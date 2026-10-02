@@ -1,485 +1,118 @@
-# Terminal Sessions MCP
+# Terminal Sessions
 
-**Interactive, persistent terminal sessions for AI assistants via Model Context Protocol**
+Persistent terminal sessions for agents and humans: a daemon that keeps shells alive, knows
+exactly where each command starts and ends and how it exited, keeps every byte in a journal
+you can page through by cursor, and tells a host when something it cares about happens.
+Several agents and humans can share a session, with provenance on every keystroke and one
+explicit controller at a time.
 
-![Web GUI Demo](docs/screenshots/web-gui-demo.gif)
+It speaks MCP to any MCP host and MCPL (MCP plus a live lane: channels, push events,
+presence) to hosts that support it — agent-framework (connectome) and Claude Code through
+`mcpl-cc-bridge`. The design, and the guarantees everything here is tested against, are in
+[`docs/redesign/DESIGN.md`](docs/redesign/DESIGN.md).
 
-## Why This Matters
-
-While many AI tools offer basic command execution, Terminal Sessions MCP provides unique capabilities:
-
-**What makes this different:**
-- **Sessions survive IDE restarts** - Unlike typical tools, your sessions persist even when you close Cursor/Claude Desktop
-- **Background tasks with log access** - Run dev servers, builds, or tests in background while retaining full access to their output
-- **True interactivity** - Send input to prompts, handle confirmations, respond to interactive tools
-- **Process control** - Send signals (Ctrl+C, Ctrl+Z) to gracefully manage long-running processes
-- **Stateful environment** - `cd`, `export`, and environment changes persist across commands
-- **Visual debugging** - Take screenshots of terminal output to debug TUI applications
-- **Context search** - Search through command history and output with regex
-
-Your AI assistant can now run servers in the background while working on other tasks, maintain persistent development environments, handle interactive workflows, and even build terminal UI applications with visual feedback.
-
-## MCP Features
-
-✅ **Truly Persistent Sessions** - Sessions survive Cursor/IDE restarts, keeping all state  
-✅ **Interactive Workflows** - Handle password prompts, confirmations, and interactive tools  
-✅ **Build & Debug TUIs** - Develop terminal UI apps with visual feedback via screenshots  
-✅ **Process Control** - Send signals (SIGINT, SIGTERM, SIGTSTP) to running processes  
-✅ **Stateful Shell** - `cd`, `export`, and other state changes persist across AI responses  
-✅ **Log Search** - Search through command history and output with regex and context  
-✅ **Service Management** - Start services with intelligent readiness detection  
-✅ **Smart Command Execution** - Detects when commands complete, handles long-running processes  
-✅ **Multi-Session Management** - Track multiple services/sessions by name  
-✅ **Terminal Screenshots** - Capture visually rich terminal output for debugging  
-✅ **Real-Time Streaming** - Watch output as it happens, not just final results  
-
-## Quick Start for AI Assistants
-
-### 1. Install
-
-**Option A: Global install (recommended)**
-```bash
-npm install -g term-sessions-mcp
-```
-
-**Option B: Local install**
-```bash
-npm install term-sessions-mcp
-```
-
-### 2. Start the Terminal Session Server
-
-This is the backend server that actually manages your terminal sessions:
-
-**If installed globally:**
-```bash
-session-server
-# Starts session server on port 3100 (with GUI on port 3200)
-```
-
-**If installed locally:**
-```bash
-npx session-server
-```
-
-**Headless mode (no GUI):**
-```bash
-session-server --headless
-```
-
-**Remote access (bind to all interfaces):**
-```bash
-session-server --host 0.0.0.0 --token your-secret-token
-```
-
-**Keep this server running** in the background - your AI assistant will connect to it.
-
-### 3. Configure the MCP Bridge for Your AI
-
-This connects your AI assistant (Cursor/Claude) to the session server:
-
-**For Cursor:**
-1. Open Cursor Settings
-2. Go to **Cursor Settings** → **MCP**  
-3. Click **"Add Custom MCP"**
-4. This will open an editor for your MCP configuration
-5. Add the following:
-
-```json
-{
-  "mcpServers": {
-    "terminal-sessions": {
-      "command": "terminal-sessions-mcp",
-      "env": {
-        "SESSION_SERVER_PORT": "3100"
-      }
-    }
-  }
-}
-```
-
-**For Claude Desktop:**
-Add to your `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "terminal-sessions": {
-      "command": "terminal-sessions-mcp",
-      "env": {
-        "SESSION_SERVER_PORT": "3100"
-      }
-    }
-  }
-}
-```
-
-**If the above doesn't work**, you may need to use the full path. Find it with:
-```bash
-which terminal-sessions-mcp
-```
-
-Then use that path in your config:
-```json
-{
-  "mcpServers": {
-    "terminal-sessions": {
-      "command": "/full/path/to/terminal-sessions-mcp",
-      "env": {
-        "SESSION_SERVER_PORT": "3100"
-      }
-    }
-  }
-}
-```
-
-**Important Notes:** 
-- **Make sure `session-server` is running** on port 3100 before starting Cursor/Claude
-- The `terminal-sessions-mcp` executable is the MCP bridge - Cursor/Claude runs it automatically
-- You don't need to run `terminal-sessions-mcp` manually - only run `session-server`
-
-### 4. Use with Your AI Assistant
-
-Your AI assistant now has access to these MCP tools:
-
-- `startService` - Start a service with readiness detection
-- `runCommand` - Execute a command in a session
-- `tailLogs` - Get recent output from a session  
-- `searchLogs` - Search through output with regex
-- `sendInput` - Send input to interactive prompts (with named-key support for TUIs)
-- `sendSignal` - Send signals (Ctrl+C, etc.) to processes
-- `listSessions` - See all active sessions
-- `killSession` - Stop a session gracefully or forcefully
-- `takeScreenshot` - Capture terminal visual state
-
-## Web GUI (Optional)
-
-The server includes an optional web-based GUI for human operators to monitor and interact with sessions:
-
-**Features:**
-- 📊 Dashboard showing all active sessions with live status
-- 🖥️ Full xterm.js terminal emulator with 256-color support
-- 🖱️ Complete mouse support in TUI apps (Midnight Commander, htop, etc.)
-- ⌨️ Direct keyboard input with proper key code forwarding
-- 📐 Automatic resize handling for perfect coordinate mapping
-- 🎨 Beautiful GitHub-inspired dark theme
-- 🔄 Real-time output streaming
-- ⚡ Signal controls (Ctrl+C, Ctrl+Z, SIGTERM)
-
-**Access:** Open `http://localhost:3200` when running with GUI enabled (default), or use `--headless` to disable.
-
-## TUI Control Sequences Support
-
-All terminal control sequences work perfectly, enabling rich TUI applications:
-
-[![TUI Controls](docs/screenshots/tui-controls.png)](docs/screenshots/tui-controls.png)
-
-- ✅ **Cursor positioning** - `\033[row;colH`
-- ✅ **Screen clearing** - `\033[2J\033[H`
-- ✅ **Colors & formatting** - All ANSI codes (30-37, 40-47, bold, dim, etc.)
-- ✅ **Progress bars** - Dynamic updates with proper positioning
-- ✅ **Box drawing** - UTF-8 box characters (╔═══╗)
-- ✅ **Live TUIs** - htop, vim, tmux, custom TUI apps
-
-## API Usage
-
-### From TypeScript/JavaScript
-
-```typescript
-import { SessionClient } from 'term-sessions-mcp';
-
-const client = new SessionClient('ws://localhost:3100');
-
-// Create a session
-await client.createSession({ id: 'my-session' });
-
-// Execute commands
-const result = await client.exec('my-session', 'npm test');
-console.log(result.output);
-
-// Search logs
-const matches = await client.searchLogs('my-session', 'error|warning', 5);
-
-// Take a screenshot (includes all colors and formatting!)
-const screenshot = await client.takeScreenshot('my-session', {
-  lines: 50,
-  outputPath: './terminal.png'
-});
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│      Web GUI (http://localhost:3200)            │
-│  - xterm.js terminal rendering                  │
-│  - Live Socket.IO updates                       │
-│  - Session dashboard                            │
-└─────────────────────────────────────────────────┘
-                     ↕ Socket.IO
-┌─────────────────────────────────────────────────┐
-│    Session Server (ws://localhost:3100)         │
-│  - PTY-based persistent sessions                │
-│  - WebSocket API                                │
-│  - Event streaming                              │
-└─────────────────────────────────────────────────┘
-                     ↕ MCP Protocol
-┌─────────────────────────────────────────────────┐
-│       AI Assistant (Cursor, Claude, etc.)       │
-│  - 10 MCP tools for session management          │
-│  - Start services, run commands                 │
-│  - Take screenshots                             │
-└─────────────────────────────────────────────────┘
-```
-
-## Available Tools (MCP)
-
-Once configured, your AI assistant will have access to these tools:
-
-### Session Management
-- **startService** - Start a long-running service with startup detection
-- **runCommand** - Execute a command and wait for completion
-- **listSessions** - Get all active sessions
-- **killSession** - Terminate a specific session (graceful by default)
-- **killAll** - Terminate all active sessions
-
-### Interactive Operations
-- **sendInput** - Send input to a running process
-- **sendSignal** - Send a signal (SIGINT, SIGTERM, etc)
-
-#### sendInput: text, Enter, and named keys
-
-`sendInput` sends the `input` text to the session PTY **verbatim**. Raw control
-characters cannot pass through the JSON tool layer, so special keys are
-expressed as **named keys** (tmux `send-keys` style) via the `keys` parameter:
-
-```jsonc
-// Type a message into a TUI composer, without submitting
-{ "session": "codex", "input": "Hello there", "appendNewline": false }
-
-// Press Enter (as a separate write — some TUIs treat text+CR in one
-// write as a paste and won't submit)
-{ "session": "codex", "input": "", "keys": ["Enter"] }
-
-// Ctrl+C, Escape, arrow keys...
-{ "session": "codex", "input": "", "keys": ["C-c"] }
-{ "session": "vim",   "input": "", "keys": ["Esc", "Down", "Down"] }
-```
-
-Supported key names (case-insensitive): `Enter`, `Tab`, `Shift-Tab`, `Esc`/`Escape`,
-`Space`, `Backspace`, `Delete`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`,
-`PageUp`, `PageDown`, `F1`–`F12`, `C-a`..`C-z` (Ctrl+letter), `M-<char>` (Alt/Meta).
-Unknown key names return an error listing the valid vocabulary.
-
-`appendNewline` appends a carriage return (`\r`, what a real Enter key sends —
-correct for both canonical-mode shells and raw-mode TUIs). It defaults to
-**true** when `keys` is absent, and **false** when `keys` is given (the caller
-controls the exact bytes; pass `appendNewline: true` explicitly to add Enter).
-
-### Log Operations
-- **tailLogs** - Get recent logs from a session
-- **searchLogs** - Search logs with regex patterns and context
-- **takeScreenshot** - Capture terminal screenshot with proper TUI rendering 📸
-
-## CLI Usage
-
-The package includes a CLI tool for manual session management:
+## Quick start
 
 ```bash
-# List sessions
-npx session-cli list
-
-# Create a session
-npx session-cli create my-session --cwd=/path/to/dir
-
-# Execute a command
-npx session-cli exec my-session "npm test"
-
-# Tail logs
-npx session-cli tail my-session --lines=100
-
-# Subscribe to live events
-npx session-cli subscribe my-session --replay=50
+npm install -g term-sessions-mcp     # bins: termd, tsm, tsm-shim
+termd                                 # ws://127.0.0.1:3101 · GUI at http://127.0.0.1:3101/
+tsm run demo 'echo hello; pwd'        # exit code = the command's; 2 while still running
 ```
 
-## Web GUI Usage
+Then connect a host (configurations in [`next/config/`](next/config/)):
 
-Start the web GUI to visually manage all your terminal sessions:
+- **Claude Code with `mcpl-cc-bridge`**: add the `terminal` entry from
+  `next/config/mcpl-bridge.json` to your bridge config, and allow
+  `mcp__plugin_mcpl-bridge_mcpl__terminal__*`. Completions, questions and watch firings wake
+  the session; progress is held.
+- **agent-framework**: the `mcplServers` entry from `next/config/agent-framework.recipe.json` and
+  the gate policies from `next/config/agent-framework.gate.json`.
+- **Any MCP host** (Cursor, Claude Desktop, Claude Code without the bridge):
+  `next/config/mcp.json` — the stdio shim starts `termd` if nothing is listening.
 
-```bash
-# Start on default port (3200)
-npx session-gui
+## What an agent gets
 
-# Or custom port
-GUI_PORT=8080 npx session-gui
+Nine core tools, one verb each (DESIGN §11, §11.1):
+
+| Tool | Use it to |
+|---|---|
+| `run` | run a command in a session's persistent shell (or `target: process`) and wait up to `wait` ms; a command still running comes back with its `runId` and keeps running |
+| `await` | keep waiting for a `runId` |
+| `read` | page through history by cursor (`since`), one command's output (`runId`), or the last lines (`tail`) |
+| `screen` | see what the terminal shows now (TUIs) |
+| `input` | type text and named keys, nothing appended |
+| `cancel` | stop a Run: queued → dropped; process → SIGINT/TERM/KILL; shell → ^C, ^\, then the foreground job |
+| `session_list`, `session_open`, `session_close` | manage sessions |
+
+Every result has two renderings: a readable transcript closed by one status line —
+`[run r4-1a2b exited 1 in 8.2s · shell · cwd /w/app · next=4990]` — and a structured
+envelope (`structuredContent`) whose `state` is the only authority on whether a command
+finished. The text block is the transcript when the connection asks for it
+(`TSM_RESULT_TEXT=transcript` for the shim, `?resultText=transcript` on the URL; the
+shipped configs set it) and the envelope as JSON otherwise — the default, for hosts whose
+scripts parse tool text (agent-framework's code execution). Opt-in tiers: `terminal.control` (`signal`, `control`, `resize`,
+`session_env_capture`), `terminal.services` (`start` with readiness and health probes),
+`terminal.watch` (`watch`, `wait_for`), `terminal.search` (`search`). Mutating tools take an
+`idempotencyKey` (a fresh UUID per operation): a retry returns the first outcome instead of
+running twice, also across a daemon restart for `run` and `start`.
+
+Over MCPL, each session is a channel. What concerns you arrives on its own: a Run you
+started ending, a service you started turning ready or unhealthy, a watch you set firing, a
+program that seems to wait for input, your session's shell exiting. Before each inference a
+short presence block says what changed since you last read. A completion your own call
+already returned is not repeated, and one that ended while you were disconnected arrives
+when you reconnect.
+
+## Humans
+
+The GUI is served by `termd` itself (`tsm gui` prints the URL, with the token when one is
+configured). It attaches with a snapshot and then streams everything: who holds the seat,
+who ran and typed what, each command's exit code. Take the seat to type; observers never
+resize or type, and the GUI's emulator never answers terminal queries (the daemon's does).
+
+## Running the daemon
+
+```
+termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
+      [--tokens-file F.json | --token T | --anonymous <principal>] [--allow-host name]
+      [--shell /bin/zsh] [--profile core|full|compat] [--result-text json|transcript]
+      [--usage-log F | --no-usage-log]
 ```
 
-Then open http://localhost:3200 in your browser to:
-- View all active sessions in a sidebar
-- Click any session to see its xterm.js rendered terminal
-- Type commands directly in the web interface
-- Watch live updates stream in real-time
-- Take screenshots from the rendered terminal
-- Monitor multiple services simultaneously
+- **Principals.** Loopback without a token runs as `token:local-<user>`. For several
+  agents, `--tokens-file` maps tokens to principals (`{"t1": "agent:linn@animalabs.ai"}`,
+  mode 0600). The GUI's browser connection is the human (`human:gui:<name>`).
+- **Safety.** Only loopback or `--allow-host` names are accepted as Host; a browser Origin
+  other than the daemon's own is refused. A non-loopback bind needs a token. Session shells
+  never inherit the daemon's credentials or the launching terminal's identity variables.
+- **Persistence.** Sessions outlive connections; journals (`~/.tsm/sessions/<id>/`) outlive
+  the daemon, and after a restart each old session is readable as `history-only` with its
+  in-flight Runs reported `lost` (reason `daemon-restart`). Live processes surviving a restart
+  needs the keeper backend (milestone 3).
+- **Supervision.** `next/config/com.animalabs.termd.plist` (launchd), `next/config/termd.service`
+  (systemd). SIGTERM ends sessions cleanly.
+- **Measure.** Every tool call is recorded (names and hashes, never contents) in
+  `~/.tsm/usage.jsonl`; `tsm usage` reports per-tool use, errors and confusion signatures.
 
-## Terminal Screenshots 📸
+## CLI
 
-Perfect for debugging visually rich terminal applications:
+`tsm` is the tool table over the same endpoint, `--json` on every command:
+`tsm run build 'npm test' --wait 20000`, `tsm await r41`, `tsm read build --since 4812`,
+`tsm screen build`, `tsm input build --keys C-c`, `tsm sessions`, `tsm gui`, `tsm usage`.
+`TSM_URL` and `TSM_TOKEN` point it at a daemon.
 
-```typescript
-// Capture a TUI, progress bar, or ANSI art
-const result = await client.takeScreenshot('my-session', {
-  lines: 50,           // How many lines to capture
-  outputPath: './screenshot.png',  // Save to file
-  width: 1200,         // Image width
-  height: 800          // Image height
-});
+## Upgrading from 1.x
 
-// Or get base64 (omit outputPath) - displays inline in MCP!
-const { base64 } = await client.takeScreenshot('my-session');
-```
-
-**Use cases:**
-- 📊 Debugging progress bars and spinners
-- 🎨 Capturing ANSI art and colors
-- 🖥️  Visual regression testing of CLI tools
-- 📝 Documenting terminal applications
-- 🔍 Sharing colorized logs with proper formatting
-
-## Use Cases
-
-### 1. AI-Assisted Development
-
-Enable AI assistants to manage development services, run tests, and interact with terminal sessions without losing context between responses.
-
-### 2. Multi-Service Testing
-
-Start and monitor multiple services simultaneously, with intelligent startup detection and log search.
-
-### 3. Visual Terminal Debugging
-
-Capture screenshots of TUIs, progress bars, and ANSI art for debugging or documentation. The web GUI provides real-time visual feedback.
-
-### 4. Interactive Debugging
-
-AI assistants can interact with running processes, send input, and observe output in real-time.
-
-### 5. Team Collaboration
-
-Share terminal sessions between multiple agents or humans. Send a URL to view live terminal output.
+2.0 replaces the 1.x session server, MCP bridge, GUI and CLI with one daemon (`termd`, port
+3101) and thin clients. The old binary names still work: `terminal-sessions-mcp` is the stdio
+shim and serves the 1.x tool names (`runCommand`, `tailLogs`, `sendInput`, …) for one release,
+with results that also say whether a command is still running; `session-server` starts
+`termd`. The GUI is served by `termd` itself. Nothing reads the 1.x data, which lived only in
+memory.
 
 ## Development
 
-```bash
-# Clone the repository
-git clone https://github.com/antra-tess/terminal-sessions-mcp.git
-cd terminal-sessions-mcp
+The code is in [`next/`](next/README.md) (the 2.0 tree; it moves to the repository root once
+1.x is retired). `npm test` builds and runs every suite; the design of record and its
+guarantees are in `docs/redesign/`.
 
-# Install dependencies
-npm install
-
-# Build
-npm run build
-
-# Start session server
-npm run start-server
-
-# Start web GUI
-npm run start-gui
-
-# Run CLI
-npm run cli -- list
-
-# Run demos
-npx ts-node examples/screenshot-demo.ts
-npx ts-node examples/service-management.ts
-```
-
-## Requirements
-
-- **Node.js** 18.x, 20.x, or 22.x LTS (Node 25+ not yet supported due to node-pty compatibility)
-- **Headless Chrome** (via Puppeteer) for screenshots
-- **Modern browser** for web GUI (Chrome, Firefox, Safari, Edge)
-
-## Configuration
-
-### Environment Variables
-
-**Server:**
-- `SESSION_SERVER_PORT` - WebSocket session server port (default: 3100)
-- `SESSION_SERVER_HOST` - Host to bind to (default: localhost)
-- `SESSION_SERVER_TOKEN` - Authentication token (optional, recommended for remote access)
-- `GUI_PORT` - Web GUI port (default: 3200)
-
-**MCP Client:**
-- `SESSION_SERVER_URL` - Full WebSocket URL (e.g., `ws://192.168.1.100:3100`)
-- `SESSION_SERVER_HOST` - Remote host (alternative to full URL)
-- `SESSION_SERVER_PORT` - Remote port (default: 3100)
-- `SESSION_SERVER_TOKEN` - Authentication token (must match server)
-- `MCP_DEBUG` - Enable debug logging (set to "1")
-
-### Remote Connections
-
-You can connect to a session server running on a different machine:
-
-**On the remote machine:**
-```bash
-session-server --host 0.0.0.0 --token mysecrettoken
-```
-
-**In your MCP config (local machine):**
-```json
-{
-  "mcpServers": {
-    "terminal-sessions-remote": {
-      "command": "terminal-sessions-mcp",
-      "env": {
-        "SESSION_SERVER_URL": "ws://192.168.1.100:3100",
-        "SESSION_SERVER_TOKEN": "mysecrettoken"
-      }
-    }
-  }
-}
-```
-
-You can configure multiple MCP servers to connect to different machines simultaneously.
-
-## Troubleshooting
-
-### MCP server not loading
-
-1. Ensure the session server is running: `npx session-server`
-2. Check that paths in mcp.json are absolute
-3. Restart your AI assistant after configuration changes
-4. Enable debug mode: `MCP_DEBUG=1`
-
-### Web GUI not connecting
-
-1. Ensure session server is running on port 3100
-2. Check browser console for errors
-3. Verify Socket.IO and xterm.js CDN libraries loaded
-4. Try a different port if 3200 is occupied
-
-### Screenshots failing
-
-1. Ensure Puppeteer can launch headless Chrome
-2. Check system resources (memory)
-3. Try with fewer lines: `lines: 20`
-
-## License
-
-MIT
-
-## Credits
-
-Developed by [Anima Labs](https://github.com/anima-labs) as part of the Connectome project.
-
-Extracted as a standalone package because terminal session management with proper TUI support is universally useful for AI-assisted development workflows.
-
-## Contributing
-
-Contributions welcome! Please open an issue or PR on GitHub.
-
----
-
-**Star ⭐ this repo if you find it useful!**

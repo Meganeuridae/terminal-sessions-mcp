@@ -1,37 +1,37 @@
 {
   "name": "term-sessions-mcp",
   "version": "1.6.0",
-  "description": "Persistent terminal session management with MCP integration for AI assistants",
-  "main": "dist/src/index.js",
-  "types": "dist/src/index.d.ts",
+  "description": "Persistent terminal sessions for agents and humans: a daemon with a journal, shell integration, MCP and MCPL.",
+  "main": "next/dist/src/index.js",
+  "types": "next/dist/src/index.d.ts",
   "bin": {
-    "terminal-sessions-mcp": "./dist/src/mcp/mcp-stdio-server.js",
-    "session-server": "./dist/src/server/start-session-server.js",
-    "session-gui": "./dist/gui/src/start-gui.js",
-    "session-cli": "./dist/cli/session-cli.js"
+    "termd": "./next/dist/src/daemon.js",
+    "tsm": "./next/dist/src/cli/tsm.js",
+    "tsm-shim": "./next/dist/src/shim/stdio.js",
+    "terminal-sessions-mcp": "./next/dist/src/shim/compat.js",
+    "session-server": "./next/dist/src/daemon.js"
   },
   "scripts": {
-    "build": "tsc",
-    "test": "npm run build && node --test",
-    "dev": "tsc --watch",
-    "start": "node dist/src/server/start-session-server.js",
-    "start-server": "ts-node src/server/start-session-server.ts",
-    "start-headless": "ts-node src/server/start-session-server.ts --headless",
-    "start-gui": "ts-node gui/src/start-gui.ts",
-    "mcp-server": "ts-node src/mcp/mcp-stdio-server.ts",
-    "cli": "ts-node cli/session-cli.ts",
+    "build": "tsc -p next/tsconfig.json",
+    "test": "npm run build && node --test \"next/dist/spec/**/*.spec.js\"",
+    "build:next": "npm run build",
+    "test:next": "npm test",
+    "acceptance:af": "npm run build && node next/acceptance/agent-framework.mjs",
+    "acceptance:bridge": "npm run build && bun next/acceptance/bridge.ts",
     "prepublishOnly": "npm run build",
     "postinstall": "node -e \"const fs=require('fs'),path=require('path');try{const p=path.join(path.dirname(require.resolve('node-pty/package.json')),'build/Release/spawn-helper');fs.chmodSync(p,0o755);}catch(e){}\""
   },
   "keywords": [
-    "mcp",
-    "terminal",
-    "session",
+    "agents",
     "ai",
     "assistant",
+    "mcp",
+    "mcpl",
+    "persistent",
     "pty",
+    "session",
     "shell",
-    "persistent"
+    "terminal"
   ],
   "author": "Anima Labs",
   "license": "MIT",
@@ -40,26 +40,32 @@
     "url": "https://github.com/antra-tess/terminal-sessions-mcp.git"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.11.2",
-    "@xterm/addon-fit": "^0.10.0",
-    "@xterm/addon-web-links": "^0.11.0",
-    "@xterm/xterm": "^5.5.0",
-    "ansi-to-html": "^0.7.2",
-    "express": "^5.1.0",
+    "@animalabs/mcpl-core": "0.3.0",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-serialize": "0.14.0",
+    "@xterm/headless": "6.0.0",
+    "@xterm/xterm": "6.0.0",
     "node-pty": "^1.0.0",
-    "puppeteer": "^24.29.1",
-    "socket.io": "^4.8.1",
-    "strip-ansi": "^7.1.0",
-    "ws": "^8.16.0"
+    "ws": "8.21.3"
   },
   "devDependencies": {
-    "@types/express": "^5.0.5",
     "@types/node": "^20.0.0",
     "@types/ws": "^8.5.10",
-    "ts-node": "^10.0.0",
+    "puppeteer": "^24.29.1",
     "typescript": "^5.0.0"
   },
   "engines": {
-    "node": ">=18.0.0 <25.0.0"
-  }
+    "node": ">=20.0.0 <25.0.0"
+  },
+  "files": [
+    "next/dist/src",
+    "next/gui",
+    "next/config",
+    "next/package.json",
+    "next/README.md",
+    "docs/redesign/DESIGN.md",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ]
 }
