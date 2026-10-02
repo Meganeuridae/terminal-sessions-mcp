@@ -1,0 +1,33 @@
+{
+  "servers": {
+    "terminal": {
+      "transport": { "url": "ws://127.0.0.1:3101/?resultText=transcript", "tokenEnv": "TSM_TOKEN" },
+      "grant": [
+        "tools",
+        "pushEvents",
+        "channels.register",
+        "channels.lifecycle",
+        "channels.incoming",
+        "channels.publish",
+        "contextHooks.beforeInference.inject.beforeUser"
+      ],
+      "enableFeatureSets": ["terminal.core", "terminal.live", "terminal.presence", "terminal.channels", "terminal.annotate"],
+      "toolPrefix": "terminal",
+      "wake": {
+        "wake": [
+          ["terminal:run-finished"],
+          ["terminal:run-lost"],
+          ["terminal:needs-input"],
+          ["terminal:watch"],
+          ["terminal:session-exited"],
+          ["terminal:service-unhealthy"],
+          ["terminal:service-exited"],
+          ["terminal:service-ready"]
+        ],
+        "hold": [["terminal:output"], ["terminal:screen"], ["terminal:control"], ["terminal:note"]]
+      },
+      "reconnect": true,
+      "reconnectIntervalMs": 1000
+    }
+  }
+}

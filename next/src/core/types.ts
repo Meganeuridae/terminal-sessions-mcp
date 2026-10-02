@@ -1,0 +1,128 @@
+/**
+ * Core types: the entity model and the journal event schema.
+ * See docs/redesign/DESIGN.md §4 (entities), §5 (guarantees), Appendix A (journal).
+ */
+
+export type Seq = number;
+
+/** Who acted. Resolved at the transport; `system` is the daemon itself. */
+export type Principal = string; // 'agent:<name>@<domain>' | 'human:<provider>:<id>' | 'token:<name>' | 'system'
+export const SYSTEM: Principal = 'system';
+
+export type RunTarget = 'shell' | 'process';
+export type RunState = 'queued' | 'starting' | 'running' | 'exited' | 'cancelled' | 'lost';
+export type RunOrigin = 'self' | 'human' | 'agent' | 'system';
+
+/** The shell terminal's state. `tui` is `busy` with the alternate screen active. */
+export type ShellState = 'starting' | 'idle' | 'busy' | 'exited';
+
+/** Shell-integration level, VS Code's vocabulary (G5). */
+export type IntegrationLevel = 'unknown' | 'rich' | 'basic' | 'none';
+
+export type Attribution = 'exact' | 'temporal';
+export type OutputStream = 'pty' | 'stdout' | 'stderr';
+export type EnvBasis = 'configured' | 'snapshot';
+
+export type ControlPolicy = 'seat' | 'owner-priority';
+export type Visibility = 'private' | 'shared';
+export type AttachmentRole = 'observer' | 'controller';
+
+/** Journal events without the fields the journal assigns (`seq`, `ts`). Appendix A. */
+export type EventInput =
+  | { type: 'output'; data: string; runId?: string; stream: OutputStream; attribution?: Attribution }
+  | { type: 'input'; data: string; principal: Principal; kind: 'text' | 'keys' | 'paste' | 'protocol-reply'; sensitive?: true; runId?: string; key?: string }
+  | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string }
+  | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number }
+  | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number }
+  | { type: 'prompt'; cwd: string; phase: 'start' | 'end' }
+  | { type: 'cwd'; path: string }
+  | { type: 'env.snapshot'; vars: Record<string, string> }
+  | { type: 'screen.mode'; alt: boolean }
+  | { type: 'title'; text: string }
+  | { type: 'resize'; cols: number; rows: number; principal: Principal }
+  | { type: 'signal'; signal: string; principal: Principal; runId?: string }
+  | { type: 'control'; controller: Principal | null; by: Principal; how: 'take' | 'release' | 'override' | 'auto' }
+  | { type: 'attach'; attachmentId: string; principal: Principal; role: AttachmentRole }
+  | { type: 'detach'; attachmentId: string; principal: Principal }
+  | { type: 'integration'; level: IntegrationLevel }
+  /**
+   * A range of seqs that is gone (G11). Beyond Appendix A's `retention | keeper-overflow`: `torn-write` (a crash cut
+   * the last line), `store-error` (the ring dropped events the disk had refused), `store-failed` (the disk still
+   * refused them when the journal sealed, or the daemon died first); their seqs are never reissued (G10).
+   */
+  | { type: 'gap'; from: Seq; to: Seq; reason: 'retention' | 'keeper-overflow' | 'torn-write' | 'store-error' | 'store-failed' }
+  | { type: 'recovered'; class: 'continuous' | 'reattached' | 'history-only' }
+  /** `reason` names why the daemon ended the shell (e.g. 'daemon-shutdown'); absent when the shell ended on its own. */
+  | { type: 'session.exit'; code: number | null; signal?: string; reason?: string }
+  | { type: 'note'; text: string; principal: Principal; channel?: string }
+  /** A Service's status changed (§8.3); `principal` started it. */
+  | { type: 'service'; runId: string; status: ServiceStatus; probe: string; principal: Principal; name?: string; evidence?: string; exit?: number }
+  /** A Watch fired (§4); `principal` set it; `at` is the event that satisfied it. */
+  | { type: 'watch.fired'; watchId: string; label: string; kind: 'pattern' | 'silence' | 'idle'; principal: Principal; at: Seq; match?: string; line?: string; suppressed?: number }
+  /**
+   * A running Run may be waiting for input (G15: a heuristic, journaled with its evidence) —
+   * the last line, how long output has been silent, the session state — so catch-up and
+   * presence see it after the moment passed (m2-18). Journaled by the segmenter.
+   */
+  | { type: 'run.waiting'; runId: string; lastLine: string; silentMs: number; state: string };
+
+/**
+ * A Service's status (§8.3). `ready` only from a readiness probe (G9); `running`
+ * when no readiness probe was given and the Run stayed alive through the liveness
+ * window; `lost` when the Run's end was not observed (its process may still be
+ * alive, G3), as opposed to `exited`, an observed end.
+ */
+export type ServiceStatus = 'starting' | 'ready' | 'running' | 'unhealthy' | 'exited' | 'lost';
+
+export type JournalEvent = EventInput & { seq: Seq; ts: number };
+export type EventType = JournalEvent['type'];
+export type EventOf<T extends EventType> = Extract<JournalEvent, { type: T }>;
+
+/** A Run as exposed by the core (G1–G3). */
+export interface RunInfo {
+  runId: string;
+  sessionId: string;
+  target: RunTarget;
+  origin: RunOrigin;
+  principal: Principal;
+  state: RunState;
+  line?: string;
+  argv?: string[];
+  cwd?: string;
+  envBasis?: EnvBasis;
+  admittedAt: number;
+  startedAt?: number;
+  endedAt?: number;
+  exit?: number;
+  signal?: string;
+  reason?: string;
+  /** Journal positions: admission, start (pre-execution mark or spawn), end. */
+  seq: { admit: Seq; start?: Seq; end?: Seq };
+  attribution: Attribution;
+  /** The terminal geometry the Run started at: its transcript is projected at this width (§6). */
+  cols?: number;
+  rows?: number;
+  /** The admitting call's idempotency identity (G16): opaque, set by the application layer, journaled so it survives a restart. */
+  idem?: string;
+  /** A process Run's pid and process group, from its run.start: recovery terminates a group a dead daemon left behind (G19c). */
+  pid?: number;
+  pgid?: number;
+}
+
+export interface ScreenSnapshot {
+  cols: number;
+  rows: number;
+  alt: boolean;
+  cursor: { x: number; y: number };
+  lines: string[];
+  title: string;
+  /** The journal position the snapshot reflects: every event ≤ seq has been applied. */
+  seq: Seq;
+  /** Output units the emulator dropped under pressure since the session started (§6); absent when none. */
+  droppedUnits?: number;
+}
+
+export interface Cursors {
+  delivered: Seq;
+  read: Seq;
+}

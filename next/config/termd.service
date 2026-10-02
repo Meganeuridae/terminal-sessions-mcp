@@ -1,0 +1,22 @@
+# systemd user unit: cp to ~/.config/systemd/user/termd.service, replace PACKAGE with the
+# installed package ("$(npm root -g)/term-sessions-mcp"), then
+#   systemctl --user daemon-reload && systemctl --user enable --now termd
+# termd-launch.sh finds node (nvm, Volta, /usr/local, ~/.local; or Environment=TSM_NODE=…),
+# puts those directories on PATH for process Runs and starts in $HOME. Logs go to the
+# journal: journalctl --user -u termd.
+[Unit]
+Description=terminal sessions daemon (termd)
+
+[Service]
+ExecStart=/bin/sh PACKAGE/next/config/termd-launch.sh --port 3101
+WorkingDirectory=%h
+UMask=0077
+Restart=on-failure
+# SIGTERM to termd alone: it drains its sessions (Runs end with reason daemon-shutdown) and
+# kills what they left; only what survives that is killed when the stop times out.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

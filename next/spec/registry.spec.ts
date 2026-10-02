@@ -1,0 +1,454 @@
+/**
+ * The session registry against the scripted backend: name ownership (G18),
+ * case-insensitive names, concurrent creation (G10), close into readable
+ * history (G19), history Runs and recovery (G20), retention (G21), and the
+ * modes of what it writes (G26). Each test is named for the guarantee or the
+ * review finding it encodes.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { SessionRegistry, type AnySession, type HistorySession, type LiveSession, type RegistryChange } from '../src/api/registry.js';
+import { ScriptedBackend, type ScriptedProcess } from '../src/backends/scripted.js';
+import { TermError } from '../src/core/errors.js';
+import { FileStore } from '../src/core/stores.js';
+import { Journal } from '../src/core/journal.js';
+import type { Session } from '../src/core/session.js';
+import type { JournalEvent } from '../src/core/types.js';
+import { FakeShell } from './fake-shell.js';
+
+const A = 'agent:a@test';
+const B = 'agent:b@test';
+
+interface Rig {
+  dir: string;
+  backend: ScriptedBackend;
+  shells: FakeShell[];
+  reg: SessionRegistry;
+  changes: RegistryChange[];
+}
+
+function scripted(): { backend: ScriptedBackend; shells: FakeShell[] } {
+  const backend = new ScriptedBackend();
+  const shells: FakeShell[] = [];
+  backend.onSpawnShell = (p) => {
+    const sh = new FakeShell(p, { marks: 'rich' });
+    sh.on(/^echo (.*)$/, (l) => ({ output: `${l.slice(5)}\r\n`, exit: 0 }));
+    sh.on(/^fail$/, () => ({ output: 'nope\r\n', exit: 3 }));
+    sh.on(/^sleep/, () => ({ hang: true }));
+    sh.on(/^big (\d+)$/, (l) => ({ output: `${'x'.repeat(Number(l.split(' ')[1]))}\r\n`, exit: 0 }));
+    const kill = p.kill.bind(p);
+    p.kill = (sig) => {
+      kill(sig);
+      if (sig === 'SIGHUP' || sig === 'SIGKILL') queueMicrotask(() => p.exit({ exitCode: null, signal: sig }));
+    };
+    shells.push(sh);
+  };
+  return { backend, shells };
+}
+
+function registry(dir: string, backend: ScriptedBackend): SessionRegistry {
+  return new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir() });
+}
+
+function rig(dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-registry-'))): Rig {
+  const { backend, shells } = scripted();
+  const reg = registry(dir, backend);
+  const changes: RegistryChange[] = [];
+  reg.onChange((c) => changes.push(c));
+  return { dir, backend, shells, reg, changes };
+}
+
+/** A new registry over the same data dir: the daemon after a restart. */
+function restart(r: Rig): Rig {
+  return rig(r.dir);
+}
+
+async function run(session: Session, principal: string, line: string, opts: { queue?: boolean; wait?: number } = {}) {
+  if (!session.listAttachments().some((a) => a.principal === principal)) session.attach(principal, `conn-${principal}`);
+  const ao: Parameters<Session['admitWhenAvailable']>[0] = { target: 'shell', line, principal };
+  if (opts.queue) ao.queue = true;
+  const a = await session.admitWhenAvailable(ao);
+  assert.ok(a.admitted, `admitted ${line}: ${!a.admitted && a.reason}`);
+  return session.awaitRun(a.run.runId, opts.wait ?? 2000);
+}
+
+const code = (e: unknown) => (e instanceof TermError ? e.code : String(e));
+const rejectsWith = async (p: Promise<unknown>, c: string) => assert.equal(await p.then(() => 'resolved', code), c);
+const hist = (s: AnySession | undefined): HistorySession => {
+  assert.ok(s && s.kind === 'history', `expected history, got ${s?.kind}`);
+  return s;
+};
+const live = (s: AnySession | undefined): LiveSession => {
+  assert.ok(s && s.kind === 'live', `expected live, got ${s?.kind}`);
+  return s;
+};
+const text = (events: JournalEvent[]) => events.map((e) => (e.type === 'output' ? e.data : '')).join('');
+const xs = (events: JournalEvent[]) => (text(events).match(/x/g) ?? []).length;
+const seqsOnDisk = (dir: string) =>
+  fs
+    .readFileSync(path.join(dir, 'journal.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => (JSON.parse(l) as { seq?: number }).seq)
+    .filter((s): s is number => typeof s === 'number');
+const cleanup = async (...rigs: Rig[]) => {
+  for (const r of rigs) await r.reg.closeAll();
+  const dir = rigs[0]!.dir;
+  // Command directories live in /tmp, outside the data dir (jr2-12).
+  for (const id of fs.readdirSync(path.join(dir, 'sessions'))) {
+    fs.rmSync(path.join(`/tmp/tsm-${process.getuid!()}`, createHash('sha256').update(`${path.resolve(dir)}\0${id}`).digest('hex').slice(0, 8)), { recursive: true, force: true });
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+};
+
+test('jr-1/api-2/tg-1/G18: after a restart, another principal cannot take over a private session name', async () => {
+  const r1 = rig();
+  const s = (await r1.reg.ensure({ id: 'secret', owner: A })).session;
+  const secret = await run(s, A, 'echo AWS_SECRET=hunter2');
+  const before = s.journal.lastSeq;
+  await r1.reg.closeAll();
+  const r2 = restart(r1);
+  const h = hist(r2.reg.get('secret'));
+  assert.equal(h.owner, A);
+  assert.equal(h.closed, false);
+  await rejectsWith(r2.reg.ensure({ id: 'secret', owner: B }), 'forbidden');
+  await rejectsWith(r2.reg.create({ id: 'secret', owner: B }), 'forbidden');
+  assert.equal(hist(r2.reg.get('secret')).owner, A, 'the history keeps its owner');
+  assert.equal((JSON.parse(fs.readFileSync(path.join(r1.dir, 'sessions/secret/session.json'), 'utf8')) as { owner: string }).owner, A);
+  assert.equal(r2.backend.ptys.length, 0, 'no shell was started for the refused caller');
+  // The owner starts a new life: the journal and its numbering continue, and old runIds stay valid.
+  const again = await r2.reg.ensure({ id: 'secret', owner: A });
+  assert.equal(again.created, true);
+  assert.ok(again.session.journal.since(before).events[0]!.seq > before);
+  const l = live(r2.reg.get('secret'));
+  const old = l.run(secret.runId);
+  assert.equal(old.state, 'exited');
+  assert.equal(old.exit, 0);
+  assert.match(text(l.runOutput(secret.runId).events), /AWS_SECRET=hunter2/);
+  assert.ok(l.listRuns().some((x) => x.runId === secret.runId));
+  assert.deepEqual(seqsOnDisk(path.join(r1.dir, 'sessions/secret')), [...new Set(seqsOnDisk(path.join(r1.dir, 'sessions/secret')))].sort((a, b) => a - b), 'seq strictly increasing on disk');
+  await cleanup(r2, r1);
+});
+
+test('jr-1/jr-12/tg-1/G18/G19: a closed session stays readable history, and its name stays its owner\'s', async () => {
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'priv', owner: A })).session;
+  const tok = await run(s, A, 'echo TOKEN=abc123');
+  await r.reg.close('priv', { reason: 'done' });
+  const h = hist(r.reg.get('priv'));
+  assert.equal(h.closed, true);
+  assert.equal(h.owner, A);
+  assert.match(text(h.journal.since(0).events), /TOKEN=abc123/, 'history stays readable after close');
+  assert.equal(h.run(tok.runId).state, 'exited');
+  assert.deepEqual(r.changes.map((c) => c.type), ['created', 'closed'], 'close emits closed, not removed');
+  assert.ok(r.reg.list().includes(h));
+  await rejectsWith(r.reg.ensure({ id: 'priv', owner: B }), 'forbidden');
+  await rejectsWith(r.reg.create({ id: 'priv', owner: B }), 'forbidden');
+  await r.reg.close('priv'); // closing history again changes nothing
+  assert.throws(() => r.reg.live('priv'), (e: TermError) => e.code === 'session_exited' && /closed/.test(e.message));
+  // After a restart it is still a closed history entry, and no second `recovered` marker is written.
+  const r2 = restart(r);
+  const h2 = hist(r2.reg.get('priv'));
+  assert.equal(h2.closed, true);
+  assert.equal(h2.journal.since(0).events.filter((e) => e.type === 'recovered').length, 0);
+  // remove deletes the entry and its files.
+  await r2.reg.remove('priv');
+  assert.equal(r2.reg.get('priv'), undefined);
+  assert.equal(fs.existsSync(path.join(r.dir, 'sessions/priv')), false);
+  assert.deepEqual(r2.changes.map((c) => c.type), ['removed']);
+  await rejectsWith(r2.reg.remove('priv'), 'session_not_found');
+  const other = (await r2.reg.ensure({ id: 'livebox', owner: A })).session;
+  assert.ok(other);
+  await rejectsWith(r2.reg.remove('livebox'), 'invalid_argument');
+  await cleanup(r2, r);
+});
+
+test('sec-5/G10: session names are unique case-insensitively, live and on disk', async () => {
+  const r = rig();
+  await r.reg.ensure({ id: 'Box', owner: A });
+  const clash = await r.reg.create({ id: 'box', owner: B }).then(
+    () => undefined,
+    (e: TermError) => e,
+  );
+  assert.equal(clash?.code, 'session_exists');
+  assert.equal(clash?.data?.existing, 'Box', 'the error names the existing session');
+  await rejectsWith(r.reg.ensure({ id: 'BOX', owner: B }), 'session_exists');
+  assert.equal(r.reg.get('box'), undefined);
+  assert.equal(r.backend.ptys.length, 1);
+  await r.reg.closeAll();
+  const r2 = restart(r);
+  hist(r2.reg.get('Box'));
+  await rejectsWith(r2.reg.ensure({ id: 'bOx', owner: A }), 'session_exists');
+  assert.deepEqual(fs.readdirSync(path.join(r.dir, 'sessions')), ['Box']);
+  await cleanup(r2, r);
+});
+
+test('jr-3/api-7/G10: concurrent opens of one new name make one shell and one journal', async () => {
+  const r = rig();
+  const results = await Promise.all([r.reg.ensure({ id: 'dup', owner: A }), r.reg.ensure({ id: 'dup', owner: A }), r.reg.ensure({ id: 'dup', owner: B })]);
+  assert.equal(r.backend.ptys.length, 1, 'one shell');
+  assert.deepEqual(results.map((x) => x.created), [true, false, false]);
+  assert.ok(results.every((x) => x.session === results[0]!.session), 'every caller gets the same session');
+  assert.equal(results[0]!.session.owner, A, 'the first caller owns it');
+  const creates = await Promise.allSettled([r.reg.create({ id: 'dup2', owner: A }), r.reg.create({ id: 'dup2', owner: A })]);
+  assert.deepEqual(creates.map((c) => c.status), ['fulfilled', 'rejected']);
+  assert.equal(code((creates[1] as PromiseRejectedResult).reason), 'session_exists');
+  assert.equal(r.backend.ptys.length, 2);
+  const s = results[0]!.session;
+  await Promise.all([run(s, A, 'echo one'), run(s, A, 'echo two', { queue: true })]);
+  const seqs = seqsOnDisk(path.join(r.dir, 'sessions/dup'));
+  assert.equal(new Set(seqs).size, seqs.length, 'no duplicate seqs on disk');
+  await r.reg.closeAll();
+  assert.ok(r.backend.ptys.every((p) => p.exited), 'no shell leaked past closeAll');
+  await cleanup(r);
+});
+
+test('jr-4/api-9/tg-11/G20: a history session reconstructs its Runs from the journal; in-flight ones are lost', async () => {
+  const r1 = rig();
+  const s = (await r1.reg.ensure({ id: 'h', owner: A })).session;
+  const first = await run(s, A, 'echo first-run-output');
+  const second = await run(s, A, 'fail');
+  const slow = await run(s, A, 'sleep 100', { wait: 20 });
+  assert.equal(slow.state, 'running');
+  const queued = await run(s, A, 'echo queued', { queue: true, wait: 0 });
+  assert.equal(queued.state, 'queued');
+  // The daemon dies here: a new registry recovers while the old one is never closed.
+  const r2 = restart(r1);
+  const h = hist(r2.reg.get('h'));
+  assert.equal(h.recovered, 'history-only');
+  assert.deepEqual(h.listRuns().map((x) => x.runId), [first.runId, second.runId, slow.runId, queued.runId]);
+  const one = h.run(first.runId);
+  assert.deepEqual([one.state, one.exit, one.line], ['exited', 0, 'echo first-run-output']);
+  assert.deepEqual([h.run(second.runId).state, h.run(second.runId).exit], ['exited', 3]);
+  for (const id of [slow.runId, queued.runId]) {
+    const x = h.run(id);
+    assert.deepEqual([x.state, x.reason], ['lost', 'daemon-restart'], `${id} was in flight`);
+  }
+  const outOne = h.runOutput(first.runId);
+  // Keyed marks are not output (atc-3); what matters is that no other Run's output is in it.
+  assert.match(text(outOne.events), /^first-run-output\r\n(\x1b\]133;D;0(;k=[^\x07]*)?\x07)?$/, 'only that Run\'s output');
+  assert.equal(live(r1.reg.get('h')).runOutput(first.runId).events.map((e) => e.seq).join(), outOne.events.map((e) => e.seq).join(), 'the same events the live session attributes');
+  assert.equal(outOne.truncated, false);
+  assert.ok(outOne.to - outOne.from < 10);
+  assert.equal(text(h.runOutput(queued.runId).events), '');
+  // Bounded: only the newest output, walking the Run's range backwards.
+  const capped = h.runOutput(first.runId, { maxBytes: 5 });
+  assert.deepEqual([capped.truncated, capped.to], [outOne.truncated || capped.events.length < outOne.events.length, outOne.to]);
+  assert.ok(text(capped.events).length >= 5 && outOne.events.slice(-capped.events.length).every((e, i) => e.seq === capped.events[i]!.seq));
+  assert.deepEqual(h.runOutput(first.runId, { maxBytes: 1 << 20 }).events.map((e) => e.seq), outOne.events.map((e) => e.seq));
+  assert.throws(() => h.run('r99-bogus'), (e: TermError) => e.code === 'run_not_found');
+  assert.throws(() => h.runOutput('r99-bogus'), (e: TermError) => e.code === 'run_not_found');
+  // A second restart ends nothing twice and marks the restart once.
+  const r3 = restart(r1);
+  const events = hist(r3.reg.get('h')).journal.since(0).events;
+  assert.equal(events.filter((e) => e.type === 'run.end' && e.runId === slow.runId).length, 1);
+  assert.equal(events.filter((e) => e.type === 'recovered').length, 1);
+  await cleanup(r3, r2, r1);
+});
+
+test('jr-8/tg-11/G20: recovery ends a Run that was starting (admitted, written, no pre-execution mark yet)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-registry-'));
+  const sdir = path.join(dir, 'sessions', 'st');
+  const j = new Journal({ cold: new FileStore(sdir), sessionId: 'st' });
+  j.append({ type: 'integration', level: 'rich' });
+  j.append({ type: 'run.admit', runId: 'r1-aaaaaa', target: 'shell', line: 'make', principal: A, origin: 'self', queued: false });
+  j.close();
+  fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }));
+  const r = rig(dir);
+  const x = hist(r.reg.get('st')).run('r1-aaaaaa');
+  assert.deepEqual([x.state, x.reason, x.principal, x.line], ['lost', 'daemon-restart', A, 'make']);
+  await cleanup(r);
+});
+
+test('jr-10: a closed session\'s late events never reach the journal, and a new life numbers on without duplicates', async () => {
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'p', owner: A })).session;
+  s.attach(A, 'c1');
+  const a = s.admit({ target: 'process', line: 'devserver', principal: A });
+  assert.ok(a.admitted);
+  await new Promise((res) => setTimeout(res, 10));
+  const proc = r.backend.processes[0] as ScriptedProcess;
+  const kill = proc.kill.bind(proc);
+  proc.kill = (sig) => {
+    kill(sig);
+    if (sig === 'SIGINT') setTimeout(() => {
+      proc.emitStdout('shutting down\n');
+      proc.exit({ exitCode: 0 });
+    }, 150);
+  };
+  await r.reg.close('p');
+  const h = hist(r.reg.get('p'));
+  const atClose = h.lastSeq;
+  const outcome = h.run(a.run.runId);
+  assert.ok(['exited', 'cancelled', 'lost'].includes(outcome.state), `the Run is terminal in history: ${outcome.state}`);
+  await r.reg.ensure({ id: 'p', owner: A });
+  await new Promise((res) => setTimeout(res, 400));
+  assert.equal(h.lastSeq, atClose, 'nothing appended to the closed journal');
+  const seqs = seqsOnDisk(path.join(r.dir, 'sessions/p'));
+  assert.equal(new Set(seqs).size, seqs.length, `no duplicate seqs: ${seqs.join(',')}`);
+  assert.ok(seqs.every((q, i) => i === 0 || q > seqs[i - 1]!), 'monotonic on disk');
+  await cleanup(r);
+});
+
+test('api-15/G19: a live session whose shell exited is replaced for its owner; anyone else gets what is there', async () => {
+  const r = rig();
+  const old = (await r.reg.ensure({ id: 'x', owner: A, visibility: 'shared' })).session;
+  const ran = await run(old, A, 'echo before-exit');
+  r.backend.ptys[0]!.exit({ exitCode: 0 });
+  assert.equal(old.state, 'exited');
+  await rejectsWith(r.reg.create({ id: 'x', owner: B }), 'forbidden');
+  const forB = await r.reg.ensure({ id: 'x', owner: B });
+  assert.deepEqual([forB.created, forB.session === old], [false, true], 'a non-owner is not given a new life');
+  const lastOld = old.journal.lastSeq;
+  const forA = await r.reg.ensure({ id: 'x', owner: A });
+  assert.equal(forA.created, true);
+  assert.notEqual(forA.session, old);
+  assert.equal(r.backend.ptys.length, 2);
+  assert.ok(forA.session.journal.since(lastOld).events.length > 0 && forA.session.journal.since(lastOld).events[0]!.seq === lastOld + 1, 'seq continues');
+  assert.equal(live(r.reg.get('x')).run(ran.runId).state, 'exited', 'the old life\'s run stays reachable');
+  assert.deepEqual(r.changes.map((c) => c.type), ['created', 'closed', 'created']);
+  await rejectsWith(r.reg.create({ id: 'x', owner: A }), 'session_exists');
+  await cleanup(r);
+});
+
+test('G21: retention is explicit per session, recorded, reported, and kept by a new life', async () => {
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'ret', owner: A, retention: { maxBytes: 128 * 1024, maxAgeMs: 3_600_000 } })).session;
+  const meta = JSON.parse(fs.readFileSync(path.join(r.dir, 'sessions/ret/session.json'), 'utf8')) as { retention: unknown };
+  assert.deepEqual(meta.retention, { maxBytes: 131072, maxAgeMs: 3_600_000 });
+  const st = s.journal.stats();
+  assert.deepEqual(st.retention, { maxBytes: 131072, maxAgeMs: 3_600_000, memoryBytes: 131072 });
+  assert.equal(st.oldestSeq, 1);
+  assert.equal(st.coldFailed, null);
+  assert.deepEqual(live(r.reg.get('ret')).retention, { maxBytes: 131072, maxAgeMs: 3_600_000 });
+  await rejectsWith(r.reg.ensure({ id: 'bad', owner: A, retention: { maxBytes: 10 } }), 'invalid_argument');
+  await rejectsWith(r.reg.ensure({ id: 'bad', owner: A, retention: { maxAgeMs: -1 } }), 'invalid_argument');
+  const d = (await r.reg.ensure({ id: 'dflt', owner: A })).session;
+  // By default nothing is deleted: no byte or age limit, only the in-memory cache (G21).
+  assert.deepEqual(d.journal.stats().retention, { maxBytes: null, maxAgeMs: null, memoryBytes: 8 * 1024 * 1024 });
+  assert.deepEqual(live(r.reg.get(d.id)).retention, {});
+  await r.reg.close('ret');
+  assert.deepEqual(hist(r.reg.get('ret')).retention, { maxBytes: 131072, maxAgeMs: 3_600_000 });
+  const again = (await r.reg.ensure({ id: 'ret', owner: A })).session;
+  assert.equal(again.journal.stats().retention.maxBytes, 131072, 'a new life keeps the recorded retention');
+  await cleanup(r);
+});
+
+test('sec-9/G26: the data layout is private: sessions 0700, session.json and journals 0600, fixed on recovery', async () => {
+  const r = rig();
+  await r.reg.ensure({ id: 'm', owner: A });
+  const mode = (p: string) => fs.statSync(path.join(r.dir, p)).mode & 0o777;
+  assert.equal(mode('sessions'), 0o700);
+  assert.equal(mode('sessions/m'), 0o700);
+  assert.equal(mode('sessions/m/session.json'), 0o600);
+  assert.equal(mode('sessions/m/journal.jsonl'), 0o600);
+  await r.reg.closeAll();
+  for (const p of ['sessions', 'sessions/m']) fs.chmodSync(path.join(r.dir, p), 0o755);
+  for (const p of ['sessions/m/session.json', 'sessions/m/journal.jsonl']) fs.chmodSync(path.join(r.dir, p), 0o644);
+  const r2 = restart(r);
+  assert.deepEqual(['sessions', 'sessions/m', 'sessions/m/session.json', 'sessions/m/journal.jsonl'].map(mode), [0o700, 0o700, 0o600, 0o600]);
+  await cleanup(r2, r);
+});
+
+test('jr-2/G19: a session whose journal becomes unwritable stays alive and reports it', async () => {
+  if (process.getuid?.() === 0) return; // root ignores modes
+  const r = rig();
+  // Small files, so the flood below needs a rotation, which a read-only directory refuses (EACCES on rename).
+  const s = (await r.reg.ensure({ id: 'ro', owner: A, retention: { maxBytes: 16 * 1024 } })).session;
+  const sdir = path.join(r.dir, 'sessions/ro');
+  fs.chmodSync(sdir, 0o500);
+  let ran;
+  try {
+    ran = await run(s, A, 'big 6000');
+    assert.equal(ran.state, 'exited', 'the session kept working');
+    assert.match(s.journal.stats().coldFailed ?? '', /EACCES|EPERM/);
+    assert.equal(xs(live(r.reg.get('ro')).runOutput(ran.runId).events), 6000, 'served from the ring');
+  } finally {
+    fs.chmodSync(sdir, 0o700);
+  }
+  assert.equal(s.journal.retryCold(), true);
+  assert.equal(s.journal.stats().coldFailed, null);
+  await r.reg.closeAll();
+  const r2 = restart(r);
+  assert.equal(xs(hist(r2.reg.get('ro')).runOutput(ran.runId).events), 6000, 'nothing lost once the disk healed');
+  await cleanup(r2, r);
+});
+
+test('closeAll passes the reason to Session.close and leaves every session readable', async () => {
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'c1', owner: A })).session;
+  const seen: unknown[] = [];
+  const orig = s.close.bind(s);
+  s.close = (o) => {
+    seen.push(o);
+    return orig(o);
+  };
+  await r.reg.closeAll({ reason: 'daemon-shutdown' });
+  assert.equal((seen[0] as { reason?: string }).reason, 'daemon-shutdown');
+  const h = hist(r.reg.get('c1'));
+  assert.equal(h.closed, false, 'a shutdown is not the owner closing it');
+  assert.ok(h.journal.since(0).events.length > 0);
+  await cleanup(r);
+});
+
+test('G19: a new life that fails to start keeps the history, readable and owned', async () => {
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'f', owner: A })).session;
+  await run(s, A, 'echo keep-me');
+  await r.reg.close('f');
+  const spawn = r.backend.spawnShell.bind(r.backend);
+  r.backend.spawnShell = () => {
+    throw new Error('spawn failed');
+  };
+  await rejectsWith(r.reg.ensure({ id: 'f', owner: A }), 'Error: spawn failed');
+  r.backend.spawnShell = spawn;
+  const h = hist(r.reg.get('f'));
+  assert.equal(h.owner, A);
+  assert.match(text(h.journal.since(0).events), /keep-me/);
+  await rejectsWith(r.reg.ensure({ id: 'f', owner: B }), 'forbidden');
+  assert.equal((await r.reg.ensure({ id: 'f', owner: A })).created, true);
+  await cleanup(r);
+});
+
+test('jr-13/G21/G26: a history session whose newest event is past its maxAgeMs expires — at startup and by expire()', async () => {
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'old', owner: A, retention: { maxAgeMs: 60_000 } })).session;
+  await run(s, A, 'echo stale-secret');
+  await r.reg.close('old');
+  await r.reg.ensure({ id: 'alive', owner: A, retention: { maxAgeMs: 60_000 } });
+  assert.deepEqual(await r.reg.expire(Date.now() + 10_000), [], 'nothing is past its age yet');
+  assert.deepEqual(await r.reg.expire(Date.now() + 120_000), ['old'], 'a live session never expires');
+  assert.equal(r.reg.get('old'), undefined);
+  assert.equal(fs.existsSync(path.join(r.dir, 'sessions/old')), false);
+  assert.ok(r.changes.some((c) => c.type === 'removed' && c.id === 'old'));
+  live(r.reg.get('alive'));
+  // At startup: a journal whose newest event is older than its retention is not recovered at all.
+  const sdir = path.join(r.dir, 'sessions', 'ancient');
+  const j = new Journal({ cold: new FileStore(sdir, { maxAgeMs: 60_000 }), now: () => Date.now() - 3_600_000 });
+  j.append({ type: 'output', data: 'old news', stream: 'pty' });
+  j.close();
+  fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', retention: { maxAgeMs: 60_000 } }));
+  await r.reg.closeAll();
+  const r2 = restart(r);
+  assert.equal(r2.reg.get('ancient'), undefined);
+  assert.equal(fs.existsSync(sdir), false);
+  hist(r2.reg.get('alive'));
+  await cleanup(r2, r);
+});
+
+test('G19: one unreadable session directory does not keep the registry from starting', async () => {
+  const r = rig();
+  await r.reg.ensure({ id: 'fine', owner: A });
+  await r.reg.closeAll();
+  fs.mkdirSync(path.join(r.dir, 'sessions', 'weird', 'journal.jsonl'), { recursive: true });
+  fs.writeFileSync(path.join(r.dir, 'sessions', 'weird', 'journal.1.jsonl'), JSON.stringify({ type: 'cwd', path: '/', seq: 1, ts: Date.now() }) + '\n');
+  const r2 = restart(r);
+  hist(r2.reg.get('fine'));
+  assert.equal(r2.reg.get('weird'), undefined);
+  assert.deepEqual(r2.reg.recoveryErrors.map((e) => e.id), ['weird']);
+  await cleanup(r2, r);
+});

@@ -1,0 +1,18 @@
+{
+  "mcplServers": [
+    {
+      "id": "terminal",
+      "transport": "websocket",
+      "url": "ws://127.0.0.1:3101/?resultText=transcript",
+      "toolPrefix": "terminal",
+      "reconnect": true,
+      "enabledFeatureSets": [
+        "terminal.core",
+        "terminal.live",
+        "terminal.presence",
+        "terminal.annotate"
+      ],
+      "token": "${TSM_TOKEN}"
+    }
+  ]
+}
