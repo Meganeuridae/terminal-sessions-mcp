@@ -2,7 +2,7 @@
 
 **Status:** Proposal backlog; A1 implemented in draft [agent-framework #181](https://github.com/anima-research/agent-framework/pull/181), not merged or deployed. B3 and A2 corrected after Codex's review (acceptance is invalidated by an ontology change, never recompiled); A5 and A6 added 2026-09-23 from the milestone-1 review, which exercised both hosts' real code against termd
 **Date:** 2026-09-17, amended 2026-09-24
-**Companion:** `DESIGN.md` draft 4 (§10.6 host profiles, §11 result shape and tiers); [planning index and shared Connectome handoff](README.md)
+**Companion:** `DESIGN.md` draft 4 (§10.6 host profiles, §11 result shape and tiers)
 **Audience:** an agent writing the PRs. Every claim below carries a `file:line` anchor as of
 the checkouts on 2026-09-17; re-verify lines before editing, they drift.
 
@@ -16,8 +16,7 @@ are what phase 2 wants in place.
 
 ## mcpl-cc-bridge
 
-Repo: `github.com/anima-research/mcpl-cc-bridge`, checkout
-`/Users/aster/projects/mcpl-cc-bridge/bridge`, plugin at `plugins/mcpl-bridge`, version
+Repo: `github.com/anima-research/mcpl-cc-bridge`, source under `bridge/`, plugin at `plugins/mcpl-bridge`, version
 0.2.6 (`.claude-plugin/plugin.json`).
 
 ### B1 — Glob matching in wake rules (S)
@@ -145,7 +144,7 @@ per-server wake object (`src/config.ts` validation, `src/wake.ts` `WakePolicy`),
 
 README notes `src/vendor/mcpl-core/` is vendored because npm `@animalabs/mcpl-core@0.2.2`
 was stale. npm now has 0.3.0 (checked 2026-09-16), which the reference servers depend on.
-Re-sync the vendored copy from `/Users/aster/projects/archipelago-design/mcpl-core-ts/src`
+Re-sync the vendored copy from `mcpl-core-ts/src`
 or switch to the package. Not required by the terminal work; it is where the
 `TreatmentRule` types for B3 come from, so do it first if B3 is taken.
 
@@ -153,12 +152,11 @@ or switch to the package. Not required by the terminal work; it is where the
 
 ## agent-framework
 
-Repo: `github.com/anima-research/agent-framework`, checkout
-`/Users/aster/projects/archipelago-design/agent-framework`.
+Repo: `github.com/anima-research/agent-framework`.
 
 ### A1 — `code_execution` hands scripts `structuredContent` when a tool provides it (S–M)
 
-**Implementation (2026-09-24).** Draft [agent-framework #181](https://github.com/anima-research/agent-framework/pull/181), commit `cccb0f2`, implements this against main `359cbc5`, independently of the earlier lifecycle PR #155. Both dispatch paths preserve the envelope; Python gets JSON, direct model calls retain readable content, and legacy results retain their existing serialization. The existing cap is 5,000,000 characters; structured overflow reports an explicit error rather than incomplete JSON. Full suite: 956 passed / 4 skipped / 0 failed (baseline 954 / 4 / 0). Both new tests fail on baseline. Real termd → framework → Python acceptance and the existing host lifecycle acceptance pass. No deployed host or live LLM was exercised. See the [local handoff](CONNECTOME-INTEGRATION.md) for activation, collaboration, and deferred work. The proposal below is retained as context for reviewing and continuing the implementation; any collaborator may do so.
+**Implementation (2026-09-24).** Draft [agent-framework #181](https://github.com/anima-research/agent-framework/pull/181), commit `cccb0f2`, implements this against main `359cbc5`, independently of the earlier lifecycle PR #155. Both dispatch paths preserve the envelope; Python gets JSON, direct model calls retain readable content, and legacy results retain their existing serialization. The existing cap is 5,000,000 characters; structured overflow reports an explicit error rather than incomplete JSON. Full suite: 956 passed / 4 skipped / 0 failed (baseline 954 / 4 / 0). Both new tests fail on baseline. Real termd → framework → Python acceptance and the existing host lifecycle acceptance pass. No deployed host or live LLM was exercised. The proposal below is retained as context for reviewing and continuing the implementation; any collaborator may do so.
 
 **Why.** Scripts receive "the same text the tool would have returned" and are told to
 `json.loads` it (`src/code-execution/tool-definition.ts:22-28`). MCP 2025-06-18 lets a tool

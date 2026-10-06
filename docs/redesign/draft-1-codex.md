@@ -1,6 +1,6 @@
 # Codex assessment and design sketch (draft 1)
 
-*Verbatim, as relayed by Aster on 2026-09-16, written independently of `draft-1-claude.md`. Kept for provenance; the integrated design is `DESIGN.md`.*
+*Verbatim, as relayed by Aster on 2026-09-16, written independently of `draft-1-claude.md`, except that links to files on the author's machine are given as repository paths. Kept for provenance; the integrated design is `DESIGN.md`.*
 
 ---
 
@@ -10,13 +10,13 @@ I would support a substantial rebuild. I'd make its organizing idea **a persiste
 
 I read the runtime, transports, MCP bridge, CLI, GUI, tests, and the sibling MCPL specification and core library. I also ran the existing tests and several isolated PTY experiments.
 
-The part I would preserve is the daemon/client separation. Keeping terminal ownership outside an individual agent connection is fundamentally sound, and your [deployment documentation](/Users/aster/projects/archipelago-design/connectome-host/docs/DEPLOYMENTS.md:38) already builds around that arrangement. Real PTYs, human access through xterm, interactive input, and named sessions are also good product decisions.
+The part I would preserve is the daemon/client separation. Keeping terminal ownership outside an individual agent connection is fundamentally sound, and your deployment documentation (`connectome-host/docs/DEPLOYMENTS.md`) already builds around that arrangement. Real PTYs, human access through xterm, interactive input, and named sessions are also good product decisions.
 
 The implementation is relatively small—about 4,500 lines including the GUI and tests—so a coherent replacement is realistic.
 
 **The deepest problem is that the code does not adequately distinguish a shell, a command, a service, and a request waiting for a result.**
 
-They largely collapse into one mutable session object. That object owns the PTY, output buffers, command queue, completion detection, service readiness, logging, screenshots, and some process shutdown behavior. The [937-line session implementation](/Users/aster/projects/terminal-sessions-mcp/src/server/session-server-v3.ts:118) is where most of the product's assumptions meet.
+They largely collapse into one mutable session object. That object owns the PTY, output buffers, command queue, completion detection, service readiness, logging, screenshots, and some process shutdown behavior. The 937-line session implementation (`src/server/session-server-v3.ts`) is where most of the product's assumptions meet.
 
 Three experiments made the consequences concrete:
 
@@ -26,11 +26,11 @@ Three experiments made the consequences concrete:
 | Launch `false` as a service | Reported `running`, because the enclosing shell remained alive. |
 | Print text resembling the completion marker | The printed marker determined the reported exit code before the command finished. |
 
-These follow directly from [queue advancement and timeout handling](/Users/aster/projects/terminal-sessions-mcp/src/server/session-server-v3.ts:366), [completion detection](/Users/aster/projects/terminal-sessions-mcp/src/server/session-server-v3.ts:434), and [service monitoring](/Users/aster/projects/terminal-sessions-mcp/src/server/session-server-v3.ts:559).
+These follow directly from queue advancement and timeout handling (`src/server/session-server-v3.ts`), completion detection (`src/server/session-server-v3.ts`), and service monitoring (`src/server/session-server-v3.ts`).
 
 That matters especially for capable agents. An agent can recover from an explicit "still running" or "execution state unknown." A confident but incorrect "finished successfully" can corrupt its entire subsequent plan.
 
-There is a similar ambiguity around observation. The project has raw chunks, reconstructed log lines, cleaned text, and browser terminal state, but no authoritative model tying them together. Reconnection replays modified lines; the GUI loads history and then subscribes, leaving a gap; screenshots launch a browser and click through the GUI. Opening that screenshot view also follows the GUI's normal path for resizing the live PTY. An observation can therefore change what it is observing. See the [screenshot implementation](/Users/aster/projects/terminal-sessions-mcp/src/server/session-server-v3.ts:793) and [GUI initialization](/Users/aster/projects/terminal-sessions-mcp/gui/public/app.js:155).
+There is a similar ambiguity around observation. The project has raw chunks, reconstructed log lines, cleaned text, and browser terminal state, but no authoritative model tying them together. Reconnection replays modified lines; the GUI loads history and then subscribes, leaving a gap; screenshots launch a browser and click through the GUI. Opening that screenshot view also follows the GUI's normal path for resizing the live PTY. An observation can therefore change what it is observing. See the screenshot implementation (`src/server/session-server-v3.ts`) and GUI initialization (`gui/public/app.js`).
 
 Around those central issues, I see ordinary signs of incremental growth: two WebSocket clients with different behavior, duplicated contracts, extensive `any` at boundaries, an MCP-specific wrapper carrying application logic, and documentation that has drifted from implementation. Those are repairable, but reorganizing files alone would leave the deeper problems intact.
 
@@ -102,7 +102,7 @@ These can be modules in one TypeScript project. The boundaries matter more than 
 
 For MCPL specifically, **the opportunity is to let agents stay aware of work without continually polling it.**
 
-I read the local [0.5 draft specification](/Users/aster/projects/archipelago-design/mcpl/SPEC.md:1), including the grants and event semantics. I would introduce MCPL alongside the new core, with a small initial surface:
+I read the local 0.5 draft specification (`mcpl/SPEC.md`), including the grants and event semantics. I would introduce MCPL alongside the new core, with a small initial surface:
 
 - **Tools:** start, inspect, await, cancel, attach, input, and retrieve evidence.
 - **Push events:** run completed, service became ready or unhealthy, session exited, or a subscribed condition occurred.
@@ -111,7 +111,7 @@ I read the local [0.5 draft specification](/Users/aster/projects/archipelago-des
 
 Raw terminal output should remain available through observation subscriptions. The MCPL adapter should coalesce it into meaningful events, and the host should decide which events warrant inference. Prompt/input detection should carry its evidence and uncertainty.
 
-I would reuse the sibling [MCPL core library](/Users/aster/projects/archipelago-design/mcpl-core-ts/README.md:13) for protocol machinery, capability matching, and manifest handling. Its grants govern interaction with the host; they do not replace terminal-side authorization. Likewise, a terminal history checkpoint must never imply that arbitrary shell side effects can be rolled back.
+I would reuse the sibling MCPL core library (`mcpl-core-ts/README.md`) for protocol machinery, capability matching, and manifest handling. Its grants govern interaction with the host; they do not replace terminal-side authorization. Likewise, a terminal history checkpoint must never imply that arbitrary shell side effects can be rolled back.
 
 For the rebuild, I would begin with **one complete vertical slice**: create a session, start a run, detach, reconnect, recover output, and observe the correct completion. Exercise timeout, cancellation, shell exit, interactive input, simultaneous clients, and output flooding against that slice. Then add service monitoring, screen snapshots, and MCPL events, keeping compatibility adapters for existing consumers during migration.
 
