@@ -40,6 +40,13 @@ interface SessionInfo {
   // after it wait in the tty as typeahead until the shell reads and sources
   // them.
   pendingFiles: Map<string, string>;
+  // Every command written to this shell: its nonce → its temp-file path as
+  // typed (and the set of those paths, for lookup). Exactly these wrapper
+  // echoes and resolved markers are exec plumbing; marker-shaped text
+  // carrying any other nonce is the command's own output and is never
+  // filtered. Bounded (see rememberIssued).
+  issued: Map<string, string>;
+  issuedPaths: Set<string>;
 }
 
 interface QueuedCommand {
@@ -186,7 +193,9 @@ export class PersistentSessionServer extends EventEmitter {
       isProcessingCommand: false,
       commandQueue: [],
       lineBuffer: '',
-      pendingFiles: new Map()
+      pendingFiles: new Map(),
+      issued: new Map(),
+      issuedPaths: new Set()
     };
 
     // Handle output
@@ -209,13 +218,13 @@ export class PersistentSessionServer extends EventEmitter {
       const segments = sessionInfo.lineBuffer.split(/\r?\n/);
       const completedLines: string[] = [];
       
-      // All but the last element are complete lines. Internal plumbing lines
-      // (the echoed `. '<tempfile>'; echo ...` wrapper and resolved markers)
-      // are kept out of the logs — the command itself is already logged as
-      // `$ <command>` when it is issued.
+      // All but the last element are complete lines. Exec plumbing (the
+      // echoed `. '<tempfile>'; echo ...` wrapper of an issued command, and
+      // issued commands' resolved markers) is kept out of the logs — the
+      // command itself is already logged as `$ <command>` when it is issued.
       for (let i = 0; i < segments.length - 1; i++) {
-        const line = segments[i];
-        if (line.length > 0 && !this.isInternalPlumbingLine(line)) {
+        const line = this.withoutPlumbing(sessionInfo, segments[i]);
+        if (line !== null) {
           this.addLog(sessionInfo, line);
           completedLines.push(line);
         }
@@ -247,10 +256,9 @@ export class PersistentSessionServer extends EventEmitter {
       sessionInfo.isAlive = false;
 
       // Flush any remaining buffered line
-      if (sessionInfo.lineBuffer.length > 0) {
-        this.addLog(sessionInfo, sessionInfo.lineBuffer);
-        sessionInfo.lineBuffer = '';
-      }
+      const lastLine = this.withoutPlumbing(sessionInfo, sessionInfo.lineBuffer);
+      if (lastLine !== null) this.addLog(sessionInfo, lastLine);
+      sessionInfo.lineBuffer = '';
 
       this.addLog(sessionInfo, `[Session terminated with code ${exitCode}]`);
 
@@ -427,22 +435,21 @@ export class PersistentSessionServer extends EventEmitter {
     // mangled the input — otherwise ANSI cleaning can hide a corrupt write.
     this.warnIfInputCorrupted(session);
 
-    // Clean output. The echoed wrapper line marks where the command's real
-    // output begins — everything before it is echo of the typed line plus
+    // Clean output. The echo of this command's own wrapper marks where its
+    // real output begins — everything before it is echo of the typed line plus
     // bleed-over from the previous prompt, so cut through it when present.
-    // Then strip wrapper fragments (matched separately since soft wraps can
-    // break the echoed line apart) and any resolved markers (any nonce —
-    // stale ones from a previously timed-out command must not leak either).
+    // Then remove the remaining plumbing of issued commands only: wrapper
+    // fragments (matched separately since soft wraps can break the echoed line
+    // apart) and resolved markers, including a timed-out predecessor's late
+    // marker. Only the spans go; text around them on the same line stays, and
+    // marker-shaped text with an unknown nonce is the command's own output.
     let output = session.outputBuffer;
-    const echoedWrapper = output.match(/echo "<<<EXI""T:[0-9a-z]+:\$\?>>>"\r?\n?/);
-    if (echoedWrapper && echoedWrapper.index !== undefined) {
-      output = output.slice(echoedWrapper.index + echoedWrapper[0].length);
+    const ownEcho = `echo "<<<EXI""T:${currentCommand.nonce}:$?${this.exitCodeEnd}"`;
+    const echoAt = output.indexOf(ownEcho);
+    if (echoAt !== -1) {
+      output = output.slice(echoAt + ownEcho.length).replace(/^\r?\n/, '');
     }
-    const cleanOutput = output
-      .replace(/\. '[^']*tsm-cmd[^']*';? ?/g, '')
-      .replace(/echo "<<<EXI""T:[0-9a-z]+:\$\?>>>"\r?\n?/g, '')
-      .replace(/<<<EXIT:[0-9a-z]+:\d+>>>\r?\n?/g, '')
-      .trim();
+    const cleanOutput = this.stripPlumbingSpans(session, output).trim();
 
     const duration = Date.now() - currentCommand.startTime;
 
@@ -497,14 +504,66 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * True for lines that are exec-plumbing rather than command output: the
-   * echoed wrapper command (possibly prefixed by a prompt) and resolved
-   * exit-code markers. These are filtered from logs/output events.
+   * A complete output line as logs and output events should show it, or null
+   * to leave it out. A line carrying the echo of an issued command's typed
+   * wrapper is plumbing and is left out whole (it is the prompt plus the line
+   * the server typed). Issued commands' resolved markers are removed as spans:
+   * output printed without a trailing newline shares its line with the marker
+   * and stays. Marker-shaped text with a nonce this session never issued is
+   * output and is untouched.
    */
-  private isInternalPlumbingLine(line: string): boolean {
-    return /\. '[^']*tsm-cmd[^']*'/.test(line) ||
-      /echo "<<<EXI""T:/.test(line) ||
-      this.resolvedMarkerRegex.test(line);
+  private withoutPlumbing(session: SessionInfo, line: string): string | null {
+    if (line.length === 0) return null;
+    if (this.hasIssuedWrapperEcho(session, line)) return null;
+    const kept = line.replace(/<<<EXIT:([0-9a-z]+):(\d+)>>>/g, (span, nonce: string) =>
+      session.issued.has(nonce) ? '' : span);
+    if (kept === line) return line;
+    return kept.trim().length > 0 ? kept : null;
+  }
+
+  private hasIssuedWrapperEcho(session: SessionInfo, text: string): boolean {
+    for (const m of text.matchAll(/\. '([^']*tsm-cmd[^']*)'/g)) {
+      if (session.issuedPaths.has(m[1])) return true;
+    }
+    for (const m of text.matchAll(/echo "<<<EXI""T:([0-9a-z]+):\$\?>>>"/g)) {
+      if (session.issued.has(m[1])) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Remove issued commands' plumbing spans from command output: wrapper
+   * fragments (soft wraps can split the echoed line, so the `. '<file>'` and
+   * `echo "..."` parts are matched separately) and resolved markers together
+   * with the newline echo ends them with. Text around a span stays.
+   */
+  private stripPlumbingSpans(session: SessionInfo, text: string): string {
+    return text
+      .replace(/\. '([^']*tsm-cmd[^']*)';? ?/g, (span, file: string) =>
+        session.issuedPaths.has(file) ? '' : span)
+      .replace(/echo "<<<EXI""T:([0-9a-z]+):\$\?>>>"(\r?\n)?/g, (span, nonce: string) =>
+        session.issued.has(nonce) ? '' : span)
+      .replace(/<<<EXIT:([0-9a-z]+):(\d+)>>>(\r?\n)?/g, (span, nonce: string) =>
+        session.issued.has(nonce) ? '' : span);
+  }
+
+  /**
+   * Record an issued command's nonce and typed path for plumbing filters.
+   * Bounded so a long-lived session cannot grow these without limit: the
+   * oldest settled commands are forgotten first. A command still pending is
+   * kept, since its echo and late marker must still be recognized.
+   */
+  private rememberIssued(session: SessionInfo, nonce: string, typedPath: string): void {
+    session.issued.set(nonce, typedPath);
+    session.issuedPaths.add(typedPath);
+    const limit = 1024;
+    if (session.issued.size <= limit) return;
+    for (const [old, oldPath] of session.issued) {
+      if (session.issued.size <= limit) break;
+      if (session.pendingFiles.has(old)) continue;
+      session.issued.delete(old);
+      session.issuedPaths.delete(oldPath);
+    }
   }
 
   /**
@@ -529,6 +588,7 @@ export class PersistentSessionServer extends EventEmitter {
     const shellPath = process.platform === 'win32'
       ? file.replace(/^([A-Za-z]):\\/, (_, drive) => `/mnt/${drive.toLowerCase()}/`).replace(/\\/g, '/')
       : file;
+    this.rememberIssued(session, nonce, shellPath);
     // `.` (POSIX source) keeps execution in the interactive shell so env/cwd
     // changes persist, and unlike `source` it also works in plain sh/dash.
     // Single-quote the path to be safe against unusual tmpdir characters.
@@ -703,8 +763,9 @@ export class PersistentSessionServer extends EventEmitter {
 
     // Include any incomplete line still in the buffer (like the initial prompt)
     let output = [...session.logs];
-    if (session.lineBuffer.length > 0) {
-      output.push(session.lineBuffer);
+    const partial = this.withoutPlumbing(session, session.lineBuffer);
+    if (partial !== null) {
+      output.push(partial);
     }
 
     if (lines) {

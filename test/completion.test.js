@@ -181,3 +181,52 @@ test('PTY exit releases the files of commands that can no longer run', async () 
   for (let i = 0; i < 50 && server.listSessions().find(s => s.id === 't-exit-files')?.isAlive; i++) await sleep(50);
   assert.deepStrictEqual(ourTempFiles().filter(f => !before.has(f)), []);
 });
+
+/** Complete output lines the server emitted for one session, as output events carry them. */
+function collectEventLines(sessionId) {
+  const lines = [];
+  server.on('session:output', (e) => { if (e.sessionId === sessionId) lines.push(...e.lines); });
+  return lines;
+}
+
+test('output without a trailing newline survives in the result, the logs and output events', async () => {
+  await server.createSession('t-nonl');
+  const events = collectEventLines('t-nonl');
+  const result = await server.execCommand('t-nonl', 'printf NO_NEWLINE', 8000);
+  assert.strictEqual(result.exitCode, 0);
+  assert.match(result.output, /NO_NEWLINE/);
+  // It shares its line with the real marker; only the marker span may go.
+  assert.ok(server.getOutput('t-nonl').some(l => l.includes('NO_NEWLINE')), 'logs keep the output');
+  assert.ok(events.some(l => l.includes('NO_NEWLINE')), 'output events keep the output');
+  assert.ok(![...server.getOutput('t-nonl'), ...events].some(l => /<<<EXIT:[0-9a-z]+:\d+>>>/.test(l)), 'the marker span is removed');
+});
+
+test('marker-shaped text with a nonce the server never issued is output, everywhere', async () => {
+  await server.createSession('t-literal');
+  const events = collectEventLines('t-literal');
+  const literal = 'prefix <<<EXIT:abc:0>>> suffix';
+  const result = await server.execCommand('t-literal', `printf '${literal}\\n'; false`, 8000);
+  assert.strictEqual(result.exitCode, 1);
+  assert.ok(result.output.includes(literal), `result keeps the literal: ${JSON.stringify(result.output)}`);
+  assert.ok(server.getOutput('t-literal').some(l => l.includes(literal)), 'logs keep the literal line');
+  assert.ok(events.some(l => l.includes(literal)), 'output events keep the literal line');
+});
+
+test("a timed-out predecessor's late marker is removed everywhere, and the text beside it stays", async () => {
+  await server.createSession('t-late');
+  const events = collectEventLines('t-late');
+  const timedOut = await server.execCommand('t-late', 'sleep 0.4; printf LATE_TAIL', 100);
+  assert.strictEqual(timedOut.exitCode, -1);
+  // The predecessor prints LATE_TAIL and then its own marker on the same line
+  // while this command waits behind it in the tty.
+  const next = await server.execCommand('t-late', 'echo NEXT_OUT', 8000);
+  assert.strictEqual(next.exitCode, 0);
+  assert.match(next.output, /NEXT_OUT/);
+  assert.ok(!/<<<EXIT:[0-9a-z]+:\d+>>>/.test(next.output), 'no issued marker in the result');
+  const logs = server.getOutput('t-late');
+  for (const [surface, lines] of [['logs', logs], ['events', events]]) {
+    assert.ok(lines.some(l => l.includes('LATE_TAIL')), `${surface} keep the text beside the late marker`);
+    assert.ok(!lines.some(l => /<<<EXIT:[0-9a-z]+:\d+>>>/.test(l)), `${surface} carry no issued marker`);
+    assert.ok(!lines.some(l => l.includes('tsm-cmd')), `${surface} carry no wrapper echo`);
+  }
+});
