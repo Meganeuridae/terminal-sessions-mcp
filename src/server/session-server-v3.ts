@@ -33,7 +33,13 @@ interface SessionInfo {
   currentCommand?: QueuedCommand;
   currentTimeout?: NodeJS.Timeout;
   lineBuffer: string; // Buffer for incomplete lines
-  tempFiles: string[]; // Temp files backing in-flight commands, cleaned up lazily
+  // Temp files of commands already written to the shell whose own completion
+  // marker has not been seen yet, by nonce. A file is deleted only when that
+  // marker arrives or the PTY exits. A caller timeout proves nothing about the
+  // file: the timed-out command may still be running, and commands written
+  // after it wait in the tty as typeahead until the shell reads and sources
+  // them.
+  pendingFiles: Map<string, string>;
 }
 
 interface QueuedCommand {
@@ -180,7 +186,7 @@ export class PersistentSessionServer extends EventEmitter {
       isProcessingCommand: false,
       commandQueue: [],
       lineBuffer: '',
-      tempFiles: []
+      pendingFiles: new Map()
     };
 
     // Handle output
@@ -255,6 +261,9 @@ export class PersistentSessionServer extends EventEmitter {
       if (sessionInfo.currentCommand) {
         this.resolveCommand(sessionInfo, exitCode ?? -1);
       }
+
+      // Nothing written to this shell can be sourced any more.
+      this.cleanupTempFiles(sessionInfo);
 
       this.notify('session:exit', {
         sessionId: sessionInfo.id,
@@ -353,10 +362,6 @@ export class PersistentSessionServer extends EventEmitter {
     const currentCommand = session.commandQueue.shift()!;
     session.currentCommand = currentCommand;
 
-    // Any temp files from previously-issued commands are safe to remove now:
-    // a new command means the shell has finished sourcing the prior one.
-    this.cleanupTempFiles(session);
-
     // Clear output buffer
     session.outputBuffer = '';
 
@@ -393,7 +398,7 @@ export class PersistentSessionServer extends EventEmitter {
     //   - The per-command nonce means stale markers from a timed-out earlier
     //     command can't resolve (and corrupt) a later one.
     session.shell.write(
-      this.writeCommandViaTempFile(session, currentCommand.command) +
+      this.writeCommandViaTempFile(session, currentCommand.nonce, currentCommand.command) +
       `; echo "<<<EXI""T:${currentCommand.nonce}:$?${this.exitCodeEnd}"\n`
     );
 
@@ -461,22 +466,30 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * Check if command execution is complete by scanning for the resolved
-   * exit-code marker belonging to the CURRENT command (matched by nonce, so
-   * stale markers from timed-out commands and marker-shaped output from other
-   * sources are ignored). Only the tail of the buffer around the newest chunk
-   * is scanned — the marker always arrives at the end of a command's output,
-   * and a full-buffer scan per chunk is O(n²) on chatty commands.
+   * Scan the newest output for resolved exit-code markers (matched by nonce,
+   * so marker-shaped output from other sources is ignored). A marker means
+   * the shell has finished sourcing that command's temp file, whether it is
+   * the CURRENT command (which then completes) or an earlier one that timed
+   * out and has finished since. Runs whether or not a command is current, so
+   * a timed-out command that ends while the session is idle still releases
+   * its file. Only the tail of the buffer around the newest chunk is scanned:
+   * a full-buffer scan per chunk is O(n²) on chatty commands.
    */
   private checkCommandCompletion(session: SessionInfo, latestChunk: string): void {
-    if (!session.currentCommand) return;
+    if (session.pendingFiles.size === 0 && !session.currentCommand) return;
 
     // Overlap covers a marker split across chunk boundaries (marker is <48 chars).
     const scanWindow = session.outputBuffer.slice(-(latestChunk.length + 64));
     const globalMarker = new RegExp(this.resolvedMarkerRegex.source, 'g');
     let match: RegExpExecArray | null;
     while ((match = globalMarker.exec(scanWindow)) !== null) {
-      if (match[1] === session.currentCommand.nonce) {
+      const nonce = match[1];
+      const file = session.pendingFiles.get(nonce);
+      if (file !== undefined) {
+        session.pendingFiles.delete(nonce);
+        this.removeTempFile(file);
+      }
+      if (session.currentCommand && nonce === session.currentCommand.nonce) {
         this.resolveCommand(session, parseInt(match[2], 10));
         return;
       }
@@ -497,9 +510,10 @@ export class PersistentSessionServer extends EventEmitter {
   /**
    * Persist a command body to a temp file and return the single-line shell
    * command that runs it in the current shell (preserving cwd/env).
-   * The file is tracked on the session and cleaned up lazily.
+   * The file is tracked on the session under the command's nonce until the
+   * shell reports that nonce's marker (or the PTY exits).
    */
-  private writeCommandViaTempFile(session: SessionInfo, command: string): string {
+  private writeCommandViaTempFile(session: SessionInfo, nonce: string, command: string): string {
     // Short name: the echoed wrapper line should fit the terminal width when
     // possible (soft-wrapped echoes are much harder to filter from output).
     const file = path.join(
@@ -508,7 +522,7 @@ export class PersistentSessionServer extends EventEmitter {
     );
     // Trailing newline so the final line is terminated even if the caller omitted it.
     fs.writeFileSync(file, command.endsWith('\n') ? command : command + '\n', { mode: 0o600 });
-    session.tempFiles.push(file);
+    session.pendingFiles.set(nonce, file);
     // On Windows the shell is WSL but the temp file lives on the host
     // filesystem — translate C:\Users\... to /mnt/c/Users/... so the shell
     // can actually source it.
@@ -522,19 +536,22 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * Remove temp files backing already-issued commands. Safe to call between
-   * commands: serialized execution guarantees the shell has finished sourcing.
+   * Remove every temp file still pending on the session. Only for when the
+   * shell can no longer source them: the PTY has exited or the session is
+   * being removed. A command whose marker never appears (an interrupted line,
+   * an `exit` inside a nested shell) keeps its file until then.
    */
   private cleanupTempFiles(session: SessionInfo): void {
-    if (session.tempFiles.length === 0) return;
-    for (const file of session.tempFiles) {
-      try {
-        fs.unlinkSync(file);
-      } catch {
-        // Best-effort: file may already be gone, or tmpdir cleaned by the OS.
-      }
+    for (const file of session.pendingFiles.values()) this.removeTempFile(file);
+    session.pendingFiles.clear();
+  }
+
+  private removeTempFile(file: string): void {
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // Best-effort: file may already be gone, or tmpdir cleaned by the OS.
     }
-    session.tempFiles = [];
   }
 
   /**

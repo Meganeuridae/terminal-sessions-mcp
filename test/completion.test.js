@@ -8,10 +8,17 @@
  */
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const { PersistentSessionServer } = require('../dist/src/server/session-server-v3.js');
 
 let server;
+
+/** Command temp files this process's server has on disk right now. */
+const ourTempFiles = () => fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(`tsm-cmd-${process.pid}-`));
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 before(() => {
   server = new PersistentSessionServer();
@@ -132,4 +139,45 @@ test('multi-line commands (heredocs) still work through the temp-file path', asy
   assert.strictEqual(result.exitCode, 0);
   assert.match(result.output, /line-one/);
   assert.match(result.output, /line-two/);
+});
+
+test('a command queued behind a timed-out one still runs: caller timeouts do not delete its file', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-queued-'));
+  await server.createSession('t-queued', { cwd: dir });
+  const first = await server.execCommand('t-queued', 'sleep 1', 100);
+  assert.strictEqual(first.exitCode, -1);
+  // Written into the tty while sleep still owns it: typeahead, not yet sourced.
+  const queued = await server.execCommand('t-queued', 'printf MUST_RUN > queued', 100);
+  assert.strictEqual(queued.exitCode, -1);
+  // Issuing a third command used to delete the second one's temp file before
+  // the shell got to source it.
+  const third = await server.execCommand('t-queued', 'printf after', 8000);
+  assert.strictEqual(third.exitCode, 0);
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'queued'), 'utf8'), 'MUST_RUN');
+});
+
+test('a temp file is released by its own marker, including one that arrives after a caller timeout', async () => {
+  await server.createSession('t-files');
+  const before = new Set(ourTempFiles());
+  const fresh = () => ourTempFiles().filter(f => !before.has(f));
+  const done = await server.execCommand('t-files', 'echo done', 8000);
+  assert.strictEqual(done.exitCode, 0);
+  assert.deepStrictEqual(fresh(), [], 'a completed command leaves no temp file behind');
+  const timedOut = await server.execCommand('t-files', 'sleep 0.6', 100);
+  assert.strictEqual(timedOut.exitCode, -1);
+  assert.strictEqual(fresh().length, 1, 'a timed-out command keeps its file while the shell may still source it');
+  // No command is current when sleep ends; its late marker still releases the file.
+  await sleep(1500);
+  assert.deepStrictEqual(fresh(), [], 'the late marker released the file');
+});
+
+test('PTY exit releases the files of commands that can no longer run', async () => {
+  await server.createSession('t-exit-files');
+  const before = new Set(ourTempFiles());
+  const timedOut = await server.execCommand('t-exit-files', 'sleep 5', 100);
+  assert.strictEqual(timedOut.exitCode, -1);
+  assert.strictEqual(ourTempFiles().filter(f => !before.has(f)).length, 1);
+  server.sendSignal('t-exit-files', 'SIGKILL');
+  for (let i = 0; i < 50 && server.listSessions().find(s => s.id === 't-exit-files')?.isAlive; i++) await sleep(50);
+  assert.deepStrictEqual(ourTempFiles().filter(f => !before.has(f)), []);
 });
