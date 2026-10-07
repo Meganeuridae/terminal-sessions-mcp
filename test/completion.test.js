@@ -230,3 +230,21 @@ test("a timed-out predecessor's late marker is removed everywhere, and the text 
     assert.ok(!lines.some(l => l.includes('tsm-cmd')), `${surface} carry no wrapper echo`);
   }
 });
+
+test("a timed-out command's partial tail survives the next wrapper's echo in logs and output events", async () => {
+  await server.createSession('t-tail');
+  const events = collectEventLines('t-tail');
+  let arrived = false;
+  server.on('session:output', (e) => { if (e.sessionId === 't-tail' && e.chunk.includes('AFTER_TIMEOUT')) arrived = true; });
+  const first = await server.execCommand('t-tail', 'sleep 0.2; printf AFTER_TIMEOUT; sleep 0.6', 50);
+  assert.strictEqual(first.exitCode, -1);
+  for (let i = 0; i < 200 && !arrived; i++) await sleep(10);
+  assert.ok(arrived, 'the timed-out command printed its tail');
+  // The tty echoes the next typed wrapper onto the tail's unterminated line.
+  const next = await server.execCommand('t-tail', 'echo NEXT', 8000);
+  assert.strictEqual(next.exitCode, 0);
+  for (const [surface, lines] of [['logs', server.getOutput('t-tail')], ['events', events]]) {
+    assert.ok(lines.some(l => l.includes('AFTER_TIMEOUT')), `${surface} keep the timed-out command's tail`);
+    assert.ok(!lines.some(l => l.includes('tsm-cmd') || l.includes('<<<EXI""T')), `${surface} carry no wrapper echo`);
+  }
+});

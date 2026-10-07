@@ -505,30 +505,20 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * A complete output line as logs and output events should show it, or null
-   * to leave it out. A line carrying the echo of an issued command's typed
-   * wrapper is plumbing and is left out whole (it is the prompt plus the line
-   * the server typed). Issued commands' resolved markers are removed as spans:
-   * output printed without a trailing newline shares its line with the marker
-   * and stays. Marker-shaped text with a nonce this session never issued is
-   * output and is untouched.
+   * to leave it out. Only issued commands' plumbing spans are removed: the
+   * echo of a typed wrapper and resolved markers. Everything else on the line
+   * stays, because a line can carry real output beside them — output printed
+   * without a trailing newline shares its line with the marker, and a
+   * timed-out command's partial output shares its line with the tty echo of
+   * the next typed wrapper; logs are the only way left to recover that tail.
+   * Marker-shaped text with a nonce this session never issued is output and is
+   * untouched. A line that held nothing but plumbing is left out.
    */
   private withoutPlumbing(session: SessionInfo, line: string): string | null {
     if (line.length === 0) return null;
-    if (this.hasIssuedWrapperEcho(session, line)) return null;
-    const kept = line.replace(/<<<EXIT:([0-9a-z]+):(\d+)>>>/g, (span, nonce: string) =>
-      session.issued.has(nonce) ? '' : span);
+    const kept = this.stripPlumbingSpans(session, line);
     if (kept === line) return line;
     return kept.trim().length > 0 ? kept : null;
-  }
-
-  private hasIssuedWrapperEcho(session: SessionInfo, text: string): boolean {
-    for (const m of text.matchAll(/\. '([^']*tsm-cmd[^']*)'/g)) {
-      if (session.issuedPaths.has(m[1])) return true;
-    }
-    for (const m of text.matchAll(/echo "<<<EXI""T:([0-9a-z]+):\$\?>>>"/g)) {
-      if (session.issued.has(m[1])) return true;
-    }
-    return false;
   }
 
   /**
