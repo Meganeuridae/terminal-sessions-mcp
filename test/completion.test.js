@@ -265,3 +265,30 @@ test("a result ends at its own marker and begins after the shell's own echo of i
   assert.strictEqual(cleanTerminalOutput(next.output).trim(), 'NEXT_OUT');
   assert.ok(server.getOutput('t-bounds').some(l => l.includes('LATE_TAIL')), 'the tail stays recoverable from the logs');
 });
+
+for (const [label, setup] of [['terminal echo off', 'stty -echo'], ['no line editor', 'set +o emacs; set +o vi']]) {
+  test(`result bounds come from execution markers, not echo (${label})`, async () => {
+    const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
+    const id = `t-bounds-${label.replace(/\W+/g, '-')}`;
+    await server.createSession(id);
+    await server.execCommand(id, setup, 8000);
+    const timedOut = await server.execCommand(id, 'sleep 0.3; printf LATE_TAIL', 50);
+    assert.strictEqual(timedOut.exitCode, -1);
+    const next = await server.execCommand(id, 'printf NEXT_OUT', 8000);
+    assert.strictEqual(next.exitCode, 0);
+    assert.strictEqual(cleanTerminalOutput(next.output).trim(), 'NEXT_OUT');
+    assert.ok(server.getOutput(id).some(l => l.includes('LATE_TAIL')), 'the tail stays recoverable from the logs');
+    assert.ok(!server.getOutput(id).some(l => /<<<(START|EXIT):/.test(l)), 'no issued marker in the logs');
+  });
+}
+
+test('a command that times out before it starts has no output of its own', async () => {
+  await server.createSession('t-unstarted');
+  await server.execCommand('t-unstarted', 'sleep 0.2; printf BUSY_TAIL; sleep 1', 50);
+  // Written while the predecessor owns the tty; the predecessor prints its
+  // tail after this command was written, and this one times out before the
+  // shell ever reads it.
+  const queued = await server.execCommand('t-unstarted', 'echo QUEUED_OUT', 600);
+  assert.strictEqual(queued.exitCode, -1);
+  assert.strictEqual(queued.output, '', 'nothing the predecessor printed is attributed to it');
+});

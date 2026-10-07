@@ -55,6 +55,8 @@ interface QueuedCommand {
   startTime: number;
   timeout: number;
   nonce: string;
+  // Set when the shell prints this command's start marker: execution began.
+  started?: boolean;
 }
 
 interface CommandResult {
@@ -134,9 +136,6 @@ export class PersistentSessionServer extends EventEmitter {
   private readonly defaultCommandTimeout = 30000; // 30 seconds default
   private readonly exitCodeMarker = '<<<EXIT:';
   private readonly exitCodeEnd = '>>>';
-  // Matches a RESOLVED marker (nonce + numeric exit code), never the echoed
-  // command text, which contains the literal `$?` instead of digits.
-  private readonly resolvedMarkerRegex = /<<<EXIT:([0-9a-z]+):(\d+)>>>/;
   private tempFileCounter = 0;
 
   /**
@@ -382,8 +381,15 @@ export class PersistentSessionServer extends EventEmitter {
       startedAt: new Date(currentCommand.startTime)
     });
 
-    // Write the command and its exit-code marker as ONE line:
-    //   . '<tempfile>'; echo "<<<EXIT:<nonce>:$?>>>"
+    // Write the command and its start and exit-code markers as ONE line:
+    //   echo "<<<START:<nonce>>>>"; . '<tempfile>'; echo "<<<EXIT:<nonce>:$?>>>"
+    //
+    // The two markers bound the command's own output by execution evidence:
+    // the shell prints the start marker immediately before sourcing the file
+    // and the exit marker immediately after. Terminal echo of the typed line
+    // can't bound it — echo can be off (`stty -echo`), and a timed-out
+    // predecessor's late output arrives between the typed line's echo and the
+    // moment the shell actually reads it.
     //
     // Every command body goes through a temp file (not just multi-line ones —
     // see issue #3 for the readline paste-corruption rationale; single-line
@@ -406,6 +412,7 @@ export class PersistentSessionServer extends EventEmitter {
     //   - The per-command nonce means stale markers from a timed-out earlier
     //     command can't resolve (and corrupt) a later one.
     session.shell.write(
+      `echo "<<<STAR""T:${currentCommand.nonce}${this.exitCodeEnd}"; ` +
       this.writeCommandViaTempFile(session, currentCommand.nonce, currentCommand.command) +
       `; echo "<<<EXI""T:${currentCommand.nonce}:$?${this.exitCodeEnd}"\n`
     );
@@ -435,27 +442,30 @@ export class PersistentSessionServer extends EventEmitter {
     // mangled the input — otherwise ANSI cleaning can hide a corrupt write.
     this.warnIfInputCorrupted(session);
 
-    // Clean output. This command's own plumbing bounds its result:
-    // - It begins after the LAST echo of its own wrapper. That echo is the
-    //   shell's own, just before it sources the file; anything earlier is the
-    //   typed line's echo, the previous prompt, or the late output of a
-    //   timed-out predecessor still running when this command was written
-    //   (which stays in the logs, where its caller can recover it).
-    // - It ends at its own resolved marker. What follows is the shell's next
+    // Clean output. The command's own markers bound its result, by execution
+    // evidence rather than terminal echo:
+    // - It begins after its own start marker. Earlier text is the typed line's
+    //   echo, the previous prompt, or the late output of a timed-out
+    //   predecessor still running when this command was written (which stays
+    //   in the logs, where its caller can recover it). A command whose start
+    //   marker never appeared had not begun executing, so it has no output.
+    // - It ends at its own exit marker. What follows is the shell's next
     //   prompt, not this command's output; a result is consumed as data.
-    // Inside those bounds only issued commands' plumbing spans are removed —
-    // wrapper fragments (soft wraps can split an echo) and resolved markers;
+    // Inside those bounds only issued commands' plumbing spans are removed;
     // text beside them stays, and marker-shaped text with an unknown nonce is
     // the command's own output.
-    let output = session.outputBuffer;
-    const ownEcho = `echo "<<<EXI""T:${currentCommand.nonce}:$?${this.exitCodeEnd}"`;
-    const echoAt = output.lastIndexOf(ownEcho);
-    if (echoAt !== -1) {
-      output = output.slice(echoAt + ownEcho.length).replace(/^\r?\n/, '');
-    }
-    const ownMarkerAt = output.search(new RegExp(`<<<EXIT:${currentCommand.nonce}:\\d+>>>`));
-    if (ownMarkerAt !== -1) {
-      output = output.slice(0, ownMarkerAt);
+    let output = '';
+    if (currentCommand.started) {
+      output = session.outputBuffer;
+      // Only a buffer trimmed past its start (>100MB of output) lacks it.
+      const start = output.match(new RegExp(`<<<START:${currentCommand.nonce}>>>(\\r?\\n)?`));
+      if (start && start.index !== undefined) {
+        output = output.slice(start.index + start[0].length);
+      }
+      const ownExitAt = output.search(new RegExp(`<<<EXIT:${currentCommand.nonce}:\\d+>>>`));
+      if (ownExitAt !== -1) {
+        output = output.slice(0, ownExitAt);
+      }
     }
     const cleanOutput = this.stripPlumbingSpans(session, output).trim();
 
@@ -495,17 +505,24 @@ export class PersistentSessionServer extends EventEmitter {
 
     // Overlap covers a marker split across chunk boundaries (marker is <48 chars).
     const scanWindow = session.outputBuffer.slice(-(latestChunk.length + 64));
-    const globalMarker = new RegExp(this.resolvedMarkerRegex.source, 'g');
+    const markers = /<<<(?:START:([0-9a-z]+)|EXIT:([0-9a-z]+):(\d+))>>>/g;
     let match: RegExpExecArray | null;
-    while ((match = globalMarker.exec(scanWindow)) !== null) {
-      const nonce = match[1];
+    while ((match = markers.exec(scanWindow)) !== null) {
+      const current = session.currentCommand;
+      if (match[1] !== undefined) {
+        // A start marker: the shell is about to source that command's file.
+        if (current && match[1] === current.nonce) current.started = true;
+        continue;
+      }
+      const nonce = match[2];
       const file = session.pendingFiles.get(nonce);
       if (file !== undefined) {
         session.pendingFiles.delete(nonce);
         this.removeTempFile(file);
       }
-      if (session.currentCommand && nonce === session.currentCommand.nonce) {
-        this.resolveCommand(session, parseInt(match[2], 10));
+      if (current && nonce === current.nonce) {
+        current.started = true; // an exit marker implies the start, even if a trimmed buffer lost it
+        this.resolveCommand(session, parseInt(match[3], 10));
         return;
       }
     }
@@ -514,7 +531,7 @@ export class PersistentSessionServer extends EventEmitter {
   /**
    * A complete output line as logs and output events should show it, or null
    * to leave it out. Only issued commands' plumbing spans are removed: the
-   * echo of a typed wrapper and resolved markers. Everything else on the line
+   * echo of a typed wrapper and start/exit markers. Everything else on the line
    * stays, because a line can carry real output beside them — output printed
    * without a trailing newline shares its line with the marker, and a
    * timed-out command's partial output shares its line with the tty echo of
@@ -531,18 +548,22 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * Remove issued commands' plumbing spans from command output: wrapper
-   * fragments (soft wraps can split the echoed line, so the `. '<file>'` and
-   * `echo "..."` parts are matched separately) and resolved markers together
-   * with the newline echo ends them with. Text around a span stays.
+   * fragments (soft wraps can split the echoed line, so its start-echo,
+   * `. '<file>'` and exit-echo parts are matched separately) and printed
+   * start/exit markers together with the newline echo ends them with. Text
+   * around a span stays. The echoed wrapper never contains a contiguous
+   * marker (the marker strings are split in it), so the two cannot be
+   * confused.
    */
   private stripPlumbingSpans(session: SessionInfo, text: string): string {
+    const issued = (span: string, nonce: string) => (session.issued.has(nonce) ? '' : span);
     return text
+      .replace(/echo "<<<STAR""T:([0-9a-z]+)>>>";? ?/g, issued)
       .replace(/\. '([^']*tsm-cmd[^']*)';? ?/g, (span, file: string) =>
         session.issuedPaths.has(file) ? '' : span)
-      .replace(/echo "<<<EXI""T:([0-9a-z]+):\$\?>>>"(\r?\n)?/g, (span, nonce: string) =>
-        session.issued.has(nonce) ? '' : span)
-      .replace(/<<<EXIT:([0-9a-z]+):(\d+)>>>(\r?\n)?/g, (span, nonce: string) =>
-        session.issued.has(nonce) ? '' : span);
+      .replace(/echo "<<<EXI""T:([0-9a-z]+):\$\?>>>"(\r?\n)?/g, issued)
+      .replace(/<<<START:([0-9a-z]+)>>>(\r?\n)?/g, issued)
+      .replace(/<<<EXIT:([0-9a-z]+):(\d+)>>>(\r?\n)?/g, issued);
   }
 
   /**
