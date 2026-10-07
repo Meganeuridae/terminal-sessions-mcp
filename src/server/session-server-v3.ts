@@ -447,8 +447,10 @@ export class PersistentSessionServer extends EventEmitter {
     // - It begins after its own start marker. Earlier text is the typed line's
     //   echo, the previous prompt, or the late output of a timed-out
     //   predecessor still running when this command was written (which stays
-    //   in the logs, where its caller can recover it). A command whose start
-    //   marker never appeared had not begun executing, so it has no output.
+    //   in the logs, where its caller can recover it). If no start marker was
+    //   observed before the wait ended, the result has no output of its own;
+    //   the command may still begin later, and what it prints then reaches the
+    //   logs and output events.
     // - It ends at its own exit marker. What follows is the shell's next
     //   prompt, not this command's output; a result is consumed as data.
     // Inside those bounds only issued commands' plumbing spans are removed;
