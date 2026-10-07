@@ -248,3 +248,20 @@ test("a timed-out command's partial tail survives the next wrapper's echo in log
     assert.ok(!lines.some(l => l.includes('tsm-cmd') || l.includes('<<<EXI""T')), `${surface} carry no wrapper echo`);
   }
 });
+
+test("a result ends at its own marker and begins after the shell's own echo of its wrapper", async () => {
+  const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
+  await server.createSession('t-bounds');
+  // What follows the marker is the shell's next prompt, not the command's output.
+  const number = await server.execCommand('t-bounds', 'printf 42', 8000);
+  assert.strictEqual(number.exitCode, 0);
+  assert.strictEqual(cleanTerminalOutput(number.output).trim(), '42');
+  // A timed-out predecessor's late tail belongs to the predecessor (and stays
+  // in the logs), not to the command written while it was still running.
+  const timedOut = await server.execCommand('t-bounds', 'sleep 0.3; printf LATE_TAIL', 100);
+  assert.strictEqual(timedOut.exitCode, -1);
+  const next = await server.execCommand('t-bounds', 'echo NEXT_OUT', 8000);
+  assert.strictEqual(next.exitCode, 0);
+  assert.strictEqual(cleanTerminalOutput(next.output).trim(), 'NEXT_OUT');
+  assert.ok(server.getOutput('t-bounds').some(l => l.includes('LATE_TAIL')), 'the tail stays recoverable from the logs');
+});

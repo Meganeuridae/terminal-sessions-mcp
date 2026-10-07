@@ -435,19 +435,27 @@ export class PersistentSessionServer extends EventEmitter {
     // mangled the input — otherwise ANSI cleaning can hide a corrupt write.
     this.warnIfInputCorrupted(session);
 
-    // Clean output. The echo of this command's own wrapper marks where its
-    // real output begins — everything before it is echo of the typed line plus
-    // bleed-over from the previous prompt, so cut through it when present.
-    // Then remove the remaining plumbing of issued commands only: wrapper
-    // fragments (matched separately since soft wraps can break the echoed line
-    // apart) and resolved markers, including a timed-out predecessor's late
-    // marker. Only the spans go; text around them on the same line stays, and
-    // marker-shaped text with an unknown nonce is the command's own output.
+    // Clean output. This command's own plumbing bounds its result:
+    // - It begins after the LAST echo of its own wrapper. That echo is the
+    //   shell's own, just before it sources the file; anything earlier is the
+    //   typed line's echo, the previous prompt, or the late output of a
+    //   timed-out predecessor still running when this command was written
+    //   (which stays in the logs, where its caller can recover it).
+    // - It ends at its own resolved marker. What follows is the shell's next
+    //   prompt, not this command's output; a result is consumed as data.
+    // Inside those bounds only issued commands' plumbing spans are removed —
+    // wrapper fragments (soft wraps can split an echo) and resolved markers;
+    // text beside them stays, and marker-shaped text with an unknown nonce is
+    // the command's own output.
     let output = session.outputBuffer;
     const ownEcho = `echo "<<<EXI""T:${currentCommand.nonce}:$?${this.exitCodeEnd}"`;
-    const echoAt = output.indexOf(ownEcho);
+    const echoAt = output.lastIndexOf(ownEcho);
     if (echoAt !== -1) {
       output = output.slice(echoAt + ownEcho.length).replace(/^\r?\n/, '');
+    }
+    const ownMarkerAt = output.search(new RegExp(`<<<EXIT:${currentCommand.nonce}:\\d+>>>`));
+    if (ownMarkerAt !== -1) {
+      output = output.slice(0, ownMarkerAt);
     }
     const cleanOutput = this.stripPlumbingSpans(session, output).trim();
 
