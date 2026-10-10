@@ -31,7 +31,20 @@
   the temp-file path to `/mnt/<drive>/...` form so sourcing works under WSL
   on Windows.
 - Exec plumbing (wrapper echoes, markers) is filtered out of session logs,
-  so `tailLogs` shows `$ command` + output without internal noise.
+  so `tailLogs` shows `$ command` + output without internal noise. Only this
+  session's own plumbing is removed, and only its spans: output sharing a line
+  with it (text without a trailing newline, a timed-out command's late tail)
+  stays, marker-shaped text from anywhere else is output, and a wrapper echo
+  soft-wrapped at the terminal's edge (bash 3.2 on macOS) is still recognized.
+- **A result is bounded by its own command's execution.** The shell prints a
+  start marker immediately before sourcing the command and the exit marker
+  immediately after, so a result no longer picks up the next prompt or the
+  late output of a timed-out predecessor; a command that never started
+  returns no output of its own (it may still run later; its output then
+  reaches the logs).
+- **A command queued behind a timed-out one still runs.** Each command's temp
+  file is kept until its own exit marker arrives or the shell exits, instead
+  of being deleted when the next command starts.
 
 ### Changed
 
