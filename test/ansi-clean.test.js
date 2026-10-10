@@ -23,6 +23,16 @@ test('strips private-mode and OSC sequences', () => {
   assert.strictEqual(stripAnsi('\x1b]0;window title\x07abc'), 'abc');
 });
 
+test('strips two-character and charset escapes without leaving their final byte', () => {
+  assert.strictEqual(stripAnsi('42\x1b>'), '42', 'keypad numeric mode (ESC >), printed by less on exit');
+  assert.strictEqual(stripAnsi('\x1b=abc'), 'abc', 'keypad application mode (ESC =)');
+  assert.strictEqual(stripAnsi('\x1b7abc\x1b8'), 'abc', 'save/restore cursor (ESC 7 / ESC 8)');
+  assert.strictEqual(stripAnsi('\x1bMabc'), 'abc', 'reverse index (ESC M)');
+  assert.strictEqual(stripAnsi('\x1b(Babc\x1b)0'), 'abc', 'charset selection (ESC ( B, ESC ) 0)');
+  assert.strictEqual(stripAnsi('\x1bOAabc'), 'abc', 'SS3 cursor key (ESC O A)');
+  assert.strictEqual(stripAnsi('a > b'), 'a > b', 'a plain > is output');
+});
+
 test('carriage-return overwrite keeps final state', () => {
   assert.strictEqual(
     cleanTerminalOutput('Downloading 10%\rDownloading 50%\rDownloading 100%'),

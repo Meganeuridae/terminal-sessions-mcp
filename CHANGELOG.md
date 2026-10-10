@@ -21,6 +21,8 @@
 - **ANSI cleaning covers the full CSI grammar** - sequences with non-letter
   final bytes (e.g. insert-character `ESC[1@`, cursor-style `ESC[2 q`) used
   to leave residue like `[1@` in cleaned output.
+  Two-character escapes are stripped whole too: `ESC >`, which `less` prints
+  when it exits, used to leave a stray `>` at the end of a result.
 - `listSessions` (MCP) returned `pid`/`startTime` fields that never existed
   server-side (always undefined); it now returns the real fields
   (`isAlive`, `createdAt`, `lastActivity`, `logSize`).

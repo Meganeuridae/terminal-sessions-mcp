@@ -18,9 +18,13 @@ const ANSI_PATTERNS = {
   // Used for window titles, hyperlinks, etc.
   osc: /\x1b\].*?(?:\x07|\x1b\\)/g,
   
-  // Single-character escape sequences (ESC + one char)
-  // e.g., ESC ( for character set selection
-  singleChar: /\x1b[()][AB0-9]/g,
+  // The remaining escape sequences (ECMA-48), stripped after CSI/OSC/DCS so
+  // those keep their own patterns: SS3 (ESC O + one char), nF (ESC, one or
+  // more intermediate bytes 0x20-0x2F, a final byte, e.g. ESC ( B charset
+  // selection), and two-character Fp/Fe/Fs sequences (ESC + 0x30-0x7E, e.g.
+  // ESC > / ESC = keypad mode that less prints on exit, ESC 7 / ESC 8, ESC M).
+  // Matching only ESC ( / ESC ) used to leave the final byte, like a stray ">".
+  singleChar: /\x1bO[@-~]|\x1b[ -/]+[0-~]|\x1b[0-~]/g,
   
   // DCS (Device Control String) and other sequences
   dcs: /\x1b[PX^_].*?(?:\x1b\\|\x07)/g,
