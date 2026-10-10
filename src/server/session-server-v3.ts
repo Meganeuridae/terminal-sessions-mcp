@@ -129,6 +129,30 @@ type SessionEventMap = {
   };
 };
 
+/**
+ * The shell's echo of a typed wrapper can be soft-wrapped anywhere, not only
+ * between its parts: where the echoed line reaches the terminal's right edge,
+ * readline writes a wrap artifact (bash 3.2 on macOS: a space and a carriage
+ * return; other versions may move the cursor with an escape sequence). The
+ * wrapper-echo patterns therefore allow such an artifact between any two
+ * characters. Printed markers are program output, which the terminal wraps
+ * without inserting anything, so they need no such tolerance.
+ */
+const WRAP_ONE = ' ?\\r|\\x1b\\[[0-9;]*[A-Za-z]';
+const WRAP = `(?:${WRAP_ONE})*`;
+const wrapTolerant = (literal: string) =>
+  [...literal].map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join(WRAP);
+const NONCE = `((?:[0-9a-z]|${WRAP_ONE})+)`;
+const START_ECHO = new RegExp(
+  wrapTolerant('echo "<<<STAR""T:') + NONCE + wrapTolerant('>>>"') + `(?:${WRAP};)?(?:${WRAP} )?`, 'g');
+const SOURCE_ECHO = new RegExp(
+  wrapTolerant(". '") + "([^']*)'" + `(?:${WRAP};)?(?:${WRAP} )?`, 'g');
+const EXIT_ECHO = new RegExp(
+  wrapTolerant('echo "<<<EXI""T:') + NONCE + wrapTolerant(':$?>>>"') + '(\\r?\\n)?', 'g');
+const WRAP_ARTIFACT = new RegExp(WRAP_ONE, 'g');
+/** A captured nonce or path with any wrap artifacts removed. */
+const unwrap = (captured: string) => captured.replace(WRAP_ARTIFACT, '');
+
 export class PersistentSessionServer extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
   private readonly maxLogSize = 10000; // lines per session
@@ -558,12 +582,12 @@ export class PersistentSessionServer extends EventEmitter {
    * confused.
    */
   private stripPlumbingSpans(session: SessionInfo, text: string): string {
-    const issued = (span: string, nonce: string) => (session.issued.has(nonce) ? '' : span);
+    const issued = (span: string, nonce: string) => (session.issued.has(unwrap(nonce)) ? '' : span);
     return text
-      .replace(/echo "<<<STAR""T:([0-9a-z]+)>>>";? ?/g, issued)
-      .replace(/\. '([^']*tsm-cmd[^']*)';? ?/g, (span, file: string) =>
-        session.issuedPaths.has(file) ? '' : span)
-      .replace(/echo "<<<EXI""T:([0-9a-z]+):\$\?>>>"(\r?\n)?/g, issued)
+      .replace(START_ECHO, issued)
+      .replace(SOURCE_ECHO, (span, file: string) =>
+        session.issuedPaths.has(unwrap(file)) ? '' : span)
+      .replace(EXIT_ECHO, issued)
       .replace(/<<<START:([0-9a-z]+)>>>(\r?\n)?/g, issued)
       .replace(/<<<EXIT:([0-9a-z]+):(\d+)>>>(\r?\n)?/g, issued);
   }

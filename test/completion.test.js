@@ -249,6 +249,22 @@ test("a timed-out command's partial tail survives the next wrapper's echo in log
   }
 });
 
+test('a wrapper echo soft-wrapped mid-part leaves no plumbing in logs or output events', async () => {
+  // A narrow terminal makes the shell's echo of the typed wrapper wrap inside
+  // its parts (on macOS a long temp directory does this even at 120 columns).
+  await server.createSession('t-wrap');
+  server.resizeSession('t-wrap', 30, 30);
+  const events = collectEventLines('t-wrap');
+  const result = await server.execCommand('t-wrap', 'echo WRAPPED', 8000);
+  assert.strictEqual(result.exitCode, 0);
+  for (const [surface, lines] of [['logs', server.getOutput('t-wrap')], ['events', events]]) {
+    assert.ok(lines.some(l => l.includes('WRAPPED')), `${surface} keep the output`);
+    for (const fragment of ['<<', '""', 'tsm-', ". '"]) {
+      assert.ok(!lines.some(l => l.includes(fragment)), `${surface} carry no wrapper fragment ${JSON.stringify(fragment)}: ${JSON.stringify(lines)}`);
+    }
+  }
+});
+
 test("a result ends at its own marker and begins after the shell's own echo of its wrapper", async () => {
   const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
   await server.createSession('t-bounds');
