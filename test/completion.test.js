@@ -288,22 +288,28 @@ test("a later command's start releases the files of lines the shell read past wi
   const timedOut = await server.execCommand('t-interrupt', 'echo SLEEP_STARTED; sleep 30', 200);
   assert.strictEqual(timedOut.exitCode, -1);
   await sleeping;
+  assert.strictEqual(fresh().length, 1);
+  const [sleepFile] = fresh();
   // Two more commands are typed in behind the running sleep and time out unread.
   for (const word of ['ONE', 'TWO']) {
     assert.strictEqual((await server.execCommand('t-interrupt', `printf FLUSHED_%s ${word}`, 100)).exitCode, -1);
   }
   assert.strictEqual(fresh().length, 3);
-  // Ctrl-C ends sleep, bash drops the rest of its line (no exit marker), and
-  // the tty, flushing its input on the interrupt, discards the two lines typed
-  // in behind it.
+  const flushedFiles = fresh().filter(f => f !== sleepFile);
+  // Ctrl-C ends sleep, and the tty, flushing its input on the interrupt,
+  // discards the two lines typed in behind it. bash 4 and later then drop the
+  // rest of the sleep's line, so its exit marker never prints; bash 3.2
+  // (macOS's /bin/bash) runs it, printing the marker with status 130, which
+  // releases the sleep's own file.
   const prompt = waitForOutput('t-interrupt', 'T_INTERRUPT_READY> ');
   server.sendSignal('t-interrupt', 'SIGINT');
   await prompt;
-  assert.strictEqual(fresh().length, 3, 'nothing has released their files yet');
+  assert.deepStrictEqual(fresh().filter(f => f !== sleepFile).sort(), flushedFiles.sort(),
+    "nothing has released the discarded lines' files yet");
   const next = await server.execCommand('t-interrupt', 'printf NEXT_OK', 8000);
   assert.strictEqual(next.exitCode, 0);
   assert.strictEqual(cleanTerminalOutput(next.output).trim(), 'NEXT_OK');
-  assert.deepStrictEqual(fresh(), [], "the next command's start released all three, and its own exit marker its own file");
+  assert.deepStrictEqual(fresh(), [], "the next command's start released the earlier files, and its own exit marker its own file");
   assert.ok(!server.getOutput('t-interrupt').some(l => /FLUSHED_(ONE|TWO)/.test(l)), 'the discarded lines never ran');
 });
 
