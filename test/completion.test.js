@@ -291,6 +291,9 @@ test('output without a trailing newline survives in the result, the logs and out
   assert.match(result.output, /NO_NEWLINE/);
   // It shares its line with the real marker; only the marker span may go.
   assert.ok(server.getOutput('t-nonl').some(l => l.includes('NO_NEWLINE')), 'logs keep the output');
+  // Output events carry complete lines, and the command resolves at its exit
+  // marker, which can arrive in a chunk before the newline ending its line.
+  for (let i = 0; i < 100 && !events.some(l => l.includes('NO_NEWLINE')); i++) await sleep(20);
   assert.ok(events.some(l => l.includes('NO_NEWLINE')), 'output events keep the output');
   assert.ok(![...server.getOutput('t-nonl'), ...events].some(l => /<<<EXIT:[0-9a-z]+:\d+>>>/.test(l)), 'the marker span is removed');
 });
