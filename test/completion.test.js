@@ -278,7 +278,10 @@ function waitForOutput(sessionId, needle, ms = 5000) {
 test("a later command's start releases the files of lines the shell read past without finishing", async () => {
   const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
   await server.createSession('t-interrupt');
-  await server.execCommand('t-interrupt', "PS1='T_INTERRUPT_READY> '", 8000);
+  // `-noflsh` is the terminal's default, set here because the discard below
+  // rests on it: with `noflsh` the lines typed in behind the sleep are kept,
+  // and can still run after it.
+  await server.execCommand('t-interrupt', "PS1='T_INTERRUPT_READY> '; stty -noflsh", 8000);
   const before = new Set(ourTempFiles());
   const fresh = () => ourTempFiles().filter(f => !before.has(f));
   const sleeping = waitForOutput('t-interrupt', 'SLEEP_STARTED');
@@ -291,7 +294,8 @@ test("a later command's start releases the files of lines the shell read past wi
   }
   assert.strictEqual(fresh().length, 3);
   // Ctrl-C ends sleep, bash drops the rest of its line (no exit marker), and
-  // the tty discards the two lines typed in behind it.
+  // the tty, flushing its input on the interrupt, discards the two lines typed
+  // in behind it.
   const prompt = waitForOutput('t-interrupt', 'T_INTERRUPT_READY> ');
   server.sendSignal('t-interrupt', 'SIGINT');
   await prompt;

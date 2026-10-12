@@ -62,8 +62,11 @@
   and the server removes the files still pending when its process exits
   normally (through `process.exit`, as the daemon's SIGINT and SIGTERM
   shutdown does). A predecessor that reads stdin can take the queued line as
-  its input, and interrupting it with Ctrl-C (`sendSignal` SIGINT) discards
-  the lines typed in behind it; either way those commands never run.
+  its input, and then that command never runs. Interrupting the predecessor
+  with Ctrl-C (`sendSignal` SIGINT) discards the lines typed in behind it
+  under the terminal's default settings, so those never run either; in a
+  session that has set `stty noflsh`, they are kept and can still run after
+  it.
 
 ### Changed
 
@@ -73,9 +76,10 @@
   commands sent meanwhile are typed in behind it: they run when it ends, or
   become its input if it reads any. Check on it with `tailLogs`, answer it
   with `sendInput`, or interrupt it with `sendSignal` (SIGINT, the default,
-  sent as Ctrl-C, which also discards the commands typed in behind it; other
-  signals go to the session's shell itself). The `runCommand` tool's
-  `timeout` parameter documents this.
+  sent as Ctrl-C, which under the terminal's default settings also discards
+  the commands typed in behind it, and with `stty noflsh` keeps them, so they
+  can still run after it; other signals go to the session's shell itself).
+  The `runCommand` tool's `timeout` parameter documents this.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
 - Shell history records each command's wrapper line (its temp file sourced
