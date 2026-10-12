@@ -94,9 +94,12 @@ test('a stdin-reading command times out without the marker being fed to it', asy
   // Nothing was typed into `read` behind the caller's back: it is still
   // waiting, and the session can be unblocked explicitly.
   server.sendInput('t-read', '', true); // plain Enter -> read returns
-  const follow = await server.execCommand('t-read', 'echo unblocked', 8000);
+  // Before #7 the marker line typed 50ms after the command landed in `x`.
+  // Its length is printed rather than its text, which the old output
+  // filter would have stripped from the result.
+  const follow = await server.execCommand('t-read', 'printf "read got %s characters\\n" "${#x}"', 8000);
   assert.strictEqual(follow.exitCode, 0);
-  assert.match(follow.output, /unblocked/);
+  assert.match(follow.output, /read got 0 characters/, `read received only the Enter: ${JSON.stringify(follow.output)}`);
 });
 
 test('marker-shaped text in command/output cannot cause premature completion', async () => {
@@ -115,10 +118,11 @@ test('marker-shaped text in command/output cannot cause premature completion', a
 
 test('a timed-out command does not corrupt the next command (stale-marker cascade)', async () => {
   await server.createSession('t-cascade');
-  const timedOut = await server.execCommand('t-cascade', 'sleep 1', 300);
+  const timedOut = await server.execCommand('t-cascade', 'sh -c "sleep 1; exit 3"', 300);
   assert.strictEqual(timedOut.exitCode, -1);
-  // sleep is still running; the next command queues behind it in the tty and
-  // must resolve with ITS OWN result, not sleep's stale marker.
+  // The predecessor is still running; the next command queues behind it in
+  // the tty and must resolve with ITS OWN result (0), not the predecessor's
+  // stale marker (3).
   const next = await server.execCommand('t-cascade', 'echo after-cascade', 8000);
   assert.strictEqual(next.exitCode, 0);
   assert.match(next.output, /after-cascade/);
@@ -180,7 +184,7 @@ test('a temp file is released by its own marker, including one that arrives afte
   assert.strictEqual(timedOut.exitCode, -1);
   assert.strictEqual(fresh().length, 1, 'a timed-out command keeps its file while the shell may still source it');
   // No command is current when sleep ends; its late marker still releases the file.
-  await sleep(1500);
+  for (let i = 0; i < 100 && fresh().length > 0; i++) await sleep(50);
   assert.deepStrictEqual(fresh(), [], 'the late marker released the file');
 });
 
@@ -394,11 +398,34 @@ for (const [label, setup] of [['terminal echo off', 'stty -echo'], ['no line edi
 
 test('a command that times out before it starts has no output of its own', async () => {
   await server.createSession('t-unstarted');
-  await server.execCommand('t-unstarted', 'sleep 0.2; printf BUSY_TAIL; sleep 1', 50);
+  await server.execCommand('t-unstarted', 'sleep 0.2; printf BUSY_%s TAIL; sleep 1', 50);
   // Written while the predecessor owns the tty; the predecessor prints its
   // tail after this command was written, and this one times out before the
   // shell ever reads it.
   const queued = await server.execCommand('t-unstarted', 'echo QUEUED_OUT', 600);
   assert.strictEqual(queued.exitCode, -1);
+  assert.ok(server.getOutput('t-unstarted').some(l => l.includes('BUSY_TAIL')), 'the predecessor printed while this command waited');
   assert.strictEqual(queued.output, '', 'nothing the predecessor printed is attributed to it');
+});
+
+test('commands queued behind a running one each get their own output and status, in order', async () => {
+  const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
+  await server.createSession('t-queue');
+  const results = await Promise.all([
+    server.execCommand('t-queue', 'sleep 0.3; printf FIRST', 8000),
+    server.execCommand('t-queue', 'printf SECOND; (exit 2)', 8000),
+    server.execCommand('t-queue', 'printf THIRD; (exit 3)', 8000)
+  ]);
+  assert.deepStrictEqual(
+    results.map(r => [cleanTerminalOutput(r.output).trim(), r.exitCode]),
+    [['FIRST', 0], ['SECOND', 2], ['THIRD', 3]]
+  );
+});
+
+test('a plain sh session runs commands through the same path', async () => {
+  const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
+  await server.createSession('t-sh', { shell: '/bin/sh', cwd: '/' });
+  const result = await server.execCommand('t-sh', 'printf "%s\\n" "$((6 * 7))"; (exit 5)', 8000);
+  assert.strictEqual(result.exitCode, 5);
+  assert.strictEqual(cleanTerminalOutput(result.output).trim(), '42');
 });
