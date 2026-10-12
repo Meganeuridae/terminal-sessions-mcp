@@ -44,10 +44,10 @@ interface SessionInfo {
   // Every command written to this shell: its nonce → its temp-file path as
   // typed (and the set of those paths, for lookup). Exactly these commands'
   // wrapper echoes and printed start and exit markers are exec plumbing,
-  // removed wherever they appear, so a command that prints them back
-  // (`history`, a reader that received a typed wrapper) loses those spans
-  // too. Marker-shaped text carrying any other nonce is output and is never
-  // filtered. Bounded (see rememberIssued).
+  // removed wherever they appear while the command is remembered (see
+  // rememberIssued), so a command that prints them back (`history`, a reader
+  // that received a typed wrapper) loses those spans too. Marker-shaped text
+  // carrying any other nonce is output and is never filtered.
   issued: Map<string, string>;
   issuedPaths: Set<string>;
 }
@@ -293,8 +293,14 @@ export class PersistentSessionServer extends EventEmitter {
       if (lastLine !== null) this.addLog(sessionInfo, lastLine);
       sessionInfo.lineBuffer = '';
 
-      this.addLog(sessionInfo, signal
-        ? `[Session terminated by signal ${signal}]`
+      // node-pty gives the signal as a number; the log names it (SIGKILL).
+      const signalName = signal
+        ? Object.keys(os.constants.signals).find(
+            (name) => os.constants.signals[name as keyof typeof os.constants.signals] === signal
+          ) ?? `signal ${signal}`
+        : undefined;
+      this.addLog(sessionInfo, signalName
+        ? `[Session terminated by ${signalName}]`
         : `[Session terminated with code ${exitCode}]`);
 
       // A dying shell can never echo the completion marker, so resolve the
@@ -405,26 +411,28 @@ export class PersistentSessionServer extends EventEmitter {
       return;
     }
 
-    const currentCommand = session.commandQueue.shift()!;
-
-    // Write the body to its temp file before anything marks the session busy.
-    // A write that fails (a missing temp directory, a full disk, a name that's
-    // taken) fails this command alone, and the queue moves on.
-    let source: string;
-    try {
-      source = this.writeCommandViaTempFile(session, currentCommand.nonce, currentCommand.command);
-    } catch (err) {
-      const reason = `[command not run: could not write its temp file: ${(err as Error).message}]`;
-      this.addLog(session, `$ ${currentCommand.command}`);
-      this.addLog(session, reason);
-      currentCommand.resolve({
-        output: reason,
-        exitCode: -1,
-        duration: Date.now() - currentCommand.startTime
-      });
-      this.processCommandQueue(session);
-      return;
+    // Write the next command's body to its temp file before anything marks the
+    // session busy. A write that fails (a missing temp directory, a full disk,
+    // a name that's taken) fails that command alone, and the next is tried.
+    let currentCommand: QueuedCommand | undefined;
+    let source = '';
+    while (!currentCommand && session.commandQueue.length > 0) {
+      const next = session.commandQueue.shift()!;
+      try {
+        source = this.writeCommandViaTempFile(session, next.nonce, next.command);
+        currentCommand = next;
+      } catch (err) {
+        const reason = `[command not run: could not write its temp file: ${(err as Error).message}]`;
+        this.addLog(session, `$ ${next.command}`);
+        this.addLog(session, reason);
+        next.resolve({
+          output: reason,
+          exitCode: -1,
+          duration: Date.now() - next.startTime
+        });
+      }
     }
+    if (!currentCommand) return;
 
     session.isProcessingCommand = true;
     session.currentCommand = currentCommand;
@@ -472,15 +480,20 @@ export class PersistentSessionServer extends EventEmitter {
     //     redisplay, soft wraps — which no exact-string filter survives.)
     //   - The per-command nonce means stale markers from a timed-out earlier
     //     command can't resolve (and corrupt) a later one.
-    session.shell.write(
-      `echo "<<<STAR""T:${currentCommand.nonce}>>>"; ${source}; ` +
-      `echo "<<<EXI""T:${currentCommand.nonce}:$?>>>"\n`
-    );
+    session.shell.write(this.wrapperLine(currentCommand.nonce, source) + '\n');
 
     // Set up fallback timeout
     session.currentTimeout = setTimeout(() => {
       this.resolveCommand(session, -1); // -1 = timed out
     }, currentCommand.timeout);
+  }
+
+  /**
+   * The line typed for a command whose body `source` runs (see
+   * processCommandQueue for why it looks like this).
+   */
+  private wrapperLine(nonce: string, source: string): string {
+    return `echo "<<<STAR""T:${nonce}>>>"; ${source}; echo "<<<EXI""T:${nonce}:$?>>>"`;
   }
 
   /**
@@ -649,12 +662,13 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * Record an issued command's nonce and typed path for plumbing filters.
-   * Settled commands are kept up to 1024, the oldest forgotten first. A command
-   * still pending is kept beyond that, since its echo and late markers must
-   * still be recognized. Pending commands are the lines the shell hasn't read
-   * past (see pendingFiles), so they accumulate only while commands keep being
-   * written that the shell never reads as commands: typed behind a reader that
-   * takes them as its input.
+   * The map holds at most 1024 commands, forgetting the oldest settled ones
+   * first. A pending command (a line the shell hasn't read past, see
+   * pendingFiles) is never forgotten, since its echo and late markers must
+   * still be recognized, so the map grows past 1024 only while more than that
+   * are pending: commands keep being typed in behind one that hasn't
+   * finished, such as a long-running job or a reader that takes them as its
+   * input.
    */
   private rememberIssued(session: SessionInfo, nonce: string, typedPath: string): void {
     session.issued.set(nonce, typedPath);
@@ -676,12 +690,13 @@ export class PersistentSessionServer extends EventEmitter {
    * shell is done with it (see pendingFiles).
    */
   private writeCommandViaTempFile(session: SessionInfo, nonce: string, command: string): string {
-    // The name carries the nonce, whose random part keeps it from being
-    // guessed ahead of time, and 'wx' creates the file exclusively: it never
-    // follows a link or reuses a file someone else made, and a name that's
-    // taken fails the command instead. The name is short to keep the echoed
-    // wrapper short; with a long temp directory (macOS's) the echo still wraps
-    // at 120 columns, which the wrap-tolerant patterns above allow for.
+    // 'wx' creates the file exclusively: it never follows a link or reuses a
+    // file someone else made, and a name that's taken fails the command
+    // instead. That is the protection; the name carries the command's nonce,
+    // which is no secret (it is typed into the session, and its random part is
+    // Math.random's). The name is short to keep the echoed wrapper short; with
+    // a long temp directory (macOS's) the echo still wraps at 120 columns,
+    // which the wrap-tolerant patterns above allow for.
     const file = path.join(os.tmpdir(), `tsm-cmd-${process.pid}-${nonce}.sh`);
     try {
       // Trailing newline so the final line is terminated even if the caller omitted it.

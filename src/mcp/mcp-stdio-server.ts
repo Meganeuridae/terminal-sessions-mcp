@@ -69,7 +69,7 @@ const TOOLS = {
         session: { type: 'string', description: 'Session name (will be created automatically if it does not exist)' },
         command: { type: 'string' },
         cwd: { type: 'string', description: 'Working directory (used when auto-creating a new session)' },
-        timeout: { type: 'number', description: 'Command timeout in ms (default: 30000). Use -1 to return immediately without waiting. A timed-out command keeps running in the session (exitCode -1 in the result) — use tailLogs to check on it, sendInput to answer it, or sendSignal with SIGINT (the default, sent as Ctrl-C) to interrupt it; other signals go to the session\'s shell itself.' },
+        timeout: { type: 'number', description: 'Command timeout in ms (default: 30000). Use -1 to return immediately without waiting. A timed-out command keeps running in the session (exitCode -1 in the result), and commands sent meanwhile are typed in behind it: they run when it ends, or become its input if it reads any. Use tailLogs to check on it, sendInput to answer it, or sendSignal with SIGINT (the default, sent as Ctrl-C) to interrupt it, which also discards the commands typed in behind it; other signals go to the session\'s shell itself.' },
         raw: { type: 'boolean', description: 'If true, preserve raw ANSI escape codes in output (default: false, returns clean text)' }
       },
       required: ['session', 'command']

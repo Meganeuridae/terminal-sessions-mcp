@@ -12,7 +12,8 @@
   - `runCommand("exit")` (or any command that kills the shell) resolved only
     at the fallback timeout; the PTY exit handler now resolves the in-flight
     command immediately with the shell's exit status (-1 if a signal killed
-    it), and queued commands fail fast instead of hanging.
+    it, which the session log names, as in `[Session terminated by SIGKILL]`),
+    and queued commands fail fast instead of hanging.
   - Commands that read stdin (`read`, REPLs, `ssh`...) used to swallow the
     delayed marker line as *input* — burning the full timeout AND feeding a
     line of garbage into whatever was reading (picture a password prompt).
@@ -27,7 +28,7 @@
     Nonces make stale markers inert (and they're stripped from output).
 
   A command that replaces the shell (`exec bash`) or exits a nested shell
-  (`exit` sent to a `bash` an earlier command started) still prints no
+  (`exit` sent to a `bash` an earlier command started) still prints no exit
   marker of its own and waits for its timeout.
 - **Every `runCommand` command goes through the temp-file path** (not just
   multi-line ones), which also fixes single-line commands longer than the
@@ -36,8 +37,8 @@
   sourcing works under WSL on Windows. `startService` still types its
   command. A command whose temp file can't be written (a missing or full
   temp directory) fails alone with exitCode -1 and the reason, instead of
-  wedging the session; the file is created exclusively, under a name that
-  can't be guessed ahead of time.
+  wedging the session; the file is created exclusively, so nothing planted
+  at its name is written through or reused.
 - Exec plumbing (wrapper echoes, markers) is filtered out of session logs and
   the `lines` of output events, so `tailLogs` shows `$ command`, its output
   and the shell's prompts without the wrapper text. Only this session's own
@@ -58,19 +59,23 @@
   reaches it. Each command's temp file is kept until the shell has read past
   its line (its own exit marker, a later command's start marker, or the
   shell's exit), instead of being deleted when the next command is written,
-  and the server removes the files still pending when it exits. A
-  predecessor that reads stdin can take the queued line as its input, and
-  then it never runs.
+  and the server removes the files still pending when its process exits
+  normally (through `process.exit`, as the daemon's SIGINT and SIGTERM
+  shutdown does). A predecessor that reads stdin can take the queued line as
+  its input, and interrupting it with Ctrl-C (`sendSignal` SIGINT) discards
+  the lines typed in behind it; either way those commands never run.
 
 ### Changed
 
 - **A timed-out command is left untouched.** Previously the marker machinery
   incidentally poked blocked stdin-readers with garbage input. Now a command
-  that times out (exitCode -1) simply keeps running in the session — check on
-  it with `tailLogs`, answer it with `sendInput`, or interrupt it with
-  `sendSignal` (SIGINT, the default, sent as Ctrl-C; other signals go to the
-  session's shell itself). The `runCommand` tool's `timeout` parameter
-  documents this.
+  that times out (exitCode -1) simply keeps running in the session, and
+  commands sent meanwhile are typed in behind it: they run when it ends, or
+  become its input if it reads any. Check on it with `tailLogs`, answer it
+  with `sendInput`, or interrupt it with `sendSignal` (SIGINT, the default,
+  sent as Ctrl-C, which also discards the commands typed in behind it; other
+  signals go to the session's shell itself). The `runCommand` tool's
+  `timeout` parameter documents this.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
 - Shell history records each command's wrapper line (its temp file sourced

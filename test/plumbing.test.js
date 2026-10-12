@@ -12,7 +12,7 @@ const { PersistentSessionServer } = require('../dist/src/server/session-server-v
 const bareServer = () => Object.create(PersistentSessionServer.prototype);
 const bareSession = () => ({ issued: new Map(), issuedPaths: new Set(), pendingFiles: new Map() });
 
-test('remembered commands: 1024 settled ones, oldest forgotten first, and every pending one', () => {
+test('remembered commands: at most 1024, the oldest settled ones forgotten first, never a pending one', () => {
   const server = bareServer();
   const session = bareSession();
   // The first command never finishes: the shell hasn't read past its line.
@@ -39,14 +39,15 @@ test("a command's file is created exclusively: never through a link, never into 
     assert.equal(fs.readFileSync(target, 'utf8'), 'ORIGINAL', 'nothing was written through the link');
     assert.ok(fs.lstatSync(file).isSymbolicLink(), 'a file someone else made is left alone');
     assert.equal(session.pendingFiles.size, 0);
+    assert.equal(session.issued.size, 0, 'a command whose file failed is not remembered as issued');
   } finally {
     fs.rmSync(file, { force: true });
     fs.rmSync(target, { force: true });
   }
 });
 
-/** The line the server types for a command, as processCommandQueue writes it. */
-const typedLine = (nonce, file) => `echo "<<<STAR""T:${nonce}>>>"; . '${file}'; echo "<<<EXI""T:${nonce}:$?>>>"`;
+/** The line the server types for a command (writeCommandViaTempFile makes the `. '<file>'` part). */
+const typedLine = (nonce, file) => bareServer().wrapperLine(nonce, `. '${file}'`);
 // What readline writes where an echoed line soft-wraps: bash 3.2 on macOS
 // writes a space and a carriage return; a cursor-moving escape stands for
 // the other form the patterns allow.
@@ -59,6 +60,7 @@ test('a wrapper echo soft-wrapped at any point, seams included, is removed and t
   server.rememberIssued(session, nonce, file);
   const line = typedLine(nonce, file);
   assert.equal(server.stripPlumbingSpans(session, `BEFORE${line}AFTER`), 'BEFOREAFTER');
+  assert.equal(server.stripPlumbingSpans(session, `BEFORE${line}\r\nAFTER`), 'BEFOREAFTER', 'the newline that ends the echo goes with it');
   const missed = [];
   for (const artifact of ARTIFACTS) {
     for (let cut = 1; cut <= line.length; cut++) {
@@ -83,4 +85,29 @@ test("a wrapper echo with a nonce and path the server never issued is output, wr
   assert.equal(server.stripPlumbingSpans(session, other), other);
   const wrapped = other.slice(0, 20) + ' \r' + other.slice(20);
   assert.equal(server.stripPlumbingSpans(session, wrapped), wrapped);
+});
+
+/** checkCommandCompletion on a session whose newest output is `chunk`. */
+function scan(server, session, chunk) {
+  session.outputBuffer += chunk;
+  server.checkCommandCompletion(session, chunk);
+}
+
+test("a start marker releases every earlier command's file, and none after it", () => {
+  const server = bareServer();
+  const session = { ...bareSession(), outputBuffer: '', currentCommand: undefined };
+  // Fake paths: removeTempFile is best-effort, so only the bookkeeping is checked.
+  for (const n of ['n1', 'n2', 'n3', 'n4']) session.pendingFiles.set(n, `/nonexistent/${n}.sh`);
+  scan(server, session, 'output\r\n<<<START:n3>>>\r\n');
+  assert.deepEqual([...session.pendingFiles.keys()], ['n3', 'n4']);
+});
+
+test('a start marker for a command no longer pending releases nothing', () => {
+  const server = bareServer();
+  const session = { ...bareSession(), outputBuffer: '', currentCommand: undefined };
+  for (const n of ['n4', 'n5']) session.pendingFiles.set(n, `/nonexistent/${n}.sh`);
+  // n3 started and finished earlier; its start marker scanned again (the scan
+  // window overlaps the previous chunk) must not release n4 or n5.
+  scan(server, session, '<<<START:n3>>>\r\nok\r\n');
+  assert.deepEqual([...session.pendingFiles.keys()], ['n4', 'n5']);
 });

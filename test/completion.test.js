@@ -65,13 +65,14 @@ test('shell death resolves the in-flight command instead of hanging until timeou
 test('a shell killed by a signal resolves its in-flight command with -1, not as a success', async () => {
   await server.createSession('t-killed');
   const started = waitForOutput('t-killed', 'KILLED_STARTED');
-  const call = server.execCommand('t-killed', 'echo KILLED_STARTED; sleep 30', 8000);
+  const call = server.execCommand('t-killed', 'echo KILLED_STARTED; sleep 60', 30000);
   await started;
   const start = Date.now();
   server.sendSignal('t-killed', 'SIGKILL');
   const result = await call;
-  assert.ok(Date.now() - start < 4000, 'resolved at the death, not at the timeout');
+  assert.ok(Date.now() - start < 10000, 'resolved at the death, not at the 30s timeout');
   assert.strictEqual(result.exitCode, -1);
+  assert.ok(server.getOutput('t-killed').includes('[Session terminated by SIGKILL]'), 'the log names the signal');
 });
 
 test('shell death fails queued commands instead of hanging', async () => {
@@ -208,32 +209,40 @@ test('the server process removes pending temp files when it exits', () => {
     const { PersistentSessionServer } = require(${JSON.stringify(serverModule)});
     const server = new PersistentSessionServer();
     (async () => {
-      await server.createSession('child');
-      const timedOut = await server.execCommand('child', 'sleep 30', 100);
+      const exitCodes = [];
+      for (const id of ['child-a', 'child-b']) {
+        await server.createSession(id);
+        exitCodes.push((await server.execCommand(id, 'sleep 30', 100)).exitCode);
+      }
       const pending = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith('tsm-cmd-' + process.pid + '-')).length;
-      process.stdout.write(JSON.stringify({ pid: process.pid, exitCode: timedOut.exitCode, pending }));
+      process.stdout.write(JSON.stringify({ pid: process.pid, exitCodes, pending }));
       process.exit(0);
     })();`;
   const report = JSON.parse(execFileSync(process.execPath, ['-e', child], { encoding: 'utf8', timeout: 20000 }));
-  assert.deepStrictEqual([report.exitCode, report.pending], [-1, 1], 'the timed-out command held its file when the process exited');
+  assert.deepStrictEqual([report.exitCodes, report.pending], [[-1, -1], 2], "each session's timed-out command held its file when the process exited");
   assert.deepStrictEqual(fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(`tsm-cmd-${report.pid}-`)), []);
 });
 
-test('a command whose temp file cannot be written fails alone, and the session stays usable', async () => {
+// A command left in the queue has no timer, so a drain that stopped would hang; the
+// test's own timeout turns that into a failure.
+test('commands whose temp files cannot be written fail alone, and the session stays usable', { timeout: 20000 }, async () => {
   await server.createSession('t-nowrite');
+  // Its file is written now; the three below queue behind it while it runs.
+  const running = server.execCommand('t-nowrite', 'sleep 0.3; printf RAN', 8000);
   const saved = process.env.TMPDIR;
   process.env.TMPDIR = path.join(os.tmpdir(), `tsm-missing-${process.pid}`);
   let failed;
-  const start = Date.now();
   try {
-    failed = await server.execCommand('t-nowrite', 'printf NEVER', 8000);
+    failed = await Promise.all(['printf ONE', 'printf TWO', 'printf THREE'].map(c => server.execCommand('t-nowrite', c, 8000)));
   } finally {
     if (saved === undefined) delete process.env.TMPDIR;
     else process.env.TMPDIR = saved;
   }
-  assert.strictEqual(failed.exitCode, -1);
-  assert.match(failed.output, /could not write its temp file/);
-  assert.ok(Date.now() - start < 3000, 'it fails at once rather than at its timeout');
+  assert.strictEqual((await running).exitCode, 0);
+  for (const result of failed) {
+    assert.strictEqual(result.exitCode, -1);
+    assert.match(result.output, /could not write its temp file/, 'it failed at its write, not at its timeout');
+  }
   const after = await server.execCommand('t-nowrite', 'printf AFTER_OK', 8000);
   assert.strictEqual(after.exitCode, 0);
   assert.match(after.output, /AFTER_OK/);
@@ -266,21 +275,32 @@ function waitForOutput(sessionId, needle, ms = 5000) {
   });
 }
 
-test("a later command's start releases the file of a line the shell read past without finishing", async () => {
+test("a later command's start releases the files of lines the shell read past without finishing", async () => {
+  const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
   await server.createSession('t-interrupt');
   await server.execCommand('t-interrupt', "PS1='T_INTERRUPT_READY> '", 8000);
   const before = new Set(ourTempFiles());
   const fresh = () => ourTempFiles().filter(f => !before.has(f));
-  const timedOut = await server.execCommand('t-interrupt', 'sleep 30', 200);
+  const sleeping = waitForOutput('t-interrupt', 'SLEEP_STARTED');
+  const timedOut = await server.execCommand('t-interrupt', 'echo SLEEP_STARTED; sleep 30', 200);
   assert.strictEqual(timedOut.exitCode, -1);
-  // Ctrl-C ends sleep, and bash drops the rest of its line, so its exit marker never prints.
+  await sleeping;
+  // Two more commands are typed in behind the running sleep and time out unread.
+  for (const word of ['ONE', 'TWO']) {
+    assert.strictEqual((await server.execCommand('t-interrupt', `printf FLUSHED_%s ${word}`, 100)).exitCode, -1);
+  }
+  assert.strictEqual(fresh().length, 3);
+  // Ctrl-C ends sleep, bash drops the rest of its line (no exit marker), and
+  // the tty discards the two lines typed in behind it.
   const prompt = waitForOutput('t-interrupt', 'T_INTERRUPT_READY> ');
   server.sendSignal('t-interrupt', 'SIGINT');
   await prompt;
-  assert.strictEqual(fresh().length, 1, 'the interrupted command still holds its file');
+  assert.strictEqual(fresh().length, 3, 'nothing has released their files yet');
   const next = await server.execCommand('t-interrupt', 'printf NEXT_OK', 8000);
   assert.strictEqual(next.exitCode, 0);
-  assert.deepStrictEqual(fresh(), [], "the next command's start released it, and its own exit marker its own file");
+  assert.strictEqual(cleanTerminalOutput(next.output).trim(), 'NEXT_OK');
+  assert.deepStrictEqual(fresh(), [], "the next command's start released all three, and its own exit marker its own file");
+  assert.ok(!server.getOutput('t-interrupt').some(l => /FLUSHED_(ONE|TWO)/.test(l)), 'the discarded lines never ran');
 });
 
 test('output without a trailing newline survives in the result, the logs and output events', async () => {
@@ -401,11 +421,11 @@ for (const [label, setup] of [['terminal echo off', 'stty -echo'], ['no line edi
 
 test('a command that times out before it starts has no output of its own', async () => {
   await server.createSession('t-unstarted');
-  await server.execCommand('t-unstarted', 'sleep 0.2; printf BUSY_%s TAIL; sleep 1', 50);
+  await server.execCommand('t-unstarted', 'sleep 0.2; printf BUSY_%s TAIL; sleep 5', 50);
   // Written while the predecessor owns the tty; the predecessor prints its
-  // tail after this command was written, and this one times out before the
-  // shell ever reads it.
-  const queued = await server.execCommand('t-unstarted', 'echo QUEUED_OUT', 600);
+  // tail after this command was written (about 0.2s in, leaving nearly 3s of
+  // margin), and this one times out before the shell ever reads it.
+  const queued = await server.execCommand('t-unstarted', 'echo QUEUED_OUT', 3000);
   assert.strictEqual(queued.exitCode, -1);
   assert.ok(server.getOutput('t-unstarted').some(l => l.includes('BUSY_TAIL')), 'the predecessor printed while this command waited');
   assert.strictEqual(queued.output, '', 'nothing the predecessor printed is attributed to it');
