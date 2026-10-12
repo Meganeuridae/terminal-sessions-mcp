@@ -182,6 +182,26 @@ test('PTY exit releases the files of commands that can no longer run', async () 
   assert.deepStrictEqual(ourTempFiles().filter(f => !before.has(f)), []);
 });
 
+test('the server process removes pending temp files when it exits', () => {
+  const { execFileSync } = require('node:child_process');
+  const serverModule = path.resolve(__dirname, '../dist/src/server/session-server-v3.js');
+  const child = `
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const { PersistentSessionServer } = require(${JSON.stringify(serverModule)});
+    const server = new PersistentSessionServer();
+    (async () => {
+      await server.createSession('child');
+      const timedOut = await server.execCommand('child', 'sleep 30', 100);
+      const pending = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith('tsm-cmd-' + process.pid + '-')).length;
+      process.stdout.write(JSON.stringify({ pid: process.pid, exitCode: timedOut.exitCode, pending }));
+      process.exit(0);
+    })();`;
+  const report = JSON.parse(execFileSync(process.execPath, ['-e', child], { encoding: 'utf8', timeout: 20000 }));
+  assert.deepStrictEqual([report.exitCode, report.pending], [-1, 1], 'the timed-out command held its file when the process exited');
+  assert.deepStrictEqual(fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(`tsm-cmd-${report.pid}-`)), []);
+});
+
 /** Complete output lines the server emitted for one session, as output events carry them. */
 function collectEventLines(sessionId) {
   const lines = [];

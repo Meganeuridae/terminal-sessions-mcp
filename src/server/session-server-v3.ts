@@ -171,8 +171,13 @@ export class PersistentSessionServer extends EventEmitter {
 
   constructor() {
     super();
-    // Clean up on exit
-    process.on('exit', () => this.killAll());
+    // Clean up on exit. An 'exit' listener runs only synchronous code, so the
+    // pending temp files are removed here: killAll's own cleanup waits on a
+    // timer that never fires once the process is exiting.
+    process.on('exit', () => {
+      for (const session of this.sessions.values()) this.cleanupTempFiles(session);
+      this.killAll();
+    });
     process.on('SIGINT', () => {
       this.killAll();
       process.exit(0);
