@@ -42,9 +42,11 @@ interface SessionInfo {
   // the shell reads and sources them.
   pendingFiles: Map<string, string>;
   // Every command written to this shell: its nonce → its temp-file path as
-  // typed (and the set of those paths, for lookup). Exactly these wrapper
-  // echoes and resolved markers are exec plumbing; marker-shaped text
-  // carrying any other nonce is the command's own output and is never
+  // typed (and the set of those paths, for lookup). Exactly these commands'
+  // wrapper echoes and printed start and exit markers are exec plumbing,
+  // removed wherever they appear, so a command that prints them back
+  // (`history`, a reader that received a typed wrapper) loses those spans
+  // too. Marker-shaped text carrying any other nonce is output and is never
   // filtered. Bounded (see rememberIssued).
   issued: Map<string, string>;
   issuedPaths: Set<string>;
@@ -267,6 +269,9 @@ export class PersistentSessionServer extends EventEmitter {
       }
 
       if (data.length > 0) {
+        // `chunk` is the terminal stream as the PTY wrote it, plumbing
+        // included, for terminal renderers (the GUI writes it to xterm);
+        // `lines` are its complete lines with the plumbing removed.
         this.notify('session:output', {
           sessionId: sessionInfo.id,
           chunk: data,
@@ -346,7 +351,8 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * Execute a command in a session and wait for it to finish.
-   * Detects completion via an exit-code marker echoed after the command.
+   * Detects completion by the exit marker the shell prints after running the
+   * command's line.
    */
   async execCommand(sessionId: string, command: string, timeout?: number): Promise<CommandResult> {
     const session = this.sessions.get(sessionId);
@@ -501,19 +507,24 @@ export class PersistentSessionServer extends EventEmitter {
     // - It begins after its own start marker. Earlier text is the typed line's
     //   echo, the previous prompt, or the late output of a timed-out
     //   predecessor still running when this command was written (which stays
-    //   in the logs, where its caller can recover it). If no start marker was
-    //   observed before the wait ended, the result has no output of its own;
-    //   the command may still begin later, and what it prints then reaches the
-    //   logs and output events.
+    //   in the logs, where its caller can recover it). A background job the
+    //   predecessor left running can still print inside these bounds. If no
+    //   start marker was observed before the wait ended, the result has no
+    //   output of its own; the command may still begin later, and what it
+    //   prints then reaches the logs and output events.
     // - It ends at its own exit marker. What follows is the shell's next
-    //   prompt, not this command's output; a result is consumed as data.
+    //   prompt, not this command's output; a result is consumed as data. A
+    //   command that times out has no exit marker yet, so its result runs to
+    //   the end of the wait, which after an interrupted line can include the
+    //   next prompt.
     // Inside those bounds only issued commands' plumbing spans are removed;
     // text beside them stays, and marker-shaped text with an unknown nonce is
     // the command's own output.
     let output = '';
     if (currentCommand.started) {
       output = session.outputBuffer;
-      // Only a buffer trimmed past its start (>100MB of output) lacks it.
+      // A buffer trimmed past its start (>100MB of output) lacks it; the
+      // result then starts where the buffer does.
       const start = output.match(new RegExp(`<<<START:${currentCommand.nonce}>>>(\\r?\\n)?`));
       if (start && start.index !== undefined) {
         output = output.slice(start.index + start[0].length);

@@ -6,13 +6,13 @@
 
 - **Command completion is now detected at actual completion** 🏁 - The
   exit-code marker is chained onto the same shell line as the command
-  (`. '<tempfile>'; echo "<<<EXIT:<nonce>:$?>>>"`) instead of being typed
-  into the PTY 50ms later. This fixes the whole family of "doesn't notice
-  the command ended / waits for the full timeout" bugs:
+  (`echo "<<<STAR""T:<nonce>>>"; . '<tempfile>'; echo "<<<EXI""T:<nonce>:$?>>>"`)
+  instead of being typed into the PTY 50ms later. This fixes the family of
+  "doesn't notice the command ended / waits for the full timeout" bugs:
   - `runCommand("exit")` (or any command that kills the shell) resolved only
     at the fallback timeout; the PTY exit handler now resolves the in-flight
-    command immediately with the shell's exit code, and queued commands fail
-    fast instead of hanging.
+    command immediately with the shell's exit status (-1 if a signal killed
+    it), and queued commands fail fast instead of hanging.
   - Commands that read stdin (`read`, REPLs, `ssh`...) used to swallow the
     delayed marker line as *input* — burning the full timeout AND feeding a
     line of garbage into whatever was reading (picture a password prompt).
@@ -25,36 +25,56 @@
   - After a timeout, the stale marker from the still-running command could
     resolve the *next* command with the wrong exit code and mangled output.
     Nonces make stale markers inert (and they're stripped from output).
-- **All commands go through the temp-file path** (not just multi-line ones),
-  which also fixes single-line commands longer than the tty's canonical-mode
-  line buffer (1024 bytes on macOS) being silently truncated, and translates
-  the temp-file path to `/mnt/<drive>/...` form so sourcing works under WSL
-  on Windows.
-- Exec plumbing (wrapper echoes, markers) is filtered out of session logs,
-  so `tailLogs` shows `$ command` + output without internal noise. Only this
-  session's own plumbing is removed, and only its spans: output sharing a line
-  with it (text without a trailing newline, a timed-out command's late tail)
-  stays, marker-shaped text from anywhere else is output, and a wrapper echo
-  soft-wrapped at the terminal's edge (bash 3.2 on macOS) is still recognized.
+
+  A command that replaces the shell (`exec bash`) or exits a nested shell
+  (`exit` sent to a `bash` an earlier command started) still prints no
+  marker of its own and waits for its timeout.
+- **Every `runCommand` command goes through the temp-file path** (not just
+  multi-line ones), which also fixes single-line commands longer than the
+  tty's canonical-mode line buffer (1024 bytes on macOS) being silently
+  truncated, and translates the temp-file path to `/mnt/<drive>/...` form so
+  sourcing works under WSL on Windows. `startService` still types its
+  command. A command whose temp file can't be written (a missing or full
+  temp directory) fails alone with exitCode -1 and the reason, instead of
+  wedging the session; the file is created exclusively, under a name that
+  can't be guessed ahead of time.
+- Exec plumbing (wrapper echoes, markers) is filtered out of session logs and
+  the `lines` of output events, so `tailLogs` shows `$ command`, its output
+  and the shell's prompts without the wrapper text. Only this session's own
+  plumbing is removed, and only its spans: output sharing a line with it
+  (text without a trailing newline, a timed-out command's late tail) stays,
+  marker-shaped text from anywhere else is output, and a wrapper echo
+  soft-wrapped at the terminal's edge (bash 3.2 on macOS) is still
+  recognized. An output event's `chunk` stays the raw terminal stream.
 - **A result is bounded by its own command's execution.** The shell prints a
   start marker immediately before sourcing the command and the exit marker
-  immediately after, so a result no longer picks up the next prompt or the
-  late output of a timed-out predecessor; a command that never started
-  returns no output of its own (it may still run later; its output then
-  reaches the logs).
-- **A command queued behind a timed-out one still runs.** Each command's temp
-  file is kept until its own exit marker arrives or the shell exits, instead
-  of being deleted when the next command starts.
+  immediately after, so a result no longer picks up the next prompt or what
+  a timed-out predecessor prints before this command starts (a background
+  job the predecessor left running can still print into it); a command that
+  never started returns no output of its own (it may still run later; its
+  output then reaches the logs). A command that times out returns what it
+  printed by the end of the wait.
+- **A command queued behind a timed-out one still runs** once the shell
+  reaches it. Each command's temp file is kept until the shell has read past
+  its line (its own exit marker, a later command's start marker, or the
+  shell's exit), instead of being deleted when the next command is written,
+  and the server removes the files still pending when it exits. A
+  predecessor that reads stdin can take the queued line as its input, and
+  then it never runs.
 
 ### Changed
 
 - **A timed-out command is left untouched.** Previously the marker machinery
   incidentally poked blocked stdin-readers with garbage input. Now a command
   that times out (exitCode -1) simply keeps running in the session — check on
-  it with `tailLogs`, unblock it with `sendInput`, or stop it with
-  `sendSignal`. The `runCommand` tool description documents this.
+  it with `tailLogs`, answer it with `sendInput`, or interrupt it with
+  `sendSignal` (SIGINT, the default, sent as Ctrl-C; other signals go to the
+  session's shell itself). The `runCommand` tool's `timeout` parameter
+  documents this.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
+- Shell history records each command's wrapper line (its temp file sourced
+  between two markers), not the command's own text.
 
 ## v1.6.0 - 2026-07-11
 

@@ -363,7 +363,7 @@ test('a wrapper echo soft-wrapped mid-part leaves no plumbing in logs or output 
   }
 });
 
-test("a result ends at its own marker and begins after the shell's own echo of its wrapper", async () => {
+test('a result begins after its own start marker and ends at its own exit marker', async () => {
   const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
   await server.createSession('t-bounds');
   // What follows the marker is the shell's next prompt, not the command's output.
