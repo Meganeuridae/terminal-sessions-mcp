@@ -55,10 +55,23 @@ test('env and cwd persist across the temp-file exec path', async () => {
 test('shell death resolves the in-flight command instead of hanging until timeout', async () => {
   await server.createSession('t-exit');
   const start = Date.now();
-  const result = await server.execCommand('t-exit', 'exit', 8000);
+  const result = await server.execCommand('t-exit', 'exit 7', 8000);
   const elapsed = Date.now() - start;
   assert.ok(elapsed < 4000, `resolved in ${elapsed}ms; must not wait out the 8s timeout`);
+  assert.strictEqual(result.exitCode, 7, "the shell's own exit status, not the timeout's -1");
   assert.ok(!result.output.includes('<<<EXIT'));
+});
+
+test('a shell killed by a signal resolves its in-flight command with -1, not as a success', async () => {
+  await server.createSession('t-killed');
+  const started = waitForOutput('t-killed', 'KILLED_STARTED');
+  const call = server.execCommand('t-killed', 'echo KILLED_STARTED; sleep 30', 8000);
+  await started;
+  const start = Date.now();
+  server.sendSignal('t-killed', 'SIGKILL');
+  const result = await call;
+  assert.ok(Date.now() - start < 4000, 'resolved at the death, not at the timeout');
+  assert.strictEqual(result.exitCode, -1);
 });
 
 test('shell death fails queued commands instead of hanging', async () => {

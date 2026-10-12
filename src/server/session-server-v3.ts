@@ -279,7 +279,7 @@ export class PersistentSessionServer extends EventEmitter {
     });
 
     // Handle exit
-    ptyProcess.onExit(({ exitCode }) => {
+    ptyProcess.onExit(({ exitCode, signal }) => {
       sessionInfo.isAlive = false;
 
       // Flush any remaining buffered line
@@ -287,14 +287,19 @@ export class PersistentSessionServer extends EventEmitter {
       if (lastLine !== null) this.addLog(sessionInfo, lastLine);
       sessionInfo.lineBuffer = '';
 
-      this.addLog(sessionInfo, `[Session terminated with code ${exitCode}]`);
+      this.addLog(sessionInfo, signal
+        ? `[Session terminated by signal ${signal}]`
+        : `[Session terminated with code ${exitCode}]`);
 
       // A dying shell can never echo the completion marker, so resolve the
       // in-flight command instead of letting callers hang until their
-      // fallback timeout (e.g. exec("exit")). Queued commands drain via
+      // fallback timeout (e.g. exec("exit")): with the shell's exit status
+      // when it exited, and with -1 when a signal killed it, since the command
+      // then has no status of its own (node-pty reports that death as
+      // exitCode 0, with the signal beside it). Queued commands drain via
       // processCommandQueue, which refuses to write to a dead PTY.
       if (sessionInfo.currentCommand) {
-        this.resolveCommand(sessionInfo, exitCode ?? -1);
+        this.resolveCommand(sessionInfo, signal ? -1 : exitCode ?? -1);
       }
 
       // Nothing written to this shell can be sourced any more.
