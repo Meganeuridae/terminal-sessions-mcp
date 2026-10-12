@@ -189,6 +189,43 @@ function collectEventLines(sessionId) {
   return lines;
 }
 
+/** Resolves once the session's raw output from now on contains the needle. */
+function waitForOutput(sessionId, needle, ms = 5000) {
+  return new Promise((resolve, reject) => {
+    let seen = '';
+    const onOutput = (e) => {
+      if (e.sessionId !== sessionId) return;
+      seen += e.chunk;
+      if (!seen.includes(needle)) return;
+      clearTimeout(timer);
+      server.off('session:output', onOutput);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      server.off('session:output', onOutput);
+      reject(new Error(`${sessionId} printed no ${JSON.stringify(needle)} within ${ms}ms`));
+    }, ms);
+    server.on('session:output', onOutput);
+  });
+}
+
+test("a later command's start releases the file of a line the shell read past without finishing", async () => {
+  await server.createSession('t-interrupt');
+  await server.execCommand('t-interrupt', "PS1='T_INTERRUPT_READY> '", 8000);
+  const before = new Set(ourTempFiles());
+  const fresh = () => ourTempFiles().filter(f => !before.has(f));
+  const timedOut = await server.execCommand('t-interrupt', 'sleep 30', 200);
+  assert.strictEqual(timedOut.exitCode, -1);
+  // Ctrl-C ends sleep, and bash drops the rest of its line, so its exit marker never prints.
+  const prompt = waitForOutput('t-interrupt', 'T_INTERRUPT_READY> ');
+  server.sendSignal('t-interrupt', 'SIGINT');
+  await prompt;
+  assert.strictEqual(fresh().length, 1, 'the interrupted command still holds its file');
+  const next = await server.execCommand('t-interrupt', 'printf NEXT_OK', 8000);
+  assert.strictEqual(next.exitCode, 0);
+  assert.deepStrictEqual(fresh(), [], "the next command's start released it, and its own exit marker its own file");
+});
+
 test('output without a trailing newline survives in the result, the logs and output events', async () => {
   await server.createSession('t-nonl');
   const events = collectEventLines('t-nonl');

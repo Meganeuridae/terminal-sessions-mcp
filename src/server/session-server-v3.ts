@@ -33,12 +33,13 @@ interface SessionInfo {
   currentCommand?: QueuedCommand;
   currentTimeout?: NodeJS.Timeout;
   lineBuffer: string; // Buffer for incomplete lines
-  // Temp files of commands already written to the shell whose own completion
-  // marker has not been seen yet, by nonce. A file is deleted only when that
-  // marker arrives or the PTY exits. A caller timeout proves nothing about the
-  // file: the timed-out command may still be running, and commands written
-  // after it wait in the tty as typeahead until the shell reads and sources
-  // them.
+  // Temp files of commands written to the shell that it may still source, by
+  // nonce, in the order they were written. A file is deleted when its own exit
+  // marker arrives, when a later command's start marker shows the shell has
+  // read past its line, or when the shell or the session goes away. A caller
+  // timeout proves nothing about the file: the timed-out command may still be
+  // running, and commands written after it wait in the tty as typeahead until
+  // the shell reads and sources them.
   pendingFiles: Map<string, string>;
   // Every command written to this shell: its nonce → its temp-file path as
   // typed (and the set of those paths, for lookup). Exactly these wrapper
@@ -517,14 +518,21 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * Scan the newest output for resolved exit-code markers (matched by nonce,
-   * so marker-shaped output from other sources is ignored). A marker means
-   * the shell has finished sourcing that command's temp file, whether it is
-   * the CURRENT command (which then completes) or an earlier one that timed
-   * out and has finished since. Runs whether or not a command is current, so
-   * a timed-out command that ends while the session is idle still releases
-   * its file. Only the tail of the buffer around the newest chunk is scanned:
-   * a full-buffer scan per chunk is O(n²) on chatty commands.
+   * Scan the newest output for printed start and exit markers (matched by
+   * nonce, so marker-shaped output from other sources is ignored), whether
+   * they belong to the CURRENT command or to an earlier one that timed out.
+   * - A start marker means the shell has read that command's line and is about
+   *   to source its file. It marks the current command as started, and it
+   *   releases the files of every command written before it: the shell has
+   *   read past their lines, which ran (their files already sourced),
+   *   were cut short by an interrupt, or were taken as input by a reader. None
+   *   of those files can be sourced again.
+   * - An exit marker means the shell has finished sourcing that command's
+   *   file, which is released; the current command then completes.
+   * Runs whether or not a command is current, so a timed-out command that ends
+   * while the session is idle still releases its file. Only the tail of the
+   * buffer around the newest chunk is scanned: a full-buffer scan per chunk is
+   * O(n²) on chatty commands.
    */
   private checkCommandCompletion(session: SessionInfo, latestChunk: string): void {
     if (session.pendingFiles.size === 0 && !session.currentCommand) return;
@@ -536,8 +544,15 @@ export class PersistentSessionServer extends EventEmitter {
     while ((match = markers.exec(scanWindow)) !== null) {
       const current = session.currentCommand;
       if (match[1] !== undefined) {
-        // A start marker: the shell is about to source that command's file.
-        if (current && match[1] === current.nonce) current.started = true;
+        const started = match[1];
+        if (current && started === current.nonce) current.started = true;
+        if (session.pendingFiles.has(started)) {
+          for (const [earlier, file] of session.pendingFiles) {
+            if (earlier === started) break;
+            session.pendingFiles.delete(earlier);
+            this.removeTempFile(file);
+          }
+        }
         continue;
       }
       const nonce = match[2];
@@ -594,9 +609,12 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * Record an issued command's nonce and typed path for plumbing filters.
-   * Bounded so a long-lived session cannot grow these without limit: the
-   * oldest settled commands are forgotten first. A command still pending is
-   * kept, since its echo and late marker must still be recognized.
+   * Settled commands are kept up to 1024, the oldest forgotten first. A command
+   * still pending is kept beyond that, since its echo and late markers must
+   * still be recognized. Pending commands are the lines the shell hasn't read
+   * past (see pendingFiles), so they accumulate only while commands keep being
+   * written that the shell never reads as commands: typed behind a reader that
+   * takes them as its input.
    */
   private rememberIssued(session: SessionInfo, nonce: string, typedPath: string): void {
     session.issued.set(nonce, typedPath);
@@ -615,7 +633,7 @@ export class PersistentSessionServer extends EventEmitter {
    * Persist a command body to a temp file and return the single-line shell
    * command that runs it in the current shell (preserving cwd/env).
    * The file is tracked on the session under the command's nonce until the
-   * shell reports that nonce's marker (or the PTY exits).
+   * shell is done with it (see pendingFiles).
    */
   private writeCommandViaTempFile(session: SessionInfo, nonce: string, command: string): string {
     // Short name: the echoed wrapper line should fit the terminal width when
@@ -642,9 +660,10 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * Remove every temp file still pending on the session. Only for when the
-   * shell can no longer source them: the PTY has exited or the session is
-   * being removed. A command whose marker never appears (an interrupted line,
-   * an `exit` inside a nested shell) keeps its file until then.
+   * shell can no longer source them: the PTY has exited, or the session or the
+   * server is going away. Before that, a command whose exit marker never
+   * appears (an interrupted line, an `exit` inside a nested shell) keeps its
+   * file until a later command starts.
    */
   private cleanupTempFiles(session: SessionInfo): void {
     for (const file of session.pendingFiles.values()) this.removeTempFile(file);
