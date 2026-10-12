@@ -159,8 +159,6 @@ export class PersistentSessionServer extends EventEmitter {
   private readonly maxLogSize = 10000; // lines per session
   private readonly maxOutputBufferSize = 100 * 1024 * 1024; // 100MB max buffer size
   private readonly defaultCommandTimeout = 30000; // 30 seconds default
-  private readonly exitCodeMarker = '<<<EXIT:';
-  private readonly exitCodeEnd = '>>>';
   private tempFileCounter = 0;
 
   /**
@@ -395,8 +393,28 @@ export class PersistentSessionServer extends EventEmitter {
       return;
     }
 
-    session.isProcessingCommand = true;
     const currentCommand = session.commandQueue.shift()!;
+
+    // Write the body to its temp file before anything marks the session busy.
+    // A write that fails (a missing temp directory, a full disk, a name that's
+    // taken) fails this command alone, and the queue moves on.
+    let source: string;
+    try {
+      source = this.writeCommandViaTempFile(session, currentCommand.nonce, currentCommand.command);
+    } catch (err) {
+      const reason = `[command not run: could not write its temp file: ${(err as Error).message}]`;
+      this.addLog(session, `$ ${currentCommand.command}`);
+      this.addLog(session, reason);
+      currentCommand.resolve({
+        output: reason,
+        exitCode: -1,
+        duration: Date.now() - currentCommand.startTime
+      });
+      this.processCommandQueue(session);
+      return;
+    }
+
+    session.isProcessingCommand = true;
     session.currentCommand = currentCommand;
 
     // Clear output buffer
@@ -411,8 +429,9 @@ export class PersistentSessionServer extends EventEmitter {
       startedAt: new Date(currentCommand.startTime)
     });
 
-    // Write the command and its start and exit-code markers as ONE line:
-    //   echo "<<<START:<nonce>>>>"; . '<tempfile>'; echo "<<<EXIT:<nonce>:$?>>>"
+    // Write the command and its start and exit-code markers as ONE line,
+    //   echo "<<<STAR""T:<nonce>>>"; . '<tempfile>'; echo "<<<EXI""T:<nonce>:$?>>>"
+    // which the shell runs to print <<<START:<nonce>>> and <<<EXIT:<nonce>:<status>>>.
     //
     // The two markers bound the command's own output by execution evidence:
     // the shell prints the start marker immediately before sourcing the file
@@ -442,9 +461,8 @@ export class PersistentSessionServer extends EventEmitter {
     //   - The per-command nonce means stale markers from a timed-out earlier
     //     command can't resolve (and corrupt) a later one.
     session.shell.write(
-      `echo "<<<STAR""T:${currentCommand.nonce}${this.exitCodeEnd}"; ` +
-      this.writeCommandViaTempFile(session, currentCommand.nonce, currentCommand.command) +
-      `; echo "<<<EXI""T:${currentCommand.nonce}:$?${this.exitCodeEnd}"\n`
+      `echo "<<<STAR""T:${currentCommand.nonce}>>>"; ${source}; ` +
+      `echo "<<<EXI""T:${currentCommand.nonce}:$?>>>"\n`
     );
 
     // Set up fallback timeout
@@ -641,14 +659,22 @@ export class PersistentSessionServer extends EventEmitter {
    * shell is done with it (see pendingFiles).
    */
   private writeCommandViaTempFile(session: SessionInfo, nonce: string, command: string): string {
-    // Short name: the echoed wrapper line should fit the terminal width when
-    // possible (soft-wrapped echoes are much harder to filter from output).
-    const file = path.join(
-      os.tmpdir(),
-      `tsm-cmd-${process.pid}-${++this.tempFileCounter}.sh`
-    );
-    // Trailing newline so the final line is terminated even if the caller omitted it.
-    fs.writeFileSync(file, command.endsWith('\n') ? command : command + '\n', { mode: 0o600 });
+    // The name carries the nonce, whose random part keeps it from being
+    // guessed ahead of time, and 'wx' creates the file exclusively: it never
+    // follows a link or reuses a file someone else made, and a name that's
+    // taken fails the command instead. The name is short to keep the echoed
+    // wrapper short; with a long temp directory (macOS's) the echo still wraps
+    // at 120 columns, which the wrap-tolerant patterns above allow for.
+    const file = path.join(os.tmpdir(), `tsm-cmd-${process.pid}-${nonce}.sh`);
+    try {
+      // Trailing newline so the final line is terminated even if the caller omitted it.
+      fs.writeFileSync(file, command.endsWith('\n') ? command : command + '\n', { mode: 0o600, flag: 'wx' });
+    } catch (err) {
+      // A write that failed after creating the file (a full disk) leaves a
+      // partial file that is ours to remove; a file that already existed isn't.
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') this.removeTempFile(file);
+      throw err;
+    }
     session.pendingFiles.set(nonce, file);
     // On Windows the shell is WSL but the temp file lives on the host
     // filesystem — translate C:\Users\... to /mnt/c/Users/... so the shell

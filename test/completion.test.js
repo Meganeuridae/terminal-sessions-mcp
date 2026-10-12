@@ -202,6 +202,26 @@ test('the server process removes pending temp files when it exits', () => {
   assert.deepStrictEqual(fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(`tsm-cmd-${report.pid}-`)), []);
 });
 
+test('a command whose temp file cannot be written fails alone, and the session stays usable', async () => {
+  await server.createSession('t-nowrite');
+  const saved = process.env.TMPDIR;
+  process.env.TMPDIR = path.join(os.tmpdir(), `tsm-missing-${process.pid}`);
+  let failed;
+  const start = Date.now();
+  try {
+    failed = await server.execCommand('t-nowrite', 'printf NEVER', 8000);
+  } finally {
+    if (saved === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = saved;
+  }
+  assert.strictEqual(failed.exitCode, -1);
+  assert.match(failed.output, /could not write its temp file/);
+  assert.ok(Date.now() - start < 3000, 'it fails at once rather than at its timeout');
+  const after = await server.execCommand('t-nowrite', 'printf AFTER_OK', 8000);
+  assert.strictEqual(after.exitCode, 0);
+  assert.match(after.output, /AFTER_OK/);
+});
+
 /** Complete output lines the server emitted for one session, as output events carry them. */
 function collectEventLines(sessionId) {
   const lines = [];
