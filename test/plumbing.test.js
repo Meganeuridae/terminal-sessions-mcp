@@ -44,3 +44,43 @@ test("a command's file is created exclusively: never through a link, never into 
     fs.rmSync(target, { force: true });
   }
 });
+
+/** The line the server types for a command, as processCommandQueue writes it. */
+const typedLine = (nonce, file) => `echo "<<<STAR""T:${nonce}>>>"; . '${file}'; echo "<<<EXI""T:${nonce}:$?>>>"`;
+// What readline writes where an echoed line soft-wraps: bash 3.2 on macOS
+// writes a space and a carriage return; a cursor-moving escape stands for
+// the other form the patterns allow.
+const ARTIFACTS = [' \r', '\r', '\x1b[1C'];
+
+test('a wrapper echo soft-wrapped at any point, seams included, is removed and the text beside it stays', () => {
+  const server = bareServer();
+  const session = bareSession();
+  const nonce = 'k3x9q2a', file = '/tmp/tsm-cmd-4242-k3x9q2a.sh';
+  server.rememberIssued(session, nonce, file);
+  const line = typedLine(nonce, file);
+  assert.equal(server.stripPlumbingSpans(session, `BEFORE${line}AFTER`), 'BEFOREAFTER');
+  const missed = [];
+  for (const artifact of ARTIFACTS) {
+    for (let cut = 1; cut <= line.length; cut++) {
+      const wrapped = line.slice(0, cut) + artifact + line.slice(cut);
+      if (server.stripPlumbingSpans(session, `BEFORE${wrapped}AFTER`) !== 'BEFOREAFTER') missed.push({ artifact, cut, at: line.slice(cut - 3, cut + 3) });
+    }
+  }
+  assert.deepEqual(missed, []);
+  // A narrow terminal wraps the echo several times.
+  for (const width of [17, 23, 30]) {
+    let wrapped = '';
+    for (let i = 0; i < line.length; i += width) wrapped += line.slice(i, i + width) + (i + width < line.length ? ' \r' : '');
+    assert.equal(server.stripPlumbingSpans(session, `BEFORE${wrapped}AFTER`), 'BEFOREAFTER', `wrapped every ${width} columns`);
+  }
+});
+
+test("a wrapper echo with a nonce and path the server never issued is output, wrapped or not", () => {
+  const server = bareServer();
+  const session = bareSession();
+  server.rememberIssued(session, 'k3x9q2a', '/tmp/tsm-cmd-4242-k3x9q2a.sh');
+  const other = typedLine('zz11yy2', '/tmp/tsm-cmd-4242-zz11yy2.sh');
+  assert.equal(server.stripPlumbingSpans(session, other), other);
+  const wrapped = other.slice(0, 20) + ' \r' + other.slice(20);
+  assert.equal(server.stripPlumbingSpans(session, wrapped), wrapped);
+});

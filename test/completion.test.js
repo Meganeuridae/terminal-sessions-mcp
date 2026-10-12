@@ -342,7 +342,11 @@ test("a timed-out command's partial tail survives the next wrapper's echo in log
 test('a wrapper echo soft-wrapped mid-part leaves no plumbing in logs or output events', async () => {
   // A narrow terminal makes the shell's echo of the typed wrapper wrap inside
   // its parts (on macOS a long temp directory does this even at 120 columns).
-  await server.createSession('t-wrap');
+  // Where bash writes no wrap artifact, as on Linux, this passes without the
+  // patterns' tolerance too; the plumbing unit tests feed the artifacts
+  // directly. The session starts in / so that a prompt showing a checkout
+  // path with "tsm-" in it can't look like a wrapper fragment.
+  await server.createSession('t-wrap', { cwd: '/' });
   server.resizeSession('t-wrap', 30, 30);
   const events = collectEventLines('t-wrap');
   const result = await server.execCommand('t-wrap', 'echo WRAPPED', 8000);
