@@ -27,9 +27,11 @@
     resolve the *next* command with the wrong exit code and mangled output.
     Nonces make stale markers inert (and they're stripped from output).
 
-  A command that replaces the shell (`exec bash`) or exits a nested shell
-  (`exit` sent to a `bash` an earlier command started) still prints no exit
-  marker of its own and waits for its timeout.
+  A command that replaces the shell (`exec bash`) still prints no exit marker
+  of its own and waits for its timeout. One that exits a shell an earlier
+  command started (`exit` sent to ssh's remote shell or a nested `bash`)
+  ends when that earlier command's line does, with the status that line ends
+  with: ssh's, when ssh ends it, which ssh takes from the remote shell.
 - **Every `runCommand` command goes through the temp-file path** (not just
   multi-line ones), which also fixes single-line commands longer than the
   tty's canonical-mode line buffer (1024 bytes on macOS) being silently

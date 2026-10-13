@@ -476,7 +476,7 @@ test('a shell that dies with a marker still waiting for its newline leaves nothi
   assert.strictEqual(session.scanCarry, '');
 });
 
-test("a shell in front that can't read the temp files gets each body typed inline", async () => {
+test("a shell in front that can't read the temp files gets each body typed inline, and its exit ends the command that exited it", async () => {
   const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
   // A nested bash whose `.` and `[ -r` fail as they would in a shell that
   // can't see this machine's temp directory, such as a remote one ssh opened.
@@ -502,6 +502,13 @@ test("a shell in front that can't read the temp files gets each body typed inlin
     assert.match(tooLong.output, /^\[command not run: the shell in front can't read this machine's temp files, and typed in, this command would be a line over 1000 bytes/);
     assert.ok(!raw.join('').includes('B'.repeat(200)), 'the long body never reached the terminal');
     assert.strictEqual(cleanTerminalOutput((await server.execCommand('t-remote', 'echo "level=$SHLVL"', 8000)).output).trim(), `level=${level + 1}`);
+    // `exit` prints no exit marker of its own; the line that started the
+    // nested shell prints one when it ends, with the status that ends it.
+    // A timeout would give -1.
+    const exited = await server.execCommand('t-remote', 'exit 4', 8000);
+    assert.strictEqual(exited.exitCode, 4);
+    const back = await server.execCommand('t-remote', 'echo "level=$SHLVL"', 8000);
+    assert.strictEqual(cleanTerminalOutput(back.output).trim(), `level=${level}`);
     assert.ok(raw.join('').includes('eval "unset __tsm_'), 'the bodies were typed inline');
     // The `$ <command>` lines show each command as the caller sent it.
     const logs = server.getOutput('t-remote').filter(l => !l.startsWith('$ '));
@@ -526,4 +533,6 @@ test('a nested shell that can read the temp files runs each command from its fil
   assert.strictEqual(long.exitCode, 0);
   assert.strictEqual(cleanTerminalOutput(long.output).trim(), 'length=20000');
   assert.ok(!raw.join('').includes('A'.repeat(200)), 'the body never reached the terminal');
+  // Its exit ends with the nested shell; a timeout would give -1.
+  assert.strictEqual((await server.execCommand('t-local-nested', 'exit', 8000)).exitCode, 0);
 });

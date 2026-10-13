@@ -12,7 +12,7 @@ const { PersistentSessionServer } = require('../dist/src/server/session-server-v
 const bareServer = () => Object.create(PersistentSessionServer.prototype);
 const bareSession = () => ({
   issued: new Map(), issuedPaths: new Set(), pendingFiles: new Map(),
-  typedInline: new Set(), scanCarry: '', awaitingMarkers: [], logs: []
+  unfinished: new Map(), typedInline: new Set(), scanCarry: '', awaitingMarkers: [], logs: []
 });
 
 test('remembered commands: at most 1024, the oldest settled ones forgotten first, never a pending one', () => {
@@ -29,16 +29,19 @@ test('remembered commands: at most 1024, the oldest settled ones forgotten first
   assert.ok(session.issued.has('n1099'));
 });
 
-test('a forgotten command takes its typed-inline mark with it', () => {
+test('an unfinished command is remembered past the limit, and a forgotten one takes its typed-inline mark with it', () => {
   const server = bareServer();
   const session = bareSession();
+  // n0 started a shell that hasn't exited, so its exit marker is still to come.
+  session.unfinished.set('n0', true);
   for (let i = 0; i < 1100; i++) {
     session.typedInline.add(`n${i}`);
     server.rememberIssued(session, `n${i}`, `/tmp/f${i}`);
   }
   assert.equal(session.issued.size, 1024);
+  assert.ok(session.issued.has('n0'), 'an unfinished command is never forgotten');
   assert.equal(session.typedInline.size, 1024, 'the marks go with their commands');
-  assert.ok(!session.typedInline.has('n75') && session.typedInline.has('n76'));
+  assert.ok(session.typedInline.has('n0') && !session.typedInline.has('n1'));
 });
 
 test("a command's file is created exclusively: never through a link, never into a file that exists", () => {
@@ -240,9 +243,10 @@ test('a body whose line would pass 1,000 bytes, whose file alone does, or whose 
     assert.match(session.logs.at(-1), /a line over 1000 bytes \(1001 bytes, \d+ of them the body escaped for printf\), which a shell can cut short/, 'one byte more is refused');
     assert.ok(!fs.existsSync(files[1]) && !session.pendingFiles.has('nb'));
     // Under the limit as bytes, over it escaped: each non-ASCII byte takes five.
+    session.unfinished.set('nc', false);
     pending('nc', 'echo ' + '\u00e9'.repeat(200));
     scan(server, session, '<<<NOFILE:nc>>>\r\n');
-    assert.ok(!session.pendingFiles.has('nc'));
+    assert.ok(!session.pendingFiles.has('nc') && !session.unfinished.has('nc'));
     // A newline takes two: 400 of them fit.
     pending('nd', 'true' + '\n'.repeat(400));
     scan(server, session, '<<<NOFILE:nd>>>\r\n');
@@ -392,15 +396,18 @@ test("a gone marker gives up on its command once, its file pending or already re
   const server = bareServer();
   const session = { ...bareSession(), outputBuffer: '', shell: { write() {} }, currentCommand: undefined };
   const file = pendingFile(session, 'ng', 'echo G\n');
+  session.unfinished.set('ng', false);
   session.typedInline.add('ng');
   // nk's file is gone already: a later command's start marker released it.
+  session.unfinished.set('nk', false);
   session.typedInline.add('nk');
   session.issued.set('nk', '/tmp/nk');
   try {
     scan(server, session, '<<<GONE:ng>>>\r\n');
-    assert.ok(!fs.existsSync(file) && !session.pendingFiles.has('ng'));
+    assert.ok(!fs.existsSync(file) && !session.pendingFiles.has('ng') && !session.unfinished.has('ng'));
     assert.match(session.logs.at(-1), /its body's line reached a shell other than the one that asked for it, so nothing ran/);
     scan(server, session, '<<<GONE:nk>>>\r\n');
+    assert.ok(!session.unfinished.has('nk'));
     assert.equal(session.logs.length, 2);
     scan(server, session, '<<<GONE:ng>>>\r\n<<<GONE:nk>>>\r\n'); // printed again: nothing more
     assert.equal(session.logs.length, 2);
@@ -408,5 +415,24 @@ test("a gone marker gives up on its command once, its file pending or already re
     assert.equal(server.stripPlumbingSpans(session, 'A<<<GONE:ng>>>\r\nB'), 'AB', 'the printed marker is plumbing');
   } finally {
     fs.rmSync(file, { force: true });
+  }
+});
+
+test("an exit marker takes its command, and the started ones written after it, out of the unfinished, with their files", () => {
+  const server = bareServer();
+  // w started a shell; x and c ran in it; y was written after w but hasn't
+  // started, so the shell that printed w's marker may read it next.
+  const session = { ...bareSession(), currentCommand: { nonce: 'c' } };
+  session.unfinished = new Map([['a', true], ['w', true], ['x', true], ['y', false], ['c', true]]);
+  const files = ['x', 'y', 'c'].map((nonce) => pendingFile(session, nonce, 'true\n'));
+  try {
+    assert.equal(server.finishUnfinished(session, 'w'), true, 'the current command ran in the shell that exited');
+    assert.deepEqual([...session.unfinished.keys()], ['a', 'y']);
+    assert.deepEqual([...session.pendingFiles.keys()], ['y'], 'the files of the commands that went go with them');
+    assert.deepEqual(files.map((file) => fs.existsSync(file)), [false, true, false]);
+    assert.equal(server.finishUnfinished(session, 'a'), false, 'the current command is no longer unfinished');
+    assert.deepEqual([...session.unfinished.keys()], ['y']);
+  } finally {
+    for (const file of files) fs.rmSync(file, { force: true });
   }
 });

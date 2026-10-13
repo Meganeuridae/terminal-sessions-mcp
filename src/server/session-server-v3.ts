@@ -51,6 +51,16 @@ interface SessionInfo {
   // carrying any other nonce is output and is never filtered.
   issued: Map<string, string>;
   issuedPaths: Set<string>;
+  // Commands written to this shell whose exit marker hasn't arrived, in the
+  // order they were written, each with whether it has started. An earlier
+  // command's exit marker ends the started ones written after it, which ran
+  // in a shell it started (see finishUnfinished). A command given up before
+  // its body ran leaves too (see dropUntyped). One whose exit marker never
+  // prints stays: a line cut short by Ctrl-C (bash 4 and later drop the rest
+  // of it) until an earlier command's exit marker takes it out, and a
+  // typed-ahead line the interrupt discarded, which never started, for the
+  // rest of the session.
+  unfinished: Map<string, boolean>;
   // Commands whose body has been typed inline (see typeBodyInline), so a
   // marker scanned again can't type it twice; forgotten with their command
   // (see rememberIssued).
@@ -299,6 +309,7 @@ export class PersistentSessionServer extends EventEmitter {
       pendingFiles: new Map(),
       issued: new Map(),
       issuedPaths: new Set(),
+      unfinished: new Map(),
       typedInline: new Set(),
       scanCarry: '',
       awaitingMarkers: []
@@ -566,6 +577,7 @@ export class PersistentSessionServer extends EventEmitter {
     // server can't know which shell is in front: an earlier command, or input
     // sent with sendInput, may have started another one, such as a remote
     // shell ssh opened, which can't read this machine's files.
+    session.unfinished.set(currentCommand.nonce, false);
     session.shell.write(this.probeLine(currentCommand.nonce, quotedPath) + '\n');
 
     // Set up fallback timeout
@@ -645,10 +657,16 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * Resolve the current command with the given exit code. `reason` is the
-   * result's output for a command that never ran.
+   * Resolve the current command with the given exit code. `endedBy` names the
+   * command whose exit marker ended it: its own, or that of the earlier
+   * command whose shell it ran in, when that shell exited under it. `reason`
+   * is the result's output for a command that never ran.
    */
-  private resolveCommand(session: SessionInfo, exitCode: number, how: { reason?: string } = {}): void {
+  private resolveCommand(
+    session: SessionInfo,
+    exitCode: number,
+    how: { endedBy?: string; reason?: string } = {}
+  ): void {
     const currentCommand = session.currentCommand;
     if (!currentCommand) return;
 
@@ -674,11 +692,12 @@ export class PersistentSessionServer extends EventEmitter {
     //   start marker was observed before the wait ended, the result has no
     //   output of its own; the command may still begin later, and what it
     //   prints then reaches the logs and output events.
-    // - It ends at its own exit marker. What follows is the shell's next
-    //   prompt, not this command's output; a result is consumed as data. A
-    //   command that times out has no exit marker yet, so its result runs to
-    //   the end of the wait, which after an interrupted line can include the
-    //   next prompt.
+    // - It ends at its own exit marker, or, for a command that exited the shell
+    //   it ran in (`exit` typed into ssh), at the exit marker of the command
+    //   that started that shell. What follows is the shell's next prompt, not
+    //   this command's output; a result is consumed as data. A command that
+    //   times out has no exit marker yet, so its result runs to the end of the
+    //   wait, which after an interrupted line can include the next prompt.
     // Inside those bounds only issued commands' plumbing spans are removed;
     // text beside them stays, and marker-shaped text with an unknown nonce is
     // the command's own output.
@@ -691,9 +710,9 @@ export class PersistentSessionServer extends EventEmitter {
       if (start && start.index !== undefined) {
         output = output.slice(start.index + start[0].length);
       }
-      const ownExitAt = output.search(new RegExp(`<<<EXIT:${currentCommand.nonce}:\\d+>>>`));
-      if (ownExitAt !== -1) {
-        output = output.slice(0, ownExitAt);
+      const exitAt = output.search(new RegExp(`<<<EXIT:${how.endedBy ?? currentCommand.nonce}:\\d+>>>`));
+      if (exitAt !== -1) {
+        output = output.slice(0, exitAt);
       }
     }
     const cleanOutput = how.reason ?? this.stripPlumbingSpans(session, output).trim();
@@ -796,6 +815,7 @@ export class PersistentSessionServer extends EventEmitter {
     }
     if (marker.kind === 'start') {
       if (current && nonce === current.nonce) current.started = true;
+      if (session.unfinished.has(nonce)) session.unfinished.set(nonce, true);
       if (session.pendingFiles.has(nonce)) {
         for (const [earlier, file] of session.pendingFiles) {
           if (earlier === nonce) break;
@@ -810,9 +830,10 @@ export class PersistentSessionServer extends EventEmitter {
       session.pendingFiles.delete(nonce);
       this.removeTempFile(file);
     }
-    if (current && nonce === current.nonce) {
+    const endsCurrent = session.unfinished.has(nonce) && this.finishUnfinished(session, nonce);
+    if (current && (nonce === current.nonce || endsCurrent)) {
       current.started = true; // an exit marker implies the start, even if a trimmed buffer lost it
-      this.resolveCommand(session, marker.code ?? -1);
+      this.resolveCommand(session, marker.code ?? -1, { endedBy: nonce });
     }
   }
 
@@ -861,8 +882,9 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * Give up on a command whose body won't run: release its file and say why,
-   * to the caller if it is still waiting and to the log either way.
+   * Give up on a command whose body won't run: release its file, take it out
+   * of `unfinished`, since it will print no exit marker, and say why, to the
+   * caller if it is still waiting and to the log either way.
    */
   private dropUntyped(session: SessionInfo, nonce: string, reason: string): void {
     const file = session.pendingFiles.get(nonce);
@@ -870,8 +892,38 @@ export class PersistentSessionServer extends EventEmitter {
       session.pendingFiles.delete(nonce);
       this.removeTempFile(file);
     }
+    session.unfinished.delete(nonce);
     this.addLog(session, reason);
     if (session.currentCommand?.nonce === nonce) this.resolveCommand(session, -1, { reason });
+  }
+
+  /**
+   * Take a command whose exit marker just arrived out of `unfinished`: its
+   * line has finished in the shell that read it. A command written after it
+   * that has started ran in a shell this one started, which has exited too,
+   * as when `exit` is typed into ssh, so it goes as well, with its file. One
+   * that hasn't started stays, since the shell that printed the marker may
+   * read it next. Returns whether the current command was among those that
+   * went with it.
+   */
+  private finishUnfinished(session: SessionInfo, nonce: string): boolean {
+    let later = false;
+    let endsCurrent = false;
+    for (const [written, started] of session.unfinished) {
+      if (written === nonce) {
+        later = true;
+        session.unfinished.delete(written);
+      } else if (later && started) {
+        session.unfinished.delete(written);
+        const file = session.pendingFiles.get(written);
+        if (file !== undefined) {
+          session.pendingFiles.delete(written);
+          this.removeTempFile(file);
+        }
+        if (written === session.currentCommand?.nonce) endsCurrent = true;
+      }
+    }
+    return endsCurrent;
   }
 
   /**
@@ -926,11 +978,14 @@ export class PersistentSessionServer extends EventEmitter {
    * Record an issued command's nonce and typed path for plumbing filters.
    * The map holds at most 1024 commands, forgetting the oldest settled ones
    * first. A pending command (a line the shell hasn't read past, see
-   * pendingFiles) is never forgotten, since its echo and late markers must
-   * still be recognized, so the map grows past 1024 only while more than that
-   * are pending: commands keep being typed in behind one that hasn't
-   * finished, such as a long-running job or a reader that takes them as its
-   * input.
+   * pendingFiles) or an unfinished one (no exit marker yet, see unfinished)
+   * is never forgotten, since its echo and late markers must still be
+   * recognized, so the map grows past 1024 only while more than that are
+   * pending or unfinished: commands keep being typed in behind one that
+   * hasn't finished, such as a long-running job, a reader that takes them as
+   * its input, or a shell that an earlier command started. A command whose
+   * exit marker never prints stays unfinished, and remembered, for the rest of
+   * the session.
    */
   private rememberIssued(session: SessionInfo, nonce: string, typedPath: string): void {
     session.issued.set(nonce, typedPath);
@@ -939,7 +994,7 @@ export class PersistentSessionServer extends EventEmitter {
     if (session.issued.size <= limit) return;
     for (const [old, oldPath] of session.issued) {
       if (session.issued.size <= limit) break;
-      if (session.pendingFiles.has(old)) continue;
+      if (session.pendingFiles.has(old) || session.unfinished.has(old)) continue;
       session.issued.delete(old);
       session.issuedPaths.delete(oldPath);
       session.typedInline.delete(old);
