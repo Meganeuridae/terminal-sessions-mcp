@@ -178,19 +178,24 @@ const START_ECHO = new RegExp(
   wrapTolerant('echo "<<<STAR""T:') + NONCE + wrapTolerant('>>>"') + `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
 const SOURCE_ECHO = new RegExp(
   wrapTolerant(". '") + "([^']*)'" + `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
+// A typed line that ends exactly at the terminal's right edge is followed by
+// readline moving the cursor back and writing the line's last character again
+// (bash 5.2: ` \r`, ESC[A, ESC[C repeated, ESC[K, then the character), so the
+// patterns for a line's last part take that character once more.
+const lastAgain = (character: string) => `(?:(?:${WRAP_ONE})+${character})?`;
 const EXIT_ECHO = new RegExp(
-  wrapTolerant('echo "<<<EXI""T:') + NONCE + wrapTolerant(':$?>>>"') + `${WRAP}(\\r?\\n)?`, 'g');
+  wrapTolerant('echo "<<<EXI""T:') + NONCE + wrapTolerant(':$?>>>"') + lastAgain('"') + `${WRAP}(\\r?\\n)?`, 'g');
 // The parts a probe line (see probeLine) and an inline line (see inlineLine)
 // add around a wrapper.
 const PROBE_HEAD = new RegExp(
   wrapTolerant("if [ -r '") + "([^']*)'" + WRAP + wrapTolerant(' ]; then ') + WRAP, 'g');
 const PROBE_TAIL = new RegExp(
   wrapTolerant('; else __tsm_') + NONCE + wrapTolerant('=$$; echo "<<<NOFIL""E:') + `(?:[0-9a-z]|${WRAP_ONE})+` +
-  wrapTolerant('>>>"; fi') + `${WRAP}(\\r?\\n)?`, 'g');
+  wrapTolerant('>>>"; fi') + lastAgain('i') + `${WRAP}(\\r?\\n)?`, 'g');
 const INLINE_IF = new RegExp(
   wrapTolerant('if [ "${__tsm_') + NONCE + wrapTolerant('-}" = "$$" ]; then ') + WRAP, 'g');
 const INLINE_TAIL = new RegExp(
-  wrapTolerant('; else echo "<<<GON""E:') + NONCE + wrapTolerant('>>>"; fi') + `${WRAP}(\\r?\\n)?`, 'g');
+  wrapTolerant('; else echo "<<<GON""E:') + NONCE + wrapTolerant('>>>"; fi') + lastAgain('i') + `${WRAP}(\\r?\\n)?`, 'g');
 const ASSIGN_ECHO = new RegExp(
   wrapTolerant('__tsm_') + NONCE + WRAP + '=' + WRAP + "'[^']*'" + `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
 const EVAL_ECHO = new RegExp(

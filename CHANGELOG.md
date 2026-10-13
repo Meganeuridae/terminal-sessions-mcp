@@ -76,8 +76,9 @@
   plumbing is removed, and only its spans: output sharing a line with it
   (text without a trailing newline, a timed-out command's late tail) stays,
   marker-shaped text from anywhere else is output, and a wrapper echo
-  soft-wrapped at the terminal's edge (bash 3.2 on macOS) is still
-  recognized. A line typed ahead behind a busy shell is echoed as it's typed, and output
+  soft-wrapped at the terminal's edge (bash 3.2 on macOS), or ending exactly
+  at it (where bash 5 redraws its last character), is still recognized. A
+  line typed ahead behind a busy shell is echoed as it's typed, and output
   the shell prints meanwhile can break that echo across lines; pieces of it
   then stay in the logs. An output event's `chunk` stays the raw terminal
   stream.

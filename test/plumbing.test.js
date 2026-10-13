@@ -107,6 +107,10 @@ test('every typed line, soft-wrapped at any point, seams included, is removed an
       for (let i = 0; i < line.length; i += width) wrapped += line.slice(i, i + width) + (i + width < line.length ? ' \r' : '');
       assert.equal(server.stripPlumbingSpans(session, `BEFORE${wrapped}AFTER`), 'BEFOREAFTER', `${form} wrapped every ${width} columns`);
     }
+    // A line ending exactly at the right edge: bash 5.2's readline moves the
+    // cursor back up and writes the line's last character again.
+    const atEdge = line + ' \r\x1b[A' + '\x1b[C'.repeat(119) + '\x1b[K' + line.at(-1) + '\r\n';
+    assert.equal(server.stripPlumbingSpans(session, `BEFORE${atEdge}AFTER`), 'BEFOREAFTER', `${form} ending at the edge`);
   }
 });
 
