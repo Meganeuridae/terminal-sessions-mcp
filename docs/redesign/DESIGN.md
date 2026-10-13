@@ -325,10 +325,8 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   never executes twice; a retried `run` or `start` is the same Run, awaited again, also
   after a daemon restart (the key's identity is journaled on `run.admit`) and after the
   session was forgotten (the first outcome is returned). A key reused for a different tool
-  or with different arguments is refused, including after restart for journaled `run` and
-  `start` admissions: key identity and operation fingerprint are stored separately.
-  Earlier journals that stored only a combined hash still recover identical retries, but
-  cannot detect conflicting uses of those old keys. A call that admitted nothing (`busy`) is not
+  or with different arguments is refused, also after a restart: the journaled identity keeps
+  the key apart from the tool and the arguments' fingerprint. A call that admitted nothing (`busy`) is not
   remembered, so its retry can run. The memory is bounded per principal and in total, oldest
   evicted first. A client never blindly resends input after an ambiguous outcome.
 - **G17.** A session has at most one controller at a time. Observers may not type, signal,
@@ -525,6 +523,11 @@ starting/busy ── unverified replacement ──► unavailable ──► exit
 The state describes the shell terminal only and is derived from marks, the emulator's
 alternate-screen flag, and PTY exit — never from timers. `idle` requires an observed prompt
 (G4, G5), which is what lets a queue advance safely and what the presence line reports.
+`unavailable` needs evidence too: the shell process's own command line changed (an `exec`
+the integration announced, or one during startup) and no handshake followed within the
+startup cap. A timer alone never makes a terminal ready, and nothing but a new shell leaves
+`unavailable`: shell Runs are refused (queued ones wait, or are cancelled), while `input`
+and `screen` keep working on whatever program is in front.
 
 ---
 
@@ -1099,6 +1102,21 @@ can load another terminal's shell integration (Ghostty), hence keyed marks; the 
 digest forbids `=` in declared identifiers, hence bare tag classes for statuses; a
 `/tmp` directory can vanish under a cleaner, hence the command directory's fallback.
 
+**Review round (2026-10-13).** An external review of the draft PR tried combinations of
+failures rather than single edge cases, and found five places where a heuristic had become
+authoritative evidence or a contract was not upheld through a failure: a replaced shell was
+declared `idle` and the queue drained into the replacement (G4); the exec handoff exported
+the mark key to every child of a line containing the word `exec`, so a child could forge a
+completion; a refused completion notification stopped pinning `delivered` (G22); after a
+restart, a key reused with other arguments executed (G16); process output was promised
+byte-exact but decoded. All five are fixed above with the reviewer's reproducers as tests:
+the `unavailable` state (§7), the private key file and launcher (§7, "Marks are
+authenticated"), retried deliveries with the same message id (G22), the journaled key
+identity (G16), and the narrower output promise (G7, G10, §8.2). Open from the same round:
+a shell the caller knows to be in front (after `ssh host`, or after an `exec` into a shell
+without our integration) has no way to receive shell Runs other than a new session; the
+declared-shell proposal (§18) would serve both cases and is the planned route.
+
 **Milestone 0 — close the old line.** Land upstream PRs #7, #8, #9; publish 1.7.0; move
 the repository under `anima-research`. Nothing below depends on these, but they stop the
 bleeding for deployed agents.
@@ -1204,6 +1222,17 @@ protocol tests; the application API schema is the shared artifact both build to.
    turns "a session has a terminal" into "a session has terminals". Milestone 3 assumes
    yes; the alternative is that anything needing a tty is a shell Run, forever, which is
    simpler and may be enough.
+8. **A declared shell.** After `ssh host`, or after an `exec` into a shell without our
+   integration, the program in front is a shell the caller knows about but the daemon has no
+   evidence for: shell Runs queue behind the `ssh` Run (G4) or are refused as `unavailable`,
+   and only `input` and `screen` reach it. Teams' work over ssh is extensive, so a route is
+   wanted for 2.0. Proposal (also made for 1.x on upstream #7): the caller declares "the
+   program in front is a shell", naming its flavour; commands to a declared shell travel
+   inline (no local command file, which the remote cannot read), bounded by the marker
+   strategy with a per-command nonce, in pieces short enough for any line discipline; the
+   declared layer ends when the Run that opened it ends. Without a declaration, refusal
+   while busy stays the default. The alternative is a `termd` on the remote machine with a
+   forwarded port, which gives full semantics but needs an install there.
 
 ---
 
@@ -1213,7 +1242,7 @@ protocol tests; the application API schema is the shared artifact both build to.
 type JournalEvent =
   | { seq; ts; type: 'output';      data: string; runId?; stream: 'pty'|'stdout'|'stderr'; attribution?: 'exact'|'temporal' }
   | { seq; ts; type: 'input';       data: string; principal; kind: 'text'|'keys'|'paste'|'protocol-reply'; sensitive?: true; runId? }
-  | { seq; ts; type: 'run.admit';   runId; target: 'shell'|'process'; line?|argv?; principal; queued: boolean }
+  | { seq; ts; type: 'run.admit';   runId; target: 'shell'|'process'; line?|argv?; principal; queued: boolean; idem? }  // idem: key identity (G16)
   | { seq; ts; type: 'run.start';   runId; cwd; line?; envBasis?: 'configured'|'snapshot' }   // C mark, or spawn
   | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs }
   | { seq; ts; type: 'service';     runId; status: 'ready'|'unhealthy'|'exited'; probe; evidence? }

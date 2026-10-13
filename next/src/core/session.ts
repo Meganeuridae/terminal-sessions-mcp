@@ -16,7 +16,7 @@ import type { ExecutionBackend, ProcessHandle, PtyExit, PtyHandle } from '../bac
 import { configuredEnv, historyIsolationEnv, parseEnvNul, redactSnapshot, type EnvSnapshot } from './env.js';
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
-import { CLEAR_LINE_KEYS, MARK_KEY_ENV, MarksParser, type Mark } from './marks.js';
+import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
 import { project, type ProjectChunk } from './transcript.js';
@@ -55,7 +55,11 @@ export interface SessionOptions {
   rows?: number;
   backend: ExecutionBackend;
   journal: Journal;
-  /** Integration setup from `prepareIntegration`; omit for none. */
+  /**
+   * Integration setup from `prepareIntegration`; omit for none. The mark key never enters the
+   * shell's environment: it reaches the backend out of band (`bootstrap`), and the launcher
+   * writes it to a private file the integration reads. Without a key one is generated.
+   */
   integration?: { args: string[]; env: Record<string, string>; key?: string; launcher?: string };
   /** How long to wait for the integration's handshake before declaring `none` (G5). */
   integrationGraceMs?: number;
@@ -381,7 +385,7 @@ export class Session {
     this.safeId = this.id.replace(/[^a-zA-Z0-9_-]/g, '_');
     this.histFile = path.join(this.tempDir, `tsm-history-${this.safeId}`);
     this.configured = configuredEnv(opts.daemonEnv ?? process.env, opts.env ?? {});
-    this.markKey = opts.integration?.key || opts.integration?.env[MARK_KEY_ENV] || randomBytes(16).toString('hex');
+    this.markKey = opts.integration?.key || randomBytes(16).toString('hex');
     this.marks = new MarksParser(this.markKey);
     this.flavor = flavorOf(opts.shell);
     this.screen = new Screen({ cols: opts.cols ?? 120, rows: opts.rows ?? 30 });
@@ -423,8 +427,7 @@ export class Session {
     }
     const args = [...(this.opts.shellArgs ?? [])];
     if (integrated) {
-      Object.assign(env, this.opts.integration!.env, { [MARK_KEY_ENV]: this.markKey, TSM_HISTFILE: this.histFile });
-      if (this.opts.integration!.launcher) delete env[MARK_KEY_ENV];
+      Object.assign(env, this.opts.integration!.env, { TSM_HISTFILE: this.histFile });
       if (login && kind === 'bash') env.TSM_LOGIN = '1';
       if (login && (kind === 'zsh' || kind === 'fish')) args.push('-l');
       // ss-7: login files (macOS path_helper, fish's login config) and the user's rc reorder
@@ -433,7 +436,8 @@ export class Session {
       args.push(...this.opts.integration!.args);
     }
     const launcher = this.opts.integration?.launcher;
-    this.pty = this.backend.spawnShell({ shell: this.opts.shell, args, cwd: this.opts.cwd, env, cols: this.screen.cols, rows: this.screen.rows, ...(launcher && { bootstrap: { launcher, key: this.markKey } }) });
+    const bootstrap = integrated ? { key: this.markKey, ...(launcher && { launcher }) } : undefined;
+    this.pty = this.backend.spawnShell({ shell: this.opts.shell, args, cwd: this.opts.cwd, env, cols: this.screen.cols, rows: this.screen.rows, ...(bootstrap && { bootstrap }) });
     this.pty.onData((d) => this.onPtyData(d));
     this.pty.onExit((e) => this.onPtyExit(e));
     // G25: the daemon's emulator is the sole responder to terminal queries.

@@ -11,8 +11,12 @@ export interface SpawnShellOptions {
   env: Record<string, string>;
   cols: number;
   rows: number;
-  /** Private shell bootstrap; the credential is backend configuration, never child env. */
-  bootstrap?: { launcher: string; key: string };
+  /**
+   * The integration's mark key, out of band: never part of the child's environment. With a
+   * `launcher`, the backend starts it (`/bin/sh launcher shell args…`) and it writes the key to
+   * a private file for the shell's PID before exec'ing the shell.
+   */
+  bootstrap?: { key: string; launcher?: string };
 }
 
 export interface PtyExit {

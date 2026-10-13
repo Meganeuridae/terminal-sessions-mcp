@@ -10,8 +10,8 @@ export const BASH_RC = `__tsm_st0=$?
 # (VS Code's technique: /etc/profile, then the first of ~/.bash_profile,
 # ~/.bash_login, ~/.profile), otherwise sources ~/.bashrc, then installs the hooks
 # that emit the session's marks. Every mark ends in ";k=<key>": the key arrives in
-# a private file for this PID (legacy custom setups can supply TSM_MARK_KEY).
-# It stays unexported, so ordinary children and nested shells do not inherit it.
+# a private file named for this PID, read and removed here, never in the environment.
+# It stays unexported, so children and nested shells cannot inherit it.
 #
 # The hooks never trip the user's set -e / set -u, chain a DEBUG trap the rc
 # installed, join bash-preexec's arrays when it is loaded, and heal themselves when
@@ -42,11 +42,8 @@ __tsm_before_key_opts=$-
 set +a
 unset __tsm_key
 __tsm_key=
-if [ -n "$\{TSM_MARK_KEY-}" ] && { [ -z "$\{TSM_MARK_PID-}" ] || [ "$\{TSM_MARK_PID-}" = "$$" ]; }; then
-  __tsm_key=$TSM_MARK_KEY
-elif [ -r "$__tsm_dir/key-$$" ]; then
+if [ -r "$__tsm_dir/key-$$" ]; then
   IFS= builtin read -r __tsm_key < "$__tsm_dir/key-$$"
-  export -n __tsm_key
   /bin/rm -f -- "$__tsm_dir/key-$$"
 fi
 export -n __tsm_key
@@ -71,7 +68,7 @@ esac
 if [ -n "$\{TSM_XDG_CONFIG_HOME+x}" ] && [ "$\{XDG_CONFIG_HOME-}" = "$__tsm_dir/no-user-config" ]; then
   if [ -n "$TSM_XDG_CONFIG_HOME" ]; then XDG_CONFIG_HOME=$TSM_XDG_CONFIG_HOME; else unset XDG_CONFIG_HOME; fi
 fi
-unset TSM_MARK_KEY TSM_MARK_PID TSM_LOGIN TSM_NO_USER_RC TSM_USER_RCFILE TSM_HISTFILE TSM_BASH_RC TSM_SESSION_PATH TSM_USER_ZDOTDIR TSM_XDG_DATA_DIRS TSM_XDG_CONFIG_HOME
+unset TSM_LOGIN TSM_NO_USER_RC TSM_USER_RCFILE TSM_HISTFILE TSM_BASH_RC TSM_SESSION_PATH TSM_USER_ZDOTDIR TSM_XDG_DATA_DIRS TSM_XDG_CONFIG_HOME
 
 # The handshake: integration is loading; the daemon waits for the first prompt.
 if [ -n "$__tsm_key" ]; then
@@ -368,7 +365,7 @@ __tsm_exec_disarm() {
   if [ -n "$__tsm_no_user_rc" ]; then
     if [ -n "$__tsm_had_cfg" ]; then XDG_CONFIG_HOME=$__tsm_saved_cfg; else unset XDG_CONFIG_HOME; fi
   fi
-  unset TSM_MARK_KEY TSM_MARK_PID TSM_BASH_RC TSM_HISTFILE TSM_NO_USER_RC TSM_USER_ZDOTDIR TSM_XDG_DATA_DIRS TSM_XDG_CONFIG_HOME
+  unset TSM_BASH_RC TSM_HISTFILE TSM_NO_USER_RC TSM_USER_ZDOTDIR TSM_XDG_DATA_DIRS TSM_XDG_CONFIG_HOME
 }
 # bash-preexec owns the DEBUG trap and PROMPT_COMMAND; it restores $? for each hook.
 __tsm_bp_first() {

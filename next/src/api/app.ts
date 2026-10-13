@@ -132,10 +132,10 @@ interface IdemEntry {
   value: Promise<unknown>;
 }
 
-/** New journals keep key identity independent of the operation fingerprint. Older
- * journals contain only the combined hash, which can recover identical retries. */
+/** The journaled form of a keyed admission: the key's identity (principal and key), the tool and
+ * the arguments' fingerprint, kept apart so recovery can refuse a conflicting reuse (G16). */
 function idemIdentity(idem: string): { key: string; tool: string; digest: string } | undefined {
-  const m = /^v2:([a-f0-9]{24}):([^:]+):([a-f0-9]{16})$/.exec(idem);
+  const m = /^([a-f0-9]{24}):([^:]+):([a-f0-9]{16})$/.exec(idem);
   return m ? { key: m[1]!, tool: m[2]!, digest: m[3]! } : undefined;
 }
 
@@ -183,9 +183,8 @@ class Idempotency {
     if (prev) {
       return replay((await prev.value) as T);
     }
-    const idem = `v2:${identity}:${tool}:${digest}`;
-    const legacy = createHash('sha256').update(`${principal}\u0000${key}\u0000${tool}\u0000${digest}`).digest('hex').slice(0, 24);
-    const recovered = opts.recover?.(idem) ?? opts.recover?.(legacy);
+    const idem = `${identity}:${tool}:${digest}`;
+    const recovered = opts.recover?.(idem);
     if (recovered !== undefined) {
       this.put(k, { principal, tool, digest, at: now, value: Promise.resolve(recovered) });
       return replay(recovered);

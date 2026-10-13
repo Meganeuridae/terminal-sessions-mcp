@@ -11,17 +11,14 @@ export const ZSH_ZSHENV = `# --- tsm shell integration (zsh .zshenv shim) --- ge
 # forwards to the user's own file with the user's ZDOTDIR — keeping the one the
 # user's .zshenv chooses (XDG layouts) — and ZDOTDIR stays on the shim only until
 # the user's .zshrc (or, in a login shell, .zlogin) has been read. Every mark ends
-# in ";k=<key>": the key is read from this PID's private file into an unexported
-# variable (legacy custom setups can supply TSM_MARK_KEY). A zsh with another PID
-# finds no handoff file and is a plain zsh.
+# in ";k=<key>": the key is read from this PID's private file (never the environment)
+# into an unexported variable, and the file is removed. A zsh with another PID finds
+# no handoff file and is a plain zsh.
 () {
   emulate -L zsh
   typeset -g __tsm_key=
-  if [[ -n $\{TSM_MARK_KEY-} && ( -z $\{TSM_MARK_PID-} || $\{TSM_MARK_PID-} == $$ ) ]]; then
-    __tsm_key=$TSM_MARK_KEY
-  elif [[ -r $ZDOTDIR/key-$$ ]]; then
+  if [[ -r $ZDOTDIR/key-$$ ]]; then
     IFS= builtin read -r __tsm_key < "$ZDOTDIR/key-$$"
-    typeset -g +x __tsm_key
     /bin/rm -f -- "$ZDOTDIR/key-$$"
   fi
   typeset -g +x __tsm_key
@@ -37,7 +34,7 @@ export const ZSH_ZSHENV = `# --- tsm shell integration (zsh .zshenv shim) --- ge
   if (( $\{+TSM_XDG_CONFIG_HOME} )) && [[ $\{XDG_CONFIG_HOME-} == $__tsm_shim/no-user-config ]]; then
     if [[ -n $TSM_XDG_CONFIG_HOME ]]; then export XDG_CONFIG_HOME=$TSM_XDG_CONFIG_HOME; else unset XDG_CONFIG_HOME; fi
   fi
-  unset TSM_MARK_KEY TSM_MARK_PID TSM_NO_USER_RC TSM_HISTFILE TSM_USER_ZDOTDIR TSM_SESSION_PATH TSM_BASH_RC TSM_XDG_DATA_DIRS TSM_XDG_CONFIG_HOME
+  unset TSM_NO_USER_RC TSM_HISTFILE TSM_USER_ZDOTDIR TSM_SESSION_PATH TSM_BASH_RC TSM_XDG_DATA_DIRS TSM_XDG_CONFIG_HOME
   # The handshake: integration is loading; the daemon waits for the first prompt.
   if [[ -n $__tsm_key ]]; then builtin printf '\\033]633;P;TsmHello=zsh;k=%s\\007' $__tsm_key; fi
 }
@@ -179,7 +176,7 @@ __tsm_exec_arm() {
 }
 __tsm_exec_disarm() {
   /bin/rm -f -- "$__tsm_shim/key-$$"
-  unset __tsm_exec_armed TSM_MARK_KEY TSM_MARK_PID TSM_HISTFILE TSM_USER_ZDOTDIR TSM_NO_USER_RC TSM_BASH_RC TSM_XDG_DATA_DIRS TSM_XDG_CONFIG_HOME
+  unset __tsm_exec_armed TSM_HISTFILE TSM_USER_ZDOTDIR TSM_NO_USER_RC TSM_BASH_RC TSM_XDG_DATA_DIRS TSM_XDG_CONFIG_HOME
   if (( __tsm_had_pc )); then PROMPT_COMMAND=$__tsm_saved_pc; else unset PROMPT_COMMAND; fi
   if (( __tsm_had_xdg )); then export XDG_DATA_DIRS=$__tsm_saved_xdg; else unset XDG_DATA_DIRS; fi
   if [[ -n $__tsm_no_user_rc ]]; then

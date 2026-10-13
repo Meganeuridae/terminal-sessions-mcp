@@ -1,7 +1,7 @@
 /**
  * A scripted shell with rich integration, for deterministic session tests.
  * It echoes typed lines, emits the keyed OSC 133/633 marks a real integrated shell
- * would (the key comes from the spawn env, as with the real integration), runs
+ * would (the key comes with the spawn, out of band, as with the real integration), runs
  * registered handlers for command lines, and answers ^C.
  */
 import { execFileSync } from 'node:child_process';
@@ -11,7 +11,7 @@ import * as path from 'node:path';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { ScriptedBackend, type ScriptedPty } from '../src/backends/scripted.js';
 import { Journal } from '../src/core/journal.js';
-import { CLEAR_LINE_KEYS, encodeVscodeValue, MARK_KEY_ENV } from '../src/core/marks.js';
+import { CLEAR_LINE_KEYS, encodeVscodeValue } from '../src/core/marks.js';
 import type { TermError } from '../src/core/errors.js';
 import { Session, type RunInfo } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
@@ -87,7 +87,7 @@ export class FakeShell {
     this.opts = opts;
     this.marks = opts.marks ?? 'rich';
     this.ignoreSignals = opts.ignoreSignals ?? false;
-    this.key = pty.opts.bootstrap?.key ?? pty.opts.env[MARK_KEY_ENV] ?? '';
+    this.key = pty.opts.bootstrap?.key ?? '';
     pty.onWrite((d) => this.onWrite(d));
     pty.onGroupSignal = (pgid, sig) => {
       if (!this.running || pgid !== this.jobPgid || this.opts.ignoreGroupSignals) return;

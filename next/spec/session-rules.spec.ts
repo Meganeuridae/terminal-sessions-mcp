@@ -353,7 +353,8 @@ test('G7/G26 (core-7, api-4, jr-6, sec-4): shells and process Runs never see the
     assert.equal(e.COLORTERM, 'truecolor');
     assert.equal(e.TERM, 'xterm-256color');
   }
-  assert.ok(h.pty.opts.env.TSM_MARK_KEY, 'the shell alone gets its mark key (the integration unsets it)');
+  assert.ok(h.pty.opts.bootstrap?.key, 'the shell gets its mark key out of band');
+  assert.equal(h.pty.opts.env.TSM_MARK_KEY, undefined, 'never through the environment');
   assert.equal(proc.opts.env.TSM_MARK_KEY, undefined);
   assert.deepEqual(redactSnapshot({ TSM_TOKEN: 'x', TSM_MARK_KEY: 'k', TSM_API_SECRET: 's', TSM_SNAP: 'yes', PATH: '/bin' }), { TSM_SNAP: 'yes', PATH: '/bin' });
   await h.session.close();

@@ -38,9 +38,6 @@ export type Mark = Mark133 | Mark633;
 
 export type Piece = { kind: 'output'; data: string } | { kind: 'mark'; mark: Mark; raw: string };
 
-/** The env name that carries the session's mark key into the shell (the integration unsets it). */
-export const MARK_KEY_ENV = 'TSM_MARK_KEY';
-
 /** What the key's literal text in output is replaced with. */
 export const KEY_REDACTED = '[redacted]';
 
