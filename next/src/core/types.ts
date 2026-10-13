@@ -31,7 +31,8 @@ export type AttachmentRole = 'observer' | 'controller';
 export type EventInput =
   | { type: 'output'; data: string; runId?: string; stream: OutputStream; attribution?: Attribution }
   | { type: 'input'; data: string; principal: Principal; kind: 'text' | 'keys' | 'paste' | 'protocol-reply'; sensitive?: true; runId?: string; key?: string }
-  | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string }
+  /** `shell`/`within`: a Run declared for the shell in front of the terminal (§8.1): the kind of shell, and the Run whose program it is (null: what replaced the session's shell). */
+  | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string; shell?: string; within?: string | null }
   | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number }
   | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number }
   | { type: 'prompt'; cwd: string; phase: 'start' | 'end' }
@@ -104,6 +105,10 @@ export interface RunInfo {
   rows?: number;
   /** The admitting call's idempotency identity (G16): opaque, set by the application layer, journaled so it survives a restart. */
   idem?: string;
+  /** A declared shell Run (§8.1): the caller's name for the shell in front (`bash`, `sh`, `fish`…). */
+  shell?: string;
+  /** With `shell`: the Run whose program is that shell (`ssh host`, `sudo -i`…), or null for the program that replaced the session's shell. */
+  within?: string | null;
   /** A process Run's pid and process group, from its run.start: recovery terminates a group a dead daemon left behind (G19c). */
   pid?: number;
   pgid?: number;

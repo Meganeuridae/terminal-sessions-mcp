@@ -177,10 +177,10 @@ test('channels/register goes out after the policy receipt, and is retried while 
   await h.close();
 });
 
-test('feature sets: the shipped selection lists the nine core tools; a tools-only grant keeps session tools; a malformed policy fails closed', async () => {
+test('feature sets: the shipped selection lists the ten core tools; a tools-only grant keeps session tools; a malformed policy fails closed', async () => {
   const core = await host('ta', 'fs-core', { enabled: ['terminal.core', 'terminal.live', 'terminal.presence'] });
   const tools = (await core.request('tools/list')) as { tools: Array<{ name: string }> };
-  assert.deepEqual(tools.tools.map((t) => t.name).sort(), ['await', 'cancel', 'input', 'read', 'run', 'screen', 'session_close', 'session_list', 'session_open']);
+  assert.deepEqual(tools.tools.map((t) => t.name).sort(), ['await', 'cancel', 'input', 'read', 'run', 'screen', 'session_close', 'session_declare_shell', 'session_list', 'session_open']);
   await core.close();
 
   const toolsOnly = await host('ta', 'fs-tools', { grant: ['tools'] });
@@ -191,7 +191,7 @@ test('feature sets: the shipped selection lists the nine core tools; a tools-onl
   const bad = await host('ta', 'fs-bad');
   await assert.rejects(bad.request('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'], deniedCapabilities: ['pushEvents'] }), (e: { code: number }) => e.code === -32602);
   const t3 = (await bad.request('tools/list')) as { tools: Array<{ name: string }> };
-  assert.ok(t3.tools.length <= 9, 'nothing beyond the pre-policy core after a malformed update');
+  assert.ok(t3.tools.length <= 10, 'nothing beyond the pre-policy core after a malformed update');
   await bad.close();
 });
 

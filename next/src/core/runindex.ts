@@ -188,6 +188,8 @@ export class RunIndex {
         if (ev.line !== undefined) r.line = ev.line;
         if (ev.argv) r.argv = ev.argv;
         if (ev.idem !== undefined) r.idem = ev.idem;
+        if (ev.shell !== undefined) r.shell = ev.shell;
+        if (ev.within !== undefined) r.within = ev.within;
         this.add(r);
         return;
       }

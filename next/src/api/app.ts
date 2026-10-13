@@ -57,6 +57,9 @@ export interface RunResult {
   busy?: { runId?: string; reason: string; line?: string; principal?: Principal };
   /** A queued Run: how long it has waited to start. */
   queuedMs?: number;
+  /** A declared shell's Run (§8.1): the kind of shell in front, and the Run whose program it is (null: what replaced the session's shell). */
+  shell?: string;
+  within?: string | null;
   /** The session's integration level (G5): under `none`, only daemon-issued Runs have boundaries and the cwd is not tracked. */
   integration?: string;
   /** A running Run that seems to wait for someone (G15, heuristic): a prompt-like last line after silence, or a full-screen program. */
@@ -557,6 +560,20 @@ export class App {
   }
 
   /**
+   * Declare the program in front of a session's terminal a shell (§8.1), or take the last
+   * declaration back with `none`. Shell Runs then go to it until the Run whose program it is ends.
+   */
+  async declareShell(caller: Caller, o: { session: string; shell: string; within?: string }): Promise<{ session: string; shell: string | null; within: string | null; depth: number; line?: string }> {
+    const { session } = await this.liveSession(caller, o.session, 'run', {});
+    this.ensureAttached(caller, session);
+    const r = session.declareShell({ shell: o.shell, principal: caller.principal, ...(o.within !== undefined && { within: o.within }), ...this.seat(caller, session) });
+    const res: { session: string; shell: string | null; within: string | null; depth: number; line?: string } = { session: session.id, ...r };
+    const line = r.within ? session.run(r.within).line : undefined;
+    if (line !== undefined) res.line = head(line, 80);
+    return res;
+  }
+
+  /**
    * A keyed Run admitted before a restart (G16): its admission journaled the key's identity, so a
    * retry finds it instead of executing again. The index is built once, from what recovery loaded.
    */
@@ -634,7 +651,8 @@ export class App {
       // Waiting with our principal lets the lane withhold this Run's completion from us (G28).
       run = await session.awaitRun(runId, ms, caller.principal);
       // Let the prompt that follows an end mark land, so `cwd` is current and the caller's next run does not race it.
-      if (isTerminal(run.state) && run.target === 'shell') await session.waitAvailable(500);
+      // (A declared shell's Run has no prompt the daemon can see, and its enclosing Run keeps the shell busy.)
+      if (isTerminal(run.state) && run.target === 'shell' && run.shell === undefined) await session.waitAvailable(500);
     } else {
       // A Run of an ended shell (history, or an earlier life of this name): its recorded outcome.
       run = s.run(runId);
@@ -645,13 +663,14 @@ export class App {
       session: id,
       target: run.target,
       state: run.state,
-      cwd: run.cwd ?? session?.cwd ?? '',
+      // A declared shell's cwd is not tracked (§8.1): the result says so rather than naming the session's.
+      cwd: run.shell !== undefined ? '' : (run.cwd ?? session?.cwd ?? ''),
       origin: run.origin,
       principal: run.principal,
       attribution: run.attribution,
       output: out,
     };
-    if (session && isTerminal(run.state) && run.target === 'shell') res.cwd = session.cwd;
+    if (session && isTerminal(run.state) && run.target === 'shell' && run.shell === undefined) res.cwd = session.cwd;
     if (run.exit !== undefined) res.exit = run.exit;
     if (run.signal) res.signal = run.signal;
     if (run.reason) res.reason = run.reason;
@@ -659,6 +678,8 @@ export class App {
     else if (run.state === 'queued') res.queuedMs = Date.now() - run.admittedAt;
     if (run.envBasis) res.envBasis = run.envBasis;
     if (run.line !== undefined) res.line = head(run.line, 200);
+    if (run.shell !== undefined) res.shell = run.shell;
+    if (run.within !== undefined) res.within = run.within;
     if (session) {
       res.integration = session.integration;
       const waiting = this.waitingEvidence(session, run);
@@ -824,6 +845,8 @@ export class App {
     if (run.reason) res.reason = run.reason;
     if (run.startedAt !== undefined) res.durationMs = (run.endedAt ?? Date.now()) - run.startedAt;
     if (run.envBasis) res.envBasis = run.envBasis;
+    if (run.shell !== undefined) res.shell = run.shell;
+    if (run.within !== undefined) res.within = run.within;
     if (run.line !== undefined) res.line = head(run.line, 200);
     res.integration = session.integration;
     session.markRead(caller.principal, out.nextCursor);

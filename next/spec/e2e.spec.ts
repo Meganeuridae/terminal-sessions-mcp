@@ -101,8 +101,8 @@ test('MCP host: core tools, dual-rendered results, validation errors, health', a
   const tools = (await h.request('tools/list')) as { tools: Array<{ name: string; outputSchema?: unknown }> };
   assert.deepEqual(
     tools.tools.map((t) => t.name).sort(),
-    ['await', 'cancel', 'input', 'read', 'run', 'screen', 'session_close', 'session_list', 'session_open'],
-    'core profile lists nine single-purpose tools',
+    ['await', 'cancel', 'input', 'read', 'run', 'screen', 'session_close', 'session_declare_shell', 'session_list', 'session_open'],
+    'core profile lists ten single-purpose tools',
   );
   assert.ok(tools.tools.find((t) => t.name === 'run')!.outputSchema, 'run declares an output schema');
   const r = await h.call('run', { session: 'e2e', command: 'echo hi-from-e2e' });

@@ -104,6 +104,28 @@ export interface AdmitOptions {
   asOwner?: boolean;
 }
 
+/**
+ * A declared shell (§8.1): the caller said the program in front of the terminal is a shell of
+ * this kind — the remote end of `ssh`, a `sudo -i`, a nested shell, or what replaced the
+ * session's shell — and shell Runs go to it until the Run whose program it is ends.
+ */
+export interface DeclaredShell {
+  shell: string;
+  /** The Run whose program is the shell; null for the program that replaced the session's shell. */
+  within: string | null;
+  by: Principal;
+  at: number;
+}
+
+export interface DeclareOptions {
+  /** The kind of shell in front (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`), or `none` to take the last declaration back. */
+  shell: string;
+  /** The Run whose program is the shell. Default: the innermost running Run (the one holding the terminal). */
+  within?: string;
+  principal: Principal;
+  asOwner?: boolean;
+}
+
 /** Seat-checked operations accept the owner's rights for a principal the application layer vouches for (tsg-13, atc-12). */
 export interface SeatOptions {
   asOwner?: boolean;
@@ -116,8 +138,8 @@ export interface CancelResult {
   runId: string;
   state: RunState;
   contract: 'process' | 'shell';
-  /** Present when the Run survived every step of the contract (shell target only). */
-  escalation?: 'session_close';
+  /** Present when the Run survived every step of the contract (shell target only): what to do next (`cancel <runId>` names the enclosing Run of a declared shell). */
+  escalation?: 'session_close' | `cancel ${string}`;
   /** What the daemon did, in order (e.g. `^C`, `^\`, `SIGTERM → foreground process group 4242`). */
   steps: string[];
 }
@@ -141,6 +163,8 @@ export interface SessionInfo {
   queued: number;
   attachments: number;
   lastSeq: Seq;
+  /** The innermost declared shell (§8.1), where shell Runs go now; absent when they go to the session's own shell. */
+  declared?: { shell: string; within: string | null };
   /** While the seat holder is disconnected, when its reservation lapses (epoch ms). */
   seatReservedUntil?: number;
 }
@@ -154,8 +178,11 @@ interface RunRecord extends RunInfo {
   changeWaiters?: Array<() => void>;
   process?: ProcessHandle;
   markerNonce?: string;
-  /** Which launch strategy issued this shell Run (transcript hygiene differs). */
-  strategy?: 'rich' | 'basic' | 'marker';
+  /** Which launch strategy issued this shell Run (transcript hygiene differs). `inline`: a declared shell's Run (§8.1). */
+  strategy?: 'rich' | 'basic' | 'marker' | 'inline';
+  /** Inline strategy: the lines still to type, one per acknowledgement; and how many pieces were acknowledged. */
+  inlineLines?: string[];
+  inlineAck?: number;
   tempFile?: string;
   /** The exact line typed for a daemon-issued shell Run (trimmed): what its 633;E must say. */
   execLine?: string;
@@ -183,9 +210,65 @@ const MAX_ORPHAN_LINES = 32;
 /** The end-marker probe: the same marker, split differently from the wrapper's so echoes tell them apart. */
 const probeLine = (nonce: string, status: string) => ` echo "<<<EX""IT:${nonce}:${status}>>>"`;
 const publicRun = (r: RunRecord): RunInfo => {
-  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, strategy: _s, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, ...info } = r;
+  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, strategy: _s, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, ...info } = r;
   return { ...info, seq: { ...info.seq } };
 };
+
+/**
+ * The inline strategy (§8.1): a Run for a shell the daemon has no marks from — the remote end
+ * of `ssh`, a `sudo -i`, a nested shell, the program that replaced the session's shell — whose
+ * filesystem may not be ours, so the text travels on the typed line itself. Bytes outside this
+ * set go as `printf '%b'` octal escapes: the typed line then holds nothing a line editor
+ * expands or completes (no `!`, no tab, no quote the body could close), and each line stays
+ * under what any tty line discipline accepts (1024 bytes in canonical mode on macOS). A long
+ * body goes in pieces, each acknowledged by the shell before the next is typed, so nothing
+ * piles up unread; the last line prints a start marker, runs the text with `eval` in the
+ * shell itself (so `cd` and exports persist), and prints the end marker with the status.
+ */
+const INLINE_SAFE = new Set([...'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ,._/:=@+-'].map((c) => c.charCodeAt(0)));
+const INLINE_LINE_BYTES = 900;
+
+function inlineTokens(body: string): string[] {
+  const out: string[] = [];
+  for (const b of Buffer.from(body, 'utf8')) out.push(INLINE_SAFE.has(b) ? String.fromCharCode(b) : `\\0${b.toString(8).padStart(3, '0')}`);
+  return out;
+}
+
+/** The lines to type for `body`, bounded by markers carrying `nonce`; pieces end in an acknowledgement, the last line in start and end markers. */
+function inlineLines(body: string, nonce: string, fish: boolean): string[] {
+  const toks = inlineTokens(body);
+  const set = fish ? (c: string) => ` set -g __tsm_b '${c}'` : (c: string) => ` __tsm_b='${c}'`;
+  const add = fish ? (c: string) => ` set -g __tsm_b "$__tsm_b"'${c}'` : (c: string) => ` __tsm_b=$__tsm_b'${c}'`;
+  const ack = (k: number) => `; printf '<<<AC''K:${nonce}:${k}>>>\\n'`;
+  const finish = fish
+    ? `printf '<<<STAR''T:${nonce}>>>\\n'; eval (printf '%b' "$__tsm_b" | string collect); printf '<<<EXI''T:${nonce}:%s>>>\\n' $status; set -e __tsm_b`
+    : `printf '<<<STAR''T:${nonce}>>>\\n'; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:${nonce}:%s>>>\\n' "$?"; unset __tsm_b`;
+  const single = `${set(toks.join(''))}; ${finish}`;
+  if (Buffer.byteLength(single) <= INLINE_LINE_BYTES) return [single];
+  const room = INLINE_LINE_BYTES - add('').length - ack(999).length;
+  const pieces: string[] = [];
+  let cur = '';
+  for (const t of toks) {
+    if (cur.length + t.length > room) {
+      pieces.push(cur);
+      cur = '';
+    }
+    cur += t;
+  }
+  pieces.push(cur);
+  return [...pieces.map((c, i) => `${i === 0 ? set(c) : add(c)}${ack(i + 1)}`), ` ${finish}`];
+}
+
+/** The end marker typed alone after a ^C (the ^C may have cut the line before it), with the Run's nonce. */
+const inlineProbe = (nonce: string, fish: boolean) => ` printf '<<<EXI''T:${nonce}:%s>>>\\n' ${fish ? '$status' : '"$?"'}`;
+
+/** The caller's name for the shell in front → the syntax the inline strategy types. */
+function declaredFlavor(name: string): 'posix' | 'fish' {
+  const base = path.basename(name.trim()).replace(/^-/, '');
+  if (base === 'fish') return 'fish';
+  if (/^(sh|bash|zsh|dash|ash|ksh|mksh|busybox|posix)$/.test(base)) return 'posix';
+  throw err('invalid_argument', `shell: "${name}" is not a shell the daemon can type for (sh, bash, zsh, dash, ash, ksh, fish)`, { shell: name });
+}
 
 type OutputEvent = Extract<JournalEvent, { type: 'output' }>;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -336,6 +419,16 @@ export class Session {
   /** Daemon lines whose Run ended before its C: a later C with that line is their late execution. */
   private readonly orphanLines = new Map<string, RunRecord>();
   private readonly queue: RunRecord[] = [];
+  /**
+   * Declared shells (§8.1): the Run in flight in front of each program — keyed by the Run whose
+   * program it is (null: what replaced the session's shell) — and the Runs queued behind them.
+   */
+  private readonly inFront = new Map<string | null, RunRecord>();
+  private readonly declaredQueue: RunRecord[] = [];
+  /** Declared shells, innermost last: shell Runs go to the last one (§8.1). A layer ends with the Run whose program it is. */
+  private readonly layers: DeclaredShell[] = [];
+  /** The end of the terminal output so far (64 chars): a declared shell's marker may straddle two reads. */
+  private inlineTail = '';
   private controller: Principal | null = null;
   private seatReserved: { principal: Principal; until: number; timer: NodeJS.Timeout } | undefined;
   private readonly attachments = new Map<string, Attachment>();
@@ -565,18 +658,38 @@ export class Session {
       if (piece.kind === 'output') {
         shown += piece.data;
         this.outputTail = (this.outputTail + piece.data).slice(-512);
-        const run = this.currentShellRun?.state === 'running' ? this.currentShellRun : undefined;
-        // G12: output while a shell Run runs is its output, attributed temporally.
-        this.append({ type: 'output', data: piece.data, stream: 'pty', ...(run && { runId: run.runId, attribution: 'temporal' as const }) });
-        // The marker ends its Run right after the piece that carried it, before any mark
-        // that follows in the same read (the line's own D and A when marks appeared).
-        if (run?.markerNonce) this.scanMarker(run, piece.data);
+        this.emitOutput(piece.data);
         if (this.typeaheadWatch !== undefined) this.watchTypeahead(piece.data);
       } else {
         this.onMark(piece.mark);
       }
     }
     return shown;
+  }
+
+  /**
+   * Journal an output piece attributed to the Run whose program holds the terminal (G12: temporal,
+   * to the innermost running Run — a declared shell's inside `ssh`). A declared shell's markers
+   * cut the piece: what precedes a start marker belongs to the Run around it and what follows to
+   * the Run it starts; an end marker closes its Run before the prompt that follows it.
+   */
+  private emitOutput(data: string): void {
+    let rest = data;
+    let seen = this.inlineTail;
+    while (rest.length) {
+      const hit = this.nextInlineMarker(seen, rest);
+      const chunk = hit ? rest.slice(0, hit.end) : rest;
+      const run = this.innermostRunning();
+      this.append({ type: 'output', data: chunk, stream: 'pty', ...(run && { runId: run.runId, attribution: 'temporal' as const }) });
+      // The marker ends its Run right after the piece that carried it, before any mark
+      // that follows in the same read (the line's own D and A when marks appeared).
+      const base = this.currentShellRun;
+      if (base?.state === 'running' && base.markerNonce) this.scanMarker(base, chunk);
+      seen = (seen + chunk).slice(-64);
+      rest = rest.slice(chunk.length);
+      if (hit) this.applyInlineMarker(hit);
+    }
+    this.inlineTail = seen;
   }
 
   /**
@@ -883,6 +996,10 @@ export class Session {
     }
     this.pendingShellRun = undefined;
     this.currentShellRun = undefined;
+    // Declared shells went with the terminal's program (those inside a Run above ended with it).
+    for (const r of [...this.inFront.values()]) if (!isTerminal(r.state)) this.endRun(r, { state: 'lost', reason });
+    for (const r of this.declaredQueue.splice(0)) this.endRun(r, { state: 'lost', reason: this.closeReason ?? 'shell-exited-before-start' });
+    this.layers.length = 0;
     // What the shell forked outside any job stays in its own process group — command
     // substitutions, or a fork hung on a lock inherited from an interrupted hook — and
     // may ignore the hangup. It ends with the shell. Jobs (`cmd &`, nohup) have groups
@@ -1007,12 +1124,25 @@ export class Session {
 
   // ───────────────────────────── runs ─────────────────────────────
 
-  private newRun(init: { target: RunTarget; principal: Principal; origin: RunOrigin; line?: string | undefined; argv?: string[]; queued: boolean; envBasis?: EnvBasis | undefined; idem?: string | undefined }): RunRecord {
+  private newRun(init: {
+    target: RunTarget;
+    principal: Principal;
+    origin: RunOrigin;
+    line?: string | undefined;
+    argv?: string[];
+    queued: boolean;
+    envBasis?: EnvBasis | undefined;
+    idem?: string | undefined;
+    shell?: string;
+    within?: string | null;
+  }): RunRecord {
     const runId = `r${++this.runCounter}-${randomBytes(3).toString('hex')}`;
-    const given: { line?: string; argv?: string[]; idem?: string } = {};
+    const given: { line?: string; argv?: string[]; idem?: string; shell?: string; within?: string | null } = {};
     if (init.line !== undefined) given.line = init.line;
     if (init.argv) given.argv = init.argv;
     if (init.idem !== undefined) given.idem = init.idem;
+    if (init.shell !== undefined) given.shell = init.shell;
+    if (init.within !== undefined) given.within = init.within;
     const admitted = this.append({ type: 'run.admit', runId, target: init.target, principal: init.principal, origin: init.origin, queued: init.queued, ...given });
     const rec: RunRecord = {
       runId,
@@ -1047,7 +1177,8 @@ export class Session {
     run.cwd = info.cwd;
     run.cols = this.screen.cols;
     run.rows = this.screen.rows;
-    if (run.target === 'shell') this.currentShellRun = run;
+    // A declared shell's Run runs inside the Run that occupies the shell; it never becomes it.
+    if (run.target === 'shell' && run.strategy !== 'inline') this.currentShellRun = run;
     for (const w of run.changeWaiters?.splice(0) ?? []) w();
   }
 
@@ -1090,6 +1221,25 @@ export class Session {
       delete run.tempFile;
     }
     if (this.execWatch?.run === run) this.stopExecWatch();
+    if (run.strategy === 'inline') {
+      const ctx = run.within ?? null;
+      if (this.inFront.get(ctx) === run) {
+        this.inFront.delete(ctx);
+        queueMicrotask(() => this.drainDeclared(ctx));
+      }
+    }
+    // The program this Run started went with it: Runs declared for that program can never report (G3),
+    // and the declaration itself ends — shell Runs go to what is in front now.
+    if (run.target === 'shell') {
+      this.endDeclaredIn(run.runId, `enclosing-run-ended: ${run.runId} ${outcome.state}`);
+      const i = this.layers.findIndex((l) => l.within === run.runId);
+      if (i !== -1) {
+        const [layer] = this.layers.splice(i);
+        const now = this.layers.at(-1);
+        const how = `${outcome.state}${outcome.exit !== undefined ? ` ${outcome.exit}` : ''}`;
+        this.note(`the declared ${layer!.shell} shell ended with ${run.runId} (${how}): shell Runs go to ${now ? `the declared ${now.shell} shell` : "the session's own shell"} again`);
+      }
+    }
     const wasCurrent = this.currentShellRun === run;
     if (wasCurrent) this.currentShellRun = undefined;
     if (wasCurrent && this.integrationLevel === 'none' && this.shellState !== 'exited' && this.shellState !== 'unavailable') {
@@ -1185,6 +1335,9 @@ export class Session {
       return { admitted: true, run: publicRun(run) };
     }
     if (opts.line === undefined) throw err('invalid_argument', 'shell Run needs a line');
+    // A declared shell in front (§8.1): the Run goes to it, inline.
+    const layer = this.layers.at(-1);
+    if (layer) return this.admitDeclared(opts, origin, layer);
     const avail = this.shellAvailable();
     if (!avail.ok && (avail.reason === 'exited' || avail.reason === 'shell-unavailable' || !opts.queue)) {
       // (After an exit no shell Run is in flight: busy is null.)
@@ -1208,6 +1361,209 @@ export class Session {
         this.endRun(next, { state: 'lost', reason: `launch-failed: ${errMessage(e)}` });
       }
     }
+  }
+
+  // ───────────── declared shells (§8.1) ─────────────
+
+  /**
+   * The caller declares that the program in front of the terminal is a shell — the remote end of
+   * `ssh`, a `sudo -i`, a nested shell, or what replaced the session's shell. From then on shell
+   * Runs go to it, inline; the daemon has no marks from that shell, so the caller's word says
+   * where Runs go and the markers that come back say what happened. The declaration ends by
+   * itself with the Run whose program the shell is (the `ssh` exiting), or on `none`.
+   */
+  declareShell(opts: DeclareOptions): { shell: string | null; within: string | null; depth: number } {
+    this.assertAlive();
+    if (opts.principal !== SYSTEM && this.control !== 'open') this.requireSeat(opts.principal, 'declare', { asOwner: opts.asOwner === true });
+    const shell = opts.shell.trim();
+    if (shell === 'none') {
+      const top = this.layers.pop();
+      if (!top) throw err('invalid_argument', 'no declared shell to take back: shell Runs already go to the session’s own shell');
+      this.endDeclaredIn(top.within, 'undeclared');
+      const now = this.layers.at(-1);
+      this.note(`the declared ${top.shell} shell was taken back: shell Runs go to ${now ? `the declared ${now.shell} shell` : "the session's own shell"} again`);
+      return { shell: now?.shell ?? null, within: now?.within ?? null, depth: this.layers.length };
+    }
+    declaredFlavor(shell);
+    const within = this.frontOf(opts.within);
+    const same = this.layers.findIndex((l) => l.within === within);
+    const layer: DeclaredShell = { shell, within, by: opts.principal, at: this.now() };
+    // Declaring the same program again corrects the kind; anything declared inside it is gone with the old word.
+    if (same !== -1) {
+      const old = this.layers.splice(same)[0]!;
+      for (const l of this.layers.splice(same)) this.endDeclaredIn(l.within, 'undeclared');
+      if (old.shell !== shell) this.note(`the program in front is declared a ${shell} shell now (was ${old.shell})`);
+    } else {
+      const program = within === null ? 'the program that replaced the session’s shell' : `${within} (${(this.runs.get(within)?.line ?? '').slice(0, 60)})`;
+      this.note(`declared: ${program} is a ${shell} shell; shell Runs go to it${within === null ? '' : ` until ${within} ends`}`);
+    }
+    this.layers.push(layer);
+    return { shell, within, depth: this.layers.length };
+  }
+
+  /** The Run whose program holds the terminal now, as a declared shell's context: a running Run's id, or null for the replacement program. */
+  private frontOf(within: string | undefined): string | null {
+    if (within !== undefined) {
+      const enclosing = this.runs.get(within);
+      if (!enclosing || enclosing.target !== 'shell') throw err('invalid_argument', `within: ${within} is not a shell Run of this session`, { runId: within });
+      if (enclosing.state !== 'running') throw err('invalid_argument', `within: ${within} is ${enclosing.state}: nothing of its is in front of the terminal`, { runId: within });
+      return enclosing.runId;
+    }
+    const front = this.innermostRunning();
+    if (front) return front.runId;
+    if (this.shellState === 'unavailable') return null;
+    throw err('invalid_argument', "nothing is running in front of the session's own shell: there is no shell to declare (run `ssh host` or the like first)");
+  }
+
+  private admitDeclared(opts: AdmitOptions, origin: RunOrigin, layer: DeclaredShell): AdmitResult {
+    const { shell, within } = layer;
+    if (within !== null && this.runs.get(within)?.state !== 'running') {
+      // The layer outlived its Run for a moment (its end is being processed): nothing in front to type into.
+      return { admitted: false, busy: null, reason: 'shell-unavailable' };
+    }
+    const init = { target: 'shell' as const, principal: opts.principal, origin, line: opts.line, idem: opts.idem, shell, within };
+    const occupying = this.inFront.get(within);
+    if (occupying && !isTerminal(occupying.state)) {
+      if (!opts.queue) return { admitted: false, busy: publicRun(occupying), reason: 'running' };
+      const run = this.newRun({ ...init, queued: true });
+      this.declaredQueue.push(run);
+      return { admitted: true, run: publicRun(run) };
+    }
+    const run = this.newRun({ ...init, queued: false });
+    this.launchInline(run);
+    return { admitted: true, run: publicRun(run) };
+  }
+
+  private launchInline(run: RunRecord): void {
+    const fish = declaredFlavor(run.shell!) === 'fish';
+    run.markerNonce = randomBytes(4).toString('hex');
+    run.strategy = 'inline';
+    run.inlineLines = inlineLines(run.line ?? '', run.markerNonce, fish);
+    run.inlineAck = 0;
+    // Typed, not started: the start marker says when the shell took it (no mark will).
+    run.state = 'starting';
+    this.inFront.set(run.within ?? null, run);
+    this.pty.write(`${run.inlineLines.shift()!}\n`);
+    for (const w of run.changeWaiters?.splice(0) ?? []) w();
+  }
+
+  /**
+   * The declared shells answer with markers — an acknowledgement per piece typed, the start marker,
+   * the end marker with the status. The earliest one that ends inside `rest` (what precedes `rest`
+   * was `seen` already) says where to cut the piece and what it means.
+   */
+  private nextInlineMarker(seen: string, rest: string): { run: RunRecord; kind: 'ack' | 'start' | 'exit'; end: number; exit?: number } | undefined {
+    const window = seen + rest;
+    let best: { run: RunRecord; kind: 'ack' | 'start' | 'exit'; end: number; exit?: number } | undefined;
+    const consider = (run: RunRecord, kind: 'ack' | 'start' | 'exit', idx: number, len: number, exit?: number) => {
+      if (idx === -1 || idx + len <= seen.length) return;
+      const end = idx + len - seen.length;
+      if (!best || end < best.end) best = { run, kind, end, ...(exit !== undefined && { exit }) };
+    };
+    for (const run of this.inFront.values()) {
+      if (isTerminal(run.state)) continue;
+      const n = run.markerNonce!;
+      if (run.inlineLines?.length) {
+        const t = `<<<ACK:${n}:${(run.inlineAck ?? 0) + 1}>>>`;
+        consider(run, 'ack', window.indexOf(t), t.length);
+      }
+      if (run.state === 'starting') {
+        const t = `<<<START:${n}>>>`;
+        consider(run, 'start', window.indexOf(t), t.length);
+      }
+      if (run.state === 'running' || run.probed) {
+        const m = new RegExp(`<<<EXIT:${n}:(-?\\d+)>>>`).exec(window);
+        if (m) consider(run, 'exit', m.index, m[0].length, Number(m[1]));
+      }
+    }
+    return best;
+  }
+
+  private applyInlineMarker(hit: { run: RunRecord; kind: 'ack' | 'start' | 'exit'; exit?: number }): void {
+    const { run } = hit;
+    if (hit.kind === 'ack') {
+      run.inlineAck = (run.inlineAck ?? 0) + 1;
+      this.pty.write(`${run.inlineLines!.shift()!}\n`);
+    } else if (hit.kind === 'start') {
+      this.startRun(run, { cwd: '' }); // that shell's cwd is not tracked (no cwd mark)
+    } else if (run.probed) {
+      // The probe's status is its own line's; the start marker precedes `eval`, so without it the text never ran (G3).
+      this.endRun(run, { state: run.cancelRequested ? 'cancelled' : 'lost', reason: run.state === 'starting' ? 'cancelled-before-start' : 'exit-unobserved' });
+    } else {
+      this.endRun(run, { state: run.cancelRequested ? 'cancelled' : 'exited', exit: hit.exit! });
+    }
+  }
+
+  /** The Run whose program holds the terminal: the deepest running declared Run, else the shell's own. */
+  private innermostRunning(): RunRecord | undefined {
+    let run = this.currentShellRun?.state === 'running' ? this.currentShellRun : undefined;
+    for (let r = this.inFront.get(run?.runId ?? null); r && r.state === 'running'; r = this.inFront.get(r.runId)) run = r;
+    return run;
+  }
+
+  /** The program a Run started is gone: every Run declared for it ends — in flight as `lost`, queued before it started. */
+  private endDeclaredIn(within: string | null, reason: string): void {
+    for (const r of [...this.inFront.values()]) if (!isTerminal(r.state) && (r.within ?? null) === within) this.endRun(r, { state: 'lost', reason });
+    const waiting = this.declaredQueue.filter((r) => (r.within ?? null) === within);
+    if (!waiting.length) return;
+    this.declaredQueue.splice(0, this.declaredQueue.length, ...this.declaredQueue.filter((r) => !waiting.includes(r)));
+    for (const r of waiting) this.endRun(r, { state: 'lost', reason: `${reason} (before start)` });
+  }
+
+  private drainDeclared(within: string | null): void {
+    if (this.inFront.has(within)) return;
+    const i = this.declaredQueue.findIndex((r) => (r.within ?? null) === within && !isTerminal(r.state));
+    if (i === -1) return;
+    const next = this.declaredQueue.splice(i, 1)[0]!;
+    const present = within === null ? this.shellState === 'unavailable' : this.runs.get(within)?.state === 'running';
+    if (!present) {
+      this.endRun(next, { state: 'lost', reason: 'enclosing-run-ended (before start)' });
+      return this.drainDeclared(within);
+    }
+    try {
+      this.launchInline(next);
+    } catch (e) {
+      this.endRun(next, { state: 'lost', reason: `launch-failed: ${errMessage(e)}` });
+    }
+  }
+
+  /**
+   * Cancel in a declared shell: the daemon cannot see or signal that shell's jobs (they may be
+   * on another machine), so it does what a person at the keyboard could — ^C, the end marker
+   * typed alone, ^\ — and when the Run survives, names the enclosing Run as the next thing to
+   * cancel (its program, e.g. `ssh`, is what the daemon can reach).
+   */
+  private async cancelDeclared(run: RunRecord, principal: Principal, grace: number, steps: string[]): Promise<CancelResult> {
+    const runId = run.runId;
+    if (run.state === 'queued') {
+      const i = this.declaredQueue.indexOf(run);
+      if (i !== -1) this.declaredQueue.splice(i, 1);
+      steps.push('removed from the queue');
+      this.endRun(run, { state: 'cancelled', reason: 'cancelled-before-start' });
+      return { runId, state: run.state, contract: 'shell', steps };
+    }
+    run.cancelRequested = true;
+    run.inlineLines = []; // no more pieces, whatever is acknowledged from here
+    this.typeSignal(run, 'SIGINT', principal);
+    steps.push('^C');
+    await this.awaitRun(runId, grace);
+    if (!isTerminal(run.state)) {
+      // The ^C may have cut the line before its end marker (dash abandons the rest of a line): the marker alone (ss-5).
+      run.probed = true;
+      this.pty.write(`${inlineProbe(run.markerNonce!, declaredFlavor(run.shell!) === 'fish')}\n`);
+      steps.push('end-marker probe');
+      await this.awaitRun(runId, grace);
+    }
+    if (!isTerminal(run.state)) {
+      this.typeSignal(run, 'SIGQUIT', principal);
+      steps.push('^\\');
+      await this.awaitRun(runId, grace);
+    }
+    if (!isTerminal(run.state)) {
+      run.cancelRequested = false; // core-14
+      return { runId, state: run.state, contract: 'shell', escalation: run.within ? `cancel ${run.within}` : 'session_close', steps };
+    }
+    return { runId, state: run.state, contract: 'shell', steps };
   }
 
   /**
@@ -1448,6 +1804,7 @@ export class Session {
       return { runId, state: run.state, contract: 'process', steps };
     }
     if (isTerminal(run.state)) return { runId, state: run.state, contract: 'shell', steps };
+    if (run.strategy === 'inline' || run.shell !== undefined) return this.cancelDeclared(run, principal, grace, steps);
     if (run.state === 'queued') {
       // Not started: leave the terminal alone (the Run ahead is someone else's).
       const i = this.queue.indexOf(run);
@@ -1650,6 +2007,20 @@ export class Session {
         body = nl === -1 ? '' : body.slice(plain.map[nl]! + 1);
       }
       chunks = [body];
+    } else if (run.strategy === 'inline' && run.markerNonce) {
+      // A declared shell's Run: its output begins right after its start marker (the newline that
+      // ends the marker's line is the shell's) and ends at its end marker; a probe line typed after
+      // a ^C is cut too.
+      let body = chunks.join('');
+      const marker = body.indexOf(`<<<EXIT:${run.markerNonce}:`);
+      if (marker !== -1) body = body.slice(0, marker);
+      const plain = stripEscapes(body);
+      const probe = plain.text.lastIndexOf(`printf '<<<EXI''T:${run.markerNonce}`);
+      if (probe !== -1) {
+        const nl = plain.text.lastIndexOf('\n', probe);
+        body = nl === -1 ? '' : body.slice(0, plain.map[nl]! + 1);
+      }
+      chunks = [body.replace(/^\r?\n/, '')];
     } else if (run.strategy === 'basic' && !out.truncated) {
       // The Run started at the write, so the first line is the echo of what was typed (a read
       // that starts later has none).
@@ -2048,6 +2419,8 @@ export class Session {
       lastSeq: this.journal.lastSeq,
     };
     if (this.seatReserved) info.seatReservedUntil = this.seatReserved.until;
+    const layer = this.layers.at(-1);
+    if (layer) info.declared = { shell: layer.shell, within: layer.within };
     return info;
   }
 

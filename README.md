@@ -70,51 +70,38 @@ written to files or encoded explicitly. Shell integration credentials are kept o
 ordinary child environments and observer output; they are not an isolation boundary
 against code deliberately inspecting its own shell or same-user private files.
 
-## SSH and VPN work
+## SSH, sudo and nested shells
 
-Use your normal OpenSSH host aliases, keys, `ProxyJump` and VPN routing on the machine
-running `termd`. The daemon's network and SSH-agent access matter, not the host's browser
-connection. Authentication and host-key verification remain OpenSSH's responsibility.
+Use your normal OpenSSH configuration on the machine running `termd`: host aliases, keys,
+`ProxyJump`, VPN routes. Authentication and host keys stay OpenSSH's business.
 
-For an **interactive remote terminal**:
-
-```bash
-tsm run remote-shell 'ssh -tt workbox' --wait 1000
-tsm screen remote-shell
-tsm input remote-shell 'pwd' --keys Enter
-```
-
-The Run tracks the SSH connection. Use `input`/`screen` for remote commands and TUIs;
-remote prompt strings do not establish local command boundaries or remote cwd. A new
-`run` targets the original local shell and returns busy while SSH occupies it. Explicitly
-queued commands run **locally after SSH exits**; do not queue commands intended for the
-remote shell. Avoid `exec ssh`: replacing the local shell makes shell Runs unavailable,
-although explicit terminal input remains usable.
-
-For an **unattended remote command**:
+Run `ssh host` as a command. It stays running, and the session's shell is busy with it.
+Then declare once that the program in front is a shell, and run commands as usual:
 
 ```bash
-tsm run remote-job "ssh -T -o BatchMode=yes workbox 'cd /srv/app && ./build.sh'" --target process --wait 1000
+tsm run work 'ssh workbox' --wait 2000
+tsm declare work bash
+tsm run work 'cd /srv/app && git pull && ./build.sh'
+tsm run work 'exit'
 ```
 
-This tracks the local SSH process with separate stdout/stderr and an observed exit status.
-OpenSSH returns the remote command's status, or 255 for an SSH error; a broken connection
-does not prove whether remote work finished. Local cancellation likewise cannot certify
-that a remote job stopped. See the [OpenSSH manual](https://man.openbsd.org/ssh.1).
+Commands to a declared shell travel inline with start and end markers, so each one is a Run
+with output and exit status, and `cd`, exports and activations persist on the remote side;
+long commands go in pieces. The result says `cwd unknown` and names the declared shell.
+When `ssh` exits — the remote `exit`, or a dropped connection — the declaration ends with it:
+the next `run` is in the session's own shell again, a note in the session's history says
+so, and a command that was in flight ends `lost` with that reason rather than being guessed
+at. The same works for `sudo -i`, `docker exec -it … bash`, a nested `bash`, and a shell
+that replaced the session's own (`exec sh`, reported as `shell-unavailable`): declare it and
+go on. A second hop (`ssh` from the remote) is declared again; `tsm declare work none`
+takes a declaration back. Cancel inside a declared shell types `^C` and the end marker and
+nothing more: the daemon cannot signal a job on another machine, and says so.
 
-For **persistent remote command identities and reconnectable observation**, run `termd`
-on the remote machine under its service manager and forward its loopback endpoint:
-
-```bash
-ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:43101:127.0.0.1:3101 workbox
-TSM_URL=ws://127.0.0.1:43101 tsm run build './build.sh' --wait 1000
-```
-
-Configure a token on the remote daemon and supply it through `TSM_TOKEN` in the client.
-After a VPN/tunnel interruption, reconnect to the same remote daemon and await/read the
-same Run; do not rerun an uncertain remote operation with a fresh key. Remote sessions
-survive client/tunnel disconnects, but live jobs do not yet survive a daemon restart.
-Forwarding options are described in [ssh_config](https://man.openbsd.org/ssh_config.5).
+For an unattended remote command, run `ssh -T host 'cmd'` with `--target process`: separate
+stdout and stderr, and ssh's exit status (the remote command's, or 255 for a connection
+error). A `termd` on the remote machine with a forwarded port keeps full semantics across
+tunnel interruptions: reconnect and `await` the same Run instead of rerunning an uncertain
+operation with a fresh key.
 
 ## Humans
 

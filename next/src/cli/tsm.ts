@@ -33,6 +33,8 @@ const USAGE = `tsm <command> [args] [--key value ...] [--json]
   close <session> [--force]
   run <session> [--wait 20s] [--target process] [--queue] [--] <command...>
                                         after --, every word is the command's, flags included
+  declare <session> <shell>             the program in front (ssh, sudo -i, a nested shell) is a
+                                        bash|sh|zsh|fish: run goes to it until it ends; "none" takes it back
   await [<session>] <runId> [--wait 20s]
   read <session> [--since N | --tail N | --run-id ID] [--as events]
   screen <session>
@@ -58,6 +60,7 @@ const SHORT: Record<string, { tool: string; positional: string[]; join?: string;
   open: { tool: 'session_open', positional: ['session'] },
   close: { tool: 'session_close', positional: ['session'] },
   run: { tool: 'run', positional: ['session', 'command'], join: 'command' },
+  declare: { tool: 'session_declare_shell', positional: ['session', 'shell'] },
   // One positional is the runId (session is optional, as the tool allows): `tsm await r41` (atc-25).
   await: { tool: 'await', positional: ['session', 'runId'], single: 'runId' },
   read: { tool: 'read', positional: ['session'] },

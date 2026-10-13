@@ -76,9 +76,13 @@ function pick<T extends object>(a: Record<string, unknown>, keys: string[]): T {
 }
 
 const BUSY_NEXT: Record<string, string> = {
-  running: 'await or cancel it, pass queue:true to run after it, or use another session',
+  running:
+    'await or cancel it, pass queue:true to run after it, or — when the program it started is a shell (ssh, sudo -i, docker exec, a nested shell) — ' +
+    'declare that with session_declare_shell and run again: commands then go to that shell. Or use another session',
   'prompt-pending': 'the shell is between commands: retry, or pass queue:true',
-  'shell-unavailable': 'the original shell is no longer available: use input to interact with the terminal, or open a new session',
+  'shell-unavailable':
+    "the session's shell was replaced by a program without integration: if that program is a shell, declare it with session_declare_shell (sh, bash, zsh, fish…) and run again; " +
+    'input and screen work regardless; or open a new session',
   'human-editing': 'a partial command line sits at the prompt: clear it with input keys:["C-u"] (needs the seat), or pass queue:true',
   starting: 'the shell is still starting: pass queue:true to run once it is ready',
   exited: 'the shell has exited: run again to start a new one',
@@ -96,6 +100,9 @@ function runStatus(r: RunResult): string {
       return `queued for ${fmt(r.queuedMs ?? 0)}, not started — it runs when the shell is free; await it`;
     case 'running':
     case 'starting': {
+      if (r.state === 'starting' && r.shell !== undefined) {
+        return `typed into the declared ${r.shell} shell, no start marker yet — if the program in front is not a ${r.shell} shell at its prompt, cancel it; else await it`;
+      }
       const w = r.waiting;
       const next =
         w?.kind === 'tui'
@@ -118,11 +125,14 @@ export function renderRun(r: RunResult, mode: ResultText): ToolResult {
   if (mode === 'json') return { text: JSON.stringify(r, null, 2), structured };
   const head = r.state === 'busy' ? '' : r.output.text ? r.output.text + '\n' : '';
   const service = r.service ? ` · service ${r.service}${r.evidence ? ` (${r.evidence})` : ''}` : '';
-  // Under integration none the shell's cwd is not tracked, and only daemon Runs have boundaries (G5).
-  const cwd = r.integration === 'none' ? 'cwd unknown (integration none: only daemon runs have boundaries)' : `cwd ${r.cwd}`;
+  // Under integration none the shell's cwd is not tracked, and only daemon Runs have boundaries (G5);
+  // a declared shell (§8.1) has no marks at all: the daemon knows its Runs' boundaries and nothing else.
+  const where = r.shell !== undefined ? ` · in the declared ${r.shell} shell${r.within ? ` (${r.within})` : ' that replaced the session’s shell'}` : '';
+  const cwd =
+    r.shell !== undefined ? 'cwd unknown (declared shell)' : r.integration === 'none' ? 'cwd unknown (integration none: only daemon runs have boundaries)' : `cwd ${r.cwd}`;
   const basis = r.target === 'process' && r.envBasis ? ` · env ${r.envBasis}` : '';
   const ignored = r.ignored?.length ? ` · ignored: ${r.ignored.join(', ')} (the session exists; cd in the command instead)` : '';
-  const status = `[run ${r.runId ?? '—'} ${runStatus(r)}${service} · ${r.target}${basis} · ${cwd} · next=${r.output.nextCursor}${r.output.truncated ? ' · truncated' : ''}${r.created ? ' · session created' : ''}${ignored}${r.replayed ? ' · replayed' : ''}]`;
+  const status = `[run ${r.runId ?? '—'} ${runStatus(r)}${service} · ${r.target}${where}${basis} · ${cwd} · next=${r.output.nextCursor}${r.output.truncated ? ' · truncated' : ''}${r.created ? ' · session created' : ''}${ignored}${r.replayed ? ' · replayed' : ''}]`;
   return { text: head + status, structured };
 }
 
@@ -169,6 +179,8 @@ const RUN_OUTPUT: Schema = {
     busy: { type: 'object', properties: { runId: { type: 'string' }, reason: { type: 'string' }, line: { type: 'string' }, principal: { type: 'string' } }, required: ['reason'] },
     queuedMs: { type: 'number' },
     integration: { type: 'string' },
+    shell: { type: 'string', description: 'A declared shell’s Run: the kind of shell in front (bash, sh, zsh, fish…).' },
+    within: { description: 'With shell: the runId whose program is that shell, or null for the program that replaced the session’s shell.' },
     waiting: { type: 'object', properties: { kind: { type: 'string', enum: ['input', 'tui'] }, lastLine: { type: 'string' }, silentMs: { type: 'number' }, heuristic: { type: 'boolean' } }, required: ['kind', 'heuristic'] },
     ignored: { type: 'array', items: { type: 'string' } },
     created: { type: 'boolean' },
@@ -347,6 +359,8 @@ export const TOOLS: ToolDef[] = [
       'Returns the output and one status line. If the command is still running when the wait ends you get its runId ' +
       'and `state: running` — it keeps running; use `await` to keep waiting or `read` to fetch what it printed. ' +
       'If another command is occupying the shell you get `state: busy` and nothing runs (pass `queue: true` to run after it). ' +
+      'When that command opened another shell — `ssh host`, `sudo -i`, `docker exec -it … bash`, a nested `bash` — declare it once with `session_declare_shell`; ' +
+      'from then on `run` goes to that shell (output, exit status, `cd`/exports persisting there; results say `cwd unknown` and name the declared shell) until the command ends. ' +
       'A running command that seems to wait for input, or a full-screen program, is flagged in the result (`waiting`). Creates the session if it does not exist. ' +
       'Use `input` to type into a program that is already running, `screen` to see a full-screen program.',
     inputSchema: {
@@ -367,6 +381,42 @@ export const TOOLS: ToolDef[] = [
     outputSchema: RUN_OUTPUT,
     async run(ctx, a) {
       return runResult(ctx, await ctx.app.run(ctx.caller, pick(a, ['session', 'command', 'target', 'wait', 'queue', 'cwd', 'envBasis', 'idempotencyKey'])));
+    },
+  },
+  {
+    name: 'session_declare_shell',
+    tier: 'core',
+    description:
+      'Say that the program in front of the session’s terminal is a shell — the remote end of `ssh host`, a `sudo -i`, `docker exec -it … bash`, a nested shell, ' +
+      'or a shell that replaced the session’s own (`reason: shell-unavailable`). From then on `run` goes to that shell: the command travels inline with start and end ' +
+      'markers, so you get its output and exit status, and `cd`/exports persist there; results say `cwd unknown` and name the declared shell. The declaration ends by itself ' +
+      'when the command that opened the shell ends (ssh exits): the next `run` is in the session’s own shell again, and a note in the session says so. ' +
+      'Declare again inside a second hop (an `ssh` run from a declared shell); `shell: "none"` takes the last declaration back. Needs the seat, like `run`.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session,
+        shell: { type: 'string', description: 'The kind of shell in front: bash, sh, zsh, dash, ksh or fish — or none, to take the last declaration back.' },
+        within: { type: 'string', description: 'Optional: the runId whose program is that shell. Default: the innermost running Run (what holds the terminal now).' },
+      },
+      required: ['session', 'shell'],
+      additionalProperties: false,
+    },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        session: { type: 'string' },
+        shell: { description: 'The declared shell commands go to now, or null for the session’s own shell.' },
+        within: { description: 'The runId whose program it is; null for the program that replaced the session’s shell.' },
+        depth: { type: 'integer', description: 'How many declarations are stacked (a second hop is 2).' },
+        line: { type: 'string', description: 'The command line of that Run.' },
+      },
+      required: ['session', 'shell', 'within', 'depth'],
+    },
+    async run(ctx, a) {
+      const r = await ctx.app.declareShell(ctx.caller, pick(a, ['session', 'shell', 'within']));
+      const where = r.shell === null ? 'the session’s own shell' : `the declared ${r.shell} shell${r.within ? ` in front (${r.within}${r.line ? ` ${r.line}` : ''}), until ${r.within} ends` : ' that replaced the session’s shell'}`;
+      return render(ctx, `[declared: run in ${r.session} now goes to ${where}${r.depth > 1 ? ` · depth ${r.depth}` : ''}]`, env(r));
     },
   },
   {
@@ -468,7 +518,8 @@ export const TOOLS: ToolDef[] = [
     description:
       'Cancel a Run. A queued Run is dropped. A process Run is signalled SIGINT, then SIGTERM, then SIGKILL, and its exit is ' +
       'observed. A shell Run gets ^C, then ^\\, then SIGTERM and SIGKILL to its foreground job (never the shell); the result ' +
-      'says `cancelled` only when the shell confirmed the job ended, and names the escalation (`session_close`) if it survived.',
+      'says `cancelled` only when the shell confirmed the job ended, and names the escalation (`session_close`) if it survived. ' +
+      'A Run in a declared shell (ssh and the like) gets ^C, the end marker, ^\\ — no signals, its job may be on another machine — and the escalation names the enclosing Run to cancel.',
     inputSchema: {
       type: 'object',
       properties: { runId: { type: 'string' }, session: { ...session, description: 'Optional: the session the Run belongs to.' }, idempotencyKey },

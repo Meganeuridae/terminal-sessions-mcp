@@ -237,7 +237,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   asked to `queue`. A queued Run advances only when the Run ahead of it has ended *and* a
   prompt mark confirms the shell is back. After `lost`, the queue waits for a confirmed
   prompt or for a cancel; an unknown outcome never establishes availability. Process Runs
-  never occupy the shell and are admitted at any time.
+  never occupy the shell and are admitted at any time. The one exception is the caller's
+  own: once the caller has **declared** that the program in front of the terminal is a shell
+  (§8.1), shell Runs go to that shell, one at a time, until the Run whose program it is
+  ends; the session's own shell stays busy with that Run throughout.
 - **G5.** A session's shell terminal is `idle` iff a prompt mark has been observed after the
   most recent shell Run's end and no shell Run is `starting | running`. The integration
   level is known and reported: `rich` (prompt-start, prompt-end, pre-execution and
@@ -248,8 +251,9 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   shell) heals at the next prompt where the shell allows it; the Run that broke it ends
   `lost`, never left `running`. An unverified replacement program is `unavailable` for
   shell Runs (including queued admission); it remains observable and accepts explicit
-  input. Losing a Run never establishes a ready shell or drains its queue. A configured
-  unintegrated shell's initial marker fallback is distinct from losing an integrated shell.
+  input, and declaring it a shell (§8.1) is the way to run commands in it. Losing a Run
+  never establishes a ready shell or drains its queue. A configured unintegrated shell's
+  initial marker fallback is distinct from losing an integrated shell.
 
 ### Execution
 
@@ -552,6 +556,28 @@ same Run, with `origin: human`.
 marker (`$status` under fish). A `^C` that aborts the marker's echo is followed, once the
 shell's own group holds the terminal again, by the marker alone as a probe, so a cancelled
 marker Run still ends. Both strategies produce identical result shapes.
+
+*Declared shell* (inline strategy). After `ssh host`, `sudo -i`, `docker exec -it … bash`, a
+nested shell, or an `exec` into a shell without our integration, the program in front of the
+terminal is a shell the daemon has no marks from — and often no filesystem in common with.
+The caller declares it once (`session_declare_shell`, naming the kind: sh, bash, zsh, dash,
+ksh or fish); from then on shell Runs go to it. The text travels on the typed line itself:
+bytes outside a small safe set go as `printf '%b'` octal escapes, so the line holds nothing a
+line editor expands or completes; a body longer than one line (900 bytes) goes in pieces,
+each acknowledged by the shell before the next is typed; the last line prints a start marker,
+runs the text with `eval` in that shell (so `cd` and exports persist there) and prints the end
+marker with the status. Markers carry the Run's nonce and are split in the typed text, so an
+echo never matches. Output is attributed to the innermost running Run, and a start or end
+marker cuts the read it arrives in, so a Run's output begins and ends exactly at its markers.
+A Run is `starting` until its start marker arrives: when the program in front is not a shell,
+nothing starts and the result says so. Cancel does what a person at the keyboard could — `^C`,
+the end marker typed alone, `^\` — never a signal to the local foreground group (that is the
+`ssh`), and names the enclosing Run as the escalation. The declaration ends by itself when the
+Run whose program the shell is ends: its Runs in flight end `lost` (`enclosing-run-ended`),
+queued ones too, a note is journaled, and shell Runs go to the session's own shell (or to the
+declaration below) again. One Run at a time per declared shell; a second hop is declared
+again (the innermost running Run is its program); `none` takes a declaration back. Results of
+declared Runs carry `shell` and `within` and report the cwd as unknown.
 
 ### 8.2 Process target
 
@@ -1112,10 +1138,10 @@ restart, a key reused with other arguments executed (G16); process output was pr
 byte-exact but decoded. All five are fixed above with the reviewer's reproducers as tests:
 the `unavailable` state (§7), the private key file and launcher (§7, "Marks are
 authenticated"), retried deliveries with the same message id (G22), the journaled key
-identity (G16), and the narrower output promise (G7, G10, §8.2). Open from the same round:
-a shell the caller knows to be in front (after `ssh host`, or after an `exec` into a shell
-without our integration) has no way to receive shell Runs other than a new session; the
-declared-shell proposal (§18) would serve both cases and is the planned route.
+identity (G16), and the narrower output promise (G7, G10, §8.2). The same round decided and
+built the declared shell (§8.1, §18 item 8): after `ssh host`, or after an `exec` into a
+shell without our integration, the caller declares the program in front a shell once, and
+plain Runs go to it, inline, until the Run that opened it ends.
 
 **Milestone 0 — close the old line.** Land upstream PRs #7, #8, #9; publish 1.7.0; move
 the repository under `anima-research`. Nothing below depends on these, but they stop the
@@ -1222,17 +1248,16 @@ protocol tests; the application API schema is the shared artifact both build to.
    turns "a session has a terminal" into "a session has terminals". Milestone 3 assumes
    yes; the alternative is that anything needing a tty is a shell Run, forever, which is
    simpler and may be enough.
-8. **A declared shell.** After `ssh host`, or after an `exec` into a shell without our
-   integration, the program in front is a shell the caller knows about but the daemon has no
-   evidence for: shell Runs queue behind the `ssh` Run (G4) or are refused as `unavailable`,
-   and only `input` and `screen` reach it. Teams' work over ssh is extensive, so a route is
-   wanted for 2.0. Proposal (also made for 1.x on upstream #7): the caller declares "the
-   program in front is a shell", naming its flavour; commands to a declared shell travel
-   inline (no local command file, which the remote cannot read), bounded by the marker
-   strategy with a per-command nonce, in pieces short enough for any line discipline; the
-   declared layer ends when the Run that opened it ends. Without a declaration, refusal
-   while busy stays the default. The alternative is a `termd` on the remote machine with a
-   forwarded port, which gives full semantics but needs an install there.
+8. **A declared shell.** Decided 2026-10-13: declare once (§8.1). After `ssh host`, or after
+   an `exec` into a shell without our integration, the program in front is a shell the caller
+   knows about but the daemon has no evidence for; the caller's declaration is that evidence,
+   and plain Runs flow to the shell until the Run that opened it ends. The alternative
+   considered was naming the shell on every `run`, which refuses rather than runs locally
+   when a connection drops, at the cost of a field on every remote command. Comfort won; the
+   drop is made visible instead (the opening Run's `run.end`, the Run in flight ending
+   `lost`, a journaled note). Without a declaration, refusal while busy stays the default. A
+   `termd` on the remote machine with a forwarded port remains the way to keep full
+   semantics across tunnel interruptions.
 
 ---
 
@@ -1242,7 +1267,7 @@ protocol tests; the application API schema is the shared artifact both build to.
 type JournalEvent =
   | { seq; ts; type: 'output';      data: string; runId?; stream: 'pty'|'stdout'|'stderr'; attribution?: 'exact'|'temporal' }
   | { seq; ts; type: 'input';       data: string; principal; kind: 'text'|'keys'|'paste'|'protocol-reply'; sensitive?: true; runId? }
-  | { seq; ts; type: 'run.admit';   runId; target: 'shell'|'process'; line?|argv?; principal; queued: boolean; idem? }  // idem: key identity (G16)
+  | { seq; ts; type: 'run.admit';   runId; target: 'shell'|'process'; line?|argv?; principal; queued: boolean; idem?; shell?; within? }  // idem: key identity (G16); shell/within: a declared shell's Run (§8.1)
   | { seq; ts; type: 'run.start';   runId; cwd; line?; envBasis?: 'configured'|'snapshot' }   // C mark, or spawn
   | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs }
   | { seq; ts; type: 'service';     runId; status: 'ready'|'unhealthy'|'exited'; probe; evidence? }

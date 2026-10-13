@@ -84,6 +84,30 @@ describe('SSH workflows', { skip: ![SSH, SSHD, KEYGEN].every(fs.existsSync) }, (
     } finally { await x.close(); }
   });
 
+  test('a declared remote shell over SSH: plain Runs run remotely with status and exact text, and the declaration ends with the connection', async () => {
+    const x = await realSession('/bin/bash');
+    try {
+      const command = [SSH, ...args, '-tt', dest, `cd ${quote(remote)}; printf REMOTE_READY; exec /bin/sh -i`].map(quote).join(' ');
+      const ssh = await x.run(command, 20);
+      await until(() => x.journal.since(0).events.some((e) => e.type === 'output' && e.data.includes('REMOTE_READY')), 5000);
+      assert.deepEqual(x.session.declareShell({ shell: 'sh', principal: AGENT }), { shell: 'sh', within: ssh.runId, depth: 1 });
+      const where = await x.run('pwd; echo "pid=$$"; (exit 6)');
+      assert.deepEqual([where.state, where.exit, where.within], ['exited', 6, ssh.runId]);
+      assert.equal(where.text.split('\n')[0], remote, 'the command ran on the remote side');
+      const payload = `it's "quoted" \\back\\slash %d\ttab ünïcødé 😀 $HOME \`x\` !bang`;
+      const exact = await x.run(`cat <<'TSM_EOF'\n${payload}\nTSM_EOF`);
+      assert.equal(exact.text.replace(/\s+/g, ' '), payload.replace(/\s+/g, ' '));
+      const long = await x.run(`f() {\n${Array.from({ length: 80 }, (_, i) => `  echo remote-${i}-${'y'.repeat(40)}`).join('\n')}\n}\nf | wc -l`, 10_000);
+      assert.deepEqual([long.state, long.text.trim()], ['exited', '80']);
+      assert.equal((await x.run('cd /; pwd')).text.trim(), '/');
+      // Leaving the remote shell ends ssh with its status; the declaration ends with it and the local shell is back.
+      assert.equal((await x.run('exit 7')).state, 'lost');
+      assert.equal((await x.session.awaitRun(ssh.runId, 5000)).exit, 7);
+      assert.equal(x.session.info().declared, undefined);
+      assert.equal((await x.run('echo local-again')).text, 'local-again');
+    } finally { await x.close(); }
+  });
+
   test('unattended SSH preserves observed exit and separate streams without occupying the shell', async () => {
     const x = await realSession('/bin/bash');
     try {
