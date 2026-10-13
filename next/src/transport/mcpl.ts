@@ -187,8 +187,6 @@ const BATCH_MS = 50;
 /** How long a completion is held for a synchronous call that may still return it (G28, mcpl-1); checked every HOLD_POLL_MS. */
 const HOLD_MS = 2000;
 const HOLD_POLL_MS = 100;
-/** An owed entry older than this can never settle (its message was never built): it stops pinning `delivered` (mcpl-7). */
-const OWED_TTL_MS = 120_000;
 /** Message ids remembered per connection so one message is delivered once (mcpl-8). */
 const SENT_MAX = 4096;
 
@@ -209,10 +207,14 @@ type Settled = 'accepted' | 'not-owed' | 'refused';
  */
 interface LaneState {
   lineage: object;
-  /** Lifecycle seqs still owed (G22) → when recorded. */
-  owed: Map<Seq, number>;
-  /** Seqs whose delivery awaits the host's answer. */
-  inflight: Set<Seq>;
+  /** Lifecycle seqs still owed (G22). Elapsed time is never an acknowledgement. */
+  owed: Set<Seq>;
+  /** Message ids whose delivery awaits the host's answer. A summary and an event can share a seq. */
+  inflight: Map<string, Seq>;
+  /** Failed lifecycle deliveries remain owed, with their original stable message id. */
+  retries: Map<string, { seq: Seq; attempt: number; timer?: NodeJS.Timeout | undefined }>;
+  /** A summary pins at its oldest event until accepted, then settles the individual debts it covers. */
+  summaries: Map<string, { from: Seq; covered: Set<Seq> }>;
   /** Messages withheld while a synchronous call may still return them (G28): key (runId, or `runId:service=status`) → since. */
   held: Map<string, { since: number; seq?: Seq; timer?: NodeJS.Timeout | undefined }>;
   /** Everything up to here is settled for this principal except what is owed: `delivered` may advance to it. */
@@ -446,6 +448,7 @@ export class McplLane {
     if (this.app.registry.get(sessionId)) return; // re-created meanwhile: sessionCreated announced it (mcpl-10)
     const st = this.states.get(sessionId);
     if (st) for (const h of st.held.values()) if (h.timer) clearTimeout(h.timer);
+    if (st) for (const r of st.retries.values()) if (r.timer) clearTimeout(r.timer);
     this.states.delete(sessionId);
     const id = channelId(sessionId);
     this.open.delete(id);
@@ -611,9 +614,12 @@ export class McplLane {
     if (cur?.lineage === lineage) return cur;
     const entry = this.app.registry.get(t.id);
     const current = entry ? (entry.kind === 'live' ? entry.session.journal.runs : entry.journal.runs) : undefined;
-    const st: LaneState = { lineage, owed: new Map(), inflight: new Set(), held: new Map(), clearTo: 0 };
+    const st: LaneState = { lineage, owed: new Set(), inflight: new Map(), retries: new Map(), summaries: new Map(), held: new Map(), clearTo: 0 };
     if (current !== undefined && current !== lineage) return st;
-    if (cur) for (const h of cur.held.values()) if (h.timer) clearTimeout(h.timer);
+    if (cur) {
+      for (const h of cur.held.values()) if (h.timer) clearTimeout(h.timer);
+      for (const r of cur.retries.values()) if (r.timer) clearTimeout(r.timer);
+    }
     this.states.set(t.id, st);
     return st;
   }
@@ -630,20 +636,14 @@ export class McplLane {
   }
 
   private owe(st: LaneState, seq: Seq): void {
-    if (!st.owed.has(seq)) st.owed.set(seq, Date.now());
+    st.owed.add(seq);
   }
 
   /** The highest seq `delivered` may reach: below every owed message, and below a catch-up's start while it scans. */
   private floor(st: LaneState): Seq {
-    const now = Date.now();
     let min = Number.POSITIVE_INFINITY;
-    for (const [seq, at] of st.owed) {
-      if (now - at > OWED_TTL_MS && !st.inflight.has(seq)) {
-        st.owed.delete(seq); // it will never settle (mcpl-7)
-        continue;
-      }
-      if (seq < min) min = seq;
-    }
+    for (const seq of st.owed) if (seq < min) min = seq;
+    for (const summary of st.summaries.values()) if (summary.from < min) min = summary.from;
     let f = min - 1;
     if (st.scanningFrom !== undefined) f = Math.min(f, st.scanningFrom);
     return f;
@@ -653,15 +653,30 @@ export class McplLane {
    * A message was accepted, or is owed to nobody here: `delivered` advances, but never
    * past a lifecycle message still owed to this principal (G22). A completion the
    * principal's synchronous call returned counts as accepted (mcpl-1); so does a host's
-   * `duplicate` answer (mcpl-7). A refusal only stops it pinning the cursor.
+   * `duplicate` answer (mcpl-7). Refusal is not delivery: it keeps pinning the cursor.
    */
   private settle(t: Target, seq: Seq, how: Settled): void {
     const st = this.stateOf(t);
-    st.owed.delete(seq);
-    st.inflight.delete(seq);
     if (how === 'refused') return;
+    st.owed.delete(seq);
     if (seq > st.clearTo) st.clearTo = seq;
     this.advance(t, st);
+  }
+
+  private settleSegment(t: Target, seg: Segment, how: Settled): void {
+    const st = this.stateOf(t);
+    const id = qualify(seg.messageId);
+    st.inflight.delete(id);
+    if (how === 'refused') return;
+    const summary = st.summaries.get(id);
+    st.summaries.delete(id);
+    if (summary && how === 'accepted') for (const seq of summary.covered) st.owed.delete(seq);
+    for (const [key, retry] of st.retries) {
+      if (key !== id && !(how === 'accepted' && summary?.covered.has(retry.seq) && !st.summaries.has(key))) continue;
+      if (retry.timer) clearTimeout(retry.timer);
+      st.retries.delete(key);
+    }
+    this.settle(t, seg.seq, how);
   }
 
   private advance(t: Target, st: LaneState): void {
@@ -680,13 +695,40 @@ export class McplLane {
   private releaseUnsettled(t: Target, upTo: Seq): void {
     const st = this.stateOf(t);
     const held = new Set([...st.held.values()].map((h) => h.seq));
-    for (const seq of [...st.owed.keys()]) if (seq <= upTo && !st.inflight.has(seq) && !held.has(seq)) st.owed.delete(seq);
+    const pending = new Set([...st.inflight.values(), ...[...st.retries.values()].map((r) => r.seq)]);
+    for (const seq of st.owed) if (seq <= upTo && !pending.has(seq) && !held.has(seq)) st.owed.delete(seq);
     this.advance(t, st);
   }
 
   private remember(id: string): void {
     this.sent.add(id);
     if (this.sent.size > SENT_MAX) this.sent.delete(this.sent.values().next().value!);
+  }
+
+  /** Retry only lifecycle messages. Progress can be superseded; outcomes cannot.
+   * Back off to 30s on a persistently rejecting host, and recheck policy on every attempt. */
+  private retry(t: Target, seg: Segment): void {
+    if (this.disposed) return;
+    const entry = this.app.registry.get(t.id);
+    if (!entry || targetOf(entry).journal.runs !== t.journal.runs) return;
+    const st = this.stateOf(t);
+    const id = qualify(seg.messageId);
+    st.inflight.delete(id);
+    // An accepted catch-up summary (or another connection) may have covered this
+    // message while its earlier request was still waiting for a refusal.
+    if (seg.seq <= t.cursorsOf(this.me).delivered) return this.settleSegment(t, seg, 'accepted');
+    this.sent.delete(id);
+    if (!seg.lifecycle) return;
+    this.owe(st, seg.seq);
+    let r = st.retries.get(id);
+    if (!r) st.retries.set(id, (r = { seq: seg.seq, attempt: 0 }));
+    if (r.timer) return;
+    const retry = r;
+    retry.timer = setTimeout(() => {
+      retry.timer = undefined;
+      if (!this.disposed && this.carries(t.id)) this.deliver(t, seg, { released: true });
+    }, Math.min(30_000, 500 * 2 ** Math.min(retry.attempt++, 6)));
+    retry.timer.unref?.();
   }
 
   // ───────────── delivery ─────────────
@@ -738,16 +780,20 @@ export class McplLane {
     const st = this.stateOf(t);
     const id = qualify(seg.messageId);
     // Once per connection (mcpl-8): catch-up and the live path can meet on one message.
-    if (this.sent.has(id)) return;
+    if (this.sent.has(id)) {
+      // Catch-up can encounter an already accepted message behind an earlier gap.
+      if (!st.inflight.has(id) && !st.retries.has(id)) this.settleSegment(t, seg, 'accepted');
+      return;
+    }
     // G28 (and mcpl-13 for a start): what a synchronous result carried is not sent again.
-    if (this.returnedSeg(t, seg)) return this.settle(t, seg.seq, 'accepted');
+    if (this.returnedSeg(t, seg)) return this.settleSegment(t, seg, 'accepted');
     if (!opts.released && this.shouldHold(t, st, seg)) return this.hold(t, st, seg);
     // Never a principal's own note back to it (mcpl-14).
-    if (seg.kind === 'note' && seg.author === this.me) return this.settle(t, seg.seq, 'not-owed');
+    if (seg.kind === 'note' && seg.author === this.me) return this.settleSegment(t, seg, 'not-owed');
     if (this.open.has(channelId(t.id)) && this.enabled('terminal.channels', 'channels.incoming')) {
       const msg = this.message(t, seg);
       this.remember(msg.messageId);
-      st.inflight.add(seg.seq);
+      st.inflight.set(id, seg.seq);
       this.batch.push({ t, seg, msg });
       if (!this.batchTimer) {
         this.batchTimer = setTimeout(() => void this.flush(), BATCH_MS);
@@ -755,8 +801,8 @@ export class McplLane {
       }
       return;
     }
-    if (!seg.lifecycle || !(t.owner === this.me || seg.interested.includes(this.me))) return this.settle(t, seg.seq, 'not-owed');
-    if (!this.enabled('terminal.live', 'pushEvents')) return this.settle(t, seg.seq, 'refused');
+    if (!seg.lifecycle || !(t.owner === this.me || seg.interested.includes(this.me))) return this.settleSegment(t, seg, 'not-owed');
+    if (!this.enabled('terminal.live', 'pushEvents')) return this.settleSegment(t, seg, 'refused');
     this.push(t, seg);
   }
 
@@ -787,7 +833,7 @@ export class McplLane {
       if (this.disposed) return;
       if (this.returnedSeg(t, seg)) {
         st.held.delete(key);
-        return this.settle(t, seg.seq, 'accepted');
+        return this.settleSegment(t, seg, 'accepted');
       }
       if (Date.now() - held.since >= HOLD_MS) {
         st.held.delete(key);
@@ -804,7 +850,7 @@ export class McplLane {
     const msg = this.message(t, seg);
     const cid = channelId(t.id);
     this.remember(msg.messageId);
-    st.inflight.add(seg.seq);
+    st.inflight.set(msg.messageId, seg.seq);
     this.out
       .request('push/event', {
         featureSet: 'terminal.live',
@@ -816,11 +862,11 @@ export class McplLane {
       })
       .then((r) => {
         const res = r as { accepted?: boolean; reason?: string } | undefined;
-        this.settle(t, seg.seq, res?.accepted !== false || res?.reason === 'duplicate' ? 'accepted' : 'refused');
+        if (res?.accepted !== false || res?.reason === 'duplicate') this.settleSegment(t, seg, 'accepted');
+        else this.retry(t, seg);
       })
       .catch((e) => {
-        st.inflight.delete(seg.seq);
-        this.sent.delete(msg.messageId);
+        this.retry(t, seg);
         this.log(`push/event failed: ${(e as Error).message}`);
       });
   }
@@ -835,7 +881,7 @@ export class McplLane {
     for (const i of items) {
       if (this.open.has(channelId(i.t.id)) && this.enabled('terminal.channels', 'channels.incoming')) send.push(i);
       else {
-        this.stateOf(i.t).inflight.delete(i.seg.seq);
+        this.stateOf(i.t).inflight.delete(i.msg.messageId);
         this.sent.delete(i.msg.messageId);
         this.deliver(i.t, i.seg, { released: true });
       }
@@ -845,10 +891,11 @@ export class McplLane {
       const r = (await this.out.request('channels/incoming', { messages: send.map((i) => i.msg) })) as { results?: Array<{ messageId: string; accepted: boolean; reason?: string }> };
       for (const i of send) {
         const x = r?.results?.find((y) => y.messageId === i.msg.messageId);
-        this.settle(i.t, i.seg.seq, !r?.results || x?.accepted !== false || x?.reason === 'duplicate' ? 'accepted' : 'refused');
+        if (!r?.results || x?.accepted === true || x?.reason === 'duplicate') this.settleSegment(i.t, i.seg, 'accepted');
+        else this.retry(i.t, i.seg);
       }
     } catch (e) {
-      for (const i of send) this.stateOf(i.t).inflight.delete(i.seg.seq);
+      for (const i of send) this.retry(i.t, i.seg);
       this.log(`channels/incoming failed: ${(e as Error).message}`);
     }
   }
@@ -864,7 +911,7 @@ export class McplLane {
    * across sessions; the rest of each session is one summary with the cursor to read it.
    */
   private async catchUpAll(): Promise<void> {
-    const plans: Array<{ t: Target; st: LaneState; src: ReplaySource; from: Seq; open: boolean; scan?: LifecycleScan }> = [];
+    const plans: Array<{ t: Target; st: LaneState; src: ReplaySource; from: Seq; open: boolean; covered: Set<Seq>; scan?: LifecycleScan }> = [];
     // Every floor goes up before any scan yields, so the live path cannot move a cursor past what a scan has yet to find.
     for (const entry of this.app.registry.list()) {
       if (!this.app.can(this.me, entry, 'observe')) continue;
@@ -873,12 +920,18 @@ export class McplLane {
       if (from >= t.journal.lastSeq || !this.carries(t.id)) continue;
       const st = this.stateOf(t);
       st.scanningFrom = from;
-      plans.push({ t, st, src: this.sourceOf(entry), from, open: this.open.has(channelId(t.id)) });
+      plans.push({ t, st, src: this.sourceOf(entry), from, open: this.open.has(channelId(t.id)), covered: new Set() });
     }
     try {
       for (const p of plans) {
         if (this.disposed) return;
-        p.scan = await scanLifecycle(p.src, p.from, { keep: CATCHUP_LIMIT, accept: (pk) => this.owedOnCatchUp(p.t, p.st, p.src, pk, p.open) });
+        p.scan = await scanLifecycle(p.src, p.from, { keep: CATCHUP_LIMIT, accept: (pk) => {
+          if (!this.owedOnCatchUp(p.t, p.st, p.src, pk, p.open)) return false;
+          // Remember only existing debts, not every event in an arbitrarily long
+          // journal. Held outcomes and separately replayed messages stay separate.
+          if (p.st.owed.has(pk.ev.seq)) p.covered.add(pk.ev.seq);
+          return true;
+        } });
       }
     } catch (e) {
       for (const p of plans) p.st.scanningFrom = undefined;
@@ -893,11 +946,15 @@ export class McplLane {
       const picked = scan.picked.filter((pk) => chosen.has(pk));
       const omitted = countOmitted(scan.omitted, scan.picked.filter((pk) => !chosen.has(pk)));
       // What is owed is recorded before the scan's floor lifts; everything else up to the scan's end is settled.
-      for (const pk of picked) this.owe(p.st, pk.ev.seq);
+      for (const pk of picked) {
+        this.owe(p.st, pk.ev.seq);
+        p.covered.delete(pk.ev.seq);
+      }
       const w: (typeof work)[number] = { t: p.t, src: p.src, picked };
       if (omitted) {
         this.owe(p.st, omitted.to);
         w.summary = this.summary(p.t, omitted);
+        p.st.summaries.set(qualify(w.summary.messageId), { from: omitted.from, covered: p.covered });
       }
       if (scan.end > p.st.clearTo) p.st.clearTo = scan.end;
       p.st.scanningFrom = undefined;
@@ -976,6 +1033,7 @@ export class McplLane {
     this.watched.clear();
     if (this.batchTimer) clearTimeout(this.batchTimer);
     for (const st of this.states.values()) for (const h of st.held.values()) if (h.timer) clearTimeout(h.timer);
+    for (const st of this.states.values()) for (const r of st.retries.values()) if (r.timer) clearTimeout(r.timer);
   }
 }
 

@@ -18,6 +18,20 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-pty-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 let n = 0;
 
+test('process output is streaming UTF-8 text with separate stderr, including invalid-byte replacement', async () => {
+  const backend = new NodePtyBackend();
+  const child = backend.spawnProcess({
+    argv: [process.execPath, '-e', "process.stdout.write(Buffer.from([0xe2])); setTimeout(() => { process.stdout.write(Buffer.from([0x82,0xac,0x80,0xff])); process.stderr.write('separate'); }, 30)"],
+    cwd: tmp, env: {},
+  });
+  let stdout = '', stderr = '';
+  child.onStdout((s) => { stdout += s; });
+  child.onStderr((s) => { stderr += s; });
+  await new Promise<void>((resolve) => child.onExit(() => resolve()));
+  assert.equal(stdout, '€\ufffd\ufffd');
+  assert.equal(stderr, 'separate');
+});
+
 async function real(shell: string): Promise<{ session: Session; journal: Journal }> {
   const id = `real-${++n}`;
   const integ = prepareIntegration(shell, { noUserRc: true, dir: path.join(tmp, `integration-${id}`) });
@@ -33,7 +47,7 @@ async function real(shell: string): Promise<{ session: Session; journal: Journal
     tempDir: tmp,
     env: { TSM_MARK: 'present' },
   };
-  if (integ.kind !== 'none') so.integration = { args: integ.args, env: integ.env };
+  if (integ.kind !== 'none') so.integration = integ;
   const session = await Session.start(so);
   session.attach(AGENT, 'c1');
   return { session, journal };

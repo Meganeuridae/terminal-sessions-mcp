@@ -20,11 +20,8 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** The leftovers an armed exec could leave in the environment of the shell it became. */
 const LEAKS = 'echo "[${TSM_MARK_KEY-}][${TSM_MARK_PID-}][${TSM_BASH_RC-}][${TSM_USER_ZDOTDIR-}][${TSM_XDG_DATA_DIRS-}]"';
 
-const PAIRS: Array<[string, string]> = [
-  ['/bin/bash', '/bin/zsh'],
-  ['/bin/zsh', '/bin/bash'],
-  ...(FISH ? ([['/bin/bash', FISH]] as Array<[string, string]>) : []),
-];
+const SHELLS = ['/bin/bash', '/bin/zsh', ...(FISH ? [FISH] : [])].filter(hasShell);
+const PAIRS = SHELLS.flatMap((from) => SHELLS.map((to) => [from, to] as const));
 for (const [from, to] of PAIRS) {
   test(`ss-4: \`exec ${to}\` in a ${from.split('/').pop()} session re-integrates the new shell; the exec Run ends lost (shell-replaced)`, async () => {
     const x = await realSession(from);
@@ -45,21 +42,18 @@ for (const [from, to] of PAIRS) {
   });
 }
 
-test('ss-4: `exec dash` replaces the shell with one that has no integration: lost (shell-replaced), level none, marker strategy and its cancel serve', { skip: !hasShell('/bin/dash') }, async () => {
+test('exec into an unintegrated shell does not establish a ready command destination', { skip: !hasShell('/bin/dash') }, async () => {
   const x = await realSession('/bin/zsh', { integrationGraceMs: 800 });
   try {
     const r = await x.run('exec /bin/dash', 6000);
     assert.deepEqual([r.state, r.reason], ['lost', 'shell-replaced']);
     assert.equal(x.session.integration, 'none');
     assert.ok(x.journal.since(0).events.some((e) => e.type === 'integration' && e.level === 'none'), 'the change is journaled');
-    const next = await x.run('sh -c "exit 3"');
-    assert.deepEqual([next.state, next.exit], ['exited', 3]);
-    const c = await x.session.admitWhenAvailable({ target: 'shell', line: 'sleep 30', principal: AGENT });
-    assert.ok(c.admitted);
-    await sleep(300);
-    const cr = await x.session.cancel(c.run.runId, AGENT, { graceMs: 400 });
-    assert.equal(cr.state, 'cancelled', JSON.stringify(cr));
-    assert.equal((await x.run('echo after')).text, 'after');
+    assert.deepEqual(x.session.shellAvailable(), { ok: false, reason: 'shell-unavailable' });
+    const next = x.session.admit({ target: 'shell', line: 'echo must-not-run', principal: AGENT, queue: true });
+    assert.equal(next.admitted, false);
+    x.session.input('echo explicit-input\n', { principal: AGENT });
+    await until(() => x.journal.since(0).events.some((e) => e.type === 'output' && e.data.includes('explicit-input')), 2000);
   } finally {
     await x.close();
   }

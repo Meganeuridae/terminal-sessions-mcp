@@ -1,8 +1,9 @@
 /**
  * The fish integration (§7): a vendor_conf.d snippet found through XDG_DATA_DIRS,
  * Ghostty's technique. fish sources vendor snippets before the user's config.fish,
- * so the handshake mark goes out before a slow config runs (`--init-command` would
- * only run after it).
+ * though user conf.d files can precede them; the initial key is therefore a private
+ * PID file, never an environment variable visible to those earlier files' children.
+ * The handshake mark goes out before config.fish (`--init-command` would run after it).
  *
  * Written as a template literal: `$\{` below would be the shell's `${` (fish has
  * none), `\\` is one backslash.
@@ -11,7 +12,7 @@ export const FISH_CONF = `# --- tsm shell integration (fish) --- generated; do n
 #
 # XDG_DATA_DIRS pointed here for this one startup; it is restored at once, so
 # programs and nested shells see the user's value. Every mark ends in ";k=<key>":
-# the key arrives in TSM_MARK_KEY and moves into a global (unexported) variable.
+# the key is read from this PID's private file into a global unexported variable.
 # The hooks are fish events: fish_preexec (E, C), fish_postexec (D), fish_prompt
 # and fish_cancel (cwd, A), and a fish_prompt wrapper that ends the prompt with B.
 # An "exec fish" (or "exec bash", "exec zsh") re-integrates: the pid it keeps is the
@@ -62,13 +63,16 @@ if set -q TSM_XDG_CONFIG_HOME
     set -e TSM_XDG_CONFIG_HOME
 end
 # The key is this process's only: taken out of the environment whatever happens.
-set -l __tsm_k
+set -lu __tsm_k
 if set -q TSM_MARK_KEY; and begin; not set -q TSM_MARK_PID; or test "$TSM_MARK_PID" = "$fish_pid"; end
     set __tsm_k $TSM_MARK_KEY
+else if test -r "$__tsm_here/key-$fish_pid"
+    read __tsm_k < "$__tsm_here/key-$fish_pid"
+    /bin/rm -f -- "$__tsm_here/key-$fish_pid"
 end
 set -e TSM_MARK_KEY TSM_MARK_PID TSM_NO_USER_RC TSM_HISTFILE
 if test -n "$__tsm_k"; and not set -q __tsm_key; and status is-interactive
-    set -g __tsm_key $__tsm_k
+    set -gu __tsm_key $__tsm_k
     set -g __tsm_dir $__tsm_here
     set -g __tsm_user_dirs $__tsm_user_dirs
     set -g __tsm_empty_config $__tsm_empty_config
@@ -149,8 +153,12 @@ if test -n "$__tsm_k"; and not set -q __tsm_key; and status is-interactive
         if test -n "$__tsm_empty_config"
             set -gx TSM_NO_USER_RC 1
         end
-        set -gx TSM_MARK_KEY $__tsm_key
-        set -gx TSM_MARK_PID $fish_pid
+        begin
+            set -l old_umask (umask)
+            umask 077
+            printf '%s\\n' "$__tsm_key" > "$__tsm_dir/key-$fish_pid"
+            umask $old_umask
+        end
         set -gx TSM_XDG_DATA_DIRS "$__tsm_user_dirs"
         if test -n "$__tsm_user_dirs"
             set -gx XDG_DATA_DIRS "$__tsm_dir:$__tsm_user_dirs"
@@ -163,6 +171,7 @@ if test -n "$__tsm_k"; and not set -q __tsm_key; and status is-interactive
         end
     end
     function __tsm_exec_disarm
+        /bin/rm -f -- "$__tsm_dir/key-$fish_pid"
         set -e __tsm_exec_armed TSM_MARK_KEY TSM_MARK_PID TSM_XDG_DATA_DIRS TSM_BASH_RC TSM_USER_ZDOTDIR TSM_NO_USER_RC
         if test -n "$__tsm_had_zdotdir"
             set -gx ZDOTDIR "$__tsm_saved_zdotdir"

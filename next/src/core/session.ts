@@ -55,8 +55,8 @@ export interface SessionOptions {
   rows?: number;
   backend: ExecutionBackend;
   journal: Journal;
-  /** Integration args/env from `prepareIntegration` (the env carries the mark key); omit for none. */
-  integration?: { args: string[]; env: Record<string, string> };
+  /** Integration setup from `prepareIntegration`; omit for none. */
+  integration?: { args: string[]; env: Record<string, string>; key?: string; launcher?: string };
   /** How long to wait for the integration's handshake before declaring `none` (G5). */
   integrationGraceMs?: number;
   /** After the handshake, how long `start` waits for the first prompt at most (it then resolves in `starting`). */
@@ -105,7 +105,7 @@ export interface SeatOptions {
   asOwner?: boolean;
 }
 
-export type BusyReason = 'running' | 'prompt-pending' | 'human-editing' | 'starting' | 'exited';
+export type BusyReason = 'running' | 'prompt-pending' | 'human-editing' | 'starting' | 'shell-unavailable' | 'exited';
 export type AdmitResult = { admitted: true; run: RunInfo } | { admitted: false; busy: RunInfo | null; reason: BusyReason };
 
 export interface CancelResult {
@@ -381,7 +381,7 @@ export class Session {
     this.safeId = this.id.replace(/[^a-zA-Z0-9_-]/g, '_');
     this.histFile = path.join(this.tempDir, `tsm-history-${this.safeId}`);
     this.configured = configuredEnv(opts.daemonEnv ?? process.env, opts.env ?? {});
-    this.markKey = opts.integration?.env[MARK_KEY_ENV] || randomBytes(16).toString('hex');
+    this.markKey = opts.integration?.key || opts.integration?.env[MARK_KEY_ENV] || randomBytes(16).toString('hex');
     this.marks = new MarksParser(this.markKey);
     this.flavor = flavorOf(opts.shell);
     this.screen = new Screen({ cols: opts.cols ?? 120, rows: opts.rows ?? 30 });
@@ -424,6 +424,7 @@ export class Session {
     const args = [...(this.opts.shellArgs ?? [])];
     if (integrated) {
       Object.assign(env, this.opts.integration!.env, { [MARK_KEY_ENV]: this.markKey, TSM_HISTFILE: this.histFile });
+      if (this.opts.integration!.launcher) delete env[MARK_KEY_ENV];
       if (login && kind === 'bash') env.TSM_LOGIN = '1';
       if (login && (kind === 'zsh' || kind === 'fish')) args.push('-l');
       // ss-7: login files (macOS path_helper, fish's login config) and the user's rc reorder
@@ -431,7 +432,8 @@ export class Session {
       if (given.PATH !== undefined) env.TSM_SESSION_PATH = given.PATH;
       args.push(...this.opts.integration!.args);
     }
-    this.pty = this.backend.spawnShell({ shell: this.opts.shell, args, cwd: this.opts.cwd, env, cols: this.screen.cols, rows: this.screen.rows });
+    const launcher = this.opts.integration?.launcher;
+    this.pty = this.backend.spawnShell({ shell: this.opts.shell, args, cwd: this.opts.cwd, env, cols: this.screen.cols, rows: this.screen.rows, ...(launcher && { bootstrap: { launcher, key: this.markKey } }) });
     this.pty.onData((d) => this.onPtyData(d));
     this.pty.onExit((e) => this.onPtyExit(e));
     // G25: the daemon's emulator is the sole responder to terminal queries.
@@ -463,7 +465,7 @@ export class Session {
       this.capTimer = undefined;
       // Still no prompt: resolve in `starting` (admission answers busy 'starting' until
       // the prompt arrives) — unless the rc replaced the shell (`exec zsh` in a .bashrc),
-      // whose prompt will never carry our marks: then the marker strategy serves.
+      // whose prompt carries no marks: shell command admission then remains unavailable.
       if (this.integrationLevel === 'unknown' && this.replacedDuringStartup()) this.declareIntegration('none');
       else this.markReady();
     }, this.opts.startupCapMs ?? 15_000);
@@ -471,12 +473,19 @@ export class Session {
 
   /** Did the shell process exec something else after the integration's handshake (its rc exec'd a shell)? */
   private replacedDuringStartup(): boolean {
-    if (!this.sawHello || this.sawPromptStart || this.helloCommand === undefined) return false;
+    if (this.sawPromptStart || !this.opts.integration) return false;
     const now = this.pty.command?.();
-    if (now === undefined || now === this.helloCommand) return false;
-    this.note(`the shell was replaced during startup (${now}); its prompt carries no marks`);
-    this.helloCommand = now;
-    this.flavor = flavorOf(now);
+    if (now === undefined) return false;
+    if (this.sawHello) {
+      if (this.helloCommand === undefined || now === this.helloCommand) return false;
+    } else {
+      // User/system startup files can exec before our first hello (fish conf.d,
+      // for example). Missing integration does not make that replacement a shell.
+      const program = path.basename(now.trim().split(/\s+/)[0] ?? '').replace(/^-/, '');
+      if (program === path.basename(this.opts.shell).replace(/^-/, '')) return false;
+    }
+    this.onShellReplaced(now);
+    this.markReady();
     return true;
   }
 
@@ -505,6 +514,7 @@ export class Session {
 
   private settleNone(): void {
     if (this.shellState !== 'starting') return;
+    if (this.replacedDuringStartup()) return;
     if (this.settleTimer) clearTimeout(this.settleTimer);
     this.settleTimer = undefined;
     // The program at its prompt now (not the spawn's helper): what a later `exec` is told from (ss-4).
@@ -617,6 +627,11 @@ export class Session {
     if (!this.sawHello) {
       this.sawHello = true;
       this.helloCommand = this.pty.command?.();
+      // The rc can exec before we consume its hello. Do not take the replacement's
+      // command line as proof that it was the shell which emitted that handshake.
+      if (kind && this.helloCommand && path.basename(this.helloCommand.trim().split(/\s+/)[0] ?? '').replace(/^-/, '') !== kind) {
+        this.helloCommand = kind;
+      }
       // The grace timer stays: when it fires without a prompt, it checks that the rc
       // has not replaced the shell.
       return;
@@ -675,12 +690,11 @@ export class Session {
    * rc of the new shell that never loads us). The Run in flight ends lost ('shell-replaced');
    * the level drops to what the program provides — none (G5 as amended: the level is what
    * the terminal's current program reports, and it only rises within one program) — so the
-   * marker strategy, with the new program's status variable, serves later Runs and cancel
-   * follows the none-level contract. The key went out in that program's environment: it is
-   * retired, so marks carrying it are ordinary output from now on.
+   * replacement remains available for explicit input, but is not a verified shell command
+   * destination. Neither a process name nor elapsed time establishes prompt readiness.
    */
   private onShellReplaced(command: string): void {
-    this.note(`the shell was replaced by \`${command}\`, which reports no marks: integration none from here; the marker strategy serves daemon Runs`);
+    this.note(`the shell was replaced by \`${command}\`, which reports no marks: shell commands are unavailable; use input to interact, or open a new session`);
     this.markKey = randomBytes(16).toString('hex');
     this.marks.rekey(this.markKey);
     this.helloCommand = command;
@@ -696,10 +710,8 @@ export class Session {
       this.integrationLevel = 'none';
       this.append({ type: 'integration', level: 'none' });
     }
-    if (this.shellState !== 'exited') this.shellState = 'idle';
+    if (this.shellState !== 'exited') this.shellState = 'unavailable';
     for (const r of inFlight) if (r && !isTerminal(r.state)) this.endRun(r, { state: 'lost', reason: 'shell-replaced' });
-    this.drainQueue();
-    this.notifyAvailable();
   }
 
   private onPromptStart(): void {
@@ -1074,9 +1086,10 @@ export class Session {
       delete run.tempFile;
     }
     if (this.execWatch?.run === run) this.stopExecWatch();
-    if (this.currentShellRun === run) this.currentShellRun = undefined;
-    if (run.target === 'shell' && this.integrationLevel === 'none' && this.shellState !== 'exited') {
-      this.shellState = 'idle';
+    const wasCurrent = this.currentShellRun === run;
+    if (wasCurrent) this.currentShellRun = undefined;
+    if (wasCurrent && this.integrationLevel === 'none' && this.shellState !== 'exited' && this.shellState !== 'unavailable') {
+      this.shellState = outcome.state === 'lost' ? 'unavailable' : 'idle';
       queueMicrotask(() => {
         this.drainQueue();
         this.notifyAvailable();
@@ -1090,6 +1103,7 @@ export class Session {
   /** Is the shell terminal available for a shell Run (G4)? */
   shellAvailable(): { ok: true } | { ok: false; reason: BusyReason } {
     if (this.shellState === 'exited') return { ok: false, reason: 'exited' };
+    if (this.shellState === 'unavailable') return { ok: false, reason: 'shell-unavailable' };
     if (this.shellState === 'starting') return { ok: false, reason: 'starting' };
     if (this.pendingShellRun || (this.currentShellRun && !isTerminal(this.currentShellRun.state))) return { ok: false, reason: 'running' };
     // The last Run ended but the prompt that confirms the shell is back has not arrived.
@@ -1168,7 +1182,7 @@ export class Session {
     }
     if (opts.line === undefined) throw err('invalid_argument', 'shell Run needs a line');
     const avail = this.shellAvailable();
-    if (!avail.ok && (avail.reason === 'exited' || !opts.queue)) {
+    if (!avail.ok && (avail.reason === 'exited' || avail.reason === 'shell-unavailable' || !opts.queue)) {
       // (After an exit no shell Run is in flight: busy is null.)
       const busy = this.currentShellRun ?? this.pendingShellRun;
       return { admitted: false, busy: busy ? publicRun(busy) : null, reason: avail.reason };

@@ -4,9 +4,9 @@
  * vendor_conf.d snippet found through XDG_DATA_DIRS (fish.ts). Anything else: no
  * integration; the marker strategy serves daemon-issued Runs (G5).
  *
- * Every mark the scripts emit carries the session's key (`TSM_MARK_KEY` in the env
- * returned here; the scripts move it into an unexported variable at once). The
- * Session reads the key from this env and trusts only marks that carry it.
+ * The private launcher writes the initial credential for its own PID, then execs
+ * the shell. No user/system startup child inherits a credential in its environment.
+ * Session receives the key separately and trusts only marks that carry it.
  *
  * The directory holds all three shells' files whatever the session's shell is: an
  * `exec zsh` in a bash session (or any other pair) re-integrates the new shell from
@@ -16,7 +16,6 @@ import { randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { MARK_KEY_ENV } from '../core/marks.js';
 import { BASH_RC } from './bash.js';
 import { FISH_CONF } from './fish.js';
 import { ZSH_ZLOGIN, ZSH_ZPROFILE, ZSH_ZSHENV, ZSH_ZSHRC } from './zsh.js';
@@ -27,8 +26,11 @@ export interface IntegrationSetup {
   kind: IntegrationKind;
   /** Arguments to pass to the shell binary. */
   args: string[];
-  /** Environment additions (includes `TSM_MARK_KEY`, the session's mark key, for an integrated shell). */
+  /** Environment additions, with no completion credentials. */
   env: Record<string, string>;
+  /** Private launch script, interpreted by /bin/sh before the configured shell. */
+  launcher?: string;
+  key?: string;
   /** Remove any files written for this setup. */
   cleanup(): void;
 }
@@ -52,7 +54,12 @@ export function prepareIntegration(shellPath: string, opts: PrepareOptions = {})
   const dir = opts.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), `tsm-integration-${process.pid}-${++counter}-`));
   fs.mkdirSync(path.join(dir, 'fish', 'vendor_conf.d'), { recursive: true, mode: 0o700 });
   const cleanup = () => fs.rmSync(dir, { recursive: true, force: true });
-  const env: Record<string, string> = { [MARK_KEY_ENV]: randomBytes(16).toString('hex') };
+  const key = randomBytes(16).toString('hex');
+  const env: Record<string, string> = {};
+  const launcher = path.join(dir, 'launch.sh');
+  // No shell config, external command or exported variable sees the key. exec keeps
+  // the PID, and each shell consumes only the private file for its own PID.
+  fs.writeFileSync(launcher, `umask 077\ncommand printf '%s\\n' '${key}' > "\${0%/*}/key-$$" || exit 1\nexec "$@"\n`, { mode: 0o600 });
   if (opts.noUserRc) env.TSM_NO_USER_RC = '1';
   const files = { 'bash-rc.sh': BASH_RC, '.zshenv': ZSH_ZSHENV, '.zprofile': ZSH_ZPROFILE, '.zshrc': ZSH_ZSHRC, '.zlogin': ZSH_ZLOGIN, 'fish/vendor_conf.d/tsm-integration.fish': FISH_CONF };
   for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text, { mode: 0o600 });
@@ -62,7 +69,7 @@ export function prepareIntegration(shellPath: string, opts: PrepareOptions = {})
   if (opts.noUserRc) fs.mkdirSync(empty, { recursive: true, mode: 0o700 });
   if (kind === 'bash') {
     env.BASH_SILENCE_DEPRECATION_WARNING = '1'; // macOS's /bin/bash banner is not command output
-    return { kind, args: ['--rcfile', path.join(dir, 'bash-rc.sh')], env, cleanup };
+    return { kind, args: ['--rcfile', path.join(dir, 'bash-rc.sh')], env, key, launcher, cleanup };
   }
   if (kind === 'zsh') {
     env.ZDOTDIR = dir;
@@ -77,5 +84,5 @@ export function prepareIntegration(shellPath: string, opts: PrepareOptions = {})
       env.TSM_XDG_CONFIG_HOME = userEnv.XDG_CONFIG_HOME ?? '';
     }
   }
-  return { kind, args: [], env, cleanup };
+  return { kind, args: [], env, key, launcher, cleanup };
 }

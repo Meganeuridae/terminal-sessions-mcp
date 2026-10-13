@@ -132,6 +132,13 @@ interface IdemEntry {
   value: Promise<unknown>;
 }
 
+/** New journals keep key identity independent of the operation fingerprint. Older
+ * journals contain only the combined hash, which can recover identical retries. */
+function idemIdentity(idem: string): { key: string; tool: string; digest: string } | undefined {
+  const m = /^v2:([a-f0-9]{24}):([^:]+):([a-f0-9]{16})$/.exec(idem);
+  return m ? { key: m[1]!, tool: m[2]!, digest: m[3]! } : undefined;
+}
+
 /**
  * Per-principal memory of idempotency keys (G16). A replay returns the original outcome,
  * success or failure; a key reused for another tool or other arguments is refused. Nothing
@@ -146,6 +153,7 @@ class Idempotency {
 
   constructor(
     readonly windowMs: number,
+    private readonly recoverIdentity: (key: string) => { tool: string; digest: string } | undefined,
     private readonly perPrincipal = 1024,
     private readonly total = 16_384,
   ) {}
@@ -165,14 +173,19 @@ class Idempotency {
     this.sweep(now);
     const k = `${principal}\u0000${key}`;
     const digest = argsDigest(args);
+    const identity = createHash('sha256').update(k).digest('hex').slice(0, 24);
     const prev = this.entries.get(k);
+    const prior = prev ?? this.recoverIdentity(identity);
+    if (prior) {
+      if (prior.tool !== tool) throw err('invalid_argument', `idempotencyKey ${key} was used for ${prior.tool}, not ${tool}; use a new key for a new operation`, { idempotencyKey: key });
+      if (prior.digest !== digest) throw err('invalid_argument', `idempotencyKey ${key} was used for a ${tool} call with other arguments; use a new key (a UUID) for each operation`, { idempotencyKey: key });
+    }
     if (prev) {
-      if (prev.tool !== tool) throw err('invalid_argument', `idempotencyKey ${key} was used for ${prev.tool}, not ${tool}; use a new key for a new operation`, { idempotencyKey: key });
-      if (prev.digest !== digest) throw err('invalid_argument', `idempotencyKey ${key} was used for a ${tool} call with other arguments; use a new key (a UUID) for each operation`, { idempotencyKey: key });
       return replay((await prev.value) as T);
     }
-    const idem = createHash('sha256').update(`${principal}\u0000${key}\u0000${tool}\u0000${digest}`).digest('hex').slice(0, 24);
-    const recovered = opts.recover?.(idem);
+    const idem = `v2:${identity}:${tool}:${digest}`;
+    const legacy = createHash('sha256').update(`${principal}\u0000${key}\u0000${tool}\u0000${digest}`).digest('hex').slice(0, 24);
+    const recovered = opts.recover?.(idem) ?? opts.recover?.(legacy);
     if (recovered !== undefined) {
       this.put(k, { principal, tool, digest, at: now, value: Promise.resolve(recovered) });
       return replay(recovered);
@@ -237,6 +250,7 @@ export class App {
   private readonly extrasBySession = new Map<Session, Extras>();
   private readonly segmenterOptions: SegmenterOptions;
   private recoveredIdem: Map<string, { session: string; run: RunInfo }> | undefined;
+  private readonly recoveredKeys = new Map<string, { tool: string; digest: string; at: number }>();
 
   constructor(opts: AppOptions) {
     this.segmenterOptions = opts.segmenter ?? {};
@@ -244,7 +258,11 @@ export class App {
     this.defaultWaitMs = opts.defaultWaitMs ?? 20_000;
     this.maxWaitMs = opts.maxWaitMs ?? 55_000;
     this.resultBytes = opts.resultBytes ?? 16 * 1024;
-    this.idem = new Idempotency(opts.idempotencyWindowMs ?? 15 * 60_000);
+    this.idem = new Idempotency(opts.idempotencyWindowMs ?? 15 * 60_000, (key) => {
+      this.indexRecoveredIdem();
+      const hit = this.recoveredKeys.get(key);
+      return hit && Date.now() - hit.at <= this.idem.windowMs ? hit : undefined;
+    });
     this.registry.onChange((c) => {
       if (c.type === 'created') return;
       for (const [s, x] of this.extrasBySession) {
@@ -543,15 +561,26 @@ export class App {
    * A keyed Run admitted before a restart (G16): its admission journaled the key's identity, so a
    * retry finds it instead of executing again. The index is built once, from what recovery loaded.
    */
-  private recoverRun(idem: string): RunResult | undefined {
+  private indexRecoveredIdem(): void {
     if (!this.recoveredIdem) {
       this.recoveredIdem = new Map();
       const since = Date.now() - this.idem.windowMs;
       for (const s of this.registry.list()) {
-        for (const r of s.listRuns()) if (r.idem !== undefined && r.admittedAt >= since) this.recoveredIdem.set(r.idem, { session: sessionId(s), run: r });
+        for (const r of s.listRuns()) {
+          if (r.idem === undefined || r.admittedAt < since) continue;
+          this.recoveredIdem.set(r.idem, { session: sessionId(s), run: r });
+          const identity = idemIdentity(r.idem);
+          if (identity && r.admittedAt > (this.recoveredKeys.get(identity.key)?.at ?? -Infinity)) {
+            this.recoveredKeys.set(identity.key, { tool: identity.tool, digest: identity.digest, at: r.admittedAt });
+          }
+        }
       }
     }
-    const hit = this.recoveredIdem.get(idem);
+  }
+
+  private recoverRun(idem: string): RunResult | undefined {
+    this.indexRecoveredIdem();
+    const hit = this.recoveredIdem!.get(idem);
     if (!hit || Date.now() - hit.run.admittedAt > this.idem.windowMs) return undefined;
     const r = hit.run;
     const last = r.seq.end ?? r.seq.admit;

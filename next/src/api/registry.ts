@@ -643,7 +643,7 @@ export class SessionRegistry {
         onCursors: (p, c) => cursors.set(p, c),
       };
       if (options.shellArgs) so.shellArgs = [...options.shellArgs];
-      if (integ && integ.kind !== 'none') so.integration = { args: integ.args, env: integ.env };
+      if (integ && integ.kind !== 'none') so.integration = integ;
       session = await Session.start(so);
     } catch (e) {
       integ?.cleanup();

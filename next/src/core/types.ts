@@ -14,7 +14,7 @@ export type RunState = 'queued' | 'starting' | 'running' | 'exited' | 'cancelled
 export type RunOrigin = 'self' | 'human' | 'agent' | 'system';
 
 /** The shell terminal's state. `tui` is `busy` with the alternate screen active. */
-export type ShellState = 'starting' | 'idle' | 'busy' | 'exited';
+export type ShellState = 'starting' | 'idle' | 'busy' | 'unavailable' | 'exited';
 
 /** Shell-integration level, VS Code's vocabulary (G5). */
 export type IntegrationLevel = 'unknown' | 'rich' | 'basic' | 'none';

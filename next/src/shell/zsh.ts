@@ -11,15 +11,20 @@ export const ZSH_ZSHENV = `# --- tsm shell integration (zsh .zshenv shim) --- ge
 # forwards to the user's own file with the user's ZDOTDIR — keeping the one the
 # user's .zshenv chooses (XDG layouts) — and ZDOTDIR stays on the shim only until
 # the user's .zshrc (or, in a login shell, .zlogin) has been read. Every mark ends
-# in ";k=<key>": the key arrives in TSM_MARK_KEY and moves at once into an
-# unexported variable, so programs and nested shells never see it. A zsh that finds
-# this file without a key (or, after an armed exec, with another pid) is a plain zsh.
+# in ";k=<key>": the key is read from this PID's private file into an unexported
+# variable (legacy custom setups can supply TSM_MARK_KEY). A zsh with another PID
+# finds no handoff file and is a plain zsh.
 () {
   emulate -L zsh
   typeset -g __tsm_key=
   if [[ -n $\{TSM_MARK_KEY-} && ( -z $\{TSM_MARK_PID-} || $\{TSM_MARK_PID-} == $$ ) ]]; then
     __tsm_key=$TSM_MARK_KEY
+  elif [[ -r $ZDOTDIR/key-$$ ]]; then
+    IFS= builtin read -r __tsm_key < "$ZDOTDIR/key-$$"
+    typeset -g +x __tsm_key
+    /bin/rm -f -- "$ZDOTDIR/key-$$"
   fi
+  typeset -g +x __tsm_key
   typeset -g __tsm_shim=$ZDOTDIR __tsm_no_user_rc=$\{TSM_NO_USER_RC-} __tsm_histfile=$\{TSM_HISTFILE-}
   if (( $\{+TSM_USER_ZDOTDIR} )); then typeset -g __tsm_user_zdotdir=$TSM_USER_ZDOTDIR; else unset __tsm_user_zdotdir; fi
   if (( $\{+TSM_SESSION_PATH} )); then typeset -g __tsm_session_path=$TSM_SESSION_PATH; fi
@@ -100,14 +105,13 @@ __tsm_prompt_sp() {
   integer w=$\{#plain}
   builtin printf '%s%*s\\r%*s\\r' "$m" $(( COLUMNS - w )) '' $w ''
 }
-# The last precmd hook: cwd, prompt start, and the prompt-end mark at the end of
-# PS1 — after every theme (p10k, starship, atuin) has rebuilt it. It keeps our
+# The last precmd hook: cwd and prompt start, after themes rebuild the prompt.
+# The line-init hook emits prompt end once the line editor is ready. Keep our
 # hooks first and last for the next prompt too.
 __tsm_precmd_last() {
   emulate -L zsh
   __tsm_escape "$PWD"
   __tsm_osc "633;P;Cwd=$REPLY"
-  if [[ "$PS1" != *"$__tsm_b"* ]]; then PS1="$PS1$__tsm_b"; fi
   __tsm_osc '133;A'
   precmd_functions=(__tsm_precmd_first $\{precmd_functions:#__tsm_precmd_(first|last)} __tsm_precmd_last)
   preexec_functions=($\{preexec_functions:#__tsm_preexec} __tsm_preexec)
@@ -141,9 +145,12 @@ __tsm_execs() {
 __tsm_line_init() {
   emulate -L zsh
   [[ $CONTEXT == start ]] || return 0
-  (( $precmd_functions[(Ie)__tsm_precmd_first] && $precmd_functions[(Ie)__tsm_precmd_last] )) && return 0
-  __tsm_in_cmd=
-  __tsm_precmd_last
+  if ! (( $precmd_functions[(Ie)__tsm_precmd_first] && $precmd_functions[(Ie)__tsm_precmd_last] )); then
+    __tsm_in_cmd=
+    __tsm_precmd_last
+  fi
+  # Keep the credential out of PS1, even when the user's prompt is exported.
+  __tsm_osc '133;B'
 }
 # Daemon plumbing (" . '<tmp>/tsm-cmd-…'") never enters history.
 __tsm_addhistory() {
@@ -154,14 +161,15 @@ __tsm_addhistory() {
 # An exec replaces this process: tell the daemon (it watches whether the program that
 # follows is a shell that re-integrates, ss-4), and export what a fresh shell of ours
 # needs — zsh the shim directory, bash a PROMPT_COMMAND that sources its rc beside it,
-# fish the vendor snippet — with the key (same pid, so the check passes; nested shells
-# fail it). Disarmed at the next prompt if the exec did not happen.
+# fish the vendor snippet. The key stays in a private file for this PID, never in
+# a child's environment. Disarmed at the next prompt if the exec did not happen.
 __tsm_exec_arm() {
   typeset -g __tsm_exec_armed=1
   __tsm_osc '633;P;TsmExec=1'
   typeset -g __tsm_had_xdg=$\{+XDG_DATA_DIRS} __tsm_saved_xdg=$\{XDG_DATA_DIRS-} __tsm_had_cfg=$\{+XDG_CONFIG_HOME} __tsm_saved_cfg=$\{XDG_CONFIG_HOME-}
   typeset -g __tsm_had_pc=$\{+PROMPT_COMMAND} __tsm_saved_pc=$\{PROMPT_COMMAND-}
-  export TSM_MARK_KEY=$__tsm_key TSM_MARK_PID=$$ ZDOTDIR=$__tsm_shim
+  (umask 077; builtin printf '%s\\n' "$__tsm_key" > "$__tsm_shim/key-$$")
+  export ZDOTDIR=$__tsm_shim
   if [[ -n $__tsm_histfile ]]; then export TSM_HISTFILE=$__tsm_histfile; fi
   if (( $\{+__tsm_user_zdotdir} )); then export TSM_USER_ZDOTDIR=$__tsm_user_zdotdir; fi
   if [[ -n $__tsm_no_user_rc ]]; then export TSM_NO_USER_RC=1; fi
@@ -170,6 +178,7 @@ __tsm_exec_arm() {
   if [[ -n $__tsm_no_user_rc ]]; then export TSM_XDG_CONFIG_HOME=$__tsm_saved_cfg XDG_CONFIG_HOME=$__tsm_shim/no-user-config; fi
 }
 __tsm_exec_disarm() {
+  /bin/rm -f -- "$__tsm_shim/key-$$"
   unset __tsm_exec_armed TSM_MARK_KEY TSM_MARK_PID TSM_HISTFILE TSM_USER_ZDOTDIR TSM_NO_USER_RC TSM_BASH_RC TSM_XDG_DATA_DIRS TSM_XDG_CONFIG_HOME
   if (( __tsm_had_pc )); then PROMPT_COMMAND=$__tsm_saved_pc; else unset PROMPT_COMMAND; fi
   if (( __tsm_had_xdg )); then export XDG_DATA_DIRS=$__tsm_saved_xdg; else unset XDG_DATA_DIRS; fi
@@ -221,7 +230,6 @@ __tsm_finish() {
 () {
   emulate -L zsh
   typeset -g __tsm_in_cmd=
-  typeset -g __tsm_b="%{"$'\\e]133;B;k='"$__tsm_key"$'\\a'"%}"
   typeset -gi __tsm_psp=0
   typeset -ga precmd_functions preexec_functions zshaddhistory_functions
   precmd_functions=(__tsm_precmd_first $\{precmd_functions:#__tsm_precmd_(first|last)} __tsm_precmd_last)
@@ -239,7 +247,6 @@ zle -N __tsm_clear_line
 }
 if [[ -o prompt_sp && -o prompt_cr ]]; then __tsm_psp=1; fi
 unsetopt prompt_sp
-PS1="$PS1$__tsm_b"
 if [[ ! -o login ]]; then __tsm_finish; fi
 `;
 

@@ -11,6 +11,8 @@ export interface SpawnShellOptions {
   env: Record<string, string>;
   cols: number;
   rows: number;
+  /** Private shell bootstrap; the credential is backend configuration, never child env. */
+  bootstrap?: { launcher: string; key: string };
 }
 
 export interface PtyExit {

@@ -10,8 +10,8 @@ export const BASH_RC = `__tsm_st0=$?
 # (VS Code's technique: /etc/profile, then the first of ~/.bash_profile,
 # ~/.bash_login, ~/.profile), otherwise sources ~/.bashrc, then installs the hooks
 # that emit the session's marks. Every mark ends in ";k=<key>": the key arrives in
-# TSM_MARK_KEY and moves at once into an unexported variable, so programs and
-# nested shells never see it and their marks stay ordinary output to the daemon.
+# a private file for this PID (legacy custom setups can supply TSM_MARK_KEY).
+# It stays unexported, so ordinary children and nested shells do not inherit it.
 #
 # The hooks never trip the user's set -e / set -u, chain a DEBUG trap the rc
 # installed, join bash-preexec's arrays when it is loaded, and heal themselves when
@@ -34,12 +34,24 @@ if [ "$\{1-}" = reinit ] && [ -n "$\{__tsm_key-}" ]; then
   return 0
 fi
 
+__tsm_rc=$\{BASH_SOURCE[0]-}
+__tsm_dir=$\{__tsm_rc%/*}
+# Reinit may run after an rc enabled allexport and a DEBUG trap which starts
+# ordinary children. Disable allexport before any credential assignment, not after.
+__tsm_before_key_opts=$-
+set +a
+unset __tsm_key
 __tsm_key=
 if [ -n "$\{TSM_MARK_KEY-}" ] && { [ -z "$\{TSM_MARK_PID-}" ] || [ "$\{TSM_MARK_PID-}" = "$$" ]; }; then
   __tsm_key=$TSM_MARK_KEY
+elif [ -r "$__tsm_dir/key-$$" ]; then
+  IFS= builtin read -r __tsm_key < "$__tsm_dir/key-$$"
+  export -n __tsm_key
+  /bin/rm -f -- "$__tsm_dir/key-$$"
 fi
-__tsm_rc=$\{BASH_SOURCE[0]-}
-__tsm_dir=$\{__tsm_rc%/*}
+export -n __tsm_key
+case $__tsm_before_key_opts in *a*) set -a ;; esac
+unset __tsm_before_key_opts
 __tsm_login=$\{TSM_LOGIN-}
 __tsm_no_user_rc=$\{TSM_NO_USER_RC-}
 __tsm_user_rcfile=$\{TSM_USER_RCFILE-}
@@ -325,7 +337,7 @@ __tsm_grab() { __tsm_prev_debug=$\{2-}; }
 # An exec replaces this process: tell the daemon (it watches whether the program that
 # follows is a shell that re-integrates, ss-4), and export what a fresh shell of ours
 # needs to integrate — bash at its first prompt through PROMPT_COMMAND, zsh through the
-# shim directory, fish through the vendor snippet (same pid, so the key check passes;
+# shim directory, fish through the vendor snippet (same pid, so the key file matches;
 # nested shells fail it). Disarmed at the next prompt if the exec did not happen.
 __tsm_exec_arm() {
   __tsm_exec_armed=1
@@ -333,7 +345,10 @@ __tsm_exec_arm() {
   __tsm_had_zdotdir=$\{ZDOTDIR+1} __tsm_saved_zdotdir=$\{ZDOTDIR-}
   __tsm_had_xdg=$\{XDG_DATA_DIRS+1} __tsm_saved_xdg=$\{XDG_DATA_DIRS-}
   __tsm_had_cfg=$\{XDG_CONFIG_HOME+1} __tsm_saved_cfg=$\{XDG_CONFIG_HOME-}
-  export TSM_MARK_KEY="$__tsm_key" TSM_MARK_PID="$$" TSM_BASH_RC="$__tsm_rc"
+  # A textual exec hint is not authority to give every child our key. Only a
+  # startup shim with this same PID consumes the private handoff file.
+  (umask 077; builtin printf '%s\\n' "$__tsm_key" > "$__tsm_dir/key-$$")
+  export TSM_BASH_RC="$__tsm_rc"
   if [ -n "$__tsm_histfile" ]; then export TSM_HISTFILE="$__tsm_histfile"; fi
   if [ -n "$__tsm_no_user_rc" ]; then export TSM_NO_USER_RC=1; fi
   PROMPT_COMMAND=' . "$TSM_BASH_RC" reinit'
@@ -344,6 +359,7 @@ __tsm_exec_arm() {
   if [ -n "$__tsm_no_user_rc" ]; then export TSM_XDG_CONFIG_HOME="$__tsm_saved_cfg" XDG_CONFIG_HOME="$__tsm_dir/no-user-config"; fi
 }
 __tsm_exec_disarm() {
+  /bin/rm -f -- "$__tsm_dir/key-$$"
   __tsm_exec_armed=
   export -n PROMPT_COMMAND
   PROMPT_COMMAND=$__tsm_pc
@@ -358,6 +374,7 @@ __tsm_exec_disarm() {
 __tsm_bp_first() {
   local __st=$? __o=$-
   set +eu
+  if [ -n "$\{__tsm_exec_armed-}" ]; then __tsm_exec_disarm; fi
   __tsm_prompt_active=
   __tsm_close "$__st"
   __tsm_restore "$__o"

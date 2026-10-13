@@ -50,6 +50,139 @@ function live(registry: SessionRegistry, id: string): Session {
   return e.session;
 }
 
+for (const via of ['push', 'channel'] as const) {
+  for (const recovery of ['retry', 'reconnect'] as const) {
+    test(`G22: refused ${via} completion survives later acceptance and ${recovery}`, async () => {
+      const d = await daemon();
+      let allow = false;
+      let refused: string | undefined;
+      let attempts = 0;
+      const accept = (id: string, tags: string[]) => {
+        if (!tags.includes('terminal:run-finished')) return true;
+        refused ??= id;
+        if (id !== refused) return true;
+        attempts++;
+        return allow;
+      };
+      try {
+        const a = await d.host('ta', 'refusal', { answer: (m) => {
+          if (m.method === 'push/event') {
+            const p = m.params as { eventId: string; tags: string[] };
+            return { accepted: accept(p.eventId, p.tags), reason: 'queue_full' };
+          }
+          if (m.method === 'channels/incoming') {
+            const p = m.params as { messages: Array<{ messageId: string; tags: string[] }> };
+            return { results: p.messages.map((v) => ({ messageId: v.messageId, accepted: accept(v.messageId, v.tags), reason: 'queue_full' })) };
+          }
+          return undefined;
+        } });
+        await a.call('session_open', { session: 'refusal' });
+        if (via === 'channel') await a.request('channels/open', { channelId: 'terminal:refusal' });
+        const first = await a.call('run', { session: 'refusal', command: 'sleep 0.15; echo first', wait: 0 });
+        const firstId = first.structured!.runId as string;
+        const got = await a.delivery(aboutRun(firstId));
+        assert.equal(got.via, via === 'channel' ? 'incoming' : 'push');
+        const second = await a.call('run', { session: 'refusal', command: 'sleep 0.15; echo second', wait: 0 });
+        await a.delivery(aboutRun(second.structured!.runId));
+        await until(() => attempts >= 2, 3000, 'a retry with the same stable id');
+        const s = live(d.registry, 'refusal');
+        assert.ok(s.cursorsOf(A).delivered < s.run(firstId).seq.end!, 'later acceptance cannot skip the rejected outcome');
+        assert.equal(new Set(a.deliveries().filter(aboutRun(firstId)).map((v) => v.messageId)).size, 1);
+        if (recovery === 'retry') {
+          allow = true;
+          await until(() => s.cursorsOf(A).delivered >= s.run(second.structured!.runId as string).seq.end!, 5000, 'retry acceptance to release the cursor');
+        } else {
+          await a.close();
+          const b = await d.host('ta', 'refusal-reconnect');
+          const replay = await b.delivery(aboutRun(firstId));
+          assert.equal(replay.messageId, got.messageId);
+          await b.close();
+        }
+        await a.close();
+      } finally { await d.stop(); }
+    });
+  }
+}
+
+test('G22: channel RPC errors and omitted per-message receipts both retry the same completion', async () => {
+  const d = await daemon();
+  let attempts = 0;
+  let a: TestHost;
+  try {
+    a = await d.host('ta', 'receipt-errors', { answer: (m) => {
+      if (m.method !== 'channels/incoming') return undefined;
+      const p = m.params as { messages: Array<{ tags: string[] }> };
+      if (!p.messages.some((v) => v.tags.includes('terminal:run-finished'))) return undefined;
+      attempts++;
+      if (attempts === 1) {
+        queueMicrotask(() => a.respondError(m, -32000, 'temporary overload'));
+        return new Promise(() => undefined);
+      }
+      if (attempts === 2) return { results: [] };
+      return undefined;
+    } });
+    await a.call('session_open', { session: 'receipt-errors' });
+    await a.request('channels/open', { channelId: 'terminal:receipt-errors' });
+    const run = await a.call('run', { session: 'receipt-errors', command: 'sleep 0.15; echo receipt-test', wait: 0 });
+    const id = run.structured!.runId as string;
+    const s = live(d.registry, 'receipt-errors');
+    await until(() => attempts >= 3 && s.cursorsOf(A).delivered >= s.run(id).seq.end!, 6000);
+    assert.equal(new Set(a.deliveries().filter(aboutRun(id)).map((v) => v.messageId)).size, 1);
+    await a.close();
+  } finally { await d.stop(); }
+});
+
+for (const tracked of [false, true]) {
+  for (const recovery of ['retry', 'reconnect'] as const) {
+    test(`G22: a refused catch-up summary preserves every covered outcome (${tracked ? 'existing lane' : 'new lane'}, ${recovery})`, async () => {
+      const d = await daemon();
+      let allowSummary = false;
+      const answer = (m: Msg) => {
+        if (m.method === 'push/event' && (m.params as { tags: string[] }).tags.includes('terminal:missed')) {
+          return { accepted: allowSummary, reason: 'queue_full' };
+        }
+        return undefined;
+      };
+      try {
+        let a = await d.host('ta', 'summary-create', { mcpl: tracked, answer });
+        await a.call('session_open', { session: 'summary-gap' });
+        if (tracked) await a.request('featureSets/update', { effectiveCapabilities: ['tools'] });
+        const ids: string[] = [];
+        for (let i = 0; i < 30; i++) {
+          const r = await a.call('run', { session: 'summary-gap', command: `echo summary-${i}`, target: 'process', wait: 0 });
+          ids.push(r.structured!.runId as string);
+        }
+        const s = live(d.registry, 'summary-gap');
+        await until(() => ids.every((id) => s.run(id).state === 'exited'), 8000);
+        await sleep(200); // no pending live segment may stand in for catch-up
+        if (tracked) await a.request('featureSets/update', { effectiveCapabilities: FULL_GRANT });
+        else {
+          await a.close();
+          a = await d.host('ta', 'summary-catch-up', { answer });
+        }
+        const summary = await a.delivery((v) => v.tags.includes('terminal:missed'));
+        await until(() => a.deliveries().filter((v) => ids.includes(v.metadata.runId as string)).length >= 20);
+        await sleep(100); // let the accepted newer messages advance the cursor
+        const ends = ids.map((id) => s.run(id).seq.end!);
+        assert.ok(s.cursorsOf(A).delivered < Math.min(...ends), 'a rejected summary must pin before its oldest outcome');
+        if (recovery === 'retry') {
+          allowSummary = true;
+          await until(() => s.cursorsOf(A).delivered >= Math.max(...ends), 5000, 'summary acceptance to settle all covered outcomes');
+          assert.equal(new Set(a.deliveries().filter((v) => v.tags.includes('terminal:missed')).map((v) => v.messageId)).size, 1);
+        } else {
+          await a.close();
+          a = await d.host('ta', 'summary-reconnect');
+          const replay = await a.delivery((v) => v.tags.includes('terminal:missed'));
+          assert.equal(replay.messageId, summary.messageId);
+          assert.equal(replay.metadata.count, summary.metadata.count, 'all omitted outcomes remain represented');
+          await until(() => s.cursorsOf(A).delivered >= Math.max(...ends), 5000);
+        }
+        await a.close();
+      } finally { await d.stop(); }
+    });
+  }
+}
+
 test('mcpl-1: a completion held for a synchronous wait that never returned it goes out when the hold runs out; one it returned is settled, not sent', async () => {
   const d = await daemon();
   try {

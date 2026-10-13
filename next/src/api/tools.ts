@@ -78,6 +78,7 @@ function pick<T extends object>(a: Record<string, unknown>, keys: string[]): T {
 const BUSY_NEXT: Record<string, string> = {
   running: 'await or cancel it, pass queue:true to run after it, or use another session',
   'prompt-pending': 'the shell is between commands: retry, or pass queue:true',
+  'shell-unavailable': 'the original shell is no longer available: use input to interact with the terminal, or open a new session',
   'human-editing': 'a partial command line sits at the prompt: clear it with input keys:["C-u"] (needs the seat), or pass queue:true',
   starting: 'the shell is still starting: pass queue:true to run once it is ready',
   exited: 'the shell has exited: run again to start a new one',

@@ -92,6 +92,20 @@ test('G16: a keyed run retried after a restart is the same Run, never a second e
     await reg.closeAll();
     reg = new SessionRegistry({ dataDir: dir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
     a = new App({ registry: reg, defaultWaitMs: 3000 });
+    // Check before replay populates the in-memory cache: the journal must retain
+    // key identity separately from the original tool and arguments.
+    for (const changed of [
+      { session: 'dep', command: `echo duplicate >> ${log}` },
+      { session: 'elsewhere', command: `echo deploying >> ${log}; sleep 30` },
+      { session: 'dep', command: `echo deploying >> ${log}; sleep 30`, target: 'process' },
+    ]) {
+      const conflict = await call('run', { ...changed, idempotencyKey: k });
+      assert.equal(conflict.isError, true);
+      assert.match(conflict.text, /other arguments/);
+    }
+    const otherTool = await call('input', { session: 'dep', text: 'unexpected', idempotencyKey: k });
+    assert.equal(otherTool.isError, true);
+    assert.match(otherTool.text, /was used for run, not input/);
     const r2 = JSON.parse((await call('run', { session: 'dep', command: `echo deploying >> ${log}; sleep 30`, wait: 300, idempotencyKey: k })).text);
     assert.equal(r2.runId, r1.runId, 'the same Run');
     assert.equal(r2.replayed, true);

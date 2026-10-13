@@ -134,10 +134,12 @@ test('ss-4: an armed exec whose program never re-integrates ends the Run lost (s
   const runs = h.session.listRuns().length;
   h.pty.emit(oldMark('133;A') + oldMark('633;E;x') + oldMark('133;C'));
   assert.equal(h.session.listRuns().length, runs, 'no Run from the retired key');
-  // The marker strategy serves, with the new program's own syntax (fish: source, $status).
+  // A process name is not prompt evidence. Even an apparent shell remains unavailable.
+  const written = h.pty.written;
   const b = h.session.admit({ target: 'shell', line: 'echo hi', principal: AGENT });
-  assert.ok(b.admitted);
-  assert.match(h.pty.written, / source '[^']*tsm-cmd-2'; echo "<<<EXI""T:[0-9a-f]+:\$status>>>"\n$/);
+  assert.equal(b.admitted, false);
+  assert.equal(h.pty.written, written);
+  assert.deepEqual(h.session.shellAvailable(), { ok: false, reason: 'shell-unavailable' });
   await h.session.close();
 });
 
@@ -160,6 +162,8 @@ test('ss-4: a new shell that announces itself mid-Run ends it lost as shell-repl
   assert.equal(c.escalation, undefined);
   assert.ok(c.steps.some((s) => /replaced by python3/.test(s)), JSON.stringify(c.steps));
   assert.equal(g.session.integration, 'none');
+  assert.deepEqual(g.session.shellAvailable(), { ok: false, reason: 'shell-unavailable' });
+  assert.equal(g.session.admit({ target: 'shell', line: 'echo never', principal: AGENT, queue: true }).admitted, false);
   await g.session.close();
 });
 

@@ -12,8 +12,8 @@
  * cwd comes only from the keyed `633;P;Cwd=` (VS Code escaping, no percent-decoding).
  *
  * The parser splits a PTY chunk into pieces so that every mark has an exact journal
- * position: `[output before the OSC][mark][output…]`. The key never leaves the daemon
- * (atc-3): a keyed mark's bytes are not output — the mark is journaled as what it means
+ * position: `[output before the OSC][mark][output…]`. The key never reaches observers
+ * through this parser (atc-3): a keyed mark's bytes are not output — the mark is journaled as what it means
  * (prompt, cwd, run.start, run.end) — and the key's literal text in output (a `set` or
  * `declare -p` in the shell prints the integration's variables) is replaced with
  * `[redacted]`, so `read as: events`, raw renderings, followers, the GUI and the screen

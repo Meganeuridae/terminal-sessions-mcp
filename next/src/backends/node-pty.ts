@@ -113,7 +113,8 @@ export class NodePtyBackend implements ExecutionBackend {
   readonly kind = 'node-pty';
 
   spawnShell(opts: SpawnShellOptions): PtyHandle {
-    const p = pty.spawn(opts.shell, opts.args, {
+    const launcher = opts.bootstrap?.launcher;
+    const p = pty.spawn(launcher ? '/bin/sh' : opts.shell, launcher ? [launcher, opts.shell, ...opts.args] : opts.args, {
       name: 'xterm-256color',
       cwd: opts.cwd,
       env: opts.env,
@@ -130,6 +131,8 @@ export class NodePtyBackend implements ExecutionBackend {
     // /dev/null: no verb writes to a process Run's stdin, so a reader sees EOF
     // instead of hanging (core-12).
     const child = spawnChild(cmd, args, { cwd: opts.cwd, env: opts.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    // The journal stores UTF-8 text, not arbitrary binary streams. Node's streaming
+    // decoder preserves split characters and replaces invalid sequences with U+FFFD.
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     const outL = new Set<(d: string) => void>();

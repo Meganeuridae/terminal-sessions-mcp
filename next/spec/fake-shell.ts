@@ -87,7 +87,7 @@ export class FakeShell {
     this.opts = opts;
     this.marks = opts.marks ?? 'rich';
     this.ignoreSignals = opts.ignoreSignals ?? false;
-    this.key = pty.opts.env[MARK_KEY_ENV] ?? '';
+    this.key = pty.opts.bootstrap?.key ?? pty.opts.env[MARK_KEY_ENV] ?? '';
     pty.onWrite((d) => this.onWrite(d));
     pty.onGroupSignal = (pgid, sig) => {
       if (!this.running || pgid !== this.jobPgid || this.opts.ignoreGroupSignals) return;
@@ -472,7 +472,7 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
   if (opts.editingStaleMs !== undefined) so.editingStaleMs = opts.editingStaleMs;
   if (opts.control !== undefined) so.control = opts.control;
   if (opts.commandDir !== undefined) so.commandDir = opts.commandDir;
-  if (integ.kind !== 'none') so.integration = { args: integ.args, env: integ.env };
+  if (integ.kind !== 'none') so.integration = integ;
   const t0 = Date.now();
   const session = await Session.start(so);
   const startMs = Date.now() - t0;

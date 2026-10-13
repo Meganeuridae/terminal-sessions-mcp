@@ -246,7 +246,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   results say so: every Run result carries `integration`, and under `none` the status line
   reports the cwd as unknown. Integration that a command removes (hooks cleared, `exec` into a new
   shell) heals at the next prompt where the shell allows it; the Run that broke it ends
-  `lost`, never left `running`.
+  `lost`, never left `running`. An unverified replacement program is `unavailable` for
+  shell Runs (including queued admission); it remains observable and accepts explicit
+  input. Losing a Run never establishes a ready shell or drains its queue. A configured
+  unintegrated shell's initial marker fallback is distinct from losing an integrated shell.
 
 ### Execution
 
@@ -264,7 +267,8 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   current cwd as last reported by a cwd mark, or an environment snapshot the caller
   explicitly captured earlier (§8.2). The result names the basis. The daemon never claims
   to know a shell's later `export`s or activations. Exit status is observed directly;
-  stdout and stderr are journaled as separate byte-exact streams. Process Runs have no
+  stdout and stderr are journaled as separate UTF-8 text streams. Streaming decoding
+  preserves split characters; invalid byte sequences become U+FFFD. Process Runs have no
   effect on the shell's state and do not occupy it.
 - **G8.** Interaction is a capability of a terminal, not a kind of Run. `input` and `screen`
   work whenever the terminal exists, make no claim about Run boundaries, and ending an
@@ -288,7 +292,7 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 
 - **G10.** The journal is the single source of truth: append-only, per-session monotonic
   `seq`, timestamped, typed (Appendix A). Three products derive from it and each states
-  what it is. **Raw output** is retained bytes with provenance, a pure function of a
+  what it is. **Raw output** is retained decoded UTF-8 text with provenance, a pure function of a
   range. **Transcript** is a documented line-oriented projection of a range, a pure
   function of that range, for reading and search — not a claim about what anyone saw.
   **Screen** is emulator state at a position, a function of the whole history up to it.
@@ -321,7 +325,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   never executes twice; a retried `run` or `start` is the same Run, awaited again, also
   after a daemon restart (the key's identity is journaled on `run.admit`) and after the
   session was forgotten (the first outcome is returned). A key reused for a different tool
-  or with different arguments is refused. A call that admitted nothing (`busy`) is not
+  or with different arguments is refused, including after restart for journaled `run` and
+  `start` admissions: key identity and operation fingerprint are stored separately.
+  Earlier journals that stored only a combined hash still recover identical retries, but
+  cannot detect conflicting uses of those old keys. A call that admitted nothing (`busy`) is not
   remembered, so its retry can run. The memory is bounded per principal and in total, oldest
   evicted first. A client never blindly resends input after an ambiguous outcome.
 - **G17.** A session has at most one controller at a time. Observers may not type, signal,
@@ -370,6 +377,9 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   your last read" from `read`; catch-up after reconnect resumes from `delivered`, and
   `delivered` never advances past a lifecycle message still owed to that principal (a
   completion settles a moment after its `run.end`, so a later event can be accepted first).
+  Refusals and transport errors retain that debt and retry with the same message id;
+  elapsed time is not acceptance. A catch-up summary pins the cursor before its oldest
+  covered event until accepted, then settles the individual debts it represents.
   Cursors are keyed by principal, so they survive connection replacement. Delivery is
   at-least-once; duplicates are detectable by `seq` and `messageId`.
 - **G23.** Tags describe and never authorize. Treatment is the host's. Suggested treatment
@@ -416,7 +426,7 @@ Three products, each with a stated meaning (G10):
 
 | Product | What it is | Pure function of |
 |---|---|---|
-| **raw** `(from, to)` | Retained bytes with provenance: `seq`, timestamp, `runId` when attributable, stream. | the range |
+| **raw** `(from, to)` | Retained decoded UTF-8 text with provenance: `seq`, timestamp, `runId` when attributable, stream. Binary preservation is not promised. | the range |
 | **transcript** `(from, to)` | A documented line-oriented projection (the seven rules below). Cursor motion relative to content *outside* the range is lost — Codex's check: after `ABCDE`, the range `\rXY` shows `XYCDE` on a real terminal and `XY` in a transcript. Good for reading and search; never presented as a screen. | the range |
 | **screen** `()` | The session emulator's state now: `{cols, rows, alt, cursor, lines, title, seq}`. | the whole history |
 
@@ -481,14 +491,21 @@ and is about to run, and the VS Code `633;E` extension carries its text; `D ; <e
 at `C`, not `B`: a human sitting at a prompt editing a command is not a Run.
 
 **Marks are authenticated.** Every mark the integration emits carries a per-session key as
-its last parameter (`133;D;0;k=<key>`). The key reaches the shell in an environment
-variable that the integration moves into an unexported shell variable and unsets, so child
-processes never see it. Only keyed marks are marks: unkeyed or wrongly keyed `133`/`633`
+its last parameter (`133;D;0;k=<key>`). A private launcher writes a mode-0600 file for its
+own PID, then execs the configured shell. Its startup shim reads the key into an
+unexported variable; even children of earlier startup files never inherit it.
+Shell replacement uses another mode-0600 handoff file in the private
+integration directory, read by the replacement shell using its own PID and removed after
+consumption; a textual `exec` hint never exports completion authority. Zsh emits prompt-end
+from its line editor hook, so even an exported PS1 carries no credential. Only keyed marks are marks: unkeyed or wrongly keyed `133`/`633`
 sequences — from program output, a nested or remote shell, or another terminal's
 integration loaded by the user's rc (Ghostty, iTerm2, VS Code) — and every `OSC 7` are
-ordinary output. Nothing a program prints can end a Run, fake an exit code or move the cwd.
-A keyed hello (`633;P;TsmHello`) goes out before the user's rc runs, so a slow rc is waited
-for rather than mistaken for a shell without integration. Hooks heal themselves when a
+ordinary output. Output without the key cannot end a Run, fake an exit code or move the cwd.
+This protects against ambient output and credential inheritance, not deliberate inspection
+of the same shell's variables, private files or memory by code running as the daemon's user.
+A keyed hello (`633;P;TsmHello`) goes out before the main user rc runs (fish user `conf.d`
+files can run earlier), so an observed handshake keeps a slow rc from being mistaken for
+a shell without integration. Hooks heal themselves when a
 command reassigns `PROMPT_COMMAND`, replaces the DEBUG trap or clears zsh's hook arrays, and
 they chain a user's own DEBUG trap and bash-preexec rather than replace them; they are safe
 under `set -u` and `set -e`.
@@ -502,6 +519,7 @@ marker strategy (§8.1) serves daemon-issued Runs and only those have boundaries
 starting ──► idle ◄──────────────► busy ──► exited
               ▲                      │
               └── prompt (A) ◄───────┘      busy + alt-screen ⇒ tui
+starting/busy ── unverified replacement ──► unavailable ──► exited
 ```
 
 The state describes the shell terminal only and is derived from marks, the emulator's
@@ -516,7 +534,7 @@ alternate-screen flag, and PTY exit — never from timers. `idle` requires an ob
 
 Wait for the shell terminal to be available (G4); write the command to a file and type
 ` . '<dir>/tsm-cmd-N'` (G6); correlate the `C` whose command line is that one, and the
-following `D`, to this `runId`; the result's output is the transcript and raw bytes between
+following `D`, to this `runId`; the result's output is the transcript and raw decoded text between
 `C` and `D`, attributed temporally (G12); the exit is `D`'s payload. The command directory is
 a short private `/tmp/tsm-<uid>/<hash>` (checked to be ours and closed to others, falling
 back to the session's own directory), because the typed line is echoed at the prompt and
@@ -535,7 +553,7 @@ marker Run still ends. Both strategies produce identical result shapes.
 ### 8.2 Process target
 
 The daemon spawns `argv` (or `sh -c line`) itself, with pipes. Exit status is observed;
-stdout and stderr are byte-exact and separate; attribution is exact; the shell is never
+stdout and stderr are decoded UTF-8 and separate; attribution is exact; the shell is never
 occupied. The **environment basis** is explicit (G7): by default the session's configured
 environment and the shell's last-reported cwd; optionally a snapshot captured earlier by
 `session_env_capture`, which runs `env -0` as a shell Run when the shell is available and
