@@ -118,8 +118,8 @@ export interface DeclaredShell {
 }
 
 export interface DeclareOptions {
-  /** The kind of shell in front (`sh`, `bash`, `zsh`, `dash`, `ksh`, `fish`), or `none` to take the last declaration back. */
-  shell: string;
+  /** The kind of shell in front: `sh` (default; bash, zsh, dash and ksh are typed the same), `fish`, or `none` to take the last declaration back. */
+  shell?: string;
   /** The Run whose program is the shell. Default: the innermost running Run (the one holding the terminal). */
   within?: string;
   principal: Principal;
@@ -1375,7 +1375,7 @@ export class Session {
   declareShell(opts: DeclareOptions): { shell: string | null; within: string | null; depth: number } {
     this.assertAlive();
     if (opts.principal !== SYSTEM && this.control !== 'open') this.requireSeat(opts.principal, 'declare', { asOwner: opts.asOwner === true });
-    const shell = opts.shell.trim();
+    const shell = (opts.shell ?? 'sh').trim();
     if (shell === 'none') {
       const top = this.layers.pop();
       if (!top) throw err('invalid_argument', 'no declared shell to take back: shell Runs already go to the session’s own shell');

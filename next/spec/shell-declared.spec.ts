@@ -8,7 +8,22 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Session } from '../src/core/session.js';
 import type { TermError } from '../src/core/errors.js';
+import { looksLikeShellOpener, renderRun } from '../src/api/tools.js';
+import type { RunResult } from '../src/api/app.js';
 import { AGENT, hasShell, realSession, until, type Real } from './fake-shell.js';
+
+test('the result of a command that looks like it opened a shell points at the declaration; others do not', () => {
+  const running = (line: string): RunResult => ({ runId: 'r1', session: 's', target: 'shell', state: 'running', cwd: '/', attribution: 'temporal', line, durationMs: 1500, output: { text: '', truncated: false, seq: [1, 2], nextCursor: 2 } });
+  for (const line of ['ssh workbox', 'sudo -i', 'sudo docker exec -it app bash', 'kubectl exec -it pod -- sh', 'bash', '/usr/local/bin/fish', 'env FOO=1 ssh -tt host', 'limactl shell tsm-debian']) {
+    assert.ok(looksLikeShellOpener(line), line);
+    assert.match(renderRun(running(line), 'transcript').text, /declare that with session_declare_shell/);
+  }
+  for (const line of ['sleep 30', 'npm test', 'tail -f log', 'bashful', 'cat shell.txt', 'sudo apt install']) {
+    assert.ok(!looksLikeShellOpener(line), line);
+    assert.doesNotMatch(renderRun(running(line), 'transcript').text, /session_declare_shell/);
+  }
+  assert.doesNotMatch(renderRun({ ...running('ssh host'), shell: 'sh', within: 'r0' }, 'transcript').text, /it looks like it did/, 'no hint on a Run already inside a declared shell');
+});
 
 const FISH = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find(hasShell);
 const PAYLOAD = `it's "quoted" \\back\\slash %d\ttab ünïcødé 😀 $HOME \`x\` !bang`;
@@ -43,7 +58,9 @@ for (const s of SHELLS) {
       const enclosing = await open(x.session, s.open);
       const plain = x.session.admit({ target: 'shell', line: 'echo WRONG', principal: AGENT });
       assert.ok(!plain.admitted && plain.reason === 'running', 'the nested shell occupies the session’s shell');
-      assert.deepEqual(declare(x.session, s.shell), { shell: s.shell, within: enclosing, depth: 1 });
+      // The kind need not be named for a POSIX shell: `sh` is the default (fish is the one that types differently).
+      const declared = s.name === 'sh' ? x.session.declareShell({ principal: AGENT }) : declare(x.session, s.shell);
+      assert.deepEqual(declared, { shell: s.shell, within: enclosing, depth: 1 });
       assert.deepEqual(x.session.info().declared, { shell: s.shell, within: enclosing });
       assert.ok(notes(x).some((n) => n.startsWith(`declared: ${enclosing}`)));
       // A plain Run now goes to the declared shell: its status and output, no cwd.

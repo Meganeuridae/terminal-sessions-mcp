@@ -88,6 +88,13 @@ const BUSY_NEXT: Record<string, string> = {
   exited: 'the shell has exited: run again to start a new one',
 };
 
+/**
+ * Does the command line read like one that opens another shell (ssh, sudo -i, docker exec, a
+ * nested shell, …)? Only ever a hint in a result's text; what is in front is the caller's to say (§8.1).
+ */
+const SHELL_OPENER = /^(?:(?:sudo|doas|env|command|exec|time)\s+(?:(?:-\S+|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*)*(?:ssh|mosh|sudo\s+-[is]\b|su\b|docker\s+(?:exec|run)\b|podman\s+(?:exec|run)\b|kubectl\s+exec\b|nix-shell\b|nix\s+develop\b|poetry\s+shell\b|pipenv\s+shell\b|limactl\s+shell\b|lima\s+shell\b|vagrant\s+ssh\b|(?:\S*\/)?(?:sh|bash|zsh|dash|ksh|mksh|fish)(?:\s|$))/;
+export const looksLikeShellOpener = (line: string | undefined): boolean => line !== undefined && SHELL_OPENER.test(line.trim());
+
 function runStatus(r: RunResult): string {
   switch (r.state) {
     case 'exited':
@@ -110,7 +117,9 @@ function runStatus(r: RunResult): string {
           : w?.kind === 'input'
             ? `it seems to wait for input (silent ${fmt(w.silentMs ?? 0)}, last line "${w.lastLine ?? ''}"): answer with input, or cancel`
             : `it keeps running; await it, or read since=${r.output.nextCursor}`;
-      return `${r.state} ${fmt(r.durationMs ?? 0)} so far — ${next}`;
+      // A hint, never evidence (§8.1): the line reads like one that opens another shell.
+      const opened = r.target === 'shell' && r.shell === undefined && looksLikeShellOpener(r.line) ? ' — if it opened a shell (it looks like it did), declare that with session_declare_shell and run your commands in it' : '';
+      return `${r.state} ${fmt(r.durationMs ?? 0)} so far — ${next}${opened}`;
     }
     case 'busy': {
       const b = r.busy;
@@ -396,10 +405,15 @@ export const TOOLS: ToolDef[] = [
       type: 'object',
       properties: {
         session,
-        shell: { type: 'string', description: 'The kind of shell in front: bash, sh, zsh, dash, ksh or fish — or none, to take the last declaration back.' },
+        shell: {
+          type: 'string',
+          description:
+            'Optional: the kind of shell in front. sh (the default), bash, zsh, dash and ksh are all the same to the daemon; name fish, which is typed differently. ' +
+            'none takes the last declaration back.',
+        },
         within: { type: 'string', description: 'Optional: the runId whose program is that shell. Default: the innermost running Run (what holds the terminal now).' },
       },
-      required: ['session', 'shell'],
+      required: ['session'],
       additionalProperties: false,
     },
     outputSchema: {

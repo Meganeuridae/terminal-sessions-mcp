@@ -80,10 +80,13 @@ Then declare once that the program in front is a shell, and run commands as usua
 
 ```bash
 tsm run work 'ssh workbox' --wait 2000
-tsm declare work bash
+tsm declare work
 tsm run work 'cd /srv/app && git pull && ./build.sh'
 tsm run work 'exit'
 ```
+
+The result of the `ssh` command itself says that it looks like it opened a shell and points
+at the declaration; the kind of shell only needs naming for fish (`tsm declare work fish`).
 
 Commands to a declared shell travel inline with start and end markers, so each one is a Run
 with output and exit status, and `cd`, exports and activations persist on the remote side;

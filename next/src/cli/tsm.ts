@@ -33,8 +33,8 @@ const USAGE = `tsm <command> [args] [--key value ...] [--json]
   close <session> [--force]
   run <session> [--wait 20s] [--target process] [--queue] [--] <command...>
                                         after --, every word is the command's, flags included
-  declare <session> <shell>             the program in front (ssh, sudo -i, a nested shell) is a
-                                        bash|sh|zsh|fish: run goes to it until it ends; "none" takes it back
+  declare <session> [fish|none]         the program in front (ssh, sudo -i, a nested shell) is a shell:
+                                        run goes to it until it ends; name fish when it is one; "none" takes it back
   await [<session>] <runId> [--wait 20s]
   read <session> [--since N | --tail N | --run-id ID] [--as events]
   screen <session>

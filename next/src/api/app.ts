@@ -563,10 +563,10 @@ export class App {
    * Declare the program in front of a session's terminal a shell (§8.1), or take the last
    * declaration back with `none`. Shell Runs then go to it until the Run whose program it is ends.
    */
-  async declareShell(caller: Caller, o: { session: string; shell: string; within?: string }): Promise<{ session: string; shell: string | null; within: string | null; depth: number; line?: string }> {
+  async declareShell(caller: Caller, o: { session: string; shell?: string; within?: string }): Promise<{ session: string; shell: string | null; within: string | null; depth: number; line?: string }> {
     const { session } = await this.liveSession(caller, o.session, 'run', {});
     this.ensureAttached(caller, session);
-    const r = session.declareShell({ shell: o.shell, principal: caller.principal, ...(o.within !== undefined && { within: o.within }), ...this.seat(caller, session) });
+    const r = session.declareShell({ principal: caller.principal, ...(o.shell !== undefined && { shell: o.shell }), ...(o.within !== undefined && { within: o.within }), ...this.seat(caller, session) });
     const res: { session: string; shell: string | null; within: string | null; depth: number; line?: string } = { session: session.id, ...r };
     const line = r.within ? session.run(r.within).line : undefined;
     if (line !== undefined) res.line = head(line, 80);

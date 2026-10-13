@@ -560,8 +560,10 @@ marker Run still ends. Both strategies produce identical result shapes.
 *Declared shell* (inline strategy). After `ssh host`, `sudo -i`, `docker exec -it … bash`, a
 nested shell, or an `exec` into a shell without our integration, the program in front of the
 terminal is a shell the daemon has no marks from — and often no filesystem in common with.
-The caller declares it once (`session_declare_shell`, naming the kind: sh, bash, zsh, dash,
-ksh or fish); from then on shell Runs go to it. The text travels on the typed line itself:
+The caller declares it once (`session_declare_shell`; the kind is named only when it matters —
+fish is typed differently, every POSIX shell the same); from then on shell Runs go to it. The
+result of a Run whose line reads like `ssh`, `sudo -i` or a nested shell says so as a hint,
+never as evidence. The text travels on the typed line itself:
 bytes outside a small safe set go as `printf '%b'` octal escapes, so the line holds nothing a
 line editor expands or completes; a body longer than one line (900 bytes) goes in pieces,
 each acknowledged by the shell before the next is typed; the last line prints a start marker,
