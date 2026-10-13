@@ -462,3 +462,68 @@ test('a plain sh session runs commands through the same path', async () => {
   assert.strictEqual(result.exitCode, 5);
   assert.strictEqual(cleanTerminalOutput(result.output).trim(), '42');
 });
+
+test('a shell that dies with a marker still waiting for its newline leaves nothing waiting in the session', async () => {
+  await server.createSession('t-dead-marker', { cwd: '/' });
+  assert.strictEqual((await server.execCommand('t-dead-marker', 'true', 8000)).exitCode, 0);
+  const session = server.sessions.get('t-dead-marker');
+  const nonce = [...session.issued.keys()].at(-1);
+  // The shell prints that command's start marker again, and the start of
+  // another, with no newline after them, and dies.
+  const died = await server.execCommand('t-dead-marker', `printf '<<<STAR''T:%s>>><<<EX' ${nonce}; kill -9 $$`, 8000);
+  assert.strictEqual(died.exitCode, -1);
+  assert.deepStrictEqual(session.awaitingMarkers, []);
+  assert.strictEqual(session.scanCarry, '');
+});
+
+test("a shell in front that can't read the temp files gets each body typed inline", async () => {
+  const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
+  // A nested bash whose `.` and `[ -r` fail as they would in a shell that
+  // can't see this machine's temp directory, such as a remote one ssh opened.
+  const rc = path.join(os.tmpdir(), `tsm-test-rc-${process.pid}`);
+  fs.writeFileSync(rc, '.() { echo "bash: $1: No such file or directory" >&2; return 1; }\n' +
+    '[() { if builtin test "$1" = -r; then return 1; fi; builtin [ "$@"; }\nPS1="NESTED> "\n');
+  try {
+    await server.createSession('t-remote', { cwd: '/' });
+    const raw = [];
+    server.on('session:output', (e) => { if (e.sessionId === 't-remote') raw.push(e.chunk); });
+    const level = Number(cleanTerminalOutput((await server.execCommand('t-remote', 'echo "$SHLVL"', 8000)).output).trim());
+    const nested = waitForOutput('t-remote', 'NESTED> ');
+    assert.strictEqual((await server.execCommand('t-remote', `bash --rcfile '${rc}'`, 500)).exitCode, -1);
+    await nested;
+    const content = `it's "quoted" \\ %d\ttab`;
+    const heredoc = await server.execCommand('t-remote', `cat <<'END'\n${content}\nEND\necho "level=$SHLVL"`, 8000);
+    assert.strictEqual(heredoc.exitCode, 0);
+    assert.deepStrictEqual(cleanTerminalOutput(heredoc.output).trim().split(/\r?\n/), [content, `level=${level + 1}`]);
+    assert.strictEqual((await server.execCommand('t-remote', '(exit 3)', 8000)).exitCode, 3);
+    // A body too long to type as one line isn't typed, and says why.
+    const tooLong = await server.execCommand('t-remote', `x='${'B'.repeat(5000)}'; echo "length=\${#x}"`, 8000);
+    assert.strictEqual(tooLong.exitCode, -1);
+    assert.match(tooLong.output, /^\[command not run: the shell in front can't read this machine's temp files, and typed in, this command would be a line over 1000 bytes/);
+    assert.ok(!raw.join('').includes('B'.repeat(200)), 'the long body never reached the terminal');
+    assert.strictEqual(cleanTerminalOutput((await server.execCommand('t-remote', 'echo "level=$SHLVL"', 8000)).output).trim(), `level=${level + 1}`);
+    assert.ok(raw.join('').includes('eval "unset __tsm_'), 'the bodies were typed inline');
+    // The `$ <command>` lines show each command as the caller sent it.
+    const logs = server.getOutput('t-remote').filter(l => !l.startsWith('$ '));
+    for (const fragment of ['<<', '""', 'tsm-', ". '", "printf '%b'", '[ -r', '__tsm_', 'NOFIL', 'GON']) {
+      assert.ok(!logs.some(l => l.includes(fragment)), `logs carry no plumbing fragment ${JSON.stringify(fragment)}: ${JSON.stringify(logs)}`);
+    }
+  } finally {
+    fs.rmSync(rc, { force: true });
+  }
+});
+
+test('a nested shell that can read the temp files runs each command from its file, so a long body is never typed', async () => {
+  const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
+  await server.createSession('t-local-nested', { cwd: '/' });
+  const raw = [];
+  server.on('session:output', (e) => { if (e.sessionId === 't-local-nested') raw.push(e.chunk); });
+  // The prompt is built when the line runs, so its echo can't match it.
+  const nested = waitForOutput('t-local-nested', 'LOCAL_NESTED> ');
+  assert.strictEqual((await server.execCommand('t-local-nested', 'PS1="LOCAL_$(printf NESTED)> " bash --norc --noprofile', 500)).exitCode, -1);
+  await nested;
+  const long = await server.execCommand('t-local-nested', `x='${'A'.repeat(20000)}'; echo "length=\${#x}"`, 8000);
+  assert.strictEqual(long.exitCode, 0);
+  assert.strictEqual(cleanTerminalOutput(long.output).trim(), 'length=20000');
+  assert.ok(!raw.join('').includes('A'.repeat(200)), 'the body never reached the terminal');
+});

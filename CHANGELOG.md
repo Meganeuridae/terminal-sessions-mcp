@@ -39,6 +39,35 @@
   temp directory) fails alone with exitCode -1 and the reason, instead of
   wedging the session; the file is created exclusively, so nothing planted
   at its name is written through or reused.
+- **Commands reach a shell an earlier command started**, such as ssh's remote
+  shell, multi-line ones included (1.6.0 typed only single-line commands, so
+  only those ran there). Each typed line sources the temp file only if the
+  shell in front can read it, so a shell that can, such as the session's own
+  or a nested one run on this machine as the same user, keeps the file, and
+  long or multi-line bodies are never typed into it. A shell that can't, such
+  as a remote one, sets a variable named for the command to its own pid and
+  gets the body typed in as one line, escaped for `printf '%b'` and run with
+  `eval`, in the order the commands were written, commands typed in behind a
+  timed-out one included. The body runs only in a shell where that variable
+  holds its own pid: a shell that reads the line without it, such as the one
+  behind after an ssh connection drops, or one an earlier command started in
+  front meanwhile, runs nothing, and the command is given up rather than run
+  there. A body whose line would be over 1,000 bytes isn't typed, since a
+  shell can cut a longer line short (macOS's line limit is 1,024 bytes, and
+  escaped, a byte of the body can take up to five characters); 1.6.0 typed a
+  single-line command of any length there, which a shell could cut short
+  like any long line, and longer ones now need splitting. Either way the
+  command ends with exitCode -1 and says why if it's still waiting, and the
+  session log says so too. Such a command leaves the variable set in the shell
+  that asked, where nothing reads it. The shell in front has to be a POSIX
+  shell (sh, bash, dash, zsh, ksh); in fish or csh the typed lines don't
+  parse, and a command there times out without running. The typed lines rely
+  on the standard behavior of the shell's `.`, `eval`, `[`, `echo`, `printf`
+  and `unset`, which they call by name. A function or alias in the shell in
+  front that changes how one of them behaves is outside what the transport
+  supports, since it can make a command end with a status the body didn't
+  produce: a function named `eval` that returns 0 ends every command typed
+  inline with 0, without running it. runCommand's description says so.
 - Exec plumbing (wrapper echoes, markers) is filtered out of session logs and
   the `lines` of output events, so `tailLogs` shows `$ command`, its output
   and the shell's prompts without the wrapper text. Only this session's own
@@ -46,15 +75,19 @@
   (text without a trailing newline, a timed-out command's late tail) stays,
   marker-shaped text from anywhere else is output, and a wrapper echo
   soft-wrapped at the terminal's edge (bash 3.2 on macOS) is still
-  recognized. An output event's `chunk` stays the raw terminal stream.
+  recognized. A line typed ahead behind a busy shell is echoed as it's typed, and output
+  the shell prints meanwhile can break that echo across lines; pieces of it
+  then stay in the logs. An output event's `chunk` stays the raw terminal
+  stream.
 - **A result is bounded by its own command's execution.** The shell prints a
   start marker immediately before sourcing the command and the exit marker
   immediately after, so a result no longer picks up the next prompt or what
   a timed-out predecessor prints before this command starts (a background
   job the predecessor left running can still print into it); a command that
   never started returns no output of its own (it may still run later; its
-  output then reaches the logs). A command that times out returns what it
-  printed by the end of the wait.
+  output then reaches the logs), and one refused before it could be typed
+  returns the reason. A command that times out returns what it printed by
+  the end of the wait.
 - **A command queued behind a timed-out one still runs** once the shell
   reaches it. Each command's temp file is kept until the shell has read past
   its line (its own exit marker, a later command's start marker, or the
@@ -74,16 +107,18 @@
   incidentally poked blocked stdin-readers with garbage input. Now a command
   that times out (exitCode -1) simply keeps running in the session, and
   commands sent meanwhile are typed in behind it: they run when it ends, or
-  become its input if it reads any. Check on it with `tailLogs`, answer it
-  with `sendInput`, or interrupt it with `sendSignal` (SIGINT, the default,
-  sent as Ctrl-C, which under the terminal's default settings also discards
-  the commands typed in behind it, and with `stty noflsh` keeps them, so they
-  can still run after it; other signals go to the session's shell itself).
+  become its input if it reads any, and a shell it started, such as ssh's,
+  runs them. Check on it with `tailLogs`, answer it with `sendInput`, or
+  interrupt it with `sendSignal` (SIGINT, the default, sent as Ctrl-C, which
+  under the terminal's default settings also discards the commands typed in
+  behind it, and with `stty noflsh` keeps them, so they can still run after
+  it; other signals go to the session's shell itself).
   The `runCommand` tool's `timeout` parameter documents this.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
-- Shell history records each command's wrapper line (its temp file sourced
-  between two markers), not the command's own text.
+- Shell history records each command's typed line (a check that the shell
+  can read its temp file, which it then sources between two markers, or in a
+  shell that can't, the body escaped), not the command's own text.
 
 ## v1.6.0 - 2026-07-11
 

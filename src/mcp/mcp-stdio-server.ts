@@ -62,14 +62,14 @@ const TOOLS = {
     }
   },
   runCommand: {
-    description: 'Run a command in a session (auto-creates the session if it does not exist)',
+    description: 'Run a command in a session (auto-creates the session if it does not exist). It runs in the shell in front, which can be one an earlier command started, such as ssh\'s; that shell has to be a POSIX shell (sh, bash, dash, zsh, ksh). Where it can\'t read this machine\'s temp files, the command is typed in escaped, and one whose typed line would pass 1,000 bytes ends with exitCode -1 and the reason, without running. The transport relies on the standard behavior of that shell\'s `.`, `eval`, `[`, `echo`, `printf` and `unset`: a function or alias that changes one of them can make a command report a status its body didn\'t produce.',
     parameters: {
       type: 'object',
       properties: {
         session: { type: 'string', description: 'Session name (will be created automatically if it does not exist)' },
         command: { type: 'string' },
         cwd: { type: 'string', description: 'Working directory (used when auto-creating a new session)' },
-        timeout: { type: 'number', description: 'Command timeout in ms (default: 30000). Use -1 to return immediately without waiting. A timed-out command keeps running in the session (exitCode -1 in the result), and commands sent meanwhile are typed in behind it: they run when it ends, or become its input if it reads any. Use tailLogs to check on it, sendInput to answer it, or sendSignal with SIGINT (the default, sent as Ctrl-C) to interrupt it, which under the terminal\'s default settings also discards the commands typed in behind it (with `stty noflsh` they are kept, and can still run after it); other signals go to the session\'s shell itself.' },
+        timeout: { type: 'number', description: 'Command timeout in ms (default: 30000). Use -1 to return immediately without waiting. A timed-out command keeps running in the session (exitCode -1 in the result), and commands sent meanwhile are typed in behind it: they run when it ends, or become its input if it reads any, and a shell it started, such as ssh\'s, runs them. Use tailLogs to check on it, sendInput to answer it, or sendSignal with SIGINT (the default, sent as Ctrl-C) to interrupt it, which under the terminal\'s default settings also discards the commands typed in behind it (with `stty noflsh` they are kept, and can still run after it); other signals go to the session\'s shell itself.' },
         raw: { type: 'boolean', description: 'If true, preserve raw ANSI escape codes in output (default: false, returns clean text)' }
       },
       required: ['session', 'command']

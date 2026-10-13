@@ -43,14 +43,31 @@ interface SessionInfo {
   pendingFiles: Map<string, string>;
   // Every command written to this shell: its nonce → its temp-file path as
   // typed (and the set of those paths, for lookup). Exactly these commands'
-  // wrapper echoes and printed start and exit markers are exec plumbing,
-  // removed wherever they appear while the command is remembered (see
+  // typed lines' echoes (probe, wrapper and inline parts) and printed start,
+  // exit, no-file and gone markers are exec plumbing, removed wherever they
+  // appear while the command is remembered (see
   // rememberIssued), so a command that prints them back (`history`, a reader
   // that received a typed wrapper) loses those spans too. Marker-shaped text
   // carrying any other nonce is output and is never filtered.
   issued: Map<string, string>;
   issuedPaths: Set<string>;
+  // Commands whose body has been typed inline (see typeBodyInline), so a
+  // marker scanned again can't type it twice; forgotten with their command
+  // (see rememberIssued).
+  typedInline: Set<string>;
+  // The last characters checkCommandCompletion scanned after its last marker
+  // or newline, at most 63, enough to hold the start of a marker split across
+  // chunks. They're kept apart from outputBuffer, which is cleared whenever a
+  // command is written, so a marker split across that moment is recognized.
+  scanCarry: string;
+  // This session's commands' markers recognized whose line hasn't ended yet,
+  // in the order printed, each kind and nonce once.
+  awaitingMarkers: Marker[];
 }
+
+// A start, exit, no-file or gone marker the shell printed (see
+// checkCommandCompletion), with the exit marker's status.
+type Marker = { kind: 'start' | 'exit' | 'nofile' | 'gone'; nonce: string; code?: number };
 
 interface QueuedCommand {
   command: string;
@@ -153,9 +170,65 @@ const SOURCE_ECHO = new RegExp(
   wrapTolerant(". '") + "([^']*)'" + `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
 const EXIT_ECHO = new RegExp(
   wrapTolerant('echo "<<<EXI""T:') + NONCE + wrapTolerant(':$?>>>"') + `${WRAP}(\\r?\\n)?`, 'g');
+// The parts a probe line (see probeLine) and an inline line (see inlineLine)
+// add around a wrapper.
+const PROBE_HEAD = new RegExp(
+  wrapTolerant("if [ -r '") + "([^']*)'" + WRAP + wrapTolerant(' ]; then ') + WRAP, 'g');
+const PROBE_TAIL = new RegExp(
+  wrapTolerant('; else __tsm_') + NONCE + wrapTolerant('=$$; echo "<<<NOFIL""E:') + `(?:[0-9a-z]|${WRAP_ONE})+` +
+  wrapTolerant('>>>"; fi') + `${WRAP}(\\r?\\n)?`, 'g');
+const INLINE_IF = new RegExp(
+  wrapTolerant('if [ "${__tsm_') + NONCE + wrapTolerant('-}" = "$$" ]; then ') + WRAP, 'g');
+const INLINE_TAIL = new RegExp(
+  wrapTolerant('; else echo "<<<GON""E:') + NONCE + wrapTolerant('>>>"; fi') + `${WRAP}(\\r?\\n)?`, 'g');
+const ASSIGN_ECHO = new RegExp(
+  wrapTolerant('__tsm_') + NONCE + WRAP + '=' + WRAP + "'[^']*'" + `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
+const EVAL_ECHO = new RegExp(
+  wrapTolerant('eval "unset __tsm_') + NONCE + wrapTolerant(`; $(printf '%b' "$__tsm_`) +
+  `(?:[0-9a-z]|${WRAP_ONE})+` + wrapTolerant('")"') + `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
 const WRAP_ARTIFACT = new RegExp(WRAP_ONE, 'g');
 /** A captured nonce or path with any wrap artifacts removed. */
 const unwrap = (captured: string) => captured.replace(WRAP_ARTIFACT, '');
+/**
+ * Whether a captured path, wrap artifacts removed, is one `issued` holds.
+ * Where it has spaces, a bare carriage return after one of them could be an
+ * artifact on its own or the end of bash 3.2's space-and-return, so both
+ * readings are tried.
+ */
+const capturedIn = (issued: Set<string>, captured: string) =>
+  issued.has(unwrap(captured)) || issued.has(captured.replace(/\r|\x1b\[[0-9;]*[A-Za-z]/g, ''));
+
+/**
+ * A command body as the single-quoted argument of `printf '%b'`, which POSIX
+ * shells decode back to the body's bytes (a command substitution then drops
+ * its trailing newlines; see inlineLine): backslashes doubled, newlines
+ * and tabs as \n and \t, and single quotes, `!`, other control characters
+ * and non-ASCII bytes as \0NNN octal. The typed line is then one line of
+ * printable ASCII with no single quote in the argument, so readline has
+ * nothing to act on (a tab would start completion, a newline would end the
+ * line, and older bash may expand a `!`), and nothing ends the argument early.
+ */
+const printfBody = (body: string): string => {
+  let escaped = '';
+  for (const byte of Buffer.from(body, 'utf8')) {
+    if (byte === 0x5c) escaped += '\\\\';
+    else if (byte === 0x0a) escaped += '\\n';
+    else if (byte === 0x09) escaped += '\\t';
+    else if (byte === 0x27 || byte === 0x21 || byte < 0x20 || byte >= 0x7f) escaped += '\\0' + byte.toString(8).padStart(3, '0');
+    else escaped += String.fromCharCode(byte);
+  }
+  return escaped;
+};
+
+/**
+ * The longest line typed into a shell that can't read the temp files, in
+ * bytes. A shell reading without a line editor gets a line cut at its tty's
+ * canonical limit (1,024 bytes on macOS, 4,095 on Linux), and so does a line
+ * typed before readline is back at its prompt. A cut line loses its end, and
+ * can leave the shell inside an open quote that takes in what is typed next.
+ * A body whose line would be longer isn't typed (see typeBodyInline).
+ */
+const INLINE_LINE_MAX = 1000;
 
 export class PersistentSessionServer extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
@@ -225,7 +298,10 @@ export class PersistentSessionServer extends EventEmitter {
       lineBuffer: '',
       pendingFiles: new Map(),
       issued: new Map(),
-      issuedPaths: new Set()
+      issuedPaths: new Set(),
+      typedInline: new Set(),
+      scanCarry: '',
+      awaitingMarkers: []
     };
 
     // Handle output
@@ -314,8 +390,12 @@ export class PersistentSessionServer extends EventEmitter {
         this.resolveCommand(sessionInfo, signal ? -1 : exitCode ?? -1);
       }
 
-      // Nothing written to this shell can be sourced any more.
+      // Nothing written to this shell can be sourced or print a marker any
+      // more. A dead session stays listable, so its temp files go, and so do
+      // the markers still waiting for a newline and what the scan carried.
       this.cleanupTempFiles(sessionInfo);
+      sessionInfo.awaitingMarkers.length = 0;
+      sessionInfo.scanCarry = '';
 
       this.notify('session:exit', {
         sessionId: sessionInfo.id,
@@ -415,11 +495,11 @@ export class PersistentSessionServer extends EventEmitter {
     // session busy. A write that fails (a missing temp directory, a full disk,
     // a name that's taken) fails that command alone, and the next is tried.
     let currentCommand: QueuedCommand | undefined;
-    let source = '';
+    let quotedPath = '';
     while (!currentCommand && session.commandQueue.length > 0) {
       const next = session.commandQueue.shift()!;
       try {
-        source = this.writeCommandViaTempFile(session, next.nonce, next.command);
+        quotedPath = this.writeCommandViaTempFile(session, next.nonce, next.command);
         currentCommand = next;
       } catch (err) {
         const reason = `[command not run: could not write its temp file: ${(err as Error).message}]`;
@@ -470,7 +550,7 @@ export class PersistentSessionServer extends EventEmitter {
     // PTY after a delay — is what makes completion detection robust:
     //   - The shell echoes the marker only after the command actually exits,
     //     so completion is detected at true completion, never early or late.
-    //   - Nothing extra is typed into the PTY while the command runs, so a
+    //   - No marker line is typed into the PTY while the command runs, so a
     //     command that reads stdin (read, REPLs, ssh...) can't swallow the
     //     marker line and force a full-timeout wait.
     //   - The marker string is SPLIT in the echo command ("<<<EXI""T:...), so
@@ -480,7 +560,13 @@ export class PersistentSessionServer extends EventEmitter {
     //     redisplay, soft wraps — which no exact-string filter survives.)
     //   - The per-command nonce means stale markers from a timed-out earlier
     //     command can't resolve (and corrupt) a later one.
-    session.shell.write(this.wrapperLine(currentCommand.nonce, source) + '\n');
+    //
+    // The line runs that wrapper only if the shell in front can read the temp
+    // file, and otherwise asks for the body typed inline (see probeLine). The
+    // server can't know which shell is in front: an earlier command, or input
+    // sent with sendInput, may have started another one, such as a remote
+    // shell ssh opened, which can't read this machine's files.
+    session.shell.write(this.probeLine(currentCommand.nonce, quotedPath) + '\n');
 
     // Set up fallback timeout
     session.currentTimeout = setTimeout(() => {
@@ -497,9 +583,72 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * Resolve the current command with the given exit code
+   * The line typed for every command: the wrapper, run only if the shell in
+   * front can read the temp file. A shell that can, such as the session's own
+   * or a nested one run on this machine as the same user, keeps the file, so
+   * a long or multi-line body is never typed into it. A shell that can't,
+   * such as a remote one ssh opened, sets a variable named for the command to
+   * its own pid and prints a no-file marker instead, and typeBodyInline then
+   * types the body for that shell (see inlineLine).
+   *
+   * The typed lines rely on the standard behavior of the shell's `.`, `eval`,
+   * `[`, `echo`, `printf` and `unset`, which they call by name. A function or
+   * alias in the shell in front that changes how one of them behaves is
+   * outside what the transport supports, since it can make a command end with
+   * a status the body didn't produce. `.() { builtin . "$@"; true; }` runs
+   * every command that sources its file but ends it with 0, and a function
+   * named `eval` that returns 0 ends every command typed inline with 0
+   * without running it. runCommand's description tells callers. This
+   * boundary was chosen over a prefix that picks the builtin by shell, to
+   * keep the inline line's bytes for bodies and the echo filters to the forms
+   * they know. An unconditional `command` fails for special builtins in zsh's
+   * default mode, where it runs only programs, and dash has no `builtin`. The
+   * file is tested with `[` rather than `test`, a name people do give a
+   * function of their own, for running a project's tests.
    */
-  private resolveCommand(session: SessionInfo, exitCode: number): void {
+  private probeLine(nonce: string, quotedPath: string): string {
+    return `if [ -r ${quotedPath} ]; then ${this.wrapperLine(nonce, `. ${quotedPath}`)}; ` +
+      `else __tsm_${nonce}=$$; echo "<<<NOFIL""E:${nonce}>>>"; fi`;
+  }
+
+  /**
+   * The line typed for a shell in front that can't read the temp file: the
+   * escaped body (see printfBody) put in a shell variable named for the
+   * command, then the wrapper around an `eval` of it. The command substitution
+   * expands before `eval` runs, so the variable is unset before the body runs,
+   * and the status is the body's. The body runs only in a shell where the
+   * variable named for the command holds that shell's own pid, which the
+   * probe set in the shell that couldn't read the file. A shell without it
+   * prints a gone marker and runs nothing: the shell behind the one that
+   * asked, when that one has gone, as when an ssh connection drops between
+   * the marker and this line, or a shell an earlier command started in front
+   * of it meanwhile. So does a child that inherited the variable (exported
+   * under `set -a`), since its pid differs. A shell that replaced the asking
+   * one with `exec` keeps its pid, and the variable too if it was exported,
+   * as under `set -a`, and then runs the body, as does a subshell of the
+   * asking one, which keeps both. A command whose body isn't typed, or
+   * reaches another shell, leaves the variable set in the asking shell, where
+   * nothing reads it. Every part of the line carries the nonce, so plumbing
+   * filters know its echo. `eval` runs the
+   * body as `.` would in most
+   * respects, not all: what only a sourced file has differs, such as `return`
+   * at the body's top level (`.` ends the file there, and an interactive
+   * shell refuses it outside one and goes on) and BASH_SOURCE, and so does a
+   * body whose last line ends in a backslash, since the command substitution
+   * drops the trailing newline it continues onto.
+   */
+  private inlineLine(nonce: string, escapedBody: string): string {
+    const name = `__tsm_${nonce}`;
+    return `if [ "\${${name}-}" = "$$" ]; then ${name}='${escapedBody}'; ` +
+      this.wrapperLine(nonce, `eval "unset ${name}; $(printf '%b' "$${name}")"`) +
+      `; else echo "<<<GON""E:${nonce}>>>"; fi`;
+  }
+
+  /**
+   * Resolve the current command with the given exit code. `reason` is the
+   * result's output for a command that never ran.
+   */
+  private resolveCommand(session: SessionInfo, exitCode: number, how: { reason?: string } = {}): void {
     const currentCommand = session.currentCommand;
     if (!currentCommand) return;
 
@@ -547,7 +696,7 @@ export class PersistentSessionServer extends EventEmitter {
         output = output.slice(0, ownExitAt);
       }
     }
-    const cleanOutput = this.stripPlumbingSpans(session, output).trim();
+    const cleanOutput = how.reason ?? this.stripPlumbingSpans(session, output).trim();
 
     const duration = Date.now() - currentCommand.startTime;
 
@@ -582,44 +731,147 @@ export class PersistentSessionServer extends EventEmitter {
    *   of those files can be sourced again.
    * - An exit marker means the shell has finished sourcing that command's
    *   file, which is released; the current command then completes.
+   * - A no-file marker means the shell in front can't read that command's
+   *   file, and typeBodyInline types its body.
    * Runs whether or not a command is current, so a timed-out command that ends
-   * while the session is idle still releases its file. Only the tail of the
-   * buffer around the newest chunk is scanned: a full-buffer scan per chunk is
-   * O(n²) on chatty commands.
+   * while the session is idle still releases its file. Only the newest chunk,
+   * joined to what the last scan carried (scanCarry), is scanned: a
+   * full-buffer scan per chunk is O(n²) on chatty commands.
    */
   private checkCommandCompletion(session: SessionInfo, latestChunk: string): void {
-    if (session.pendingFiles.size === 0 && !session.currentCommand) return;
-
-    // Overlap covers a marker split across chunk boundaries (marker is <48 chars).
-    const scanWindow = session.outputBuffer.slice(-(latestChunk.length + 64));
-    const markers = /<<<(?:START:([0-9a-z]+)|EXIT:([0-9a-z]+):(\d+))>>>/g;
+    // A marker counts once its line has ended. The tty can put out a marker
+    // and its newline separately, and a line typed in between, such as the
+    // next command's or a body for the shell in front, is echoed between
+    // them, which splits that echo across two lines of the log. Input typed
+    // then by anything else, such as sendInput, can still land there, so the
+    // newline can come after more text on the marker's line. Each marker is
+    // recognized once and kept in awaitingMarkers until a newline follows it.
+    // The window starts with what the last one carried: its last characters
+    // after its last marker or newline, kept on the session rather than read
+    // back from outputBuffer, which a command's write clears between two
+    // chunks. So a marker split across chunks is still recognized, and none
+    // is recognized twice.
+    const scanWindow = session.scanCarry + latestChunk;
+    const tokens = /<<<(?:START:([0-9a-z]+)|EXIT:([0-9a-z]+):(\d+)|NOFILE:([0-9a-z]+)|GONE:([0-9a-z]+))>>>|\n/g;
+    let consumed = 0;
     let match: RegExpExecArray | null;
-    while ((match = markers.exec(scanWindow)) !== null) {
-      const current = session.currentCommand;
-      if (match[1] !== undefined) {
-        const started = match[1];
-        if (current && started === current.nonce) current.started = true;
-        if (session.pendingFiles.has(started)) {
-          for (const [earlier, file] of session.pendingFiles) {
-            if (earlier === started) break;
-            session.pendingFiles.delete(earlier);
-            this.removeTempFile(file);
-          }
+    while ((match = tokens.exec(scanWindow)) !== null) {
+      consumed = tokens.lastIndex;
+      if (match[0] !== '\n') {
+        const marker: Marker = match[1] !== undefined ? { kind: 'start', nonce: match[1] }
+          : match[2] !== undefined ? { kind: 'exit', nonce: match[2], code: parseInt(match[3], 10) }
+            : match[4] !== undefined ? { kind: 'nofile', nonce: match[4] }
+              : { kind: 'gone', nonce: match[5] };
+        // Only this session's commands' markers can act (the plumbing filters'
+        // rule too); any other is output. A copy of one already waiting adds
+        // nothing, so a line of repeated markers can't grow the queue.
+        if (session.issued.has(marker.nonce) &&
+            !session.awaitingMarkers.some((m) => m.kind === marker.kind && m.nonce === marker.nonce)) {
+          session.awaitingMarkers.push(marker);
         }
         continue;
       }
-      const nonce = match[2];
-      const file = session.pendingFiles.get(nonce);
-      if (file !== undefined) {
-        session.pendingFiles.delete(nonce);
-        this.removeTempFile(file);
-      }
-      if (current && nonce === current.nonce) {
-        current.started = true; // an exit marker implies the start, even if a trimmed buffer lost it
-        this.resolveCommand(session, parseInt(match[3], 10));
-        return;
-      }
+      for (const marker of session.awaitingMarkers.splice(0)) this.actOnMarker(session, marker);
     }
+    // Markers are under 48 characters, so 63 hold the start of any of them.
+    session.scanCarry = scanWindow.slice(Math.max(consumed, scanWindow.length - 63));
+  }
+
+  /** Act on a marker whose line has ended (see checkCommandCompletion). */
+  private actOnMarker(session: SessionInfo, marker: Marker): void {
+    const current = session.currentCommand;
+    const { nonce } = marker;
+    if (marker.kind === 'nofile') {
+      this.typeBodyInline(session, nonce);
+      return;
+    }
+    if (marker.kind === 'gone') {
+      // The body's line reached a shell other than the one that asked for
+      // it. Taking the mark makes a second gone marker do nothing.
+      if (session.typedInline.delete(nonce)) {
+        this.dropUntyped(session, nonce,
+          `[command not run: its body's line reached a shell other than the one that asked for it, so nothing ran]`);
+      }
+      return;
+    }
+    if (marker.kind === 'start') {
+      if (current && nonce === current.nonce) current.started = true;
+      if (session.pendingFiles.has(nonce)) {
+        for (const [earlier, file] of session.pendingFiles) {
+          if (earlier === nonce) break;
+          session.pendingFiles.delete(earlier);
+          this.removeTempFile(file);
+        }
+      }
+      return;
+    }
+    const file = session.pendingFiles.get(nonce);
+    if (file !== undefined) {
+      session.pendingFiles.delete(nonce);
+      this.removeTempFile(file);
+    }
+    if (current && nonce === current.nonce) {
+      current.started = true; // an exit marker implies the start, even if a trimmed buffer lost it
+      this.resolveCommand(session, marker.code ?? -1);
+    }
+  }
+
+  /**
+   * The shell in front printed a command's no-file marker: it can't read the
+   * command's temp file, so it is another shell, such as a remote one ssh
+   * opened. Type the body there inline, once, whether or not the command is
+   * still waiting for its result, so that commands typed in behind a
+   * timed-out one run in the order they were written, as they do in a shell
+   * that reads the file. The body comes from the temp file, which is still
+   * pending, since this marker comes from the command's own line. The line
+   * runs only in the shell that asked for it (see inlineLine). A body whose
+   * line would pass INLINE_LINE_MAX, or whose file can't be read, isn't typed
+   * (see dropUntyped).
+   */
+  private typeBodyInline(session: SessionInfo, nonce: string): void {
+    const file = session.pendingFiles.get(nonce);
+    if (file === undefined || session.typedInline.has(nonce)) return; // released, or typed already
+    const tooLong = (size: string) => `[command not run: the shell in front can't read this machine's temp files, ` +
+      `and typed in, this command would be a line over ${INLINE_LINE_MAX} bytes (${size}), which a shell can cut short; ` +
+      `send it as smaller commands]`;
+    let line = '';
+    let refusal = '';
+    try {
+      // Escaping only lengthens a body, so a file over the limit isn't read.
+      const size = fs.statSync(file).size;
+      if (size > INLINE_LINE_MAX) {
+        refusal = tooLong(`its body alone is ${size} bytes`);
+      } else {
+        const escapedBody = printfBody(fs.readFileSync(file, 'utf8'));
+        line = this.inlineLine(nonce, escapedBody);
+        if (line.length > INLINE_LINE_MAX) { // the line is ASCII, so its length is its bytes
+          refusal = tooLong(`${line.length} bytes, ${escapedBody.length} of them the body escaped for printf`);
+        }
+      }
+    } catch (err) {
+      refusal = `[command not run: the shell in front can't read this machine's temp files, ` +
+        `and this command's temp file couldn't be read here either: ${(err as Error).message}]`;
+    }
+    if (refusal) {
+      this.dropUntyped(session, nonce, refusal);
+      return;
+    }
+    session.typedInline.add(nonce);
+    session.shell.write(line + '\n');
+  }
+
+  /**
+   * Give up on a command whose body won't run: release its file and say why,
+   * to the caller if it is still waiting and to the log either way.
+   */
+  private dropUntyped(session: SessionInfo, nonce: string, reason: string): void {
+    const file = session.pendingFiles.get(nonce);
+    if (file !== undefined) {
+      session.pendingFiles.delete(nonce);
+      this.removeTempFile(file);
+    }
+    this.addLog(session, reason);
+    if (session.currentCommand?.nonce === nonce) this.resolveCommand(session, -1, { reason });
   }
 
   /**
@@ -643,20 +895,30 @@ export class PersistentSessionServer extends EventEmitter {
   /**
    * Remove issued commands' plumbing spans from command output: wrapper
    * fragments (soft wraps can split the echoed line, so its start-echo,
-   * `. '<file>'` and exit-echo parts are matched separately) and printed
-   * start/exit markers together with the newline echo ends them with. Text
+   * `. '<file>'` or inline `eval`, and exit-echo parts are matched separately,
+   * as are a probe line's head and tail and an inline line's check,
+   * assignment and tail) and printed start, exit, no-file and gone markers
+   * together with the newline echo ends them with. Text
    * around a span stays. The echoed wrapper never contains a contiguous
    * marker (the marker strings are split in it), so the two cannot be
    * confused.
    */
   private stripPlumbingSpans(session: SessionInfo, text: string): string {
     const issued = (span: string, nonce: string) => (session.issued.has(unwrap(nonce)) ? '' : span);
+    const issuedPath = (span: string, file: string) => (capturedIn(session.issuedPaths, file) ? '' : span);
     return text
+      .replace(PROBE_HEAD, issuedPath)
       .replace(START_ECHO, issued)
-      .replace(SOURCE_ECHO, (span, file: string) =>
-        session.issuedPaths.has(unwrap(file)) ? '' : span)
+      .replace(SOURCE_ECHO, issuedPath)
+      .replace(ASSIGN_ECHO, issued)
+      .replace(INLINE_IF, issued)
+      .replace(EVAL_ECHO, issued)
       .replace(EXIT_ECHO, issued)
+      .replace(PROBE_TAIL, issued)
+      .replace(INLINE_TAIL, issued)
       .replace(/<<<START:([0-9a-z]+)>>>(\r?\n)?/g, issued)
+      .replace(/<<<NOFILE:([0-9a-z]+)>>>(\r?\n)?/g, issued)
+      .replace(/<<<GONE:([0-9a-z]+)>>>(\r?\n)?/g, issued)
       .replace(/<<<EXIT:([0-9a-z]+):(\d+)>>>(\r?\n)?/g, issued);
   }
 
@@ -680,14 +942,15 @@ export class PersistentSessionServer extends EventEmitter {
       if (session.pendingFiles.has(old)) continue;
       session.issued.delete(old);
       session.issuedPaths.delete(oldPath);
+      session.typedInline.delete(old);
     }
   }
 
   /**
-   * Persist a command body to a temp file and return the single-line shell
-   * command that runs it in the current shell (preserving cwd/env).
-   * The file is tracked on the session under the command's nonce until the
-   * shell is done with it (see pendingFiles).
+   * Persist a command body to a temp file and return its path as the shell
+   * sees it, quoted for the typed line, which sources it in the current shell
+   * (preserving cwd/env). The file is tracked on the session under the
+   * command's nonce until the shell is done with it (see pendingFiles).
    */
   private writeCommandViaTempFile(session: SessionInfo, nonce: string, command: string): string {
     // 'wx' creates the file exclusively: it never follows a link or reuses a
@@ -715,10 +978,11 @@ export class PersistentSessionServer extends EventEmitter {
       ? file.replace(/^([A-Za-z]):\\/, (_, drive) => `/mnt/${drive.toLowerCase()}/`).replace(/\\/g, '/')
       : file;
     this.rememberIssued(session, nonce, shellPath);
-    // `.` (POSIX source) keeps execution in the interactive shell so env/cwd
-    // changes persist, and unlike `source` it also works in plain sh/dash.
-    // Single-quote the path to be safe against unusual tmpdir characters.
-    return `. '${shellPath.replace(/'/g, `'\\''`)}'`;
+    // Single-quote the path to be safe against unusual tmpdir characters. The
+    // line runs it with `.` (POSIX source), which keeps execution in the
+    // interactive shell so env/cwd changes persist, and unlike `source` it
+    // also works in plain sh/dash.
+    return `'${shellPath.replace(/'/g, `'\\''`)}'`;
   }
 
   /**
