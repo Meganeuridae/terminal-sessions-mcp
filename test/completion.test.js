@@ -496,11 +496,16 @@ test("a shell in front that can't read the temp files gets each body typed inlin
     assert.strictEqual(heredoc.exitCode, 0);
     assert.deepStrictEqual(cleanTerminalOutput(heredoc.output).trim().split(/\r?\n/), [content, `level=${level + 1}`]);
     assert.strictEqual((await server.execCommand('t-remote', '(exit 3)', 8000)).exitCode, 3);
-    // A body too long to type as one line isn't typed, and says why.
-    const tooLong = await server.execCommand('t-remote', `x='${'B'.repeat(5000)}'; echo "length=\${#x}"`, 8000);
+    // A body too long for one line goes in lines of at most 1,000 bytes, and
+    // runs whole.
+    const long = await server.execCommand('t-remote', `x='${'B'.repeat(5000)}'; echo "length=\${#x}"`, 8000);
+    assert.strictEqual(long.exitCode, 0);
+    assert.strictEqual(cleanTerminalOutput(long.output).trim(), 'length=5000');
+    // One that would take more than 128 such lines isn't typed, and says why.
+    const tooLong = await server.execCommand('t-remote', `x='${'B'.repeat(130000)}'; echo "length=\${#x}"`, 8000);
     assert.strictEqual(tooLong.exitCode, -1);
-    assert.match(tooLong.output, /^\[command not run: the shell in front can't read this machine's temp files, and typed in, this command would be a line over 1000 bytes/);
-    assert.ok(!raw.join('').includes('B'.repeat(200)), 'the long body never reached the terminal');
+    assert.match(tooLong.output, /^\[command not run: the shell in front can't read this machine's temp files, and typed in, this command would take more than 128 lines of 1000 bytes \(its body alone is 1300\d\d bytes\)/);
+    assert.ok(!raw.join('').includes('B'.repeat(6000)), 'the refused body never reached the terminal');
     assert.strictEqual(cleanTerminalOutput((await server.execCommand('t-remote', 'echo "level=$SHLVL"', 8000)).output).trim(), `level=${level + 1}`);
     // `exit` prints no exit marker of its own; the line that started the
     // nested shell prints one when it ends, with the status that ends it.

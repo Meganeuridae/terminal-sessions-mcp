@@ -65,6 +65,11 @@ interface SessionInfo {
   // marker scanned again can't type it twice; forgotten with their command
   // (see rememberIssued).
   typedInline: Set<string>;
+  // The lines of a body typed inline still to type, by command, with the
+  // index of the next: each is typed once the shell has printed the piece
+  // marker of the one before (see typeNextPiece); forgotten with their
+  // command, or when it is given up.
+  inlinePieces: Map<string, { lines: string[]; next: number }>;
   // The last characters checkCommandCompletion scanned after its last marker
   // or newline, at most 63, enough to hold the start of a marker split across
   // chunks. They're kept apart from outputBuffer, which is cleared whenever a
@@ -75,9 +80,10 @@ interface SessionInfo {
   awaitingMarkers: Marker[];
 }
 
-// A start, exit, no-file or gone marker the shell printed (see
-// checkCommandCompletion), with the exit marker's status.
-type Marker = { kind: 'start' | 'exit' | 'nofile' | 'gone'; nonce: string; code?: number };
+// A start, exit, no-file, gone or piece marker the shell printed (see
+// checkCommandCompletion), with the exit marker's status or the piece
+// marker's index.
+type Marker = { kind: 'start' | 'exit' | 'nofile' | 'gone' | 'piece'; nonce: string; code?: number; index?: number };
 
 interface QueuedCommand {
   command: string;
@@ -185,22 +191,36 @@ const SOURCE_ECHO = new RegExp(
 const lastAgain = (character: string) => `(?:(?:${WRAP_ONE})+${character})?`;
 const EXIT_ECHO = new RegExp(
   wrapTolerant('echo "<<<EXI""T:') + NONCE + wrapTolerant(':$?>>>"') + lastAgain('"') + `${WRAP}(\\r?\\n)?`, 'g');
-// The parts a probe line (see probeLine) and an inline line (see inlineLine)
-// add around a wrapper.
+// The parts a probe line (see probeLine) and an inline line (see inlinePiece)
+// add around a wrapper. A nonce after the one a pattern captures.
+const NONCE_AGAIN = `(?:[0-9a-z]|${WRAP_ONE})+`;
 const PROBE_HEAD = new RegExp(
   wrapTolerant("if [ -r '") + "([^']*)'" + WRAP + wrapTolerant(' ]; then ') + WRAP, 'g');
 const PROBE_TAIL = new RegExp(
-  wrapTolerant('; else __tsm_') + NONCE + wrapTolerant('=$$; echo "<<<NOFIL""E:') + `(?:[0-9a-z]|${WRAP_ONE})+` +
+  wrapTolerant('; else __tsm_') + NONCE + wrapTolerant('=$$; echo "<<<NOFIL""E:') + NONCE_AGAIN +
   wrapTolerant('>>>"; fi') + lastAgain('i') + `${WRAP}(\\r?\\n)?`, 'g');
+// The check that opens every inline line, with the length check a line after
+// the body's first adds (see inlinePiece).
 const INLINE_IF = new RegExp(
-  wrapTolerant('if [ "${__tsm_') + NONCE + wrapTolerant('-}" = "$$" ]; then ') + WRAP, 'g');
+  wrapTolerant('if [ "${__tsm_') + NONCE + wrapTolerant('-}" = "$$" ]') + WRAP +
+  `(?:${wrapTolerant(' && [ "${#__tsm_')}${NONCE_AGAIN}${wrapTolerant('_b}" = "')}(?:[0-9]|${WRAP_ONE})+${wrapTolerant('" ]')}${WRAP})?` +
+  wrapTolerant('; then ') + WRAP, 'g');
+const PIECE_ECHO = new RegExp(
+  wrapTolerant('echo "<<<PIEC""E:') + NONCE + wrapTolerant(':') + `(?:[0-9]|${WRAP_ONE})+` + wrapTolerant('>>>"') +
+  `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
+// The tail's `; ` may already have gone with the assignment or piece echo
+// before it, on a line that only adds to the body.
 const INLINE_TAIL = new RegExp(
-  wrapTolerant('; else echo "<<<GON""E:') + NONCE + wrapTolerant('>>>"; fi') + lastAgain('i') + `${WRAP}(\\r?\\n)?`, 'g');
+  `(?:${WRAP};)?(?:${WRAP} )?${WRAP}` + wrapTolerant('else echo "<<<GON""E:') + NONCE + wrapTolerant('>>>"; fi') +
+  lastAgain('i') + `${WRAP}(\\r?\\n)?`, 'g');
+// The body variable set to a piece of the escaped body, or to what it held
+// followed by one.
 const ASSIGN_ECHO = new RegExp(
-  wrapTolerant('__tsm_') + NONCE + WRAP + '=' + WRAP + "'[^']*'" + `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
+  wrapTolerant('__tsm_') + NONCE + wrapTolerant('_b') + WRAP + '=' + WRAP +
+  `(?:${wrapTolerant('"$__tsm_')}${NONCE_AGAIN}${wrapTolerant('_b"')}${WRAP})?` + "'[^']*'" + `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
 const EVAL_ECHO = new RegExp(
-  wrapTolerant('eval "unset __tsm_') + NONCE + wrapTolerant(`; $(printf '%b' "$__tsm_`) +
-  `(?:[0-9a-z]|${WRAP_ONE})+` + wrapTolerant('")"') + `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
+  wrapTolerant('eval "unset __tsm_') + NONCE + wrapTolerant(' __tsm_') + NONCE_AGAIN + wrapTolerant(`_b; $(printf '%b' "$__tsm_`) +
+  NONCE_AGAIN + wrapTolerant('_b")"') + `(?:${WRAP};)?(?:${WRAP} )?${WRAP}`, 'g');
 const WRAP_ARTIFACT = new RegExp(WRAP_ONE, 'g');
 /** A captured nonce or path with any wrap artifacts removed. */
 const unwrap = (captured: string) => captured.replace(WRAP_ARTIFACT, '');
@@ -216,12 +236,14 @@ const capturedIn = (issued: Set<string>, captured: string) =>
 /**
  * A command body as the single-quoted argument of `printf '%b'`, which POSIX
  * shells decode back to the body's bytes (a command substitution then drops
- * its trailing newlines; see inlineLine): backslashes doubled, newlines
+ * its trailing newlines; see inlinePiece): backslashes doubled, newlines
  * and tabs as \n and \t, and single quotes, `!`, other control characters
- * and non-ASCII bytes as \0NNN octal. The typed line is then one line of
+ * and non-ASCII bytes as \0NNN octal. The typed lines are then lines of
  * printable ASCII with no single quote in the argument, so readline has
  * nothing to act on (a tab would start completion, a newline would end the
  * line, and older bash may expand a `!`), and nothing ends the argument early.
+ * The escaped text can be cut anywhere, inside an escape too, since the shell
+ * decodes it only once it is whole again (see inlineLines).
  */
 const printfBody = (body: string): string => {
   let escaped = '';
@@ -241,9 +263,25 @@ const printfBody = (body: string): string => {
  * canonical limit (1,024 bytes on macOS, 4,095 on Linux), and so does a line
  * typed before readline is back at its prompt. A cut line loses its end, and
  * can leave the shell inside an open quote that takes in what is typed next.
- * A body whose line would be longer isn't typed (see typeBodyInline).
+ * A body whose line would be longer goes in pieces, each a line under this
+ * limit (see inlineLines), typed one at a time: each line after the first is
+ * typed once the shell has printed the piece marker of the one before, so
+ * the shell is at its prompt, with nothing else queued, whenever a line
+ * reaches it (see typeNextPiece). The tty itself would take the lines
+ * together, making the writer wait when its queue is full rather than
+ * cutting a complete line, but a line editor fed several long lines at once
+ * is not safe: bash 3.2's readline, given the fourth of a body's lines while
+ * still redrawing the third, redrew that line's start over and over without
+ * ever reading it to its end.
  */
 const INLINE_LINE_MAX = 1000;
+/**
+ * The most lines a body typed inline may take, so a body passed in by
+ * mistake, such as a whole file, isn't fed to the shell in front for
+ * minutes with no way to stop it short of killing the session. A body that
+ * would take more isn't typed (see typeBodyInline).
+ */
+const INLINE_PIECES_MAX = 128;
 
 export class PersistentSessionServer extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
@@ -316,6 +354,7 @@ export class PersistentSessionServer extends EventEmitter {
       issuedPaths: new Set(),
       unfinished: new Map(),
       typedInline: new Set(),
+      inlinePieces: new Map(),
       scanCarry: '',
       awaitingMarkers: []
     };
@@ -606,7 +645,7 @@ export class PersistentSessionServer extends EventEmitter {
    * a long or multi-line body is never typed into it. A shell that can't,
    * such as a remote one ssh opened, sets a variable named for the command to
    * its own pid and prints a no-file marker instead, and typeBodyInline then
-   * types the body for that shell (see inlineLine).
+   * types the body for that shell (see inlineLines).
    *
    * The typed lines rely on the standard behavior of the shell's `.`, `eval`,
    * `[`, `echo`, `printf` and `unset`, which they call by name. A function or
@@ -629,36 +668,79 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * The line typed for a shell in front that can't read the temp file: the
+   * The lines typed for a shell in front that can't read the temp file: the
    * escaped body (see printfBody) put in a shell variable named for the
-   * command, then the wrapper around an `eval` of it. The command substitution
-   * expands before `eval` runs, so the variable is unset before the body runs,
-   * and the status is the body's. The body runs only in a shell where the
-   * variable named for the command holds that shell's own pid, which the
-   * probe set in the shell that couldn't read the file. A shell without it
-   * prints a gone marker and runs nothing: the shell behind the one that
-   * asked, when that one has gone, as when an ssh connection drops between
-   * the marker and this line, or a shell an earlier command started in front
-   * of it meanwhile. So does a child that inherited the variable (exported
-   * under `set -a`), since its pid differs. A shell that replaced the asking
-   * one with `exec` keeps its pid, and the variable too if it was exported,
-   * as under `set -a`, and then runs the body, as does a subshell of the
-   * asking one, which keeps both. A command whose body isn't typed, or
-   * reaches another shell, leaves the variable set in the asking shell, where
-   * nothing reads it. Every part of the line carries the nonce, so plumbing
-   * filters know its echo. `eval` runs the
-   * body as `.` would in most
-   * respects, not all: what only a sourced file has differs, such as `return`
-   * at the body's top level (`.` ends the file there, and an interactive
-   * shell refuses it outside one and goes on) and BASH_SOURCE, and so does a
-   * body whose last line ends in a backslash, since the command substitution
-   * drops the trailing newline it continues onto.
+   * command, in pieces when it doesn't fit one line (see inlinePiece), then
+   * the wrapper around an `eval` of it on the last line. Each line is at most
+   * INLINE_LINE_MAX bytes; a body that would take more than INLINE_PIECES_MAX
+   * lines gives null, and isn't typed.
    */
-  private inlineLine(nonce: string, escapedBody: string): string {
-    const name = `__tsm_${nonce}`;
-    return `if [ "\${${name}-}" = "$$" ]; then ${name}='${escapedBody}'; ` +
-      this.wrapperLine(nonce, `eval "unset ${name}; $(printf '%b' "$${name}")"`) +
-      `; else echo "<<<GON""E:${nonce}>>>"; fi`;
+  private inlineLines(nonce: string, escapedBody: string): string[] | null {
+    const lines: string[] = [];
+    let at = 0;
+    for (;;) {
+      // The rest fits the line that runs the body: that line ends them.
+      const closing = lines.length === 0 ? 'only' : 'last';
+      if (escapedBody.length - at <= INLINE_LINE_MAX - this.inlinePiece(nonce, '', closing, at, lines.length).length) {
+        lines.push(this.inlinePiece(nonce, escapedBody.slice(at), closing, at, lines.length));
+        return lines;
+      }
+      if (lines.length + 1 >= INLINE_PIECES_MAX) return null;
+      const adding = lines.length === 0 ? 'first' : 'middle';
+      const text = escapedBody.slice(at, at + INLINE_LINE_MAX - this.inlinePiece(nonce, '', adding, at, lines.length).length);
+      lines.push(this.inlinePiece(nonce, text, adding, at, lines.length));
+      at += text.length;
+    }
+  }
+
+  /**
+   * One line of a body typed inline (see inlineLines): the escaped text it
+   * carries put in the body variable, named for the command, on the body's
+   * `first` line, or added to what the variable holds on a `middle` or the
+   * `last` one; on the `last` line, or the `only` one, the wrapper around an
+   * `eval` of the variable follows, and on any other a piece marker carrying
+   * the line's `index` is printed, which asks for the next line (see
+   * typeNextPiece). The command substitution expands before `eval` runs, so
+   * both variables are unset before the body runs, and the status is the
+   * body's.
+   *
+   * Every line runs only in a shell where the pid variable named for the
+   * command holds that shell's own pid, which the probe set in the shell that
+   * couldn't read the file. A shell without it prints a gone marker and runs
+   * nothing: the shell behind the one that asked, when that one has gone, as
+   * when an ssh connection drops between the marker and the lines, or a shell
+   * an earlier command started in front of it meanwhile. So does a child
+   * that inherited the variable (exported under `set -a`), since its pid
+   * differs. A shell that replaced the asking one with `exec` keeps its pid,
+   * and the variables too if they were exported, as under `set -a`, and then
+   * runs the body, as does a subshell of the asking one, which keeps both. A
+   * line after the first also runs only where the body variable holds
+   * exactly the text typed before it, `typed` characters (the text is ASCII,
+   * so a shell counting characters or bytes agrees), and prints the gone
+   * marker otherwise: a line that reached another shell, or was cut or taken
+   * by something else reading the terminal, leaves a body that is never
+   * run, instead of one with a gap. A command whose body isn't typed, or
+   * doesn't all reach the asking shell, leaves the variables set there,
+   * where nothing reads them. Every part of a line carries the nonce, so
+   * plumbing filters know its echo.
+   *
+   * `eval` runs the body as `.` would in most respects, not all: what only a
+   * sourced file has differs, such as `return` at the body's top level (`.`
+   * ends the file there, and an interactive shell refuses it outside one and
+   * goes on) and BASH_SOURCE, and so does a body whose last line ends in a
+   * backslash, since the command substitution drops the trailing newline it
+   * continues onto.
+   */
+  private inlinePiece(nonce: string, text: string, place: 'only' | 'first' | 'middle' | 'last', typed: number, index: number): string {
+    const pid = `__tsm_${nonce}`;
+    const body = `${pid}_b`;
+    const adds = place === 'middle' || place === 'last';
+    const check = adds ? ` && [ "\${#${body}}" = "${typed}" ]` : '';
+    const assign = adds ? `${body}="$${body}"'${text}'` : `${body}='${text}'`;
+    const then = place === 'only' || place === 'last'
+      ? this.wrapperLine(nonce, `eval "unset ${pid} ${body}; $(printf '%b' "$${body}")"`)
+      : `echo "<<<PIEC""E:${nonce}:${index}>>>"`;
+    return `if [ "\${${pid}-}" = "$$" ]${check}; then ${assign}; ${then}; else echo "<<<GON""E:${nonce}>>>"; fi`;
   }
 
   /**
@@ -776,7 +858,7 @@ export class PersistentSessionServer extends EventEmitter {
     // chunks. So a marker split across chunks is still recognized, and none
     // is recognized twice.
     const scanWindow = session.scanCarry + latestChunk;
-    const tokens = /<<<(?:START:([0-9a-z]+)|EXIT:([0-9a-z]+):(\d+)|NOFILE:([0-9a-z]+)|GONE:([0-9a-z]+))>>>|\n/g;
+    const tokens = /<<<(?:START:([0-9a-z]+)|EXIT:([0-9a-z]+):(\d+)|NOFILE:([0-9a-z]+)|GONE:([0-9a-z]+)|PIECE:([0-9a-z]+):(\d+))>>>|\n/g;
     let consumed = 0;
     let match: RegExpExecArray | null;
     while ((match = tokens.exec(scanWindow)) !== null) {
@@ -785,12 +867,13 @@ export class PersistentSessionServer extends EventEmitter {
         const marker: Marker = match[1] !== undefined ? { kind: 'start', nonce: match[1] }
           : match[2] !== undefined ? { kind: 'exit', nonce: match[2], code: parseInt(match[3], 10) }
             : match[4] !== undefined ? { kind: 'nofile', nonce: match[4] }
-              : { kind: 'gone', nonce: match[5] };
+              : match[5] !== undefined ? { kind: 'gone', nonce: match[5] }
+                : { kind: 'piece', nonce: match[6], index: parseInt(match[7], 10) };
         // Only this session's commands' markers can act (the plumbing filters'
         // rule too); any other is output. A copy of one already waiting adds
         // nothing, so a line of repeated markers can't grow the queue.
         if (session.issued.has(marker.nonce) &&
-            !session.awaitingMarkers.some((m) => m.kind === marker.kind && m.nonce === marker.nonce)) {
+            !session.awaitingMarkers.some((m) => m.kind === marker.kind && m.nonce === marker.nonce && m.index === marker.index)) {
           session.awaitingMarkers.push(marker);
         }
         continue;
@@ -809,12 +892,19 @@ export class PersistentSessionServer extends EventEmitter {
       this.typeBodyInline(session, nonce);
       return;
     }
+    if (marker.kind === 'piece') {
+      this.typeNextPiece(session, nonce, marker.index ?? -1);
+      return;
+    }
     if (marker.kind === 'gone') {
-      // The body's line reached a shell other than the one that asked for
-      // it. Taking the mark makes a second gone marker do nothing.
+      // A line of the body reached a shell other than the one that asked for
+      // it, or didn't reach that one whole (see inlinePiece). Taking the mark
+      // makes the gone markers of the body's other lines do nothing.
       if (session.typedInline.delete(nonce)) {
+        session.inlinePieces.delete(nonce);
         this.dropUntyped(session, nonce,
-          `[command not run: its body's line reached a shell other than the one that asked for it, so nothing ran]`);
+          `[command not run: a line of its body reached a shell other than the one that asked for it, ` +
+          `or didn't reach it whole, so nothing ran]`);
       }
       return;
     }
@@ -849,40 +939,60 @@ export class PersistentSessionServer extends EventEmitter {
    * still waiting for its result, so that commands typed in behind a
    * timed-out one run in the order they were written, as they do in a shell
    * that reads the file. The body comes from the temp file, which is still
-   * pending, since this marker comes from the command's own line. The line
-   * runs only in the shell that asked for it (see inlineLine). A body whose
-   * line would pass INLINE_LINE_MAX, or whose file can't be read, isn't typed
-   * (see dropUntyped).
+   * pending, since this marker comes from the command's own line. The lines
+   * run only in the shell that asked for them (see inlinePiece); the first is
+   * typed here and each next one when the shell has printed the piece marker
+   * of the one before (see typeNextPiece). A body that would take more than
+   * INLINE_PIECES_MAX lines, or whose file can't be read, isn't typed (see
+   * dropUntyped).
    */
   private typeBodyInline(session: SessionInfo, nonce: string): void {
     const file = session.pendingFiles.get(nonce);
     if (file === undefined || session.typedInline.has(nonce)) return; // released, or typed already
     const tooLong = (size: string) => `[command not run: the shell in front can't read this machine's temp files, ` +
-      `and typed in, this command would be a line over ${INLINE_LINE_MAX} bytes (${size}), which a shell can cut short; ` +
+      `and typed in, this command would take more than ${INLINE_PIECES_MAX} lines of ${INLINE_LINE_MAX} bytes (${size}); ` +
       `send it as smaller commands]`;
-    let line = '';
+    let lines: string[] | null = null;
     let refusal = '';
     try {
-      // Escaping only lengthens a body, so a file over the limit isn't read.
+      // Escaping only lengthens a body, so a file over the lines' total isn't read.
       const size = fs.statSync(file).size;
-      if (size > INLINE_LINE_MAX) {
+      if (size > INLINE_PIECES_MAX * INLINE_LINE_MAX) {
         refusal = tooLong(`its body alone is ${size} bytes`);
       } else {
         const escapedBody = printfBody(fs.readFileSync(file, 'utf8'));
-        line = this.inlineLine(nonce, escapedBody);
-        if (line.length > INLINE_LINE_MAX) { // the line is ASCII, so its length is its bytes
-          refusal = tooLong(`${line.length} bytes, ${escapedBody.length} of them the body escaped for printf`);
-        }
+        lines = this.inlineLines(nonce, escapedBody);
+        if (lines === null) refusal = tooLong(`its body is ${size} bytes, ${escapedBody.length} escaped for printf`);
       }
     } catch (err) {
       refusal = `[command not run: the shell in front can't read this machine's temp files, ` +
         `and this command's temp file couldn't be read here either: ${(err as Error).message}]`;
     }
-    if (refusal) {
+    if (refusal || lines === null) {
       this.dropUntyped(session, nonce, refusal);
       return;
     }
     session.typedInline.add(nonce);
+    if (lines.length > 1) session.inlinePieces.set(nonce, { lines, next: 1 });
+    session.shell.write(lines[0] + '\n');
+  }
+
+  /**
+   * The shell in front printed the piece marker of a body's line, `index`:
+   * that line is in the body variable, and the shell is at its prompt again.
+   * Type the next line, once. A marker printed again, out of turn, or for a
+   * command given up or without lines left types nothing: a line typed twice
+   * would find the body variable longer than it checks for and print the
+   * gone marker (see inlinePiece), ending a command that could still run. A
+   * line whose marker never comes, as when something reading the terminal
+   * took it, leaves the rest untyped: nothing more is fed to that reader, and
+   * the command waits for its timeout.
+   */
+  private typeNextPiece(session: SessionInfo, nonce: string, index: number): void {
+    const pieces = session.inlinePieces.get(nonce);
+    if (pieces === undefined || index !== pieces.next - 1) return;
+    const line = pieces.lines[pieces.next++];
+    if (pieces.next === pieces.lines.length) session.inlinePieces.delete(nonce);
     session.shell.write(line + '\n');
   }
 
@@ -898,6 +1008,7 @@ export class PersistentSessionServer extends EventEmitter {
       this.removeTempFile(file);
     }
     session.unfinished.delete(nonce);
+    session.inlinePieces.delete(nonce);
     this.addLog(session, reason);
     if (session.currentCommand?.nonce === nonce) this.resolveCommand(session, -1, { reason });
   }
@@ -970,12 +1081,14 @@ export class PersistentSessionServer extends EventEmitter {
       .replace(ASSIGN_ECHO, issued)
       .replace(INLINE_IF, issued)
       .replace(EVAL_ECHO, issued)
+      .replace(PIECE_ECHO, issued)
       .replace(EXIT_ECHO, issued)
       .replace(PROBE_TAIL, issued)
       .replace(INLINE_TAIL, issued)
       .replace(/<<<START:([0-9a-z]+)>>>(\r?\n)?/g, issued)
       .replace(/<<<NOFILE:([0-9a-z]+)>>>(\r?\n)?/g, issued)
       .replace(/<<<GONE:([0-9a-z]+)>>>(\r?\n)?/g, issued)
+      .replace(/<<<PIECE:([0-9a-z]+):\d+>>>(\r?\n)?/g, issued)
       .replace(/<<<EXIT:([0-9a-z]+):(\d+)>>>(\r?\n)?/g, issued);
   }
 
@@ -1003,6 +1116,7 @@ export class PersistentSessionServer extends EventEmitter {
       session.issued.delete(old);
       session.issuedPaths.delete(oldPath);
       session.typedInline.delete(old);
+      session.inlinePieces.delete(old);
     }
   }
 

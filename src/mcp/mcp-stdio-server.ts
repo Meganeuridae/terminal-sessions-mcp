@@ -62,7 +62,7 @@ const TOOLS = {
     }
   },
   runCommand: {
-    description: 'Run a command in a session (auto-creates the session if it does not exist). It runs in the shell in front, which can be one an earlier command started, such as ssh\'s; that shell has to be a POSIX shell (sh, bash, dash, zsh, ksh). Where it can\'t read this machine\'s temp files, the command is typed in escaped, and one whose typed line would pass 1,000 bytes ends with exitCode -1 and the reason, without running. The transport relies on the standard behavior of that shell\'s `.`, `eval`, `[`, `echo`, `printf` and `unset`: a function or alias that changes one of them can make a command report a status its body didn\'t produce.',
+    description: 'Run a command in a session (auto-creates the session if it does not exist). It runs in the shell in front, which can be one an earlier command started, such as ssh\'s; that shell has to be a POSIX shell (sh, bash, dash, zsh, ksh). Where it can\'t read this machine\'s temp files, the command is typed in escaped, in lines of at most 1,000 bytes; one that would take more than 128 such lines (about 100 KB) ends with exitCode -1 and the reason, without running. The transport relies on the standard behavior of that shell\'s `.`, `eval`, `[`, `echo`, `printf` and `unset`: a function or alias that changes one of them can make a command report a status its body didn\'t produce.',
     parameters: {
       type: 'object',
       properties: {

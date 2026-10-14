@@ -12,7 +12,7 @@ const { PersistentSessionServer } = require('../dist/src/server/session-server-v
 const bareServer = () => Object.create(PersistentSessionServer.prototype);
 const bareSession = () => ({
   issued: new Map(), issuedPaths: new Set(), pendingFiles: new Map(),
-  unfinished: new Map(), typedInline: new Set(), scanCarry: '', awaitingMarkers: [], logs: []
+  unfinished: new Map(), typedInline: new Set(), inlinePieces: new Map(), scanCarry: '', awaitingMarkers: [], logs: []
 });
 
 test('remembered commands: at most 1024, the oldest settled ones forgotten first, never a pending one', () => {
@@ -70,12 +70,16 @@ const typedLine = (nonce, file) => bareServer().wrapperLine(nonce, `. '${file}'`
 // backslash, `%d` and a `!`, and `E`.
 const ESCAPED_BODY = 'cat <<\\0047E\\0047\\na\\tb \\\\ %d \\0041\\nE';
 // Each line the server types: the wrapper (inside the others), the probe line
-// typed for every command, and the inline line typed for a shell that can't
-// read the temp file.
+// typed for every command, and the lines typed for a shell that can't read
+// the temp file: a body on one line, and the first, a middle and the last
+// line of one typed in pieces.
 const typedLines = (nonce, file) => ({
   wrapper: typedLine(nonce, file),
   probe: bareServer().probeLine(nonce, `'${file}'`),
-  inline: bareServer().inlineLine(nonce, ESCAPED_BODY)
+  inline: bareServer().inlinePiece(nonce, ESCAPED_BODY, 'only', 0, 0),
+  first: bareServer().inlinePiece(nonce, ESCAPED_BODY, 'first', 0, 0),
+  middle: bareServer().inlinePiece(nonce, ESCAPED_BODY, 'middle', 885, 1),
+  last: bareServer().inlinePiece(nonce, ESCAPED_BODY, 'last', 1770, 2)
 });
 // What readline writes where an echoed line soft-wraps: bash 3.2 on macOS
 // writes a space and a carriage return; a cursor-moving escape stands for
@@ -200,25 +204,25 @@ test('a no-file marker types the body from its temp file inline, once, even for 
     // The marker printed again, as a reader that took the line might.
     scan(server, session, 'prompt$ <<<NOFILE:n1>>>\r\n');
     assert.equal(written.length, 1, 'typed once');
-    // One line: in a shell where the variable named for the command holds
-    // its own pid, the escaped body put in that variable and the wrapper
+    // One line: in a shell where the pid variable named for the command holds
+    // its own pid, the escaped body put in the body variable and the wrapper
     // around an eval of it. The body's characters are printable ASCII other
     // than the single quote (space to & and ( to ~), and the check after it
     // excludes `!` too.
     assert.match(written[0],
-      /^if \[ "\$\{__tsm_n1-\}" = "\$\$" \]; then __tsm_n1='[ -&(-~]*'; echo "<<<STAR""T:n1>>>"; eval "unset __tsm_n1; \$\(printf '%b' "\$__tsm_n1"\)"; echo "<<<EXI""T:n1:\$\?>>>"; else echo "<<<GON""E:n1>>>"; fi\n$/);
+      /^if \[ "\$\{__tsm_n1-\}" = "\$\$" \]; then __tsm_n1_b='[ -&(-~]*'; echo "<<<STAR""T:n1>>>"; eval "unset __tsm_n1 __tsm_n1_b; \$\(printf '%b' "\$__tsm_n1_b"\)"; echo "<<<EXI""T:n1:\$\?>>>"; else echo "<<<GON""E:n1>>>"; fi\n$/);
     assert.ok(!written[0].includes('!'), 'no `!` for an older bash to history-expand');
-    const left = 'echo "left:${__tsm_n1-unset}"\n';
+    const left = 'echo "left:${__tsm_n1-unset}:${__tsm_n1_b-unset}"\n';
     // What the probe's else branch sets in the shell that couldn't read the file.
     const asked = '__tsm_n1=$$\n';
     for (const shell of ['sh', 'bash']) {
       const run = (script) => execFileSync(shell, ['-c', script], { encoding: 'utf8' });
       // In the shell that asked, it runs the body to its bytes and status, and
       // leaves no variable behind.
-      assert.equal(run(asked + written[0] + left), `<<<START:n1>>>\n${content}\n<<<EXIT:n1:7>>>\nleft:unset\n`, shell);
+      assert.equal(run(asked + written[0] + left), `<<<START:n1>>>\n${content}\n<<<EXIT:n1:7>>>\nleft:unset:unset\n`, shell);
       // A shell without the variable, as when the one that asked has gone,
       // runs nothing.
-      assert.equal(run(written[0] + left), '<<<GONE:n1>>>\nleft:unset\n', shell);
+      assert.equal(run(written[0] + left), '<<<GONE:n1>>>\nleft:unset:unset\n', shell);
       // Nor does a child that inherited it, exported under `set -a`. (The
       // `true` after it keeps the outer shell from exec'ing the child in its
       // own place, with its own pid, as bash does with a last command.)
@@ -230,7 +234,89 @@ test('a no-file marker types the body from its temp file inline, once, even for 
   }
 });
 
-test('a body whose line would pass 1,000 bytes, whose file alone does, or whose file is gone, is not typed: its file goes, and the log says why once', () => {
+test('a body that would pass one line of 1,000 bytes goes in lines of at most that, each typed once the shell has taken the one before, which sh and bash assemble and run once whole, and never with a line missing or cut', () => {
+  const { execFileSync } = require('node:child_process');
+  const server = bareServer();
+  const written = [];
+  const session = { ...bareSession(), outputBuffer: '', shell: { write: (text) => written.push(text) }, currentCommand: undefined };
+  // Non-ASCII text, whose five-character escapes the cuts land inside, a
+  // heredoc, a long comment and a status.
+  const text = 'x' + '\u00e9'.repeat(600) + ' \u00fc';
+  const file = pendingFile(session, 'n2', `cat <<'TSM_END'\n${text}\nTSM_END\n# ${'z'.repeat(1500)}\n(exit 7)\n`);
+  try {
+    scan(server, session, '<<<NOFILE:n2>>>\r\n');
+    assert.equal(written.length, 1, 'the first line is typed');
+    // Each next line is typed when the shell prints the piece marker of the
+    // one before, once: the marker printed again, or out of turn, types nothing.
+    for (let index = 0; !written.at(-1).includes('eval "unset'); index++) {
+      scan(server, session, `<<<PIECE:n2:${index + 3}>>>\r\n<<<PIECE:n2:${index}>>>\r\n`);
+      assert.equal(written.length, index + 2, `line ${index + 1} typed on the marker of line ${index}`);
+      scan(server, session, `<<<PIECE:n2:${index}>>>\r\n`);
+      assert.equal(written.length, index + 2, 'and only once');
+    }
+    assert.ok(!session.inlinePieces.has('n2'), 'nothing left to type');
+    const lines = written.map((line) => line.replace(/\n$/, ''));
+    assert.ok(lines.length >= 8 && lines.length <= 10, `${lines.length} lines`);
+    for (const line of lines) assert.ok(Buffer.byteLength(line) <= 1000 && /^[ -~]*$/.test(line), 'a line of at most 1,000 bytes of printable ASCII');
+    for (const line of lines.slice(0, -1)) assert.ok(Buffer.byteLength(line) > 950, 'full, but for the last');
+    // The first line sets the body variable, in a shell where the pid variable
+    // holds its own pid, and prints its piece marker. The others add to it,
+    // where it also holds exactly what was typed before; the last then runs it.
+    assert.match(lines[0], /^if \[ "\$\{__tsm_n2-\}" = "\$\$" \]; then __tsm_n2_b='[ -&(-~]*'; echo "<<<PIEC""E:n2:0>>>"; else echo "<<<GON""E:n2>>>"; fi$/);
+    const adding = /^if \[ "\$\{__tsm_n2-\}" = "\$\$" \] && \[ "\$\{#__tsm_n2_b\}" = "(\d+)" \]; then __tsm_n2_b="\$__tsm_n2_b"'([ -&(-~]*)'/;
+    let typed = lines[0].match(/'([^']*)'/)[1].length;
+    for (const line of lines.slice(1)) {
+      const [, before, piece] = line.match(adding);
+      assert.equal(Number(before), typed, 'each line checks for the text typed before it');
+      typed += piece.length;
+    }
+    lines.slice(1, -1).forEach((line, i) => assert.match(line, new RegExp(`'; echo "<<<PIEC""E:n2:${i + 1}>>>"; else echo "<<<GON""E:n2>>>"; fi$`)));
+    assert.match(lines.at(-1), /'; echo "<<<STAR""T:n2>>>"; eval "unset __tsm_n2 __tsm_n2_b; \$\(printf '%b' "\$__tsm_n2_b"\)"; echo "<<<EXI""T:n2:\$\?>>>"; else echo "<<<GON""E:n2>>>"; fi$/);
+    const left = 'echo "left:${__tsm_n2-unset}:${__tsm_n2_b-unset}"\n';
+    const asked = '__tsm_n2=$$\n';
+    const pieces = (count) => Array.from({ length: count }, (_, i) => `<<<PIECE:n2:${i}>>>\n`).join('');
+    for (const shell of ['sh', 'bash']) {
+      const run = (script) => {
+        try { return execFileSync(shell, ['-c', script], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }); } catch (err) { return err.stdout; }
+      };
+      assert.equal(run(asked + written.join('') + left), `${pieces(lines.length - 1)}<<<START:n2>>>\n${text}\n<<<EXIT:n2:7>>>\nleft:unset:unset\n`, shell);
+      // Without the pid, every line prints the gone marker, and nothing runs.
+      assert.equal(run(written.join('') + left), '<<<GONE:n2>>>\n'.repeat(lines.length) + 'left:unset:unset\n', `${shell}: no pid`);
+      // A line that didn't reach the shell: the lines after it print the gone
+      // marker, and the body never runs.
+      const missing = run(asked + [lines[0], ...lines.slice(2)].join('\n') + '\n');
+      assert.equal(missing, pieces(1) + '<<<GONE:n2>>>\n'.repeat(lines.length - 2), `${shell}: a line missing`);
+      // A line cut short, as a tty over its limit would: the open quote takes
+      // in what follows, and the body never runs.
+      const cut = run(asked + [lines[0].slice(0, 400), ...lines.slice(1)].join('\n') + '\n');
+      assert.ok(!cut.includes('<<<START:n2>>>') && !cut.includes(text), `${shell}: a line cut: ${JSON.stringify(cut.slice(0, 200))}`);
+    }
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+});
+
+test("a gone marker while a body's lines are still to be typed drops them: a piece marker after it types nothing", () => {
+  const server = bareServer();
+  const written = [];
+  const session = { ...bareSession(), outputBuffer: '', shell: { write: (text) => written.push(text) }, currentCommand: undefined };
+  const file = pendingFile(session, 'n3', `# ${'z'.repeat(2500)}\n`);
+  session.unfinished.set('n3', false);
+  try {
+    scan(server, session, '<<<NOFILE:n3>>>\r\n');
+    assert.equal(written.length, 1);
+    assert.ok(session.inlinePieces.get('n3').lines.length >= 3 && session.inlinePieces.get('n3').next === 1);
+    scan(server, session, '<<<GONE:n3>>>\r\n');
+    assert.ok(!session.inlinePieces.has('n3') && !session.unfinished.has('n3') && !fs.existsSync(file));
+    assert.match(session.logs.at(-1), /a line of its body reached a shell other than the one that asked for it, or didn't reach it whole/);
+    scan(server, session, '<<<PIECE:n3:0>>>\r\n');
+    assert.equal(written.length, 1, 'nothing more is typed');
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+});
+
+test('a body that would take more than 128 lines, whose file alone would, or whose file is gone, is not typed: its file goes, and the log says why once', () => {
   const server = bareServer();
   const written = [];
   const session = { ...bareSession(), outputBuffer: '', shell: { write: (text) => written.push(text) }, currentCommand: undefined };
@@ -238,29 +324,33 @@ test('a body whose line would pass 1,000 bytes, whose file alone does, or whose 
   const pending = (nonce, body) => files.push(pendingFile(session, nonce, body));
   try {
     // The line's length past the body itself, for a nonce of this length.
-    const overhead = server.inlineLine('nb', '').length;
+    const overhead = server.inlinePiece('nb', '', 'only', 0, 0).length;
     pending('na', 'a'.repeat(1000 - overhead));
     pending('nb', 'a'.repeat(1001 - overhead));
     scan(server, session, '<<<NOFILE:na>>>\r\n<<<NOFILE:nb>>>\r\n');
-    assert.equal(written.length, 1, 'a line of exactly 1,000 bytes is typed');
-    assert.equal(written[0].length, 1001, 'with its newline');
-    assert.match(session.logs.at(-1), /a line over 1000 bytes \(1001 bytes, \d+ of them the body escaped for printf\), which a shell can cut short/, 'one byte more is refused');
-    assert.ok(!fs.existsSync(files[1]) && !session.pendingFiles.has('nb'));
-    // Under the limit as bytes, over it escaped: each non-ASCII byte takes five.
-    session.unfinished.set('nc', false);
-    pending('nc', 'echo ' + '\u00e9'.repeat(200));
-    scan(server, session, '<<<NOFILE:nc>>>\r\n');
-    assert.ok(!session.pendingFiles.has('nc') && !session.unfinished.has('nc'));
-    // A newline takes two: 400 of them fit.
-    pending('nd', 'true' + '\n'.repeat(400));
-    scan(server, session, '<<<NOFILE:nd>>>\r\n');
-    assert.equal(written.length, 2, 'a body of newlines that fits at two characters each is typed');
-    // A file over the limit on its own is refused with its size, unread.
-    pending('nf', 'a'.repeat(2000));
-    scan(server, session, '<<<NOFILE:nf>>>\r\n');
-    assert.match(session.logs.at(-1), /a line over 1000 bytes \(its body alone is 2000 bytes\), which a shell can cut short/);
-    assert.ok(!fs.existsSync(files.at(-1)) && !session.pendingFiles.has('nf'));
     assert.equal(written.length, 2);
+    assert.equal(written[0].length, 1001, 'a body that fits a line of exactly 1,000 bytes is typed as one, with its newline');
+    assert.ok(!session.inlinePieces.has('na'));
+    assert.deepEqual([session.inlinePieces.get('nb').lines.length, session.inlinePieces.get('nb').next], [2, 1], 'one byte more takes two lines, the second still to type');
+    // Within the lines' total as bytes, over it escaped: each non-ASCII byte
+    // takes five characters.
+    session.unfinished.set('nc', false);
+    pending('nc', 'echo ' + '\u00e9'.repeat(12000));
+    scan(server, session, '<<<NOFILE:nc>>>\r\n');
+    assert.equal(written.length, 2);
+    assert.match(session.logs.at(-1), /would take more than 128 lines of 1000 bytes \(its body is 24005 bytes, 120005 escaped for printf\); send it as smaller commands/);
+    assert.ok(!fs.existsSync(files.at(-1)) && !session.pendingFiles.has('nc') && !session.unfinished.has('nc'));
+    // A newline takes two characters: as many as fit one line with `true`.
+    pending('nd', 'true' + '\n'.repeat(Math.floor((1000 - overhead - 4) / 2)));
+    scan(server, session, '<<<NOFILE:nd>>>\r\n');
+    assert.equal(written.length, 3, 'a body of newlines that fits at two characters each is typed');
+    assert.ok(written[2].length <= 1001 && !session.inlinePieces.has('nd'), 'as one line');
+    // A file over the lines' total on its own is refused with its size, unread.
+    pending('nf', 'a'.repeat(130000));
+    scan(server, session, '<<<NOFILE:nf>>>\r\n');
+    assert.match(session.logs.at(-1), /would take more than 128 lines of 1000 bytes \(its body alone is 130000 bytes\)/);
+    assert.ok(!fs.existsSync(files.at(-1)) && !session.pendingFiles.has('nf'));
+    assert.equal(written.length, 3);
     session.issued.set('ne', path.join(os.tmpdir(), `tsm-test-${process.pid}-gone.sh`));
     session.pendingFiles.set('ne', path.join(os.tmpdir(), `tsm-test-${process.pid}-gone.sh`));
     scan(server, session, '<<<NOFILE:ne>>>\r\n');
@@ -269,9 +359,9 @@ test('a body whose line would pass 1,000 bytes, whose file alone does, or whose 
     // Printed again, a refused command's marker finds its file released and
     // does nothing more.
     const logged = session.logs.length;
-    scan(server, session, '<<<NOFILE:nb>>>\r\n<<<NOFILE:ne>>>\r\n');
+    scan(server, session, '<<<NOFILE:nc>>>\r\n<<<NOFILE:ne>>>\r\n');
     assert.equal(session.logs.length, logged);
-    assert.equal(written.length, 2);
+    assert.equal(written.length, 3);
   } finally {
     for (const file of files) fs.rmSync(file, { force: true });
   }
@@ -313,7 +403,7 @@ test("markers after one that ends the waiting command are still handled, and a g
     scan(server, session, '<<<GONE:nd>>>\r\n');
     assert.equal(results.length, 2);
     assert.equal(results[1].exitCode, -1);
-    assert.match(results[1].output, /^\[command not run: its body's line reached a shell other than the one that asked for it, so nothing ran\]$/);
+    assert.match(results[1].output, /^\[command not run: a line of its body reached a shell other than the one that asked for it, or didn't reach it whole, so nothing ran\]$/);
     assert.equal(session.currentCommand, undefined);
     // Printed again, the markers do nothing more.
     scan(server, session, '<<<EXIT:nc:0>>>\r\n<<<NOFILE:nd>>>\r\n<<<GONE:nd>>>\r\n');
@@ -409,7 +499,7 @@ test("a gone marker gives up on its command once, its file pending or already re
   try {
     scan(server, session, '<<<GONE:ng>>>\r\n');
     assert.ok(!fs.existsSync(file) && !session.pendingFiles.has('ng') && !session.unfinished.has('ng'));
-    assert.match(session.logs.at(-1), /its body's line reached a shell other than the one that asked for it, so nothing ran/);
+    assert.match(session.logs.at(-1), /a line of its body reached a shell other than the one that asked for it, or didn't reach it whole, so nothing ran/);
     scan(server, session, '<<<GONE:nk>>>\r\n');
     assert.ok(!session.unfinished.has('nk'));
     assert.equal(session.logs.length, 2);

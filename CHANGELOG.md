@@ -48,20 +48,29 @@
   or a nested one run on this machine as the same user, keeps the file, and
   long or multi-line bodies are never typed into it. A shell that can't, such
   as a remote one, sets a variable named for the command to its own pid and
-  gets the body typed in as one line, escaped for `printf '%b'` and run with
-  `eval`, in the order the commands were written, commands typed in behind a
-  timed-out one included. The body runs only in a shell where that variable
-  holds its own pid: a shell that reads the line without it, such as the one
+  gets the body typed in, escaped for `printf '%b'` and run with `eval`, in
+  the order the commands were written, commands typed in behind a timed-out
+  one included. The lines typed run only in a shell where that variable
+  holds its own pid: a shell that reads them without it, such as the one
   behind after an ssh connection drops, or one an earlier command started in
   front meanwhile, runs nothing, and the command is given up rather than run
-  there. A body whose line would be over 1,000 bytes isn't typed, since a
-  shell can cut a longer line short (macOS's line limit is 1,024 bytes, and
-  escaped, a byte of the body can take up to five characters); 1.6.0 typed a
-  single-line command of any length there, which a shell could cut short
-  like any long line, and longer ones now need splitting. Either way the
-  command ends with exitCode -1 and says why if it's still waiting, and the
-  session log says so too. Such a command leaves the variable set in the shell
-  that asked, where nothing reads it. The shell in front has to be a POSIX
+  there. A body is typed in lines of at most 1,000 bytes, since a shell can
+  cut a longer line short (macOS's line limit is 1,024 bytes, and escaped, a
+  byte of the body can take up to five characters): a body that fits goes
+  as one line, and a longer one, such as a file written with a heredoc or a
+  short script, is put together in a shell variable from as many lines as
+  it takes, each typed once the shell has taken the one before (it prints a
+  marker for it), and each run only where the variable holds exactly what
+  the lines before it typed, so a line that reached another shell, or was
+  cut or taken by something else reading the terminal, leaves a body that
+  never runs rather than one with a gap; the last line runs it. 1.6.0 typed a
+  single-line command of any length as one line, which a shell could cut
+  short. A body that would take more than 128 lines (about 100 KB) isn't
+  typed, and the command ends with exitCode -1 and says why if it's still
+  waiting, and the session log says so too, as does a command given up
+  because its lines reached another shell. Such a command leaves the
+  variables set in the shell that asked, where nothing reads them. The
+  shell in front has to be a POSIX
   shell (sh, bash, dash, zsh, ksh); in fish or csh the typed lines don't
   parse, and a command there times out without running. The typed lines rely
   on the standard behavior of the shell's `.`, `eval`, `[`, `echo`, `printf`
