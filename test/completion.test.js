@@ -161,17 +161,21 @@ test('multi-line commands (heredocs) still work through the temp-file path', asy
 
 test('a command queued behind a timed-out one still runs: caller timeouts do not delete its file', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-queued-'));
-  await server.createSession('t-queued', { cwd: dir });
-  const first = await server.execCommand('t-queued', 'sleep 1', 100);
-  assert.strictEqual(first.exitCode, -1);
-  // Written into the tty while sleep still owns it: typeahead, not yet sourced.
-  const queued = await server.execCommand('t-queued', 'printf MUST_RUN > queued', 100);
-  assert.strictEqual(queued.exitCode, -1);
-  // Issuing a third command used to delete the second one's temp file before
-  // the shell got to source it.
-  const third = await server.execCommand('t-queued', 'printf after', 8000);
-  assert.strictEqual(third.exitCode, 0);
-  assert.strictEqual(fs.readFileSync(path.join(dir, 'queued'), 'utf8'), 'MUST_RUN');
+  try {
+    await server.createSession('t-queued', { cwd: dir });
+    const first = await server.execCommand('t-queued', 'sleep 1', 100);
+    assert.strictEqual(first.exitCode, -1);
+    // Written into the tty while sleep still owns it: typeahead, not yet sourced.
+    const queued = await server.execCommand('t-queued', 'printf MUST_RUN > queued', 100);
+    assert.strictEqual(queued.exitCode, -1);
+    // Issuing a third command used to delete the second one's temp file before
+    // the shell got to source it.
+    const third = await server.execCommand('t-queued', 'printf after', 8000);
+    assert.strictEqual(third.exitCode, 0);
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'queued'), 'utf8'), 'MUST_RUN');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a temp file is released by its own marker, including one that arrives after a caller timeout', async () => {
