@@ -63,7 +63,15 @@
   marker for it), and each run only where the variable holds exactly what
   the lines before it typed, so a line that reached another shell, or was
   cut or taken by something else reading the terminal, leaves a body that
-  never runs rather than one with a gap; the last line runs it. 1.6.0 typed a
+  never runs rather than one with a gap; the last line runs it. Bodies go
+  in one at a time, in the order the commands were written: the next
+  body's first line is typed once the shell has read the one before to its
+  end, so a short body can't pass a longer one that is still going in.
+  A body whose line something else reading the terminal took, such as a
+  program the body before it started, holds the ones behind it only until
+  the shell prints a marker for a line typed after that one, which shows
+  it has read past where the taken line would have been; the body is given
+  up then, the log says so, and the ones behind it go on. 1.6.0 typed a
   single-line command of any length as one line, which a shell could cut
   short. A body that would take more than 128 lines (about 100 KB) isn't
   typed, and the command ends with exitCode -1 and says why if it's still

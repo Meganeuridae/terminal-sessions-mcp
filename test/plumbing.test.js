@@ -12,7 +12,7 @@ const { PersistentSessionServer } = require('../dist/src/server/session-server-v
 const bareServer = () => Object.create(PersistentSessionServer.prototype);
 const bareSession = () => ({
   issued: new Map(), issuedPaths: new Set(), pendingFiles: new Map(),
-  unfinished: new Map(), typedInline: new Set(), inlinePieces: new Map(), scanCarry: '', awaitingMarkers: [], logs: []
+  unfinished: new Map(), typedInline: new Set(), inlinePieces: new Map(), inlineQueue: [], typedCount: 0, lineSeq: new Map(), scanCarry: '', awaitingMarkers: [], logs: []
 });
 
 test('remembered commands: at most 1024, the oldest settled ones forgotten first, never a pending one', () => {
@@ -180,11 +180,13 @@ test("the probe reads the temp file in a shell with a function of its own named 
 });
 
 /** A command written to `session` under `nonce`, its temp file holding `body` and pending. */
+// A command written to the shell: its file pending, its probe line typed now.
 function pendingFile(session, nonce, body) {
   const file = path.join(os.tmpdir(), `tsm-test-${process.pid}-${nonce}.sh`);
   fs.writeFileSync(file, body);
   session.issued.set(nonce, file);
   session.pendingFiles.set(nonce, file);
+  if (session.lineSeq) session.lineSeq.set(nonce, ++session.typedCount);
   return file;
 }
 
@@ -316,6 +318,128 @@ test("a gone marker while a body's lines are still to be typed drops them: a pie
   }
 });
 
+test("bodies for the shell in front go in one at a time, in the order their no-file markers came: the next body's first line is typed on the start marker of the one before, or when that one is given up", () => {
+  const { execFileSync } = require('node:child_process');
+  const server = bareServer();
+  const written = [];
+  const session = { ...bareSession(), outputBuffer: '', shell: { write: (text) => written.push(text) }, currentCommand: undefined };
+  const files = [];
+  const pending = (nonce, body) => files.push(pendingFile(session, nonce, body));
+  // The shell reads the typed lines in the order they reached its terminal,
+  // one per marker it prints. For each line typed after the first, how many
+  // lines typed before it the shell hadn't read yet when it was typed; the
+  // line editor needs that to be none (see INLINE_LINE_MAX).
+  const unreadAtWrite = [];
+  let read = 0;
+  const shellReads = () => {
+    for (; read < written.length; read++) {
+      const piece = written[read].match(/echo "<<<PIEC""E:([0-9a-z]+):(\d+)>>>"/);
+      if (!piece) continue;
+      const before = written.length;
+      scan(server, session, `<<<PIECE:${piece[1]}:${piece[2]}>>>\r\n`);
+      if (written.length > before) unreadAtWrite.push(written.length - 1 - (read + 1));
+    }
+  };
+  try {
+    // Three commands typed in behind a timed-out one: the shell reads their
+    // probe lines together, so their no-file markers come back to back. The
+    // first body takes three lines, the second one, the third two.
+    pending('na', `echo first # ${'z'.repeat(2500)}\n`);
+    pending('nb', 'echo second\n');
+    pending('nc', `echo third # ${'z'.repeat(1200)}\n`);
+    scan(server, session, '<<<NOFILE:na>>>\r\n<<<NOFILE:nb>>>\r\n<<<NOFILE:nc>>>\r\n');
+    assert.equal(written.length, 1, "only the first body's first line is typed");
+    assert.deepEqual(session.inlineQueue, ['na', 'nb', 'nc']);
+    shellReads();
+    assert.ok(written.length >= 3 && written.every((line) => line.includes('__tsm_na')), 'the first body goes in whole before anything of the others');
+    assert.match(written.at(-1), /eval "unset __tsm_na __tsm_na_b;/);
+    const first = written.length;
+    // Its markers printed again type nothing more.
+    scan(server, session, '<<<NOFILE:nb>>>\r\n<<<PIECE:na:0>>>\r\n');
+    assert.equal(written.length, first);
+    // Its start marker: the shell has read its last line, and the second
+    // body's only line follows.
+    scan(server, session, '<<<START:na>>>\r\n');
+    assert.equal(written.length, first + 1);
+    assert.match(written.at(-1), /^if \[ "\$\{__tsm_nb-\}" = "\$\$" \]; then __tsm_nb_b='echo second\\n'; echo "<<<STAR""T:nb>>>"/);
+    assert.deepEqual(session.inlineQueue, ['nb', 'nc']);
+    // A command given up (here, its line reached another shell) gives the
+    // next its turn at once.
+    session.unfinished.set('nb', false);
+    scan(server, session, '<<<GONE:nb>>>\r\n');
+    assert.equal(written.length, first + 2);
+    assert.match(written.at(-1), /^if \[ "\$\{__tsm_nc-\}" = "\$\$" \]; then __tsm_nc_b='/);
+    assert.deepEqual(session.inlineQueue, ['nc']);
+    shellReads();
+    assert.match(written.at(-1), /eval "unset __tsm_nc __tsm_nc_b;/);
+    scan(server, session, '<<<START:nc>>>\r\n');
+    assert.deepEqual(session.inlineQueue, []);
+    assert.deepEqual(unreadAtWrite, unreadAtWrite.map(() => 0), 'each line was typed with nothing unread ahead of it');
+    // The shell runs the lines as they reached its terminal: in the order the
+    // commands were written.
+    const out = execFileSync('sh', ['-c', '__tsm_na=$$\n__tsm_nb=$$\n__tsm_nc=$$\n' + written.join('')], { encoding: 'utf8' });
+    assert.deepEqual(out.split('\n').filter((line) => /^(first|second|third)$/.test(line)), ['first', 'second', 'third']);
+    // A body refused at its turn gives the next its turn too, and a no-file
+    // marker for a command whose file is already released is passed over.
+    pending('nd', 'a'.repeat(130000));
+    pending('ne', 'echo fifth\n');
+    session.issued.set('nf', path.join(os.tmpdir(), `tsm-test-${process.pid}-nf.sh`));
+    const typed = written.length;
+    scan(server, session, '<<<NOFILE:nf>>>\r\n<<<NOFILE:nd>>>\r\n<<<NOFILE:ne>>>\r\n');
+    assert.equal(written.length, typed + 1);
+    assert.match(written.at(-1), /__tsm_ne_b='echo fifth\\n'/);
+    assert.deepEqual(session.inlineQueue, ['ne']);
+    // Its exit marker releases its turn too, should the start have been lost.
+    scan(server, session, '<<<EXIT:ne:0>>>\r\n');
+    assert.deepEqual(session.inlineQueue, []);
+    // A body whose typed line never prints its marker, because something
+    // reading the terminal took it, holds the bodies behind it only until the
+    // shell prints a marker for a line typed after that one: the shell reads
+    // in order, so that line couldn't have been read first. Here ng, nh and
+    // ni were written in behind a busy shell, so their probe lines were in
+    // the terminal before ng's line: their markers prove nothing about it.
+    pending('ng', 'echo sixth\n');
+    pending('nh', `echo seventh # ${'z'.repeat(1200)}\n`);
+    pending('ni', 'echo eighth\n');
+    session.unfinished.set('ng', false);
+    session.unfinished.set('nh', false);
+    scan(server, session, '<<<NOFILE:ng>>>\r\n');
+    let before = written.length;
+    let logged = session.logs.length;
+    scan(server, session, '<<<NOFILE:nh>>>\r\n<<<NOFILE:ni>>>\r\n');
+    assert.deepEqual([session.inlineQueue, written.length, session.logs.length], [['ng', 'nh', 'ni'], before, logged], 'ng keeps its turn: those probes were typed before its line');
+    // nj's probe was typed after ng's line (its command timed out meanwhile);
+    // its marker shows the shell read on past where ng's line would have
+    // been. ng is given up, and nh's turn comes.
+    pending('nj', 'echo ninth\n');
+    scan(server, session, '<<<NOFILE:nj>>>\r\n');
+    assert.match(session.logs.at(-1), /a line of its body never reached the shell in front, which has since read a line typed after it/);
+    assert.ok(!session.pendingFiles.has('ng') && !session.unfinished.has('ng') && !session.typedInline.has('ng'), 'ng given up');
+    assert.deepEqual(session.inlineQueue, ['nh', 'ni', 'nj']);
+    assert.equal(written.length, before + 1);
+    assert.match(written.at(-1), /__tsm_nh_b='/);
+    scan(server, session, '<<<PIECE:nh:0>>>\r\n');
+    assert.match(written.at(-1), /__tsm_nh_b="\$__tsm_nh_b"'/);
+    // The same for a body cut off mid-way: its lines still to type go with it.
+    pending('nk', 'echo tenth\n');
+    before = written.length;
+    scan(server, session, '<<<NOFILE:nk>>>\r\n');
+    assert.ok(!session.inlinePieces.has('nh') && !session.pendingFiles.has('nh'), 'nh given up with its lines');
+    assert.deepEqual(session.inlineQueue, ['ni', 'nj', 'nk']);
+    assert.equal(written.length, before + 1);
+    assert.match(written.at(-1), /__tsm_ni_b='echo eighth/);
+    // Late markers of a body given up change nothing.
+    before = written.length;
+    logged = session.logs.length;
+    scan(server, session, '<<<GONE:ng>>>\r\n<<<PIECE:nh:1>>>\r\n<<<NOFILE:nh>>>\r\n<<<START:ng>>>\r\n');
+    assert.equal(written.length, before);
+    assert.equal(session.logs.length, logged);
+    assert.deepEqual(session.inlineQueue, ['ni', 'nj', 'nk']);
+  } finally {
+    for (const file of files) fs.rmSync(file, { force: true });
+  }
+});
+
 test('a body that would take more than 128 lines, whose file alone would, or whose file is gone, is not typed: its file goes, and the log says why once', () => {
   const server = bareServer();
   const written = [];
@@ -328,29 +452,35 @@ test('a body that would take more than 128 lines, whose file alone would, or who
     pending('na', 'a'.repeat(1000 - overhead));
     pending('nb', 'a'.repeat(1001 - overhead));
     scan(server, session, '<<<NOFILE:na>>>\r\n<<<NOFILE:nb>>>\r\n');
-    assert.equal(written.length, 2);
+    assert.equal(written.length, 1, "the second body waits for the first's start marker");
     assert.equal(written[0].length, 1001, 'a body that fits a line of exactly 1,000 bytes is typed as one, with its newline');
     assert.ok(!session.inlinePieces.has('na'));
+    scan(server, session, '<<<START:na>>>\r\n');
+    assert.equal(written.length, 2);
     assert.deepEqual([session.inlinePieces.get('nb').lines.length, session.inlinePieces.get('nb').next], [2, 1], 'one byte more takes two lines, the second still to type');
+    // nb's second line goes in and the shell reads it: the next body's turn.
+    scan(server, session, '<<<PIECE:nb:0>>>\r\n<<<START:nb>>>\r\n');
+    assert.equal(written.length, 3);
     // Within the lines' total as bytes, over it escaped: each non-ASCII byte
     // takes five characters.
     session.unfinished.set('nc', false);
     pending('nc', 'echo ' + '\u00e9'.repeat(12000));
     scan(server, session, '<<<NOFILE:nc>>>\r\n');
-    assert.equal(written.length, 2);
+    assert.equal(written.length, 3);
     assert.match(session.logs.at(-1), /would take more than 128 lines of 1000 bytes \(its body is 24005 bytes, 120005 escaped for printf\); send it as smaller commands/);
     assert.ok(!fs.existsSync(files.at(-1)) && !session.pendingFiles.has('nc') && !session.unfinished.has('nc'));
     // A newline takes two characters: as many as fit one line with `true`.
     pending('nd', 'true' + '\n'.repeat(Math.floor((1000 - overhead - 4) / 2)));
     scan(server, session, '<<<NOFILE:nd>>>\r\n');
-    assert.equal(written.length, 3, 'a body of newlines that fits at two characters each is typed');
-    assert.ok(written[2].length <= 1001 && !session.inlinePieces.has('nd'), 'as one line');
+    assert.equal(written.length, 4, 'a body of newlines that fits at two characters each is typed');
+    assert.ok(written[3].length <= 1001 && !session.inlinePieces.has('nd'), 'as one line');
+    scan(server, session, '<<<START:nd>>>\r\n');
     // A file over the lines' total on its own is refused with its size, unread.
     pending('nf', 'a'.repeat(130000));
     scan(server, session, '<<<NOFILE:nf>>>\r\n');
     assert.match(session.logs.at(-1), /would take more than 128 lines of 1000 bytes \(its body alone is 130000 bytes\)/);
     assert.ok(!fs.existsSync(files.at(-1)) && !session.pendingFiles.has('nf'));
-    assert.equal(written.length, 3);
+    assert.equal(written.length, 4);
     session.issued.set('ne', path.join(os.tmpdir(), `tsm-test-${process.pid}-gone.sh`));
     session.pendingFiles.set('ne', path.join(os.tmpdir(), `tsm-test-${process.pid}-gone.sh`));
     scan(server, session, '<<<NOFILE:ne>>>\r\n');
@@ -361,7 +491,7 @@ test('a body that would take more than 128 lines, whose file alone would, or who
     const logged = session.logs.length;
     scan(server, session, '<<<NOFILE:nc>>>\r\n<<<NOFILE:ne>>>\r\n');
     assert.equal(session.logs.length, logged);
-    assert.equal(written.length, 3);
+    assert.equal(written.length, 4);
   } finally {
     for (const file of files) fs.rmSync(file, { force: true });
   }
@@ -425,6 +555,7 @@ test("a marker counts only once its line has ended, so nothing is typed between 
   };
   for (const nonce of ['nc', 'nf']) session.issued.set(nonce, `/tmp/${nonce}`);
   const file = pendingFile(session, 'nd', 'echo D\n');
+  const files = [];
   try {
     scan(server, session, '<<<START:nc>>>\r\nC\r\n<<<EXIT:nc:0>>>');
     assert.equal(results.length, 0, 'not ended before its exit marker\'s newline');
@@ -436,6 +567,7 @@ test("a marker counts only once its line has ended, so nothing is typed between 
     assert.equal(written.length, 0, 'no body typed before the no-file marker\'s newline');
     scan(server, session, '\r\n');
     assert.equal(written.length, 1);
+    scan(server, session, '<<<START:nd>>>\r\n'); // read to its end: the next body's turn
     // Input typed at that moment, here a line's echo or 600 or 5,000
     // characters, can land between a marker and its newline; the marker
     // counts once its line ends all the same.
@@ -450,7 +582,6 @@ test("a marker counts only once its line has ended, so nothing is typed between 
       scan(server, session, '\r\n');
       assert.deepEqual(results.map((r) => r.exitCode), [0], `an exit marker with ${between.length} characters before its newline`);
     }
-    const files = [];
     for (const [k, between] of [echo, 'x'.repeat(600), 'y'.repeat(5000)].entries()) {
       const nonce = `ng${k}`;
       files.push(pendingFile(session, nonce, 'echo G\n'));
@@ -459,10 +590,10 @@ test("a marker counts only once its line has ended, so nothing is typed between 
       scan(server, session, between);
       scan(server, session, '\r\n');
       assert.equal(written.length, typed + 1, `a no-file marker with ${between.length} characters before its newline`);
+      scan(server, session, `<<<START:${nonce}>>>\r\n`);
     }
-    for (const typedFile of files) fs.rmSync(typedFile, { force: true });
   } finally {
-    fs.rmSync(file, { force: true });
+    for (const typedFile of [file, ...files]) fs.rmSync(typedFile, { force: true });
   }
 });
 

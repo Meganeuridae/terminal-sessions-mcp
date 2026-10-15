@@ -66,10 +66,25 @@ interface SessionInfo {
   // (see rememberIssued).
   typedInline: Set<string>;
   // The lines of a body typed inline still to type, by command, with the
-  // index of the next: each is typed once the shell has printed the piece
-  // marker of the one before (see typeNextPiece); forgotten with their
-  // command, or when it is given up.
+  // index of the next: 0 while the body waits its turn (see inlineQueue),
+  // then each is typed once the shell has printed the piece marker of the
+  // one before (see typeNextPiece); forgotten with their command, or when it
+  // is given up.
   inlinePieces: Map<string, { lines: string[]; next: number }>;
+  // Commands whose no-file marker has arrived and whose body hasn't yet
+  // started in the shell in front, or been given up, in the order the
+  // markers arrived. The first has its lines being typed, the rest wait
+  // their turn (see typeBodyInline), so that shell gets one body at a time,
+  // the bodies in the order their commands were written.
+  inlineQueue: string[];
+  // How many lines the server has typed for its commands (probe lines and
+  // the lines of bodies typed inline), and for each command still
+  // remembered, the number of the last line typed for it (see typeLine). The
+  // shell reads its terminal in order, so a marker printed by a line typed
+  // after another shows that the other was read, or taken, first (see
+  // releaseStuckInline).
+  typedCount: number;
+  lineSeq: Map<string, number>;
   // The last characters checkCommandCompletion scanned after its last marker
   // or newline, at most 63, enough to hold the start of a marker split across
   // chunks. They're kept apart from outputBuffer, which is cleared whenever a
@@ -355,6 +370,9 @@ export class PersistentSessionServer extends EventEmitter {
       unfinished: new Map(),
       typedInline: new Set(),
       inlinePieces: new Map(),
+      inlineQueue: [],
+      typedCount: 0,
+      lineSeq: new Map(),
       scanCarry: '',
       awaitingMarkers: []
     };
@@ -447,10 +465,14 @@ export class PersistentSessionServer extends EventEmitter {
 
       // Nothing written to this shell can be sourced or print a marker any
       // more. A dead session stays listable, so its temp files go, and so do
-      // the markers still waiting for a newline and what the scan carried.
+      // the markers still waiting for a newline, what the scan carried, and
+      // the bodies still being typed or waiting their turn.
       this.cleanupTempFiles(sessionInfo);
       sessionInfo.awaitingMarkers.length = 0;
       sessionInfo.scanCarry = '';
+      sessionInfo.inlineQueue.length = 0;
+      sessionInfo.inlinePieces.clear();
+      sessionInfo.typedInline.clear();
 
       this.notify('session:exit', {
         sessionId: sessionInfo.id,
@@ -622,7 +644,7 @@ export class PersistentSessionServer extends EventEmitter {
     // sent with sendInput, may have started another one, such as a remote
     // shell ssh opened, which can't read this machine's files.
     session.unfinished.set(currentCommand.nonce, false);
-    session.shell.write(this.probeLine(currentCommand.nonce, quotedPath) + '\n');
+    this.typeLine(session, currentCommand.nonce, this.probeLine(currentCommand.nonce, quotedPath));
 
     // Set up fallback timeout
     session.currentTimeout = setTimeout(() => {
@@ -888,6 +910,7 @@ export class PersistentSessionServer extends EventEmitter {
   private actOnMarker(session: SessionInfo, marker: Marker): void {
     const current = session.currentCommand;
     const { nonce } = marker;
+    this.releaseStuckInline(session, nonce);
     if (marker.kind === 'nofile') {
       this.typeBodyInline(session, nonce);
       return;
@@ -916,8 +939,11 @@ export class PersistentSessionServer extends EventEmitter {
           if (earlier === nonce) break;
           session.pendingFiles.delete(earlier);
           this.removeTempFile(file);
+          this.releaseInline(session, earlier);
         }
       }
+      // The shell has read this body to its end: the next may be typed.
+      this.releaseInline(session, nonce);
       return;
     }
     const file = session.pendingFiles.get(nonce);
@@ -925,6 +951,7 @@ export class PersistentSessionServer extends EventEmitter {
       session.pendingFiles.delete(nonce);
       this.removeTempFile(file);
     }
+    this.releaseInline(session, nonce); // in case its start marker was lost
     const endsCurrent = session.unfinished.has(nonce) && this.finishUnfinished(session, nonce);
     if (current && (nonce === current.nonce || endsCurrent)) {
       current.started = true; // an exit marker implies the start, even if a trimmed buffer lost it
@@ -939,16 +966,43 @@ export class PersistentSessionServer extends EventEmitter {
    * still waiting for its result, so that commands typed in behind a
    * timed-out one run in the order they were written, as they do in a shell
    * that reads the file. The body comes from the temp file, which is still
-   * pending, since this marker comes from the command's own line. The lines
-   * run only in the shell that asked for them (see inlinePiece); the first is
-   * typed here and each next one when the shell has printed the piece marker
-   * of the one before (see typeNextPiece). A body that would take more than
-   * INLINE_PIECES_MAX lines, or whose file can't be read, isn't typed (see
-   * dropUntyped).
+   * pending, since this marker comes from the command's own line.
+   *
+   * Bodies go in one at a time, in the order their markers arrived
+   * (inlineQueue). Commands typed in behind a busy shell have their probe
+   * lines read together, so their no-file markers come back to back; were
+   * each body's first line typed on its own marker, a body in pieces would
+   * have the line of a body written after it ahead of its own second line,
+   * which would run first, and a long line would reach the line editor with
+   * another long line still queued ahead of it (see INLINE_LINE_MAX). So a
+   * body's first line is typed only once the body before it has started (its
+   * start marker, which shows the shell has read it to its end), or been
+   * given up (see releaseInline); the next command's probe line, typed when
+   * the one before times out, can land between a body's lines, but only
+   * sets its variable and prints its marker, and the body it asks for waits
+   * its turn. A body still waiting when its command times out keeps its
+   * place.
+   *
+   * A body whose typed line never prints its marker, as when something else
+   * reading the terminal took it, such as a program the body before it
+   * started, would hold the bodies behind it. It can't hold them past the
+   * shell's next line: the shell reads its terminal in order, so a marker
+   * printed by a line typed after that body's line shows the line never
+   * reached the shell, and never will. That body is given up then, with the
+   * reason in the log, and the next one goes (see releaseStuckInline).
+   *
+   * The lines run only in the shell that asked for them (see inlinePiece);
+   * the first is typed at the body's turn (see startInlineBody) and each next
+   * one when the shell has printed the piece marker of the one before (see
+   * typeNextPiece). A body that would take more than INLINE_PIECES_MAX lines,
+   * or whose file can't be read, isn't typed, and is given up here, at its
+   * marker, rather than at its turn (see dropUntyped).
    */
   private typeBodyInline(session: SessionInfo, nonce: string): void {
     const file = session.pendingFiles.get(nonce);
-    if (file === undefined || session.typedInline.has(nonce)) return; // released, or typed already
+    if (file === undefined || session.typedInline.has(nonce) || session.inlineQueue.includes(nonce)) {
+      return; // released, typed already, or waiting its turn
+    }
     const tooLong = (size: string) => `[command not run: the shell in front can't read this machine's temp files, ` +
       `and typed in, this command would take more than ${INLINE_PIECES_MAX} lines of ${INLINE_LINE_MAX} bytes (${size}); ` +
       `send it as smaller commands]`;
@@ -972,9 +1026,73 @@ export class PersistentSessionServer extends EventEmitter {
       this.dropUntyped(session, nonce, refusal);
       return;
     }
+    session.inlinePieces.set(nonce, { lines, next: 0 });
+    session.inlineQueue.push(nonce);
+    if (session.inlineQueue.length === 1) this.startInlineBody(session, nonce);
+  }
+
+  /**
+   * The turn of the body at the head of inlineQueue has come (see
+   * typeBodyInline): type its first line, once. A body whose file was
+   * released meanwhile, by a later command's start marker, isn't typed, and
+   * the next body's turn comes.
+   */
+  private startInlineBody(session: SessionInfo, nonce: string): void {
+    const pieces = session.inlinePieces.get(nonce);
+    if (pieces === undefined || !session.pendingFiles.has(nonce)) {
+      session.inlinePieces.delete(nonce);
+      this.releaseInline(session, nonce);
+      return;
+    }
     session.typedInline.add(nonce);
-    if (lines.length > 1) session.inlinePieces.set(nonce, { lines, next: 1 });
-    session.shell.write(lines[0] + '\n');
+    pieces.next = 1;
+    if (pieces.lines.length === 1) session.inlinePieces.delete(nonce);
+    this.typeLine(session, nonce, pieces.lines[0]);
+  }
+
+  /**
+   * Type a line for a command into the shell, and number it (see lineSeq).
+   */
+  private typeLine(session: SessionInfo, nonce: string, line: string): void {
+    session.lineSeq.set(nonce, ++session.typedCount);
+    session.shell.write(line + '\n');
+  }
+
+  /**
+   * A marker for `nonce` has arrived: the shell has read the last line typed
+   * for that command. If the body being typed (the head of inlineQueue) is
+   * another command whose last line was typed before that one, the shell has
+   * read past where that line would have been without printing its marker:
+   * something else reading the terminal took it, and will take nothing more,
+   * since the shell is reading again. The body is given up, with the reason,
+   * and the next one's turn comes (see typeBodyInline). A line typed before
+   * the head's proves nothing: a probe line typed in behind a busy shell
+   * waits in the terminal ahead of the head's lines, and its no-file marker
+   * comes while they're still to be read.
+   */
+  private releaseStuckInline(session: SessionInfo, nonce: string): void {
+    const head = session.inlineQueue[0];
+    if (head === undefined || head === nonce || !session.typedInline.has(head)) return;
+    const headLine = session.lineSeq.get(head);
+    const thisLine = session.lineSeq.get(nonce);
+    if (headLine === undefined || thisLine === undefined || thisLine < headLine) return;
+    this.dropUntyped(session, head,
+      `[command not run: a line of its body never reached the shell in front, which has since read a line typed after it; ` +
+      `something else reading the terminal took it, and nothing of the body ran]`);
+  }
+
+  /**
+   * A body's turn in inlineQueue is over: the shell has read it to its end
+   * (its start marker, or its exit marker when the start was lost), or the
+   * command was given up or released. Take it out, wherever it stands, and
+   * when it was the one being typed, start the body behind it (see
+   * typeBodyInline).
+   */
+  private releaseInline(session: SessionInfo, nonce: string): void {
+    const at = session.inlineQueue.indexOf(nonce);
+    if (at < 0) return;
+    session.inlineQueue.splice(at, 1);
+    if (at === 0 && session.inlineQueue.length > 0) this.startInlineBody(session, session.inlineQueue[0]);
   }
 
   /**
@@ -993,7 +1111,7 @@ export class PersistentSessionServer extends EventEmitter {
     if (pieces === undefined || index !== pieces.next - 1) return;
     const line = pieces.lines[pieces.next++];
     if (pieces.next === pieces.lines.length) session.inlinePieces.delete(nonce);
-    session.shell.write(line + '\n');
+    this.typeLine(session, nonce, line);
   }
 
   /**
@@ -1009,8 +1127,10 @@ export class PersistentSessionServer extends EventEmitter {
     }
     session.unfinished.delete(nonce);
     session.inlinePieces.delete(nonce);
+    session.typedInline.delete(nonce);
     this.addLog(session, reason);
     if (session.currentCommand?.nonce === nonce) this.resolveCommand(session, -1, { reason });
+    this.releaseInline(session, nonce);
   }
 
   /**
@@ -1117,6 +1237,8 @@ export class PersistentSessionServer extends EventEmitter {
       session.issuedPaths.delete(oldPath);
       session.typedInline.delete(old);
       session.inlinePieces.delete(old);
+      session.lineSeq.delete(old);
+      this.releaseInline(session, old);
     }
   }
 

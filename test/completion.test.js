@@ -478,6 +478,7 @@ test('a shell that dies with a marker still waiting for its newline leaves nothi
   assert.strictEqual(died.exitCode, -1);
   assert.deepStrictEqual(session.awaitingMarkers, []);
   assert.strictEqual(session.scanCarry, '');
+  assert.deepStrictEqual([session.inlineQueue, session.inlinePieces.size, session.typedInline.size], [[], 0, 0]);
 });
 
 test("a shell in front that can't read the temp files gets each body typed inline, and its exit ends the command that exited it", async () => {
@@ -524,6 +525,44 @@ test("a shell in front that can't read the temp files gets each body typed inlin
     for (const fragment of ['<<', '""', 'tsm-', ". '", "printf '%b'", '[ -r', '__tsm_', 'NOFIL', 'GON']) {
       assert.ok(!logs.some(l => l.includes(fragment)), `logs carry no plumbing fragment ${JSON.stringify(fragment)}: ${JSON.stringify(logs)}`);
     }
+  } finally {
+    fs.rmSync(rc, { force: true });
+  }
+});
+
+test("a body whose line a program took holds the bodies behind it only until the shell reads a line typed later; then it is given up and they run", async () => {
+  const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
+  const rc = path.join(os.tmpdir(), `tsm-test-rc2-${process.pid}`);
+  fs.writeFileSync(rc, '.() { echo "bash: $1: No such file or directory" >&2; return 1; }\n' +
+    '[() { if builtin test "$1" = -r; then return 1; fi; builtin [ "$@"; }\nPS1="NESTED> "\n');
+  try {
+    await server.createSession('t-stuck', { cwd: '/' });
+    const nested = waitForOutput('t-stuck', 'NESTED> ');
+    assert.strictEqual((await server.execCommand('t-stuck', `bash --rcfile '${rc}'`, 500)).exitCode, -1);
+    await nested;
+    // Four commands typed in behind a sleeping one. Their probe lines wait
+    // in the terminal together, so their no-file markers come back to back,
+    // and their bodies go in one at a time. The first body reads one line
+    // from the terminal when it runs, and takes the second body's line.
+    const done = waitForOutput('t-stuck', 'B_DONE', 8000);
+    assert.strictEqual((await server.execCommand('t-stuck', 'sleep 1.5', 300)).exitCode, -1);
+    assert.strictEqual((await server.execCommand('t-stuck', 'head -n 1 >/dev/null; echo B_DONE', 300)).exitCode, -1);
+    assert.strictEqual((await server.execCommand('t-stuck', 'echo C_RAN', 300)).exitCode, -1);
+    assert.strictEqual((await server.execCommand('t-stuck', 'echo D_RAN', 300)).exitCode, -1);
+    await done;
+    await new Promise((r) => setTimeout(r, 300));
+    const printed = (logs) => logs.map((l) => cleanTerminalOutput(l).trim()).filter((l) => /^(B_DONE|C_RAN|D_RAN|E_RAN)$/.test(l));
+    assert.deepStrictEqual(printed(server.getOutput('t-stuck')), ['B_DONE'], 'the third body waits behind the taken one');
+    // The next command's probe line is typed after the taken line, and its
+    // marker shows the shell has read past it: the taken body is given up,
+    // and the bodies behind it run, in order.
+    const e = await server.execCommand('t-stuck', 'echo E_RAN', 8000);
+    assert.strictEqual(e.exitCode, 0);
+    assert.strictEqual(cleanTerminalOutput(e.output).trim(), 'E_RAN');
+    const logs = server.getOutput('t-stuck');
+    assert.deepStrictEqual(printed(logs), ['B_DONE', 'D_RAN', 'E_RAN']);
+    assert.ok(logs.some((l) => l.includes('a line of its body never reached the shell in front, which has since read a line typed after it')), 'the log says why');
+    assert.strictEqual((await server.execCommand('t-stuck', 'exit', 8000)).exitCode, 0);
   } finally {
     fs.rmSync(rc, { force: true });
   }
