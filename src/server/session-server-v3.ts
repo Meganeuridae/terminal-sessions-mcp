@@ -218,7 +218,7 @@ const PROBE_TAIL = new RegExp(
 // the body's first adds (see inlinePiece).
 const INLINE_IF = new RegExp(
   wrapTolerant('if [ "${__tsm_') + NONCE + wrapTolerant('-}" = "$$" ]') + WRAP +
-  `(?:${wrapTolerant(' && [ "${#__tsm_')}${NONCE_AGAIN}${wrapTolerant('_b}" = "')}(?:[0-9]|${WRAP_ONE})+${wrapTolerant('" ]')}${WRAP})?` +
+  `(?:${wrapTolerant(' && [ "${__tsm_')}${NONCE_AGAIN}${wrapTolerant('_b+set}" = set ] && [ "${#__tsm_')}${NONCE_AGAIN}${wrapTolerant('_b}" = "')}(?:[0-9]|${WRAP_ONE})+${wrapTolerant('" ]')}${WRAP})?` +
   wrapTolerant('; then ') + WRAP, 'g');
 const PIECE_ECHO = new RegExp(
   wrapTolerant('echo "<<<PIEC""E:') + NONCE + wrapTolerant(':') + `(?:[0-9]|${WRAP_ONE})+` + wrapTolerant('>>>"') +
@@ -736,12 +736,16 @@ export class PersistentSessionServer extends EventEmitter {
    * differs. A shell that replaced the asking one with `exec` keeps its pid,
    * and the variables too if they were exported, as under `set -a`, and then
    * runs the body, as does a subshell of the asking one, which keeps both. A
-   * line after the first also runs only where the body variable holds
-   * exactly the text typed before it, `typed` characters (the text is ASCII,
-   * so a shell counting characters or bytes agrees), and prints the gone
-   * marker otherwise: a line that reached another shell, or was cut or taken
-   * by something else reading the terminal, leaves a body that is never
-   * run, instead of one with a gap. A command whose body isn't typed, or
+   * line after the first also runs only where the body variable is set and
+   * holds as many characters as the lines before it typed, `typed` (the text
+   * is ASCII, so a shell counting characters or bytes agrees; the check is of
+   * the length, not the text), and prints the gone marker otherwise: a line
+   * that reached another shell, or was cut or taken by something else
+   * reading the terminal, leaves a body that is never run, instead of one
+   * with a gap. The variable is tested for being set before its length is
+   * read, so under `set -u` a line whose first line never arrived prints the
+   * gone marker too, where reading the length of an unset variable would
+   * abort the line with neither marker. A command whose body isn't typed, or
    * doesn't all reach the asking shell, leaves the variables set there,
    * where nothing reads them. Every part of a line carries the nonce, so
    * plumbing filters know its echo.
@@ -757,7 +761,7 @@ export class PersistentSessionServer extends EventEmitter {
     const pid = `__tsm_${nonce}`;
     const body = `${pid}_b`;
     const adds = place === 'middle' || place === 'last';
-    const check = adds ? ` && [ "\${#${body}}" = "${typed}" ]` : '';
+    const check = adds ? ` && [ "\${${body}+set}" = set ] && [ "\${#${body}}" = "${typed}" ]` : '';
     const assign = adds ? `${body}="$${body}"'${text}'` : `${body}='${text}'`;
     const then = place === 'only' || place === 'last'
       ? this.wrapperLine(nonce, `eval "unset ${pid} ${body}; $(printf '%b' "$${body}")"`)
@@ -1103,8 +1107,11 @@ export class PersistentSessionServer extends EventEmitter {
    * would find the body variable longer than it checks for and print the
    * gone marker (see inlinePiece), ending a command that could still run. A
    * line whose marker never comes, as when something reading the terminal
-   * took it, leaves the rest untyped: nothing more is fed to that reader, and
-   * the command waits for its timeout.
+   * took it, leaves the rest untyped, and the command waits for its timeout;
+   * the bodies behind it wait too, until a marker for a line typed after it
+   * shows the shell is reading again (see releaseStuckInline). The next
+   * command's probe line, typed when this command times out, goes to that
+   * reader if it is still reading, as any typed-ahead line does.
    */
   private typeNextPiece(session: SessionInfo, nonce: string, index: number): void {
     const pieces = session.inlinePieces.get(nonce);

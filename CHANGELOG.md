@@ -60,8 +60,8 @@
   as one line, and a longer one, such as a file written with a heredoc or a
   short script, is put together in a shell variable from as many lines as
   it takes, each typed once the shell has taken the one before (it prints a
-  marker for it), and each run only where the variable holds exactly what
-  the lines before it typed, so a line that reached another shell, or was
+  marker for it), and each run only where the variable holds as many
+  characters as the lines before it typed, so a line that reached another shell, or was
   cut or taken by something else reading the terminal, leaves a body that
   never runs rather than one with a gap; the last line runs it. Bodies go
   in one at a time, in the order the commands were written: the next
@@ -71,7 +71,10 @@
   program the body before it started, holds the ones behind it only until
   the shell prints a marker for a line typed after that one, which shows
   it has read past where the taken line would have been; the body is given
-  up then, the log says so, and the ones behind it go on. 1.6.0 typed a
+  up then, the log says so, and the ones behind it go on. Typing takes a
+  round trip per line, which counts against the command's timeout; a body
+  still going in when its timeout passes is typed to its end and then runs,
+  as a timed-out command keeps running. 1.6.0 typed a
   single-line command of any length as one line, which a shell could cut
   short. A body that would take more than 128 lines (about 100 KB) isn't
   typed, and the command ends with exitCode -1 and says why if it's still

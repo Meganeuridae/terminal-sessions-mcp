@@ -265,7 +265,7 @@ test('a body that would pass one line of 1,000 bytes goes in lines of at most th
     // holds its own pid, and prints its piece marker. The others add to it,
     // where it also holds exactly what was typed before; the last then runs it.
     assert.match(lines[0], /^if \[ "\$\{__tsm_n2-\}" = "\$\$" \]; then __tsm_n2_b='[ -&(-~]*'; echo "<<<PIEC""E:n2:0>>>"; else echo "<<<GON""E:n2>>>"; fi$/);
-    const adding = /^if \[ "\$\{__tsm_n2-\}" = "\$\$" \] && \[ "\$\{#__tsm_n2_b\}" = "(\d+)" \]; then __tsm_n2_b="\$__tsm_n2_b"'([ -&(-~]*)'/;
+    const adding = /^if \[ "\$\{__tsm_n2-\}" = "\$\$" \] && \[ "\$\{__tsm_n2_b\+set\}" = set \] && \[ "\$\{#__tsm_n2_b\}" = "(\d+)" \]; then __tsm_n2_b="\$__tsm_n2_b"'([ -&(-~]*)'/;
     let typed = lines[0].match(/'([^']*)'/)[1].length;
     for (const line of lines.slice(1)) {
       const [, before, piece] = line.match(adding);
@@ -278,20 +278,31 @@ test('a body that would pass one line of 1,000 bytes goes in lines of at most th
     const asked = '__tsm_n2=$$\n';
     const pieces = (count) => Array.from({ length: count }, (_, i) => `<<<PIECE:n2:${i}>>>\n`).join('');
     for (const shell of ['sh', 'bash']) {
+      // The shell's output and its exit status (the script's last command's).
       const run = (script) => {
-        try { return execFileSync(shell, ['-c', script], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }); } catch (err) { return err.stdout; }
+        try { return { out: execFileSync(shell, ['-c', script], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }), status: 0 }; } catch (err) { return { out: err.stdout, status: err.status }; }
       };
-      assert.equal(run(asked + written.join('') + left), `${pieces(lines.length - 1)}<<<START:n2>>>\n${text}\n<<<EXIT:n2:7>>>\nleft:unset:unset\n`, shell);
+      const gone = (count) => '<<<GONE:n2>>>\n'.repeat(count);
+      assert.deepEqual(run(asked + written.join('') + left), { out: `${pieces(lines.length - 1)}<<<START:n2>>>\n${text}\n<<<EXIT:n2:7>>>\nleft:unset:unset\n`, status: 0 }, shell);
       // Without the pid, every line prints the gone marker, and nothing runs.
-      assert.equal(run(written.join('') + left), '<<<GONE:n2>>>\n'.repeat(lines.length) + 'left:unset:unset\n', `${shell}: no pid`);
+      assert.deepEqual(run(written.join('') + left), { out: gone(lines.length) + 'left:unset:unset\n', status: 0 }, `${shell}: no pid`);
       // A line that didn't reach the shell: the lines after it print the gone
-      // marker, and the body never runs.
-      const missing = run(asked + [lines[0], ...lines.slice(2)].join('\n') + '\n');
-      assert.equal(missing, pieces(1) + '<<<GONE:n2>>>\n'.repeat(lines.length - 2), `${shell}: a line missing`);
+      // marker, and the body never runs. Under `set -u` too, where reading the
+      // length of the unset body variable would otherwise abort the line.
+      assert.deepEqual(run(asked + [lines[0], ...lines.slice(2)].join('\n') + '\n'), { out: pieces(1) + gone(lines.length - 2), status: 0 }, `${shell}: a line missing`);
+      assert.deepEqual(run('set -u\n' + asked + lines.slice(1).join('\n') + '\n'), { out: gone(lines.length - 1), status: 0 }, `${shell}: the first line missing, under set -u`);
+      // A middle line that reached the shell short of some of its text, still
+      // well-formed: it adds what it has and prints its piece marker, and
+      // every line after it finds the body too short and prints the gone
+      // marker. The body never runs. This is the check the length is for.
+      const shortened = lines[1].replace(/'([ -&(-~]{100})/, "'");
+      assert.deepEqual(run(asked + [lines[0], shortened, ...lines.slice(2)].join('\n') + '\n'), { out: pieces(2) + gone(lines.length - 2), status: 0 }, `${shell}: a middle line short of 100 characters`);
       // A line cut short, as a tty over its limit would: the open quote takes
-      // in what follows, and the body never runs.
-      const cut = run(asked + [lines[0].slice(0, 400), ...lines.slice(1)].join('\n') + '\n');
-      assert.ok(!cut.includes('<<<START:n2>>>') && !cut.includes(text), `${shell}: a line cut: ${JSON.stringify(cut.slice(0, 200))}`);
+      // in what follows, and the body never runs, whichever line is cut.
+      for (const at of [0, 1, lines.length - 1]) {
+        const cut = run(asked + lines.map((line, i) => (i === at ? line.slice(0, 400) : line)).join('\n') + '\n').out;
+        assert.ok(!cut.includes('<<<START:n2>>>') && !cut.includes(text), `${shell}: line ${at} cut: ${JSON.stringify(cut.slice(0, 200))}`);
+      }
     }
   } finally {
     fs.rmSync(file, { force: true });
@@ -435,6 +446,55 @@ test("bodies for the shell in front go in one at a time, in the order their no-f
     assert.equal(written.length, before);
     assert.equal(session.logs.length, logged);
     assert.deepEqual(session.inlineQueue, ['ni', 'nj', 'nk']);
+  } finally {
+    for (const file of files) fs.rmSync(file, { force: true });
+  }
+});
+
+test('the 128-line cap at its edge: a body that takes exactly 128 lines is typed, each at most 1,000 bytes with a three-digit index and a six-digit length, and sh runs it; one character more is refused', () => {
+  const { execFileSync } = require('node:child_process');
+  const server = bareServer();
+  const files = [];
+  // A body of k ASCII characters that printf's escaping leaves as it is, and
+  // that prints its own length when run.
+  const body = (k) => `x=${'a'.repeat(k)}; echo "\${#x}"`;
+  // How many lines a body of k characters takes, through the marker path; null
+  // when it is refused.
+  const linesFor = (k) => {
+    const session = { ...bareSession(), outputBuffer: '', shell: { write: () => {} }, currentCommand: undefined };
+    files.push(pendingFile(session, 'ne', body(k)));
+    scan(server, session, '<<<NOFILE:ne>>>\r\n');
+    const pieces = session.inlinePieces.get('ne');
+    return session.typedInline.has('ne') ? (pieces ? pieces.lines.length : 1) : null;
+  };
+  try {
+    // The largest body that takes 128 lines, by bisection.
+    let lo = 100000, hi = 130000; // 128 lines hold about 104,000 characters
+    assert.ok(linesFor(lo) !== null && linesFor(lo) <= 128 && linesFor(hi) === null);
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (linesFor(mid) === null) hi = mid; else lo = mid;
+    }
+    assert.equal(linesFor(lo), 128, `the largest typed body takes 128 lines (${lo} characters)`);
+    assert.equal(linesFor(hi), null, `one character more (${hi}) is refused`);
+    // Type the 128-line body, one line per piece marker.
+    const written = [];
+    const session = { ...bareSession(), outputBuffer: '', shell: { write: (text) => written.push(text) }, currentCommand: undefined };
+    files.push(pendingFile(session, 'nf', body(lo)));
+    scan(server, session, '<<<NOFILE:nf>>>\r\n');
+    for (let index = 0; written.length < 128; index++) scan(server, session, `<<<PIECE:nf:${index}>>>\r\n`);
+    assert.ok(!session.inlinePieces.has('nf'));
+    const lines = written.map((line) => line.replace(/\n$/, ''));
+    assert.equal(lines.length, 128);
+    for (const line of lines) assert.ok(Buffer.byteLength(line) <= 1000, `a line of ${Buffer.byteLength(line)} bytes`);
+    assert.match(lines[127], /^if \[ "\$\{__tsm_nf-\}" = "\$\$" \] && \[ "\$\{__tsm_nf_b\+set\}" = set \] && \[ "\$\{#__tsm_nf_b\}" = "(\d{6})" \]; then __tsm_nf_b="\$__tsm_nf_b"'[a-z=;" $#{}x]*'; echo "<<<STAR""T:nf>>>"; eval /);
+    assert.match(lines[126], /'; echo "<<<PIEC""E:nf:126>>>"; else echo "<<<GON""E:nf>>>"; fi$/);
+    assert.ok(lines.slice(1).every((line) => Buffer.byteLength(line) > 990), 'every line but the first is full to within ten bytes');
+    // sh assembles and runs it: 127 piece markers, the start marker, the
+    // body's own length, the exit marker.
+    const pieces = Array.from({ length: 127 }, (_, i) => `<<<PIECE:nf:${i}>>>\n`).join('');
+    const out = execFileSync('sh', ['-c', '__tsm_nf=$$\n' + written.join('')], { encoding: 'utf8', maxBuffer: 1 << 20 });
+    assert.equal(out, `${pieces}<<<START:nf>>>\n${lo}\n<<<EXIT:nf:0>>>\n`);
   } finally {
     for (const file of files) fs.rmSync(file, { force: true });
   }
