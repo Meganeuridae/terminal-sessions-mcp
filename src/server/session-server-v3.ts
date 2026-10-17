@@ -736,7 +736,8 @@ export class PersistentSessionServer extends EventEmitter {
    * bodyGoingIn), with the server's typing still moving: a line typed for any
    * command, or a marker acted on, within HELD_PROBE_MAX_MS? Input written
    * then can reach the shell in front instead of the command, or go in
-   * between a body's lines, so sendInput refuses it. The body counts on its
+   * between a body's lines, so sendInput refuses it, all but a lone ^C, which
+   * gives up what's on its way in before it's written. The body counts on its
    * own because the latest command can be given up while an earlier body
    * still goes in. A line that something other than a shell took, which
    * never answers, stops refusing input after that long, and so does one a
@@ -761,9 +762,10 @@ export class PersistentSessionServer extends EventEmitter {
    * gives up a command whose shell then asks for its body, and does nothing
    * for one whose body is typed in whole already. A body whose lines are all
    * typed may be running, and is left to the ^C. Commands still in the
-   * server's queue have no line typed and aren't touched: they go in after
-   * the ^C. Returns the reason the current command is to be answered with, if
-   * it was given up.
+   * server's queue have no line typed and aren't touched: each goes in after
+   * the ^C when the command before it is answered, at once if that one was
+   * given up here. Returns the reason the current command is to be answered
+   * with, if it was given up.
    */
   private interruptTyping(session: SessionInfo): string | undefined {
     const given: GivenUp = {};
@@ -1586,8 +1588,8 @@ export class PersistentSessionServer extends EventEmitter {
         `and until it has started, input can reach the shell in front instead of the command. ` +
         `Send it again in a moment: the refusal ends when the command starts, ends or is given up, ` +
         `or after two seconds in which the server has typed no line and read no marker. ` +
-        `To interrupt it, use sendSignal with SIGINT, its default, or send the C-c key alone, ` +
-        `neither of which is refused.`);
+        `To interrupt it, use sendSignal with SIGINT, its default, or send the C-c key alone ` +
+        `(empty text, keys ['C-c']), neither of which is refused.`);
     }
 
     // A ^C is the same event whichever call writes it (see sendSignal).

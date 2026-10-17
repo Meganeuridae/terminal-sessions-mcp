@@ -677,7 +677,7 @@ function inputServer(written) {
   server.sessions = new Map([['s', session]]);
   return { server, session };
 }
-const refusal = /^Error: Input not sent: a command is still on its way into session s, and until it has started, input can reach the shell in front instead of the command\. Send it again in a moment: the refusal ends when the command starts, ends or is given up, or after two seconds in which the server has typed no line and read no marker\. To interrupt it, use sendSignal with SIGINT, its default, or send the C-c key alone, neither of which is refused\.$/;
+const refusal = /^Error: Input not sent: a command is still on its way into session s, and until it has started, input can reach the shell in front instead of the command\. Send it again in a moment: the refusal ends when the command starts, ends or is given up, or after two seconds in which the server has typed no line and read no marker\. To interrupt it, use sendSignal with SIGINT, its default, or send the C-c key alone \(empty text, keys \['C-c'\]\), neither of which is refused\.$/;
 const queue = (session, nonce, command, resolve = () => {}) =>
   session.commandQueue.push({ command, nonce, resolve, startTime: Date.now(), timeout: 60000 });
 
@@ -1052,29 +1052,38 @@ test("a lone ^C sent with sendInput, as the C-c key or a terminal's Ctrl+C keyst
   }
 });
 
-test('input holding a ^C among other characters is refused while a body goes in, sending nothing and giving nothing up, and once the refusal has lapsed it gives the body up', (t) => {
+test("input holding a ^C that isn't a lone ^C is refused while a body goes in, sending nothing and giving nothing up, and once the refusal has lapsed it gives the body up", (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
-  const written = [];
-  const results = [];
-  const { server, session } = inputServer(written);
-  try {
-    queue(session, 'n1', `echo one # ${'z'.repeat(1500)}`, (r) => results.push(r));
-    server.processCommandQueue(session);
-    scan(server, session, '<<<NOFILE:n1>>>\r\n');
-    assert.match(written.at(-1), /__tsm_n1_b=/, "n1's first line");
-    const before = written.length;
-    assert.throws(() => server.sendInput('s', 'x\x03'), refusal, 'refused while the body goes in');
-    assert.equal(written.length, before, 'nothing sent');
-    assert.deepEqual(results, [], 'nothing answered');
-    assert.deepEqual(session.inlineQueue, ['n1'], "n1's body still goes in");
-    t.mock.timers.tick(2000); // the body's lines stall: nothing typed or read for two seconds
-    server.sendInput('s', 'x\x03');
-    assert.deepEqual(written.slice(before), ['x\x03\r'], 'the input, with its Enter, and nothing typed for the body before it');
-    assert.deepEqual(results.map((r) => [r.exitCode, r.output]), [[-1, INTERRUPTED_BODY]]);
-    assert.deepEqual(session.inlineQueue, []);
-  } finally {
-    for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
-    clearTimeout(session.currentTimeout);
+  // Only data that is exactly a ^C skips the refusal. Each of these holds a ^C
+  // and something more.
+  for (const [form, args, data] of [
+    ['a ^C among other characters', ['x\x03'], 'x\x03\r'],
+    ['a ^C as text, with the default Enter', ['\x03'], '\x03\r'],
+    ['the C-c key with appendNewline true', ['', true, ['C-c']], '\x03\r'],
+    ['two C-c keys', ['', false, ['C-c', 'C-c']], '\x03\x03'],
+  ]) {
+    const written = [];
+    const results = [];
+    const { server, session } = inputServer(written);
+    try {
+      queue(session, 'n1', `echo one # ${'z'.repeat(1500)}`, (r) => results.push(r));
+      server.processCommandQueue(session);
+      scan(server, session, '<<<NOFILE:n1>>>\r\n');
+      assert.match(written.at(-1), /__tsm_n1_b=/, `${form}: n1's first line`);
+      const before = written.length;
+      assert.throws(() => server.sendInput('s', ...args), refusal, `${form}: refused while the body goes in`);
+      assert.equal(written.length, before, `${form}: nothing sent`);
+      assert.deepEqual(results, [], `${form}: nothing answered`);
+      assert.deepEqual(session.inlineQueue, ['n1'], `${form}: n1's body still goes in`);
+      t.mock.timers.tick(2000); // the body's lines stall: nothing typed or read for two seconds
+      server.sendInput('s', ...args);
+      assert.deepEqual(written.slice(before), [data], `${form}: the input, and nothing typed for the body before it`);
+      assert.deepEqual(results.map((r) => [r.exitCode, r.output]), [[-1, INTERRUPTED_BODY]], form);
+      assert.deepEqual(session.inlineQueue, [], form);
+    } finally {
+      for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+      clearTimeout(session.currentTimeout);
+    }
   }
 });
 
@@ -1083,10 +1092,11 @@ test("a command waiting in the server's queue goes in after the ^C that gives up
   // Answering the given-up command types the next queued command's probe line
   // at once (resolveCommand runs processCommandQueue), so the ^C has to be
   // written first: a probe line written before it would be typeahead its
-  // flush discards.
-  for (const [how, send, lapse, data] of [
-    ['sendSignal', (server) => server.sendSignal('s', 'SIGINT'), false, '\x03'],
-    ['sendInput', (server) => server.sendInput('s', '', false, ['C-c']), true, '\x03'],
+  // flush discards. Both are sent while the body goes in, as the GUI's Ctrl+C
+  // keystroke can be.
+  for (const [how, send] of [
+    ['sendSignal', (server) => server.sendSignal('s', 'SIGINT')],
+    ['sendInput', (server) => server.sendInput('s', '', false, ['C-c'])],
   ]) {
     const written = [];
     const results = [];
@@ -1098,12 +1108,11 @@ test("a command waiting in the server's queue goes in after the ^C that gives up
       scan(server, session, '<<<NOFILE:n1>>>\r\n');
       assert.match(written.at(-1), /__tsm_n1_b=/, `${how}: n1's first line, with n2 waiting in the queue`);
       assert.equal(session.commandQueue.length, 1, `${how}: n2 waits`);
-      if (lapse) t.mock.timers.tick(2000);
       const before = written.length;
       send(server);
       assert.deepEqual(results.map((r) => [r.exitCode, r.output]), [[-1, INTERRUPTED_BODY]], how);
       assert.equal(written.length, before + 2, `${how}: the ^C, then n2's probe line`);
-      assert.equal(written[before], data, `${how}: the ^C first`);
+      assert.equal(written[before], '\x03', `${how}: the ^C first`);
       assert.match(written[before + 1], /^if \[ -r '/, `${how}: n2's probe line after it`);
     } finally {
       for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
