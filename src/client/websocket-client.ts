@@ -160,6 +160,32 @@ export class RobustSessionClient extends EventEmitter {
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
   }
   
+  /**
+   * How long to wait for a response before failing the request client-side.
+   * Must always exceed how long the SERVER may legitimately take, plus a 5s
+   * buffer, so the server-side outcome (e.g. a command's timeout result)
+   * arrives as a proper response instead of a client-side "Request timeout".
+   * Notably, exec without an explicit timeout used to get the generic 10s
+   * request timeout while the server default was 30s — any 10-30s command
+   * failed client-side and its (still running) result was dropped.
+   */
+  private computeRequestTimeout(method: string, params?: any): number {
+    switch (method) {
+      case 'session.exec': {
+        const commandTimeout = typeof params?.timeout === 'number'
+          ? Math.max(params.timeout, 0) // -1 = "return immediately" still needs a real wait window
+          : 30000; // mirror the server's default command timeout
+        return commandTimeout + 5000;
+      }
+      case 'service.start':
+        return 20000; // server polls ready/error patterns for up to 15s
+      case 'session.screenshot':
+        return 30000; // puppeteer launch + navigation + render waits
+      default:
+        return this.requestTimeout;
+    }
+  }
+
   async request(method: string, params?: any): Promise<any> {
     // Wait for connection if not connected
     if (this.state !== ConnectionState.CONNECTED) {
@@ -174,11 +200,7 @@ export class RobustSessionClient extends EventEmitter {
         console.error('[RobustClient] Sending request:', message);
       }
 
-      // Use command timeout if provided, otherwise default request timeout
-      // Add 5s buffer so the server-side timeout fires first with a proper response
-      const effectiveTimeout = (method === 'session.exec' && params?.timeout)
-        ? params.timeout + 5000
-        : this.requestTimeout;
+      const effectiveTimeout = this.computeRequestTimeout(method, params);
 
       // Set up timeout
       const timeout = setTimeout(() => {

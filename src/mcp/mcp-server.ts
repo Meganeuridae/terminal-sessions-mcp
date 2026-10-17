@@ -205,25 +205,29 @@ export class ConnectomeTestingMCP {
   async listSessions(): Promise<Array<{
     id: string;
     name?: string;
-    pid: number;
-    startTime: Date;
     isAlive: boolean;
+    createdAt: Date;
+    lastActivity: Date;
+    logSize: number;
   }>> {
     const sessions = await this.withConnectionRetry(() =>
       this.getClient().listSessions()
     );
-    
-    // Enhance with service names
+
+    // Enhance with service names. (Map the fields the server actually
+    // returns — the old pid/startTime fields never existed server-side and
+    // always came back undefined.)
     return sessions.map((session: any) => {
       const name = Array.from(this.serviceMap.entries())
         .find(([_, id]) => id === session.id)?.[0];
-      
+
       return {
         id: session.id,
         name,
-        pid: session.pid,
-        startTime: session.startTime,
-        isAlive: session.isAlive
+        isAlive: session.isAlive,
+        createdAt: session.createdAt,
+        lastActivity: session.lastActivity,
+        logSize: session.logSize
       };
     });
   }

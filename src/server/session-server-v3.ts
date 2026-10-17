@@ -6,7 +6,8 @@
  * - Environment variable persistence
  * - Working directory persistence
  * - Interactive input support
- * - Signal handling (SIGINT, SIGTERM)
+ * - Temp-file cleanup at process exit (signals are left to the embedding
+ *   program; start-session-server handles SIGINT and SIGTERM)
  */
 
 import * as pty from 'node-pty';
@@ -369,17 +370,35 @@ export class PersistentSessionServer extends EventEmitter {
 
   constructor() {
     super();
-    // Clean up on exit. An 'exit' listener runs only synchronous code, so the
-    // pending temp files are removed here: killAll's own cleanup waits on a
-    // timer that never fires once the process is exiting.
-    process.on('exit', () => {
-      for (const session of this.sessions.values()) this.cleanupTempFiles(session);
-      this.killAll();
-    });
-    process.on('SIGINT', () => {
-      this.killAll();
-      process.exit(0);
-    });
+    // When the program exits, remove the sessions' temp files. An 'exit'
+    // listener can't await, so this is synchronous: the async graceful path
+    // would be abandoned when the event loop stops.
+    //
+    // It sends the shells no signal. When the program ends, the kernel hangs
+    // up each session's terminal once nothing else holds it open, and the
+    // shell passes that hangup on to the jobs it started in the background.
+    // (On Linux, node-pty 1.0.0 lets each later session's shell and jobs
+    // inherit the earlier sessions' terminals, so a later session's job that
+    // survives its own hangup keeps them open.) A signal sent from here gets
+    // in the way: a SIGKILLed shell can't pass the hangup on, and in our runs
+    // on Linux (bash 5.2), in a program that exited right after a command, a
+    // SIGHUP sent here left the job running in 11 of 30 runs, against 1 of 60
+    // with the kernel's hangup alone.
+    //
+    // The class registers no SIGINT handler: Ctrl+C belongs to the program
+    // that embeds it. start-session-server handles SIGINT with its graceful
+    // shutdown. A program that doesn't is ended by the signal, so no 'exit'
+    // listener runs (this one and the program's own alike) and the temp files
+    // stay; the kernel then hangs up its sessions' terminals as above.
+    process.on('exit', () => this.cleanupOnExit());
+  }
+
+  /** Synchronous cleanup for process exit: removes every session's temp files. */
+  private cleanupOnExit(): void {
+    for (const session of this.sessions.values()) {
+      this.cleanupTempFiles(session);
+    }
+    this.sessions.clear();
   }
 
   /**
@@ -560,11 +579,22 @@ export class PersistentSessionServer extends EventEmitter {
     const isWindows = process.platform === 'win32';
 
     if (!isWindows) {
-      // Minimal setup - just ensure a clean environment
-      session.shell.write('export TERM=xterm-256color\n');
-      await this.sleep(200); // Give shell time to initialize
+      // Minimal setup, ending in a ready marker so we wait exactly as long as
+      // the shell needs (slow rc files can outlive a fixed sleep and leak
+      // startup noise into the first command's output). The echoed input
+      // contains the literal `$$` (split so no echo can match), so only the
+      // shell actually executing the line produces the digits the regex needs.
+      session.shell.write('export TERM=xterm-256color; echo "<<<RD""Y:$$>>>"\n');
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline && !/<<<RDY:\d+>>>/.test(session.outputBuffer)) {
+        await this.sleep(20);
+      }
+      // Small settle window for the prompt that follows the marker.
+      await this.sleep(50);
 
-      // Clear any initial output/warnings
+      // Clear the startup output. The line buffer is kept, as on main: it
+      // holds the prompt that followed the marker, and getOutput appends it to
+      // the logs, so the GUI's first read of a fresh session shows the prompt.
       session.outputBuffer = '';
       session.logs = [];
     }
@@ -1807,15 +1837,28 @@ export class PersistentSessionServer extends EventEmitter {
 
     if (session.isAlive) {
       if (graceful) {
-        // Send SIGINT for graceful shutdown
-        session.shell.kill('SIGINT');
+        // SIGHUP is the "terminal went away" signal: an interactive shell
+        // exits on it and resends it to its jobs. (SIGINT, used previously, is
+        // IGNORED by an interactive bash — every graceful kill burned the full
+        // timeout and then SIGKILLed anyway.) bash can defer a SIGHUP that
+        // lands between two commands until its next input, so it is sent
+        // again every 500 ms while the shell is still there. In our runs on
+        // Linux (bash 5.2), a SIGHUP sent right after a command left the shell
+        // running 1.5 s later in 39 of 120 trials, and a second SIGHUP, or an
+        // Enter, ended it within about 30 ms each time.
+        session.shell.kill('SIGHUP');
 
-        // Wait up to 5 seconds for process to exit gracefully
+        // Wait up to 3 seconds for the process to exit gracefully
         const timeout = 3000;
         const startTime = Date.now();
+        let nextHangup = startTime + 500;
 
         while (session.isAlive && Date.now() - startTime < timeout) {
-          await this.sleep(100);
+          await this.sleep(50);
+          if (session.isAlive && Date.now() >= nextHangup) {
+            session.shell.kill('SIGHUP');
+            nextHangup += 500;
+          }
         }
 
         // If still alive after timeout, force kill
@@ -1829,8 +1872,8 @@ export class PersistentSessionServer extends EventEmitter {
       }
     }
 
-    // Wait a bit to ensure the process has fully terminated
-    await this.sleep(100);
+    // Brief settle so the exit handler (log flush, event) runs before removal
+    await this.sleep(50);
     this.cleanupTempFiles(session);
     this.sessions.delete(sessionId);
   }

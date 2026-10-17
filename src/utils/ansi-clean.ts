@@ -8,16 +8,23 @@
 // Regex patterns for various ANSI escape sequences
 const ANSI_PATTERNS = {
   // CSI (Control Sequence Introducer) sequences: ESC [ ... final_byte
-  // This covers colors, cursor movement, screen clearing, etc.
-  csi: /\x1b\[[0-9;]*[A-Za-z]/g,
+  // Full CSI grammar: parameter bytes (0x30-0x3F, covers digits ; : ? >),
+  // intermediate bytes (0x20-0x2F), one final byte (0x40-0x7E). A letters-only
+  // final byte match would leave residue like "[1@" from insert-character
+  // sequences (ESC[1@) or "[2 q" from cursor-style sequences (ESC[2 q).
+  csi: /\x1b\[[0-?]*[ -/]*[@-~]/g,
   
   // OSC (Operating System Command) sequences: ESC ] ... BEL or ESC \
   // Used for window titles, hyperlinks, etc.
   osc: /\x1b\].*?(?:\x07|\x1b\\)/g,
   
-  // Single-character escape sequences (ESC + one char)
-  // e.g., ESC ( for character set selection
-  singleChar: /\x1b[()][AB0-9]/g,
+  // The remaining escape sequences (ECMA-48), stripped after CSI/OSC/DCS so
+  // those keep their own patterns: SS3 (ESC O + one char), nF (ESC, one or
+  // more intermediate bytes 0x20-0x2F, a final byte, e.g. ESC ( B charset
+  // selection), and two-character Fp/Fe/Fs sequences (ESC + 0x30-0x7E, e.g.
+  // ESC > / ESC = keypad mode that less prints on exit, ESC 7 / ESC 8, ESC M).
+  // Matching only ESC ( / ESC ) used to leave the final byte, like a stray ">".
+  singleChar: /\x1bO[@-~]|\x1b[ -/]+[0-~]|\x1b[0-~]/g,
   
   // DCS (Device Control String) and other sequences
   dcs: /\x1b[PX^_].*?(?:\x1b\\|\x07)/g,
