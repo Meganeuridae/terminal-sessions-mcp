@@ -595,15 +595,18 @@ test("a command that times out while its body is still going in pieces goes in t
     const nested = waitForOutput('t-pieces', 'NESTED> ');
     assert.strictEqual((await server.execCommand('t-pieces', `bash --rcfile '${rc}'`, 500)).exitCode, -1);
     await nested;
-    // About 22 lines, each a round trip: the 100 ms timeout usually passes while
-    // they go in, and the next command's probe line is then held until the
-    // body is in, so it isn't typed between two of its lines unless the body
-    // has gone two seconds without a line typed. The server's writes are kept
-    // to check that.
+    // About 22 lines, each a round trip, and every write reaches the shell 50 ms
+    // after the server makes it, in order, as over a link, so the 100 ms
+    // timeout passes while they go in. Without the delay, an idle machine
+    // typed and ran the whole body inside 100 ms (5 runs of 5 at a load of 8),
+    // and the test then failed on the command's exit code. The next command's
+    // probe line is held until the body is in, so it isn't typed between two
+    // of its lines unless the body has gone two seconds without a line typed.
+    // The server's writes are kept to check that.
     const s = server.sessions.get('t-pieces');
     const writes = [];
     const write = s.shell.write.bind(s.shell);
-    s.shell.write = (text) => { writes.push({ text: String(text), at: Date.now() }); return write(text); };
+    s.shell.write = (text) => { writes.push({ text: String(text), at: Date.now() }); setTimeout(() => write(text), 50); };
     const long = await server.execCommand('t-pieces', `x='${'y'.repeat(20000)}'; echo "len=\${#x}"`, 100);
     assert.strictEqual(long.exitCode, -1, 'timed out while its body was going in');
     const after = await server.execCommand('t-pieces', 'echo AFTER', 8000);
