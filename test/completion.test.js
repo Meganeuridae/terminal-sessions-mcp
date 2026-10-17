@@ -596,36 +596,43 @@ test("a command that times out while its body is still going in pieces goes in t
     assert.strictEqual((await server.execCommand('t-pieces', `bash --rcfile '${rc}'`, 500)).exitCode, -1);
     await nested;
     // About 22 lines, each a round trip, and every write reaches the shell 50 ms
-    // after the server makes it, in order, as over a link, so the 100 ms
-    // timeout passes while they go in. Without the delay, an idle machine
-    // typed and ran the whole body inside 100 ms (5 runs of 5 at a load of 8),
-    // and the test then failed on the command's exit code. The next command's
-    // probe line is held until the body is in, so it isn't typed between two
-    // of its lines unless the body has gone two seconds without a line typed.
-    // The server's writes are kept to check that.
+    // after the server makes it, in order, standing in for a link's latency, so
+    // the 100 ms timeout passes while they go in. Without the delay, the VPS at
+    // a load of 8 on its 12 CPUs typed and ran the whole body inside 100 ms
+    // (5 runs of 5), and the test then failed on the command's exit code. AFTER
+    // is sent once the body's first line has been written, so its probe line
+    // has a body going in ahead of it, and is held until the body is in: it
+    // isn't typed between two of its lines unless the body has gone two
+    // seconds without a line typed. The server's writes are kept to check that.
     const s = server.sessions.get('t-pieces');
     const writes = [];
     const write = s.shell.write.bind(s.shell);
     s.shell.write = (text) => { writes.push({ text: String(text), at: Date.now() }); setTimeout(() => write(text), 50); };
     const long = await server.execCommand('t-pieces', `x='${'y'.repeat(20000)}'; echo "len=\${#x}"`, 100);
     assert.strictEqual(long.exitCode, -1, 'timed out while its body was going in');
+    const bodyLine = (w) => /; then __tsm_\w+_b=/.test(w.text);
+    const deadline = Date.now() + 5000;
+    while (!writes.some(bodyLine) && Date.now() < deadline) await sleep(10);
+    assert.ok(writes.some(bodyLine), "the body's first line was written within 5 s");
     const after = await server.execCommand('t-pieces', 'echo AFTER', 8000);
     assert.strictEqual(after.exitCode, 0);
     assert.strictEqual(cleanTerminalOutput(after.output).trim(), 'AFTER');
     const printed = server.getOutput('t-pieces').map((l) => cleanTerminalOutput(l).trim()).filter((l) => l === 'len=20000' || l === 'AFTER');
     assert.deepStrictEqual(printed, ['len=20000', 'AFTER'], 'the long body ran whole, then the command behind it');
     // The long command's probe line comes first, then its body's lines, which
-    // name its nonce; the second probe line is AFTER's. A probe line ahead of
-    // the body's first line, as when the 100 ms timeout passed before the
-    // no-file marker came, isn't between its lines.
+    // name its nonce; the second probe line is AFTER's, sent after the body's
+    // first line, so it comes after that line.
     const probes = writes.map((w, i) => (/^if \[ -r '/.test(w.text) ? i : -1)).filter((i) => i >= 0);
     const nonce = (writes[probes[0]].text.match(/tsm-cmd-\d+-(\w+)\.sh/) || [])[1];
     const lines = writes.map((w, i) => (w.text.includes(`__tsm_${nonce}_b`) ? i : -1)).filter((i) => i >= 0);
     assert.ok(lines.length > 1, `the body went in ${lines.length} lines`);
     const afterProbe = probes[1];
-    if (afterProbe > lines[0] && afterProbe < lines.at(-1)) {
+    assert.ok(afterProbe > lines[0], "AFTER's probe line comes after the body's first line");
+    if (afterProbe < lines.at(-1)) {
+      // The hold's two seconds are a timer's; the two Date.now() stamps can
+      // read up to a few ms short of them, so 10 ms are allowed.
       const before = writes[Math.max(...lines.filter((i) => i < afterProbe))];
-      assert.ok(writes[afterProbe].at - before.at >= 2000,
+      assert.ok(writes[afterProbe].at - before.at >= 1990,
         `AFTER's probe line was typed between the body's lines ${writes[afterProbe].at - before.at} ms after its line before`);
     }
     assert.strictEqual((await server.execCommand('t-pieces', 'exit', 8000)).exitCode, 0);

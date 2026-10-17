@@ -677,7 +677,7 @@ function inputServer(written) {
   server.sessions = new Map([['s', session]]);
   return { server, session };
 }
-const refusal = /^Error: Input not sent: a command is still on its way into session s, and until it has started, input can reach the shell in front instead of the command\. Send it again in a moment: the refusal ends when the command starts, ends or is given up, or after two seconds in which the server has typed no line and read no marker\. To interrupt it, use sendSignal with SIGINT, its default, which isn't refused\.$/;
+const refusal = /^Error: Input not sent: a command is still on its way into session s, and until it has started, input can reach the shell in front instead of the command\. Send it again in a moment: the refusal ends when the command starts, ends or is given up, or after two seconds in which the server has typed no line and read no marker\. To interrupt it, use sendSignal with SIGINT, its default, or send the C-c key alone, neither of which is refused\.$/;
 const queue = (session, nonce, command, resolve = () => {}) =>
   session.commandQueue.push({ command, nonce, resolve, startTime: Date.now(), timeout: 60000 });
 
@@ -1021,13 +1021,14 @@ test("a marked command whose line the ^C discarded never answers: its own timeou
   }
 });
 
-test("a Ctrl-C sent with sendInput, as the C-c key or a ^C in its text, is refused while a body goes in, and once the refusal has lapsed it gives the body up as sendSignal's SIGINT does", (t) => {
+test("a lone ^C sent with sendInput, as the C-c key or a terminal's Ctrl+C keystroke, isn't refused while a body goes in: it gives the body up at once, as sendSignal's SIGINT does", (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
-  // The C-c key writes '\x03' alone, as the GUI's terminal does for a Ctrl+C
-  // keystroke; text holding a ^C gets the default Enter after it.
-  for (const [form, args, data] of [
-    ['the C-c key', ['', false, ['C-c']], '\x03'],
-    ['a ^C in its text', ['x\x03'], 'x\x03\r'],
+  // The C-c key writes '\x03' alone, and so does the GUI's terminal for a
+  // Ctrl+C keystroke (its 'input' handler sends the keystroke's data with no
+  // Enter).
+  for (const [form, args] of [
+    ['the C-c key', ['', false, ['C-c']]],
+    ["a terminal's keystroke", ['\x03', false]],
   ]) {
     const written = [];
     const results = [];
@@ -1036,13 +1037,10 @@ test("a Ctrl-C sent with sendInput, as the C-c key or a ^C in its text, is refus
       queue(session, 'n1', `echo one # ${'z'.repeat(1500)}`, (r) => results.push(r));
       server.processCommandQueue(session);
       scan(server, session, '<<<NOFILE:n1>>>\r\n');
-      assert.match(written.at(-1), /__tsm_n1_b=/, `${form}: n1's first line`);
-      assert.throws(() => server.sendInput('s', ...args), refusal, `${form}: refused while the body goes in`);
-      t.mock.timers.tick(2000); // the body's lines stall: nothing typed or read for two seconds
+      assert.match(written.at(-1), /__tsm_n1_b=/, `${form}: n1's first line, with the rest still to type`);
       const before = written.length;
       server.sendInput('s', ...args);
-      assert.equal(written.length, before + 1, form);
-      assert.equal(written.at(-1), data, `${form}: the ^C, and nothing typed for the body before it`);
+      assert.deepEqual(written.slice(before), ['\x03'], `${form}: the ^C, and nothing typed for the body before it`);
       assert.deepEqual(results.map((r) => [r.exitCode, r.output]), [[-1, INTERRUPTED_BODY]], form);
       assert.deepEqual(session.inlineQueue, [], form);
       scan(server, session, '<<<PIECE:n1:0>>>\r\n');
@@ -1051,6 +1049,32 @@ test("a Ctrl-C sent with sendInput, as the C-c key or a ^C in its text, is refus
       for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
       clearTimeout(session.currentTimeout);
     }
+  }
+});
+
+test('input holding a ^C among other characters is refused while a body goes in, sending nothing and giving nothing up, and once the refusal has lapsed it gives the body up', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const written = [];
+  const results = [];
+  const { server, session } = inputServer(written);
+  try {
+    queue(session, 'n1', `echo one # ${'z'.repeat(1500)}`, (r) => results.push(r));
+    server.processCommandQueue(session);
+    scan(server, session, '<<<NOFILE:n1>>>\r\n');
+    assert.match(written.at(-1), /__tsm_n1_b=/, "n1's first line");
+    const before = written.length;
+    assert.throws(() => server.sendInput('s', 'x\x03'), refusal, 'refused while the body goes in');
+    assert.equal(written.length, before, 'nothing sent');
+    assert.deepEqual(results, [], 'nothing answered');
+    assert.deepEqual(session.inlineQueue, ['n1'], "n1's body still goes in");
+    t.mock.timers.tick(2000); // the body's lines stall: nothing typed or read for two seconds
+    server.sendInput('s', 'x\x03');
+    assert.deepEqual(written.slice(before), ['x\x03\r'], 'the input, with its Enter, and nothing typed for the body before it');
+    assert.deepEqual(results.map((r) => [r.exitCode, r.output]), [[-1, INTERRUPTED_BODY]]);
+    assert.deepEqual(session.inlineQueue, []);
+  } finally {
+    for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+    clearTimeout(session.currentTimeout);
   }
 });
 

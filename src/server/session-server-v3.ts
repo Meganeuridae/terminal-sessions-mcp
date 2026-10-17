@@ -99,7 +99,8 @@ interface SessionInfo {
   // instead of the command: a shell that can't read the temp file reads
   // input typed after the probe line, or between the lines of the body typed
   // for it, as part of its own command lines. So sendInput refuses input
-  // meanwhile, as it does while any body goes in (see typingHolds).
+  // other than a lone ^C meanwhile, as it does while any body goes in (see
+  // typingHolds).
   typingFor?: string;
   // When the server last typed a line for a command (see typeLine) or acted
   // on a marker (see actOnMarker). Input written by sendInput doesn't count.
@@ -747,21 +748,22 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * Before a ^C is written (sendSignal's SIGINT, or a C-c sent with
-   * sendInput), give up the commands on their way in that can't have
-   * started: a body going in with lines left and the bodies waiting their
-   * turn (inlineQueue), since a body's last line is what runs it, and a held
-   * probe line, which is then never typed. Over a link, a ^C typed while a
-   * body goes in mostly reaches the shell at its prompt between two lines and
-   * takes nothing with it, and the server would type the rest and run it.
-   * These are the inline form of the typeahead a ^C discards. Every other
-   * command that hasn't started is marked (interruptedProbes). A mark acts
-   * only at a no-file marker: it gives up a command whose shell then asks
-   * for its body, and does nothing for one whose body is typed in whole
-   * already. A body whose lines are all typed may be running, and is left to
-   * the ^C. Commands still in the server's queue have no line typed
-   * and aren't touched: they go in after the ^C. Returns the reason the
-   * current command is to be answered with, if it was given up.
+   * Before a ^C is written (sendSignal's SIGINT, or input holding a ^C sent
+   * with sendInput: the C-c key, or a ^C in its text), give up the commands
+   * on their way in that can't have started: a body going in with lines left
+   * and the bodies waiting their turn (inlineQueue), since a body's last line
+   * is what runs it, and a held probe line, which is then never typed. Over a
+   * link, a ^C typed while a body goes in mostly reaches the shell at its
+   * prompt between two lines and takes nothing with it, and the server would
+   * type the rest and run it. These are the inline form of the typeahead a ^C
+   * discards. Every other command whose line is typed and that hasn't started
+   * is marked (interruptedProbes). A mark acts only at a no-file marker: it
+   * gives up a command whose shell then asks for its body, and does nothing
+   * for one whose body is typed in whole already. A body whose lines are all
+   * typed may be running, and is left to the ^C. Commands still in the
+   * server's queue have no line typed and aren't touched: they go in after
+   * the ^C. Returns the reason the current command is to be answered with, if
+   * it was given up.
    */
   private interruptTyping(session: SessionInfo): string | undefined {
     const given: GivenUp = {};
@@ -1565,24 +1567,29 @@ export class PersistentSessionServer extends EventEmitter {
    * command until it starts, ends or is given up, and a body going in for a
    * shell that can't read the temp file, which starts only once it is all in
    * and reads input sent before then itself. The caller sends it again in a
-   * moment. Input holding a ^C, as the C-c key or in its text, first gives up
-   * the commands still being typed in, as sendSignal's SIGINT does (see
-   * interruptTyping).
+   * moment. A lone ^C, as the C-c key or a terminal's Ctrl+C keystroke writes
+   * it, isn't refused: like sendSignal's SIGINT, it first gives up the
+   * commands still being typed in (see interruptTyping). Input holding a ^C
+   * among other characters does that too, once it's accepted.
    */
   sendInput(sessionId: string, input: string, appendNewline?: boolean, keys?: string[]): void {
     const session = this.sessions.get(sessionId);
     if (!session || !session.isAlive) {
       throw new Error(`Session ${sessionId} not available`);
     }
-    if (this.typingHolds(session)) {
+    const dataToSend = buildInputData(input, appendNewline, keys);
+    // A lone ^C is an interrupt, as sendSignal's SIGINT is, and isn't refused
+    // either: it gives up what's on its way in before it's written. Other input
+    // is what the refusal keeps from reaching the shell in front.
+    if (dataToSend !== '\x03' && this.typingHolds(session)) {
       throw new Error(`Input not sent: a command is still on its way into session ${sessionId}, ` +
         `and until it has started, input can reach the shell in front instead of the command. ` +
         `Send it again in a moment: the refusal ends when the command starts, ends or is given up, ` +
         `or after two seconds in which the server has typed no line and read no marker. ` +
-        `To interrupt it, use sendSignal with SIGINT, its default, which isn't refused.`);
+        `To interrupt it, use sendSignal with SIGINT, its default, or send the C-c key alone, ` +
+        `neither of which is refused.`);
     }
 
-    const dataToSend = buildInputData(input, appendNewline, keys);
     // A ^C is the same event whichever call writes it (see sendSignal).
     const givenUp = dataToSend.includes('\x03') ? this.interruptTyping(session) : undefined;
     session.shell.write(dataToSend);

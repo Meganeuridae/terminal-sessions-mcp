@@ -95,7 +95,7 @@ const TOOLS = {
     }
   },
   sendInput: {
-    description: 'Send input to an interactive session. Text is sent verbatim; use `keys` for special keys (Enter, C-c for Ctrl+C, arrows, ...) since raw control characters cannot pass through the JSON layer. Refused, with nothing sent, while a command is still on its way in, since until it has started, the shell in front could read the input instead of the command. The refusal ends when the command starts, ends or is given up, or after two seconds in which the server has typed no line and read no marker, as when a program took the command\'s line or a busy shell hasn\'t read it yet; that lapse doesn\'t mean the command has started. Send refused input again in a moment. To interrupt a command, use sendSignal with SIGINT, its default, which isn\'t refused; a C-c sent here once input is accepted does the same.',
+    description: 'Send input to an interactive session. Text is sent verbatim; use `keys` for special keys (Enter, C-c for Ctrl+C, arrows, ...) since raw control characters cannot pass through the JSON layer. Refused, with nothing sent, while a command is still on its way in, since until it has started, the shell in front could read the input instead of the command. The refusal ends when the command starts, ends or is given up, or after two seconds in which the server has typed no line and read no marker, as when a program took the command\'s line or a busy shell hasn\'t read it yet; that lapse doesn\'t mean the command has started. Send refused input again in a moment. To interrupt a command, use sendSignal with SIGINT, its default, or send the C-c key alone here: neither is refused, and both give up the commands still being typed in before the Ctrl+C. A ^C in the text among other characters does the same once input is accepted.',
     parameters: {
       type: 'object',
       properties: {
@@ -112,7 +112,7 @@ const TOOLS = {
     }
   },
   sendSignal: {
-    description: 'Send a signal to a session. SIGINT, the default, is sent as Ctrl+C; other signals go to the session\'s shell itself. SIGINT first gives up any command whose body is still being typed in, or waits its turn to be, and a command held back behind them, so these never run. A command whose line is already typed is given up only if its shell turns out to need its body typed. Otherwise the Ctrl+C reaches it if its shell had already read its line; a line still waiting is discarded with the Ctrl+C, and its command never runs, unless `stty noflsh` keeps the line, and then the command runs after the Ctrl+C, to its end.',
+    description: 'Send a signal to a session. SIGINT, the default, is sent as Ctrl+C; other signals go to the session\'s shell itself. SIGINT first gives up any command whose body is still being typed in, or waits its turn to be, and a command held back behind them, so these never run. A command whose line is already typed is given up only if its shell turns out to need its body typed. Otherwise the Ctrl+C reaches it if its shell had already read its line; a line still waiting is discarded with the Ctrl+C, and its command never runs, unless `stty noflsh` keeps the line, which is then read after the Ctrl+C as any line typed ahead is, so its command can still run, and its caller gets the result or its timeout\'s -1, whichever comes first.',
     parameters: {
       type: 'object',
       properties: {
