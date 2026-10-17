@@ -20,6 +20,10 @@
     <string>--port</string><string>3101</string>
   </array>
   <key>Umask</key><integer>63</integer>
+  <!-- launchd starts agents with a soft limit of 256 open files; a session costs about five
+       (pty, journal, key file), so new sessions would fail near 45. -->
+  <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>65536</integer></dict>
+  <key>HardResourceLimits</key><dict><key>NumberOfFiles</key><integer>65536</integer></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>

@@ -156,6 +156,17 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   needs the keeper backend (milestone 3).
 - **Supervision.** `next/config/com.animalabs.termd.plist` (launchd), `next/config/termd.service`
   (systemd). SIGTERM ends sessions cleanly.
+- **Limits and memory.** A session costs about five open files and, idle, about 0.3 MB in
+  the daemon plus its shell (about 4 MB); a busy session holds up to 8 MiB of recent history
+  in memory (`memoryBytes`) and the rest on disk. The daemon itself is about 170 MB. The
+  shipped units raise the open-file limit to 65536 (launchd's default of 256 would end new
+  sessions near 45), and the launcher raises it where a supervisor didn't. Everything a
+  session runs is the daemon's descendant: under systemd, the unit sets `OOMPolicy=continue`
+  so a build the kernel kills for memory costs that Run, not every session (the default
+  stops the whole service), and on Linux the shells start with a raised `oom_score_adj`, so
+  the kernel takes one of them before the daemon. History on disk is kept forever unless
+  `--retention-days` or `--retention-bytes` says otherwise; a long-lived deployment should
+  set one.
 - **Measure.** Every tool call is recorded (names and hashes, never contents) in
   `~/.tsm/usage.jsonl`; `tsm usage` reports per-tool use, errors and confusion signatures.
 

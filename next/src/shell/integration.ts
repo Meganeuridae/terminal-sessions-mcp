@@ -58,8 +58,14 @@ export function prepareIntegration(shellPath: string, opts: PrepareOptions = {})
   const env: Record<string, string> = {};
   const launcher = path.join(dir, 'launch.sh');
   // No shell config, external command or exported variable sees the key. exec keeps
-  // the PID, and each shell consumes only the private file for its own PID.
-  fs.writeFileSync(launcher, `umask 077\ncommand printf '%s\\n' '${key}' > "\${0%/*}/key-$$" || exit 1\nexec "$@"\n`, { mode: 0o600 });
+  // the PID, and each shell consumes only the private file for its own PID. On Linux the
+  // shell, and so everything a session runs, is made a likelier victim of the kernel's
+  // out-of-memory killer than the daemon (a build's peak then costs that Run, not every
+  // session); raising one's own oom_score_adj needs no privilege, and /proc is Linux's.
+  fs.writeFileSync(launcher,
+    `umask 077\ncommand printf '%s\\n' '${key}' > "\${0%/*}/key-$$" || exit 1\n` +
+    `if [ -w /proc/self/oom_score_adj ]; then echo 500 > /proc/self/oom_score_adj 2>/dev/null || :; fi\n` +
+    `exec "$@"\n`, { mode: 0o600 });
   if (opts.noUserRc) env.TSM_NO_USER_RC = '1';
   const files = { 'bash-rc.sh': BASH_RC, '.zshenv': ZSH_ZSHENV, '.zprofile': ZSH_ZPROFILE, '.zshrc': ZSH_ZSHRC, '.zlogin': ZSH_ZLOGIN, 'fish/vendor_conf.d/tsm-integration.fish': FISH_CONF };
   for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), text, { mode: 0o600 });

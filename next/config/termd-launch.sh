@@ -15,6 +15,17 @@ umask 077
 : "${HOME:?HOME is not set}"
 cd "$HOME"
 
+# A session costs about five open files (pty, journal, key file). A supervisor that didn't
+# raise the soft limit (launchd's default is 256, many systems' 1024) would end new sessions
+# early; raise it to the hard limit, up to 65536, where that is allowed.
+soft=$(ulimit -Sn 2>/dev/null || echo 0)
+hard=$(ulimit -Hn 2>/dev/null || echo 0)
+if [ "$soft" != unlimited ] && [ "${soft:-0}" -lt 65536 ] 2>/dev/null; then
+  want=65536
+  if [ "$hard" != unlimited ] && [ "${hard:-0}" -lt 65536 ] 2>/dev/null; then want=$hard; fi
+  ulimit -Sn "$want" 2>/dev/null || true
+fi
+
 # Prepended in reverse, so a version manager the user chose wins, then Homebrew, then /usr/local.
 for d in /usr/local/bin /opt/homebrew/sbin /opt/homebrew/bin "$HOME/.local/bin" "$HOME/.nvm/current/bin" "$HOME/.volta/bin"; do
   case ":$PATH:" in

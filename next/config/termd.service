@@ -12,6 +12,17 @@ ExecStart=/bin/sh PACKAGE/next/config/termd-launch.sh --port 3101
 WorkingDirectory=%h
 UMask=0077
 Restart=on-failure
+# Each session costs about five file descriptors (pty, journal, key file); the default
+# soft limit of 1024 would end new sessions near 200.
+LimitNOFILE=65536
+# The sessions' shells and everything they run (builds, test suites) are in this service's
+# cgroup. When the kernel kills one of them for memory, systemd's default (OOMPolicy=stop)
+# stops the whole service: every live session is lost for one build's peak. With continue,
+# termd keeps serving and that one Run reports its process killed. On Linux the shells are
+# started with a raised oom_score_adj, so the kernel takes one of them before termd.
+OOMPolicy=continue
+# History on disk is kept forever by default. For a long-lived deployment, cap it:
+#   ExecStart=... --retention-days 30          (or --retention-bytes 200000000 per session)
 # SIGTERM to termd alone: it drains its sessions (Runs end with reason daemon-shutdown) and
 # kills what they left; only what survives that is killed when the stop times out.
 KillMode=mixed
