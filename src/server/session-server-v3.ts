@@ -93,6 +93,17 @@ interface SessionInfo {
   // This session's commands' markers recognized whose line hasn't ended yet,
   // in the order printed, each kind and nonce once.
   awaitingMarkers: Marker[];
+  // The latest command whose probe line the server has typed or holds, until
+  // it starts (its start or exit marker) or is given up (see dropUntyped).
+  // Until then, input written to the terminal can reach the shell in front
+  // instead of the command: a shell that can't read the temp file reads
+  // input typed after the probe line, or between the lines of the body typed
+  // for it, as part of its own command lines. So sendInput refuses input
+  // meanwhile (see typingHolds).
+  typingFor?: string;
+  // When the server last typed a line for a command (see typeLine) or acted
+  // on a marker (see actOnMarker). Input written by sendInput doesn't count.
+  typingProgressAt: number;
 }
 
 // A start, exit, no-file, gone or piece marker the shell printed (see
@@ -321,7 +332,10 @@ const INLINE_PIECES_MAX = 128;
  * is what shows the body stuck (see releaseStuckInline), and the commands
  * behind it keep their order. Over a link whose round trip is longer than
  * this, the probe is typed between the body's lines, the case the hold is
- * there to avoid.
+ * there to avoid. sendInput's refusal of input before the last command has
+ * started lapses after the same time with nothing typed or read for a
+ * command (see typingHolds), and over such a link it lapses between the
+ * body's lines too.
  */
 const HELD_PROBE_MAX_MS = 2000;
 
@@ -401,7 +415,8 @@ export class PersistentSessionServer extends EventEmitter {
       typedCount: 0,
       lineSeq: new Map(),
       scanCarry: '',
-      awaitingMarkers: []
+      awaitingMarkers: [],
+      typingProgressAt: 0
     };
 
     // Handle output
@@ -672,6 +687,7 @@ export class PersistentSessionServer extends EventEmitter {
     // shell ssh opened, which can't read this machine's files.
     session.unfinished.set(currentCommand.nonce, false);
     const probe = this.probeLine(currentCommand.nonce, quotedPath);
+    session.typingFor = currentCommand.nonce;
     if (this.bodyGoingIn(session)) {
       currentCommand.probe = probe; // held: see typeHeldProbe
       this.armHeldProbe(session);
@@ -696,6 +712,18 @@ export class PersistentSessionServer extends EventEmitter {
   private bodyGoingIn(session: SessionInfo): boolean {
     const head = session.inlineQueue[0];
     return head !== undefined && session.typedInline.has(head);
+  }
+
+  /**
+   * Is the session's latest command still on its way in (typingFor), with
+   * the server's typing still moving: a line typed for any command, or a
+   * marker acted on, within HELD_PROBE_MAX_MS? Input written then can reach
+   * the shell in front instead of the command, so sendInput refuses it. A
+   * probe line that something other than a shell took, which never answers,
+   * stops refusing input after that long.
+   */
+  private typingHolds(session: SessionInfo): boolean {
+    return session.typingFor !== undefined && Date.now() - session.typingProgressAt < HELD_PROBE_MAX_MS;
   }
 
   /**
@@ -1006,6 +1034,7 @@ export class PersistentSessionServer extends EventEmitter {
    */
   private actOnMarker(session: SessionInfo, marker: Marker): void {
     const given: GivenUp = {};
+    session.typingProgressAt = Date.now();
     this.handleMarker(session, marker, given);
     this.advanceInline(session);
     this.typeHeldProbe(session);
@@ -1017,6 +1046,7 @@ export class PersistentSessionServer extends EventEmitter {
     const { nonce } = marker;
     if (marker.kind === 'start') {
       if (current && nonce === current.nonce) current.started = true;
+      if (nonce === session.typingFor) delete session.typingFor;
       if (session.unfinished.has(nonce)) session.unfinished.set(nonce, true);
       // The shell read on to this command's line, so every earlier line it had
       // was read too: the earlier files go, and a body among them still
@@ -1067,6 +1097,7 @@ export class PersistentSessionServer extends EventEmitter {
       this.removeTempFile(file);
     }
     this.releaseInline(session, nonce); // in case its start marker was lost
+    if (nonce === session.typingFor) delete session.typingFor; // so it started too
     const endsCurrent = session.unfinished.has(nonce) && this.finishUnfinished(session, nonce);
     if (current && (nonce === current.nonce || endsCurrent)) {
       current.started = true; // an exit marker implies the start, even if a trimmed buffer lost it
@@ -1179,6 +1210,7 @@ export class PersistentSessionServer extends EventEmitter {
    */
   private typeLine(session: SessionInfo, nonce: string, line: string): void {
     session.lineSeq.set(nonce, ++session.typedCount);
+    session.typingProgressAt = Date.now();
     session.shell.write(line + '\n');
   }
 
@@ -1261,6 +1293,7 @@ export class PersistentSessionServer extends EventEmitter {
     session.unfinished.delete(nonce);
     session.inlinePieces.delete(nonce);
     session.typedInline.delete(nonce);
+    if (session.typingFor === nonce) delete session.typingFor;
     this.addLog(session, reason);
     if (session.currentCommand?.nonce === nonce) given.current = reason;
     this.releaseInline(session, nonce);
@@ -1463,11 +1496,22 @@ export class PersistentSessionServer extends EventEmitter {
    * @param keys    Optional named keys sent after the text, tmux send-keys
    *   style: Enter, Tab, Esc, Up/Down/Left/Right, Backspace, C-c, M-x, F1...
    *   See src/server/keys.ts for decoding.
+   *
+   * Throws, writing nothing, while the session's last command hasn't started
+   * and the server's typing is still moving (see typingHolds). A command
+   * typed inline, for a shell that can't read the temp file, starts only once
+   * its body is in, and that shell reads input sent before then itself. The
+   * caller sends it again once the command has started.
    */
   sendInput(sessionId: string, input: string, appendNewline?: boolean, keys?: string[]): void {
     const session = this.sessions.get(sessionId);
     if (!session || !session.isAlive) {
       throw new Error(`Session ${sessionId} not available`);
+    }
+    if (this.typingHolds(session)) {
+      throw new Error(`Input not sent: session ${sessionId}'s last command hasn't started yet, ` +
+        `and until it has, input can reach the shell in front instead of the command. ` +
+        `Send it again once the command has started.`);
     }
 
     const dataToSend = buildInputData(input, appendNewline, keys);

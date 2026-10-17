@@ -276,6 +276,12 @@ correct for both canonical-mode shells and raw-mode TUIs). It defaults to
 **true** when `keys` is absent, and **false** when `keys` is given (the caller
 controls the exact bytes; pass `appendNewline: true` explicitly to add Enter).
 
+Until the session's last command has started, `sendInput` refuses input and
+sends nothing, since the shell in front could read it instead of the command;
+send it again once the command has started. The refusal also ends after two
+seconds in which the server has typed no line and read no marker, as when a
+program rather than a shell took the command's line.
+
 ### Log Operations
 - **tailLogs** - Get recent logs from a session
 - **searchLogs** - Search logs with regex patterns and context

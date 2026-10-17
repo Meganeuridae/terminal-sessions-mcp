@@ -631,6 +631,36 @@ test("a command that times out while its body is still going in pieces goes in t
   }
 });
 
+test("input sent before a command typed in for a shell that can't read the temp file has started is refused, and once the command has started it answers the command", async () => {
+  const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
+  const rc = path.join(os.tmpdir(), `tsm-test-rc4-${process.pid}`);
+  fs.writeFileSync(rc, '.() { echo "bash: $1: No such file or directory" >&2; return 1; }\n' +
+    '[() { if builtin test "$1" = -r; then return 1; fi; builtin [ "$@"; }\nPS1="NESTED> "\n');
+  try {
+    await server.createSession('t-input', { cwd: '/' });
+    const nested = waitForOutput('t-input', 'NESTED> ');
+    assert.strictEqual((await server.execCommand('t-input', `bash --rcfile '${rc}'`, 500)).exitCode, -1);
+    await nested;
+    // About 22 lines, each typed a round trip after the one before, so the
+    // command can't have started when runCommand returns with -1.
+    const long = await server.execCommand('t-input', `echo STARTED; x='${'y'.repeat(20000)}'; read -r a; echo "got=$a len=\${#x}"`, -1);
+    assert.strictEqual(long.exitCode, -1);
+    assert.throws(() => server.sendInput('t-input', 'hello'),
+      /^Error: Input not sent: session t-input's last command hasn't started yet/);
+    const out = () => server.getOutput('t-input').map((l) => cleanTerminalOutput(l).trim());
+    const deadline = Date.now() + 20000;
+    while (!out().includes('STARTED') && Date.now() < deadline) await sleep(20);
+    assert.ok(out().includes('STARTED'), 'the command started');
+    server.sendInput('t-input', 'hello');
+    while (!out().some((l) => l.startsWith('got=')) && Date.now() < deadline) await sleep(20);
+    assert.deepStrictEqual(out().filter((l) => l.startsWith('got=')), ['got=hello len=20000'], 'the input reached the command whole');
+    assert.ok(!out().some((l) => l.includes('command not found')), 'no input ran as a command of its own');
+    assert.strictEqual((await server.execCommand('t-input', 'exit', 8000)).exitCode, 0);
+  } finally {
+    fs.rmSync(rc, { force: true });
+  }
+});
+
 test('a nested shell that can read the temp files runs each command from its file, so a long body is never typed', async () => {
   const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
   await server.createSession('t-local-nested', { cwd: '/' });

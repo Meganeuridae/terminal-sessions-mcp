@@ -69,7 +69,7 @@ const TOOLS = {
         session: { type: 'string', description: 'Session name (will be created automatically if it does not exist)' },
         command: { type: 'string' },
         cwd: { type: 'string', description: 'Working directory (used when auto-creating a new session)' },
-        timeout: { type: 'number', description: 'Command timeout in ms (default: 30000). Use -1 to return immediately without waiting. A timed-out command, one still being typed in included, goes on to run (exitCode -1 in the result) unless its body is given up, which the session log says, and commands sent meanwhile are typed in behind it: they run when it ends, or become its input if it reads any. Where the shell in front can\'t read this machine\'s temp files, a long command goes in a line at a time, and the round trips count against its timeout. Use tailLogs to check on a running command, sendInput to answer it, or sendSignal with SIGINT (the default) to interrupt it, which also discards the commands typed in behind it unless `stty noflsh` is set; other signals go to the session\'s shell itself.' },
+        timeout: { type: 'number', description: 'Command timeout in ms (default: 30000). Use -1 to return immediately without waiting. A timed-out command, one still being typed in included, goes on to run (exitCode -1 in the result) unless its body is given up, which the session log says, and commands sent meanwhile are typed in behind it: they run when it ends, or become its input if it reads any. Where the shell in front can\'t read this machine\'s temp files, a long command goes in a line at a time, and the round trips count against its timeout. Use tailLogs to check on a running command, sendInput to answer it once it has started (until then sendInput refuses input, which the shell in front could read instead, so input sent straight after a return with -1 may need sending again), or sendSignal with SIGINT (the default) to interrupt it, which also discards the commands typed in behind it unless `stty noflsh` is set; other signals go to the session\'s shell itself.' },
         raw: { type: 'boolean', description: 'If true, preserve raw ANSI escape codes in output (default: false, returns clean text)' }
       },
       required: ['session', 'command']
@@ -95,7 +95,7 @@ const TOOLS = {
     }
   },
   sendInput: {
-    description: 'Send input to an interactive session. Text is sent verbatim; use `keys` for special keys (Enter, Ctrl+C, arrows, ...) since raw control characters cannot pass through the JSON layer.',
+    description: 'Send input to an interactive session. Text is sent verbatim; use `keys` for special keys (Enter, Ctrl+C, arrows, ...) since raw control characters cannot pass through the JSON layer. Refused, with nothing sent, while the session\'s last command hasn\'t started, since until then the shell in front could read the input instead of the command; send it again once the command has started.',
     parameters: {
       type: 'object',
       properties: {

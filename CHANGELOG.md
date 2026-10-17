@@ -140,12 +140,23 @@
   that times out (exitCode -1) simply keeps running in the session, and
   commands sent meanwhile are typed in behind it: they run when it ends, or
   become its input if it reads any, and a shell it started, such as ssh's,
-  runs them. Check on it with `tailLogs`, answer it with `sendInput`, or
+  runs them. Check on it with `tailLogs`, answer it with `sendInput` once it
+  has started (see below), or
   interrupt it with `sendSignal` (SIGINT, the default, sent as Ctrl-C, which
   under the terminal's default settings also discards the commands typed in
   behind it, and with `stty noflsh` keeps them, so they can still run after
   it; other signals go to the session's shell itself).
   The `runCommand` tool's `timeout` parameter documents this.
+- **`sendInput` refuses input until the session's last command has
+  started.** A command for a shell that can't read the temp file starts only
+  once its body has been typed in (see above), and that shell would read
+  input sent before then as part of its own command lines. So `sendInput`
+  sends nothing and throws until the last command's start marker comes, or
+  until two seconds pass in which the server has typed no line and read no
+  marker. With a shell that reads the temp file and waits at its prompt, the
+  refusal lasts the probe line's round trip, so a `sendInput` sent straight
+  after `runCommand` with a timeout of -1 can be refused where 1.6.0 sent
+  it: send it again once the command has started.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
 - Shell history records each command's typed line (a check that the shell

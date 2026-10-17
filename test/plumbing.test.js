@@ -666,6 +666,145 @@ test("a body's first line, typed at its turn, restarts the held probe's wait as 
   }
 });
 
+/** A bare server and session for sendInput's refusal: the session is 's'. */
+function inputServer(written) {
+  const server = bareServer();
+  server.notify = () => {};
+  server.emit = () => true;
+  const session = holdSession(written);
+  session.typingProgressAt = 0;
+  server.sessions = new Map([['s', session]]);
+  return { server, session };
+}
+const refusal = /^Error: Input not sent: session s's last command hasn't started yet, and until it has, input can reach the shell in front instead of the command\. Send it again once the command has started\.$/;
+const queue = (session, nonce, command, resolve = () => {}) =>
+  session.commandQueue.push({ command, nonce, resolve, startTime: Date.now(), timeout: 60000 });
+
+test("sendInput refuses input, sending nothing, from the moment the last command's probe line is typed or held until that command starts", (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const written = [];
+  const { server, session } = inputServer(written);
+  try {
+    server.sendInput('s', 'idle');
+    assert.deepEqual(written, ['idle\r'], 'nothing written for a command yet: sent');
+    queue(session, 'n1', 'echo one');
+    server.processCommandQueue(session);
+    assert.equal(written.length, 2, "n1's probe line");
+    assert.throws(() => server.sendInput('s', 'early'), refusal);
+    assert.equal(written.length, 2, 'nothing was sent');
+    scan(server, session, '<<<START:n1>>>\r\n');
+    server.sendInput('s', 'answer');
+    assert.equal(written[2], 'answer\r', 'sent once n1 started');
+    // An exit marker ends the refusal too, as when a trimmed buffer lost the start marker.
+    clearTimeout(session.currentTimeout);
+    session.currentCommand = undefined;
+    session.isProcessingCommand = false;
+    queue(session, 'n2', 'echo two');
+    server.processCommandQueue(session);
+    assert.throws(() => server.sendInput('s', 'early'), refusal);
+    scan(server, session, '<<<EXIT:n2:0>>>\r\n');
+    server.sendInput('s', 'after exit');
+    assert.equal(written.at(-1), 'after exit\r');
+    // A probe line held while a body goes in: refused from the hold, still
+    // refused once the body starts and the held line is typed, and sent once
+    // the held command starts.
+    pendingFile(session, 'nb', `echo b # ${'z'.repeat(1500)}\n`);
+    scan(server, session, '<<<NOFILE:nb>>>\r\n');
+    queue(session, 'n3', 'echo three');
+    server.processCommandQueue(session);
+    assert.ok(session.currentCommand.probe !== undefined, "n3's probe line is held while nb goes in");
+    assert.throws(() => server.sendInput('s', 'early'), refusal);
+    scan(server, session, '<<<PIECE:nb:0>>>\r\n');
+    scan(server, session, '<<<START:nb>>>\r\n');
+    assert.match(written.at(-1), /^if \[ -r '/, "n3's probe line, typed on nb's start marker");
+    assert.throws(() => server.sendInput('s', 'early'), refusal, 'nb started, but n3, the last command, has not');
+    scan(server, session, '<<<START:n3>>>\r\n');
+    server.sendInput('s', 'answer');
+    assert.equal(written.at(-1), 'answer\r');
+  } finally {
+    for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+    clearTimeout(session.currentTimeout);
+  }
+});
+
+test("the refusal lapses two seconds after the server last typed a line or read a marker, and input sent then doesn't restart it", (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const written = [];
+  const { server, session } = inputServer(written);
+  try {
+    t.mock.timers.tick(10000); // the session sat idle: only what comes after counts
+    // A long body, so that its no-file marker types a line.
+    queue(session, 'n1', `echo one # ${'z'.repeat(1500)}`);
+    server.processCommandQueue(session);
+    assert.equal(written.length, 1, "n1's probe line, which nothing answers");
+    t.mock.timers.tick(1999);
+    assert.throws(() => server.sendInput('s', 'early'), refusal, '1,999 ms after the probe line');
+    t.mock.timers.tick(1);
+    server.sendInput('s', 'to whatever took it');
+    server.sendInput('s', 'and again');
+    assert.deepEqual(written.slice(1), ['to whatever took it\r', 'and again\r'], "sent from 2,000 ms on, and sendInput's own writes don't restart the wait");
+    scan(server, session, '<<<NOFILE:n1>>>\r\n');
+    assert.match(written.at(-1), /__tsm_n1_b=/, "n1's first body line");
+    assert.throws(() => server.sendInput('s', 'early'), refusal, 'the marker and the line typed for it restart the wait');
+  } finally {
+    for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+    clearTimeout(session.currentTimeout);
+  }
+});
+
+test('a marker restarts the wait even when it types nothing, as when an earlier command ends and the shell goes on to the last one', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const written = [];
+  const { server, session } = inputServer(written);
+  try {
+    queue(session, 'n1', 'sleep 5');
+    server.processCommandQueue(session);
+    scan(server, session, '<<<START:n1>>>\r\n');
+    t.mock.timers.tick(60000); // n1 times out, still running: n2's probe line waits in the tty behind it
+    queue(session, 'n2', 'echo two');
+    server.processCommandQueue(session);
+    assert.match(written.at(-1), /^if \[ -r '/, "n2's probe line");
+    t.mock.timers.tick(2000);
+    server.sendInput('s', 'to n1');
+    assert.equal(written.at(-1), 'to n1\r', 'two seconds with nothing typed or read: sent');
+    scan(server, session, '<<<EXIT:n1:0>>>\r\n');
+    assert.throws(() => server.sendInput('s', 'early'), refusal, "n1's exit marker: the shell goes on to n2's line");
+    scan(server, session, '<<<START:n2>>>\r\n');
+    server.sendInput('s', 'to n2');
+    assert.equal(written.at(-1), 'to n2\r');
+  } finally {
+    for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+    clearTimeout(session.currentTimeout);
+  }
+});
+
+test('a command given up before it starts ends the refusal at once: a body whose line reached another shell, and one too long to type', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const written = [];
+  const results = [];
+  const { server, session } = inputServer(written);
+  try {
+    queue(session, 'n1', `echo one # ${'z'.repeat(1500)}`, (r) => results.push(r));
+    server.processCommandQueue(session);
+    scan(server, session, '<<<NOFILE:n1>>>\r\n');
+    assert.throws(() => server.sendInput('s', 'early'), refusal, "n1's body going in");
+    scan(server, session, '<<<GONE:n1>>>\r\n');
+    assert.match(results.at(-1).output, /^\[command not run: a line of its body reached a shell other than/);
+    server.sendInput('s', 'after gone');
+    assert.equal(written.at(-1), 'after gone\r', 'sent with no time passing');
+    queue(session, 'n2', `echo ${'x'.repeat(130000)}`, (r) => results.push(r));
+    server.processCommandQueue(session);
+    assert.throws(() => server.sendInput('s', 'early'), refusal);
+    scan(server, session, '<<<NOFILE:n2>>>\r\n');
+    assert.match(results.at(-1).output, /^\[command not run: the shell in front can't read this machine's temp files, and typed in, this command would take more than 128 lines/);
+    server.sendInput('s', 'after too long');
+    assert.equal(written.at(-1), 'after too long\r');
+  } finally {
+    for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+    clearTimeout(session.currentTimeout);
+  }
+});
+
 test('the 128-line cap at its edge: a body that takes exactly 128 lines is typed, each at most 1,000 bytes with a three-digit index and a six-digit length, and sh runs it; one character more is refused', () => {
   const { execFileSync } = require('node:child_process');
   const server = bareServer();
