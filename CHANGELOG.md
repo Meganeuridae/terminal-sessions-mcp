@@ -74,9 +74,16 @@
   up then, the log says so, and the ones behind it go on. Typing takes a
   round trip per line, which counts against the command's timeout; a body
   still going in when its timeout passes is typed to its end and then runs,
-  as a timed-out command keeps running. 1.6.0 typed a
+  as a timed-out command keeps running, and the next command's line waits
+  until it is in (or until the body has made no progress for two seconds,
+  or that command's own timeout), since a line typed into a line editor
+  that is still handling a long one can leave it redrawing instead of
+  reading. 1.6.0 typed a
   single-line command of any length as one line, which a shell could cut
-  short. A body that would take more than 128 lines (about 100 KB) isn't
+  short. A body that would take more than 128 lines (about 100 KB of ASCII
+  text; a byte at or above 0x7f, a quote, a `!` or a control byte takes five
+  characters escaped, so text that is mostly non-ASCII reaches the cap near
+  20 KB) isn't
   typed, and the command ends with exitCode -1 and says why if it's still
   waiting, and the session log says so too, as does a command given up
   because its lines reached another shell. Such a command leaves the

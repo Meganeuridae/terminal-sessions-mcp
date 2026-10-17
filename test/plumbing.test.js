@@ -333,22 +333,23 @@ test("bodies for the shell in front go in one at a time, in the order their no-f
   const { execFileSync } = require('node:child_process');
   const server = bareServer();
   const written = [];
-  const session = { ...bareSession(), outputBuffer: '', shell: { write: (text) => written.push(text) }, currentCommand: undefined };
-  const files = [];
-  const pending = (nonce, body) => files.push(pendingFile(session, nonce, body));
-  // The shell reads the typed lines in the order they reached its terminal,
-  // one per marker it prints. For each line typed after the first, how many
-  // lines typed before it the shell hadn't read yet when it was typed; the
-  // line editor needs that to be none (see INLINE_LINE_MAX).
+  // The shell reads the typed lines in the order they reached its terminal.
+  // For every line typed, how many lines typed before it the shell hadn't read
+  // yet when it was typed: the line editor needs that to be none, for a
+  // body's first line (typed on a start or gone marker) as for its others
+  // (see INLINE_LINE_MAX).
   const unreadAtWrite = [];
   let read = 0;
+  const session = { ...bareSession(), outputBuffer: '', shell: { write: (text) => { unreadAtWrite.push(written.length - read); written.push(text); } }, currentCommand: undefined };
+  const files = [];
+  const pending = (nonce, body) => files.push(pendingFile(session, nonce, body));
+  // The shell reads every typed line it hasn't yet, printing each piece
+  // marker as it goes; a body's last line prints its start marker, which the
+  // test scans itself.
   const shellReads = () => {
-    for (; read < written.length; read++) {
-      const piece = written[read].match(/echo "<<<PIEC""E:([0-9a-z]+):(\d+)>>>"/);
-      if (!piece) continue;
-      const before = written.length;
-      scan(server, session, `<<<PIECE:${piece[1]}:${piece[2]}>>>\r\n`);
-      if (written.length > before) unreadAtWrite.push(written.length - 1 - (read + 1));
+    while (read < written.length) {
+      const piece = written[read++].match(/echo "<<<PIEC""E:([0-9a-z]+):(\d+)>>>"/);
+      if (piece) scan(server, session, `<<<PIECE:${piece[1]}:${piece[2]}>>>\r\n`);
     }
   };
   try {
@@ -374,9 +375,10 @@ test("bodies for the shell in front go in one at a time, in the order their no-f
     assert.equal(written.length, first + 1);
     assert.match(written.at(-1), /^if \[ "\$\{__tsm_nb-\}" = "\$\$" \]; then __tsm_nb_b='echo second\\n'; echo "<<<STAR""T:nb>>>"/);
     assert.deepEqual(session.inlineQueue, ['nb', 'nc']);
-    // A command given up (here, its line reached another shell) gives the
-    // next its turn at once.
+    // A command given up (here, the shell read its line and printed the gone
+    // marker: it reached another shell) gives the next its turn at once.
     session.unfinished.set('nb', false);
+    shellReads();
     scan(server, session, '<<<GONE:nb>>>\r\n');
     assert.equal(written.length, first + 2);
     assert.match(written.at(-1), /^if \[ "\$\{__tsm_nc-\}" = "\$\$" \]; then __tsm_nc_b='/);
@@ -385,7 +387,8 @@ test("bodies for the shell in front go in one at a time, in the order their no-f
     assert.match(written.at(-1), /eval "unset __tsm_nc __tsm_nc_b;/);
     scan(server, session, '<<<START:nc>>>\r\n');
     assert.deepEqual(session.inlineQueue, []);
-    assert.deepEqual(unreadAtWrite, unreadAtWrite.map(() => 0), 'each line was typed with nothing unread ahead of it');
+    assert.equal(unreadAtWrite.length, written.length, 'every typed line was measured');
+    assert.deepEqual(unreadAtWrite, written.map(() => 0), 'every line, the first of each body included, was typed with nothing unread ahead of it');
     // The shell runs the lines as they reached its terminal: in the order the
     // commands were written.
     const out = execFileSync('sh', ['-c', '__tsm_na=$$\n__tsm_nb=$$\n__tsm_nc=$$\n' + written.join('')], { encoding: 'utf8' });
@@ -424,7 +427,7 @@ test("bodies for the shell in front go in one at a time, in the order their no-f
     // been. ng is given up, and nh's turn comes.
     pending('nj', 'echo ninth\n');
     scan(server, session, '<<<NOFILE:nj>>>\r\n');
-    assert.match(session.logs.at(-1), /a line of its body never reached the shell in front, which has since read a line typed after it/);
+    assert.match(session.logs.at(-1), /^\[command given up: a line of its body never reached the shell in front, which has since read a line typed after it, so its markers won't come; something else reading the terminal took it\]$/);
     assert.ok(!session.pendingFiles.has('ng') && !session.unfinished.has('ng') && !session.typedInline.has('ng'), 'ng given up');
     assert.deepEqual(session.inlineQueue, ['nh', 'ni', 'nj']);
     assert.equal(written.length, before + 1);
@@ -448,6 +451,142 @@ test("bodies for the shell in front go in one at a time, in the order their no-f
     assert.deepEqual(session.inlineQueue, ['ni', 'nj', 'nk']);
   } finally {
     for (const file of files) fs.rmSync(file, { force: true });
+  }
+});
+
+test("a later command's start marker gives up the bodies still queued, typing no line for them and forgetting their lines, before anything starts a body", () => {
+  // The shell in front (ssh's remote one) asked for e1 and e2; e1's first
+  // line went; e2 waits its turn. Then that shell goes, and the session's own
+  // shell reads x's probe line, can read x's file, and prints x's start
+  // marker: it read on past every earlier line. e1 and e2 are given up with
+  // their lines, and nothing is typed for them: a line typed for e2 here would
+  // reach the shell that printed x's start marker, for nothing.
+  const server = bareServer();
+  const written = [];
+  const session = { ...bareSession(), outputBuffer: '', shell: { write: (text) => written.push(text) }, currentCommand: undefined };
+  const files = [];
+  const pending = (nonce, body) => files.push(pendingFile(session, nonce, body));
+  try {
+    pending('e1', `echo one # ${'z'.repeat(1500)}\n`);
+    pending('e2', 'echo two\n');
+    pending('x', 'echo three\n');
+    for (const n of ['e1', 'e2', 'x']) session.unfinished.set(n, false);
+    scan(server, session, '<<<NOFILE:e1>>>\r\n<<<NOFILE:e2>>>\r\n');
+    assert.equal(written.length, 1);
+    const logged = session.logs.length;
+    scan(server, session, '<<<START:x>>>\r\n');
+    assert.equal(written.length, 1, 'no line typed for a body given up');
+    assert.deepEqual(session.inlineQueue, []);
+    for (const n of ['e1', 'e2']) {
+      assert.ok(!session.inlinePieces.has(n) && !session.typedInline.has(n) && !session.unfinished.has(n) && !session.pendingFiles.has(n), `${n} forgotten whole`);
+    }
+    assert.equal(session.logs.length, logged + 2);
+    for (const line of session.logs.slice(-2)) assert.match(line, /^\[command given up: the shell read on to a later command's line before this one's body started, so its markers won't come\]$/);
+    assert.ok(session.pendingFiles.has('x') && session.unfinished.get('x') === true);
+    // The same when x's probe was typed after the head's line, so the stuck
+    // check would fire too: the start marker's releases come first, and no
+    // body is started for the loop to give up (e2 and e3 each in pieces).
+    pending('e2b', `echo two # ${'z'.repeat(1500)}\n`);
+    pending('e3b', `echo three # ${'z'.repeat(1500)}\n`);
+    pending('e1b', 'echo one\n');
+    scan(server, session, '<<<NOFILE:e1b>>>\r\n<<<NOFILE:e2b>>>\r\n<<<NOFILE:e3b>>>\r\n');
+    assert.equal(written.length, 2, "e1b's only line is typed");
+    pending('xb', 'echo four\n'); // typed after e1b's line
+    scan(server, session, '<<<START:xb>>>\r\n');
+    assert.equal(written.length, 2, 'nothing typed for e2b or e3b');
+    assert.deepEqual(session.inlineQueue, []);
+    for (const n of ['e1b', 'e2b', 'e3b']) assert.ok(!session.inlinePieces.has(n) && !session.typedInline.has(n), `${n} forgotten`);
+    // Late markers for them change nothing.
+    scan(server, session, '<<<PIECE:e2b:0>>>\r\n<<<START:e1b>>>\r\n<<<GONE:e3b>>>\r\n');
+    assert.equal(written.length, 2);
+  } finally {
+    for (const file of files) fs.rmSync(file, { force: true });
+  }
+});
+
+test("a body whose file was released before its turn, and that nothing gave up, is passed over when its turn comes", () => {
+  const server = bareServer();
+  const written = [];
+  const session = { ...bareSession(), outputBuffer: '', shell: { write: (text) => written.push(text) }, currentCommand: undefined };
+  const files = [];
+  const pending = (nonce, body) => files.push(pendingFile(session, nonce, body));
+  try {
+    pending('na', 'echo one\n');
+    pending('nb', 'echo two\n');
+    pending('nc', 'echo three\n');
+    scan(server, session, '<<<NOFILE:na>>>\r\n<<<NOFILE:nb>>>\r\n<<<NOFILE:nc>>>\r\n');
+    assert.deepEqual(session.inlineQueue, ['na', 'nb', 'nc']);
+    session.pendingFiles.delete('nb'); // released by some other path, its lines kept
+    scan(server, session, '<<<START:na>>>\r\n');
+    assert.equal(written.length, 2, "na's line, then nc's: nb passed over");
+    assert.match(written[1], /__tsm_nc_b=/);
+    assert.deepEqual(session.inlineQueue, ['nc']);
+    assert.ok(!session.inlinePieces.has('nb'));
+  } finally {
+    for (const file of files) fs.rmSync(file, { force: true });
+  }
+});
+
+test("a waiting command given up is answered after the next body's first line is typed, so the next command's probe line lands behind that line", async () => {
+  const server = bareServer();
+  const written = [];
+  const results = [];
+  const session = {
+    ...bareSession(), id: 's', outputBuffer: '', isProcessingCommand: true, isAlive: true, commandQueue: [],
+    shell: { write: (text) => written.push(text) },
+    currentCommand: undefined,
+  };
+  server.notify = () => {};
+  server.emit = () => true;
+  const files = [];
+  const pending = (nonce, body) => files.push(pendingFile(session, nonce, body));
+  try {
+    pending('nh', `echo head # ${'z'.repeat(1500)}\n`);
+    pending('nk', 'echo next\n');
+    session.currentCommand = { command: 'echo head', nonce: 'nh', startTime: Date.now(), resolve: (result) => results.push(result) };
+    session.unfinished.set('nh', false);
+    session.unfinished.set('nk', false);
+    // A command written behind nh, still queued in the server (nh is current).
+    session.commandQueue.push({ command: 'echo later', nonce: 'nq1', resolve: () => {}, startTime: Date.now(), timeout: 1000 });
+    scan(server, session, '<<<NOFILE:nh>>>\r\n<<<NOFILE:nk>>>\r\n');
+    assert.equal(written.length, 1);
+    // nh's line reached another shell: nh is given up, nk's line goes, and
+    // only then is nh answered. The queued command's probe line is held while
+    // nk goes in, and typed once nk's start marker shows the shell read nk's
+    // line: nothing reaches the line editor while it handles a long line.
+    scan(server, session, '<<<GONE:nh>>>\r\n');
+    assert.deepEqual(results.map((r) => r.exitCode), [-1]);
+    assert.match(results[0].output, /^\[command not run: a line of its body reached a shell other than/);
+    assert.equal(written.length, 2);
+    assert.match(written[1], /__tsm_nk_b='echo next\\n'/, "nk's first line, nothing behind it yet");
+    assert.ok(session.currentCommand.probe !== undefined, 'the probe line is held');
+    scan(server, session, '<<<START:nk>>>\r\n');
+    assert.equal(written.length, 3);
+    assert.match(written[2], /^if \[ -r '/, "the probe line, typed on nk's start marker");
+    assert.equal(session.currentCommand.probe, undefined);
+    // A probe held while a body goes in pieces, and the body's line taken: the
+    // hold ends at the waiting command's own timeout, so the body can be found
+    // stuck. nm's first line goes; the next command, timing out in 60 ms, has
+    // its probe held, then typed, then is answered -1.
+    clearTimeout(session.currentTimeout);
+    session.currentCommand = undefined;
+    session.isProcessingCommand = false;
+    pending('nm', `echo more # ${'z'.repeat(1500)}\n`);
+    scan(server, session, '<<<NOFILE:nm>>>\r\n');
+    assert.equal(written.length, 4);
+    const late = [];
+    session.commandQueue.push({ command: 'echo late', nonce: 'nq2', resolve: (r) => late.push(r), startTime: Date.now(), timeout: 60 });
+    server.processCommandQueue(session);
+    assert.equal(written.length, 4, 'held while nm goes in');
+    assert.ok(session.currentCommand.probe !== undefined);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(written.length, 5, 'typed at the timeout');
+    assert.match(written[4], /^if \[ -r '/);
+    assert.deepEqual(late.map((r) => r.exitCode), [-1]);
+  } finally {
+    for (const file of files) fs.rmSync(file, { force: true });
+    for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+    if (session.currentTimeout) clearTimeout(session.currentTimeout);
   }
 });
 

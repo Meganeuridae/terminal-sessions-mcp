@@ -545,7 +545,8 @@ test("a body whose line a program took holds the bodies behind it only until the
     // and their bodies go in one at a time. The first body reads one line
     // from the terminal when it runs, and takes the second body's line.
     const done = waitForOutput('t-stuck', 'B_DONE', 8000);
-    assert.strictEqual((await server.execCommand('t-stuck', 'sleep 1.5', 300)).exitCode, -1);
+    // The three probe lines below are typed at three 300 ms timeouts; the sleep outlasts them with margin.
+    assert.strictEqual((await server.execCommand('t-stuck', 'sleep 3', 300)).exitCode, -1);
     assert.strictEqual((await server.execCommand('t-stuck', 'head -n 1 >/dev/null; echo B_DONE', 300)).exitCode, -1);
     assert.strictEqual((await server.execCommand('t-stuck', 'echo C_RAN', 300)).exitCode, -1);
     assert.strictEqual((await server.execCommand('t-stuck', 'echo D_RAN', 300)).exitCode, -1);
@@ -561,8 +562,33 @@ test("a body whose line a program took holds the bodies behind it only until the
     assert.strictEqual(cleanTerminalOutput(e.output).trim(), 'E_RAN');
     const logs = server.getOutput('t-stuck');
     assert.deepStrictEqual(printed(logs), ['B_DONE', 'D_RAN', 'E_RAN']);
-    assert.ok(logs.some((l) => l.includes('a line of its body never reached the shell in front, which has since read a line typed after it')), 'the log says why');
+    assert.ok(logs.some((l) => l.includes('command given up: a line of its body never reached the shell in front, which has since read a line typed after it')), 'the log says why');
     assert.strictEqual((await server.execCommand('t-stuck', 'exit', 8000)).exitCode, 0);
+  } finally {
+    fs.rmSync(rc, { force: true });
+  }
+});
+
+test("a command that times out while its body is still going in pieces goes in to the end and runs, and the command typed in behind it runs after it", async () => {
+  const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
+  const rc = path.join(os.tmpdir(), `tsm-test-rc3-${process.pid}`);
+  fs.writeFileSync(rc, '.() { echo "bash: $1: No such file or directory" >&2; return 1; }\n' +
+    '[() { if builtin test "$1" = -r; then return 1; fi; builtin [ "$@"; }\nPS1="NESTED> "\n');
+  try {
+    await server.createSession('t-pieces', { cwd: '/' });
+    const nested = waitForOutput('t-pieces', 'NESTED> ');
+    assert.strictEqual((await server.execCommand('t-pieces', `bash --rcfile '${rc}'`, 500)).exitCode, -1);
+    await nested;
+    // About 22 lines, each a round trip: the 100 ms timeout passes while they go in,
+    // and the next command's probe line is typed then, between two pieces.
+    const long = await server.execCommand('t-pieces', `x='${'y'.repeat(20000)}'; echo "len=\${#x}"`, 100);
+    assert.strictEqual(long.exitCode, -1, 'timed out while its body was going in');
+    const after = await server.execCommand('t-pieces', 'echo AFTER', 8000);
+    assert.strictEqual(after.exitCode, 0);
+    assert.strictEqual(cleanTerminalOutput(after.output).trim(), 'AFTER');
+    const printed = server.getOutput('t-pieces').map((l) => cleanTerminalOutput(l).trim()).filter((l) => l === 'len=20000' || l === 'AFTER');
+    assert.deepStrictEqual(printed, ['len=20000', 'AFTER'], 'the long body ran whole, then the command behind it');
+    assert.strictEqual((await server.execCommand('t-pieces', 'exit', 8000)).exitCode, 0);
   } finally {
     fs.rmSync(rc, { force: true });
   }
