@@ -110,9 +110,9 @@ interface SessionInfo {
   // typeBodyInline): its shell needed the body typed, and the ^C came first.
   // A command whose shell reads its file starts and runs, and its start
   // marker takes the mark away. One whose line the ^C discarded never
-  // answers, and its own timeout answers its caller. A mark goes with its
-  // command's place in `unfinished`: at its start or exit marker, or when it
-  // is given up (see dropUntyped).
+  // answers, and its own timeout answers its caller. A mark goes at its
+  // command's start or exit marker, or when the command is given up (see
+  // dropUntyped).
   interruptedProbes: Set<string>;
 }
 
@@ -755,10 +755,11 @@ export class PersistentSessionServer extends EventEmitter {
    * body goes in mostly reaches the shell at its prompt between two lines and
    * takes nothing with it, and the server would type the rest and run it.
    * These are the inline form of the typeahead a ^C discards. Every other
-   * command that hasn't started is marked (interruptedProbes), since the
-   * server doesn't know yet whether a body will follow: a mark acts only at
-   * a no-file marker. A body whose lines are all typed may be running, and is
-   * left to the ^C. Commands still in the server's queue have no line typed
+   * command that hasn't started is marked (interruptedProbes). A mark acts
+   * only at a no-file marker: it gives up a command whose shell then asks
+   * for its body, and does nothing for one whose body is typed in whole
+   * already. A body whose lines are all typed may be running, and is left to
+   * the ^C. Commands still in the server's queue have no line typed
    * and aren't touched: they go in after the ^C. Returns the reason the
    * current command is to be answered with, if it was given up.
    */
@@ -1564,8 +1565,9 @@ export class PersistentSessionServer extends EventEmitter {
    * command until it starts, ends or is given up, and a body going in for a
    * shell that can't read the temp file, which starts only once it is all in
    * and reads input sent before then itself. The caller sends it again in a
-   * moment. Input holding a ^C (C-c) first gives up the commands still being
-   * typed in, as sendSignal's SIGINT does (see interruptTyping).
+   * moment. Input holding a ^C, as the C-c key or in its text, first gives up
+   * the commands still being typed in, as sendSignal's SIGINT does (see
+   * interruptTyping).
    */
   sendInput(sessionId: string, input: string, appendNewline?: boolean, keys?: string[]): void {
     const session = this.sessions.get(sessionId);
