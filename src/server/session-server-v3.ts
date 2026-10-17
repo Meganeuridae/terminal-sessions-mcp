@@ -115,6 +115,9 @@ type SessionEventMap = {
   };
 };
 
+/** The SIGINT fallbacks every PersistentSessionServer in this process registered (see the constructor). */
+const sigintFallbacks = new Set<NodeJS.SignalsListener>();
+
 export class PersistentSessionServer extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
   private readonly maxLogSize = 10000; // lines per session
@@ -140,13 +143,17 @@ export class PersistentSessionServer extends EventEmitter {
     // shutdown; were this one to run first, every shell would be SIGKILLed,
     // and a killed shell can't pass the hangup on to the jobs it started in
     // the background, which would then outlive the server (where a SIGTERM
-    // to the same server ends them). So it steps aside when another handler
-    // is registered, and that one's graceful killAll does the work.
-    process.on('SIGINT', () => {
-      if (process.listenerCount('SIGINT') > 1) return;
+    // to the same server ends them). So it steps aside when a handler that
+    // isn't another server's fallback is registered, and that one's graceful
+    // killAll does the work. Two servers in one program with no handler of
+    // its own still end the process: their fallbacks don't count each other.
+    const fallback: NodeJS.SignalsListener = () => {
+      if (process.listeners('SIGINT').some((l) => !sigintFallbacks.has(l))) return;
       this.forceKillAllSync();
       process.exit(0);
-    });
+    };
+    sigintFallbacks.add(fallback);
+    process.on('SIGINT', fallback);
   }
 
   /** Synchronous last-resort cleanup for process shutdown paths. */
@@ -307,10 +314,11 @@ export class PersistentSessionServer extends EventEmitter {
       // Small settle window for the prompt that follows the marker.
       await this.sleep(50);
 
-      // Clear any initial output/warnings
+      // Clear any initial output/warnings. The line buffer is kept: the prompt
+      // that followed the marker is in it, and the GUI shows a fresh session's
+      // first output from the logs, which that prompt line completes.
       session.outputBuffer = '';
       session.logs = [];
-      session.lineBuffer = '';
     }
   }
 

@@ -69,15 +69,36 @@ test("the server's SIGINT fallback steps aside when the embedding program handle
   const fallback = process.listeners('SIGINT').find((l) => l.toString().includes('forceKillAllSync'));
   assert.ok(fallback, 'the fallback is registered');
   const exit = process.exit;
-  let exited = false;
-  process.exit = () => { exited = true; };
+  let exited = 0;
+  process.exit = () => { exited++; };
   const noop = () => {};
   process.on('SIGINT', noop);
   try {
     fallback();
-    assert.strictEqual(exited, false, 'with another handler registered, the fallback neither kills nor exits');
+    assert.strictEqual(exited, 0, 'with another handler registered, the fallback neither kills nor exits');
+    process.off('SIGINT', noop);
+    // A second server's fallback is not such a handler: two servers in a
+    // program with no handler of its own still end the process on Ctrl+C.
+    const second = new PersistentSessionServer();
+    const fallbacks = process.listeners('SIGINT').filter((l) => l.toString().includes('forceKillAllSync'));
+    assert.strictEqual(fallbacks.length, 2);
+    fallback();
+    assert.strictEqual(exited, 1, "the first server's fallback runs when only the second's is beside it");
+    process.off('SIGINT', fallbacks[1]);
+    void second;
   } finally {
     process.off('SIGINT', noop);
     process.exit = exit;
+  }
+});
+
+test("a fresh session's first prompt stays in the line buffer, so the GUI's first read of the session shows it", async () => {
+  await server.createSession('t-prompt');
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const logs = server.getOutput('t-prompt');
+    assert.ok(logs.length >= 1 && logs.some((l) => /\$ ?$|# ?$|> ?$/.test(l) || l.length > 0), `the prompt line is readable right after creation: ${JSON.stringify(logs)}`);
+  } finally {
+    await server.killSession('t-prompt', false);
   }
 });
