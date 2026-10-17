@@ -19,6 +19,22 @@ const rl = readline.createInterface({
 // Initialize our MCP wrapper (lazy - connection will be established on first use)
 let mcp: ConnectomeTestingMCP | null = null;
 
+// Resolve the package version for the initialize handshake. Path differs
+// between ts-node (src/mcp/) and the compiled build (dist/src/mcp/).
+function getPackageVersion(): string {
+  for (const rel of ['../../package.json', '../../../package.json']) {
+    try {
+      const pkg = require(rel);
+      if (pkg?.name?.includes('term-sessions-mcp') || pkg?.name?.includes('terminal-sessions')) {
+        return pkg.version;
+      }
+    } catch {
+      // Try the next candidate path.
+    }
+  }
+  return 'unknown';
+}
+
 function getMCP() {
   if (!mcp) {
     // Support full URL, or host+port separately
@@ -219,7 +235,7 @@ rl.on('line', async (line) => {
           },
           serverInfo: {
             name: 'terminal-sessions-mcp',
-            version: '1.0.0'
+            version: getPackageVersion()
           }
         });
         break;
