@@ -52,6 +52,13 @@
   status 0. No `exit` listener runs then, the program's own included, so
   its sessions' temp files stay, as with 1.6.0. Handling SIGINT with
   `process.exit()` runs them.
+- **`session-cli` runs with `node`** - its shebang named `ts-node`, a dev
+  dependency, so the installed command failed with "No such file or
+  directory" wherever `ts-node` wasn't on the PATH. It runs on Node
+  versions that can `require` an ES module: from 20.19 on Node 20, from
+  22.12 on Node 22, and on 23 and 24. On older ones it still stops: it
+  loads the ESM-only `strip-ansi` 7 with `require`, which predates this
+  change.
 
 ## v1.6.1 - 2026-10-17
 

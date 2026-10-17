@@ -1,4 +1,4 @@
-#!/usr/bin/env ts-node
+#!/usr/bin/env node
 
 import { SessionClient, EventEnvelope } from '../src/server/websocket-api';
 import stripAnsi from 'strip-ansi';
