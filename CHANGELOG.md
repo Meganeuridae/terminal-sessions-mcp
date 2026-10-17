@@ -147,16 +147,31 @@
   behind it, and with `stty noflsh` keeps them, so they can still run after
   it; other signals go to the session's shell itself).
   The `runCommand` tool's `timeout` parameter documents this.
-- **`sendInput` refuses input until the session's last command has
-  started.** A command for a shell that can't read the temp file starts only
-  once its body has been typed in (see above), and that shell would read
-  input sent before then as part of its own command lines. So `sendInput`
-  sends nothing and throws until the last command's start marker comes, or
-  until two seconds pass in which the server has typed no line and read no
-  marker. With a shell that reads the temp file and waits at its prompt, the
-  refusal lasts the probe line's round trip, so a `sendInput` sent straight
-  after `runCommand` with a timeout of -1 can be refused where 1.6.0 sent
-  it: send it again once the command has started.
+- **`sendInput` refuses input while a command is on its way in.** A command
+  for a shell that can't read the temp file starts only once its body has
+  been typed in (see above), and that shell would read input sent before then
+  as part of its own command lines. So `sendInput` sends nothing and throws
+  from the moment a command's line is typed, or held behind a body still
+  going in, until its start marker comes, it ends or it's given up, and while
+  a body goes in. The refusal also lapses after two seconds in which the
+  server has typed no line and read no marker, as when a program took the
+  command's line, which doesn't mean the command has started. With a shell
+  that reads the temp file and waits at its prompt, the refusal lasts the
+  probe line's round trip, so a `sendInput` sent straight after `runCommand`
+  with a timeout of -1 can be refused where 1.6.0 sent it: send it again in a
+  moment.
+- **A SIGINT gives up a command still being typed in.** `sendSignal` with
+  SIGINT gives up every command that hasn't started and whose last line
+  hasn't been typed, since a body's last line is what runs it: before its
+  Ctrl-C, or, for a command whose probe line is typed and unanswered, at its
+  no-file marker. Over a link, a Ctrl-C typed between two of a body's lines
+  reaches the shell at its prompt and takes nothing with it, so the rest of
+  the body would be typed and run. The session log gives each one's reason,
+  `[command not run: interrupted before its body was typed in]`, or `[command
+  not run: interrupted before its line was typed]` for a probe line still
+  held, and a caller still waiting gets -1 with it. `stty noflsh`, which
+  keeps typeahead through a Ctrl-C, doesn't keep these. A command whose body
+  is typed in whole, or that reads the temp file, is left to the Ctrl-C.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
 - Shell history records each command's typed line (a check that the shell

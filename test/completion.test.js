@@ -646,7 +646,7 @@ test("input sent before a command typed in for a shell that can't read the temp 
     const long = await server.execCommand('t-input', `echo STARTED; x='${'y'.repeat(20000)}'; read -r a; echo "got=$a len=\${#x}"`, -1);
     assert.strictEqual(long.exitCode, -1);
     assert.throws(() => server.sendInput('t-input', 'hello'),
-      /^Error: Input not sent: session t-input's last command hasn't started yet/);
+      /^Error: Input not sent: a command is still on its way into session t-input,/);
     const out = () => server.getOutput('t-input').map((l) => cleanTerminalOutput(l).trim());
     const deadline = Date.now() + 20000;
     while (!out().includes('STARTED') && Date.now() < deadline) await sleep(20);
@@ -656,6 +656,45 @@ test("input sent before a command typed in for a shell that can't read the temp 
     assert.deepStrictEqual(out().filter((l) => l.startsWith('got=')), ['got=hello len=20000'], 'the input reached the command whole');
     assert.ok(!out().some((l) => l.includes('command not found')), 'no input ran as a command of its own');
     assert.strictEqual((await server.execCommand('t-input', 'exit', 8000)).exitCode, 0);
+  } finally {
+    fs.rmSync(rc, { force: true });
+  }
+});
+
+test("a SIGINT while a command is still being typed in over a link gives it up, so its body never runs, and input and the next command go in at once", async () => {
+  const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
+  const rc = path.join(os.tmpdir(), `tsm-test-rc5-${process.pid}`);
+  fs.writeFileSync(rc, '.() { echo "bash: $1: No such file or directory" >&2; return 1; }\n' +
+    '[() { if builtin test "$1" = -r; then return 1; fi; builtin [ "$@"; }\nPS1="NESTED> "\n');
+  try {
+    await server.createSession('t-sigint', { cwd: '/' });
+    const nested = waitForOutput('t-sigint', 'NESTED> ');
+    assert.strictEqual((await server.execCommand('t-sigint', `bash --rcfile '${rc}'`, 500)).exitCode, -1);
+    await nested;
+    // Every write reaches the shell 50 ms after the server makes it, in order,
+    // as over a link: the shell then waits at its prompt for most of each
+    // line's round trip, where a ^C takes nothing with it.
+    const s = server.sessions.get('t-sigint');
+    const writes = [];
+    const write = s.shell.write.bind(s.shell);
+    s.shell.write = (text) => { writes.push({ text: String(text), at: Date.now() }); setTimeout(() => write(text), 50); };
+    const out = () => server.getOutput('t-sigint').map((l) => cleanTerminalOutput(l).trim());
+    const long = await server.execCommand('t-sigint', `echo STARTED; x='${'y'.repeat(20000)}'; echo "len=\${#x}"`, -1);
+    assert.strictEqual(long.exitCode, -1);
+    await sleep(300);
+    server.sendSignal('t-sigint', 'SIGINT');
+    server.sendInput('t-sigint', '', true); // refused before the signal; an empty line now
+    const nextAt = Date.now();
+    const next = await server.execCommand('t-sigint', 'echo NEXT', 8000);
+    assert.strictEqual(next.exitCode, 0);
+    assert.strictEqual(cleanTerminalOutput(next.output).trim(), 'NEXT');
+    const nextProbe = writes.find((w) => w.at >= nextAt && /^if \[ -r '/.test(w.text));
+    assert.ok(nextProbe && nextProbe.at - nextAt < 1000, `the next command's probe line was written ${nextProbe ? nextProbe.at - nextAt : '?'} ms after it was asked for`);
+    await sleep(3000);
+    assert.ok(!out().includes('STARTED'), 'the interrupted body never ran');
+    assert.ok(out().includes('[command not run: interrupted before its body was typed in]'), 'the log says why');
+    s.shell.write = write;
+    assert.strictEqual((await server.execCommand('t-sigint', 'exit', 8000)).exitCode, 0);
   } finally {
     fs.rmSync(rc, { force: true });
   }

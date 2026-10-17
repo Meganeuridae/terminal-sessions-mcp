@@ -99,11 +99,18 @@ interface SessionInfo {
   // instead of the command: a shell that can't read the temp file reads
   // input typed after the probe line, or between the lines of the body typed
   // for it, as part of its own command lines. So sendInput refuses input
-  // meanwhile (see typingHolds).
+  // meanwhile, as it does while any body goes in (see typingHolds).
   typingFor?: string;
   // When the server last typed a line for a command (see typeLine) or acted
   // on a marker (see actOnMarker). Input written by sendInput doesn't count.
   typingProgressAt: number;
+  // Commands whose probe line was typed, with no marker back yet, when a
+  // SIGINT came (see interruptTyping): a no-file marker gives such a command
+  // up rather than typing its body (see typeBodyInline), and a start marker
+  // shows the shell read its file, which takes the mark away. A mark goes
+  // with its command's place in `unfinished`: at its start or exit marker, or
+  // when it is given up (see dropUntyped).
+  interruptedProbes: Set<string>;
 }
 
 // A start, exit, no-file, gone or piece marker the shell printed (see
@@ -332,12 +339,16 @@ const INLINE_PIECES_MAX = 128;
  * is what shows the body stuck (see releaseStuckInline), and the commands
  * behind it keep their order. Over a link whose round trip is longer than
  * this, the probe is typed between the body's lines, the case the hold is
- * there to avoid. sendInput's refusal of input before the last command has
- * started lapses after the same time with nothing typed or read for a
- * command (see typingHolds), and over such a link it lapses between the
- * body's lines too.
+ * there to avoid. sendInput's refusal of input while a command is on its way
+ * in lapses after the same time with no line typed and no marker read (see
+ * typingHolds), and over such a link it lapses between the body's lines too.
  */
 const HELD_PROBE_MAX_MS = 2000;
+/**
+ * The reason a command whose body isn't typed in whole is given up with when
+ * a SIGINT comes (see interruptTyping).
+ */
+const INTERRUPTED_BODY = '[command not run: interrupted before its body was typed in]';
 
 export class PersistentSessionServer extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
@@ -416,7 +427,8 @@ export class PersistentSessionServer extends EventEmitter {
       lineSeq: new Map(),
       scanCarry: '',
       awaitingMarkers: [],
-      typingProgressAt: 0
+      typingProgressAt: 0,
+      interruptedProbes: new Set()
     };
 
     // Handle output
@@ -715,15 +727,53 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * Is the session's latest command still on its way in (typingFor), with
-   * the server's typing still moving: a line typed for any command, or a
-   * marker acted on, within HELD_PROBE_MAX_MS? Input written then can reach
-   * the shell in front instead of the command, so sendInput refuses it. A
-   * probe line that something other than a shell took, which never answers,
-   * stops refusing input after that long.
+   * Is a command still on its way in, the session's latest one until it
+   * starts (typingFor) or a body going in for the shell in front (see
+   * bodyGoingIn), with the server's typing still moving: a line typed for any
+   * command, or a marker acted on, within HELD_PROBE_MAX_MS? Input written
+   * then can reach the shell in front instead of the command, or go in
+   * between a body's lines, so sendInput refuses it. The body counts on its
+   * own because the latest command can be given up while an earlier body
+   * still goes in. A line that something other than a shell took, which
+   * never answers, stops refusing input after that long, and so does one a
+   * busy shell hasn't read yet.
    */
   private typingHolds(session: SessionInfo): boolean {
-    return session.typingFor !== undefined && Date.now() - session.typingProgressAt < HELD_PROBE_MAX_MS;
+    return (session.typingFor !== undefined || this.bodyGoingIn(session)) &&
+      Date.now() - session.typingProgressAt < HELD_PROBE_MAX_MS;
+  }
+
+  /**
+   * Before a SIGINT's ^C is written, give up every command that hasn't
+   * started and whose last line the server hasn't typed. A body's last line
+   * is what runs it, so none of them can run. Over a link, a ^C typed while a
+   * body goes in mostly reaches the shell at its prompt between two lines and
+   * takes nothing with it, and the server would type the rest and run it.
+   * These are the inline form of the typeahead a ^C discards: a body going in
+   * with lines left, the bodies waiting their turn (inlineQueue), and a held
+   * probe line, which is then never typed. A command whose probe line is
+   * typed and whose first marker hasn't come is marked (interruptedProbes),
+   * since the server doesn't know yet whether a body will follow. A body
+   * whose lines are all typed may be running, and is left to the ^C. Returns
+   * the reason the current command is to be answered with, if it was given up.
+   */
+  private interruptTyping(session: SessionInfo): string | undefined {
+    const given: GivenUp = {};
+    for (const nonce of [...session.inlineQueue]) {
+      if (session.typedInline.has(nonce) && !session.inlinePieces.has(nonce)) continue; // all its lines typed
+      this.dropUntyped(session, nonce, given, INTERRUPTED_BODY);
+    }
+    const current = session.currentCommand;
+    if (current?.probe !== undefined) {
+      delete current.probe;
+      if (current.probeTimer) clearTimeout(current.probeTimer);
+      delete current.probeTimer;
+      this.dropUntyped(session, current.nonce, given, '[command not run: interrupted before its line was typed]');
+    }
+    for (const [nonce, started] of session.unfinished) {
+      if (!started && !session.inlineQueue.includes(nonce)) session.interruptedProbes.add(nonce);
+    }
+    return given.current;
   }
 
   /**
@@ -1047,6 +1097,7 @@ export class PersistentSessionServer extends EventEmitter {
     if (marker.kind === 'start') {
       if (current && nonce === current.nonce) current.started = true;
       if (nonce === session.typingFor) delete session.typingFor;
+      session.interruptedProbes.delete(nonce); // it read its file: nothing to give up
       if (session.unfinished.has(nonce)) session.unfinished.set(nonce, true);
       // The shell read on to this command's line, so every earlier line it had
       // was read too: the earlier files go, and a body among them still
@@ -1098,6 +1149,7 @@ export class PersistentSessionServer extends EventEmitter {
     }
     this.releaseInline(session, nonce); // in case its start marker was lost
     if (nonce === session.typingFor) delete session.typingFor; // so it started too
+    session.interruptedProbes.delete(nonce);
     const endsCurrent = session.unfinished.has(nonce) && this.finishUnfinished(session, nonce);
     if (current && (nonce === current.nonce || endsCurrent)) {
       current.started = true; // an exit marker implies the start, even if a trimmed buffer lost it
@@ -1150,6 +1202,10 @@ export class PersistentSessionServer extends EventEmitter {
     const file = session.pendingFiles.get(nonce);
     if (file === undefined || session.typedInline.has(nonce) || session.inlineQueue.includes(nonce)) {
       return; // released, typed already, or waiting its turn
+    }
+    if (session.interruptedProbes.has(nonce)) {
+      this.dropUntyped(session, nonce, given, INTERRUPTED_BODY); // a SIGINT came first (see interruptTyping)
+      return;
     }
     const tooLong = (size: string) => `[command not run: the shell in front can't read this machine's temp files, ` +
       `and typed in, this command would take more than ${INLINE_PIECES_MAX} lines of ${INLINE_LINE_MAX} bytes (${size}); ` +
@@ -1293,6 +1349,7 @@ export class PersistentSessionServer extends EventEmitter {
     session.unfinished.delete(nonce);
     session.inlinePieces.delete(nonce);
     session.typedInline.delete(nonce);
+    session.interruptedProbes.delete(nonce);
     if (session.typingFor === nonce) delete session.typingFor;
     this.addLog(session, reason);
     if (session.currentCommand?.nonce === nonce) given.current = reason;
@@ -1497,11 +1554,12 @@ export class PersistentSessionServer extends EventEmitter {
    *   style: Enter, Tab, Esc, Up/Down/Left/Right, Backspace, C-c, M-x, F1...
    *   See src/server/keys.ts for decoding.
    *
-   * Throws, writing nothing, while the session's last command hasn't started
-   * and the server's typing is still moving (see typingHolds). A command
-   * typed inline, for a shell that can't read the temp file, starts only once
-   * its body is in, and that shell reads input sent before then itself. The
-   * caller sends it again once the command has started.
+   * Throws, writing nothing, while a command is on its way in and the
+   * server's typing is still moving (see typingHolds): the session's latest
+   * command until it starts, ends or is given up, and a body going in for a
+   * shell that can't read the temp file, which starts only once it is all in
+   * and reads input sent before then itself. The caller sends it again in a
+   * moment.
    */
   sendInput(sessionId: string, input: string, appendNewline?: boolean, keys?: string[]): void {
     const session = this.sessions.get(sessionId);
@@ -1509,9 +1567,11 @@ export class PersistentSessionServer extends EventEmitter {
       throw new Error(`Session ${sessionId} not available`);
     }
     if (this.typingHolds(session)) {
-      throw new Error(`Input not sent: session ${sessionId}'s last command hasn't started yet, ` +
-        `and until it has, input can reach the shell in front instead of the command. ` +
-        `Send it again once the command has started.`);
+      throw new Error(`Input not sent: a command is still on its way into session ${sessionId}, ` +
+        `and until it has started, input can reach the shell in front instead of the command. ` +
+        `Send it again in a moment: the refusal ends when the command starts, ends or is given up, ` +
+        `or after two seconds in which the server has typed no line and read no marker. ` +
+        `To interrupt it, use sendSignal, which isn't refused.`);
     }
 
     const dataToSend = buildInputData(input, appendNewline, keys);
@@ -1529,7 +1589,8 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * Send a signal to a session
+   * Send a signal to a session. SIGINT is sent as Ctrl-C, after the commands
+   * still being typed in are given up (see interruptTyping).
    */
   sendSignal(sessionId: string, signal: string = 'SIGINT'): void {
     const session = this.sessions.get(sessionId);
@@ -1537,9 +1598,12 @@ export class PersistentSessionServer extends EventEmitter {
       throw new Error(`Session ${sessionId} not available`);
     }
 
-    // For SIGINT, send Ctrl+C
+    // For SIGINT, send Ctrl+C, once the commands it must stop that are still
+    // on their way in are given up (see interruptTyping)
     if (signal === 'SIGINT') {
+      const givenUp = this.interruptTyping(session);
       session.shell.write('\x03');
+      if (givenUp !== undefined) this.resolveCommand(session, -1, { reason: givenUp });
     } else if (signal === 'SIGTERM') {
       session.shell.kill('SIGTERM');
     } else {
