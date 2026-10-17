@@ -171,13 +171,14 @@
   in]`, or `[command not run: interrupted before its line was typed]` for a
   probe line still held, and a caller still waiting gets -1 with it, whatever
   `stty noflsh` says. A Ctrl-C sent with `sendInput` (the `C-c` key) does the
-  same. Every other command that hasn't started is marked: if its no-file
-  marker comes, it is given up there rather than its body typed. One whose
-  shell reads the temp file starts and runs, and the Ctrl-C reaches it as
-  any running command; one whose line the Ctrl-C discarded never answers,
-  and its caller gets its timeout's -1. A body typed in whole may be
-  running, and is left to the Ctrl-C. Commands waiting in the server's queue
-  have no line typed, and go in after the Ctrl-C.
+  same once input is accepted; while input is refused, the `C-c` is refused
+  with it, and `sendSignal` is the way. Every other command that hasn't
+  started is marked: if its no-file marker comes, it is given up there rather
+  than its body typed. One whose shell reads the temp file starts and runs,
+  and the Ctrl-C reaches it as any running command; one whose line the Ctrl-C
+  discarded never answers, and its caller gets its timeout's -1. A body typed
+  in whole may be running, and is left to the Ctrl-C. Commands waiting in the
+  server's queue have no line typed, and go in after the Ctrl-C.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
 - Shell history records each command's typed line (a check that the shell
