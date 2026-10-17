@@ -230,20 +230,18 @@
   same, and like `sendSignal`'s it isn't refused while a command goes in;
   input that holds a ^C among other characters does it too, once input is
   accepted. Every other command whose line is typed and that hasn't started
-  is marked, and what becomes of it depends on whether its shell had read its
-  line and whether that shell can read the temp file. If the shell had read
-  the line and can read the file, the command is running, and the Ctrl-C
-  reaches it as any running command. If the shell had read the line and can't
-  read the file, its no-file marker gives the command up rather than its body
-  being typed. A line still waiting is lost to the Ctrl-C under the
-  terminal's default settings: the command never answers, and its caller gets
-  its timeout's -1. Under `stty noflsh` the line is kept and read after the
-  Ctrl-C, as any line typed ahead is, and the command then runs, its caller
-  getting the result or its timeout's -1, whichever comes first, unless its
-  shell can't read the temp file, whose no-file marker gives it up as above.
-  A body typed in whole may be running, and is left to the Ctrl-C. Commands
-  waiting in the server's queue have no line typed and aren't given up: each
-  goes in after the Ctrl-C in its turn, as any queued command does.
+  is marked, since the server can't tell whether its shell has read the line:
+  if a no-file marker comes for it, the mark gives it up there rather than
+  its body being typed. A body typed in whole may be running, and is left to
+  the Ctrl-C. The rest is the shell's and the terminal's, as without the
+  server: the Ctrl-C can stop a command as it runs, discard a line before the
+  shell reads it, or, under `stty noflsh`, leave the line to be read and run
+  after it. A caller still waiting gets the give-up's -1, the command's own
+  exit code, or its timeout's -1, whichever comes first; a command the Ctrl-C
+  kills can end without its exit marker, since bash 4 and later drop the rest
+  of the line. Commands waiting in the server's queue have no line typed and
+  aren't given up: each goes in after the Ctrl-C in its turn, as any queued
+  command does.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
 - Shell history records each command's typed line (a check that the shell

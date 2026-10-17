@@ -1068,7 +1068,7 @@ test("a lone ^C sent with sendInput while the latest command's line is typed and
     assert.ok(session.interruptedProbes.has('n1'), 'n1 is marked, since its shell may yet need its body typed');
     assert.deepEqual(results, [], 'n1 is not answered: its shell may have read its line');
     assert.throws(() => server.sendInput('s', 'after'), refusal, 'other input is still refused while n1 is on its way in');
-    assert.equal(written.length, 2, "nothing more was sent: n2's line waits, since n1 is marked, not answered");
+    assert.equal(written.length, 2, "nothing more was sent: n2's line waits while n1, only marked, is still the current command");
     assert.equal(session.commandQueue.length, 1, 'n2 still waits in the queue');
   } finally {
     for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
@@ -1146,7 +1146,7 @@ test("a command waiting in the server's queue goes in after the ^C that gives up
   }
 });
 
-test('a C-c sent with sendInput to a command that has started is written to it, and the command is answered by its exit marker, as it would be without the server', (t) => {
+test("a C-c sent with sendInput to a command that has started is written to it and answers nothing itself: only the command's own exit marker answers it", (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const written = [];
   const results = [];
@@ -1159,6 +1159,10 @@ test('a C-c sent with sendInput to a command that has started is written to it, 
     server.sendInput('s', '', false, ['C-c']);
     assert.deepEqual(written.slice(before), ['\x03'], 'the ^C goes in, and nothing else');
     assert.deepEqual(results, [], 'not answered: it is running, and the ^C is its to meet');
+    // As completion's interrupt test says, bash 3.2 runs the rest of the line
+    // after a ^C and prints the marker with 130, while bash 4 and later drop it
+    // when the ^C kills the command, leaving the caller's timeout to answer. A
+    // command that catches SIGINT and exits prints its own code.
     scan(server, session, '<<<EXIT:n1:130>>>\r\n');
     assert.deepEqual(results.map((r) => r.exitCode), [130], 'it ends as the shell says');
   } finally {
