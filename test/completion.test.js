@@ -545,12 +545,20 @@ test("a body whose line a program took holds the bodies behind it only until the
     // and their bodies go in one at a time. The first body reads one line
     // from the terminal when it runs, and takes the second body's line.
     const done = waitForOutput('t-stuck', 'B_DONE', 8000);
-    // The three probe lines below are typed at three 300 ms timeouts; the sleep outlasts them with margin.
-    assert.strictEqual((await server.execCommand('t-stuck', 'sleep 3', 300)).exitCode, -1);
-    assert.strictEqual((await server.execCommand('t-stuck', 'head -n 1 >/dev/null; echo B_DONE', 300)).exitCode, -1);
-    assert.strictEqual((await server.execCommand('t-stuck', 'echo C_RAN', 300)).exitCode, -1);
-    assert.strictEqual((await server.execCommand('t-stuck', 'echo D_RAN', 300)).exitCode, -1);
+    // The shell stays busy until the gate file exists, which the test makes
+    // once the three probe lines below are typed, at three 300 ms timeouts.
+    const gate = path.join(os.tmpdir(), `tsm-test-gate-${process.pid}`);
+    fs.rmSync(gate, { force: true });
+    try {
+      assert.strictEqual((await server.execCommand('t-stuck', `while [ ! -e '${gate}' ]; do sleep 0.1; done`, 300)).exitCode, -1);
+      assert.strictEqual((await server.execCommand('t-stuck', 'head -n 1 >/dev/null; echo B_DONE', 300)).exitCode, -1);
+      assert.strictEqual((await server.execCommand('t-stuck', 'echo C_RAN', 300)).exitCode, -1);
+      assert.strictEqual((await server.execCommand('t-stuck', 'echo D_RAN', 300)).exitCode, -1);
+    } finally {
+      fs.writeFileSync(gate, '');
+    }
     await done;
+    fs.rmSync(gate, { force: true });
     await new Promise((r) => setTimeout(r, 300));
     const printed = (logs) => logs.map((l) => cleanTerminalOutput(l).trim()).filter((l) => /^(B_DONE|C_RAN|D_RAN|E_RAN)$/.test(l));
     assert.deepStrictEqual(printed(server.getOutput('t-stuck')), ['B_DONE'], 'the third body waits behind the taken one');
@@ -579,8 +587,15 @@ test("a command that times out while its body is still going in pieces goes in t
     const nested = waitForOutput('t-pieces', 'NESTED> ');
     assert.strictEqual((await server.execCommand('t-pieces', `bash --rcfile '${rc}'`, 500)).exitCode, -1);
     await nested;
-    // About 22 lines, each a round trip: the 100 ms timeout passes while they go in,
-    // and the next command's probe line is typed then, between two pieces.
+    // About 22 lines, each a round trip: the 100 ms timeout usually passes while
+    // they go in, and the next command's probe line is then held until the
+    // body is in, so it isn't typed between two of its lines unless the body
+    // has gone two seconds without a line typed. The server's writes are kept
+    // to check that.
+    const s = server.sessions.get('t-pieces');
+    const writes = [];
+    const write = s.shell.write.bind(s.shell);
+    s.shell.write = (text) => { writes.push({ text: String(text), at: Date.now() }); return write(text); };
     const long = await server.execCommand('t-pieces', `x='${'y'.repeat(20000)}'; echo "len=\${#x}"`, 100);
     assert.strictEqual(long.exitCode, -1, 'timed out while its body was going in');
     const after = await server.execCommand('t-pieces', 'echo AFTER', 8000);
@@ -588,6 +603,18 @@ test("a command that times out while its body is still going in pieces goes in t
     assert.strictEqual(cleanTerminalOutput(after.output).trim(), 'AFTER');
     const printed = server.getOutput('t-pieces').map((l) => cleanTerminalOutput(l).trim()).filter((l) => l === 'len=20000' || l === 'AFTER');
     assert.deepStrictEqual(printed, ['len=20000', 'AFTER'], 'the long body ran whole, then the command behind it');
+    // The long command's probe line comes first, then its body's lines, which
+    // name its nonce; the second probe line is AFTER's.
+    const probes = writes.map((w, i) => (/^if \[ -r '/.test(w.text) ? i : -1)).filter((i) => i >= 0);
+    const nonce = (writes[probes[0]].text.match(/tsm-cmd-\d+-(\w+)\.sh/) || [])[1];
+    const lines = writes.map((w, i) => (w.text.includes(`__tsm_${nonce}_b`) ? i : -1)).filter((i) => i >= 0);
+    assert.ok(lines.length > 1, `the body went in ${lines.length} lines`);
+    const afterProbe = probes[1];
+    if (afterProbe < lines.at(-1)) {
+      const before = writes[Math.max(...lines.filter((i) => i < afterProbe))];
+      assert.ok(writes[afterProbe].at - before.at >= 2000,
+        `AFTER's probe line was typed between the body's lines ${writes[afterProbe].at - before.at} ms after its line before`);
+    }
     assert.strictEqual((await server.execCommand('t-pieces', 'exit', 8000)).exitCode, 0);
   } finally {
     fs.rmSync(rc, { force: true });

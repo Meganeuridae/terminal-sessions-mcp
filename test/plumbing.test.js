@@ -263,13 +263,14 @@ test('a body that would pass one line of 1,000 bytes goes in lines of at most th
     for (const line of lines.slice(0, -1)) assert.ok(Buffer.byteLength(line) > 950, 'full, but for the last');
     // The first line sets the body variable, in a shell where the pid variable
     // holds its own pid, and prints its piece marker. The others add to it,
-    // where it also holds exactly what was typed before; the last then runs it.
+    // where it also holds as many characters as the lines before typed; the
+    // last then runs it.
     assert.match(lines[0], /^if \[ "\$\{__tsm_n2-\}" = "\$\$" \]; then __tsm_n2_b='[ -&(-~]*'; echo "<<<PIEC""E:n2:0>>>"; else echo "<<<GON""E:n2>>>"; fi$/);
     const adding = /^if \[ "\$\{__tsm_n2-\}" = "\$\$" \] && \[ "\$\{__tsm_n2_b\+set\}" = set \] && \[ "\$\{#__tsm_n2_b\}" = "(\d+)" \]; then __tsm_n2_b="\$__tsm_n2_b"'([ -&(-~]*)'/;
     let typed = lines[0].match(/'([^']*)'/)[1].length;
     for (const line of lines.slice(1)) {
       const [, before, piece] = line.match(adding);
-      assert.equal(Number(before), typed, 'each line checks for the text typed before it');
+      assert.equal(Number(before), typed, 'each line checks the length of what was typed before it');
       typed += piece.length;
     }
     lines.slice(1, -1).forEach((line, i) => assert.match(line, new RegExp(`'; echo "<<<PIEC""E:n2:${i + 1}>>>"; else echo "<<<GON""E:n2>>>"; fi$`)));
@@ -427,7 +428,7 @@ test("bodies for the shell in front go in one at a time, in the order their no-f
     // been. ng is given up, and nh's turn comes.
     pending('nj', 'echo ninth\n');
     scan(server, session, '<<<NOFILE:nj>>>\r\n');
-    assert.match(session.logs.at(-1), /^\[command given up: a line of its body never reached the shell in front, which has since read a line typed after it, so its markers won't come; something else reading the terminal took it\]$/);
+    assert.match(session.logs.at(-1), /^\[command given up: a line of its body never reached the shell in front, which has since read a line typed after it, so its markers won't come\]$/);
     assert.ok(!session.pendingFiles.has('ng') && !session.unfinished.has('ng') && !session.typedInline.has('ng'), 'ng given up');
     assert.deepEqual(session.inlineQueue, ['nh', 'ni', 'nj']);
     assert.equal(written.length, before + 1);
@@ -481,7 +482,7 @@ test("a later command's start marker gives up the bodies still queued, typing no
       assert.ok(!session.inlinePieces.has(n) && !session.typedInline.has(n) && !session.unfinished.has(n) && !session.pendingFiles.has(n), `${n} forgotten whole`);
     }
     assert.equal(session.logs.length, logged + 2);
-    for (const line of session.logs.slice(-2)) assert.match(line, /^\[command given up: the shell read on to a later command's line before this one's body started, so its markers won't come\]$/);
+    for (const line of session.logs.slice(-2)) assert.match(line, /^\[command given up: the shell read on to a later command's line before this one's start marker came\]$/);
     assert.ok(session.pendingFiles.has('x') && session.unfinished.get('x') === true);
     // The same when x's probe was typed after the head's line, so the stuck
     // check would fire too: the start marker's releases come first, and no
@@ -579,7 +580,9 @@ test("a waiting command given up is answered after the next body's first line is
     server.processCommandQueue(session);
     assert.equal(written.length, 4, 'held while nm goes in');
     assert.ok(session.currentCommand.probe !== undefined);
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    // Wait for the late command's answer, which its timeout brings.
+    const deadline = Date.now() + 5000;
+    while (late.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(written.length, 5, 'typed at the timeout');
     assert.match(written[4], /^if \[ -r '/);
     assert.deepEqual(late.map((r) => r.exitCode), [-1]);
@@ -587,6 +590,79 @@ test("a waiting command given up is answered after the next body's first line is
     for (const file of files) fs.rmSync(file, { force: true });
     for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
     if (session.currentTimeout) clearTimeout(session.currentTimeout);
+  }
+});
+
+/** A bare session for the held probe's timer tests, writing into `written`. */
+function holdSession(written) {
+  return {
+    ...bareSession(), id: 's', outputBuffer: '', isProcessingCommand: false, isAlive: true, commandQueue: [],
+    shell: { write: (text) => written.push(text) },
+    currentCommand: undefined,
+  };
+}
+
+test('a held probe line is typed once the body going in has had no line typed for two seconds, and each line typed for it restarts the wait', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const server = bareServer();
+  server.notify = () => {};
+  server.emit = () => true;
+  const written = [];
+  const session = holdSession(written);
+  try {
+    pendingFile(session, 'na', `echo a # ${'z'.repeat(2500)}\n`);
+    scan(server, session, '<<<NOFILE:na>>>\r\n');
+    assert.equal(written.length, 1, "na's first line");
+    session.commandQueue.push({ command: 'echo next', nonce: 'nq', resolve: () => {}, startTime: Date.now(), timeout: 60000 });
+    server.processCommandQueue(session);
+    assert.ok(session.currentCommand.probe !== undefined, 'the probe line is held while na goes in');
+    t.mock.timers.tick(1999);
+    assert.equal(written.length, 1, 'still held 1,999 ms after the hold began');
+    scan(server, session, '<<<PIECE:na:0>>>\r\n');
+    assert.equal(written.length, 2, "na's second line");
+    t.mock.timers.tick(1999);
+    assert.equal(written.length, 2, "still held 1,999 ms after na's second line");
+    t.mock.timers.tick(1);
+    assert.equal(written.length, 3, "typed 2,000 ms after na's second line");
+    assert.match(written[2], /^if \[ -r '/);
+    assert.equal(session.currentCommand.probe, undefined);
+  } finally {
+    for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+    clearTimeout(session.currentTimeout);
+  }
+});
+
+test("a body's first line, typed at its turn, restarts the held probe's wait as its other lines do", (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const server = bareServer();
+  server.notify = () => {};
+  server.emit = () => true;
+  const written = [];
+  const session = holdSession(written);
+  try {
+    pendingFile(session, 'na', `echo a # ${'z'.repeat(1500)}\n`);
+    pendingFile(session, 'nb', `echo b # ${'z'.repeat(1500)}\n`);
+    scan(server, session, '<<<NOFILE:na>>>\r\n<<<NOFILE:nb>>>\r\n');
+    assert.equal(written.length, 1, "na's first line; nb waits its turn");
+    session.commandQueue.push({ command: 'echo next', nonce: 'nq', resolve: () => {}, startTime: Date.now(), timeout: 60000 });
+    server.processCommandQueue(session);
+    assert.ok(session.currentCommand.probe !== undefined, 'the probe line is held while na goes in');
+    t.mock.timers.tick(1000);
+    scan(server, session, '<<<PIECE:na:0>>>\r\n');
+    assert.equal(written.length, 2, "na's last line, at 1,000 ms");
+    assert.ok(!session.inlinePieces.has('na'), 'na has no lines left to type');
+    t.mock.timers.tick(1500);
+    scan(server, session, '<<<START:na>>>\r\n');
+    assert.equal(written.length, 3, "nb's first line, at 2,500 ms");
+    assert.match(written[2], /__tsm_nb_b=/);
+    t.mock.timers.tick(1999);
+    assert.equal(written.length, 3, "still held 1,999 ms after nb's first line");
+    t.mock.timers.tick(1);
+    assert.equal(written.length, 4, "typed 2,000 ms after nb's first line");
+    assert.match(written[3], /^if \[ -r '/);
+  } finally {
+    for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+    clearTimeout(session.currentTimeout);
   }
 });
 

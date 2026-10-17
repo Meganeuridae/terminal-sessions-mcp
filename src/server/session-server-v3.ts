@@ -292,8 +292,9 @@ const printfBody = (body: string): string => {
  * typed once the shell has printed the piece marker of the one before, so
  * the shell is at its prompt, with none of the body's other lines queued,
  * whenever one reaches it (see typeNextPiece), and the next command's probe
- * line, due when a command times out, is held back until the body is in (see
- * typeHeldProbe): a probe typed between two pieces left zsh's and bash 3.2's
+ * line, due when a command times out, is held back until the body is in, or
+ * has gone two seconds without a line typed (see typeHeldProbe): a probe
+ * typed between two pieces left zsh's and bash 3.2's
  * line editors redrawing a piece without reading it to its end, now and
  * then. The tty itself would take the lines
  * together, making the writer wait when its queue is full rather than
@@ -312,11 +313,14 @@ const INLINE_LINE_MAX = 1000;
 const INLINE_PIECES_MAX = 128;
 /**
  * How long a held probe line (see typeHeldProbe) waits for the body going in
- * to make progress, in ms. A shell reading a body's lines answers each
- * within a round trip, so a body silent this long has lost its line to
+ * to make progress, in ms, counted from the last line typed for that body
+ * (see armHeldProbe). A shell reading a body's lines answers each within a
+ * round trip, so a body silent this long is taken to have lost its line to
  * something else reading the terminal, and the probe is typed: its marker
  * is what shows the body stuck (see releaseStuckInline), and the commands
- * behind it keep their order.
+ * behind it keep their order. Over a link whose round trip is longer than
+ * this, the probe is typed between the body's lines, the case the hold is
+ * there to avoid.
  */
 const HELD_PROBE_MAX_MS = 2000;
 
@@ -697,9 +701,11 @@ export class PersistentSessionServer extends EventEmitter {
    * Type the current command's probe line if it was held (see
    * processCommandQueue) and the body that held it is in, or `force`. A line
    * typed while a line editor is still handling a long line is what sets off
-   * the failure INLINE_LINE_MAX describes, so while a body goes in, nothing
-   * else is typed for it: the probe follows the body's start marker, which
-   * shows the shell has read the body's last line.
+   * the failure INLINE_LINE_MAX describes, so while a body goes in, the probe
+   * waits for the body's start marker, which shows the shell has read the
+   * body's last line. Two things end the wait sooner, with `force`: no line
+   * typed for the body for HELD_PROBE_MAX_MS (see armHeldProbe), and the
+   * waiting command's own timeout (see processCommandQueue).
    */
   private typeHeldProbe(session: SessionInfo, force = false): void {
     const current = session.currentCommand;
@@ -714,8 +720,8 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * (Re)start the held probe's progress timer (see HELD_PROBE_MAX_MS): called
-   * when the hold starts and whenever a line of the body going in is typed,
-   * which the shell's marker for the line before asked for.
+   * when the hold starts and whenever a line of a body going in is typed, its
+   * first line (advanceInline) or a next one (typeNextPiece).
    */
   private armHeldProbe(session: SessionInfo): void {
     const current = session.currentCommand;
@@ -991,7 +997,11 @@ export class PersistentSessionServer extends EventEmitter {
    * one marker, every release and give-up happens first (handleMarker), then
    * at most one body starts (advanceInline), and a waiting command given up
    * meanwhile is answered last: its answer types the next command's probe
-   * line, which then lands behind the body's first line, not ahead of it.
+   * line, which then lands behind the body's first line, not ahead of it. A
+   * command whose exit marker this is is answered in handleMarker, before the
+   * body waiting behind it starts, so there the next command's probe line goes
+   * ahead of that body's first line: a short line ahead of a long one, not the
+   * line typed behind a long one that INLINE_LINE_MAX describes.
    */
   private actOnMarker(session: SessionInfo, marker: Marker): void {
     const given: GivenUp = {};
@@ -1020,7 +1030,7 @@ export class PersistentSessionServer extends EventEmitter {
           this.removeTempFile(file);
           if (session.inlineQueue.includes(earlier)) {
             this.dropUntyped(session, earlier, given,
-              `[command given up: the shell read on to a later command's line before this one's body started, so its markers won't come]`);
+              `[command given up: the shell read on to a later command's line before this one's start marker came]`);
           }
         }
       }
@@ -1083,7 +1093,8 @@ export class PersistentSessionServer extends EventEmitter {
    * start marker, which shows the shell has read it to its end), or been
    * given up (see releaseInline). The next command's probe line, due when
    * the one before times out, is held while a body goes in and typed once
-   * the body's start marker has come, or at that command's own timeout (see
+   * the body's start marker has come, once no line has been typed for the
+   * body for HELD_PROBE_MAX_MS, or at that command's own timeout (see
    * typeHeldProbe); where it does land between a body's lines, it only sets
    * its variable and prints its marker, and the body it asks for waits its
    * turn. A body still waiting when its command times out keeps its place.
@@ -1097,7 +1108,7 @@ export class PersistentSessionServer extends EventEmitter {
    * reason in the log, and the next one goes (see releaseStuckInline).
    *
    * The lines run only in the shell that asked for them (see inlinePiece);
-   * the first is typed at the body's turn (see startInlineBody) and each next
+   * the first is typed at the body's turn (see advanceInline) and each next
    * one when the shell has printed the piece marker of the one before (see
    * typeNextPiece). A body that would take more than INLINE_PIECES_MAX lines,
    * or whose file can't be read, isn't typed, and is given up here, at its
@@ -1137,7 +1148,8 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * Start the body at the head of inlineQueue if its turn has come (see
-   * typeBodyInline): type its first line, once. Called once per marker, after
+   * typeBodyInline): type its first line, once, and restart a held probe's
+   * wait (see armHeldProbe). Called once per marker, after
    * every release and give-up the marker brought (see actOnMarker), so a body
    * given up in the same breath is never typed for. A body whose file was
    * released before its turn, and that nothing gave up, is passed over.
@@ -1156,6 +1168,7 @@ export class PersistentSessionServer extends EventEmitter {
       pieces.next = 1;
       if (pieces.lines.length === 1) session.inlinePieces.delete(head);
       this.typeLine(session, head, pieces.lines[0]);
+      this.armHeldProbe(session); // a body's first line is progress too
       return;
     }
   }
@@ -1175,7 +1188,7 @@ export class PersistentSessionServer extends EventEmitter {
    * read past where that line would have been without printing its marker:
    * something else reading the terminal took it, and will take nothing more,
    * since the shell is reading again. The body is given up, with the reason,
-   * and the next one's turn comes (see typeBodyInline). A line typed before
+   * and the next one's turn comes (see advanceInline). A line typed before
    * the head's proves nothing: a probe line typed in behind a busy shell
    * waits in the terminal ahead of the head's lines, and its no-file marker
    * comes while they're still to be read.
@@ -1192,7 +1205,7 @@ export class PersistentSessionServer extends EventEmitter {
     // lost. The reason says only what is known.
     this.dropUntyped(session, head, given,
       `[command given up: a line of its body never reached the shell in front, which has since read a line typed after it, ` +
-      `so its markers won't come; something else reading the terminal took it]`);
+      `so its markers won't come]`);
   }
 
   /**
@@ -1217,8 +1230,10 @@ export class PersistentSessionServer extends EventEmitter {
    * took it, leaves the rest untyped, and the command waits for its timeout;
    * the bodies behind it wait too, until a marker for a line typed after it
    * shows the shell is reading again (see releaseStuckInline). The next
-   * command's probe line, typed when this command times out, goes to that
-   * reader if it is still reading, as any typed-ahead line does.
+   * command's probe line, held while this body goes in, is typed once no line
+   * has been typed for it for HELD_PROBE_MAX_MS, or at that command's own
+   * timeout, and goes to that reader if it is still reading, as any
+   * typed-ahead line does.
    */
   private typeNextPiece(session: SessionInfo, nonce: string, index: number): void {
     const pieces = session.inlinePieces.get(nonce);

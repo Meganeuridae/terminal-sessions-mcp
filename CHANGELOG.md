@@ -81,9 +81,10 @@
   reading. 1.6.0 typed a
   single-line command of any length as one line, which a shell could cut
   short. A body that would take more than 128 lines (about 100 KB of ASCII
-  text; a byte at or above 0x7f, a single quote, a `!` or a control byte takes five
-  characters escaped, so text that is mostly non-ASCII reaches the cap near
-  20 KB) isn't
+  text; a byte at or above 0x7f, a single quote, a `!` or a control byte
+  other than a newline or tab takes five characters escaped, and a newline
+  or tab two, so text that is mostly made of the five-character ones reaches
+  the cap near 20 KB) isn't
   typed, and the command ends with exitCode -1 and says why if it's still
   waiting, and the session log says so too, as does a command given up
   because its lines reached another shell. Such a command leaves the
