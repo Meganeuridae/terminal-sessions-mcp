@@ -62,7 +62,7 @@ const TOOLS = {
     }
   },
   runCommand: {
-    description: 'Run a command in a session (auto-creates the session if it does not exist). It runs in the shell in front, which can be one an earlier command started, such as ssh\'s, and has to be a POSIX shell (sh, bash, dash, zsh, ksh). Where that shell can\'t read this machine\'s temp files, a command over about 100 KB (near 20 KB if mostly non-ASCII, single quotes or `!`) isn\'t run: its result has exitCode -1 and the reason if you\'re still waiting, and the session log says why. A function or alias in the shell in front that changes `.`, `eval`, `[`, `echo`, `printf` or `unset` can make a command report a status its body didn\'t produce, or keep the body from running.',
+    description: 'Run a command in a session (auto-creates the session if it does not exist). It runs in the shell in front, which can be one an earlier command started, such as ssh\'s, and has to be a POSIX shell (sh, bash, dash, zsh, ksh). Where that shell can\'t read this machine\'s temp files, a command over about 100 KB (near 20 KB if mostly non-ASCII, single quotes, `!` or control characters other than newline and tab) isn\'t run: its result has exitCode -1 and the reason if you\'re still waiting, and the session log says why. A function or alias in the shell in front that changes `.`, `eval`, `[`, `echo`, `printf` or `unset` can make a command report a status its body didn\'t produce, or keep the body from running.',
     parameters: {
       type: 'object',
       properties: {

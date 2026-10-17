@@ -428,7 +428,7 @@ test("bodies for the shell in front go in one at a time, in the order their no-f
     // been. ng is given up, and nh's turn comes.
     pending('nj', 'echo ninth\n');
     scan(server, session, '<<<NOFILE:nj>>>\r\n');
-    assert.match(session.logs.at(-1), /^\[command given up: a line of its body never reached the shell in front, which has since read a line typed after it, so its markers won't come\]$/);
+    assert.match(session.logs.at(-1), /^\[command given up: the shell in front printed a marker for a line typed after a line of its body, but none for that line, so its markers won't come\]$/);
     assert.ok(!session.pendingFiles.has('ng') && !session.unfinished.has('ng') && !session.typedInline.has('ng'), 'ng given up');
     assert.deepEqual(session.inlineQueue, ['nh', 'ni', 'nj']);
     assert.equal(written.length, before + 1);

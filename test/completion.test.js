@@ -559,8 +559,16 @@ test("a body whose line a program took holds the bodies behind it only until the
     }
     await done;
     fs.rmSync(gate, { force: true });
-    await new Promise((r) => setTimeout(r, 300));
     const printed = (logs) => logs.map((l) => cleanTerminalOutput(l).trim()).filter((l) => /^(B_DONE|C_RAN|D_RAN|E_RAN)$/.test(l));
+    const deadline = Date.now() + 5000;
+    while (!printed(server.getOutput('t-stuck')).includes('B_DONE') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    // The first body took the line typed for the second: that body is typed
+    // and stuck at the head of the queue, and the third waits behind it
+    // untyped, so it can't have run.
+    const stuck = server.sessions.get('t-stuck');
+    assert.strictEqual(stuck.inlineQueue.length, 2, `two bodies queued: ${JSON.stringify(stuck.inlineQueue)}`);
+    assert.ok(stuck.typedInline.has(stuck.inlineQueue[0]), 'the second body is typed, at the head');
+    assert.ok(!stuck.typedInline.has(stuck.inlineQueue[1]), 'the third body waits behind it, untyped');
     assert.deepStrictEqual(printed(server.getOutput('t-stuck')), ['B_DONE'], 'the third body waits behind the taken one');
     // The next command's probe line is typed after the taken line, and its
     // marker shows the shell has read past it: the taken body is given up,
@@ -570,7 +578,7 @@ test("a body whose line a program took holds the bodies behind it only until the
     assert.strictEqual(cleanTerminalOutput(e.output).trim(), 'E_RAN');
     const logs = server.getOutput('t-stuck');
     assert.deepStrictEqual(printed(logs), ['B_DONE', 'D_RAN', 'E_RAN']);
-    assert.ok(logs.some((l) => l.includes('command given up: a line of its body never reached the shell in front, which has since read a line typed after it')), 'the log says why');
+    assert.ok(logs.some((l) => l.includes('command given up: the shell in front printed a marker for a line typed after a line of its body, but none for that line')), 'the log says why');
     assert.strictEqual((await server.execCommand('t-stuck', 'exit', 8000)).exitCode, 0);
   } finally {
     fs.rmSync(rc, { force: true });
@@ -604,13 +612,15 @@ test("a command that times out while its body is still going in pieces goes in t
     const printed = server.getOutput('t-pieces').map((l) => cleanTerminalOutput(l).trim()).filter((l) => l === 'len=20000' || l === 'AFTER');
     assert.deepStrictEqual(printed, ['len=20000', 'AFTER'], 'the long body ran whole, then the command behind it');
     // The long command's probe line comes first, then its body's lines, which
-    // name its nonce; the second probe line is AFTER's.
+    // name its nonce; the second probe line is AFTER's. A probe line ahead of
+    // the body's first line, as when the 100 ms timeout passed before the
+    // no-file marker came, isn't between its lines.
     const probes = writes.map((w, i) => (/^if \[ -r '/.test(w.text) ? i : -1)).filter((i) => i >= 0);
     const nonce = (writes[probes[0]].text.match(/tsm-cmd-\d+-(\w+)\.sh/) || [])[1];
     const lines = writes.map((w, i) => (w.text.includes(`__tsm_${nonce}_b`) ? i : -1)).filter((i) => i >= 0);
     assert.ok(lines.length > 1, `the body went in ${lines.length} lines`);
     const afterProbe = probes[1];
-    if (afterProbe < lines.at(-1)) {
+    if (afterProbe > lines[0] && afterProbe < lines.at(-1)) {
       const before = writes[Math.max(...lines.filter((i) => i < afterProbe))];
       assert.ok(writes[afterProbe].at - before.at >= 2000,
         `AFTER's probe line was typed between the body's lines ${writes[afterProbe].at - before.at} ms after its line before`);

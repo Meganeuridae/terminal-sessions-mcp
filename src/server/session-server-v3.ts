@@ -292,11 +292,11 @@ const printfBody = (body: string): string => {
  * typed once the shell has printed the piece marker of the one before, so
  * the shell is at its prompt, with none of the body's other lines queued,
  * whenever one reaches it (see typeNextPiece), and the next command's probe
- * line, due when a command times out, is held back until the body is in, or
- * has gone two seconds without a line typed (see typeHeldProbe): a probe
- * typed between two pieces left zsh's and bash 3.2's
- * line editors redrawing a piece without reading it to its end, now and
- * then. The tty itself would take the lines
+ * line, due when a command times out, is held back until the body is in, has
+ * gone two seconds without a line typed, or the waiting command's own timeout
+ * passes (see typeHeldProbe): a probe typed between two pieces left zsh's and
+ * bash 3.2's line editors redrawing a piece without reading it to its end,
+ * now and then. The tty itself would take the lines
  * together, making the writer wait when its queue is full rather than
  * cutting a complete line, but a line editor fed several long lines at once
  * is not safe: bash 3.2's readline, given the fourth of a body's lines while
@@ -313,10 +313,11 @@ const INLINE_LINE_MAX = 1000;
 const INLINE_PIECES_MAX = 128;
 /**
  * How long a held probe line (see typeHeldProbe) waits for the body going in
- * to make progress, in ms, counted from the last line typed for that body
- * (see armHeldProbe). A shell reading a body's lines answers each within a
- * round trip, so a body silent this long is taken to have lost its line to
- * something else reading the terminal, and the probe is typed: its marker
+ * to make progress, in ms, counted from the hold's start, or from the last
+ * line typed for a body since then (see armHeldProbe). A shell reading a
+ * body's lines answers each within a round trip, so a body silent this long
+ * is taken to have lost its line to something else reading the terminal,
+ * and the probe is typed: its marker
  * is what shows the body stuck (see releaseStuckInline), and the commands
  * behind it keep their order. Over a link whose round trip is longer than
  * this, the probe is typed between the body's lines, the case the hold is
@@ -1204,7 +1205,7 @@ export class PersistentSessionServer extends EventEmitter {
     // connection then dropped may have run on the remote side, its markers
     // lost. The reason says only what is known.
     this.dropUntyped(session, head, given,
-      `[command given up: a line of its body never reached the shell in front, which has since read a line typed after it, ` +
+      `[command given up: the shell in front printed a marker for a line typed after a line of its body, but none for that line, ` +
       `so its markers won't come]`);
   }
 
