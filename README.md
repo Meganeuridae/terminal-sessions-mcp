@@ -287,7 +287,8 @@ goes to the running one. The refusal also ends after two seconds in which the
 server has typed no line and read no marker, as when a program rather than a
 shell took the command's line, or a busy shell hasn't read it yet; that
 doesn't mean the command has started. Send refused input again in a moment.
-To interrupt a command, use `sendSignal`, which isn't refused.
+To interrupt a command, use `sendSignal` with SIGINT, its default, which isn't
+refused.
 
 ### Log Operations
 - **tailLogs** - Get recent logs from a session

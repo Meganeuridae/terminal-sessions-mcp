@@ -104,12 +104,15 @@ interface SessionInfo {
   // When the server last typed a line for a command (see typeLine) or acted
   // on a marker (see actOnMarker). Input written by sendInput doesn't count.
   typingProgressAt: number;
-  // Commands whose probe line was typed, with no marker back yet, when a
-  // SIGINT came (see interruptTyping): a no-file marker gives such a command
-  // up rather than typing its body (see typeBodyInline), and a start marker
-  // shows the shell read its file, which takes the mark away. A mark goes
-  // with its command's place in `unfinished`: at its start or exit marker, or
-  // when it is given up (see dropUntyped).
+  // Commands that hadn't started when a ^C was written, and that it didn't
+  // give up (see interruptTyping). A mark acts only at a no-file marker, which
+  // then gives the command up rather than typing its body (see
+  // typeBodyInline): its shell needed the body typed, and the ^C came first.
+  // A command whose shell reads its file starts and runs, and its start
+  // marker takes the mark away. One whose line the ^C discarded never
+  // answers, and its own timeout answers its caller. A mark goes with its
+  // command's place in `unfinished`: at its start or exit marker, or when it
+  // is given up (see dropUntyped).
   interruptedProbes: Set<string>;
 }
 
@@ -345,10 +348,10 @@ const INLINE_PIECES_MAX = 128;
  */
 const HELD_PROBE_MAX_MS = 2000;
 /**
- * The reason a command whose body isn't typed in whole is given up with when
- * a SIGINT comes (see interruptTyping).
+ * The reason a ^C gives up a command with when its body isn't all typed in
+ * (see interruptTyping).
  */
-const INTERRUPTED_BODY = '[command not run: interrupted before its body was typed in]';
+const INTERRUPTED_BODY = '[command not run: interrupted before its body was all typed in]';
 
 export class PersistentSessionServer extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
@@ -744,18 +747,20 @@ export class PersistentSessionServer extends EventEmitter {
   }
 
   /**
-   * Before a SIGINT's ^C is written, give up every command that hasn't
-   * started and whose last line the server hasn't typed. A body's last line
-   * is what runs it, so none of them can run. Over a link, a ^C typed while a
+   * Before a ^C is written (sendSignal's SIGINT, or a C-c sent with
+   * sendInput), give up the commands on their way in that can't have
+   * started: a body going in with lines left and the bodies waiting their
+   * turn (inlineQueue), since a body's last line is what runs it, and a held
+   * probe line, which is then never typed. Over a link, a ^C typed while a
    * body goes in mostly reaches the shell at its prompt between two lines and
    * takes nothing with it, and the server would type the rest and run it.
-   * These are the inline form of the typeahead a ^C discards: a body going in
-   * with lines left, the bodies waiting their turn (inlineQueue), and a held
-   * probe line, which is then never typed. A command whose probe line is
-   * typed and whose first marker hasn't come is marked (interruptedProbes),
-   * since the server doesn't know yet whether a body will follow. A body
-   * whose lines are all typed may be running, and is left to the ^C. Returns
-   * the reason the current command is to be answered with, if it was given up.
+   * These are the inline form of the typeahead a ^C discards. Every other
+   * command that hasn't started is marked (interruptedProbes), since the
+   * server doesn't know yet whether a body will follow: a mark acts only at
+   * a no-file marker. A body whose lines are all typed may be running, and is
+   * left to the ^C. Commands still in the server's queue have no line typed
+   * and aren't touched: they go in after the ^C. Returns the reason the
+   * current command is to be answered with, if it was given up.
    */
   private interruptTyping(session: SessionInfo): string | undefined {
     const given: GivenUp = {};
@@ -771,7 +776,7 @@ export class PersistentSessionServer extends EventEmitter {
       this.dropUntyped(session, current.nonce, given, '[command not run: interrupted before its line was typed]');
     }
     for (const [nonce, started] of session.unfinished) {
-      if (!started && !session.inlineQueue.includes(nonce)) session.interruptedProbes.add(nonce);
+      if (!started) session.interruptedProbes.add(nonce);
     }
     return given.current;
   }
@@ -1559,7 +1564,8 @@ export class PersistentSessionServer extends EventEmitter {
    * command until it starts, ends or is given up, and a body going in for a
    * shell that can't read the temp file, which starts only once it is all in
    * and reads input sent before then itself. The caller sends it again in a
-   * moment.
+   * moment. Input holding a ^C (C-c) first gives up the commands still being
+   * typed in, as sendSignal's SIGINT does (see interruptTyping).
    */
   sendInput(sessionId: string, input: string, appendNewline?: boolean, keys?: string[]): void {
     const session = this.sessions.get(sessionId);
@@ -1571,12 +1577,15 @@ export class PersistentSessionServer extends EventEmitter {
         `and until it has started, input can reach the shell in front instead of the command. ` +
         `Send it again in a moment: the refusal ends when the command starts, ends or is given up, ` +
         `or after two seconds in which the server has typed no line and read no marker. ` +
-        `To interrupt it, use sendSignal, which isn't refused.`);
+        `To interrupt it, use sendSignal with SIGINT, its default, which isn't refused.`);
     }
 
     const dataToSend = buildInputData(input, appendNewline, keys);
+    // A ^C is the same event whichever call writes it (see sendSignal).
+    const givenUp = dataToSend.includes('\x03') ? this.interruptTyping(session) : undefined;
     session.shell.write(dataToSend);
     session.lastActivity = new Date();
+    if (givenUp !== undefined) this.resolveCommand(session, -1, { reason: givenUp });
 
     const hasKeys = !!(keys && keys.length > 0);
     this.notify('session:input', {
@@ -1590,7 +1599,8 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * Send a signal to a session. SIGINT is sent as Ctrl-C, after the commands
-   * still being typed in are given up (see interruptTyping).
+   * still being typed in are given up and the others that haven't started
+   * are marked (see interruptTyping).
    */
   sendSignal(sessionId: string, signal: string = 'SIGINT'): void {
     const session = this.sessions.get(sessionId);

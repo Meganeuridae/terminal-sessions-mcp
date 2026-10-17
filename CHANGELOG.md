@@ -160,18 +160,24 @@
   probe line's round trip, so a `sendInput` sent straight after `runCommand`
   with a timeout of -1 can be refused where 1.6.0 sent it: send it again in a
   moment.
-- **A SIGINT gives up a command still being typed in.** `sendSignal` with
-  SIGINT gives up every command that hasn't started and whose last line
-  hasn't been typed, since a body's last line is what runs it: before its
-  Ctrl-C, or, for a command whose probe line is typed and unanswered, at its
-  no-file marker. Over a link, a Ctrl-C typed between two of a body's lines
-  reaches the shell at its prompt and takes nothing with it, so the rest of
-  the body would be typed and run. The session log gives each one's reason,
-  `[command not run: interrupted before its body was typed in]`, or `[command
-  not run: interrupted before its line was typed]` for a probe line still
-  held, and a caller still waiting gets -1 with it. `stty noflsh`, which
-  keeps typeahead through a Ctrl-C, doesn't keep these. A command whose body
-  is typed in whole, or that reads the temp file, is left to the Ctrl-C.
+- **A SIGINT gives up a command still being typed in.** Before its Ctrl-C,
+  `sendSignal` with SIGINT gives up the commands on their way in that can't
+  have started, since a body's last line is what runs it: a body still being
+  typed in, the bodies waiting their turn, and a probe line held behind them,
+  which is then never typed. Over a link, a Ctrl-C typed between two of a
+  body's lines reaches the shell at its prompt and takes nothing with it, so
+  the rest of the body would be typed and run. The session log gives each
+  one's reason, `[command not run: interrupted before its body was all typed
+  in]`, or `[command not run: interrupted before its line was typed]` for a
+  probe line still held, and a caller still waiting gets -1 with it, whatever
+  `stty noflsh` says. A Ctrl-C sent with `sendInput` (the `C-c` key) does the
+  same. Every other command that hasn't started is marked: if its no-file
+  marker comes, it is given up there rather than its body typed. One whose
+  shell reads the temp file starts and runs, and the Ctrl-C reaches it as
+  any running command; one whose line the Ctrl-C discarded never answers,
+  and its caller gets its timeout's -1. A body typed in whole may be
+  running, and is left to the Ctrl-C. Commands waiting in the server's queue
+  have no line typed, and go in after the Ctrl-C.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
 - Shell history records each command's typed line (a check that the shell
