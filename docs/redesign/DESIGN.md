@@ -230,7 +230,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   process Run. No other source of an exit status exists.
 - **G3.** No caller's deadline changes a Run's state. An `await` that returns `running` is
   a statement about the caller. The daemon never invents an exit status; when it cannot
-  observe one, the Run is `lost` with a reason.
+  observe one, the Run is `lost` with a reason. A shell that exits under a Run gives
+  `shell-exited (status N)` or `(SIGNAL)`, from the shell's own exit, and the result's text
+  names the two usual causes (`exit`, `set -e` in the session shell); a Run whose line turns
+  on `set -e` in the shell gets a hint in its result (a hint, never evidence, as §8.1's).
 - **G4.** A shell Run is admitted only when the shell terminal is **available**: a prompt
   mark has been observed since the last shell Run ended and no shell Run is `starting |
   running`. Otherwise the call returns `busy` with the running Run's id, unless the caller

@@ -57,6 +57,15 @@ scripts parse tool text (agent-framework's code execution). Opt-in tiers: `termi
 `idempotencyKey` (a fresh UUID per operation): a retry returns the first outcome instead of
 running twice, also across a daemon restart for `run` and `start`.
 
+A result `lost` means the daemon could not observe the command's end and refuses to
+guess (DESIGN G3); the reason says why. The common self-inflicted one is `shell-exited
+(status N)`: the shell running the command exited under it. That happens when a command
+runs `exit`, or when `set -e` is on in the session shell and a command fails. `set -e` is
+for scripts. In a session shell, where every Run already reports its own exit status, it
+only arms a trap: it stays on, and every later failing command ends the whole shell and the
+state in it. Keep it inside the script or a subshell (`(set -e; …)`), never in the session
+shell; the result of a Run that turns it on says so.
+
 Over MCPL, each session is a channel. What concerns you arrives on its own: a Run you
 started ending, a service you started turning ready or unhealthy, a watch you set firing, a
 program that seems to wait for input, your session's shell exiting. Before each inference a
@@ -100,11 +109,15 @@ go on. A second hop (`ssh` from the remote) is declared again; `tsm declare work
 takes a declaration back. Cancel inside a declared shell types `^C` and the end marker and
 nothing more: the daemon cannot signal a job on another machine, and says so.
 
-For an unattended remote command, run `ssh -T host 'cmd'` with `--target process`: separate
-stdout and stderr, and ssh's exit status (the remote command's, or 255 for a connection
-error). A `termd` on the remote machine with a forwarded port keeps full semantics across
-tunnel interruptions: reconnect and `await` the same Run instead of rerunning an uncertain
-operation with a fresh key.
+For an unattended remote command, run `ssh -t host 'cmd'`, or `ssh -tt host 'cmd'` with
+`--target process`. With a terminal on the remote side, a cancel here reaches the remote
+command as an interrupt and a dropped connection hangs it up. Without one (`ssh host 'cmd'`,
+or `-T`), ending ssh leaves the remote command running until it writes to the closed
+connection, possibly for a long time; the result of such a Run says so. The process target
+keeps stdout and stderr apart under `-T` and merges them under `-tt`; ssh's exit status is
+the remote command's either way (255 for a connection error). A `termd` on the remote
+machine with a forwarded port keeps full semantics across tunnel interruptions: reconnect
+and `await` the same Run instead of rerunning an uncertain operation with a fresh key.
 
 ## Humans
 

@@ -95,14 +95,62 @@ const BUSY_NEXT: Record<string, string> = {
 const SHELL_OPENER = /^(?:(?:sudo|doas|env|command|exec|time)\s+(?:(?:-\S+|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*)*(?:ssh|mosh|sudo\s+-[is]\b|su\b|docker\s+(?:exec|run)\b|podman\s+(?:exec|run)\b|kubectl\s+exec\b|nix-shell\b|nix\s+develop\b|poetry\s+shell\b|pipenv\s+shell\b|limactl\s+shell\b|lima\s+shell\b|vagrant\s+ssh\b|(?:\S*\/)?(?:sh|bash|zsh|dash|ksh|mksh|fish)(?:\s|$))/;
 export const looksLikeShellOpener = (line: string | undefined): boolean => line !== undefined && SHELL_OPENER.test(line.trim());
 
+/**
+ * Does the line, at a command position, turn on errexit in the shell it runs in (`set -e`,
+ * `set -euo pipefail`, `set -o errexit`)? In a session shell that stays on: the next
+ * failing command ends the whole shell, and the Run in it ends `lost`. A hint only.
+ */
+const ERREXIT = /(?:^|[;&|\n]\s*|\b(?:then|do|else)\s+)set\s+(?:-[A-Za-df-z]*e[A-Za-z]*\b|-o\s+errexit\b)/;
+export const looksLikeErrexit = (line: string | undefined): boolean => line !== undefined && ERREXIT.test(line);
+
+/**
+ * Is the line a one-shot `ssh [options] host command` without `-t`/`-tt`? Such a remote
+ * command has no terminal: a cancel here ends ssh and nothing reaches the command, and a
+ * dropped connection does not hang it up, so it runs on until it writes to the closed
+ * connection. Returns the host for the hint, or undefined. A hint only.
+ */
+const SSH_OPT_WITH_ARG = new Set(['-b', '-B', '-c', '-D', '-e', '-E', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-P', '-Q', '-R', '-S', '-W', '-w']);
+export function oneShotSshWithoutTty(line: string | undefined): string | undefined {
+  if (line === undefined) return undefined;
+  const words = line.trim().split(/\s+/);
+  let i = 0;
+  // Prefixes the shell-opener pattern allows too: sudo/env/command/exec/time and assignments.
+  while (i < words.length && (/^(?:sudo|doas|env|command|exec|time)$/.test(words[i]!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!) || (i > 0 && /^-/.test(words[i]!) && /^(?:sudo|doas|env)$/.test(words[i - 1]!)))) i++;
+  if (words[i] !== 'ssh') return undefined;
+  i++;
+  let tty = false;
+  for (; i < words.length && words[i]!.startsWith('-'); i++) {
+    const w = words[i]!;
+    if (w === '--') { i++; break; }
+    if (/^-t+$/.test(w) || /^-[A-Za-z]*t/.test(w)) tty = true;
+    if (SSH_OPT_WITH_ARG.has(w)) i++;
+  }
+  if (tty || i >= words.length) return undefined;
+  const host = words[i]!;
+  return i + 1 < words.length ? host : undefined; // a host alone opens a shell: that is the other hint
+}
+
+const SET_E_NOTE = 'set -e belongs inside scripts and subshells, not in a session shell, where it makes every later failing command end the whole shell';
+
 function runStatus(r: RunResult): string {
   switch (r.state) {
-    case 'exited':
-      return `exited ${r.exit ?? '?'}${r.signal ? ` (${r.signal})` : ''} in ${fmt(r.durationMs ?? 0)}`;
-    case 'cancelled':
-      return `cancelled${r.signal ? ` by ${r.signal}` : r.exit !== undefined ? ` (exit ${r.exit})` : ''} after ${fmt(r.durationMs ?? 0)}`;
-    case 'lost':
-      return `outcome unknown: ${r.reason ?? 'lost'}`;
+    case 'exited': {
+      // A hint, never evidence: the line turned on set -e in the shell it ran in, where it stays on.
+      const armed = r.target === 'shell' && looksLikeErrexit(r.line) ? ` — this turned on set -e in the shell itself, where it stays on: the next failing command ends the whole shell and the command running then ends lost; ${SET_E_NOTE}. set +e turns it off` : '';
+      return `exited ${r.exit ?? '?'}${r.signal ? ` (${r.signal})` : ''} in ${fmt(r.durationMs ?? 0)}${armed}`;
+    }
+    case 'cancelled': {
+      const host = oneShotSshWithoutTty(r.line);
+      const remote = host !== undefined ? ` — the remote command may still be running on ${host}: without -t it had no terminal there, so ending ssh did not reach it; run remote one-shots as ssh -t host cmd (ssh -tt with target process)` : '';
+      return `cancelled${r.signal ? ` by ${r.signal}` : r.exit !== undefined ? ` (exit ${r.exit})` : ''} after ${fmt(r.durationMs ?? 0)}${remote}`;
+    }
+    case 'lost': {
+      const reason = r.reason ?? 'lost';
+      const shellWent = reason.startsWith('shell-exited')
+        ? ` — the shell running this command exited under it, so its end was never seen; that happens when a command runs exit, or when set -e is on in the shell and a command fails (${SET_E_NOTE})`
+        : '';
+      return `outcome unknown: ${reason}${shellWent}`;
+    }
     case 'queued':
       return `queued for ${fmt(r.queuedMs ?? 0)}, not started — it runs when the shell is free; await it`;
     case 'running':
@@ -119,7 +167,9 @@ function runStatus(r: RunResult): string {
             : `it keeps running; await it, or read since=${r.output.nextCursor}`;
       // A hint, never evidence (§8.1): the line reads like one that opens another shell.
       const opened = r.target === 'shell' && r.shell === undefined && looksLikeShellOpener(r.line) ? ' — if it opened a shell (it looks like it did), declare that with session_declare_shell and run your commands in it' : '';
-      return `${r.state} ${fmt(r.durationMs ?? 0)} so far — ${next}${opened}`;
+      const host = oneShotSshWithoutTty(r.line);
+      const remote = host !== undefined ? ` — a cancel would end ssh, not the command on ${host}, which has no terminal there without -t; run remote one-shots as ssh -t host cmd (ssh -tt with target process) so a cancel or a dropped connection reaches them` : '';
+      return `${r.state} ${fmt(r.durationMs ?? 0)} so far — ${next}${opened}${remote}`;
     }
     case 'busy': {
       const b = r.busy;
@@ -371,7 +421,8 @@ export const TOOLS: ToolDef[] = [
       'When that command opened another shell — `ssh host`, `sudo -i`, `docker exec -it … bash`, a nested `bash` — declare it once with `session_declare_shell`; ' +
       'from then on `run` goes to that shell (output, exit status, `cd`/exports persisting there; results say `cwd unknown` and name the declared shell) until the command ends. ' +
       'A running command that seems to wait for input, or a full-screen program, is flagged in the result (`waiting`). Creates the session if it does not exist. ' +
-      'Use `input` to type into a program that is already running, `screen` to see a full-screen program.',
+      'Use `input` to type into a program that is already running, `screen` to see a full-screen program. ' +
+      'Do not `set -e` in the session shell (keep it inside scripts and subshells): it stays on there, and the next failing command ends the whole shell, so the command running then ends `lost: shell-exited`. Every Run reports its own exit status anyway.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -533,7 +584,8 @@ export const TOOLS: ToolDef[] = [
       'Cancel a Run. A queued Run is dropped. A process Run is signalled SIGINT, then SIGTERM, then SIGKILL, and its exit is ' +
       'observed. A shell Run gets ^C, then ^\\, then SIGTERM and SIGKILL to its foreground job (never the shell); the result ' +
       'says `cancelled` only when the shell confirmed the job ended, and names the escalation (`session_close`) if it survived. ' +
-      'A Run in a declared shell (ssh and the like) gets ^C, the end marker, ^\\ — no signals, its job may be on another machine — and the escalation names the enclosing Run to cancel.',
+      'A Run in a declared shell (ssh and the like) gets ^C, the end marker, ^\\ — no signals, its job may be on another machine — and the escalation names the enclosing Run to cancel. ' +
+      'A one-shot `ssh host cmd` without -t gives the remote command no terminal: cancelling it ends ssh and the remote command runs on; use `ssh -t host cmd` (`ssh -tt` with target process) so a cancel reaches it.',
     inputSchema: {
       type: 'object',
       properties: { runId: { type: 'string' }, session: { ...session, description: 'Optional: the session the Run belongs to.' }, idempotencyKey },

@@ -352,7 +352,7 @@ test('G3/G20: shell death makes in-flight and queued Runs `lost`, never `exited`
   assert.ok(a.admitted && q.admitted);
   h.pty.exit({ exitCode: 1 });
   assert.equal(h.session.run(a.run.runId).state, 'lost');
-  assert.equal(h.session.run(a.run.runId).reason, 'shell-exited');
+  assert.equal(h.session.run(a.run.runId).reason, 'shell-exited (status 1)', "the shell's own status, the clue to set -e");
   assert.equal(h.session.run(q.run.runId).state, 'lost');
   assert.equal(h.session.state, 'exited');
   const exitEv = h.journal.since(0).events.find((e) => e.type === 'session.exit');

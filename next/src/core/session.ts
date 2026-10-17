@@ -990,7 +990,9 @@ export class Session {
     if (this.closeReason !== undefined) ev.reason = this.closeReason;
     this.append(ev);
     // In-flight shell Runs cannot report an end mark now (G3: never invent an exit).
-    const reason = this.closeReason ?? 'shell-exited';
+    // The reason carries how the shell itself ended, which is often the clue: a
+    // shell that exits under a Run with the Run's own failing status had `set -e` on.
+    const reason = this.closeReason ?? this.shellExitedReason();
     for (const r of [this.pendingShellRun, this.currentShellRun]) {
       if (r && !isTerminal(r.state)) this.endRun(r, { state: 'lost', reason });
     }
@@ -1941,9 +1943,16 @@ export class Session {
     }
   }
 
+  /** `shell-exited (status N)` or `shell-exited (SIGNAL)`, from the shell's own exit. */
+  private shellExitedReason(): string {
+    const e = this.exitInfo;
+    if (!e) return 'shell-exited';
+    return `shell-exited (${e.signal ? e.signal : `status ${e.exitCode ?? '?'}`})`;
+  }
+
   private teardownProcess(run: RunRecord): void {
     if (run.endReason !== undefined) return;
-    run.endReason = this.closeReason ?? (this.shellState === 'exited' && !this.closing ? 'shell-exited' : 'session-closed');
+    run.endReason = this.closeReason ?? (this.shellState === 'exited' && !this.closing ? this.shellExitedReason() : 'session-closed');
     const p: Promise<void> = this.cancelProcess(run, 500, [], SYSTEM)
       .catch(() => undefined)
       .finally(() => this.teardowns.delete(p));

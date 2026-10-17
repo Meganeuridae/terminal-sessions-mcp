@@ -149,7 +149,7 @@ for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
       assert.ok(a.admitted);
       const r = await session.awaitRun(a.run.runId, 3000);
       assert.equal(r.state, 'lost');
-      assert.equal(r.reason, 'shell-exited');
+      assert.match(String(r.reason), /^shell-exited \((status \d+|SIG[A-Z]+)\)$/, 'the reason carries how the shell ended');
       assert.equal(session.state, 'exited');
     } finally {
       await session.close();
