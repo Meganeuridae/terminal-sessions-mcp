@@ -659,7 +659,7 @@ export class TermServer {
       watchSessions: false,
     };
     this.conns.add(conn);
-    this.emit('info', 'connection opened', { ...this.connFields(conn), remote, profile: conn.profile });
+    this.emit('info', 'connection opened', { ...this.connFields(conn), remote });
     const pendingMs = this.opts.pendingTimeoutMs ?? 30_000;
     if (pendingMs > 0) {
       // tsg-19: a socket that never says anything does not hold a slot forever.
@@ -861,9 +861,16 @@ export class TermServer {
         const caps = (isObj(p.capabilities) ? p.capabilities : {}) as { experimental?: { mcpl?: unknown } };
         const wantsMcpl = isObj(caps.experimental) && caps.experimental.mcpl !== undefined;
         if (conn.lane) conn.lane.dispose();
-        conn.lane = wantsMcpl ? new McplLane(app, conn.caller, conn.out, (line) => this.emit('info', line, this.connFields(conn))) : null;
+        conn.lane = wantsMcpl ? new McplLane(app, conn.caller, conn.out, (line, level = 'info') => this.emit(level, line, this.connFields(conn))) : null;
         conn.initialized = true;
         conn.kind = conn.lane ? 'mcpl' : conn.gui ? 'gui' : 'mcp';
+        // Where this connection's tools come from (§11): the profile only for a
+        // plain MCP host; an MCPL host's grant decides its tools and deliveries.
+        if (conn.lane) {
+          this.emit('info', "initialized: an MCPL host; its grant (featureSets/update) decides its tools and deliveries, the core tools until it arrives", this.connFields(conn));
+        } else {
+          this.emit('info', 'initialized: a plain MCP host; the profile decides its tools', { ...this.connFields(conn), profile: conn.profile, tools: toolsFor(conn.profile).length });
+        }
         const capabilities: Record<string, unknown> = { tools: { listChanged: true } };
         if (wantsMcpl) capabilities.experimental = { mcpl: manifest() };
         return {

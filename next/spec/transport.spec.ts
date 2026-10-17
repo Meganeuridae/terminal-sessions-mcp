@@ -22,6 +22,7 @@ import { Journal } from '../src/core/journal.js';
 import { MemoryStore } from '../src/core/stores.js';
 import { Follower } from '../src/transport/follower.js';
 import { TermServer, type LogRecord, type ServerOptions, type UsageRecord } from '../src/transport/server.js';
+import { McplLane } from '../src/transport/mcpl.js';
 import { FakeShell } from './fake-shell.js';
 
 const { Terminal } = xterm;
@@ -1171,6 +1172,64 @@ test('tsg-12: on a loopback bind the loopback names are served on any port (port
     assert.equal(refused.status, 421);
     assert.match(refused.body, /--allow-host/);
   } finally {
+    await h.close();
+  }
+});
+
+test("log-1: the log says where each connection's tools come from — the profile for a plain MCP host, the grant for an MCPL host — and warns when no grant arrives", async () => {
+  const warnWas = McplLane.grantWarnMs;
+  McplLane.grantWarnMs = 60;
+  const h = await start();
+  const mcpl = { experimental: { mcpl: { version: '0.5', pushEvents: true, contextHooks: { beforeInference: true }, channels: { register: true, publish: true, incoming: true, lifecycle: true }, featureSets: true } } };
+  const init = (c: Client, capabilities: unknown) => c.request('initialize', { protocolVersion: '2025-06-18', capabilities, clientInfo: { name: 'spec', version: '0' } });
+  const since = (n: number) => h.logs.slice(n);
+  try {
+    // A plain MCP host: the profile, and how many tools it comes to.
+    let n = h.logs.length;
+    const plain = await Client.open(h.port, { profile: 'full', connection: 'plain' });
+    await init(plain, {});
+    const opened = since(n).find((r) => r.msg === 'connection opened')!;
+    assert.ok(opened && !('profile' in opened), 'the open line names no profile: whether one applies is known only at initialize');
+    const plainInit = since(n).find((r) => String(r.msg).startsWith('initialized'))!;
+    assert.deepEqual([plainInit.msg, plainInit.profile, plainInit.tools, plainInit.kind], ['initialized: a plain MCP host; the profile decides its tools', 'full', 20, 'mcp']);
+    // An MCPL host: no profile, even one asked for in the URL; the grant decides, and the log says what it came to.
+    n = h.logs.length;
+    const host = await Client.open(h.port, { profile: 'full', connection: 'mcpl-host' });
+    await init(host, mcpl);
+    const hostInit = since(n).find((r) => String(r.msg).startsWith('initialized'))!;
+    assert.equal(hostInit.msg, 'initialized: an MCPL host; its grant (featureSets/update) decides its tools and deliveries, the core tools until it arrives');
+    assert.ok(!('profile' in hostInit) && hostInit.kind === 'mcpl');
+    // The recipe's four sets asked for, but channels.publish not granted: annotate is not enabled, and the log says why.
+    await host.request('featureSets/update', {
+      effectiveCapabilities: ['tools', 'pushEvents', 'contextHooks.beforeInference.inject.beforeUser'],
+      enabled: ['terminal.core', 'terminal.live', 'terminal.presence', 'terminal.annotate'],
+    });
+    const grant = since(n).find((r) => String(r.msg).startsWith('grant received'))!;
+    assert.equal(grant.level, 'info');
+    assert.match(String(grant.msg), /^grant received: 10 tools; enabled terminal\.core, terminal\.live, terminal\.presence; not enabled: /);
+    assert.match(String(grant.msg), /terminal\.annotate \(missing channels\.publish\)/);
+    assert.match(String(grant.msg), /terminal\.control \(not enabled by the host\)/);
+    const tools = (await host.request('tools/list', {})) as { tools: Array<{ name: string }> };
+    assert.equal(tools.tools.length, 10, 'the profile in the URL changed nothing for the MCPL host');
+    // An MCPL host that never sends its grant: a warning, once, after the grace; a plain host gets none.
+    n = h.logs.length;
+    const silent = await Client.open(h.port, { connection: 'silent' });
+    await init(silent, mcpl);
+    await sleep(200);
+    const warns = since(n).filter((r) => r.level === 'warn');
+    assert.equal(warns.length, 1);
+    assert.match(String(warns[0]!.msg), /^no featureSets\/update from the host 60 ms after initialize: serving the core tools only/);
+    assert.equal(warns[0]!.connection, (since(n).find((r) => r.msg === 'connection opened')!).connection);
+    n = h.logs.length;
+    const late = await Client.open(h.port, { connection: 'late' });
+    await init(late, mcpl);
+    await late.request('featureSets/update', { effectiveCapabilities: ['tools'] });
+    await sleep(200);
+    assert.equal(since(n).filter((r) => r.level === 'warn').length, 0, 'a grant within the grace: no warning');
+    assert.match(String(since(n).find((r) => String(r.msg).startsWith('grant received'))!.msg), /^grant received: 20 tools; enabled terminal\.core, terminal\.control, terminal\.services, terminal\.watch, terminal\.search; not enabled: terminal\.live \(missing pushEvents\)/);
+    for (const c of [plain, host, silent, late]) c.close();
+  } finally {
+    McplLane.grantWarnMs = warnWas;
     await h.close();
   }
 });

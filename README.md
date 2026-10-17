@@ -125,6 +125,15 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
 - **Principals.** Loopback without a token runs as `token:local-<user>`. For several
   agents, `--tokens-file` maps tokens to principals (`{"t1": "agent:linn@animalabs.ai"}`,
   mode 0600). The GUI's browser connection is the human (`human:gui:<name>`).
+- **Which tools a connection gets.** `--profile` applies to plain MCP hosts only (Claude Code,
+  Cursor, the stdio shim): `core` (the default: run, await, read, screen, input, cancel,
+  declare_shell and the three session tools), `full` (every tier), `compat` (the 1.x names).
+  An MCPL host, such as the agent framework, is not on a profile: its own grant
+  (`featureSets/update`) decides its tools and deliveries, so the daemon's `--profile` changes
+  nothing for it. Until the grant arrives it has the core tools and no push events, channels or
+  presence. The daemon log says which it is for each connection (`initialized: …`), what the
+  grant came to (`grant received: … enabled … not enabled …`), and warns when a host has sent
+  no grant five seconds after initializing.
 - **Safety.** Only loopback or `--allow-host` names are accepted as Host; a browser Origin
   other than the daemon's own is refused. A non-loopback bind needs a token. Session shells
   never inherit the daemon's credentials or the launching terminal's identity variables.

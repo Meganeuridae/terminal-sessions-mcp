@@ -262,13 +262,23 @@ export class McplLane {
   private deliverable = { push: false, channels: false };
   private catchingUp: Promise<void> | undefined;
   private disposed = false;
+  /** Warns, once, when the host has sent no grant this long after initializing: the connection is then on the core tools with no deliveries, and the log should say so rather than look like a profile. */
+  static grantWarnMs = 5000;
+  private grantTimer: NodeJS.Timeout | undefined;
 
   constructor(
     private readonly app: App,
     private readonly caller: Caller,
     private readonly out: Outbound,
-    private readonly log: (line: string) => void,
-  ) {}
+    private readonly log: (line: string, level?: 'info' | 'warn') => void,
+  ) {
+    this.grantTimer = setTimeout(() => {
+      this.grantTimer = undefined;
+      if (this.disposed || this.policyReceived) return;
+      this.log(`no featureSets/update from the host ${McplLane.grantWarnMs} ms after initialize: serving the core tools only, with no push events, channels or presence, until the grant arrives`, 'warn');
+    }, McplLane.grantWarnMs);
+    this.grantTimer.unref();
+  }
 
   private get me(): Principal {
     return this.caller.principal;
@@ -326,6 +336,7 @@ export class McplLane {
       this.policyReceived = true;
       this.deliverable = { push: false, channels: false };
       if (this.batch.length) void this.flush();
+      this.log('grant malformed (effectiveCapabilities and deniedCapabilities overlap): nothing is granted, no tools, until a valid featureSets/update', 'warn');
       throw new RpcError(INVALID_PARAMS, 'effectiveCapabilities and deniedCapabilities overlap (§5.4); nothing is granted', { conflicts: r.conflicts });
     }
     const derived = deriveFeatureSets(DECLARATIONS, r.state.effectiveCapabilities);
@@ -333,6 +344,19 @@ export class McplLane {
     const wanted = (n: string) => (selected === null || selected.includes(n) || selected.includes('*')) && !r.state.disabledFeatureSets.includes(n);
     this.enabledFeatureSets = new Set(derived.enabled.filter(wanted));
     if (form === 'request') this.policyReceived = true;
+    if (this.grantTimer) clearTimeout(this.grantTimer);
+    this.grantTimer = undefined;
+    // The log says what the grant came to, so a connection that sees fewer
+    // tools or no deliveries than its host asked for can be read from here.
+    const notEnabled = Object.keys(DECLARATIONS)
+      .filter((n) => !this.enabledFeatureSets.has(n))
+      .map((n) => {
+        const why = derived.disabled[n];
+        if (why) return `${n} (${why.reason === 'capability_denied' ? 'missing ' + why.missingCapabilities.join(', ') : 'invalid uses'})`;
+        return `${n} (${r.state.disabledFeatureSets.includes(n) ? 'disabled by the host' : 'not enabled by the host'})`;
+      });
+    const tools = TOOLS.filter((t) => this.toolAllowed(t.name)).length;
+    this.log(`grant ${form === 'request' ? 'received' : 'updated'}: ${tools} tools; enabled ${[...this.enabledFeatureSets].join(', ') || 'nothing'}${notEnabled.length ? `; not enabled: ${notEnabled.join('; ')}` : ''}`);
     // A reduction binds at once (SPEC §6.7, mcpl-19): what no longer may flow is not sent, and a later widening catches up.
     this.deliverable = {
       push: this.deliverable.push && this.enabled('terminal.live', 'pushEvents'),
@@ -1029,6 +1053,8 @@ export class McplLane {
 
   dispose(): void {
     this.disposed = true;
+    if (this.grantTimer) clearTimeout(this.grantTimer);
+    this.grantTimer = undefined;
     for (const w of this.watched.values()) w.off();
     this.watched.clear();
     if (this.batchTimer) clearTimeout(this.batchTimer);
