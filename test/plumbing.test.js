@@ -1052,12 +1052,35 @@ test("a lone ^C sent with sendInput, as the C-c key or a terminal's Ctrl+C keyst
   }
 });
 
+test("a lone ^C sent with sendInput while the latest command's line is typed and no body goes in isn't refused: the ^C is written, the command is marked, and other input is still refused", (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const written = [];
+  const results = [];
+  const { server, session } = inputServer(written);
+  try {
+    queue(session, 'n1', 'echo one', (r) => results.push(r));
+    server.processCommandQueue(session);
+    assert.equal(written.length, 1, "n1's probe line");
+    assert.throws(() => server.sendInput('s', 'early'), refusal, 'input is refused while n1 is on its way in');
+    server.sendInput('s', '', false, ['C-c']);
+    assert.deepEqual(written.slice(1), ['\x03'], 'the ^C, not refused');
+    assert.ok(session.interruptedProbes.has('n1'), 'n1 is marked, since its shell may yet need its body typed');
+    assert.deepEqual(results, [], 'n1 is not answered: its shell may have read its line');
+    assert.throws(() => server.sendInput('s', 'after'), refusal, 'other input is still refused while n1 is on its way in');
+    assert.equal(written.length, 2, 'nothing more was sent');
+  } finally {
+    for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+    clearTimeout(session.currentTimeout);
+  }
+});
+
 test("input holding a ^C that isn't a lone ^C is refused while a body goes in, sending nothing and giving nothing up, and once the refusal has lapsed it gives the body up", (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   // Only data that is exactly a ^C skips the refusal. Each of these holds a ^C
   // and something more.
   for (const [form, args, data] of [
     ['a ^C among other characters', ['x\x03'], 'x\x03\r'],
+    ['text with the C-c key', ['x', false, ['C-c']], 'x\x03'],
     ['a ^C as text, with the default Enter', ['\x03'], '\x03\r'],
     ['the C-c key with appendNewline true', ['', true, ['C-c']], '\x03\r'],
     ['two C-c keys', ['', false, ['C-c', 'C-c']], '\x03\x03'],

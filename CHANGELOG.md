@@ -129,10 +129,8 @@
   shutdown does). A predecessor that reads stdin can take the queued line as
   its input, and then that command never runs. Interrupting the predecessor
   with Ctrl-C (`sendSignal` SIGINT) discards the lines typed in behind it
-  under the terminal's default settings, so those never run either; in a
-  session that has set `stty noflsh`, they are kept and can still run after
-  it, unless the shell in front can't read the temp files: then each is given
-  up at its no-file marker (see the SIGINT entry below).
+  under the terminal's default settings, so those never run either; the
+  SIGINT entry below says what becomes of them under `stty noflsh`.
 
 ### Changed
 
@@ -145,8 +143,7 @@
   has started (see below), or
   interrupt it with `sendSignal` (SIGINT, the default, sent as Ctrl-C, which
   under the terminal's default settings also discards the commands typed in
-  behind it, and with `stty noflsh` keeps them, so they can still run after
-  it where the shell in front reads the temp files; other signals go to the
+  behind it, as the SIGINT entry below says; other signals go to the
   session's shell itself).
   The `runCommand` tool's `timeout` parameter documents this.
 - **`sendInput` refuses input while a command is on its way in.** A command
@@ -183,13 +180,12 @@
   as any running command. One whose line was still waiting loses it to the
   Ctrl-C, never answers, and its caller gets its timeout's -1, unless `stty
   noflsh` keeps the line: then the line is read after the Ctrl-C as any line
-  typed ahead is, and its command is given up at its no-file marker if its
+  typed ahead is. Its command is then given up at its no-file marker if its
   shell can't read the temp file, and otherwise can still run, its caller
   getting the result or its timeout's -1, whichever comes first. A body typed
   in whole may be running, and is left to the Ctrl-C. Commands waiting in the
-  server's queue have no line typed, and each goes in after the Ctrl-C when
-  the command before it is answered: at once if the Ctrl-C gave that one up,
-  and otherwise at its exit marker, its give-up or its timeout.
+  server's queue have no line typed and aren't given up: each goes in after
+  the Ctrl-C in its turn, as any queued command does.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
 - Shell history records each command's typed line (a check that the shell

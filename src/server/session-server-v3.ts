@@ -763,9 +763,8 @@ export class PersistentSessionServer extends EventEmitter {
    * for one whose body is typed in whole already. A body whose lines are all
    * typed may be running, and is left to the ^C. Commands still in the
    * server's queue have no line typed and aren't touched: each goes in after
-   * the ^C when the command before it is answered, at once if that one was
-   * given up here. Returns the reason the current command is to be answered
-   * with, if it was given up.
+   * the ^C in its turn (processCommandQueue). Returns the reason the current
+   * command is to be answered with, if it was given up.
    */
   private interruptTyping(session: SessionInfo): string | undefined {
     const given: GivenUp = {};
@@ -1610,8 +1609,8 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * Send a signal to a session. SIGINT is sent as Ctrl-C, after the commands
-   * still being typed in are given up and the others that haven't started
-   * are marked (see interruptTyping).
+   * still being typed in are given up and the others whose line is typed and
+   * that haven't started are marked (see interruptTyping).
    */
   sendSignal(sessionId: string, signal: string = 'SIGINT'): void {
     const session = this.sessions.get(sessionId);
