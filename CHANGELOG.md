@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.6.1 - 2026-10-17
+
+### Changed
+
+- **Host and Origin checks at both ports**, as in 2.0. The session API and the
+  web GUI now check every HTTP request and WebSocket / socket.io handshake
+  before the token:
+  - a request carrying an `Origin` is served only from the GUI's own page
+    (same origin as the request's Host) or from an origin listed with
+    `--allow-origin`;
+  - without a token, a request is served only when its Host is `localhost`,
+    `127.0.0.1`, `[::1]` (any port on a loopback bind, so port forwards keep
+    working), the bind address, or a name listed with `--allow-host`. With a
+    token, the token remains the gate and Host is not checked.
+- A token-less server bound to a non-loopback address (`--host 0.0.0.0`) no
+  longer serves requests addressed by other names (a LAN or tailnet IP, a
+  hostname). Use `--token` (recommended) or list the name with `--allow-host`.
+- The GUI's socket.io server no longer sends permissive CORS headers.
+- Request URLs are parsed against a fixed base; token comparison is
+  constant-time.
+
+### Added
+
+- `--allow-host` / `SESSION_SERVER_ALLOW_HOSTS` and `--allow-origin` /
+  `SESSION_SERVER_ALLOW_ORIGINS` (comma-separated, flags repeatable).
+
 ## v1.6.0 - 2026-07-11
 
 ### Added

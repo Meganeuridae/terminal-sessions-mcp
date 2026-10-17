@@ -7,6 +7,7 @@
 import { SessionAPI } from './websocket-api';
 import { WebGUIServer } from '../../gui/src/server';
 import { ChildProcess, spawn } from 'child_process';
+import { AccessOptions, accessFromEnv, splitList } from './request-guard';
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -25,10 +26,25 @@ function getArgValue(argName: string): string | undefined {
   return undefined;
 }
 
+// Every value of a repeatable option (--allow-host a --allow-host=b), each possibly comma-separated
+function getArgValues(argName: string): string[] {
+  const out: string[] = [];
+  args.forEach((a, i) => {
+    if (a.startsWith(`--${argName}=`)) out.push(a.slice(argName.length + 3));
+    else if (a === `--${argName}` && args[i + 1] && !args[i + 1].startsWith('--')) out.push(args[i + 1]);
+  });
+  return splitList(out);
+}
+
 const host = getArgValue('host') || process.env.SESSION_SERVER_HOST || 'localhost';
 const port = parseInt(process.env.SESSION_SERVER_PORT || '3100');
 const guiPort = parseInt(process.env.GUI_PORT || '3200');
 const authToken = getArgValue('token') || process.env.SESSION_SERVER_TOKEN;
+const envAccess = accessFromEnv();
+const access: AccessOptions = {
+  allowHosts: [...(envAccess.allowHosts ?? []), ...getArgValues('allow-host')],
+  allowOrigins: [...(envAccess.allowOrigins ?? []), ...getArgValues('allow-origin')],
+};
 
 console.log(`
 ╔═══════════════════════════════════════╗
@@ -40,9 +56,9 @@ console.log(`
 
 Starting session server on ${host}:${port}...
 ${authToken ? '🔐 Token authentication enabled' : '⚠️  No authentication (use --token for security)'}
-`);
+${authToken ? '' : '   Without a token, only localhost Host names' + (access.allowHosts?.length ? ` and ${access.allowHosts.join(', ')}` : '') + ' are served.\n'}${access.allowOrigins?.length ? `   Browser pages allowed besides the GUI: ${access.allowOrigins.join(', ')}\n` : ''}`);
 
-const api = new SessionAPI(port, host, authToken);
+const api = new SessionAPI(port, host, authToken, access);
 
 const displayHost = host === '0.0.0.0' ? '<hostname>' : host;
 console.log(`
@@ -71,7 +87,7 @@ let guiServer: WebGUIServer | null = null;
 if (!headless) {
   try {
     console.log(`Starting web GUI on ${host}:${guiPort}...`);
-    guiServer = new WebGUIServer(guiPort, host, authToken);
+    guiServer = new WebGUIServer(guiPort, host, authToken, access);
     const tokenHint = authToken ? `?token=...` : '';
     console.log(`✅ Web GUI ready at http://${displayHost}:${guiPort}${tokenHint}\n`);
   } catch (error: any) {

@@ -9,6 +9,7 @@ import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import path from 'path';
 import { RobustSessionClient } from '../../src/client/websocket-client';
+import { AccessOptions, RequestGuard, accessFromEnv, tokenMatches } from '../../src/server/request-guard';
 
 const GUI_PORT = parseInt(process.env.GUI_PORT || '3200');
 const SESSION_SERVER_URL = process.env.SESSION_SERVER_URL || 'ws://localhost:3100';
@@ -20,15 +21,20 @@ export class WebGUIServer {
   private io: SocketIOServer;
   private sessionClient: RobustSessionClient;
   private authToken?: string;
+  private guard: RequestGuard;
 
-  constructor(port: number = GUI_PORT, host: string = 'localhost', authToken?: string) {
+  constructor(port: number = GUI_PORT, host: string = 'localhost', authToken?: string, access: AccessOptions = accessFromEnv()) {
     this.authToken = authToken;
     this.app = express();
     this.httpServer = createServer(this.app);
+    // Host/Origin check at every request and handshake (see src/server/request-guard.ts)
+    this.guard = new RequestGuard(host, () => this.httpServer?.address()?.port ?? port, !!authToken, access, 'WebGUI');
+    // No CORS headers: the only page meant to use this socket is our own, served same-origin.
+    // allowRequest runs for both the polling and the websocket handshake.
     this.io = new SocketIOServer(this.httpServer, {
-      cors: {
-        origin: '*',
-        methods: ['GET', 'POST']
+      allowRequest: (req, callback) => {
+        const verdict = this.guard.check(req);
+        callback(verdict.ok ? null : verdict.message, verdict.ok);
       }
     });
 
@@ -36,6 +42,7 @@ export class WebGUIServer {
     // Prefer the token passed to constructor (from --token CLI arg), fall back to env var
     this.sessionClient = new RobustSessionClient(SESSION_SERVER_URL, authToken || SESSION_SERVER_TOKEN);
 
+    this.setupGuard();
     this.setupStaticFiles();
     this.setupAuth();
     this.setupRoutes();
@@ -59,7 +66,19 @@ export class WebGUIServer {
 
   private validateToken(providedToken?: string): boolean {
     if (!this.authToken) return true; // No auth required
-    return providedToken === this.authToken;
+    return tokenMatches(providedToken, this.authToken);
+  }
+
+  /** Host/Origin check for every HTTP request, static files included, before the token. */
+  private setupGuard(): void {
+    this.app.use((req, res, next) => {
+      const verdict = this.guard.check(req);
+      if (!verdict.ok) {
+        res.status(verdict.status).type('text/plain').send(verdict.message);
+        return;
+      }
+      next();
+    });
   }
 
   private setupAuth(): void {
