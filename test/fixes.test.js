@@ -3,10 +3,14 @@
  * - client request timeouts must always exceed the server-side wait
  * - graceful killSession must not burn its full fallback timeout
  * - session creation waits for the shell, not a fixed sleep
- * - the server's SIGINT fallback yields to an embedding program's handler
+ * - a graceful kill ends the jobs a session's shell started in the background
+ * - the class leaves SIGINT to the program that embeds it
+ * - a program's exit removes its sessions' temp files, with the event loop stopped
+ * - a fresh session's first read isn't blank
  */
 const { test, after } = require('node:test');
 const assert = require('node:assert');
+const { spawn } = require('node:child_process');
 
 const { PersistentSessionServer } = require('../dist/src/server/session-server-v3.js');
 const { RobustSessionClient } = require('../dist/src/client/websocket-client.js');
@@ -24,6 +28,26 @@ test('graceful kill of an idle shell is fast (SIGHUP, not a burned 3s timeout)',
   await server.killSession('t-kill', true);
   const elapsed = Date.now() - start;
   assert.ok(elapsed < 1500, `graceful kill took ${elapsed}ms; must not burn the full 3s`);
+});
+
+test('a graceful kill ends the jobs the session started in the background', async () => {
+  // The shell gets SIGHUP while its terminal is still open, and passes it on to
+  // its jobs before it exits. An interactive bash ignores SIGINT, and SIGKILL
+  // would end the shell before it could pass anything on.
+  await server.createSession('t-kill-job', { shell: '/bin/bash' });
+  const r = await server.execCommand('t-kill-job', 'sleep 60 & echo BGPID=$!', 5000);
+  const pid = Number((String(r.output).match(/BGPID=(\d+)/) || [])[1]);
+  assert.ok(pid > 0, `the background job's pid: ${JSON.stringify(r.output)}`);
+  await server.killSession('t-kill-job', true);
+  // kill(pid, 0) checks that the process exists, on Linux and macOS alike.
+  const running = () => {
+    try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; }
+  };
+  const deadline = Date.now() + 3000;
+  while (running() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+  const outlived = running();
+  if (outlived) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+  assert.strictEqual(outlived, false, `the background job (pid ${pid}) outlived the graceful kill`);
 });
 
 test('client request timeout always exceeds the server-side wait', () => {
@@ -61,43 +85,69 @@ test("session creation waits for the shell to be ready: a slow rc file does not 
   }
 });
 
-test("the server's SIGINT fallback steps aside when the embedding program handles SIGINT, so a graceful shutdown can run", () => {
-  // The constructor registered the fallback; start-session-server registers
-  // `shutdown` after it. With both present the fallback must do nothing, or
-  // it would SIGKILL every shell before the graceful killAll runs, and a
-  // killed shell can't pass the hangup on to its background jobs.
-  const fallback = process.listeners('SIGINT').find((l) => l.toString().includes('forceKillAllSync'));
-  assert.ok(fallback, 'the fallback is registered');
-  const exit = process.exit;
-  let exited = 0;
-  process.exit = () => { exited++; };
-  const noop = () => {};
-  process.on('SIGINT', noop);
+test('the class registers no SIGINT handler, so Ctrl+C belongs to the program that embeds it', () => {
+  // start-session-server handles SIGINT with its graceful shutdown. A handler
+  // of the class's own would run before that shutdown could.
+  const before = process.listenerCount('SIGINT');
+  const another = new PersistentSessionServer();
+  assert.strictEqual(process.listenerCount('SIGINT'), before);
+  void another;
+});
+
+test("a program's exit removes its sessions' temp files, though the event loop has stopped", async () => {
+  // A child program, given a TMPDIR of its own, embeds a server and starts a
+  // multi-line command in each of two bash sessions; each command goes
+  // through a temp file. While both still run, the child lists its TMPDIR and
+  // calls process.exit(0). An 'exit' listener can't await, so only a
+  // synchronous cleanup removes the files.
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-fixes-exit-')));
+  const mod = path.resolve(__dirname, '../dist/src/server/session-server-v3.js');
+  const code = `
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const { PersistentSessionServer } = require(${JSON.stringify(mod)});
+    (async () => {
+      const s = new PersistentSessionServer();
+      for (const id of ['t-exit-1', 't-exit-2']) {
+        await s.createSession(id, { shell: '/bin/bash' });
+        s.execCommand(id, 'echo one\\nsleep 5').catch(() => {});
+      }
+      for (let i = 0; i < 100 && fs.readdirSync(os.tmpdir()).length < 2; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      console.log(JSON.stringify({ tmpdir: fs.realpathSync(os.tmpdir()), files: fs.readdirSync(os.tmpdir()) }));
+      process.exit(0);
+    })().catch((e) => { console.error(e); process.exit(2); });`;
+  const child = spawn(process.execPath, ['-e', code], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+    env: { ...process.env, TMPDIR: dir },
+  });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  // 'close', not 'exit': the child's stdout can still be draining when 'exit' fires.
+  const status = await new Promise((resolve) => child.on('close', (c) => resolve(c)));
   try {
-    fallback();
-    assert.strictEqual(exited, 0, 'with another handler registered, the fallback neither kills nor exits');
-    process.off('SIGINT', noop);
-    // A second server's fallback is not such a handler: two servers in a
-    // program with no handler of its own still end the process on Ctrl+C.
-    const second = new PersistentSessionServer();
-    const fallbacks = process.listeners('SIGINT').filter((l) => l.toString().includes('forceKillAllSync'));
-    assert.strictEqual(fallbacks.length, 2);
-    fallback();
-    assert.strictEqual(exited, 1, "the first server's fallback runs when only the second's is beside it");
-    process.off('SIGINT', fallbacks[1]);
-    void second;
+    assert.strictEqual(status, 0);
+    const before = JSON.parse(out.trim());
+    assert.strictEqual(before.tmpdir, dir, "the child's os.tmpdir() is its own directory");
+    assert.ok(before.files.length >= 2, `both running commands' temp files, before the exit: ${out.trim()}`);
+    assert.deepStrictEqual(fs.readdirSync(dir), [], 'a temp file outlived the program');
   } finally {
-    process.off('SIGINT', noop);
-    process.exit = exit;
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("a fresh session's first prompt stays in the line buffer, so the GUI's first read of the session shows it", async () => {
+test("a fresh session's first read isn't blank: the prompt stays in the line buffer, which getOutput appends", async () => {
   await server.createSession('t-prompt');
   try {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const logs = server.getOutput('t-prompt');
-    assert.ok(logs.length >= 1 && logs.some((l) => /\$ ?$|# ?$|> ?$/.test(l) || l.length > 0), `the prompt line is readable right after creation: ${JSON.stringify(logs)}`);
+    // An idle shell prints nothing more, so a first read that is blank stays blank.
+    const shown = () => server.getOutput('t-prompt').some((l) => l.trim().length > 0);
+    const deadline = Date.now() + 2000;
+    while (!shown() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(shown(), `the first read of a fresh session is blank: ${JSON.stringify(server.getOutput('t-prompt'))}`);
   } finally {
     await server.killSession('t-prompt', false);
   }

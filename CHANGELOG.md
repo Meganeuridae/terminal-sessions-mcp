@@ -14,13 +14,16 @@
   SIGINT, which an interactive bash ignores, so every graceful kill burned
   the full 3s timeout and then SIGKILLed anyway. It now sends SIGHUP (the
   "terminal went away" signal shells exit on) and polls at 50ms — an idle
-  session dies in ~100ms. A graceful kill now also ends the jobs the
+  session dies in ~100ms. bash can leave a SIGHUP that lands between two
+  commands unanswered until its next input, so it is sent again every 500ms
+  while the shell is still there. A graceful kill now also ends the jobs the
   session's shell started in the background (`sleep 300 &`, a service
   started with `&`), since the shell passes the hangup on to them before it
-  exits; 1.6.0 left them running.
-- **Session creation waits for shell readiness** instead of a fixed 200ms
-  sleep, so slow rc files no longer leak startup noise into the first
-  command's output.
+  exits; 1.6.0 left them running. A job started with `nohup`, or disowned,
+  ignores the hangup and keeps running.
+- **Session creation waits for shell readiness**, up to 2s, instead of a
+  fixed 200ms sleep, so an rc file that finishes within that no longer leaks
+  startup noise into the first command's output.
 - **ANSI cleaning covers the full CSI grammar** - sequences with non-letter
   final bytes (e.g. insert-character `ESC[1@`, cursor-style `ESC[2 q`) used
   to leave residue like `[1@` in cleaned output.
@@ -31,15 +34,24 @@
   (`isAlive`, `createdAt`, `lastActivity`, `logSize`).
 - The MCP initialize handshake reports the real package version instead of a
   hardcoded `1.0.0`.
-- Process-exit cleanup force-kills sessions synchronously — the old async
-  graceful path was abandoned mid-flight when the event loop stopped.
-- **Ctrl+C stops the standalone server the way SIGTERM does.** The server's
-  own SIGINT fallback ran before `start-session-server`'s graceful shutdown
-  and SIGKILLed every shell, and a killed shell can't pass the hangup on to
-  its background jobs, which outlived the server (SIGTERM ended them). The
-  fallback now steps aside when the embedding program handles SIGINT, so
-  Ctrl+C runs the same graceful `killAll`: the shells get the hangup, their
-  background jobs end with them, and the server is down in ~150ms.
+- Process-exit cleanup removes the sessions' temp files synchronously. The
+  old async graceful path was abandoned mid-flight when the event loop
+  stopped, which left the temp file behind each session's last multi-line
+  command. The cleanup sends the shells no signal: when the program ends,
+  the kernel hangs up each session's terminal once nothing else holds it
+  open, and a shell such as bash passes the hangup on to the jobs it
+  started in the background, as with 1.6.0.
+- **Ctrl+C runs the standalone server's graceful shutdown.** The server class
+  registered its own SIGINT handler, which exited the process before
+  `start-session-server`'s graceful shutdown could run. The class now
+  registers no SIGINT handler, so Ctrl+C runs the same graceful `killAll` as
+  SIGTERM: the shells get the hangup, their background jobs end with them,
+  and the server is down in under 200ms. A program that embeds
+  `PersistentSessionServer`, directly or through `SessionAPI`, and handles
+  no SIGINT itself now ends on Ctrl+C by the signal, where 1.6.0 exited with
+  status 0. No `exit` listener runs then, the program's own included, so
+  its sessions' temp files stay, as with 1.6.0. Handling SIGINT with
+  `process.exit()` runs them.
 
 ## v1.6.0 - 2026-07-11
 
