@@ -135,7 +135,15 @@ export class PersistentSessionServer extends EventEmitter {
     // Clean up on exit. Exit handlers cannot await, so force-kill synchronously —
     // the async graceful path would be abandoned mid-flight anyway.
     process.on('exit', () => this.forceKillAllSync());
+    // A fallback for a bare server only. The program embedding this one
+    // (start-session-server) registers its own SIGINT handler for a graceful
+    // shutdown; were this one to run first, every shell would be SIGKILLed,
+    // and a killed shell can't pass the hangup on to the jobs it started in
+    // the background, which would then outlive the server (where a SIGTERM
+    // to the same server ends them). So it steps aside when another handler
+    // is registered, and that one's graceful killAll does the work.
     process.on('SIGINT', () => {
+      if (process.listenerCount('SIGINT') > 1) return;
       this.forceKillAllSync();
       process.exit(0);
     });
