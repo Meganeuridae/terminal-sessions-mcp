@@ -767,11 +767,11 @@ export class PersistentSessionServer extends EventEmitter {
    * command, or a marker acted on, within HELD_PROBE_MAX_MS? Input written
    * then can reach the shell in front instead of the command, or go in
    * between a body's lines, so sendInput refuses it, all but a lone ^C, which
-   * gives up what's on its way in before it's written. The body counts on its
-   * own because the latest command can be given up while an earlier body
-   * still goes in. A line that something other than a shell took, which
-   * never answers, stops refusing input after that long, and so does one a
-   * busy shell hasn't read yet.
+   * gives up the commands still being typed in before it's written. The body
+   * counts on its own because the latest command can be given up while an
+   * earlier body still goes in. A line that something other than a shell
+   * took, which never answers, stops refusing input after that long, and so
+   * does one a busy shell hasn't read yet.
    */
   private typingHolds(session: SessionInfo): boolean {
     return (session.typingFor !== undefined || this.bodyGoingIn(session)) &&
@@ -1610,8 +1610,9 @@ export class PersistentSessionServer extends EventEmitter {
     }
     const dataToSend = buildInputData(input, appendNewline, keys);
     // A lone ^C is an interrupt, as sendSignal's SIGINT is, and isn't refused
-    // either: it gives up what's on its way in before it's written. Other input
-    // is what the refusal keeps from reaching the shell in front.
+    // either: it gives up the commands still being typed in before it's written
+    // (see interruptTyping). Other input is what the refusal keeps from
+    // reaching the shell in front.
     if (dataToSend !== '\x03' && this.typingHolds(session)) {
       throw new Error(`Input not sent: a command is still on its way into session ${sessionId}, ` +
         `and until it has started, input can reach the shell in front instead of the command. ` +

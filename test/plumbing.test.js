@@ -1060,6 +1060,7 @@ test("a lone ^C sent with sendInput while the latest command's line is typed and
   try {
     queue(session, 'n1', 'echo one', (r) => results.push(r));
     server.processCommandQueue(session);
+    queue(session, 'n2', 'echo two');
     assert.equal(written.length, 1, "n1's probe line");
     assert.throws(() => server.sendInput('s', 'early'), refusal, 'input is refused while n1 is on its way in');
     server.sendInput('s', '', false, ['C-c']);
@@ -1067,7 +1068,8 @@ test("a lone ^C sent with sendInput while the latest command's line is typed and
     assert.ok(session.interruptedProbes.has('n1'), 'n1 is marked, since its shell may yet need its body typed');
     assert.deepEqual(results, [], 'n1 is not answered: its shell may have read its line');
     assert.throws(() => server.sendInput('s', 'after'), refusal, 'other input is still refused while n1 is on its way in');
-    assert.equal(written.length, 2, 'nothing more was sent');
+    assert.equal(written.length, 2, "nothing more was sent: n2's line waits, since n1 is marked, not answered");
+    assert.equal(session.commandQueue.length, 1, 'n2 still waits in the queue');
   } finally {
     for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
     clearTimeout(session.currentTimeout);

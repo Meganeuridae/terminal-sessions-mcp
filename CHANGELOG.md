@@ -180,12 +180,12 @@
   its line (its own exit marker, a later command's start marker, or the
   shell's exit), instead of being deleted when the next command is written,
   and the server removes the files still pending when its process exits
-  normally (through `process.exit`, as the daemon's SIGINT and SIGTERM
-  shutdown does). A predecessor that reads stdin can take the queued line as
-  its input, and then that command never runs. Interrupting the predecessor
-  with Ctrl-C (`sendSignal` SIGINT) discards the lines typed in behind it
-  under the terminal's default settings, so those never run either; the
-  SIGINT entry below says what becomes of them under `stty noflsh`.
+  normally, as the process-exit cleanup entry above says. A predecessor that
+  reads stdin can take the queued line as its input, and then that command
+  never runs. Interrupting the predecessor with Ctrl-C (`sendSignal` SIGINT)
+  discards the lines typed in behind it under the terminal's default
+  settings, so those never run either; the SIGINT entry below says what
+  becomes of them under `stty noflsh`.
 
 ### Changed
 
@@ -218,29 +218,32 @@
 - **A SIGINT gives up a command still being typed in.** Before its Ctrl-C,
   `sendSignal` with SIGINT gives up the commands on their way in that can't
   have started, since a body's last line is what runs it: a body still being
-  typed in, the bodies waiting their turn, and a probe line held behind them,
-  which is then never typed. Over a link, a Ctrl-C typed between two of a
-  body's lines reaches the shell at its prompt and takes nothing with it, so
-  the rest of the body would be typed and run. The session log gives each
-  one's reason, `[command not run: interrupted before its body was all typed
-  in]`, or `[command not run: interrupted before its line was typed]` for a
-  probe line still held, and a caller still waiting gets -1 with it, whatever
-  `stty noflsh` says. A Ctrl-C sent alone with `sendInput`, as the `C-c` key
-  or a terminal's Ctrl+C keystroke, does the same, and like `sendSignal`'s it
-  isn't refused while a command goes in; input that holds a ^C among other
-  characters does it too, once input is accepted. Every other command whose
-  line is typed and that hasn't started is marked: if its no-file marker
-  comes, it is given up there rather than its body typed. Of the others, one
-  whose shell had already read its line is running, and the Ctrl-C reaches it
-  as any running command. One whose line was still waiting loses it to the
-  Ctrl-C, never answers, and its caller gets its timeout's -1, unless `stty
-  noflsh` keeps the line: then the line is read after the Ctrl-C as any line
-  typed ahead is. Its command is then given up at its no-file marker if its
-  shell can't read the temp file, and otherwise can still run, its caller
-  getting the result or its timeout's -1, whichever comes first. A body typed
-  in whole may be running, and is left to the Ctrl-C. Commands waiting in the
-  server's queue have no line typed and aren't given up: each goes in after
-  the Ctrl-C in its turn, as any queued command does.
+  typed in, the bodies waiting their turn, and a probe line held behind a
+  body, which is then never typed. Over a link, a Ctrl-C typed while a body
+  goes in mostly reaches the shell at its prompt between two of its lines and
+  takes nothing with it, so the rest of the body would be typed and run. The
+  session log gives each one's reason, `[command not run: interrupted before
+  its body was all typed in]`, or `[command not run: interrupted before its
+  line was typed]` for a probe line still held, and a caller still waiting
+  gets -1 with it, whatever `stty noflsh` says. A Ctrl-C sent alone with
+  `sendInput`, as the `C-c` key or a terminal's Ctrl+C keystroke, does the
+  same, and like `sendSignal`'s it isn't refused while a command goes in;
+  input that holds a ^C among other characters does it too, once input is
+  accepted. Every other command whose line is typed and that hasn't started
+  is marked, and what becomes of it depends on whether its shell had read its
+  line and whether that shell can read the temp file. If the shell had read
+  the line and can read the file, the command is running, and the Ctrl-C
+  reaches it as any running command. If the shell had read the line and can't
+  read the file, its no-file marker gives the command up rather than its body
+  being typed. A line still waiting is lost to the Ctrl-C under the
+  terminal's default settings: the command never answers, and its caller gets
+  its timeout's -1. Under `stty noflsh` the line is kept and read after the
+  Ctrl-C, as any line typed ahead is, and the command then runs, its caller
+  getting the result or its timeout's -1, whichever comes first, unless its
+  shell can't read the temp file, whose no-file marker gives it up as above.
+  A body typed in whole may be running, and is left to the Ctrl-C. Commands
+  waiting in the server's queue have no line typed and aren't given up: each
+  goes in after the Ctrl-C in its turn, as any queued command does.
 - Command bodies are sourced with `.` (POSIX) instead of the `source`
   bashism, so plain sh/dash sessions work too.
 - Shell history records each command's typed line (a check that the shell
