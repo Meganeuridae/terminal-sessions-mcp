@@ -1146,7 +1146,7 @@ test("a command waiting in the server's queue goes in after the ^C that gives up
   }
 });
 
-test("a C-c sent with sendInput to a command that has started is written to it and answers nothing itself: only the command's own exit marker answers it", (t) => {
+test("a C-c sent with sendInput to a command that has started is written to it and answers nothing itself: the command's own exit marker, or its timeout, answers it", (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const written = [];
   const results = [];
