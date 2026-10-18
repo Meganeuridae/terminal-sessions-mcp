@@ -67,19 +67,25 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 test('G13 (real bash): attaching during a flood gives snapshot + exactly the later events, which rebuild the screen', async () => {
   const owner = await client('ta');
   await owner.request('tools/call', { name: 'session_open', arguments: { session: 'flood', visibility: 'shared', cols: 80, rows: 20 } });
-  // A short pause every hundred rows keeps the flood going for the viewers, however fast the machine.
-  const cmd = `pad==================================================; for i in $(seq 1 1200); do printf '\\033[3%dmrow %d %s\\033[0m\\n' $((i%8)) $i "\${pad:0:$((i%50))}"; [ $((i%100)) -eq 0 ] && sleep 0.03; done; printf '\\033[5;5HMARK'`;
+  // Each viewer attaches before the producer is released into its next block. A timed
+  // pause cannot guarantee this on a loaded runner: every viewer could arrive after exit.
+  const cmd = `stty -echo; pad==================================================; for i in $(seq 1 1200); do printf '\\033[3%dmrow %d %s\\033[0m\\n' $((i%8)) $i "\${pad:0:$((i%50))}"; if [ $((i%300)) -eq 0 ]; then printf 'PHASE-%d\\n' $((i/300)); IFS= read -r next; fi; done; stty echo; printf '\\033[5;5HMARK'`;
   const run = (await owner.request('tools/call', { name: 'run', arguments: { session: 'flood', command: cmd, wait: 0 } })) as { structuredContent: { runId: string } };
+  const s = registry.get('flood');
+  assert.ok(s && s.kind === 'live');
   const viewers: Array<{ c: Awaited<ReturnType<typeof client>>; snap: { data: string; cols: number; rows: number; seq: number } }> = [];
   for (let k = 0; k < 4; k++) {
-    await sleep(10 + k * 15);
+    const phase = `PHASE-${k + 1}`;
+    const received = () => s.session.journal.since(0).events.filter((e) => e.type === 'output').map((e) => (e as { data: string }).data).join('').includes(phase);
+    const deadline = Date.now() + 10_000;
+    while (!received() && Date.now() < deadline) await sleep(10);
+    assert.ok(received(), `${phase} reached the daemon before attaching`);
     const c = await client('tb');
     const r = (await c.request('terminal/attach', { session: 'flood' })) as { snapshot: { data: string; cols: number; rows: number; seq: number } };
     viewers.push({ c, snap: r.snapshot });
+    await owner.request('tools/call', { name: 'input', arguments: { session: 'flood', text: '\n' } });
   }
   await owner.request('tools/call', { name: 'await', arguments: { session: 'flood', runId: run.structuredContent.runId, wait: 30_000 } });
-  const s = registry.get('flood');
-  assert.ok(s && s.kind === 'live');
   await sleep(300);
   await s.session.screen.settled();
   const last = s.session.journal.lastSeq;
