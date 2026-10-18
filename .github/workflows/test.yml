@@ -30,4 +30,8 @@ jobs:
         if: runner.os == 'macOS'
         run: brew list fish >/dev/null 2>&1 || brew install fish
       - run: npm ci
+      # Fail early with the shell's startup output instead of leaving later
+      # interactive-shell tests waiting behind an unread startup prompt.
+      - name: Check shell startup
+        run: npm run build && node --test --test-name-pattern='G5 rich integration is observed' next/dist/spec/pty.spec.js
       - run: npm test

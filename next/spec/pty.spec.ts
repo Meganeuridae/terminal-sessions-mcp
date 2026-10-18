@@ -79,9 +79,10 @@ async function runWait(s: Session, line: string, wait = 5000) {
 
 for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
   test(`${shell}: G5 rich integration is observed and the shell is available at start`, async () => {
-    const { session } = await real(shell);
+    const { session, journal } = await real(shell);
     try {
-      assert.equal(session.integration, 'rich');
+      const startupOutput = () => journal.since(0).events.filter((e) => e.type === 'output').map((e) => (e as { data: string }).data).join('');
+      assert.equal(session.integration, 'rich', `startup output: ${JSON.stringify(startupOutput())}`);
       assert.equal(session.state, 'idle');
       assert.ok(session.shellAvailable().ok);
     } finally {
