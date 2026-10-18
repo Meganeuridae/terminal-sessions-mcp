@@ -235,6 +235,8 @@ const publicRun = (r: RunRecord): RunInfo => {
  */
 const INLINE_SAFE = new Set([...'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ,._/:=@+-'].map((c) => c.charCodeAt(0)));
 const INLINE_LINE_BYTES = 900;
+/** Ended Runs a session keeps in memory; older ones are read from the journal's run index. */
+const MAX_ENDED_RUNS = 1000;
 
 function inlineTokens(body: string): string[] {
   const out: string[] = [];
@@ -440,6 +442,13 @@ export class Session {
    * one for keystrokes sent while a command ran (typeahead is read after its prompt).
    */
   private typerPrompts = 0;
+  /**
+   * This life's Runs, in admission order, bounded (see pruneRuns): ended Runs beyond
+   * MAX_ENDED_RUNS live on in the journal's run index, which the registry reads for a Run the
+   * session no longer holds. Unbounded, a session that ran process Runs all day grew by their
+   * handles and slowed every listing (the house's review of #11, core finding 3: 10,000 Runs
+   * took 449 MiB and 35 ms per `session_list`).
+   */
   private readonly runs = new Map<string, RunRecord>();
   private currentShellRun: RunRecord | undefined;
   private pendingShellRun: RunRecord | undefined;
@@ -1281,6 +1290,23 @@ export class Session {
     const snapshot = publicRun(run);
     for (const w of run.waiters.splice(0)) w(snapshot);
     for (const w of run.changeWaiters?.splice(0) ?? []) w();
+    this.pruneRuns();
+  }
+
+  /**
+   * Keep at most MAX_ENDED_RUNS ended Runs in memory, the oldest going first. A process Run
+   * whose group still has members stays, so close and cancel can still reach them; so does a
+   * Run anyone still waits on. What goes is read back from the journal's run index.
+   */
+  private pruneRuns(): void {
+    if (this.runs.size <= MAX_ENDED_RUNS) return;
+    for (const [id, r] of this.runs) {
+      if (this.runs.size <= MAX_ENDED_RUNS) break;
+      if (!isTerminal(r.state) || r.waiters.length || r.changeWaiters?.length) continue;
+      if (r.target === 'process' && (r.process?.groupAlive?.() ?? false)) continue;
+      this.runs.delete(id);
+      this.outcomeDelivered.delete(id);
+    }
   }
 
   /** Is the shell terminal available for a shell Run (G4)? */

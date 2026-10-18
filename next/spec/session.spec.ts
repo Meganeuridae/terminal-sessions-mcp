@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import type { ScriptedProcess } from '../src/backends/scripted.js';
 import type { Journal } from '../src/core/journal.js';
 import type { JournalEvent } from '../src/core/types.js';
-import { AGENT, HUMAN, scriptedSession as harness } from './fake-shell.js';
+import { AGENT, HUMAN, scriptedSession as harness, until } from './fake-shell.js';
 
 const types = (j: Journal, from = 0) => j.since(from).events.map((e) => e.type);
 const outputs = (j: Journal) => j.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output');
@@ -384,5 +384,38 @@ test('a Run\'s output is exactly the output events with its runId, with cursors 
   assert.equal(out.truncated, false);
   const t = await h.session.runTranscript(r.runId);
   assert.equal(t.nextCursor, r.seq.end);
+  await h.session.close();
+});
+
+test('a session keeps at most 1,000 ended Runs in memory; older ones are read from the journal\'s run index, and a process Run with a living group stays', async () => {
+  const h = await harness();
+  h.backend.onSpawnProcess = (p) => queueMicrotask(() => p.exit({ exitCode: 0 }));
+  const ids: string[] = [];
+  for (let i = 0; i < 1100; i++) {
+    const a = h.session.admit({ target: 'process', argv: ['true'], principal: AGENT });
+    assert.ok(a.admitted);
+    ids.push(a.run.runId);
+  }
+  await until(() => h.session.run(ids.at(-1)!).state === 'exited', 5000, 'the last Run to end');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(h.session.listRuns().length <= 1000, `in memory: ${h.session.listRuns().length}`);
+  assert.throws(() => h.session.run(ids[0]!), (e: { code?: string }) => e.code === 'run_not_found');
+  const fromIndex = h.journal.runs.run(ids[0]!);
+  assert.deepEqual([fromIndex.runId, fromIndex.state, fromIndex.exit], [ids[0], 'exited', 0]);
+  assert.equal(h.session.run(ids.at(-1)!).state, 'exited', 'the newest stays');
+  // A process Run whose leader exited but whose group still has a member is kept, whatever its age.
+  let keep!: { groupMembers?: number; exit(e: { exitCode: number }): void };
+  h.backend.onSpawnProcess = (p) => { keep = p as never; p.groupMembers = 1; queueMicrotask(() => p.exit({ exitCode: 0 })); };
+  const orphaned = h.session.admit({ target: 'process', argv: ['sh', '-c', 'sleep 300 &'], principal: AGENT });
+  assert.ok(orphaned.admitted);
+  await until(() => h.session.run(orphaned.run.runId).state === 'exited', 3000);
+  h.backend.onSpawnProcess = (p) => queueMicrotask(() => p.exit({ exitCode: 0 }));
+  for (let i = 0; i < 1100; i++) h.session.admit({ target: 'process', argv: ['true'], principal: AGENT });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(h.session.run(orphaned.run.runId).state, 'exited', 'kept: its group still has a member');
+  keep.groupMembers = 0;
+  for (let i = 0; i < 10; i++) h.session.admit({ target: 'process', argv: ['true'], principal: AGENT });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.throws(() => h.session.run(orphaned.run.runId), (e: { code?: string }) => e.code === 'run_not_found', 'gone once its group is');
   await h.session.close();
 });
