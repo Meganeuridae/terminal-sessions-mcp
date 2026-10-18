@@ -101,6 +101,12 @@ if test -n "$__tsm_k"; and not set -q __tsm_key; and status is-interactive
         string collect < $argv[1]
         return $argv[2]
     end
+    # A daemon command file ends with "set -g __tsm_pst $pipestatus $status; __tsm_setst $__tsm_pst[-1]":
+    # the statuses for the end mark, and $status back to the command's own (fish has no other way
+    # to set it; a return outside a function would end this shell).
+    function __tsm_setst
+        return $argv[1]
+    end
     # What the accepted line runs: for a daemon line (" eval (__tsm_collect '<tmp>/tsm-cmd-…' $status)")
     # the file's text.
     function __tsm_text
@@ -124,9 +130,21 @@ if test -n "$__tsm_k"; and not set -q __tsm_key; and status is-interactive
     end
     function __tsm_postexec --on-event fish_postexec
         set -l st $status
+        set -l ps
+        if set -q __tsm_pst
+            set st $__tsm_pst[-1]
+            if test (count $__tsm_pst) -gt 2
+                set ps (string join , $__tsm_pst[1..-2])
+            end
+            set -e __tsm_pst
+        end
         if set -q __tsm_exec_armed; __tsm_exec_disarm; end
         if test -n "$__tsm_in_cmd"
-            __tsm_osc "133;D;$st"
+            if test -n "$ps"
+                __tsm_osc "133;D;$st;p=$ps"
+            else
+                __tsm_osc "133;D;$st"
+            end
             set -g __tsm_in_cmd ''
         end
     end

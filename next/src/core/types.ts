@@ -34,7 +34,7 @@ export type EventInput =
   /** `shell`/`within`: a Run declared for the shell in front of the terminal (§8.1): the kind of shell, and the Run whose program it is (null: what replaced the session's shell). */
   | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string; shell?: string; within?: string | null }
   | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number }
-  | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number; leftovers?: true }
+  | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number; leftovers?: true; pipeStatus?: number[] }
   | { type: 'prompt'; cwd: string; phase: 'start' | 'end' }
   | { type: 'cwd'; path: string }
   | { type: 'env.snapshot'; count: number; vars?: Record<string, string> }
@@ -118,6 +118,12 @@ export interface RunInfo {
    * `cancel` on the Run or closing the session ends them (the house's review of #11, shell tools 5).
    */
   leftovers?: boolean;
+  /**
+   * A shell Run's pipeline, one status per command, when the line was a pipeline and the shell
+   * gave them (bash, zsh, fish); `exit` is the last one unless pipefail is on. Absent for a single
+   * command and under the marker strategy (the house's review of #11, shell tools 3).
+   */
+  pipeStatus?: number[];
 }
 
 export interface ScreenSnapshot {

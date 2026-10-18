@@ -789,7 +789,7 @@ export class Session {
       case 'C':
         return this.onPreExec();
       case 'D':
-        return this.onCommandEnd(mark.exit);
+        return this.onCommandEnd(mark.exit, mark.pipeStatus);
       default:
         return;
     }
@@ -1037,13 +1037,15 @@ export class Session {
     this.startRun(run, { cwd: this.cwdPath });
   }
 
-  private onCommandEnd(exit: number | undefined): void {
+  private onCommandEnd(exit: number | undefined, pipeStatus?: number[]): void {
     this.declareIntegration('basic');
     const run = this.currentShellRun;
     if (run && run.strategy === 'marker') return; // its marker ends it
     if (run && run.state === 'running') {
-      const outcome: { state: 'exited' | 'cancelled'; exit?: number } = { state: run.cancelRequested ? 'cancelled' : 'exited' };
+      const outcome: { state: 'exited' | 'cancelled'; exit?: number; pipeStatus?: number[] } = { state: run.cancelRequested ? 'cancelled' : 'exited' };
       if (exit !== undefined) outcome.exit = exit;
+      // One status per pipeline command (shell tools 3); a single command's is `exit` itself.
+      if (pipeStatus && pipeStatus.length > 1) outcome.pipeStatus = pipeStatus;
       this.endRun(run, outcome);
     }
     this.currentShellRun = undefined;
@@ -1271,7 +1273,7 @@ export class Session {
     });
   }
 
-  private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; leftovers?: boolean }): void {
+  private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; leftovers?: boolean; pipeStatus?: number[] }): void {
     if (isTerminal(run.state)) return;
     const endedAt = this.now();
     const durationMs = endedAt - (run.startedAt ?? run.admittedAt);
@@ -1281,6 +1283,7 @@ export class Session {
     if (outcome.signal) ev.signal = outcome.signal;
     if (reason) ev.reason = reason;
     if (outcome.leftovers) ev.leftovers = true;
+    if (outcome.pipeStatus) ev.pipeStatus = [...outcome.pipeStatus];
     // G28: run.end is journaled while the waiting principals are still recorded as
     // awaiting; the waiters are released after it.
     const ended = this.append(ev);
@@ -1291,6 +1294,7 @@ export class Session {
     if (outcome.signal) run.signal = outcome.signal;
     if (reason) run.reason = reason;
     if (outcome.leftovers) run.leftovers = true;
+    if (outcome.pipeStatus) run.pipeStatus = [...outcome.pipeStatus];
     // A line the shell never started goes with its file too: a late read of it sources a
     // missing file and never runs the command unawaited (ss-8). Close waits for the removal,
     // then removes the command directory.
@@ -1752,7 +1756,9 @@ export class Session {
     // written before any state changes, so a failure leaves nothing half-launched.
     let file: string;
     try {
-      file = this.writeTempFile(run.line ?? '');
+      // With an integration (bash, zsh, fish), the file ends by capturing the pipeline's statuses
+      // for the end mark; the marker strategy's shell (dash, an unknown sh) gets the text alone.
+      file = this.writeTempFile(run.line ?? '', this.integrationLevel !== 'none');
     } catch (e) {
       this.endRun(run, { state: 'lost', reason: `temp-file: ${errMessage(e)}` });
       return;
@@ -1799,11 +1805,18 @@ export class Session {
     return this.flavor === 'fish' ? '$status' : '$?';
   }
 
-  private writeTempFile(body: string): string {
+  private writeTempFile(body: string, capturePipeStatus = false): string {
     // Typed (and echoed at the prompt) as ` . '<dir>/tsm-cmd-N'`: the integration scripts know
     // plumbing by that name, and a short command directory keeps the echo short.
     const name = `tsm-cmd-${++this.tempCounter}`;
-    const text = body.endsWith('\n') ? body : body + '\n';
+    let text = body.endsWith('\n') ? body : body + '\n';
+    // The pipeline's statuses (shell tools 3) are gone by the time the integration's end hook
+    // runs: after `. file`, bash, zsh and fish report the statuses of `.` itself. So the file
+    // captures them as its last line, in the same statement as `$?`, and returns with that status
+    // so the shell and its prompt see the command's own. The empty line before it ends a command
+    // whose last line continued with a backslash. The end hook reads and unsets the variable.
+    // (bash's PIPESTATUS and zsh's pipestatus in one line: each is empty in the other shell.)
+    if (capturePipeStatus) text += this.flavor === 'fish' ? '\nset -g __tsm_pst $pipestatus $status; __tsm_setst $__tsm_pst[-1]\n' : '\n__tsm_st=$? __tsm_ps="${PIPESTATUS[*]-}${pipestatus[*]-}"; return $__tsm_st\n';
     if (this.commandDir !== this.tempDir && !this.commandDirTrusted()) {
       // jr2-3: the short directory lives under /tmp, where a cleaner may remove it and anyone
       // may create a directory of that name. Not provably ours: the session's own directory

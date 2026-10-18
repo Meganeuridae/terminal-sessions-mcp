@@ -52,3 +52,13 @@ test('the status line says when a process Run left children running in its group
   assert.match(left, /cancel r1 ends them, as does closing the session/);
   assert.doesNotMatch(text(base({ target: 'process', line: 'echo alone' })), /left processes running/);
 });
+
+test('the status line reports a failure earlier in a pipeline beside the exit, and says nothing for a clean one', () => {
+  const masked = text(base({ line: "sh -c 'exit 1' | tail -n 1", pipeStatus: [1, 0] }));
+  assert.match(masked, /exited 0 .* — pipeline statuses 1 \| 0: a command before the last one failed; the exit is the last command’s \(pipefail is off\)/);
+  const pipefail = text(base({ line: 'a | b', exit: 1, pipeStatus: [3, 1] }));
+  assert.match(pipefail, /exited 1 .* — pipeline statuses 3 \| 1: a command before the last one failed/);
+  assert.doesNotMatch(pipefail, /pipefail is off/);
+  assert.doesNotMatch(text(base({ line: 'a | b', pipeStatus: [0, 0] })), /pipeline statuses/);
+  assert.doesNotMatch(text(base({ line: 'a | b', exit: 1, pipeStatus: [0, 1] })), /pipeline statuses/, 'the last command failing is what the exit already says');
+});

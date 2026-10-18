@@ -118,3 +118,12 @@ test('ss-4: rekey retires the old key — its marks become output, and its text 
   assert.deepEqual(marksOf(pieces).map((m) => m.code), ['A']);
   assert.equal(outputOf(pieces), K('133;D;0'));
 });
+
+test('a D mark carries the pipeline statuses the integration captured (p=1,0); a malformed list is left as a plain param', () => {
+  const p = new MarksParser(KEY);
+  const marks = marksOf(p.feed(K('133;D;0;p=1,0') + K('133;D;1;p=3,1') + K('133;D;0;p=x,0') + K('133;D;7')));
+  assert.deepEqual(marks[0], { osc: 133, code: 'D', exit: 0, pipeStatus: [1, 0], params: ['0', 'p=1,0'] });
+  assert.deepEqual(marks[1], { osc: 133, code: 'D', exit: 1, pipeStatus: [3, 1], params: ['1', 'p=3,1'] });
+  assert.deepEqual(marks[2], { osc: 133, code: 'D', exit: 0, params: ['0', 'p=x,0'] });
+  assert.deepEqual(marks[3], { osc: 133, code: 'D', exit: 7, params: ['7'] });
+});

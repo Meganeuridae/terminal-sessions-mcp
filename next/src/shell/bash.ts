@@ -162,9 +162,12 @@ __tsm_cmdline() {
 # D for the command that just ended ($1: its status).
 __tsm_close() {
   if [ -n "$__tsm_in_cmd" ]; then
-    __tsm_osc "133;D;$1"
+    # A daemon command file ends by capturing its pipeline's statuses into __tsm_ps (the
+    # statuses of '.' itself are all the hook could see): they ride on D as p=1,0.
+    if [ -n "$\{__tsm_ps+x}" ]; then __tsm_osc "133;D;$1;p=$\{__tsm_ps// /,}"; else __tsm_osc "133;D;$1"; fi
     __tsm_in_cmd=
   fi
+  unset __tsm_ps __tsm_st
   if [ -z "$__tsm_hist_init" ]; then
     __tsm_hist_init=1
     __tsm_cmdline

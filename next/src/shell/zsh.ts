@@ -90,9 +90,12 @@ __tsm_close() {
   emulate -L zsh
   if [[ -n $\{__tsm_exec_armed-} ]]; then __tsm_exec_disarm; fi
   if [[ -n $__tsm_in_cmd ]]; then
-    __tsm_osc "133;D;$1"
+    # A daemon command file ends by capturing its pipeline's statuses into __tsm_ps (the
+    # statuses of '.' itself are all the hook could see): they ride on D as p=1,0.
+    if [[ -n $\{__tsm_ps+x} ]]; then __tsm_osc "133;D;$1;p=$\{__tsm_ps// /,}"; else __tsm_osc "133;D;$1"; fi
     __tsm_in_cmd=
   fi
+  unset __tsm_ps __tsm_st
   if (( __tsm_psp )); then __tsm_prompt_sp; fi
 }
 __tsm_prompt_sp() {

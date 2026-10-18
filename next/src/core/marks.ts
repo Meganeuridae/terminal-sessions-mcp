@@ -23,7 +23,7 @@
  * the key's text — is held back (bounded), so ordinary output is not delayed by it.
  */
 
-export type Mark133 = { osc: 133; code: 'A' | 'B' | 'C' | 'D' | string; exit?: number; params: string[] };
+export type Mark133 = { osc: 133; code: 'A' | 'B' | 'C' | 'D' | string; exit?: number; /** `D;<exit>;p=1,0`: the pipeline's statuses, when the integration captured them. */ pipeStatus?: number[]; params: string[] };
 export type Mark633 = {
   osc: 633;
   code: string;
@@ -222,6 +222,8 @@ function parseParams(ident: string, rest: string): Mark {
   if (ident === '133') {
     const mark: Mark133 = { osc: 133, code, params };
     if (code === 'D' && params[0] !== undefined && /^-?\d+$/.test(params[0])) mark.exit = Number(params[0]);
+    const pipe = code === 'D' ? params.find((x) => /^p=\d+(?:,\d+)*$/.test(x)) : undefined;
+    if (pipe !== undefined) mark.pipeStatus = pipe.slice(2).split(',').map(Number);
     return mark;
   }
   const mark: Mark633 = { osc: 633, code, params };

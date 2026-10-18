@@ -47,6 +47,8 @@ export interface RunResult {
   reason?: string;
   /** A process Run that left children running in its group (RunInfo.leftovers). */
   leftovers?: boolean;
+  /** A shell pipeline's statuses, one per command (RunInfo.pipeStatus). */
+  pipeStatus?: number[];
   durationMs?: number;
   cwd: string;
   origin?: RunInfo['origin'];
@@ -677,6 +679,7 @@ export class App {
     if (run.signal) res.signal = run.signal;
     if (run.reason) res.reason = run.reason;
     if (run.leftovers) res.leftovers = true;
+    if (run.pipeStatus) res.pipeStatus = [...run.pipeStatus];
     if (run.startedAt !== undefined) res.durationMs = (run.endedAt ?? Date.now()) - run.startedAt;
     else if (run.state === 'queued') res.queuedMs = Date.now() - run.admittedAt;
     if (run.envBasis) res.envBasis = run.envBasis;
@@ -847,6 +850,7 @@ export class App {
     if (run.signal) res.signal = run.signal;
     if (run.reason) res.reason = run.reason;
     if (run.leftovers) res.leftovers = true;
+    if (run.pipeStatus) res.pipeStatus = [...run.pipeStatus];
     if (run.startedAt !== undefined) res.durationMs = (run.endedAt ?? Date.now()) - run.startedAt;
     if (run.envBasis) res.envBasis = run.envBasis;
     if (run.shell !== undefined) res.shell = run.shell;

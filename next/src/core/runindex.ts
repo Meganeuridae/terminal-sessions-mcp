@@ -218,6 +218,7 @@ export class RunIndex {
         if (ev.signal) r.signal = ev.signal;
         if (ev.reason) r.reason = ev.reason;
         if (ev.leftovers) r.leftovers = true;
+        if (ev.pipeStatus) r.pipeStatus = [...ev.pipeStatus];
         this.openIds.delete(ev.runId);
         return;
       }

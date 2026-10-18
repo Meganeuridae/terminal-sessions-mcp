@@ -234,7 +234,12 @@ export class FakeShell {
       const file = src[1].replace(/'\\''/g, "'");
       tail = src[2] ?? '';
       try {
-        line = fs.readFileSync(file, 'utf8').replace(/\n$/, '');
+        // The daemon ends a command file with a line capturing the pipeline's statuses (shell tools 3);
+        // a real shell runs it and returns with the command's status. The fake drops it and runs the text.
+        line = fs
+          .readFileSync(file, 'utf8')
+          .replace(/\n\n(?:__tsm_st=\$\? __tsm_ps=.*; return \$__tsm_st|set -g __tsm_pst \$pipestatus \$status; __tsm_setst .*)\n$/, '\n')
+          .replace(/\n$/, '');
       } catch {
         // As a real shell does when the file is gone (the session removed it on close or cancel).
         line = `echo "${file}: No such file or directory"; false`;

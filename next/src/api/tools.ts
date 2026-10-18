@@ -141,7 +141,11 @@ function runStatus(r: RunResult): string {
       // A hint, never evidence: the line turned on set -e in the shell it ran in, where it stays on.
       const armed = r.target === 'shell' && looksLikeErrexit(r.line) ? ` — this turned on set -e in the shell itself, where it stays on: the next failing command ends the whole shell and the command running then ends lost; ${SET_E_NOTE}. set +e turns it off` : '';
       const left = r.leftovers ? ` — it left processes running in its group (a child put in the background): they run on, their output is journaled without this Run's id; cancel ${r.runId ?? 'this Run'} ends them, as does closing the session` : '';
-      return `exited ${r.exit ?? '?'}${r.signal ? ` (${r.signal})` : ''} in ${fmt(r.durationMs ?? 0)}${armed}${left}`;
+      // A failure earlier in the pipeline (shell tools 3): the exit alone would read as success.
+      const ps = r.pipeStatus ?? [];
+      const earlierFailed = ps.length > 1 && ps.slice(0, -1).some((x) => x !== 0);
+      const pipe = earlierFailed ? ` — pipeline statuses ${ps.join(' | ')}: a command before the last one failed${r.exit === ps[ps.length - 1] && r.exit === 0 ? '; the exit is the last command’s (pipefail is off)' : ''}` : '';
+      return `exited ${r.exit ?? '?'}${r.signal ? ` (${r.signal})` : ''} in ${fmt(r.durationMs ?? 0)}${pipe}${armed}${left}`;
     }
     case 'cancelled': {
       const host = oneShotSshWithoutTty(r.line);

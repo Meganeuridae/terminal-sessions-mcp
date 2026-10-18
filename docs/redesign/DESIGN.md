@@ -261,7 +261,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 ### Execution
 
 - **G6.** Shell Runs execute in the session's persistent shell: cwd and env effects persist,
-  and the exit code is the shell's `$?` for that line. Every daemon-issued line — one line
+  and the exit code is the shell's `$?` for that line; when the line is a pipeline and the shell
+  gives each command's status (bash, zsh, fish), the result carries them too (`pipeStatus`) and
+  the status line says when a command before the last one failed, since `$?` alone is the last
+  command's unless pipefail is on. Every daemon-issued line — one line
   or many — is delivered as a sourced command file (` . '<dir>/tsm-cmd-N'`), never as
   keystrokes through the line editor, so history expansion, completion, comments, syntax
   errors and continuation prompts can neither change it nor wedge the session; a line the
