@@ -8,18 +8,19 @@
  * with `--enable-experimental-regexp-engine`): matching costs O(pattern × input)
  * whatever the pattern. How a pattern is prepared for it:
  *
- * - That engine has no back-references or lookahead: those patterns are refused
- *   (lookbehind works).
+ * - That engine has no back-references or lookahead: those patterns are refused.
+ *   Lookbehind works from Node 22 on; a pattern the engine still rejects (lookbehind on
+ *   Node 20) runs on the backtracking engine, with its refusals and the input window.
  * - It has no case-insensitive mode: `i` is compiled by rewriting each letter
  *   into the class of what `i` equates it with (`a` → `[Aa]`, see `foldCase`).
  * - Groups are compiled non-capturing: callers use the match, never its groups,
  *   and every capture multiplies the engine's work (a match's `groups` and
  *   indices past 0 are therefore absent).
  * - It takes counted repetition only up to 16 copies along one nesting of
- *   quantifiers (`x{17}` and `(?:x{4}){5}` are refused by it), so a larger count
- *   is written out here (`x{2,20}` → `xx` and eighteen `x?`) while the result
- *   stays within MAX_EXPANDED_LENGTH; beyond that the pattern is refused, saying
- *   why.
+ *   quantifiers (`x{17}` and `(?:x{4}){5}` are refused by it, and `x+` counts as
+ *   two copies, `xx*`, to Node 20's engine), so a larger count is written out
+ *   here (`x{2,20}` → `xx` and eighteen `x?`) while the result stays within
+ *   MAX_EXPANDED_LENGTH; beyond that the pattern is refused, saying why.
  *
  * The engine's cost still grows with the pattern: a thousand-character pattern
  * matched against a 64 KiB line takes seconds. So each compiled pattern gets a
@@ -101,7 +102,9 @@ export function compileUserRegex(pattern: string, flags = ''): RegExp {
   try {
     re = new RegExp(final, `${base.replace('i', '')}l`);
   } catch {
-    throw err('invalid_argument', REFUSED);
+    // This Node's engine takes less than modelled here (Node 20's has no lookbehind): the
+    // backtracking engine, with its own refusals, on the ordinary input window.
+    return backtracking(pattern, base);
   }
   windows.set(re, size === undefined ? MIN_WINDOW : Math.max(MIN_WINDOW, Math.min(MAX_MATCH_INPUT, Math.floor(MATCH_COST / Math.max(1, sizeOf(size))))));
   return re;
@@ -284,6 +287,25 @@ function nullable(n: Node): boolean {
  */
 const copies = (q: Extract<Node, { kind: 'quant' }>): number => (q.max !== Infinity ? Math.max(1, q.max) : q.min === 0 ? 1 : q.min + (nullable(q.body) ? 1 : 0));
 
+/** The copies the engine itself makes of a quantifier's body: `x{m,}` is `x{m}x*` to it, so `x+` is two (Node 20's engine counts so; Node 22's is more lenient). */
+const engineCopies = (q: Extract<Node, { kind: 'quant' }>): number => (q.max !== Infinity ? Math.max(1, q.max) : q.min === 0 ? 1 : q.min + 1);
+
+/** The most copies along one nesting of quantifiers within `n`, as the engine counts them. */
+function nesting(n: Node): number {
+  switch (n.kind) {
+    case 'atom':
+      return 1;
+    case 'seq':
+      return Math.max(1, ...n.items.map(nesting));
+    case 'alt':
+      return Math.max(1, ...n.branches.map(nesting));
+    case 'group':
+      return nesting(n.body);
+    case 'quant':
+      return engineCopies(n) * nesting(n.body);
+  }
+}
+
 /** The engine's work per input character, roughly: atoms times the copies they are repeated in. */
 function sizeOf(n: Node): number {
   switch (n.kind) {
@@ -319,8 +341,8 @@ function emit(n: Node, product: number): string {
     case 'group':
       return `${n.capture ? '(?:' : n.open}${emit(n.body, product)})`;
     case 'quant': {
-      const c = copies(n);
-      if (product * c <= MAX_COPIES) return `${emit(n.body, product * c)}${n.src}`;
+      const c = engineCopies(n);
+      if (product * c * nesting(n.body) <= MAX_COPIES) return `${emit(n.body, product * c)}${n.src}`;
       // Too many copies for the engine: write them out. A body is an atom or a
       // group, so each copy takes a quantifier as it stands.
       const body = emit(n.body, product);
