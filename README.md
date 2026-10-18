@@ -20,6 +20,9 @@ termd                                 # ws://127.0.0.1:3101 · GUI at http://127
 tsm run demo 'echo hello; pwd'        # exit code = the command's; 2 while still running
 ```
 
+On macOS and Linux, process Runs use `/bin/bash` to close inherited descriptors before
+executing the command. Command text itself runs in `/bin/sh`.
+
 Then connect a host (configurations in [`next/config/`](next/config/)):
 
 - **Claude Code with `mcpl-cc-bridge`**: add the `terminal` entry from
@@ -31,11 +34,12 @@ Then connect a host (configurations in [`next/config/`](next/config/)):
 - **Any MCP host** (Cursor, Claude Desktop, Claude Code without the bridge):
   `next/config/mcp.json` — the stdio shim starts `termd` if nothing is listening, unless a
   termd launchd job or systemd user unit exists (then it is the supervisor's to start, and the
-  shim waits for it) or `TSM_NO_SPAWN=1` says never to.
+  shim waits for it) or `TSM_NO_SPAWN=1` says never to. With a supervisor unit of your own
+  name, set `TSM_NO_SPAWN=1` in the shim's configuration.
 
 ## What an agent gets
 
-Nine core tools, one verb each (DESIGN §11, §11.1):
+Ten core tools, one verb each (DESIGN §11, §11.1):
 
 | Tool | Use it to |
 |---|---|
@@ -46,6 +50,7 @@ Nine core tools, one verb each (DESIGN §11, §11.1):
 | `input` | type text and named keys, nothing appended |
 | `cancel` | stop a Run: queued → dropped; process → SIGINT/TERM/KILL; shell → ^C, ^\, then the foreground job |
 | `session_list`, `session_open`, `session_close` | manage sessions |
+| `session_declare_shell` | declare that the foreground program is a shell, so subsequent Runs execute there |
 
 Every result has two renderings: a readable transcript closed by one status line —
 `[run r4-1a2b exited 1 in 8.2s · shell · cwd /w/app · next=4990]` — and a structured
@@ -102,20 +107,26 @@ at the declaration; the kind of shell only needs naming for fish (`tsm declare w
 Commands to a declared shell travel inline with start and end markers, so each one is a Run
 with output and exit status, and `cd`, exports and activations persist on the remote side;
 long commands go in pieces. The result says `cwd unknown` and names the declared shell.
-When `ssh` exits — the remote `exit`, or a dropped connection — the declaration ends with it:
-the next `run` is in the session's own shell again, a note in the session's history says
+When `ssh` exits because you asked — `exit` typed into it, or a cancel of the `ssh` Run — the
+declaration ends with it and the next `run` is in the session's own shell again. When it
+ends without your asking — the connection dropped, the remote shell died — the next `run` is
+refused once (`busy: declared-shell-ended`) rather than run on the wrong machine: run it again
+if the session's own shell is what you mean. Either way a note in the session's history says
 so, and a command that was in flight ends `lost` with that reason rather than being guessed
 at. The same works for `sudo -i`, `docker exec -it … bash`, a nested `bash`, and a shell
 that replaced the session's own (`exec sh`, reported as `shell-unavailable`): declare it and
 go on. A second hop (`ssh` from the remote) is declared again; `tsm declare work none`
-takes a declaration back. Cancel inside a declared shell types `^C` and the end marker and
-nothing more: the daemon cannot signal a job on another machine, and says so.
+takes a declaration back. A partial line someone is typing at its prompt makes a new Run
+busy (`human-editing`), or queued until the line is cleared or goes stale. Cancel inside a
+declared shell types `^C`, the end marker and then `^\\`: the daemon cannot signal a job
+on another machine, and says so.
 
 For an unattended remote command, run `ssh -t host 'cmd'`, or `ssh -tt host 'cmd'` with
 `--target process`. A cancel here ends the local ssh client; that is all the daemon can see,
-and all `cancelled` means. With a terminal on the remote side, ssh passes the interrupt on
-and a dropped connection hangs the remote command up, which most commands stop for; one that
-traps or ignores those runs on, and nothing here knows. Without a terminal (`ssh host 'cmd'`,
+and all `cancelled` means. With `ssh -t` in the shell, terminal cancellation sends an interrupt,
+then quit (`^\\`); with `ssh -tt` as a process Run, ending ssh hangs the remote command up.
+A command that traps or ignores those signals can run on, and nothing here knows.
+Without a terminal (`ssh host 'cmd'`,
 or `-T`), the remote command gets neither and runs until it writes to the closed
 connection; the result of such a Run says so. The process target keeps stdout and stderr
 apart under `-T` and merges them under `-tt`; ssh's exit status is the remote command's

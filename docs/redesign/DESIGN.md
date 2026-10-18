@@ -579,8 +579,14 @@ nothing starts and the result says so. Cancel does what a person at the keyboard
 the end marker typed alone, `^\` — never a signal to the local foreground group (that is the
 `ssh`), and names the enclosing Run as the escalation. The declaration ends by itself when the
 Run whose program the shell is ends: its Runs in flight end `lost` (`enclosing-run-ended`),
-queued ones too, a note is journaled, and shell Runs go to the session's own shell (or to the
-declaration below) again. One Run at a time per declared shell; a second hop is declared
+queued ones too, and a note is journaled. When the caller asked for that end — an explicit
+`exit` or `logout` Run is executing, or the caller cancelled the enclosing Run — shell
+Runs go to the session's own shell (or to the declaration below) at once. Otherwise the end is
+unexpected (a dropped connection, a remote shell that died; an end the daemon cannot attribute
+to the caller counts as unexpected) and the daemon fails closed: the next shell Run is refused
+once (`declared-shell-ended`, naming the enclosing Run), since a line meant for that shell
+would otherwise run in the one underneath; the Run after it goes there (settled with the
+reviewers of #11, 2026-10-18). One Run at a time per declared shell; a second hop is declared
 again (the innermost running Run is its program); `none` takes a declaration back. Results of
 declared Runs carry `shell` and `within` and report the cwd as unknown.
 
@@ -1083,6 +1089,9 @@ addition; nothing about them touches the live PTY.
 - TypeScript strict, ESM, Node ≥ 20. No `any` at boundaries. Every operation validated
   against its schema before dispatch. Errors are typed with codes and reach hosts as
   JSON-RPC errors, never as `{success: false}`.
+  Regex support is capability-checked: Node 20's linear engine refuses lookbehind, and
+  misorders some nullable bounded repetitions. Such patterns receive an explicit error
+  on that engine instead of a wrong match or an automatic switch to backtracking.
 - Structured logs (JSON lines) with `session`, `principal`, `runId`; client strings are
   length-limited and JSON-encoded, tokens never appear. `/health` reports per-session
   state, backend, integration, controller, the current Run, journal stats (bytes, retention,
