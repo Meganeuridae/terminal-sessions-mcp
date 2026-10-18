@@ -48,3 +48,47 @@ jobs:
       - name: Check shell startup
         run: npm run build && node --test --test-name-pattern='G5 rich integration is observed' next/dist/spec/pty.spec.js
       - run: npm test
+
+  # The two checks against real MCPL hosts (next/acceptance), which `npm test` does not run: the
+  # agent-framework host with a mock model, and mcpl-cc-bridge's own host classes under bun. Each
+  # host is checked out at a pinned commit of its main and built as its README says; a host that
+  # is missing fails the job rather than skipping (ACCEPTANCE_REQUIRED). Move a pin when the host
+  # changes something the check depends on, and say so in the commit.
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: anima-research/agent-framework
+          ref: 0d19f7c8996433ffd1d7adbd45842559dad1c8bd
+          path: .hosts/agent-framework
+      - uses: actions/checkout@v4
+        with:
+          repository: anima-research/mcpl-cc-bridge
+          ref: b4d566fa1771f4547873054c83b9bccde4e02ff4
+          path: .hosts/mcpl-cc-bridge
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+      - run: npm ci
+      - name: Build agent-framework
+        working-directory: .hosts/agent-framework
+        # Its repository ships no lockfile, so this is `npm install`, not `npm ci`.
+        run: npm install --no-audit --no-fund && npm run build
+      - name: Install the bridge plugin
+        working-directory: .hosts/mcpl-cc-bridge/plugins/mcpl-bridge
+        run: bun install --frozen-lockfile
+      - name: Acceptance against agent-framework
+        run: npm run acceptance:af
+        env:
+          ACCEPTANCE_REQUIRED: '1'
+          AGENT_FRAMEWORK: ${{ github.workspace }}/.hosts/agent-framework
+      - name: Acceptance against mcpl-cc-bridge
+        run: npm run acceptance:bridge
+        env:
+          ACCEPTANCE_REQUIRED: '1'
+          MCPL_BRIDGE: ${{ github.workspace }}/.hosts/mcpl-cc-bridge/plugins/mcpl-bridge/src

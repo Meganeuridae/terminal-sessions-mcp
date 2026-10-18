@@ -7,3 +7,5 @@ terminal-art*
 terminal_art*
 run-art.sh
 terminal_streams*
+# Host checkouts the acceptance CI job makes beside the tree (see .github/workflows/test.yml)
+.hosts/
