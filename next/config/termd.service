@@ -26,6 +26,8 @@ LimitNOFILE=65536
 OOMPolicy=continue
 # History on disk is kept forever by default. For a long-lived deployment, cap it:
 #   ExecStart=... --retention-days 30          (or --retention-bytes 200000000 per session)
+# Whatever the caps, termd stops writing history to disk while the data dir's filesystem has
+# less than 200 MiB free (--disk-floor-bytes; 0 turns it off) and resumes when space returns.
 # SIGTERM to termd alone: it drains its sessions (Runs end with reason daemon-shutdown) and
 # kills what they left; only what survives that is killed when the stop times out.
 KillMode=mixed

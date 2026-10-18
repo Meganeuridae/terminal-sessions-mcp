@@ -56,6 +56,7 @@ const FLAGS = {
   'result-text': { type: 'string' },
   'retention-bytes': { type: 'string' },
   'retention-days': { type: 'string' },
+  'disk-floor-bytes': { type: 'string' },
   'usage-log': { type: 'string' },
   'no-usage-log': { type: 'boolean' },
   'log-level': { type: 'string' },
@@ -323,6 +324,9 @@ const HELP = `termd — terminal sessions daemon
   --result-text json|transcript   default result text rendering (default json)
   --retention-bytes <n>  cap each session's history on disk at n bytes (default: no cap)
   --retention-days <n>   delete history older than n days (default: never)
+  --disk-floor-bytes <n> stop writing history to disk while the data dir's filesystem has less than n bytes
+                         free (default 209715200, 200 MiB; 0: never): the recent part stays in memory and is
+                         written once space returns; what the memory ring had to drop meanwhile reads as a gap
   --usage-log <file>     usage records, one JSON line per tool call (default <data-dir>/usage.jsonl)
   --no-usage-log         do not record usage
   --log-file <file>      write logs to this file (0600, rotated by size) instead of stderr
@@ -332,7 +336,7 @@ const HELP = `termd — terminal sessions daemon
                          takes a build before termd; it counts against every process on the machine, so a
                          shared host may want less, or 0
 Env: TSM_TOKEN (the shared token; removed from the environment once read), TSM_DATA_DIR, TSM_HOST, TSM_PORT,
-TSM_SESSION_OOM_SCORE_ADJ;
+TSM_SESSION_OOM_SCORE_ADJ, TSM_DISK_FLOOR_BYTES;
 the 1.x names SESSION_SERVER_HOST, SESSION_SERVER_PORT and SESSION_SERVER_TOKEN are read where those are not set.
 Logs are JSON lines on stderr. Sessions start in $HOME unless given a cwd. The GUI is served at
 http://<host>:<port>/ (add ?token=… when one is required).`;
@@ -478,6 +482,12 @@ async function main(): Promise<void> {
     retention.maxAgeMs = n * 24 * 3600 * 1000;
   }
   if (rb !== undefined || ra !== undefined) registryOpts.retention = retention;
+  // A cap bounds one session; the floor bounds the machine (the house's review of #11, shell tools
+  // 4). Below it, journals keep their ring and leave the disk alone until space returns.
+  const floorSetting = f['disk-floor-bytes'] ?? (process.env.TSM_DISK_FLOOR_BYTES || undefined) ?? String(200 * 1024 * 1024);
+  const floor = /^\d+$/.test(floorSetting.trim()) ? Number(floorSetting) : NaN;
+  if (!Number.isInteger(floor) || floor < 0) fail('--disk-floor-bytes must be a whole number of bytes (0 turns the floor off)');
+  if (floor > 0) registryOpts.diskFloorBytes = floor;
 
   // The port first, then the data dir's lock, then recovery (see the header).
   let held: HeldPort | undefined;

@@ -199,9 +199,54 @@ export class MemoryStore implements JournalStore {
   }
 }
 
+/**
+ * A floor on the free space of the filesystem a store writes to (the daemon's --disk-floor-bytes;
+ * the house's review of #11, shell tools 4): a retention cap bounds one session, the floor bounds
+ * the machine. A refused append is a store error to the journal, which keeps the ring, retries,
+ * and records as a gap what the ring dropped meanwhile.
+ */
+export interface DiskFloor {
+  /** May `bytes` more be written under `dir`? False refuses the append. */
+  allow(dir: string, bytes: number): boolean;
+}
+
+/**
+ * Free space by statfs, asked at most once a second per directory or after a megabyte written
+ * since the last answer: a flood of appends costs one syscall a second. A filesystem that cannot
+ * be asked is not a full one: the write itself decides then.
+ */
+export class FreeSpaceFloor implements DiskFloor {
+  private readonly seen = new Map<string, { at: number; written: number; ok: boolean }>();
+  constructor(
+    readonly floorBytes: number,
+    private readonly statfs: (dir: string) => { bavail: number | bigint; bsize: number | bigint } = (d) => fs.statfsSync(d),
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  allow(dir: string, bytes: number): boolean {
+    const t = this.now();
+    const s = this.seen.get(dir);
+    if (s && t - s.at < 1000 && s.written + bytes < 1024 * 1024) {
+      s.written += bytes;
+      return s.ok;
+    }
+    let ok = true;
+    try {
+      const st = this.statfs(dir);
+      ok = Number(st.bavail) * Number(st.bsize) - bytes >= this.floorBytes;
+    } catch {
+      ok = true;
+    }
+    this.seen.set(dir, { at: t, written: bytes, ok });
+    return ok;
+  }
+}
+
 export interface FileStoreOptions {
   /** Rotate the active file past this many bytes. Default: a quarter of `maxBytes`, between 4 KiB and 16 MiB. */
   maxFileBytes?: number;
+  /** Refuse appends while the filesystem's free space is below the floor (see DiskFloor). */
+  floor?: DiskFloor;
   /** Retained bytes on disk, active file included (G21). Default: no limit. */
   maxBytes?: number;
   /**
@@ -320,6 +365,7 @@ export class FileStore implements JournalStore {
   private metaPending = false;
   /** Bytes read from disk by reads and scans (observability; the tests bound it). */
   bytesRead = 0;
+  private readonly floor: DiskFloor | undefined;
 
   constructor(
     private readonly dir: string,
@@ -327,6 +373,7 @@ export class FileStore implements JournalStore {
   ) {
     this.now = opts.now ?? Date.now;
     this.fixedFileBytes = opts.maxFileBytes;
+    this.floor = opts.floor;
     // The journal holds whatever programs printed: private to the daemon's user (G26).
     fs.mkdirSync(dir, { recursive: true, mode: DIR_MODE });
     try {
@@ -606,6 +653,8 @@ export class FileStore implements JournalStore {
    */
   append(event: JournalEvent): void {
     const buf = Buffer.from(JSON.stringify(event) + '\n');
+    // Below the floor the disk is left alone (shell tools 4): the journal keeps the ring and retries.
+    if (this.floor && !this.floor.allow(this.dir, buf.length)) throw new Error(`journal ${this.active}: the disk's free space is below the floor; history stays in memory until space returns`);
     if (this.dirty) {
       this.repair();
       // Writing after a fragment would swallow this event into it (jr-9): refuse until the cut succeeds.

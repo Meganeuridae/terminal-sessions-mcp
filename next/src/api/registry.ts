@@ -28,7 +28,7 @@ import { Journal, type JournalOptions } from '../core/journal.js';
 import { acquireDataDirLock, listProcesses, livingGroups, sleepSync, type DataDirLock } from '../core/lock.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { Session, trustedDir, type SessionOptions } from '../core/session.js';
-import { FileStore, MemoryStore, type Retention } from '../core/stores.js';
+import { FileStore, FreeSpaceFloor, MemoryStore, type DiskFloor, type FileStoreOptions, type Retention } from '../core/stores.js';
 import { SYSTEM, type ControlPolicy, type Cursors, type JournalEvent, type Principal, type RunInfo, type Seq, type Visibility } from '../core/types.js';
 import { prepareIntegration } from '../shell/integration.js';
 
@@ -46,6 +46,12 @@ export interface RegistryOptions {
   daemonEnv?: NodeJS.ProcessEnv;
   /** Daemon-wide history limits (G21). Absent: nothing is deleted. */
   retention?: Retention;
+  /**
+   * Stop writing history to disk while the data dir's filesystem has less free space than this
+   * (the daemon's --disk-floor-bytes): the ring carries on, writing resumes when space returns.
+   * Absent or 0: no floor.
+   */
+  diskFloorBytes?: number;
   /**
    * Take the data dir's lock (default true). Tests only: `false` lets a registry recover a
    * data dir another process holds — which a daemon must never do (jr2-2).
@@ -326,6 +332,8 @@ export class SessionRegistry {
   private readonly locks = new Map<string, Promise<void>>();
   private readonly opts: RegistryOptions;
   private readonly root: string;
+  /** One floor for every session's store: free space is a property of the filesystem, not of a session. */
+  private readonly floor: DiskFloor | undefined;
   private readonly listeners = new Set<(c: RegistryChange) => void>();
   /** The data dir's lock while this registry holds it (jr2-2). */
   private dirLock: DataDirLock | undefined;
@@ -351,6 +359,7 @@ export class SessionRegistry {
   constructor(opts: RegistryOptions) {
     this.opts = opts;
     this.root = path.join(opts.dataDir, 'sessions');
+    this.floor = opts.diskFloorBytes ? new FreeSpaceFloor(opts.diskFloorBytes) : undefined;
     // Journals hold whatever programs printed: private to the daemon's user (G26). The
     // sessions root is ours and always 0700; the data dir only when we create it (it
     // may be a directory the user chose, whose mode is theirs).
@@ -419,7 +428,7 @@ export class SessionRegistry {
     if (!fs.statSync(dir).isDirectory()) return undefined;
     const meta = readMeta(dir);
     const retention = this.retentionFor(undefined, meta.retention);
-    const store = new FileStore(dir, retention);
+    const store = new FileStore(dir, this.storeOptions(retention));
     const gone = expired(store, retention, Date.now());
     if (gone || store.lastSeq() === undefined) {
       store.close();
@@ -599,7 +608,7 @@ export class SessionRegistry {
       jo.startSeq = old.lastSeq;
       recorded = prev.meta;
     } else {
-      store = new FileStore(dir, retention);
+      store = new FileStore(dir, this.storeOptions(retention));
       recorded = readMeta(dir);
       // A journal this registry did not surface (recovery could not read it): its owner stands (G18).
       if (store.lastSeq() !== undefined && o.owner !== SYSTEM && (recorded.owner ?? SYSTEM) !== o.owner) {
@@ -695,6 +704,10 @@ export class SessionRegistry {
   }
 
   /** Requested over recorded over daemon defaults. A bad request is refused; a bad record falls back. */
+  private storeOptions(retention: Retention): FileStoreOptions {
+    return this.floor ? { ...retention, floor: this.floor } : retention;
+  }
+
   private retentionFor(requested: Retention | undefined, recorded: Retention | undefined): SessionRetention {
     const d = this.opts.retention ?? {};
     const ok = (n: unknown, min: number): n is number => typeof n === 'number' && Number.isFinite(n) && n >= min;

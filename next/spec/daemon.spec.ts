@@ -312,3 +312,17 @@ test('an empty TSM_SESSION_OOM_SCORE_ADJ is the default (200), not 0; an empty f
   assert.equal(await bad.exited, 2);
   assert.match(bad.lines.join('\n'), /--session-oom-score-adj must be an integer from 0 to 1000/);
 });
+
+test('--disk-floor-bytes takes a whole number of bytes; 0 turns the floor off; anything else is an error', async () => {
+  const bad = termd(['--port', '0', '--data-dir', path.join(tmp, 'floor-bad'), '--no-usage-log', '--disk-floor-bytes', '200MB']);
+  assert.equal(await bad.exited, 2);
+  assert.match(bad.lines.join('\n'), /--disk-floor-bytes must be a whole number of bytes/);
+  const off = termd(['--port', '0', '--data-dir', path.join(tmp, 'floor-off'), '--no-usage-log', '--shell', '/bin/bash', '--disk-floor-bytes', '0']);
+  try {
+    await until(() => listening(off) !== undefined, 10_000, 'termd with the floor off');
+    const r = await call(urlOf(off), 'run', { session: 'nofloor', command: 'echo ok', wait: 10_000 });
+    assert.equal(r.state, 'exited', JSON.stringify(r));
+  } finally {
+    await stop(off);
+  }
+});
