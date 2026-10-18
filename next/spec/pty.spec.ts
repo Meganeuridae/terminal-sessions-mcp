@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { NodePtyBackend } from '../src/backends/node-pty.js';
+import { groupStillOurs, NodePtyBackend } from '../src/backends/node-pty.js';
 import { Journal } from '../src/core/journal.js';
 import { Session } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
@@ -287,4 +287,19 @@ test('/bin/bash: a process Run inherits no terminal master, and its line is not 
     await a.session.close({ graceful: false });
     await b.session.close({ graceful: false });
   }
+});
+
+test('a process group whose leader exited is signalled only while it is still the Run\'s: orphans are, a stranger given the freed pid is not, and nothing is when nothing can say', () => {
+  const spawnedAt = 1_700_000_000_000;
+  const row = (startMs: number) => ({ pid: 4242, pgid: 4242, startMs, zombie: false });
+  // No process of the group's id: the members are the Run's orphans (the kernel keeps the pid while they live).
+  assert.equal(groupStillOurs(4242, spawnedAt, () => null), true);
+  // Our own leader, by its start time (ps truncates to the second).
+  assert.equal(groupStillOurs(4242, spawnedAt, () => row(spawnedAt - 900)), true);
+  assert.equal(groupStillOurs(4242, spawnedAt, () => row(spawnedAt + 900)), true);
+  // A stranger started later with the freed pid, or long before it: not ours.
+  assert.equal(groupStillOurs(4242, spawnedAt, () => row(spawnedAt + 60_000)), false);
+  assert.equal(groupStillOurs(4242, spawnedAt, () => row(spawnedAt - 60_000)), false);
+  // Nothing can list processes: nothing is signalled.
+  assert.equal(groupStillOurs(4242, spawnedAt, () => undefined), false);
 });

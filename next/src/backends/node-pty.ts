@@ -2,6 +2,7 @@
 import { execFileSync, spawn as spawnChild } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as pty from 'node-pty';
+import { processInfo, type ProcessRow } from '../core/lock.js';
 import type { ExecutionBackend, ForegroundInfo, ProcessHandle, PtyExit, PtyHandle, SpawnProcessOptions, SpawnShellOptions } from './types.js';
 
 const signalName = (n: number | undefined): string | undefined => {
@@ -44,6 +45,23 @@ function groupAlive(pgid: number): boolean {
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === 'EPERM';
   }
+}
+
+/**
+ * Is process group `pgid`, whose leader (a Run's own process, spawned at `spawnedAt`) has
+ * exited, still the Run's? A pid alone does not identify a process: pids are reused (lock.ts),
+ * and a group's id is its leader's pid. While any member of the group lives the kernel keeps
+ * that pid from being reused, so a group with no process of its own id is the Run's orphans.
+ * A process with the group's id that started at another time is a stranger that was given the
+ * freed pid, with a group of its own: signalling it would signal an unrelated program (the
+ * house's review of #11, core finding 2, reproduced with a forced pid). When nothing can say,
+ * nothing is signalled. `lookup` is `processInfo` (one `ps` listing), replaceable in tests.
+ */
+export function groupStillOurs(pgid: number, spawnedAt: number, lookup: (pid: number) => ProcessRow | null | undefined = processInfo): boolean {
+  const leader = lookup(pgid);
+  if (leader === undefined) return false;
+  if (leader === null) return true;
+  return leader.startMs >= spawnedAt - 2000 && leader.startMs <= spawnedAt + 1000;
 }
 
 /** A process's current command line: `/proc/<pid>/cmdline` on Linux, `ps` elsewhere. */
@@ -197,8 +215,10 @@ export class NodePtyBackend implements ExecutionBackend {
     stdout.on('data', (d: string) => outL.forEach((l) => l(d)));
     stderr.on('data', (d: string) => errL.forEach((l) => l(d)));
     const pgid = child.pid;
+    const spawnedAt = Date.now();
     let fired = false;
     let spawned = false;
+    let leaderExited = false;
     const fire = (e: PtyExit) => {
       if (fired) return;
       fired = true;
@@ -220,6 +240,7 @@ export class NodePtyBackend implements ExecutionBackend {
     stdout.on('end', () => (open--, settle()));
     stderr.on('end', () => (open--, settle()));
     child.on('exit', (code, signal) => {
+      leaderExited = true;
       pendingExit = signal ? { exitCode: null, signal } : { exitCode: code };
       drainTimer = setTimeout(() => fire(pendingExit!), DRAIN_MS);
       drainTimer.unref();
@@ -242,7 +263,9 @@ export class NodePtyBackend implements ExecutionBackend {
       onExit: (l) => (exitL.add(l), () => exitL.delete(l)),
       kill(signal) {
         if (pgid === undefined) return;
-        // The group, not the leader: members survive a leader that exited (tg-12).
+        // The group, not the leader: members survive a leader that exited (tg-12). Once the
+        // leader has exited, only a group that is still the Run's is signalled (see groupStillOurs).
+        if (leaderExited && !groupStillOurs(pgid, spawnedAt)) return;
         try {
           process.kill(-pgid, signal);
         } catch {
@@ -255,7 +278,7 @@ export class NodePtyBackend implements ExecutionBackend {
           }
         }
       },
-      groupAlive: () => pgid !== undefined && groupAlive(pgid),
+      groupAlive: () => pgid !== undefined && groupAlive(pgid) && (!leaderExited || groupStillOurs(pgid, spawnedAt)),
     };
   }
 }
