@@ -224,6 +224,14 @@ const publicRun = (r: RunRecord): RunInfo => {
  * body goes in pieces, each acknowledged by the shell before the next is typed, so nothing
  * piles up unread; the last line prints a start marker, runs the text with `eval` in the
  * shell itself (so `cd` and exports persist), and prints the end marker with the status.
+ *
+ * Every line checks, before it prints any marker, that the variable holds exactly as many
+ * characters as the lines so far typed, and prints a gone marker otherwise. Text already at
+ * the prompt when the first line arrives (a person's half-typed command in a shared
+ * terminal) would otherwise swallow the assignment while the markers after it still ran,
+ * and the Run would report `exited 0` for a command that never ran (an outside review
+ * reproduced it). The first line is preceded by ^U, which clears a pending line in every
+ * line editor and in canonical mode alike; the check is what stands when that is not enough.
  */
 const INLINE_SAFE = new Set([...'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ,._/:=@+-'].map((c) => c.charCodeAt(0)));
 const INLINE_LINE_BYTES = 900;
@@ -234,18 +242,30 @@ function inlineTokens(body: string): string[] {
   return out;
 }
 
-/** The lines to type for `body`, bounded by markers carrying `nonce`; pieces end in an acknowledgement, the last line in start and end markers. */
-function inlineLines(body: string, nonce: string, fish: boolean): string[] {
+/**
+ * The lines to type for `body`, bounded by markers carrying `nonce`: pieces end in an
+ * acknowledgement, the last line in start and end markers, and every line prints its marker
+ * only where the variable holds the text typed so far, `len` characters (the text is ASCII,
+ * so every shell counts alike), and the gone marker otherwise (see the module comment).
+ */
+export function inlineLines(body: string, nonce: string, fish: boolean): string[] {
   const toks = inlineTokens(body);
+  const gone = `printf '<<<GON''E:${nonce}>>>\\n'`;
   const set = fish ? (c: string) => ` set -g __tsm_b '${c}'` : (c: string) => ` __tsm_b='${c}'`;
-  const add = fish ? (c: string) => ` set -g __tsm_b "$__tsm_b"'${c}'` : (c: string) => ` __tsm_b=$__tsm_b'${c}'`;
-  const ack = (k: number) => `; printf '<<<AC''K:${nonce}:${k}>>>\\n'`;
+  const add = fish ? (c: string) => ` set -g __tsm_b "$__tsm_b"'${c}'` : (c: string) => ` __tsm_b=\${__tsm_b-}'${c}'`;
+  // `then` … `else` … `fi` around what a line does once the text so far is whole.
+  const whole = fish
+    ? (len: number, then: string) => `if set -q __tsm_b; and test (string length -- "$__tsm_b") = ${len}; ${then}; else ${gone}; end`
+    : (len: number, then: string) => `if [ "\${__tsm_b+set}" = set ] && [ "\${#__tsm_b}" = "${len}" ]; then ${then}; else ${gone}; fi`;
+  const ack = (k: number) => `printf '<<<AC''K:${nonce}:${k}>>>\\n'`;
   const finish = fish
-    ? `printf '<<<STAR''T:${nonce}>>>\\n'; eval (printf '%b' "$__tsm_b" | string collect); printf '<<<EXI''T:${nonce}:%s>>>\\n' $status; set -e __tsm_b`
-    : `printf '<<<STAR''T:${nonce}>>>\\n'; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:${nonce}:%s>>>\\n' "$?"; unset __tsm_b`;
-  const single = `${set(toks.join(''))}; ${finish}`;
+    ? `printf '<<<STAR''T:${nonce}>>>\\n'; eval (printf '%b' "$__tsm_b" | string collect); printf '<<<EXI''T:${nonce}:%s>>>\\n' $status`
+    : `printf '<<<STAR''T:${nonce}>>>\\n'; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:${nonce}:%s>>>\\n' "$?"`;
+  const forget = fish ? 'set -e __tsm_b' : 'unset __tsm_b';
+  const all = toks.join('');
+  const single = `${set(all)}; ${whole(all.length, finish)}; ${forget}`;
   if (Buffer.byteLength(single) <= INLINE_LINE_BYTES) return [single];
-  const room = INLINE_LINE_BYTES - add('').length - ack(999).length;
+  const room = INLINE_LINE_BYTES - `${add('')}; ${whole(999999, ack(999))}`.length;
   const pieces: string[] = [];
   let cur = '';
   for (const t of toks) {
@@ -256,8 +276,15 @@ function inlineLines(body: string, nonce: string, fish: boolean): string[] {
     cur += t;
   }
   pieces.push(cur);
-  return [...pieces.map((c, i) => `${i === 0 ? set(c) : add(c)}${ack(i + 1)}`), ` ${finish}`];
+  let typed = 0;
+  const lines = pieces.map((c, i) => {
+    typed += c.length;
+    return `${i === 0 ? set(c) : add(c)}; ${whole(typed, ack(i + 1))}`;
+  });
+  return [...lines, ` ${whole(typed, finish)}; ${forget}`];
 }
+
+type InlineMarkerKind = 'ack' | 'start' | 'exit' | 'gone';
 
 /** The end marker typed alone after a ^C (the ^C may have cut the line before it), with the Run's nonce. */
 const inlineProbe = (nonce: string, fish: boolean) => ` printf '<<<EXI''T:${nonce}:%s>>>\\n' ${fish ? '$status' : '"$?"'}`;
@@ -1442,10 +1469,11 @@ export class Session {
     run.strategy = 'inline';
     run.inlineLines = inlineLines(run.line ?? '', run.markerNonce, fish);
     run.inlineAck = 0;
-    // Typed, not started: the start marker says when the shell took it (no mark will).
+    // Typed, not started: the start marker says when the shell took it (no mark will). The ^U
+    // first clears a line someone had begun at that prompt (see the inline strategy's comment).
     run.state = 'starting';
     this.inFront.set(run.within ?? null, run);
-    this.pty.write(`${run.inlineLines.shift()!}\n`);
+    this.pty.write(`\x15${run.inlineLines.shift()!}\n`);
     for (const w of run.changeWaiters?.splice(0) ?? []) w();
   }
 
@@ -1454,10 +1482,10 @@ export class Session {
    * the end marker with the status. The earliest one that ends inside `rest` (what precedes `rest`
    * was `seen` already) says where to cut the piece and what it means.
    */
-  private nextInlineMarker(seen: string, rest: string): { run: RunRecord; kind: 'ack' | 'start' | 'exit'; end: number; exit?: number } | undefined {
+  private nextInlineMarker(seen: string, rest: string): { run: RunRecord; kind: InlineMarkerKind; end: number; exit?: number } | undefined {
     const window = seen + rest;
-    let best: { run: RunRecord; kind: 'ack' | 'start' | 'exit'; end: number; exit?: number } | undefined;
-    const consider = (run: RunRecord, kind: 'ack' | 'start' | 'exit', idx: number, len: number, exit?: number) => {
+    let best: { run: RunRecord; kind: InlineMarkerKind; end: number; exit?: number } | undefined;
+    const consider = (run: RunRecord, kind: InlineMarkerKind, idx: number, len: number, exit?: number) => {
       if (idx === -1 || idx + len <= seen.length) return;
       const end = idx + len - seen.length;
       if (!best || end < best.end) best = { run, kind, end, ...(exit !== undefined && { exit }) };
@@ -1468,6 +1496,10 @@ export class Session {
       if (run.inlineLines?.length) {
         const t = `<<<ACK:${n}:${(run.inlineAck ?? 0) + 1}>>>`;
         consider(run, 'ack', window.indexOf(t), t.length);
+      }
+      if (run.state === 'starting') {
+        const t = `<<<GONE:${n}>>>`;
+        consider(run, 'gone', window.indexOf(t), t.length);
       }
       if (run.state === 'starting') {
         const t = `<<<START:${n}>>>`;
@@ -1481,11 +1513,17 @@ export class Session {
     return best;
   }
 
-  private applyInlineMarker(hit: { run: RunRecord; kind: 'ack' | 'start' | 'exit'; exit?: number }): void {
+  private applyInlineMarker(hit: { run: RunRecord; kind: InlineMarkerKind; exit?: number }): void {
     const { run } = hit;
     if (hit.kind === 'ack') {
       run.inlineAck = (run.inlineAck ?? 0) + 1;
       this.pty.write(`${run.inlineLines!.shift()!}\n`);
+    } else if (hit.kind === 'gone') {
+      // A line reached the shell changed or cut (text already at its prompt, a reader in front):
+      // the variable does not hold what was typed, and the command never ran (G3). Nothing more
+      // is typed for it.
+      run.inlineLines = [];
+      this.endRun(run, { state: run.cancelRequested ? 'cancelled' : 'lost', reason: 'line-not-whole' });
     } else if (hit.kind === 'start') {
       this.startRun(run, { cwd: '' }); // that shell's cwd is not tracked (no cwd mark)
     } else if (run.probed) {

@@ -10,7 +10,9 @@ import type { Session } from '../src/core/session.js';
 import type { TermError } from '../src/core/errors.js';
 import { looksLikeShellOpener, renderRun } from '../src/api/tools.js';
 import type { RunResult } from '../src/api/app.js';
-import { AGENT, hasShell, realSession, until, type Real } from './fake-shell.js';
+import { execFileSync } from 'node:child_process';
+import { inlineLines } from '../src/core/session.js';
+import { AGENT, hasShell, realSession, scriptedSession, until, type Real } from './fake-shell.js';
 
 test('the result of a command that looks like it opened a shell points at the declaration; others do not', () => {
   const running = (line: string): RunResult => ({ runId: 'r1', session: 's', target: 'shell', state: 'running', cwd: '/', attribution: 'temporal', line, durationMs: 1500, output: { text: '', truncated: false, seq: [1, 2], nextCursor: 2 } });
@@ -230,5 +232,96 @@ test('the job under a declared Run is killed: the Run settles, queued Runs are n
     assert.ok(!x.journal.since(0).events.some((e) => e.type === 'output' && e.runId !== queued.run.runId && e.runId !== enclosing && e.data.includes('QUEUED-LATER')), 'nothing queued was typed into the session’s own shell');
   } finally {
     await x.close();
+  }
+});
+
+/** A shell runs a script and gives its stdout, whatever its status. */
+const runScript = (shell: string, script: string): string => {
+  try {
+    return execFileSync(shell, ['-c', script], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+  } catch (e) {
+    return (e as { stdout?: string }).stdout ?? '';
+  }
+};
+
+test('a typed line prints its marker only where the shell holds exactly the text typed so far: text already at the prompt, or a piece missing or changed, prints the gone marker and runs nothing', () => {
+  const n = 'abcd1234';
+  const short = `printf '%s\\n' CONTROL; (exit 3)`;
+  const long = `f() {\n${LINES}\n}\nf | wc -l`;
+  for (const shell of ['/bin/sh', '/bin/bash', '/bin/zsh'].filter(hasShell)) {
+    const one = inlineLines(short, n, false);
+    assert.equal(one.length, 1, shell);
+    assert.equal(runScript(shell, `${one[0]}\n`), `<<<START:${n}>>>\nCONTROL\n<<<EXIT:${n}:3>>>\n`, `${shell}: a clean prompt`);
+    // Text someone had typed at the prompt swallows the assignment (the review's case): the
+    // variable is unset or not the text, so the gone marker prints, no start, and nothing runs.
+    for (const prefix of ['echo partial ', 'set -u\necho partial ']) {
+      // (The prefix's own echo repeats the assignment's text; what matters is that no start or
+      // end marker prints and the body's command never runs: CONTROL appears once, in that echo.)
+      const out = runScript(shell, `${prefix}${one[0]!.trimStart()}\n`);
+      assert.ok(!out.includes('<<<START') && !out.includes('<<<EXIT') && out.split('CONTROL').length === 2, `${shell}: nothing ran under a prefix: ${JSON.stringify(out)}`);
+      assert.match(out, new RegExp(`<<<GONE:${n}>>>\\n$`), shell);
+    }
+    const many = inlineLines(long, n, false);
+    assert.ok(many.length >= 3, `${shell}: ${many.length} lines`);
+    for (const line of many) assert.ok(Buffer.byteLength(line) <= 900, `a line of ${Buffer.byteLength(line)} bytes`);
+    const acks = Array.from({ length: many.length - 1 }, (_, i) => `<<<ACK:${n}:${i + 1}>>>\n`).join('');
+    assert.equal(runScript(shell, `${many.join('\n')}\n`).replace(/\n +120\n/, '\n120\n'), `${acks}<<<START:${n}>>>\n120\n<<<EXIT:${n}:0>>>\n`, `${shell}: pieces (wc pads its count on macOS)`);
+    // A piece missing: every line after it finds the text short and prints the gone marker.
+    const missing = runScript(shell, `${[many[0], ...many.slice(2)].join('\n')}\n`);
+    assert.equal(missing, `<<<ACK:${n}:1>>>\n` + `<<<GONE:${n}>>>\n`.repeat(many.length - 2), `${shell}: a piece missing`);
+    // A piece changed by text typed at the prompt between two pieces: the same, from that piece on.
+    const changed = runScript(shell, `${[many[0], `echo partial ${many[1]!.trimStart()}`, ...many.slice(2)].join('\n')}\n`);
+    assert.ok(!changed.includes('<<<START') && (changed.match(new RegExp(`<<<GONE:${n}>>>`, 'g')) ?? []).length === many.length - 1, `${shell}: a piece changed: ${JSON.stringify(changed.slice(-200))}`);
+  }
+  if (FISH) {
+    const one = inlineLines(`printf '%s\\n' CONTROL; false`, n, true);
+    assert.equal(runScript(FISH, `${one[0]}\n`), `<<<START:${n}>>>\nCONTROL\n<<<EXIT:${n}:1>>>\n`, 'fish: a clean prompt');
+    const out = runScript(FISH, `echo partial ${one[0]!.trimStart()}\n`);
+    assert.ok(!out.includes('<<<START') && out.includes(`<<<GONE:${n}>>>`), `fish: a prefix: ${JSON.stringify(out)}`);
+  }
+});
+
+test('the first line typed for a declared shell clears a line someone had begun at its prompt, so the Run runs whole', { skip: !hasShell('/bin/bash') }, async () => {
+  const x = await realSession('/bin/bash');
+  try {
+    const enclosing = await open(x.session, 'bash --norc --noprofile');
+    declare(x.session, 'bash');
+    // A person began typing at the nested shell's prompt and never pressed Enter.
+    x.session.input('echo partial ', { principal: AGENT });
+    await until(() => x.journal.since(0).events.some((e) => e.type === 'output' && e.runId === enclosing && String((e as { data: string }).data).includes('echo partial')), 8000, 'the typed text echoed');
+    const r = await x.run(`printf '%s\\n' CLEAN; (exit 3)`, 8000);
+    assert.deepEqual([r.state, r.exit, r.text.trim()], ['exited', 3, 'CLEAN'], 'the half-typed line did not change the command');
+  } finally {
+    await x.close();
+  }
+});
+
+test('a gone marker from the declared shell ends the Run lost: line-not-whole, nothing more is typed for it, and the Run queued behind it gets its turn', async () => {
+  const h = await scriptedSession();
+  try {
+    const typed: string[] = [];
+    h.pty.onWrite((d) => typed.push(d));
+    const front = h.session.admit({ target: 'shell', line: 'sleep 100', principal: AGENT });
+    assert.ok(front.admitted);
+    await until(() => h.session.run(front.run.runId).state === 'running');
+    h.session.declareShell({ principal: AGENT });
+    const one = h.session.admit({ target: 'shell', line: 'echo one', principal: AGENT });
+    const two = h.session.admit({ target: 'shell', line: 'echo two', principal: AGENT, queue: true });
+    assert.ok(one.admitted && two.admitted);
+    await until(() => typed.some((t) => t.includes("__tsm_b='echo one'")), 3000, "the first Run's line");
+    const line = typed.find((t) => t.includes("__tsm_b='echo one'"))!;
+    assert.ok(line.startsWith('\x15'), 'the line is preceded by ^U, which clears a pending line');
+    assert.match(line, /if \[ "\$\{__tsm_b\+set\}" = set \] && \[ "\$\{#__tsm_b\}" = "8" \]; then printf '<<<STAR''T:/);
+    const nonce = /<<<GON''E:([0-9a-f]+)>>>/.exec(line)![1]!;
+    const before = typed.length;
+    // The shell answers with the gone marker: the line reached it changed.
+    h.pty.emit(`<<<GONE:${nonce}>>>\r\n`);
+    await until(() => h.session.run(one.run.runId).state === 'lost', 3000, 'the Run ends lost');
+    assert.equal(h.session.run(one.run.runId).reason, 'line-not-whole');
+    assert.match(renderRun({ ...(h.session.run(one.run.runId) as unknown as RunResult), session: 's', output: { text: '', truncated: false, seq: [1, 2], nextCursor: 2 } }, 'transcript').text, /reached it changed or cut/);
+    await until(() => typed.slice(before).some((t) => t.includes("__tsm_b='echo two'")), 3000, "the queued Run's line");
+    assert.equal(typed.slice(before).filter((t) => t.includes("__tsm_b='echo one'")).length, 0, 'nothing more typed for the lost Run');
+  } finally {
+    await h.session.close();
   }
 });

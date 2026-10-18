@@ -148,7 +148,9 @@ function runStatus(r: RunResult): string {
       const reason = r.reason ?? 'lost';
       const shellWent = reason.startsWith('shell-exited')
         ? ` — the shell running this command exited under it, so its end was never seen; that happens when a command runs exit, or when set -e is on in the shell and a command fails (${SET_E_NOTE})`
-        : '';
+        : reason === 'line-not-whole'
+          ? ' — a line typed for the declared shell reached it changed or cut (text already at its prompt, or something else reading the terminal), so the command never ran; look at the screen, clear the prompt, and run it again'
+          : '';
       return `outcome unknown: ${reason}${shellWent}`;
     }
     case 'queued':
