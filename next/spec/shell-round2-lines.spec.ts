@@ -12,7 +12,7 @@ import { AGENT, hasShell, realSession, until, type Real } from './fake-shell.js'
 
 const FISH = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find(hasShell);
 const BASH5 = process.env.TSM_TEST_BASH5 && hasShell(process.env.TSM_TEST_BASH5) ? process.env.TSM_TEST_BASH5 : undefined;
-const SHELLS = ['/bin/bash', '/bin/zsh', ...(FISH ? [FISH] : [])];
+const SHELLS = ['/bin/bash', '/bin/zsh', ...(FISH ? [FISH] : [])].filter(hasShell);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** Admit (waiting out prompt-pending), await, and return the Run with its transcript. */

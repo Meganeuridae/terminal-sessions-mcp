@@ -194,7 +194,7 @@ preexec_functions+=(my_preexec)
   }
 });
 
-test('/bin/zsh: shell-11: a ZDOTDIR chosen in ~/.zshenv (XDG layout) is honoured, and ZDOTDIR is the user\'s afterwards', async () => {
+test('/bin/zsh: shell-11: a ZDOTDIR chosen in ~/.zshenv (XDG layout) is honoured, and ZDOTDIR is the user\'s afterwards', { skip: !hasShell('/bin/zsh') }, async () => {
   const x = await realSession('/bin/zsh', {
     rc: {
       '.zshenv': 'export ZDOTDIR="$HOME/.config/zsh"\n',
@@ -212,7 +212,7 @@ test('/bin/zsh: shell-11: a ZDOTDIR chosen in ~/.zshenv (XDG layout) is honoured
   }
 });
 
-test('/bin/zsh: a ZDOTDIR the daemon inherited is where the user\'s files are read from, and it is restored', async () => {
+test('/bin/zsh: a ZDOTDIR the daemon inherited is where the user\'s files are read from, and it is restored', { skip: !hasShell('/bin/zsh') }, async () => {
   const x = await realSession('/bin/zsh', { rc: { 'zd/.zshrc': 'export FROM_ZD=yes\n', '.zshrc': 'export FROM_HOME=yes\n' }, userZdotdir: '~/zd' });
   try {
     assert.equal((await x.run('echo "${FROM_ZD-no} ${FROM_HOME-no} $ZDOTDIR"')).text, `yes no ${x.home}/zd`);
@@ -221,7 +221,7 @@ test('/bin/zsh: a ZDOTDIR the daemon inherited is where the user\'s files are re
   }
 });
 
-test('/bin/zsh: core-13: hooks removed at runtime heal at the next prompt; the Run that removed them is lost, never left running', async () => {
+test('/bin/zsh: core-13: hooks removed at runtime heal at the next prompt; the Run that removed them is lost, never left running', { skip: !hasShell('/bin/zsh') }, async () => {
   const x = await realSession('/bin/zsh', { rc: { '.zshrc': 'precmd() { :; }\n' } });
   try {
     const cut = await x.run('precmd_functions=()', 3000);

@@ -32,7 +32,7 @@ const CASES: Array<{ shell: string | undefined; rc: Record<string, string>; keys
 
 for (const c of CASES) {
   const name = c.shell?.split('/').pop() ?? 'bash5';
-  test(`${name}: ux-3: with atuin in the rc, Up and Ctrl-R walk the session's own history and typed lines stay out of the user's atuin database`, { skip: skip || (c.shell === undefined ? c.reason! : false) }, async () => {
+  test(`${name}: ux-3: with atuin in the rc, Up and Ctrl-R walk the session's own history and typed lines stay out of the user's atuin database`, { skip: skip || (c.shell === undefined ? c.reason! : hasShell(c.shell) ? false : `${c.shell} is not installed`) }, async () => {
     const x = await realSession(c.shell!, { rc: c.rc, startupCapMs: 20_000 });
     try {
       const keys = await x.run(c.keys, 15_000);

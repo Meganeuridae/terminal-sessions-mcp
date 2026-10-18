@@ -150,6 +150,18 @@ test('tsg-20: --token on the command line is warned about and taken out of the p
   }
 });
 
+test('the process shows in ps as `termd`, with or without a token (core: `pgrep -f node` never selects it)', async () => {
+  const d = termd(['--port', '0', '--data-dir', path.join(tmp, 'd21'), '--no-usage-log']);
+  try {
+    await until(() => listening(d) !== undefined, 10_000, 'termd to listen');
+    const title = execFileSync('ps', ['-o', 'command=', '-p', String(d.child.pid)], { encoding: 'utf8' }).trim();
+    assert.match(title, /^termd( |$)/, `ps shows: ${title}`);
+    assert.doesNotMatch(title, /node|daemon\.js/, `ps shows: ${title}`);
+  } finally {
+    await stop(d);
+  }
+});
+
 test('tsg-5: when the log reader goes away (EPIPE) termd neither spins nor loses its drain: SIGTERM still exits 0', async () => {
   const d = termd(['--port', '0', '--data-dir', path.join(tmp, 'd5'), '--no-usage-log', '--log-level', 'debug']);
   try {

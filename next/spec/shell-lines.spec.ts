@@ -134,7 +134,7 @@ for (const shell of shells) {
   });
 }
 
-test('/bin/zsh: emu-11/shell-8: output without a trailing newline has no PROMPT_SP "%" in its transcript', async () => {
+test('/bin/zsh: emu-11/shell-8: output without a trailing newline has no PROMPT_SP "%" in its transcript', { skip: !hasShell('/bin/zsh') }, async () => {
   const x = await realSession('/bin/zsh');
   try {
     assert.equal((await x.run('printf abc')).text, 'abc');

@@ -65,6 +65,10 @@ setTimeout(() => {
 test('a startup rc replacing the shell with a reader never becomes ready through a timer', async () => {
   const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': 'exec /bin/cat\n' }, integrationGraceMs: 100, startupCapMs: 400 });
   try {
+    // The cap resolves `start` at 400 ms whatever the shell has done by then; on a loaded machine
+    // bash may not have reached its rc yet, and the session is still `starting` (never `idle`).
+    assert.notEqual(x.session.info().state, 'idle');
+    await until(() => x.session.info().state !== 'starting', 5000);
     assert.equal(x.session.info().state, 'unavailable');
     assert.deepEqual(x.session.shellAvailable(), { ok: false, reason: 'shell-unavailable' });
     assert.equal(x.session.admit({ target: 'shell', line: 'echo never', principal: AGENT, queue: true }).admitted, false);

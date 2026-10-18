@@ -99,7 +99,7 @@ for (const s of SHELLS) {
   });
 }
 
-test('a declared shell is the way back from `unavailable`: exec into dash, declare, run there, leave', { skip: !hasShell('/bin/dash') }, async () => {
+test('a declared shell is the way back from `unavailable`: exec into dash, declare, run there, leave', { skip: !hasShell('/bin/dash') || !hasShell('/bin/zsh') }, async () => {
   const x = await realSession('/bin/zsh', { integrationGraceMs: 800 });
   try {
     const r = await x.run('exec /bin/dash', 6000);

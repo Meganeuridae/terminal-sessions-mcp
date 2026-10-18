@@ -42,7 +42,7 @@ for (const [from, to] of PAIRS) {
   });
 }
 
-test('exec into an unintegrated shell does not establish a ready command destination', { skip: !hasShell('/bin/dash') }, async () => {
+test('exec into an unintegrated shell does not establish a ready command destination', { skip: !hasShell('/bin/dash') || !hasShell('/bin/zsh') }, async () => {
   const x = await realSession('/bin/zsh', { integrationGraceMs: 800 });
   try {
     const r = await x.run('exec /bin/dash', 6000);
@@ -90,7 +90,7 @@ test('fish: ss-2/ss-11: a daemon line\'s job has its own process group — SIGTE
   }
 });
 
-for (const shell of ['/bin/bash', '/bin/zsh', ...(FISH ? [FISH] : [])]) {
+for (const shell of ['/bin/bash', '/bin/zsh', ...(FISH ? [FISH] : [])].filter(hasShell)) {
   test(`${shell.split('/').pop()}: ss-6: close leaves no foreground job behind that ignores the hangup`, async () => {
     const tag = `tsm-hup-${process.pid}-${shell.split('/').pop()}`;
     const x = await realSession(shell);
@@ -115,7 +115,7 @@ for (const shell of ['/bin/bash', '/bin/zsh', ...(FISH ? [FISH] : [])]) {
 const SHIM = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-path-shim-'));
 fs.writeFileSync(path.join(SHIM, 'python3'), '#!/bin/sh\necho SHIM-PYTHON\n', { mode: 0o755 });
 after(() => fs.rmSync(SHIM, { recursive: true, force: true }));
-for (const shell of ['/bin/bash', '/bin/zsh', ...(FISH ? [FISH] : [])]) {
+for (const shell of ['/bin/bash', '/bin/zsh', ...(FISH ? [FISH] : [])].filter(hasShell)) {
   test(`${shell.split('/').pop()}: ss-7: a PATH given at creation comes first in a login shell, whatever the login files and the rc did`, async () => {
     const rc = shell.endsWith('fish') ? { '.config/fish/config.fish': 'set -gx PATH /opt/rc-added $PATH\n' } : { '.bash_profile': 'export PATH=/opt/rc-added:$PATH\n', '.zshrc': 'export PATH=/opt/rc-added:$PATH\n' };
     const given = `${SHIM}:/usr/bin:/bin:/usr/sbin:/sbin`;
