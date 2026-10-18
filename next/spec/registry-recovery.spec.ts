@@ -108,13 +108,16 @@ test('jr2-4/G19c/G20/G29: recovery terminates the process groups a dead daemon l
     return c.pid!;
   };
   try {
+    const ready = path.join(dir, 'stubborn-ready');
+    fs.mkdirSync(dir, { recursive: true });
     const polite = detached('sleep', ['401']); // ends on SIGTERM
-    const stubborn = detached('/bin/sh', ['-c', "trap '' TERM; sleep 402; :"]); // ignores SIGTERM, its sleep too
+    const stubborn = detached('/bin/sh', ['-c', "trap '' TERM; printf ready > \"$1\"; sleep 402; :", 'recovery-test', ready]); // ignores SIGTERM, its sleep too
     const stranger = detached('sleep', ['403']); // a live group whose leader predates the Run: a reused pid
     const gone = detached('true', []);
-    await new Promise((r) => setTimeout(r, 300));
-    assert.ok(!groupAlive(gone));
+    // The synthetic Run starts with these processes, not after an arbitrary delay.
+    // Observe the installed trap before recovery tries to exercise SIGKILL escalation.
     let ts = Date.now();
+    await until(() => fs.existsSync(ready) && !groupAlive(gone));
     const j = new Journal({ cold: new FileStore(sdir), sessionId: 'k1', now: () => ts });
     const proc = (runId: string, pid: number) => {
       j.append({ type: 'run.admit', runId, target: 'process', line: runId, principal: A, origin: 'self', queued: false });
