@@ -18,9 +18,9 @@ import { AGENT, hasShell, until } from './fake-shell.js';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-pty-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 let n = 0;
-// Take the clean control before any test opens terminals. On Linux a plain child
-// inherits their masters, including descriptors still closing after an earlier test.
-const cleanChildFds = execFileSync('ls', ['/dev/fd'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\s+/).sort();
+// Python's independent close_fds control excludes even descriptors inherited from
+// the CI runner before this Node process started. node-gyp already requires Python.
+const cleanChildFds = execFileSync('python3', ['-c', "import subprocess; print(subprocess.check_output(['ls', '/dev/fd'], close_fds=True, text=True), end='')"], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\s+/).sort();
 
 test('process output is streaming UTF-8 text with separate stderr, including invalid-byte replacement', async () => {
   const backend = new NodePtyBackend();
