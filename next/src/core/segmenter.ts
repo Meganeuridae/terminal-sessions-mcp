@@ -120,13 +120,18 @@ export interface ReplaySource {
  * epoch is kept across lives and restarts, so replayed messages keep their ids (G22), and
  * is new when a forgotten name starts `seq` over, so an id never names two events (mcpl-4).
  */
-export function segmentId(session: string, journal: Journal, kind: SegmentKind, seq: Seq): string {
-  return `${session}~${journal.epoch}:${kind}:${seq}`;
+/**
+ * A message's stable id. A Run's progress digest carries the Run's id too: two Runs in one
+ * session, each printing a line and going quiet, had digests at the same journal seq and so the
+ * same id, and the lane's sent-set dropped the second as a repeat (the house's review of #11).
+ */
+export function segmentId(session: string, journal: Journal, kind: SegmentKind, seq: Seq, runId?: string): string {
+  return `${session}~${journal.epoch}:${kind}${runId !== undefined ? `~${runId}` : ''}:${seq}`;
 }
 
 /** The seq a message id reports, when it is one of ours. */
 export function seqOfMessageId(id: string): Seq | undefined {
-  const m = /~[^:/]+:[a-z-]+:(\d+)$/.exec(id);
+  const m = /~[^:/]+:[a-z-]+(?:~[^:]+)?:(\d+)$/.exec(id);
   return m ? Number(m[1]) : undefined;
 }
 
@@ -275,7 +280,8 @@ class Render {
   base(kind: SegmentKind, seq: Seq, extra: Record<string, unknown> = {}, ts = Date.now()): Pick<Segment, 'kind' | 'seq' | 'ts' | 'messageId' | 'metadata'> {
     const meta: Record<string, unknown> = { session: this.src.id, state: this.src.state, controller: this.src.controller };
     if (this.src.cwd !== undefined) meta.cwd = this.src.cwd;
-    return { kind, seq, ts, messageId: segmentId(this.src.id, this.src.journal, kind, seq), metadata: { ...meta, ...extra } };
+    const ofRun = kind === 'output' && typeof extra.runId === 'string' ? extra.runId : undefined;
+    return { kind, seq, ts, messageId: segmentId(this.src.id, this.src.journal, kind, seq, ofRun), metadata: { ...meta, ...extra } };
   }
 
   async run(ev: RunEnd): Promise<Segment | undefined> {
