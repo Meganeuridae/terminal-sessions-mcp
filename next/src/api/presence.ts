@@ -83,9 +83,15 @@ function lineFor(app: App, s: AnySession, principal: Principal, now: number): { 
   const info = session.info();
   const current = info.currentRun ? runs.find((r) => r.runId === info.currentRun) : undefined;
   const shellBusy = current !== undefined && running(current);
+  // A Run in a declared shell (§8.1) runs in the program in front, not as the shell's own
+  // current Run, so it is looked for by itself: without this, presence said "idle" while a
+  // declared `sleep 3` ran (an outside review's finding). The innermost one is the live one.
+  const declared = runs.filter((r) => r.shell !== undefined && running(r));
+  const front = declared.at(-1);
   if (session.exit !== undefined) bits.push('shell exited');
-  else if (shellBusy) bits.push(`${info.state === 'tui' ? 'full-screen' : 'running'} \`${describe(current)}\` ${dur(now - (current.startedAt ?? current.admittedAt))} (cwd ${info.cwd})`);
-  else bits.push(`${info.state} (cwd ${info.cwd})`);
+  else if (front) bits.push(`running \`${describe(front)}\` ${dur(now - (front.startedAt ?? front.admittedAt))} in the declared ${front.shell} shell${current ? ` (inside \`${describe(current)}\`)` : ''}`);
+  else if (shellBusy) bits.push(`${info.state === 'tui' ? 'full-screen' : 'running'} \`${describe(current)}\` ${dur(now - (current.startedAt ?? current.admittedAt))} (cwd ${info.cwd})${info.declared ? `, a declared ${info.declared.shell} shell at its prompt` : ''}`);
+  else bits.push(`${info.state} (cwd ${info.cwd})${info.declared ? `, a declared ${info.declared.shell} shell in front` : ''}`);
 
   // Process Runs never make the shell busy (§4), so they get their own bit (m2-7).
   const procs = runs.filter((r) => r.target === 'process' && running(r));
@@ -112,7 +118,7 @@ function lineFor(app: App, s: AnySession, principal: Principal, now: number): { 
   const watches = x.watches.list().filter((w) => w.owner === principal).length;
   if (watches) bits.push(`${watches} watch${watches > 1 ? 'es' : ''} armed`);
 
-  const quiet = unread.bytes === 0 && ended.length === 0 && unread.humanTyped === 0 && !shellBusy && procs.length === 0 && !serviceNews && watches === 0 && session.exit === undefined;
+  const quiet = unread.bytes === 0 && ended.length === 0 && unread.humanTyped === 0 && !shellBusy && front === undefined && procs.length === 0 && !serviceNews && watches === 0 && session.exit === undefined;
   return { text: `[terminal] ${id}: ${bits.join(' · ')}`, quiet };
 }
 

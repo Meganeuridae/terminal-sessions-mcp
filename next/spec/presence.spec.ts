@@ -66,6 +66,24 @@ test('m2-7: a running process Run and an unhealthy service are news, not "idle, 
   await app.cancel(A, { runId: st.runId! });
 });
 
+test('a Run in a declared shell is news, and named, not "idle, nothing new"', { skip: !fs.existsSync('/bin/bash') }, async () => {
+  await app.sessionOpen(A, { id: 'pd' });
+  const nested = await app.run(A, { session: 'pd', command: 'bash --norc --noprofile', wait: 400 });
+  assert.equal(nested.state, 'running');
+  live('pd').declareShell({ principal: A.principal });
+  await app.read(A, { session: 'pd', since: 0 });
+  assert.match(P(A, ['pd']), /running `bash --norc --noprofile` \d+s \(cwd .*\), a declared sh shell at its prompt/);
+  const r = await app.run(A, { session: 'pd', command: 'sleep 3', wait: 300 });
+  assert.equal(r.state, 'running');
+  const busy = P(A, ['pd']);
+  assert.doesNotMatch(busy, /idle, nothing new/);
+  assert.match(busy, /running `sleep 3` \d+s in the declared sh shell \(inside `bash --norc --noprofile`\)/);
+  await app.cancel(A, { runId: r.runId! });
+  await until(() => live('pd').run(r.runId!).state !== 'running', 5000, 'the declared Run to end');
+  await app.run(A, { session: 'pd', command: 'exit', wait: 500 });
+  await until(() => live('pd').run(nested.runId!).state === 'exited', 5000, 'the nested shell to exit');
+});
+
 test('mcpl-12: a background Run that failed behind thousands of events is reported, not "idle, nothing new"', async () => {
   await app.sessionOpen(A, { id: 'bg' });
   const r = await app.run(A, { session: 'bg', command: 'sleep 0.5; false', wait: 0 });
