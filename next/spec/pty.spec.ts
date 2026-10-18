@@ -18,6 +18,9 @@ import { AGENT, hasShell, until } from './fake-shell.js';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-pty-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 let n = 0;
+// Take the clean control before any test opens terminals. On Linux a plain child
+// inherits their masters, including descriptors still closing after an earlier test.
+const cleanChildFds = execFileSync('ls', ['/dev/fd'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\s+/).sort();
 
 test('process output is streaming UTF-8 text with separate stderr, including invalid-byte replacement', async () => {
   const backend = new NodePtyBackend();
@@ -260,9 +263,6 @@ test('/bin/sh: G5 fallback — no integration, marker strategy, observed exits, 
 });
 
 test('/bin/bash: a process Run inherits no terminal master, and its line is not in any argv', async () => {
-  // Take the clean control before opening terminals: a plain child also inherits their
-  // masters on Linux, so a control spawned afterwards would bless the very leak we test.
-  const baseline = execFileSync('ls', ['/dev/fd'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\s+/).sort();
   // Two sessions open: before, a process Run in either held both terminals' masters.
   const a = await real('/bin/bash');
   const b = await real('/bin/bash');
@@ -273,7 +273,7 @@ test('/bin/bash: a process Run inherits no terminal master, and its line is not 
     assert.equal(r.state, 'exited');
     const out = a.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output' && e.runId === r.runId).map((e) => e.data).join('');
     // Only standard streams and the descriptor ls opens to read /dev/fd remain.
-    assert.deepEqual(out.trim().split(/\s+/).filter(Boolean).sort(), baseline, `descriptors open in a process Run: ${out.trim()}`);
+    assert.deepEqual(out.trim().split(/\s+/).filter(Boolean).sort(), cleanChildFds, `descriptors open in a process Run: ${out.trim()}`);
     // Resolving a relative executable uses the Run's cwd; a relative/empty PATH component
     // does too. Those successful launches need the same descriptor cleanup as absolute argv.
     const relative = path.join(tmp, 'relative-fds.sh');
@@ -288,7 +288,7 @@ test('/bin/bash: a process Run inherits no terminal master, and its line is not 
       child.onStdout((d) => { text += d; });
       const exit = await new Promise<{ exitCode: number | null }>((resolve) => child.onExit(resolve));
       assert.equal(exit.exitCode, 0);
-      assert.deepEqual(text.trim().split(/\s+/).sort(), baseline, JSON.stringify(command));
+      assert.deepEqual(text.trim().split(/\s+/).sort(), cleanChildFds, JSON.stringify(command));
     }
     // The line's text is in a file, not in the shell's argv: a pkill -f for a word of the line
     // finds nothing but pkill itself, which it skips, and the line goes on.
@@ -305,7 +305,7 @@ test('/bin/bash: a process Run inherits no terminal master, and its line is not 
     assert.ok(fds3.admitted);
     const r3 = await a.session.awaitRun(fds3.run.runId, 5000);
     const out3 = a.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output' && e.runId === r3.runId).map((e) => e.data).join('');
-    assert.deepEqual(out3.trim().split(/\s+/).filter(Boolean).sort(), baseline, `descriptors open in a line's command: ${out3.trim()}`);
+    assert.deepEqual(out3.trim().split(/\s+/).filter(Boolean).sort(), cleanChildFds, `descriptors open in a line's command: ${out3.trim()}`);
     // A long line arrives whole: more than a pipe buffer's worth.
     const big = a.session.admit({ target: 'process', line: `x='${'y'.repeat(100000)}'; echo "len=\${#x}"`, principal: AGENT });
     assert.ok(big.admitted);
