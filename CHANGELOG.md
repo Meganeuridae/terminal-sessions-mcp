@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.7.0 - 2026-10-18
 
 ### Fixed
 
@@ -19,7 +19,7 @@
   while the shell is still there. A graceful kill now also ends the jobs the
   session's shell started in the background (`sleep 300 &`, a service
   started with `&`), since the shell passes the hangup on to them before it
-  exits; 1.6.0 left them running. A job started with `nohup`, or disowned,
+  exits; 1.6.1 left them running. A job started with `nohup`, or disowned,
   ignores the hangup and keeps running.
 - **Session creation waits for shell readiness**, up to 2s, instead of a
   fixed 200ms sleep, so an rc file that finishes within that no longer leaks
@@ -40,17 +40,19 @@
   command. The cleanup sends the shells no signal: when the program ends,
   the kernel hangs up each session's terminal once nothing else holds it
   open, and a shell such as bash passes the hangup on to the jobs it
-  started in the background, as with 1.6.0.
+  started in the background, as with 1.6.1.
 - **Ctrl+C runs the standalone server's graceful shutdown.** The server class
   registered its own SIGINT handler, which exited the process before
   `start-session-server`'s graceful shutdown could run. The class now
   registers no SIGINT handler, so Ctrl+C runs the same graceful `killAll` as
   SIGTERM: the shells get the hangup, their background jobs end with them,
-  and the server is down in under 200ms. A program that embeds
+  and the server is usually down in under 200ms. Right after a command, bash can hold
+  the first hangup until the second, which the shutdown sends 500 ms later.
+  A program that embeds
   `PersistentSessionServer`, directly or through `SessionAPI`, and handles
-  no SIGINT itself now ends on Ctrl+C by the signal, where 1.6.0 exited with
+  no SIGINT itself now ends on Ctrl+C by the signal, where 1.6.1 exited with
   status 0. No `exit` listener runs then, the program's own included, so
-  its sessions' temp files stay, as with 1.6.0. Handling SIGINT with
+  its sessions' temp files stay, as with 1.6.1. Handling SIGINT with
   `process.exit()` runs them.
 - **`session-cli` runs with `node`** - its shebang named `ts-node`, a dev
   dependency, so the installed command failed with "No such file or
@@ -97,7 +99,7 @@
   wedging the session; the file is created exclusively, so nothing planted
   at its name is written through or reused.
 - **Commands reach a shell an earlier command started**, such as ssh's remote
-  shell, multi-line ones included (1.6.0 typed only single-line commands, so
+  shell, multi-line ones included (1.6.1 typed only single-line commands, so
   only those ran there). Each typed line sources the temp file only if the
   shell in front can read it, so a shell that can, such as the session's own
   or a nested one run on this machine as the same user, keeps the file, and
@@ -134,7 +136,7 @@
   seconds while it waits, or that command's own timeout), since a line
   typed into a line editor
   that is still handling a long one can leave it redrawing instead of
-  reading. 1.6.0 typed a
+  reading. 1.6.1 typed a
   single-line command of any length as one line, which a shell could cut
   short. A body that would take more than 128 lines (about 100 KB of ASCII
   text; a byte at or above 0x7f, a single quote, a `!` or a control byte
@@ -229,7 +231,7 @@
   command's line, which doesn't mean the command has started. With a shell
   that reads the temp file and waits at its prompt, the refusal lasts the
   probe line's round trip, so a `sendInput` sent straight after `runCommand`
-  with a timeout of -1 can be refused where 1.6.0 sent it: send it again in a
+  with a timeout of -1 can be refused where 1.6.1 sent it: send it again in a
   moment.
 - **A SIGINT gives up a command still being typed in.** Before its Ctrl-C,
   `sendSignal` with SIGINT gives up the commands on their way in that can't
