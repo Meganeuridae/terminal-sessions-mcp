@@ -105,9 +105,9 @@ try {
   await h.firstAttempt
   await observer.firstAttempt
 
-  await check('connected with the shipped selection: nine core tools', async () => {
+  await check('connected with the shipped selection: the ten core tools', async () => {
     const names = h.tools.map((t: any) => t.name).sort()
-    if (names.length !== 9 || !names.includes('run') || !names.includes('input')) fail(`tools: ${names.join(',')}`)
+    if (names.length !== 10 || !names.includes('run') || !names.includes('input') || !names.includes('session_declare_shell')) fail(`tools: ${names.join(',')}`)
   })
 
   const opened = await call('session_open', { session: SESSION, visibility: 'shared' })

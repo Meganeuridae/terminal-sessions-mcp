@@ -110,14 +110,17 @@ takes a declaration back. Cancel inside a declared shell types `^C` and the end 
 nothing more: the daemon cannot signal a job on another machine, and says so.
 
 For an unattended remote command, run `ssh -t host 'cmd'`, or `ssh -tt host 'cmd'` with
-`--target process`. With a terminal on the remote side, a cancel here reaches the remote
-command as an interrupt and a dropped connection hangs it up. Without one (`ssh host 'cmd'`,
-or `-T`), ending ssh leaves the remote command running until it writes to the closed
-connection, possibly for a long time; the result of such a Run says so. The process target
-keeps stdout and stderr apart under `-T` and merges them under `-tt`; ssh's exit status is
-the remote command's either way (255 for a connection error). A `termd` on the remote
-machine with a forwarded port keeps full semantics across tunnel interruptions: reconnect
-and `await` the same Run instead of rerunning an uncertain operation with a fresh key.
+`--target process`. A cancel here ends the local ssh client; that is all the daemon can see,
+and all `cancelled` means. With a terminal on the remote side, ssh passes the interrupt on
+and a dropped connection hangs the remote command up, which most commands stop for; one that
+traps or ignores those runs on, and nothing here knows. Without a terminal (`ssh host 'cmd'`,
+or `-T`), the remote command gets neither and runs until it writes to the closed
+connection; the result of such a Run says so. The process target keeps stdout and stderr
+apart under `-T` and merges them under `-tt`; ssh's exit status is the remote command's
+either way (255 for a connection error). For remote work that must be stoppable and
+observable, run a `termd` on the remote machine with a forwarded port: it owns the remote
+process group, and across tunnel interruptions you reconnect and `await` the same Run
+instead of rerunning an uncertain operation with a fresh key.
 
 ## Humans
 

@@ -141,7 +141,7 @@ function runStatus(r: RunResult): string {
     }
     case 'cancelled': {
       const host = oneShotSshWithoutTty(r.line);
-      const remote = host !== undefined ? ` — the remote command may still be running on ${host}: without -t it had no terminal there, so ending ssh did not reach it; run remote one-shots as ssh -t host cmd (ssh -tt with target process)` : '';
+      const remote = host !== undefined ? ` — this ended the local ssh client only; the command on ${host} had no terminal there (no -t), so nothing reached it and it may still be running; with ssh -t host cmd (ssh -tt with target process) the remote command gets the interrupt, which most stop for, and a termd on that host would own it` : '';
       return `cancelled${r.signal ? ` by ${r.signal}` : r.exit !== undefined ? ` (exit ${r.exit})` : ''} after ${fmt(r.durationMs ?? 0)}${remote}`;
     }
     case 'lost': {
@@ -170,7 +170,7 @@ function runStatus(r: RunResult): string {
       // A hint, never evidence (§8.1): the line reads like one that opens another shell.
       const opened = r.target === 'shell' && r.shell === undefined && looksLikeShellOpener(r.line) ? ' — if it opened a shell (it looks like it did), declare that with session_declare_shell and run your commands in it' : '';
       const host = oneShotSshWithoutTty(r.line);
-      const remote = host !== undefined ? ` — a cancel would end ssh, not the command on ${host}, which has no terminal there without -t; run remote one-shots as ssh -t host cmd (ssh -tt with target process) so a cancel or a dropped connection reaches them` : '';
+      const remote = host !== undefined ? ` — a cancel would end the local ssh client, not the command on ${host}, which has no terminal there without -t; with ssh -t host cmd (ssh -tt with target process) the interrupt reaches it, which most commands stop for, though the daemon can only ever confirm that ssh ended` : '';
       return `${r.state} ${fmt(r.durationMs ?? 0)} so far — ${next}${opened}${remote}`;
     }
     case 'busy': {
