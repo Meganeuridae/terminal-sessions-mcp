@@ -435,7 +435,9 @@ async function main(): Promise<void> {
   // Linux: sessions' shells and process Runs raise their oom_score_adj so the kernel takes a
   // build before the daemon, whose death loses every session. The preference counts against
   // every process on the machine, so a shared host may want less, or 0.
-  const oomAdj = Number(f['session-oom-score-adj'] ?? process.env.TSM_SESSION_OOM_SCORE_ADJ ?? '200');
+  // An empty TSM_SESSION_OOM_SCORE_ADJ is unset (the default), not 0; an empty flag value is an error like any other.
+  const oomSetting = f['session-oom-score-adj'] ?? (process.env.TSM_SESSION_OOM_SCORE_ADJ || undefined) ?? '200';
+  const oomAdj = /^\d+$/.test(oomSetting.trim()) ? Number(oomSetting) : NaN;
   if (!Number.isInteger(oomAdj) || oomAdj < 0 || oomAdj > 1000) fail('--session-oom-score-adj must be an integer from 0 to 1000');
   registryOpts.sessionOomScoreAdj = oomAdj;
   // G21: nothing is deleted by default; these flags set daemon-wide limits, and a session may set its own at creation.

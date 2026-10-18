@@ -284,3 +284,31 @@ test('readiness: SIGTERM at the listening announcement drains cleanly', async ()
     await stop(d);
   }
 });
+
+test('an empty TSM_SESSION_OOM_SCORE_ADJ is the default (200), not 0; an empty flag value is an error like any other', async () => {
+  const dataDir = path.join(tmp, 'oom-env');
+  const d = termd(['--port', '0', '--data-dir', dataDir, '--no-usage-log', '--shell', '/bin/bash'], { env: { TSM_SESSION_OOM_SCORE_ADJ: '' } });
+  try {
+    await until(() => listening(d) !== undefined, 10_000, 'termd to listen');
+    const r = await call(urlOf(d), 'run', { session: 'oom', command: 'true', wait: 10_000 });
+    assert.equal(r.state, 'exited', JSON.stringify(r));
+    const find = (dir: string): string | undefined => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) {
+          const f = find(p);
+          if (f) return f;
+        } else if (e.name === 'launch.sh') return p;
+      }
+      return undefined;
+    };
+    const launcher = find(path.join(dataDir, 'sessions', 'oom'));
+    assert.ok(launcher, 'the session shell has a launcher');
+    assert.match(fs.readFileSync(launcher, 'utf8'), /echo 200 > \/proc\/self\/oom_score_adj/, 'the default preference, not none');
+  } finally {
+    await stop(d);
+  }
+  const bad = termd(['--port', '0', '--data-dir', path.join(tmp, 'oom-bad'), '--no-usage-log', '--session-oom-score-adj', '']);
+  assert.equal(await bad.exited, 2);
+  assert.match(bad.lines.join('\n'), /--session-oom-score-adj must be an integer from 0 to 1000/);
+});
