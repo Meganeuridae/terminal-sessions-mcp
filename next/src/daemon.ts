@@ -17,7 +17,10 @@
  * (G10, G20; jr2-2, tsg-1): the port is held before the data dir is read, so a
  * duplicate on the same port stops at EADDRINUSE; the registry takes the data
  * dir's lock before recovery, so a duplicate on another port stops at
- * `data_dir_locked`; only then does recovery run and the endpoint start.
+ * `data_dir_locked`; only then does recovery run and the endpoint start — on the
+ * held socket itself, so the port is never unbound in between, and a client that
+ * connected during recovery waits and is answered rather than refused or reset
+ * (a refused shim starts a daemon of its own: the house's review of #11, API 3).
  *
  * Flags are parsed strictly (tsg-18): an unknown flag, a missing value, or a
  * value that looks like another flag is an error, never a silent fallback to an
@@ -273,16 +276,36 @@ function fail(message: string, code = 2): never {
  * journals first. Clients that connect meanwhile are hung up on (not refused), so a shim
  * retries rather than starting yet another daemon. Port 0 has nothing to hold.
  */
-function holdPort(host: string, port: number): Promise<net.Server | undefined> {
+/** The port, held from before the data dir is read until the endpoint takes the socket over (see the header). */
+interface HeldPort {
+  server: net.Server;
+  /** Connections accepted during the hold, paused with their first bytes unread, for the endpoint to serve once it listens. */
+  parked: net.Socket[];
+}
+/** More waiting connections than this during one recovery are closed instead (a reset, as every connection during the hold got before). */
+const MAX_PARKED = 128;
+
+function holdPort(host: string, port: number): Promise<HeldPort | undefined> {
   if (port === 0) return Promise.resolve(undefined);
   return new Promise((resolve, reject) => {
-    const srv = net.createServer((sock) => sock.destroy());
-    srv.once('error', reject);
-    srv.listen({ host, port, exclusive: true }, () => resolve(srv));
+    const held: HeldPort = { server: net.createServer(), parked: [] };
+    held.server.on('connection', (sock) => {
+      if (held.parked.length >= MAX_PARKED) {
+        sock.destroy();
+        return;
+      }
+      sock.pause();
+      sock.on('error', () => undefined);
+      held.parked.push(sock);
+      sock.once('close', () => {
+        const i = held.parked.indexOf(sock);
+        if (i !== -1) held.parked.splice(i, 1);
+      });
+    });
+    held.server.once('error', reject);
+    held.server.listen({ host, port, exclusive: true }, () => resolve(held));
   });
 }
-
-const release = (srv: net.Server | undefined): Promise<void> => (srv ? new Promise((r) => srv.close(() => r())) : Promise.resolve());
 
 const HELP = `termd — terminal sessions daemon
   --host <addr>          bind address (default 127.0.0.1)
@@ -457,7 +480,7 @@ async function main(): Promise<void> {
   if (rb !== undefined || ra !== undefined) registryOpts.retention = retention;
 
   // The port first, then the data dir's lock, then recovery (see the header).
-  let held: net.Server | undefined;
+  let held: HeldPort | undefined;
   try {
     held = await holdPort(host, port);
   } catch (e) {
@@ -548,8 +571,10 @@ async function main(): Promise<void> {
   const server = new TermServer(serverOpts);
   let bound: { host: string; port: number };
   try {
-    await release(held);
-    bound = await server.listen();
+    // The endpoint listens on the held socket itself (the port is never unbound in between),
+    // then answers the connections that waited through recovery.
+    bound = await server.listen(held?.server);
+    for (const sock of held?.parked.splice(0) ?? []) server.adopt(sock);
   } catch (e) {
     fail(`cannot listen on ${host}:${port}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
   }

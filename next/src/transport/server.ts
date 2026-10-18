@@ -46,7 +46,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { AddressInfo, Server as NetServer, Socket } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import type { App, Caller } from '../api/app.js';
@@ -312,17 +312,32 @@ export class TermServer {
     });
   }
 
-  listen(): Promise<{ host: string; port: number }> {
+  /**
+   * Start listening: on `handle`, the bound socket the daemon held while it recovered
+   * (daemon.ts), so the port is never unbound between the hold and the endpoint — in that
+   * gap connections were refused, and a shim that is refused starts a daemon of its own (the
+   * house's review of #11, API 3); otherwise on the configured host and port.
+   */
+  listen(handle?: NetServer): Promise<{ host: string; port: number }> {
     const host = this.opts.host ?? '127.0.0.1';
     return new Promise((resolve, reject) => {
       this.http.once('error', reject);
-      this.http.listen(this.opts.port ?? 3101, host, () => {
+      const listening = (): void => {
         this.boundPort = (this.http.address() as AddressInfo).port;
         this.allowed = this.hostPatterns(host);
         this.startHeartbeat();
         resolve({ host, port: this.boundPort });
-      });
+      };
+      if (handle) this.http.listen(handle, listening);
+      else this.http.listen(this.opts.port ?? 3101, host, listening);
     });
+  }
+
+  /** Serve a connection accepted while the port was held, its first bytes still unread: it is answered as if it had arrived now. */
+  adopt(socket: Socket): void {
+    if (socket.destroyed) return;
+    this.http.emit('connection', socket);
+    socket.resume();
   }
 
   /** The Host allowlist: loopback names (on a loopback bind, any port: see the header), a specific bind address, and --allow-host entries. */
