@@ -57,7 +57,7 @@ test('the fish integration parses', { skip: !FISH }, () => {
 });
 
 test('the process launcher and the lines typed for a declared shell parse in sh, bash, zsh and fish', () => {
-  for (const keeps of [true, false]) parses('/bin/sh', ['-n', '-c', processLaunch(keeps)], `the process launcher (${keeps ? 'with' : 'without'} descriptor 3)`);
+  for (const keeps of [true, false]) parses('/bin/bash', ['-n', '-c', processLaunch(keeps)], `the process launcher (${keeps ? 'with' : 'without'} descriptor 3)`);
   const bodies = [`printf '%s\\n' "it's" 'quoted' \\\\back %d; (exit 3)`, `f() {\n${Array.from({ length: 80 }, (_, i) => `  echo line-${i}-${'x'.repeat(40)}`).join('\n')}\n}\nf | wc -l`];
   for (const body of bodies) {
     const posix = inlineLines(body, 'abcd1234', false).join('\n');

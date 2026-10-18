@@ -54,6 +54,23 @@ async function real(shell: string): Promise<{ session: Session; journal: Journal
   return { session, journal };
 }
 
+test('process cleanup ignores ambient bash startup code, for argv and line Runs', async () => {
+  const startup = path.join(tmp, 'unexpected-startup.sh');
+  fs.writeFileSync(startup, 'printf unexpected-startup >&2; exit 61\n');
+  const backend = new NodePtyBackend();
+  for (const command of [
+    { argv: [process.execPath, '-e', "process.stdout.write('safe')"] },
+    { argv: ['/bin/sh'], line: 'printf safe' },
+  ]) {
+    const child = backend.spawnProcess({ ...command, cwd: tmp, env: { BASH_ENV: startup, PATH: '/no-toolchain' } });
+    let stdout = '', stderr = '';
+    child.onStdout((s) => { stdout += s; });
+    child.onStderr((s) => { stderr += s; });
+    const exit = await new Promise<{ exitCode: number | null }>((resolve) => child.onExit(resolve));
+    assert.deepEqual([exit.exitCode, stdout, stderr], [0, 'safe', '']);
+  }
+});
+
 async function runWait(s: Session, line: string, wait = 5000) {
   const a = await s.admitWhenAvailable({ target: 'shell', line, principal: AGENT });
   assert.ok(a.admitted, `admitted: ${JSON.stringify(a)}`);
@@ -242,6 +259,9 @@ test('/bin/sh: G5 fallback — no integration, marker strategy, observed exits, 
 });
 
 test('/bin/bash: a process Run inherits no terminal master, and its line is not in any argv', async () => {
+  // Take the clean control before opening terminals: a plain child also inherits their
+  // masters on Linux, so a control spawned afterwards would bless the very leak we test.
+  const baseline = execFileSync('ls', ['/dev/fd'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\s+/).sort();
   // Two sessions open: before, a process Run in either held both terminals' masters.
   const a = await real('/bin/bash');
   const b = await real('/bin/bash');
@@ -251,11 +271,24 @@ test('/bin/bash: a process Run inherits no terminal master, and its line is not 
     const r = await a.session.awaitRun(fds.run.runId, 5000);
     assert.equal(r.state, 'exited');
     const out = a.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output' && e.runId === r.runId).map((e) => e.data).join('');
-    // Exactly what `ls /dev/fd` has when this test process spawns it directly (0, 1, 2 and the
-    // descriptors ls opens to read /dev/fd): nothing of the daemon's. On Linux the daemon's
-    // children inherited every session's terminal master before the launcher closed them.
-    const baseline = execFileSync('ls', ['/dev/fd'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\s+/).sort();
+    // Only standard streams and the descriptor ls opens to read /dev/fd remain.
     assert.deepEqual(out.trim().split(/\s+/).filter(Boolean).sort(), baseline, `descriptors open in a process Run: ${out.trim()}`);
+    // Resolving a relative executable uses the Run's cwd; a relative/empty PATH component
+    // does too. Those successful launches need the same descriptor cleanup as absolute argv.
+    const relative = path.join(tmp, 'relative-fds.sh');
+    fs.writeFileSync(relative, '#!/bin/sh\n/bin/ls /dev/fd\n', { mode: 0o700 });
+    for (const command of [
+      { argv: ['./relative-fds.sh'], env: {} },
+      { argv: ['relative-fds.sh'], env: { PATH: '' } },
+      { argv: ['ls', '/dev/fd'], env: {} },
+    ]) {
+      const child = new NodePtyBackend().spawnProcess({ ...command, cwd: tmp });
+      let text = '';
+      child.onStdout((d) => { text += d; });
+      const exit = await new Promise<{ exitCode: number | null }>((resolve) => child.onExit(resolve));
+      assert.equal(exit.exitCode, 0);
+      assert.deepEqual(text.trim().split(/\s+/).sort(), baseline, JSON.stringify(command));
+    }
     // The line's text is in a file, not in the shell's argv: a pkill -f for a word of the line
     // finds nothing but pkill itself, which it skips, and the line goes on.
     const own = a.session.admit({ target: 'process', line: "pkill -f 'qz7-relaunch' >/dev/null 2>&1; echo after-the-pkill qz7-relaunch", principal: AGENT });
@@ -290,16 +323,10 @@ test('/bin/bash: a process Run inherits no terminal master, and its line is not 
 });
 
 test('a process group whose leader exited is signalled only while it is still the Run\'s: orphans are, a stranger given the freed pid is not, and nothing is when nothing can say', () => {
-  const spawnedAt = 1_700_000_000_000;
-  const row = (startMs: number) => ({ pid: 4242, pgid: 4242, startMs, zombie: false });
   // No process of the group's id: the members are the Run's orphans (the kernel keeps the pid while they live).
-  assert.equal(groupStillOurs(4242, spawnedAt, () => null), true);
-  // Our own leader, by its start time (ps truncates to the second).
-  assert.equal(groupStillOurs(4242, spawnedAt, () => row(spawnedAt - 900)), true);
-  assert.equal(groupStillOurs(4242, spawnedAt, () => row(spawnedAt + 900)), true);
-  // A stranger started later with the freed pid, or long before it: not ours.
-  assert.equal(groupStillOurs(4242, spawnedAt, () => row(spawnedAt + 60_000)), false);
-  assert.equal(groupStillOurs(4242, spawnedAt, () => row(spawnedAt - 60_000)), false);
+  assert.equal(groupStillOurs(4242, () => false), true);
+  // The leader has already been reaped: even an immediately reused pid belongs to a stranger.
+  assert.equal(groupStillOurs(4242, () => true), false);
   // Nothing can list processes: nothing is signalled.
-  assert.equal(groupStillOurs(4242, spawnedAt, () => undefined), false);
+  assert.equal(groupStillOurs(4242, () => undefined), false);
 });
