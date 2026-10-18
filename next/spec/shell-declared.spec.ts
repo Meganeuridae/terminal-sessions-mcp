@@ -167,6 +167,10 @@ test('a program that is not a shell leaves a declared Run starting; cancel settl
     // The ^C ended cat (the enclosing Run), and with it the Run and the declaration made for it.
     await until(() => x.session.run(cat).state !== 'running', 3000);
     assert.equal(x.session.info().declared, undefined);
+    // Cancelling the inner command did not ask to leave its declared shell. Since cat
+    // was not a shell, that interrupt also ended the opener; the changed destination needs acknowledgement.
+    const refused = x.session.admit({ target: 'shell', line: 'echo back', principal: AGENT });
+    assert.ok(!refused.admitted && refused.reason === 'declared-shell-ended');
     assert.equal((await x.run('echo back')).text, 'back');
   } finally {
     await x.close();
@@ -281,16 +285,22 @@ test('a typed line prints its marker only where the shell holds exactly the text
   }
 });
 
-test('the first line typed for a declared shell clears a line someone had begun at its prompt, so the Run runs whole', { skip: !hasShell('/bin/bash') }, async () => {
+test('a declared shell preserves a half-typed prompt, refusing or queueing until it is cleared', { skip: !hasShell('/bin/bash') }, async () => {
   const x = await realSession('/bin/bash');
   try {
     const enclosing = await open(x.session, 'bash --norc --noprofile');
     declare(x.session, 'bash');
     // A person began typing at the nested shell's prompt and never pressed Enter.
     x.session.input('echo partial ', { principal: AGENT });
-    await until(() => x.journal.since(0).events.some((e) => e.type === 'output' && e.runId === enclosing && String((e as { data: string }).data).includes('echo partial')), 8000, 'the typed text echoed');
-    const r = await x.run(`printf '%s\\n' CLEAN; (exit 3)`, 8000);
-    assert.deepEqual([r.state, r.exit, r.text.trim()], ['exited', 3, 'CLEAN'], 'the half-typed line did not change the command');
+    await until(() => x.journal.since(0).events.filter((e) => e.type === 'output' && e.runId === enclosing).map((e) => (e as { data: string }).data).join('').includes('echo partial'), 8000, 'the typed text echoed');
+    const line = `printf '%s\\n' CLEAN; (exit 3)`;
+    const refused = x.session.admit({ target: 'shell', line, principal: AGENT });
+    assert.ok(!refused.admitted && refused.reason === 'human-editing');
+    const queued = x.session.admit({ target: 'shell', line, principal: AGENT, queue: true });
+    assert.ok(queued.admitted && queued.run.state === 'queued');
+    x.session.input('\x15', { principal: AGENT });
+    const r = await x.session.awaitRun(queued.run.runId, 8000);
+    assert.deepEqual([r.state, r.exit, (await x.session.runTranscript(r.runId)).text.trim()], ['exited', 3, 'CLEAN'], 'the half-typed line did not change the command');
   } finally {
     await x.close();
   }
@@ -321,6 +331,111 @@ test('a gone marker from the declared shell ends the Run lost: line-not-whole, n
     assert.match(renderRun({ ...(h.session.run(one.run.runId) as unknown as RunResult), session: 's', output: { text: '', truncated: false, seq: [1, 2], nextCursor: 2 } }, 'transcript').text, /reached it changed or cut/);
     await until(() => typed.slice(before).some((t) => t.includes("__tsm_b='echo two'")), 3000, "the queued Run's line");
     assert.equal(typed.slice(before).filter((t) => t.includes("__tsm_b='echo one'")).length, 0, 'nothing more typed for the lost Run');
+  } finally {
+    await h.session.close();
+  }
+});
+
+test('declared cancellation probes again after quit flushes an earlier probe', async () => {
+  const h = await scriptedSession();
+  const write = h.pty.write.bind(h.pty);
+  try {
+    const opener = await open(h.session, 'sleep 100');
+    declare(h.session, 'sh', opener);
+    const admitted = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+    assert.ok(admitted.admitted);
+    const nonce = /<<<GON''E:([0-9a-f]+)>>>/.exec(h.pty.writes.at(-1)!)![1]!;
+    h.pty.emit(`<<<START:${nonce}>>>\r\n`);
+    let quit = false;
+    h.pty.write = (data) => {
+      if (data === '\x03') return; // this job ignores interrupt
+      if (data === '\x1c') { quit = true; return; }
+      if (data.includes(`<<<EXI''T:${nonce}`)) {
+        // Its first probe was flushed by quit; only one typed afterwards can answer.
+        if (quit) h.pty.emit(`<<<EXIT:${nonce}:131>>>\r\n`);
+        return;
+      }
+      write(data);
+    };
+    const result = await h.session.cancel(admitted.run.runId, AGENT, { graceMs: 5 });
+    assert.equal(result.state, 'cancelled');
+    assert.ok(result.steps.includes('end-marker probe after ^\\'));
+  } finally {
+    h.pty.write = write;
+    await h.session.close();
+  }
+});
+
+test('an earlier cancelled command does not make a later declared-shell disconnect intentional', async () => {
+  const x = await realSession('/bin/bash');
+  try {
+    const opener = await open(x.session, 'bash --noprofile --norc');
+    declare(x.session, 'bash');
+    const pid = Number((await x.run('echo $$')).text.trim());
+    assert.ok(pid > 1 && pid !== x.session.pid);
+    const slow = x.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+    assert.ok(slow.admitted);
+    await until(() => x.session.run(slow.run.runId).state === 'running');
+    assert.equal((await x.session.cancel(slow.run.runId, AGENT)).state, 'cancelled');
+    process.kill(pid, 'SIGKILL');
+    await x.session.awaitRun(opener, 5000);
+    assert.throws(() => declare(x.session, 'not-a-shell'), invalid(/not a shell/));
+    const processRun = x.session.admit({ target: 'process', argv: ['/bin/true'], principal: AGENT });
+    assert.ok(processRun.admitted);
+    await x.session.awaitRun(processRun.run.runId, 5000);
+    const refused = x.session.admit({ target: 'shell', line: 'echo wrong-machine', principal: AGENT });
+    assert.ok(!refused.admitted && refused.reason === 'declared-shell-ended');
+    assert.equal((await x.run('echo local-after-ack')).text, 'local-after-ack');
+  } finally {
+    await x.close();
+  }
+});
+
+test('a declared shell that ends without its caller asking refuses the next shell Run once (fail closed); `exit` typed into it does not', async () => {
+  const h = await scriptedSession();
+  try {
+    const typed: string[] = [];
+    h.pty.onWrite((d) => typed.push(d));
+    const open = async () => {
+      const front = h.session.admit({ target: 'shell', line: 'sleep 100', principal: AGENT });
+      assert.ok(front.admitted);
+      await until(() => h.session.run(front.run.runId).state === 'running');
+      h.session.declareShell({ principal: AGENT });
+      return front.run.runId;
+    };
+    const notes = () => h.journal.since(0).events.filter((e) => e.type === 'note').map((e) => (e as { text: string }).text).join('\n');
+    // The connection drops: ssh ends with 255 while a line is typed into the remote shell.
+    const first = await open();
+    const inFlight = h.session.admit({ target: 'shell', line: 'make deploy', principal: AGENT });
+    assert.ok(inFlight.admitted);
+    await until(() => typed.some((t) => t.includes("__tsm_b='make deploy'")), 3000, 'the line typed into the declared shell');
+    h.shell.finishHung(255);
+    await until(() => h.session.run(first).state === 'exited', 3000, 'the opener ended');
+    assert.deepEqual([h.session.run(inFlight.run.runId).state, h.session.run(inFlight.run.runId).reason], ['lost', `enclosing-run-ended: ${first} exited`]);
+    assert.equal(h.session.info().declared, undefined);
+    const refused = h.session.admit({ target: 'shell', line: 'make deploy', principal: AGENT, queue: true });
+    assert.ok(!refused.admitted);
+    assert.equal(refused.reason, 'declared-shell-ended');
+    assert.equal(refused.busy?.runId, first, 'the refusal names the Run whose shell ended');
+    assert.match(notes(), /without its caller asking: the next shell Run is refused once/);
+    const again = await h.session.admitWhenAvailable({ target: 'shell', line: 'echo hello', principal: AGENT });
+    assert.ok(again.admitted, `the Run after the refusal goes to the session's own shell: ${JSON.stringify(again)}`);
+    assert.equal((await h.session.awaitRun(again.run.runId, 3000)).exit, 0);
+    await h.session.waitAvailable(2000);
+    // The caller leaves the remote shell itself: nothing is refused.
+    const second = await open();
+    const leave = h.session.admit({ target: 'shell', line: 'exit', principal: AGENT });
+    assert.ok(leave.admitted);
+    await until(() => typed.some((t) => t.includes("__tsm_b='exit'")), 3000, 'exit typed into the declared shell');
+    const exitLine = typed.find((t) => t.includes("__tsm_b='exit'"))!;
+    const exitNonce = /<<<STAR''T:([0-9a-f]+)>>>/.exec(exitLine)![1]!;
+    h.pty.emit(`<<<START:${exitNonce}>>>\r\n`);
+    h.shell.finishHung(0);
+    await until(() => h.session.run(second).state === 'exited', 3000, 'the opener ended');
+    assert.doesNotMatch(notes().split('\n').at(-1) ?? '', /refused/, 'the note after the caller’s own exit');
+    const local = await h.session.admitWhenAvailable({ target: 'shell', line: 'echo hello', principal: AGENT });
+    assert.ok(local.admitted, `after the caller's own exit the next Run is admitted: ${JSON.stringify(local)}`);
+    assert.equal((await h.session.awaitRun(local.run.runId, 3000)).exit, 0);
   } finally {
     await h.session.close();
   }

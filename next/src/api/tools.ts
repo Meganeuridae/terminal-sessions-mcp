@@ -83,6 +83,9 @@ const BUSY_NEXT: Record<string, string> = {
   'shell-unavailable':
     "the session's shell was replaced by a program without integration: if that program is a shell, declare it with session_declare_shell (sh, bash, zsh, fish…) and run again; " +
     'input and screen work regardless; or open a new session',
+  'declared-shell-ended':
+    'the declared shell (ssh, sudo -i, a nested shell) ended without your asking — the connection dropped, or that shell died — so this command would have run in the shell underneath, not where you meant it: ' +
+    'run it again if the session’s own shell is what you mean, or run the opener and declare again',
   'human-editing': 'a partial command line sits at the prompt: clear it with input keys:["C-u"] (needs the seat), or pass queue:true',
   starting: 'the shell is still starting: pass queue:true to run once it is ready',
   exited: 'the shell has exited: run again to start a new one',
@@ -141,7 +144,7 @@ function runStatus(r: RunResult): string {
     }
     case 'cancelled': {
       const host = oneShotSshWithoutTty(r.line);
-      const remote = host !== undefined ? ` — this ended the local ssh client only; the command on ${host} had no terminal there (no -t), so nothing reached it and it may still be running; with ssh -t host cmd (ssh -tt with target process) the remote command gets the interrupt, which most stop for, and a termd on that host would own it` : '';
+      const remote = host !== undefined ? ` — this ended the local ssh client only; the command on ${host} had no terminal there (no -t), so nothing reached it and it may still be running; ssh -t in the shell lets terminal interrupts reach it, while ending ssh -tt as a process Run hangs it up; a termd on that host would own the remote work` : '';
       return `cancelled${r.signal ? ` by ${r.signal}` : r.exit !== undefined ? ` (exit ${r.exit})` : ''} after ${fmt(r.durationMs ?? 0)}${remote}`;
     }
     case 'lost': {
@@ -170,7 +173,7 @@ function runStatus(r: RunResult): string {
       // A hint, never evidence (§8.1): the line reads like one that opens another shell.
       const opened = r.target === 'shell' && r.shell === undefined && looksLikeShellOpener(r.line) ? ' — if it opened a shell (it looks like it did), declare that with session_declare_shell and run your commands in it' : '';
       const host = oneShotSshWithoutTty(r.line);
-      const remote = host !== undefined ? ` — a cancel would end the local ssh client, not the command on ${host}, which has no terminal there without -t; with ssh -t host cmd (ssh -tt with target process) the interrupt reaches it, which most commands stop for, though the daemon can only ever confirm that ssh ended` : '';
+      const remote = host !== undefined ? ` — a cancel would end the local ssh client, not the command on ${host}, which has no terminal there without -t; ssh -t in the shell lets terminal interrupts reach it, while ending ssh -tt as a process Run hangs it up; the daemon can only confirm that ssh ended` : '';
       return `${r.state} ${fmt(r.durationMs ?? 0)} so far — ${next}${opened}${remote}`;
     }
     case 'busy': {
@@ -452,7 +455,8 @@ export const TOOLS: ToolDef[] = [
       'Say that the program in front of the session’s terminal is a shell — the remote end of `ssh host`, a `sudo -i`, `docker exec -it … bash`, a nested shell, ' +
       'or a shell that replaced the session’s own (`reason: shell-unavailable`). From then on `run` goes to that shell: the command travels inline with start and end ' +
       'markers, so you get its output and exit status, and `cd`/exports persist there; results say `cwd unknown` and name the declared shell. The declaration ends by itself ' +
-      'when the command that opened the shell ends (ssh exits): the next `run` is in the session’s own shell again, and a note in the session says so. ' +
+      'when the command that opened the shell ends (ssh exits), and a note in the session says so: after your own `exit` or a cancel of that command, the next `run` is in the session’s own shell again; ' +
+      'after an end you did not ask for (the connection dropped), the next `run` is refused once (`busy: declared-shell-ended`), so a command meant for the remote does not run locally — run it again if local is what you mean. ' +
       'Declare again inside a second hop (an `ssh` run from a declared shell); `shell: "none"` takes the last declaration back. Needs the seat, like `run`.',
     inputSchema: {
       type: 'object',

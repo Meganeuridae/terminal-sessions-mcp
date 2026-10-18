@@ -63,7 +63,7 @@ setTimeout(() => {
 }
 
 test('a startup rc replacing the shell with a reader never becomes ready through a timer', async () => {
-  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': 'exec /bin/cat\n' }, integrationGraceMs: 100, startupCapMs: 400 });
+  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': 'sleep 0.8; exec /bin/cat\n' }, integrationGraceMs: 100, startupCapMs: 400 });
   try {
     // The cap resolves `start` at 400 ms whatever the shell has done by then; on a loaded machine
     // bash may not have reached its rc yet, and the session is still `starting` (never `idle`).

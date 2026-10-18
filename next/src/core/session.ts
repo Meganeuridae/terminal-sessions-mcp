@@ -133,7 +133,7 @@ export interface SeatOptions {
   asOwner?: boolean;
 }
 
-export type BusyReason = 'running' | 'prompt-pending' | 'human-editing' | 'starting' | 'shell-unavailable' | 'exited';
+export type BusyReason = 'running' | 'prompt-pending' | 'human-editing' | 'starting' | 'shell-unavailable' | 'exited' | 'declared-shell-ended';
 export type AdmitResult = { admitted: true; run: RunInfo } | { admitted: false; busy: RunInfo | null; reason: BusyReason };
 
 export interface CancelResult {
@@ -232,8 +232,8 @@ const publicRun = (r: RunRecord): RunInfo => {
  * the prompt when the first line arrives (a person's half-typed command in a shared
  * terminal) would otherwise swallow the assignment while the markers after it still ran,
  * and the Run would report `exited 0` for a command that never ran (an outside review
- * reproduced it). The first line is preceded by ^U, which clears a pending line in every
- * line editor and in canonical mode alike; the check is what stands when that is not enough.
+ * reproduced it). The first line is preceded by ^U, which clears what precedes the cursor
+ * (the whole line at its end); the check is what stands when that is not enough.
  */
 const INLINE_SAFE = new Set([...'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ,._/:=@+-'].map((c) => c.charCodeAt(0)));
 const INLINE_LINE_BYTES = 900;
@@ -472,6 +472,8 @@ export class Session {
   private readonly declaredQueue: RunRecord[] = [];
   /** Declared shells, innermost last: shell Runs go to the last one (§8.1). A layer ends with the Run whose program it is. */
   private readonly layers: DeclaredShell[] = [];
+  /** A declared shell ended without its caller's word (§8.1, fail closed): the next shell Run is refused once, so a line meant for it does not run in the shell underneath. */
+  private declaredEnded: { shell: string; within: string; how: string } | undefined;
   /** The end of the terminal output so far (64 chars): a declared shell's marker may straddle two reads. */
   private inlineTail = '';
   private controller: Principal | null = null;
@@ -599,10 +601,18 @@ export class Session {
     }
     // G5: no handshake within the grace means no integration; after one, wait for the
     // first prompt, but `start` never waits past the cap.
-    this.graceTimer = setTimeout(() => {
-      if (this.integrationLevel !== 'unknown') return;
+    const checkStartup = (): void => {
+      this.graceTimer = undefined;
+      if (this.closed || this.shellState !== 'starting' || this.integrationLevel !== 'unknown') return;
       if (!this.sawHello || this.replacedDuringStartup()) this.declareIntegration('none');
-    }, this.opts.integrationGraceMs ?? 3000);
+      else {
+        // Resolving start at its cap does not end the shell's startup. Its rc may exec
+        // later; keep watching until a prompt or replacement supplies actual evidence.
+        this.graceTimer = setTimeout(checkStartup, 100);
+        this.graceTimer.unref();
+      }
+    };
+    this.graceTimer = setTimeout(checkStartup, this.opts.integrationGraceMs ?? 3000);
     this.capTimer = setTimeout(() => {
       this.capTimer = undefined;
       // Still no prompt: resolve in `starting` (admission answers busy 'starting' until
@@ -1298,13 +1308,24 @@ export class Session {
     // The program this Run started went with it: Runs declared for that program can never report (G3),
     // and the declaration itself ends — shell Runs go to what is in front now.
     if (run.target === 'shell') {
+      // Capture the intent while its inline child is still in front. An earlier cancelled
+      // command says nothing about a later disconnect, and ending the children loses this state.
+      const callerEnded = run.cancelRequested || this.callerExiting(run.runId);
       this.endDeclaredIn(run.runId, `enclosing-run-ended: ${run.runId} ${outcome.state}`);
       const i = this.layers.findIndex((l) => l.within === run.runId);
       if (i !== -1) {
         const [layer] = this.layers.splice(i);
         const now = this.layers.at(-1);
         const how = `${outcome.state}${outcome.exit !== undefined ? ` ${outcome.exit}` : ''}`;
-        this.note(`the declared ${layer!.shell} shell ended with ${run.runId} (${how}): shell Runs go to ${now ? `the declared ${now.shell} shell` : "the session's own shell"} again`);
+        const under = now ? `the declared ${now.shell} shell` : "the session's own shell";
+        if (outcome.state === 'cancelled' || callerEnded) {
+          this.note(`the declared ${layer!.shell} shell ended with ${run.runId} (${how}): shell Runs go to ${under} again`);
+        } else {
+          // Fail closed (§8.1): an end the caller did not ask for — a dropped connection, a remote
+          // shell that died — must not send the next line, meant for that shell, into the one underneath.
+          this.declaredEnded = { shell: layer!.shell, within: run.runId, how };
+          this.note(`the declared ${layer!.shell} shell ended with ${run.runId} (${how}) without its caller asking: the next shell Run is refused once (declared-shell-ended), then shell Runs go to ${under} again`);
+        }
       }
     }
     const wasCurrent = this.currentShellRun === run;
@@ -1369,6 +1390,8 @@ export class Session {
     this.editingTimer = setTimeout(() => {
       this.editingTimer = undefined;
       this.drainQueue();
+      const layer = this.layers.at(-1);
+      if (layer) this.drainDeclared(layer.within);
       this.notifyAvailable();
     }, (this.opts.editingStaleMs ?? 30_000) + 5);
     this.editingTimer.unref();
@@ -1425,6 +1448,14 @@ export class Session {
       return { admitted: true, run: publicRun(run) };
     }
     if (opts.line === undefined) throw err('invalid_argument', 'shell Run needs a line');
+    if (this.declaredEnded && !opts.internal && opts.principal !== SYSTEM) {
+      // Fail closed (§8.1): the declared shell this line may have been meant for is gone; one
+      // refusal, naming the Run whose shell it was, and the next Run goes where it says.
+      const ended = this.declaredEnded;
+      this.declaredEnded = undefined;
+      const opener = this.runs.get(ended.within);
+      return { admitted: false, busy: opener ? publicRun(opener) : null, reason: 'declared-shell-ended' };
+    }
     // A declared shell in front (§8.1): the Run goes to it, inline.
     const layer = this.layers.at(-1);
     if (layer) return this.admitDeclared(opts, origin, layer);
@@ -1441,6 +1472,7 @@ export class Session {
   }
 
   private drainQueue(): void {
+    if (this.declaredEnded) return;
     while (this.queue.length && this.shellAvailable().ok) {
       const next = this.queue.shift()!;
       if (isTerminal(next.state)) continue;
@@ -1469,6 +1501,7 @@ export class Session {
     if (shell === 'none') {
       const top = this.layers.pop();
       if (!top) throw err('invalid_argument', 'no declared shell to take back: shell Runs already go to the session’s own shell');
+      this.declaredEnded = undefined;
       this.endDeclaredIn(top.within, 'undeclared');
       const now = this.layers.at(-1);
       this.note(`the declared ${top.shell} shell was taken back: shell Runs go to ${now ? `the declared ${now.shell} shell` : "the session's own shell"} again`);
@@ -1476,6 +1509,7 @@ export class Session {
     }
     declaredFlavor(shell);
     const within = this.frontOf(opts.within);
+    this.declaredEnded = undefined; // a valid declaration explicitly chooses the execution context
     const same = this.layers.findIndex((l) => l.within === within);
     const layer: DeclaredShell = { shell, within, by: opts.principal, at: this.now() };
     // Declaring the same program again corrects the kind; anything declared inside it is gone with the old word.
@@ -1513,8 +1547,9 @@ export class Session {
     }
     const init = { target: 'shell' as const, principal: opts.principal, origin, line: opts.line, idem: opts.idem, shell, within };
     const occupying = this.inFront.get(within);
-    if (occupying && !isTerminal(occupying.state)) {
-      if (!opts.queue) return { admitted: false, busy: publicRun(occupying), reason: 'running' };
+    const running = occupying !== undefined && !isTerminal(occupying.state);
+    if (running || this.editingBlocks()) {
+      if (!opts.queue) return { admitted: false, busy: running ? publicRun(occupying!) : null, reason: running ? 'running' : 'human-editing' };
       const run = this.newRun({ ...init, queued: true });
       this.declaredQueue.push(run);
       return { admitted: true, run: publicRun(run) };
@@ -1530,8 +1565,12 @@ export class Session {
     run.strategy = 'inline';
     run.inlineLines = inlineLines(run.line ?? '', run.markerNonce, fish);
     run.inlineAck = 0;
+    if (this.staleLine) this.note('a stale partial line at the declared shell prompt is being cleared before the next command');
+    this.humanEditing = false;
+    this.submittedAt = undefined;
+    this.staleLine = false;
     // Typed, not started: the start marker says when the shell took it (no mark will). The ^U
-    // first clears a line someone had begun at that prompt (see the inline strategy's comment).
+    // clears a stale or unobserved prefix; known active edits block admission above.
     run.state = 'starting';
     this.inFront.set(run.within ?? null, run);
     this.pty.write(`\x15${run.inlineLines.shift()!}\n`);
@@ -1595,6 +1634,15 @@ export class Session {
     }
   }
 
+  /**
+   * Is an explicit request to leave executing when the enclosing program ends? Cancelling
+   * a command inside that shell does not acknowledge losing the shell itself.
+   */
+  private callerExiting(within: string): boolean {
+    const current = this.inFront.get(within);
+    return current?.state === 'running' && /(?:^|;|&&|\|\|)\s*(?:exit|logout)(?:\s+\d+)?\s*;?\s*$/.test(current.line ?? '');
+  }
+
   /** The Run whose program holds the terminal: the deepest running declared Run, else the shell's own. */
   private innermostRunning(): RunRecord | undefined {
     let run = this.currentShellRun?.state === 'running' ? this.currentShellRun : undefined;
@@ -1612,6 +1660,7 @@ export class Session {
   }
 
   private drainDeclared(within: string | null): void {
+    if (this.declaredEnded || this.editingBlocks()) return;
     if (this.inFront.has(within)) return;
     const i = this.declaredQueue.findIndex((r) => (r.within ?? null) === within && !isTerminal(r.state));
     if (i === -1) return;
@@ -1643,6 +1692,8 @@ export class Session {
       this.endRun(run, { state: 'cancelled', reason: 'cancelled-before-start' });
       return { runId, state: run.state, contract: 'shell', steps };
     }
+    if (run.state === 'starting') await this.waitLeave(run, 'starting', grace);
+    if (isTerminal(run.state)) return { runId, state: run.state, contract: 'shell', steps };
     run.cancelRequested = true;
     run.inlineLines = []; // no more pieces, whatever is acknowledged from here
     this.typeSignal(run, 'SIGINT', principal);
@@ -1658,6 +1709,13 @@ export class Session {
     if (!isTerminal(run.state)) {
       this.typeSignal(run, 'SIGQUIT', principal);
       steps.push('^\\');
+      await this.awaitRun(runId, grace);
+    }
+    if (!isTerminal(run.state)) {
+      // The quit may have flushed the first probe out of the tty while ending the job.
+      // Ask again afterwards; without an observed marker the outcome remains unknown.
+      this.pty.write(`${inlineProbe(run.markerNonce!, declaredFlavor(run.shell!) === 'fish')}\n`);
+      steps.push('end-marker probe after ^\\');
       await this.awaitRun(runId, grace);
     }
     if (!isTerminal(run.state)) {
@@ -2162,13 +2220,17 @@ export class Session {
     this.append(ev);
     if (opts.principal !== SYSTEM) {
       this.lastTyper = opts.principal;
-      const atPrompt = this.shellState === 'idle' && !this.currentShellRun && !this.pendingShellRun;
+      const layer = this.layers.at(-1);
+      const atPrompt = (this.shellState === 'idle' && !this.currentShellRun && !this.pendingShellRun) || (layer !== undefined && !this.inFront.has(layer.within));
       this.typerPrompts = atPrompt ? 0 : 1;
       if (sensitive) this.sensitiveSinceCommand = true;
       if (!atPrompt) this.noteTypeahead(data, sensitive);
       this.noteEditing(data);
     }
     this.pty.write(data);
+    // Send the user's clearing keys before giving a waiting declared Run its turn.
+    const layer = this.layers.at(-1);
+    if (layer) queueMicrotask(() => this.drainDeclared(layer.within));
     this.lastActivity = this.now();
   }
 
@@ -2222,11 +2284,13 @@ export class Session {
   /**
    * G4: a principal typing at an idle prompt is editing a command, and the shell is not
    * available until the line is submitted (the shell answers with C or A), cleared, or
-   * left alone long enough to go stale. Under basic or none no prompt mark could ever
-   * clear it, so it is never set there.
+   * left alone long enough to go stale. A declared prompt uses the same guard on explicit
+   * input. The session's own basic/none integration has no prompt marks to clear it.
    */
   private noteEditing(data: string): void {
-    if (this.integrationLevel !== 'rich' || this.shellState !== 'idle' || this.pendingShellRun || this.currentShellRun) return;
+    const layer = this.layers.at(-1);
+    const declaredPrompt = layer !== undefined && !this.inFront.has(layer.within);
+    if (!declaredPrompt && (this.integrationLevel !== 'rich' || this.shellState !== 'idle' || this.pendingShellRun || this.currentShellRun)) return;
     const last = data[data.length - 1];
     const now = this.now();
     if (last === '\r' || last === '\n') {

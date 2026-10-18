@@ -35,7 +35,9 @@ test('the status line hints: set -e armed, a one-shot ssh running or cancelled, 
   assert.doesNotMatch(text(base({ line: 'set -euo pipefail', target: 'process' })), /set -e/, 'a process does not change the shell');
   assert.doesNotMatch(text(base({ line: 'make test' })), /set -e/);
   const running = base({ state: 'running', line: 'ssh build01 make -j8', durationMs: 30000 });
-  assert.match(text(running), /a cancel would end the local ssh client, not the command on build01.*ssh -tt with target process.*can only ever confirm that ssh ended/);
+  assert.match(text(running), /a cancel would end the local ssh client, not the command on build01/);
+  assert.match(text(running), /ssh -t in the shell lets terminal interrupts reach it.*ssh -tt as a process Run hangs it up/);
+  assert.match(text(running), /can only confirm that ssh ended/);
   assert.doesNotMatch(text(base({ ...running, line: 'ssh -t build01 make -j8' })), /local ssh client/);
   assert.match(text(base({ state: 'cancelled', line: 'ssh build01 make -j8', durationMs: 31000 })), /ended the local ssh client only; the command on build01 had no terminal there.*may still be running/);
   assert.doesNotMatch(text(base({ state: 'cancelled', line: 'make -j8', durationMs: 31000 })), /still be running/);
