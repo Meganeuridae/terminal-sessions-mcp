@@ -271,13 +271,12 @@ async function main(): Promise<void> {
   ws.on('close', (code) => failAll(`closed (${code})`));
   await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'tsm', version: '0' } });
   let r = (await request('tools/call', { name: tool, arguments: args })) as { content: Array<{ text: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
-  // --until-done: a Run still going when a call's wait ran out is awaited again, with the same
-  // wait, until it has ended; the last result is the one printed and exited with.
+  // --until-done: after the initial observation, long-poll until the Run ends. A short
+  // initial wait (including zero) must not turn this into a busy polling loop.
   const unfinished = (x: typeof r) => !x.isError && ['running', 'starting', 'queued'].includes(String(x.structuredContent?.state));
   while (untilDone && (tool === 'run' || tool === 'await') && unfinished(r) && typeof r.structuredContent?.runId === 'string') {
-    const again: Record<string, unknown> = { runId: r.structuredContent.runId };
+    const again: Record<string, unknown> = { runId: r.structuredContent.runId, wait: 55_000 };
     if (typeof r.structuredContent.session === 'string') again.session = r.structuredContent.session;
-    if (args.wait !== undefined) again.wait = args.wait;
     r = (await request('tools/call', { name: 'await', arguments: again })) as typeof r;
   }
   const structured = r.structuredContent ?? {};

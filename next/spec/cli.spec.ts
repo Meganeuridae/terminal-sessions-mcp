@@ -226,14 +226,22 @@ test('--until-done keeps awaiting past the per-call wait until the Run has ended
     };
   };
   const registry = new SessionRegistry({ dataDir: path.join(tmp, 'd-until'), backend, defaultShell: '/bin/bash', noUserRc: true });
-  const server = new TermServer({ app: new App({ registry, defaultWaitMs: 2000 }), resolver: new TokenMapResolver({ tokens: { tk: 'agent:cli@test' } }), host: '127.0.0.1', port: 0 });
+  const app = new App({ registry, defaultWaitMs: 2000 });
+  const waits: Array<number | undefined> = [];
+  const awaitRun = app.awaitRun.bind(app);
+  app.awaitRun = async (caller, o) => {
+    waits.push(o.wait);
+    return awaitRun(caller, o);
+  };
+  const server = new TermServer({ app, resolver: new TokenMapResolver({ tokens: { tk: 'agent:cli@test' } }), host: '127.0.0.1', port: 0 });
   const { port } = await server.listen();
   const env = { TSM_URL: `ws://127.0.0.1:${port}`, TSM_TOKEN: 'tk' };
   try {
-    const pending = tsm(['run', 'u', '--wait', '200ms', '--until-done', '--json', '--', 'sleep', '9'], env);
-    // Two or three awaits go by; then the command ends with 3.
+    const pending = tsm(['run', 'u', '--wait', '0', '--until-done', '--json', '--', 'sleep', '9'], env);
+    // A zero initial wait becomes one long poll, rather than thousands of immediate calls.
     await new Promise((r) => setTimeout(r, 700));
     assert.ok(sh, 'the shell started');
+    assert.deepEqual(waits, [55_000]);
     sh.finishHung(3, 'took a while\r\n');
     const r = await pending;
     assert.equal(r.code, 3, `exit code: ${r.stderr}`);
