@@ -26,6 +26,19 @@ jobs:
       - name: Install shells (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh fish openssh-server
+      - name: Secure zsh completion paths (Linux)
+        if: runner.os == 'Linux'
+        # Ubuntu's global compinit otherwise waits for an answer about the hosted
+        # runner's writable completion paths. Repair them, keeping the audit on.
+        run: |
+          audit=$(mktemp)
+          trap 'rm -f "$audit"' EXIT
+          zsh -fc 'autoload -Uz compaudit; compaudit' > "$audit" || true
+          cat "$audit"
+          while IFS= read -r completion_path; do
+            sudo chmod go-w -- "$completion_path"
+          done < "$audit"
+          zsh -fc 'autoload -Uz compaudit; compaudit'
       - name: Install fish (macOS)
         if: runner.os == 'macOS'
         run: brew list fish >/dev/null 2>&1 || brew install fish
