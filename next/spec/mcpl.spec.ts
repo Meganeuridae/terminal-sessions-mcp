@@ -86,7 +86,7 @@ test('the milestone-1 sentence: start, get a run id, stop waiting, disconnect, r
   await b.close();
 });
 
-test('G28: a synchronous run whose result takes long to build is still not delivered to its caller', async () => {
+test('G28: a run whose outcome its call returned is not delivered to its caller again, whatever the size of its output', async () => {
   const a = await host('ta', 'g28-a');
   await a.call('session_open', { session: 'g28' });
   await a.request('channels/open', { channelId: 'terminal:g28' });

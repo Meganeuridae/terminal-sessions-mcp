@@ -17,6 +17,7 @@ import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import type { SegmenterOptions } from '../src/core/segmenter.js';
+import { seqOfMessageId } from '../src/core/segmenter.js';
 import type { Session } from '../src/core/session.js';
 import { Outbound, type Message } from '../src/transport/jsonrpc.js';
 import { McplLane, NODE_NAME } from '../src/transport/mcpl.js';
@@ -730,6 +731,50 @@ test('m2-18: a needs-input that fired while the host was away is caught up on re
     const done = await a2.delivery(aboutRun(q.structured?.runId), 4000);
     assert.match(done.text, /got-y/);
     await a2.close();
+  } finally {
+    await d.stop();
+  }
+});
+
+test('MCPL 4: channels/close needs channels.lifecycle, as channels/open does; with it, close answers whether the channel was open', async () => {
+  const d = await daemon();
+  try {
+    const without = await d.host('ta', 'cl-a', { grant: ['tools', 'pushEvents', 'channels.register', 'channels.incoming'] });
+    await without.call('session_open', { session: 'cl' });
+    await assert.rejects(without.request('channels/close', { channelId: 'terminal:cl' }), (e: { code: number; message: string }) => e.code === -32002 && /channels\.lifecycle not granted/.test(e.message));
+    await without.close();
+    const withIt = await d.host('ta', 'cl-b');
+    await withIt.request('channels/open', { channelId: 'terminal:cl' });
+    assert.deepEqual(await withIt.request('channels/close', { channelId: 'terminal:cl' }), { closed: true });
+    assert.deepEqual(await withIt.request('channels/close', { channelId: 'terminal:cl' }), { closed: false }, 'a channel that was not open');
+    await withIt.close();
+  } finally {
+    await d.stop();
+  }
+});
+
+test("MCPL 2: a progress digest's id carries its Run, so two Runs digested at the same journal position never share one, and seqOfMessageId still reads the seq", async () => {
+  const d = await daemon();
+  try {
+    const a = await d.host('ta', 'dg-a');
+    await a.call('session_open', { session: 'dg' });
+    await a.request('channels/open', { channelId: 'terminal:dg' });
+    // Two process Runs back to back: each prints a line and goes quiet, so each gets a digest.
+    const r1 = await a.call('run', { session: 'dg', command: 'echo one; sleep 1.5', target: 'process', wait: 20 });
+    const r2 = await a.call('run', { session: 'dg', command: 'echo two; sleep 1.5', target: 'process', wait: 20 });
+    assert.ok(typeof r1.structured?.runId === 'string' && typeof r2.structured?.runId === 'string', JSON.stringify([r1, r2]));
+    await a.delivery(aboutRun(r1.structured.runId), 8000);
+    await a.delivery(aboutRun(r2.structured.runId), 8000);
+    const digests = a.deliveries().filter((x) => x.tags.includes('terminal:output'));
+    const of = (runId: unknown) => digests.filter((x) => x.metadata.runId === runId);
+    assert.ok(of(r1.structured.runId).length >= 1 && of(r2.structured.runId).length >= 1, `digests: ${JSON.stringify(digests.map((x) => [x.messageId, x.metadata.runId]))}`);
+    for (const x of digests) {
+      const runId = String(x.metadata.runId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      assert.match(x.messageId, new RegExp(`:output~${runId}:(\\d+)$`), x.messageId);
+      assert.equal(seqOfMessageId(x.messageId), Number(/:(\d+)$/.exec(x.messageId)![1]), x.messageId);
+    }
+    assert.equal(new Set(digests.map((x) => x.messageId)).size, digests.length, 'no two digests share an id');
+    await a.close();
   } finally {
     await d.stop();
   }
