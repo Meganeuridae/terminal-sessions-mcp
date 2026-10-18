@@ -123,7 +123,14 @@ class Predicate {
     this.quietFrom = from;
     this.silenceTimer = setTimeout(() => {
       this.silenceTimer = undefined;
-      this.fire({ match: `no output for ${Math.max(0, Date.now() - this.quietFrom)}ms`, seq: this.host.journal.lastSeq });
+      const quiet = Math.max(0, Date.now() - this.quietFrom);
+      if (quiet < this.spec.silenceMs!) {
+        // Timers can wake a millisecond early, and the clock behind journal
+        // timestamps can move. The elapsed quiet time is the predicate's evidence.
+        this.armSilence(this.spec.silenceMs! - quiet, this.quietFrom);
+        return;
+      }
+      this.fire({ match: `no output for ${quiet}ms`, seq: this.host.journal.lastSeq });
     }, Math.max(0, ms));
   }
 
