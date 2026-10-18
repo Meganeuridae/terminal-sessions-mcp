@@ -1418,7 +1418,7 @@ export class Session {
       // `/bin/sh -c LINE` it was in the shell's argv, where a `pkill -f` in the line itself found
       // and killed it (the house's review of #11), and a file could be removed under a shell
       // that had not yet opened it.
-      const argv = opts.argv ?? (opts.line !== undefined ? ['/bin/sh', '/dev/fd/3'] : undefined);
+      const argv = opts.argv ?? (opts.line !== undefined ? ['/bin/sh'] : undefined);
       if (!argv || argv.length === 0) throw err('invalid_argument', 'process Run needs argv or line');
       const run = this.newRun({ target: 'process', principal: opts.principal, origin, argv, line: opts.line, envBasis: opts.envBasis, idem: opts.idem, queued: false });
       this.launchProcess(run);

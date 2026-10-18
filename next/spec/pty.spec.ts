@@ -264,7 +264,7 @@ test('/bin/bash: a process Run inherits no terminal master, and its line is not 
     assert.deepEqual([r2.state, r2.exit], ['exited', 0]);
     const out2 = a.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output' && e.runId === r2.runId).map((e) => e.data).join('');
     assert.equal(out2.trim(), 'after-the-pkill qz7-relaunch');
-    assert.deepEqual(r2.argv, ['/bin/sh', '/dev/fd/3'], 'the text reaches the shell on a descriptor, not on any command line or in a file');
+    assert.deepEqual(r2.argv, ['/bin/sh'], 'the text reaches the shell on a descriptor, not on any command line or in a file');
     // The descriptor the text came on is closed before the command's children run, and so are
     // the daemon's: the command sees only what a directly spawned `ls /dev/fd` would.
     const fds3 = a.session.admit({ target: 'process', line: 'ls /dev/fd | tr "\\n" " "', principal: AGENT });
