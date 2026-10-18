@@ -212,3 +212,39 @@ test('tsg-12/ux-18: a Host the daemon does not serve is explained, naming --allo
     await registry.closeAll();
   }
 });
+
+test('--until-done keeps awaiting past the per-call wait until the Run has ended, and exits with its code', async () => {
+  const backend = new ScriptedBackend();
+  let sh!: FakeShell;
+  backend.onSpawnShell = (p) => {
+    sh = new FakeShell(p);
+    sh.on(/^sleep/, () => ({ hang: true }));
+    const kill = p.kill.bind(p);
+    p.kill = (sig) => {
+      kill(sig);
+      if (sig === 'SIGHUP' || sig === 'SIGKILL') p.exit({ exitCode: null, signal: sig });
+    };
+  };
+  const registry = new SessionRegistry({ dataDir: path.join(tmp, 'd-until'), backend, defaultShell: '/bin/bash', noUserRc: true });
+  const server = new TermServer({ app: new App({ registry, defaultWaitMs: 2000 }), resolver: new TokenMapResolver({ tokens: { tk: 'agent:cli@test' } }), host: '127.0.0.1', port: 0 });
+  const { port } = await server.listen();
+  const env = { TSM_URL: `ws://127.0.0.1:${port}`, TSM_TOKEN: 'tk' };
+  try {
+    const pending = tsm(['run', 'u', '--wait', '200ms', '--until-done', '--json', '--', 'sleep', '9'], env);
+    // Two or three awaits go by; then the command ends with 3.
+    await new Promise((r) => setTimeout(r, 700));
+    assert.ok(sh, 'the shell started');
+    sh.finishHung(3, 'took a while\r\n');
+    const r = await pending;
+    assert.equal(r.code, 3, `exit code: ${r.stderr}`);
+    const out = JSON.parse(r.stdout) as { state: string; exit: number };
+    assert.deepEqual([out.state, out.exit], ['exited', 3]);
+    // Without the flag the same call exits 124 once its wait ran out.
+    const once = await tsm(['run', 'u', '--wait', '200ms', '--', 'sleep', '9'], env);
+    assert.equal(once.code, 124);
+    sh.finishHung(0);
+  } finally {
+    await server.close();
+    await registry.closeAll({ graceful: false });
+  }
+});

@@ -4,8 +4,7 @@
  * transport, `--json` on every command, so a shell-shaped harness composes
  * the server in scripts.
  *
- * Exit codes are the contract scripts rely on (atc-5, atc-20, G27), and none of
- * the "not finished" codes is one a command conventionally exits with:
+ * Exit codes are the contract scripts rely on (atc-5, atc-20, G27):
  *   the Run's own exit code        exited with a code
  *   128 + signal number            exited on a signal (137 for SIGKILL), as shells report it
  *   124                            not finished: running, starting or queued — `await` it
@@ -14,8 +13,13 @@
  *   1                              an error, a cancelled or lost Run, a failed start or cancel,
  *                                  or a daemon connection lost before the result (the outcome
  *                                  is then unknown)
- * `start` exits 0 when the service is ready, 124 while it is starting, 1 when it is
- * unhealthy or exited; `cancel` exits 0 once the Run has ended and 1 when it survived.
+ * A command may itself exit 124 (timeout(1) does), 75 or 1, so the code alone cannot tell a
+ * Run that ended so from one not finished, busy or lost: `--json` and its `state` are the
+ * authority (G27), and `--until-done` on `run` and `await` keeps awaiting past the per-call
+ * cap until the Run has ended, so a script that only wants the outcome reads no 124 at all
+ * (the house's review of #11). `start` exits 0 when the service is ready, 124 while it is
+ * starting, 1 when it is unhealthy or exited; `cancel` exits 0 once the Run has ended and 1
+ * when it survived.
  */
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -31,11 +35,11 @@ const USAGE = `tsm <command> [args] [--key value ...] [--json]
   sessions                              list sessions
   open <session> [--cwd DIR] [--shell S] [--visibility shared] [--control open]
   close <session> [--force]
-  run <session> [--wait 20s] [--target process] [--queue] [--] <command...>
+  run <session> [--wait 20s] [--target process] [--queue] [--until-done] [--] <command...>
                                         after --, every word is the command's, flags included
   declare <session> [fish|none]         the program in front (ssh, sudo -i, a nested shell) is a shell:
                                         run goes to it until it ends; name fish when it is one; "none" takes it back
-  await [<session>] <runId> [--wait 20s]
+  await [<session>] <runId> [--wait 20s] [--until-done]   (--until-done: keep awaiting until the Run has ended)
   read <session> [--since N | --tail N | --run-id ID] [--as events]
   screen <session>
   input <session> [text] [--keys Enter,C-c] [--sensitive]
@@ -98,7 +102,7 @@ function parseObject(key: string, v: string): unknown {
   }
 }
 
-function parse(argv: string[]): { tool: string; args: Record<string, unknown>; json: boolean } {
+function parse(argv: string[]): { tool: string; args: Record<string, unknown>; json: boolean; untilDone: boolean } {
   const [cmd, ...rest] = argv;
   if (!cmd || cmd === '--help' || cmd === '-h') {
     console.log(USAGE);
@@ -109,6 +113,7 @@ function parse(argv: string[]): { tool: string; args: Record<string, unknown>; j
   const args: Record<string, unknown> = {};
   const positional: string[] = [];
   let json = false;
+  let untilDone = false;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]!;
     if (a === '--') {
@@ -118,6 +123,10 @@ function parse(argv: string[]): { tool: string; args: Record<string, unknown>; j
     }
     if (a === '--json') {
       json = true;
+      continue;
+    }
+    if (a === '--until-done') {
+      untilDone = true;
       continue;
     }
     if (a.startsWith('--')) {
@@ -145,7 +154,7 @@ function parse(argv: string[]): { tool: string; args: Record<string, unknown>; j
       } else if (positional[i] !== undefined) args[name] = positional[i];
     });
   }
-  return { tool, args, json };
+  return { tool, args, json, untilDone };
 }
 
 /** The exit code for a finished call's envelope (see the header). */
@@ -218,7 +227,7 @@ async function main(): Promise<void> {
     usageReport(process.argv.slice(3));
     return;
   }
-  const { tool, args, json } = parse(process.argv.slice(2));
+  const { tool, args, json, untilDone } = parse(process.argv.slice(2));
   const url = new URL(process.env.TSM_URL ?? 'ws://127.0.0.1:3101');
   if (process.env.TSM_TOKEN) url.searchParams.set('token', process.env.TSM_TOKEN);
   url.searchParams.set('profile', 'full');
@@ -261,7 +270,16 @@ async function main(): Promise<void> {
   ws.on('error', (e) => failAll(`failed (${e.message})`));
   ws.on('close', (code) => failAll(`closed (${code})`));
   await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'tsm', version: '0' } });
-  const r = (await request('tools/call', { name: tool, arguments: args })) as { content: Array<{ text: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
+  let r = (await request('tools/call', { name: tool, arguments: args })) as { content: Array<{ text: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
+  // --until-done: a Run still going when a call's wait ran out is awaited again, with the same
+  // wait, until it has ended; the last result is the one printed and exited with.
+  const unfinished = (x: typeof r) => !x.isError && ['running', 'starting', 'queued'].includes(String(x.structuredContent?.state));
+  while (untilDone && (tool === 'run' || tool === 'await') && unfinished(r) && typeof r.structuredContent?.runId === 'string') {
+    const again: Record<string, unknown> = { runId: r.structuredContent.runId };
+    if (typeof r.structuredContent.session === 'string') again.session = r.structuredContent.session;
+    if (args.wait !== undefined) again.wait = args.wait;
+    r = (await request('tools/call', { name: 'await', arguments: again })) as typeof r;
+  }
   const structured = r.structuredContent ?? {};
   let text = r.content.map((c) => c.text).join('\n');
   // A command's own flag taken for a tool parameter: say how to pass it through (ux-18).
