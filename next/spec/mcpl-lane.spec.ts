@@ -418,6 +418,46 @@ test('a completion refused once, whose channel closed during the retry delay, is
   }
 });
 
+test('two channels reopened together both resume refused completions', async () => {
+  const d = await daemon();
+  try {
+    let refusing = true;
+    const refused = new Set<string>();
+    const a = await d.host('ta', 'reopen-two', {
+      grant: ['tools', 'channels.register', 'channels.lifecycle', 'channels.incoming'],
+      answer: (m) => {
+        if (m.method !== 'channels/incoming' || !refusing) return undefined;
+        const msgs = (m.params as { messages: Array<{ messageId: string; tags: string[] }> }).messages;
+        return { results: msgs.map((x) => {
+          const completion = x.tags.includes('terminal:run-finished');
+          if (completion) refused.add(x.messageId);
+          return { messageId: x.messageId, accepted: !completion, ...(completion && { reason: 'busy' }) };
+        }) };
+      },
+    });
+    const sessions = ['reopen-one', 'reopen-two'];
+    for (const session of sessions) {
+      await a.call('session_open', { session });
+      await a.request('channels/open', { channelId: `terminal:${session}` });
+    }
+    const runs = await Promise.all(sessions.map((session) => a.call('run', { session, command: 'sleep 0.3; echo finished', wait: 20 })));
+    await until(() => refused.size === 2, 4000, 'both initial completions refused');
+    await Promise.all(sessions.map((session) => a.request('channels/close', { channelId: `terminal:${session}` })));
+    await sleep(900);
+    refusing = false;
+    await Promise.all(sessions.map((session) => a.request('channels/open', { channelId: `terminal:${session}` })));
+    await until(() => runs.every((r) => a.deliveries().filter(aboutRun(r.structured?.runId)).length >= 2), 4000, 'both reopened channels to deliver');
+    for (let i = 0; i < sessions.length; i++) {
+      const session = live(d.registry, sessions[i]!);
+      const id = runs[i]!.structured!.runId as string;
+      await until(() => session.cursorsOf(A).delivered >= session.run(id).seq.end!, 2000, 'accepted completion settles its debt');
+    }
+    await a.close();
+  } finally {
+    await d.stop();
+  }
+});
+
 test('mcpl-8: a reconnect inside the completion settle window delivers the completion once', async () => {
   const d = await daemon({ segmenter: { runSettleMs: 600, cadenceMs: 10_000, needsInputMs: 5000 } });
   try {

@@ -261,6 +261,7 @@ export class McplLane {
   /** What delivery the grant allowed at the last activation: catch-up runs when it widens (mcpl-8). */
   private deliverable = { push: false, channels: false };
   private catchingUp: Promise<void> | undefined;
+  private catchUpAgain = false;
   private disposed = false;
   /** Warns, once, when the host has sent no grant this long after initializing: the connection is then on the core tools with no deliveries, and the log should say so rather than look like a profile. */
   static grantWarnMs = 5000;
@@ -373,7 +374,6 @@ export class McplLane {
     return receipt;
   }
 
-  /** After the receipt: follow every visible live session, register channels, and catch up (G22) when delivery became possible. */
   /**
    * The connection can carry something again (a channel reopened): a retry that found nothing
    * to carry it on when its timer fired is still owed, with no timer left; deliver it through a
@@ -381,14 +381,31 @@ export class McplLane {
    * closed over waited for the next grant update (an outside review reproduced it).
    */
   private resumeOwed(): void {
-    if (this.disposed || this.catchingUp) return;
-    const stranded = [...this.states.values()].some((st) => st.owed.size > 0 && [...st.retries.values()].some((r) => !r.timer));
+    if (this.disposed) return;
+    const stranded = [...this.states].some(([id, st]) => this.carries(id) && st.owed.size > 0 && [...st.retries.values()].some((r) => !r.timer));
     if (!stranded) return;
-    this.catchingUp = this.catchUpAll()
-      .catch((e) => this.log(`catch-up failed: ${(e as Error).message}`))
-      .finally(() => (this.catchingUp = undefined));
+    void this.startCatchUp();
   }
 
+  /** A reopen or grant change during a scan gets a subsequent scan with the new delivery scope. */
+  private startCatchUp(): Promise<void> {
+    if (this.catchingUp) {
+      this.catchUpAgain = true;
+      return this.catchingUp;
+    }
+    this.catchingUp = this.catchUpAll()
+      .catch((e) => this.log(`catch-up failed: ${(e as Error).message}`))
+      .finally(() => {
+        this.catchingUp = undefined;
+        if (this.catchUpAgain && !this.disposed) {
+          this.catchUpAgain = false;
+          void this.startCatchUp();
+        }
+      });
+    return this.catchingUp;
+  }
+
+  /** After the receipt: follow visible sessions, register channels and catch up when delivery becomes possible. */
   private async activate(): Promise<void> {
     if (this.disposed) return;
     for (const s of this.app.registry.list()) if (s.kind === 'live' && !s.session.journal.closed && this.app.can(this.me, s, 'observe')) this.follow(s.session);
@@ -398,11 +415,7 @@ export class McplLane {
     const widened = (now.push && !this.deliverable.push) || (now.channels && !this.deliverable.channels);
     this.deliverable = now;
     // Not on every update (mcpl-8): only the initial policy, or one that enables delivery.
-    if (!widened || this.catchingUp) return;
-    this.catchingUp = this.catchUpAll()
-      .catch((e) => this.log(`catch-up failed: ${(e as Error).message}`))
-      .finally(() => (this.catchingUp = undefined));
-    await this.catchingUp;
+    if (widened) await this.startCatchUp();
   }
 
   // ───────────── channels ─────────────
