@@ -19,6 +19,7 @@ import { looksLikeSecretPrompt } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { AGENT, code, HUMAN, OSC, ofType, scriptedSession as harness, tick } from './fake-shell.js';
 
+const TYPEAHEAD_GRACE_MS_IN_SPEC = 150; // mirrors session.ts
 const fileOf = (written: string): string => /'([^']*tsm-cmd-\d+)'/.exec(written.slice(written.lastIndexOf('tsm-cmd-') - 200))![1]!;
 
 // ───────────── ss-1, ss-8: a daemon line never merges, never wedges, never runs unawaited ─────────────
@@ -84,6 +85,53 @@ test('ss-1: typeahead the editor shows at the next prompt makes the line human e
   g.shell.finishHung(0);
   await tick();
   assert.ok(g.session.shellAvailable().ok, 'nothing echoed: nothing is being edited');
+  await g.session.close();
+});
+
+test('core-4: a Run queued behind a running one does not clear a line typed ahead: it waits until that line is submitted, and keys a program took delay it only briefly', async () => {
+  const h = await harness({
+    typeahead: true,
+    editingStaleMs: 5000,
+    setup: (s) => {
+      s.on('echo typed-ahead-marker', () => ({ output: 'TYPED\r\n', exit: 0 }));
+      s.on('echo queued-ran', () => ({ output: 'QUEUED\r\n', exit: 0 }));
+    },
+  });
+  const a = h.session.admit({ target: 'shell', line: 'sleep 1', principal: AGENT });
+  assert.ok(a.admitted);
+  // A person types their next command while the Run runs, and does not press Enter; an agent queues one.
+  h.session.input('echo typed-ahead-marker', { principal: AGENT });
+  const q = h.session.admit({ target: 'shell', line: 'echo queued-ran', principal: AGENT, queue: true });
+  assert.ok(q.admitted);
+  const clearsBefore = h.shell.clears;
+  h.shell.finishHung(0); // the prompt; the editor shows the typed text after it
+  await tick();
+  await tick();
+  assert.equal(h.session.run(q.run.runId).state, 'queued', 'the queued Run waits for the typed line');
+  assert.deepEqual(h.session.shellAvailable(), { ok: false, reason: 'human-editing' });
+  assert.equal(h.shell.clears, clearsBefore, 'nothing cleared the typed line');
+  await tick(TYPEAHEAD_GRACE_MS_IN_SPEC + 50);
+  assert.equal(h.session.run(q.run.runId).state, 'queued', 'and still waits once the grace is over: the line is being edited');
+  h.session.input('\r', { principal: AGENT }); // the person submits it
+  for (let i = 0; i < 200 && h.session.run(q.run.runId).state !== 'exited'; i++) await tick(10);
+  assert.equal(h.session.run(q.run.runId).state, 'exited');
+  const outs = ofType(h.journal.since(0).events, 'output').map((e) => e.data).join('');
+  assert.ok(outs.includes('TYPED') && outs.indexOf('TYPED') < outs.indexOf('QUEUED'), `the typed line ran first: ${JSON.stringify(outs)}`);
+  await h.session.close();
+
+  // Keys the program took (nothing echoed at the prompt): the queued Run goes after the grace.
+  const g = await harness({ setup: (s) => s.on('echo queued-ran', () => ({ output: 'QUEUED\r\n', exit: 0 })) });
+  const b = g.session.admit({ target: 'shell', line: 'sleep 1', principal: AGENT });
+  assert.ok(b.admitted);
+  g.session.input('qq', { principal: AGENT }); // a pager's keys, taken by the program
+  const q2 = g.session.admit({ target: 'shell', line: 'echo queued-ran', principal: AGENT, queue: true });
+  assert.ok(q2.admitted);
+  g.shell.finishHung(0);
+  await tick();
+  assert.equal(g.session.run(q2.run.runId).state, 'queued', 'not before the grace');
+  assert.deepEqual(g.session.shellAvailable(), { ok: false, reason: 'prompt-pending' });
+  for (let i = 0; i < 100 && g.session.run(q2.run.runId).state !== 'exited'; i++) await tick(10);
+  assert.equal(g.session.run(q2.run.runId).state, 'exited', 'after the grace, with nothing echoed, it ran');
   await g.session.close();
 });
 

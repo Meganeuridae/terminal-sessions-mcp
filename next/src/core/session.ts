@@ -239,6 +239,11 @@ const INLINE_SAFE = new Set([...'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 const INLINE_LINE_BYTES = 900;
 /** Ended Runs a session keeps in memory; older ones are read from the journal's run index. */
 const MAX_ENDED_RUNS = 1000;
+/**
+ * How long a prompt waits for the echo of keys typed during the last Run before the queue
+ * drains (see onPromptStart): the line editor shows them in the same breath as the prompt.
+ */
+const TYPEAHEAD_GRACE_MS = 150;
 
 function inlineTokens(body: string): string[] {
   const out: string[] = [];
@@ -423,6 +428,8 @@ export class Session {
   private typeaheadLines: Array<{ line: string; order: number }> = [];
   /** Typeahead to look for in the editor's echo at the prompt; seen, it makes the line human editing (G4, ss-1). */
   private typeaheadWatch: string | undefined;
+  /** Runs from the prompt start until the typeahead's echo arrives or TYPEAHEAD_GRACE_MS pass without it (see onPromptStart). */
+  private typeaheadTimer: NodeJS.Timeout | undefined;
   private idleEcho = '';
   /** A secret prompt is being answered: keystrokes are journaled redacted until Enter (m2-2). */
   private secretInput = false;
@@ -740,6 +747,8 @@ export class Session {
     this.idleEcho = (this.idleEcho + stripEscapes(data).text).slice(-1024);
     if (!this.idleEcho.includes(this.typeaheadWatch!)) return;
     this.typeaheadWatch = undefined;
+    if (this.typeaheadTimer) clearTimeout(this.typeaheadTimer);
+    this.typeaheadTimer = undefined;
     this.idleEcho = '';
     this.humanEditing = true;
     this.editedAt = this.now();
@@ -937,6 +946,24 @@ export class Session {
       // is done (the B mark). Do not wait forever for a PS1 that lost our mark.
       this.readyTimer = setTimeout(() => this.markReady(), 500);
     }
+    // Keys typed while the last Run ran may be in the editor now: their echo comes after the
+    // prompt's end mark, so a queued Run launched here, with its clear-line keys first, wiped
+    // a person's half-typed command and said nothing (the house's review of #11, core finding
+    // 4). The queue waits for the echo (then the line is being edited: G4 holds the shell
+    // until it is submitted, cleared or stale) or for a short grace without it (the program
+    // took the keys).
+    if (this.typeaheadWatch !== undefined) {
+      if (this.typeaheadTimer) clearTimeout(this.typeaheadTimer);
+      this.typeaheadTimer = setTimeout(() => {
+        this.typeaheadTimer = undefined;
+        this.typeaheadWatch = undefined;
+        this.idleEcho = '';
+        this.drainQueue();
+        this.notifyAvailable();
+      }, TYPEAHEAD_GRACE_MS);
+      this.typeaheadTimer.unref();
+      return;
+    }
     this.drainQueue();
     this.notifyAvailable();
   }
@@ -1047,7 +1074,7 @@ export class Session {
     this.pty.signalGroup?.(this.pty.pid, 'SIGKILL');
     for (const r of this.queue.splice(0)) this.endRun(r, { state: 'lost', reason: this.closeReason ?? 'shell-exited-before-start' });
     this.teardownProcessGroups();
-    for (const t of [this.graceTimer, this.settleTimer, this.capTimer, this.editingTimer]) clearTimeout(t);
+    for (const t of [this.graceTimer, this.settleTimer, this.capTimer, this.editingTimer, this.typeaheadTimer]) clearTimeout(t);
     if (this.integrationLevel === 'unknown') this.integrationLevel = 'none';
     this.markReady();
     for (const w of this.availabilityWaiters.splice(0)) w();
@@ -1124,7 +1151,7 @@ export class Session {
     // nor do the members of their groups that outlived the leader (ss-10).
     this.teardownProcessGroups();
     await Promise.allSettled([...this.teardowns]);
-    for (const t of [this.graceTimer, this.settleTimer, this.readyTimer, this.capTimer, this.editingTimer, this.seatReserved?.timer]) clearTimeout(t);
+    for (const t of [this.graceTimer, this.settleTimer, this.readyTimer, this.capTimer, this.editingTimer, this.typeaheadTimer, this.seatReserved?.timer]) clearTimeout(t);
     this.seatReserved = undefined;
     this.cleanupTempFiles();
     await this.screen.settled();
@@ -1319,6 +1346,8 @@ export class Session {
     if (this.pendingShellRun || (this.currentShellRun && !isTerminal(this.currentShellRun.state))) return { ok: false, reason: 'running' };
     // The last Run ended but the prompt that confirms the shell is back has not arrived.
     if (this.shellState === 'busy') return { ok: false, reason: 'prompt-pending' };
+    // The prompt is here, and keys typed during the last Run may be in its editor (see onPromptStart).
+    if (this.typeaheadWatch !== undefined && this.typeaheadTimer !== undefined) return { ok: false, reason: 'prompt-pending' };
     if (this.editingBlocks()) return { ok: false, reason: 'human-editing' };
     return { ok: true };
   }
