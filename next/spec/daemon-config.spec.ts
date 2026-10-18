@@ -208,8 +208,13 @@ test('tsg-21: the plist is valid and runs the launcher; the systemd unit lets te
   const plist = fs.readFileSync(path.join(CONFIG, 'com.animalabs.termd.plist'), 'utf8');
   assert.match(plist, /<string>\/bin\/sh<\/string>\s*<string>PACKAGE\/next\/config\/termd-launch\.sh<\/string>/);
   assert.doesNotMatch(plist, /\/tmp\//, 'no log in world-writable /tmp');
-  assert.match(plist, /<key>Umask<\/key><integer>63<\/integer>/);
+  // No umask imposed by a supervisor: termd's files are owner-only by mode, and the sessions
+  // inherit the mask, so files they create keep the usual permissions.
+  assert.doesNotMatch(plist, /<key>Umask<\/key>/);
   const unit = fs.readFileSync(path.join(CONFIG, 'termd.service'), 'utf8');
+  assert.doesNotMatch(unit, /^UMask=/m);
+  assert.match(unit, /^OOMPolicy=continue$/m);
+  assert.match(unit, /^LimitNOFILE=\d+$/m);
   assert.match(unit, /^KillMode=mixed$/m);
   assert.match(unit, /^WorkingDirectory=%h$/m);
   assert.match(unit, /termd-launch\.sh/);

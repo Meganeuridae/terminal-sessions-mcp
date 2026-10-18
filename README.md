@@ -150,6 +150,10 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   presence. The daemon log says which it is for each connection (`initialized: …`), what the
   grant came to (`grant received: … enabled … not enabled …`), and warns when a host has sent
   no grant five seconds after initializing.
+- **Permissions.** termd's own files (journals, logs, keys, the usage log) are owner-only by
+  mode whatever the umask. Sessions' shells and process Runs inherit the umask termd was
+  started with, so files a session creates get the usual permissions; start termd with the
+  mask you want sessions to have (a supervisor's default is 022).
 - **Safety.** Only loopback or `--allow-host` names are accepted as Host; a browser Origin
   other than the daemon's own is refused. A non-loopback bind needs a token. Session shells
   never inherit the daemon's credentials or the launching terminal's identity variables.

@@ -10,7 +10,8 @@ Description=terminal sessions daemon (termd)
 [Service]
 ExecStart=/bin/sh PACKAGE/next/config/termd-launch.sh --port 3101
 WorkingDirectory=%h
-UMask=0077
+# No UMask= here: termd creates its own files owner-only by mode, and the sessions' shells
+# inherit this mask, so files a session creates keep the usual permissions (0644).
 Restart=on-failure
 # Each session costs about five file descriptors (pty, journal, key file); the default
 # soft limit of 1024 would end new sessions near 200.

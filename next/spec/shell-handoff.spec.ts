@@ -115,3 +115,18 @@ test('an unintegrated shell remains available after a command file failed before
     assert.equal((await x.run('echo after')).text, 'after');
   } finally { await x.close(); }
 });
+
+test("the launcher's owner-only mask covers the key file alone: the shell starts with the mask it inherited and creates ordinary files", async () => {
+  const x = await realSession('/bin/bash');
+  try {
+    const inherited = process.umask().toString(8).padStart(4, '0');
+    const r = await x.run('umask');
+    assert.equal(r.text.trim(), inherited, 'the shell has the mask termd has');
+    const file = path.join(x.tmp ?? process.env.TMPDIR ?? '/tmp', `tsm-umask-${process.pid}`);
+    assert.equal((await x.run(`rm -f '${file}'; touch '${file}'`)).exit, 0);
+    assert.equal((fs.statSync(file).mode & 0o777).toString(8), (0o666 & ~process.umask()).toString(8), 'a file the session creates has the usual mode, not 0600');
+    fs.rmSync(file, { force: true });
+  } finally {
+    await x.close();
+  }
+});

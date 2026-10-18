@@ -58,12 +58,15 @@ export function prepareIntegration(shellPath: string, opts: PrepareOptions = {})
   const env: Record<string, string> = {};
   const launcher = path.join(dir, 'launch.sh');
   // No shell config, external command or exported variable sees the key. exec keeps
-  // the PID, and each shell consumes only the private file for its own PID. On Linux the
-  // shell, and so everything a session runs, is made a likelier victim of the kernel's
-  // out-of-memory killer than the daemon (a build's peak then costs that Run, not every
-  // session); raising one's own oom_score_adj needs no privilege, and /proc is Linux's.
+  // the PID, and each shell consumes only the private file for its own PID. The owner-only
+  // mask covers the key file alone and the shell starts with the mask it inherited: a mask
+  // left at 077 made every file a session created owner-only, which breaks shared projects
+  // and served build output (an outside review's finding). On Linux the shell, and so
+  // everything a session runs, is made a likelier victim of the kernel's out-of-memory
+  // killer than the daemon (a build's peak then costs that Run, not every session); raising
+  // one's own oom_score_adj needs no privilege, and /proc is Linux's.
   fs.writeFileSync(launcher,
-    `umask 077\ncommand printf '%s\\n' '${key}' > "\${0%/*}/key-$$" || exit 1\n` +
+    `__tsm_umask=$(umask); umask 077\ncommand printf '%s\\n' '${key}' > "\${0%/*}/key-$$" || exit 1\numask "$__tsm_umask"; unset __tsm_umask\n` +
     `if [ -w /proc/self/oom_score_adj ]; then echo 500 > /proc/self/oom_score_adj 2>/dev/null || :; fi\n` +
     `exec "$@"\n`, { mode: 0o600 });
   if (opts.noUserRc) env.TSM_NO_USER_RC = '1';

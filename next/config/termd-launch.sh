@@ -7,11 +7,12 @@
 # It puts the usual toolchain directories on PATH — process Runs inherit the daemon's
 # environment (G7), so `npm test` must resolve there too — finds node on it (or
 # TSM_NODE=/path/to/node), runs this package's daemon (or TSM_DAEMON=/path/to/daemon.js),
-# starts in $HOME (sessions opened without a cwd start there as well), keeps every file it
-# creates owner-only, and on macOS logs to ~/Library/Logs/termd/termd.log (0600, rotated by
-# termd) unless --log-file is given. Under systemd the log stays on stderr, for the journal.
+# starts in $HOME (sessions opened without a cwd start there as well), and on macOS logs to
+# ~/Library/Logs/termd/termd.log (0600, rotated by termd) unless --log-file is given. Under
+# systemd the log stays on stderr, for the journal. The umask is left as the supervisor set
+# it: termd creates its own files owner-only by mode, and the sessions' shells and process
+# Runs inherit the mask, so files a session creates get the usual permissions.
 set -eu
-umask 077
 : "${HOME:?HOME is not set}"
 cd "$HOME"
 
