@@ -365,14 +365,15 @@ async function main(): Promise<void> {
   }
   const tokenOnArgv = f.token !== undefined;
   const shared = f.token ?? process.env.TSM_TOKEN;
-  if (tokenOnArgv) {
-    // tsg-20: argv is world-readable (ps). Say so, and take it out of our own process title where the OS allows.
-    log('warn', '--token on the command line is visible to every local user (ps); prefer TSM_TOKEN or --tokens-file');
-    try {
-      process.title = ['termd', ...argv.map((a, i) => (argv[i - 1] === '--token' ? '[redacted]' : a.startsWith('--token=') ? '--token=[redacted]' : a))].join(' ');
-    } catch {
-      // not settable here
-    }
+  // tsg-20: argv is world-readable (ps). With a token on it, say so, and take the token out of
+  // our own process title where the OS allows. The title is `termd …` in every case: a cleanup
+  // such as `pkill -f node` run from a session would otherwise take the daemon, and every
+  // principal's sessions with it (the house's review of #11).
+  if (tokenOnArgv) log('warn', '--token on the command line is visible to every local user (ps); prefer TSM_TOKEN or --tokens-file');
+  try {
+    process.title = ['termd', ...argv.map((a, i) => (argv[i - 1] === '--token' ? '[redacted]' : a.startsWith('--token=') ? '--token=[redacted]' : a))].join(' ');
+  } catch {
+    // not settable here
   }
   // G26: the daemon's credential is not part of any session's environment. Sessions and process
   // Runs inherit the daemon's env (G7's configured basis), so it leaves here, before any spawn:
