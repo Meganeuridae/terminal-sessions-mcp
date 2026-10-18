@@ -260,3 +260,27 @@ test('--log-file: logs go to an owner-only file of termd\'s own, not stderr', as
   }
   assert.match(fs.readFileSync(file, 'utf8'), /"stopped"/);
 });
+
+test('readiness: SIGTERM at the listening announcement drains cleanly', async () => {
+  const file = path.join(tmp, 'ready.log');
+  // Act as a supervisor that signals at the instant readiness becomes visible.
+  // Hook the child only, rather than racing it from the parent's event loop.
+  const atReady = `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+    const write = fs.writeSync;
+    fs.writeSync = function(fd, data, ...rest) {
+      const n = write.call(this, fd, data, ...rest);
+      if (typeof data === 'string' && data.includes('"msg":"listening"')) process.kill(process.pid, 'SIGTERM');
+      return n;
+    };
+    syncBuiltinESMExports();`;
+  const d = termd(['--port', '0', '--data-dir', path.join(tmp, 'dready'), '--no-usage-log', '--log-file', file], {
+    env: { NODE_OPTIONS: `--import=data:text/javascript,${encodeURIComponent(atReady)}` },
+  });
+  try {
+    await until(() => d.child.exitCode !== null || d.child.signalCode !== null, 10_000, 'shutdown after readiness');
+    assert.equal(await d.exited, 0, `signal: ${d.child.signalCode}; ${d.lines.join('\n')}`);
+    assert.match(fs.readFileSync(file, 'utf8'), /"stopped"/);
+  } finally {
+    await stop(d);
+  }
+});

@@ -551,21 +551,6 @@ async function main(): Promise<void> {
   } catch (e) {
     fail(`cannot listen on ${host}:${port}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
   }
-  const recovered = registry.list().filter((s) => s.kind === 'history').length;
-  const urlHost = bound.host.includes(':') ? `[${bound.host}]` : bound.host;
-  log('info', 'listening', {
-    version: version(),
-    url: `ws://${urlHost}:${bound.port}`,
-    gui: `http://${urlHost}:${bound.port}/`,
-    dataDir,
-    auth,
-    allowHosts: allowHosts.length ? allowHosts : undefined,
-    recovered: recovered || undefined,
-    usageLog: usageFile,
-    logFile: logFile?.file,
-    pid: process.pid,
-  });
-
   let stopping = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (stopping) {
@@ -593,6 +578,23 @@ async function main(): Promise<void> {
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(sig, () => void shutdown(sig));
   // Last resort on any exit path: no process group the daemon owns survives it.
   process.on('exit', () => groups.signalAll('SIGKILL'));
+
+  // Supervisors may stop us as soon as readiness is visible. Install the drain
+  // and last-resort cleanup before publishing that boundary.
+  const recovered = registry.list().filter((s) => s.kind === 'history').length;
+  const urlHost = bound.host.includes(':') ? `[${bound.host}]` : bound.host;
+  log('info', 'listening', {
+    version: version(),
+    url: `ws://${urlHost}:${bound.port}`,
+    gui: `http://${urlHost}:${bound.port}/`,
+    dataDir,
+    auth,
+    allowHosts: allowHosts.length ? allowHosts : undefined,
+    recovered: recovered || undefined,
+    usageLog: usageFile,
+    logFile: logFile?.file,
+    pid: process.pid,
+  });
 }
 
 main().catch((e) => {
