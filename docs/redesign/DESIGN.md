@@ -728,8 +728,9 @@ honour `supersedes` collapse digests to one line; hosts that do not still see a 
 Messages are batched per `channels/incoming` request within the segmenter's window. A
 `run` message is withheld from a principal whose synchronous `run` or `await` was waiting
 on that Run when it ended — the lane checks the session's in-flight waiters inside the
-journal listener for `run.end`, so a result that takes seconds to build is never raced by a
-timer — and from one whose later `await` already returned it; it is delivered to everyone
+journal listener for `run.end`, and then holds the message for up to two seconds for the
+call to return its result; a result that takes longer than that to build may be preceded by
+its message — and from one whose later `await` already returned it; it is delivered to everyone
 else, including that principal if its call had returned `running` (G28).
 
 ### 10.3 Tag ontology

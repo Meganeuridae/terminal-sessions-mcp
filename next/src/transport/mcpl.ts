@@ -528,6 +528,8 @@ export class McplLane {
   }
 
   closeChannel(id: string): { closed: boolean } {
+    // §14.1: lifecycle methods need channels.lifecycle, close as much as open (the house's review of #11).
+    if (!this.has('channels.lifecycle')) throw new RpcError(CAPABILITY_DENIED, 'channels.lifecycle not granted', { capability: 'channels.lifecycle' });
     return { closed: this.open.delete(id) };
   }
 
