@@ -67,7 +67,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 test('G13 (real bash): attaching during a flood gives snapshot + exactly the later events, which rebuild the screen', async () => {
   const owner = await client('ta');
   await owner.request('tools/call', { name: 'session_open', arguments: { session: 'flood', visibility: 'shared', cols: 80, rows: 20 } });
-  const cmd = `pad==================================================; for i in $(seq 1 1200); do printf '\\033[3%dmrow %d %s\\033[0m\\n' $((i%8)) $i "\${pad:0:$((i%50))}"; done; printf '\\033[5;5HMARK'`;
+  // A short pause every hundred rows keeps the flood going for the viewers, however fast the machine.
+  const cmd = `pad==================================================; for i in $(seq 1 1200); do printf '\\033[3%dmrow %d %s\\033[0m\\n' $((i%8)) $i "\${pad:0:$((i%50))}"; [ $((i%100)) -eq 0 ] && sleep 0.03; done; printf '\\033[5;5HMARK'`;
   const run = (await owner.request('tools/call', { name: 'run', arguments: { session: 'flood', command: cmd, wait: 0 } })) as { structuredContent: { runId: string } };
   const viewers: Array<{ c: Awaited<ReturnType<typeof client>>; snap: { data: string; cols: number; rows: number; seq: number } }> = [];
   for (let k = 0; k < 4; k++) {

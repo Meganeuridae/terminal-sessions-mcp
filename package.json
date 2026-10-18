@@ -13,7 +13,7 @@
   },
   "scripts": {
     "build": "tsc -p next/tsconfig.json",
-    "test": "npm run build && node --test \"next/dist/spec/**/*.spec.js\"",
+    "test": "npm run build && node --test next/dist/spec/*.spec.js",
     "build:next": "npm run build",
     "test:next": "npm test",
     "acceptance:af": "npm run build && node next/acceptance/agent-framework.mjs",
