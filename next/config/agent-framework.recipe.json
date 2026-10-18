@@ -9,8 +9,7 @@
       "enabledFeatureSets": [
         "terminal.core",
         "terminal.live",
-        "terminal.presence",
-        "terminal.annotate"
+        "terminal.presence"
       ],
       "token": "${TSM_TOKEN}"
     }

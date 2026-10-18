@@ -121,7 +121,7 @@ export class TestHost {
     for (const m of this.log) {
       if (m.method === 'push/event') {
         const p = m.params as { eventId: string; tags: string[]; origin: Record<string, unknown>; payload: { content: Array<{ text: string }> } };
-        out.push({ via: 'push', messageId: p.eventId, text: p.payload.content.map((c) => c.text).join('\n'), tags: p.tags ?? [], metadata: p.origin, channelId: String(p.origin.mcplChannelId) });
+        out.push({ via: 'push', messageId: p.eventId, text: p.payload.content.map((c) => c.text).join('\n'), tags: p.tags ?? [], metadata: p.origin, channelId: String(p.origin.channelId) });
       } else if (m.method === 'channels/incoming') {
         for (const x of (m.params as { messages: Array<{ messageId: string; channelId: string; tags: string[]; metadata: Record<string, unknown>; content: Array<{ text: string }> }> }).messages) {
           out.push({ via: 'incoming', messageId: x.messageId, text: x.content.map((c) => c.text).join('\n'), tags: x.tags ?? [], metadata: x.metadata, channelId: x.channelId });

@@ -881,7 +881,11 @@ export class McplLane {
         eventId: msg.messageId,
         timestamp: msg.timestamp,
         tags: msg.tags,
-        origin: { server: 'terminal', mcplChannelId: cid, channelId: cid, ...flat(msg.metadata) },
+        // The origin names the session's channel (`channelId`) but not a channel to reply in
+        // (`mcplChannelId`): a completion is news about the agent's own work, not a message to
+        // answer, and a host that answered where `mcplChannelId` pointed made the agent's
+        // reply a note in the terminal and left the channel open (the house's review of #11).
+        origin: { server: 'terminal', channelId: cid, ...flat(msg.metadata) },
         payload: { content: msg.content },
       })
       .then((r) => {

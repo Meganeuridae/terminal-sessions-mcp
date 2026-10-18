@@ -1,7 +1,8 @@
 /**
- * The shipped configurations work as written (next/config): the agent-framework
- * recipe lets an agent's reply to a terminal wake land as a note instead of
- * failing (mcpl-17); the bridge entry registers channels, so `mcpl_open` and
+ * The shipped configurations work as written (next/config): under the agent-framework
+ * recipe a completion names no channel to reply in and a reply published into the
+ * terminal is refused, so an answer to a wake goes to the person, not into the terminal
+ * (mcpl-17); the bridge entry registers channels, so `mcpl_open` and
  * `mcpl_send` work (mcpl-20); and the supervisor launcher starts termd under a
  * supervisor's bare PATH, in $HOME, with process Runs that find the toolchain
  * and an owner-only log (tsg-21, ux-16).
@@ -20,6 +21,7 @@ import { SessionRegistry } from '../src/api/registry.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermServer } from '../src/transport/server.js';
 import { FakeShell } from './fake-shell.js';
+import { until } from './testhost.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG = path.resolve(here, '../../config');
@@ -29,7 +31,7 @@ after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 type Msg = { id?: number; method?: string; params?: unknown; result?: Record<string, unknown>; error?: { code: number; message: string } };
 
 /** An MCPL host connection that does what a host with this config does: initialize, send its policy, then call. */
-async function host(port: number): Promise<{ request(method: string, params?: unknown): Promise<Msg>; close(): void }> {
+async function host(port: number): Promise<{ request(method: string, params?: unknown): Promise<Msg>; received: Msg[]; close(): void }> {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/?token=ta&resultText=transcript`);
   await new Promise<void>((r, j) => {
     ws.once('open', () => r());
@@ -37,12 +39,17 @@ async function host(port: number): Promise<{ request(method: string, params?: un
   });
   let id = 0;
   const pending = new Map<number, (m: Msg) => void>();
+  const received: Msg[] = [];
   ws.on('message', (d) => {
     const m = JSON.parse(d.toString()) as Msg;
     if (m.method === undefined && m.id !== undefined) pending.get(m.id)?.(m);
-    else if (m.method !== undefined && m.id !== undefined) ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: {} })); // accept channels/register and the like
+    else if (m.method !== undefined) {
+      received.push(m);
+      if (m.id !== undefined) ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: m.method === 'push/event' ? { accepted: true } : {} })); // accept channels/register, push/event and the like
+    }
   });
   return {
+    received,
     request: (method, params) =>
       new Promise((resolve) => {
         const n = ++id;
@@ -53,11 +60,14 @@ async function host(port: number): Promise<{ request(method: string, params?: un
   };
 }
 
-async function scriptedDaemon(): Promise<{ port: number; registry: SessionRegistry; close(): Promise<void> }> {
+async function scriptedDaemon(): Promise<{ port: number; registry: SessionRegistry; shell(): FakeShell; close(): Promise<void> }> {
   const backend = new ScriptedBackend();
+  let shell: FakeShell | undefined;
   backend.onSpawnShell = (p) => {
     const sh = new FakeShell(p);
+    shell = sh;
     sh.on('echo hi', () => ({ output: 'hi\r\n', exit: 0 }));
+    sh.on(/^sleep/, () => ({ hang: true }));
     const kill = p.kill.bind(p);
     p.kill = (sig) => {
       kill(sig);
@@ -70,6 +80,7 @@ async function scriptedDaemon(): Promise<{ port: number; registry: SessionRegist
   return {
     port,
     registry,
+    shell: () => shell!,
     async close() {
       await server.close();
       await registry.closeAll();
@@ -81,23 +92,35 @@ const MCPL_INIT = { protocolVersion: '2025-06-18', capabilities: { experimental:
 /** What agent-framework grants a server (every capability this server declares that the host honours). */
 const AF_GRANT = ['tools', 'pushEvents', 'channels.register', 'channels.lifecycle', 'channels.incoming', 'channels.publish', 'contextHooks.beforeInference.inject.beforeUser'];
 
-test('mcpl-17: with the shipped agent-framework recipe, a reply routed to the session that woke the agent is recorded as a note, not refused (-32017)', async () => {
+test("mcpl-17: with the shipped agent-framework recipe, a completion's push origin names the session's channel but no channel to reply in, and a reply published into the terminal is refused; annotate is an explicit opt-in", async () => {
   const recipe = (JSON.parse(fs.readFileSync(path.join(CONFIG, 'agent-framework.recipe.json'), 'utf8')) as { mcplServers: Array<{ enabledFeatureSets: string[] }> }).mcplServers[0]!;
+  assert.ok(!recipe.enabledFeatureSets.includes('terminal.annotate'), 'the recipe does not turn notes on');
   const d = await scriptedDaemon();
   try {
     const h = await host(d.port);
     await h.request('initialize', MCPL_INIT);
     const receipt = await h.request('featureSets/update', { effectiveCapabilities: AF_GRANT, enabled: recipe.enabledFeatureSets });
     assert.equal(receipt.error, undefined, JSON.stringify(receipt));
-    await h.request('tools/call', { name: 'run', arguments: { session: 'woke', command: 'echo hi' } });
-    // agent-framework opens the channel by delivery, then publishes the agent's prose there.
-    const opened = await h.request('channels/open', { channelId: 'terminal:woke' });
-    const channel = ((opened.result?.channel as { id?: string }) ?? {}).id ?? 'terminal:woke';
-    const published = await h.request('channels/publish', { conversationId: 'c', channelId: channel, content: [{ type: 'text', text: 'build looks good' }] });
-    assert.equal(published.error, undefined, `the reply was refused: ${JSON.stringify(published.error)}`);
-    assert.equal(published.result?.delivered, true);
+    // A command that outlives its wait: its completion comes as a push event.
+    const r = await h.request('tools/call', { name: 'run', arguments: { session: 'woke', command: 'sleep 1', wait: 50 } });
+    assert.equal((r.result?.structuredContent as { state?: string } | undefined)?.state, 'running', JSON.stringify(r.result));
+    d.shell().finishHung(0, 'woke up\r\n');
+    await until(() => h.received.some((m) => m.method === 'push/event'), 5000, 'the completion push');
+    const push = h.received.find((m) => m.method === 'push/event')!.params as { origin: Record<string, unknown>; tags?: string[] };
+    assert.equal(push.origin.channelId, 'terminal:woke', 'the origin names the session');
+    assert.ok(!('mcplChannelId' in push.origin), 'and no channel to reply in: a completion is news, not a message to answer');
+    // Were a host to publish a reply into the terminal anyway, the recipe refuses it: notes are an opt-in.
+    await h.request('channels/open', { channelId: 'terminal:woke' });
+    const refused = await h.request('channels/publish', { conversationId: 'c', channelId: 'terminal:woke', content: [{ type: 'text', text: 'build looks good' }] });
+    assert.equal(refused.error?.code, -32017, JSON.stringify(refused));
     const s = d.registry.get('woke');
     assert.ok(s && s.kind === 'live');
+    assert.ok(!s.session.journal.since(0).events.some((e) => e.type === 'note'), 'nothing was recorded');
+    // With terminal.annotate enabled on purpose, the same publish is a note for observers.
+    await h.request('featureSets/update', { effectiveCapabilities: AF_GRANT, enabled: [...recipe.enabledFeatureSets, 'terminal.annotate'] });
+    const published = await h.request('channels/publish', { conversationId: 'c', channelId: 'terminal:woke', content: [{ type: 'text', text: 'build looks good' }] });
+    assert.equal(published.error, undefined, JSON.stringify(published.error));
+    assert.equal(published.result?.delivered, true);
     assert.ok(s.session.journal.since(0).events.some((e) => e.type === 'note' && e.text === 'build looks good'), 'the note is in the journal');
     h.close();
   } finally {
