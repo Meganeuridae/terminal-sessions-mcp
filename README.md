@@ -288,6 +288,20 @@ correct for both canonical-mode shells and raw-mode TUIs). It defaults to
 **true** when `keys` is absent, and **false** when `keys` is given (the caller
 controls the exact bytes; pass `appendNewline: true` explicitly to add Enter).
 
+While a command is on its way in, `sendInput` refuses input other than a lone
+`C-c` and sends nothing, since until the command has started, the shell in
+front could read the input instead. A command is on its way in from the moment
+its line is typed, or held behind a body still going in, until it starts, ends
+or is given up, and a body typed in for a shell that can't read the temp file
+is on its way in until it starts. A command waiting in the server's queue,
+behind one that hasn't ended or timed out, isn't on its way in yet, so input
+then goes to the running one. The refusal also ends after two seconds in which
+the server has typed no line and read no marker, as when a program rather than
+a shell took the command's line, or a busy shell hasn't read it yet; that
+doesn't mean the command has started. Send refused input again in a moment. To
+interrupt a command, use `sendSignal` with SIGINT, its default, or send the
+`C-c` key alone (empty text, `keys: ["C-c"]`); neither is refused.
+
 ### Log Operations
 - **tailLogs** - Get recent logs from a session
 - **searchLogs** - Search logs with regex patterns and context

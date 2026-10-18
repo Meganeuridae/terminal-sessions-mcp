@@ -78,14 +78,14 @@ const TOOLS = {
     }
   },
   runCommand: {
-    description: 'Run a command in a session (auto-creates the session if it does not exist)',
+    description: 'Run a command in a session (auto-creates the session if it does not exist). It runs in the shell in front, which can be one an earlier command started, such as ssh\'s, and has to be a POSIX shell (sh, bash, dash, zsh, ksh). Where that shell can\'t read this machine\'s temp files, a command over about 100 KB (near 20 KB if mostly non-ASCII, single quotes, `!` or control characters other than newline and tab) isn\'t run: its result has exitCode -1 and the reason if you\'re still waiting, and the session log says why. A function or alias in the shell in front that changes `.`, `eval`, `[`, `echo`, `printf` or `unset` can make a command report a status its body didn\'t produce, or keep the body from running.',
     parameters: {
       type: 'object',
       properties: {
         session: { type: 'string', description: 'Session name (will be created automatically if it does not exist)' },
         command: { type: 'string' },
         cwd: { type: 'string', description: 'Working directory (used when auto-creating a new session)' },
-        timeout: { type: 'number', description: 'Command timeout in ms (default: 30000). Use -1 to return immediately without waiting.' },
+        timeout: { type: 'number', description: 'Command timeout in ms (default: 30000). Use -1 to return immediately without waiting. A timed-out command, one still being typed in included, goes on to run (exitCode -1 in the result) unless its body is given up, which the session log says, or a Ctrl-C discarded its line, and commands sent meanwhile are typed in behind it: they run when it ends, or become its input if it reads any. Where the shell in front can\'t read this machine\'s temp files, a long command goes in a line at a time, and the round trips count against its timeout. Use tailLogs to check on a running command, sendInput to answer it (refused while a command is still on its way in, since the shell in front could read the input instead, so input sent straight after a return with -1, or while commands sent meanwhile go in, may need sending again), or sendSignal with SIGINT (the default) to interrupt it. Its Ctrl-C gives up a command whose body is still being typed in, which then never runs, and can discard or give up the commands typed in behind it; sendSignal\'s description says which. Other signals go to the session\'s shell itself.' },
         raw: { type: 'boolean', description: 'If true, preserve raw ANSI escape codes in output (default: false, returns clean text)' }
       },
       required: ['session', 'command']
@@ -111,7 +111,7 @@ const TOOLS = {
     }
   },
   sendInput: {
-    description: 'Send input to an interactive session. Text is sent verbatim; use `keys` for special keys (Enter, Ctrl+C, arrows, ...) since raw control characters cannot pass through the JSON layer.',
+    description: 'Send input to an interactive session. Text is sent verbatim; use `keys` for special keys (Enter, C-c for Ctrl+C, arrows, ...) since raw control characters cannot pass through the JSON layer. Refused, with nothing sent, while a command is still on its way in, since until it has started, the shell in front could read the input instead of the command. The refusal ends when the command starts, ends or is given up, or after two seconds in which the server has typed no line and read no marker, as when a program took the command\'s line or a busy shell hasn\'t read it yet; that lapse doesn\'t mean the command has started. Send refused input again in a moment. To interrupt a command, use sendSignal with SIGINT, its default, or send the C-c key alone here (empty text, keys ["C-c"]): neither is refused, and both give up the commands still being typed in before the Ctrl+C. A ^C in the text among other characters does the same once input is accepted.',
     parameters: {
       type: 'object',
       properties: {
@@ -128,7 +128,7 @@ const TOOLS = {
     }
   },
   sendSignal: {
-    description: 'Send a signal to a session (e.g., SIGINT for Ctrl+C)',
+    description: 'Send a signal to a session. SIGINT, the default, is sent as Ctrl+C; other signals go to the session\'s shell itself. SIGINT first gives up any command whose body is still being typed in, or waits its turn to be, and a command whose line is held back behind a body, so these never run. A command whose line is already typed is given up only if its shell turns out to need its body typed. The rest is the shell\'s and the terminal\'s, as without the server: the Ctrl+C can stop a command as it runs, and a line nothing has read yet is discarded with it under the terminal\'s default settings, or, under `stty noflsh`, left to be read after it. A caller still waiting gets the give-up\'s -1, the command\'s own exit code, or its timeout\'s -1, whichever comes first; a command the Ctrl+C kills can end without its exit marker, since bash 4 and later drop the rest of the line. Commands waiting in the server\'s queue aren\'t given up: each goes in after the Ctrl+C in its turn.',
     parameters: {
       type: 'object',
       properties: {

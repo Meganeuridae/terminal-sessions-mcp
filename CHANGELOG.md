@@ -59,6 +59,194 @@
   22.12 on Node 22, and on 23 and 24. On older ones it still stops: it
   loads the ESM-only `strip-ansi` 7 with `require`, which predates this
   change.
+- **Command completion is now detected at actual completion** 🏁 - The
+  exit-code marker is chained onto the same shell line as the command
+  (`echo "<<<STAR""T:<nonce>>>"; . '<tempfile>'; echo "<<<EXI""T:<nonce>:$?>>>"`)
+  instead of being typed into the PTY 50ms later. This fixes the family of
+  "doesn't notice the command ended / waits for the full timeout" bugs:
+  - `runCommand("exit")` (or any command that kills the shell) resolved only
+    at the fallback timeout; the PTY exit handler now resolves the in-flight
+    command immediately with the shell's exit status (-1 if a signal killed
+    it, which the session log names, as in `[Session terminated by SIGKILL]`),
+    and queued commands fail fast instead of hanging.
+  - Commands that read stdin (`read`, REPLs, `ssh`...) used to swallow the
+    delayed marker line as *input* — burning the full timeout AND feeding a
+    line of garbage into whatever was reading (picture a password prompt).
+    Nothing extra is typed into the PTY anymore.
+  - A command (or its output) merely *containing* marker-shaped text like
+    `<<<EXIT:7>>>` resolved instantly with that bogus exit code, before the
+    command even ran. Markers now carry a per-command nonce, and the marker
+    string is split in the echoed command text so no echo of the typed line
+    can ever match.
+  - After a timeout, the stale marker from the still-running command could
+    resolve the *next* command with the wrong exit code and mangled output.
+    Nonces make stale markers inert (and they're stripped from output).
+
+  A command that replaces the shell (`exec bash`) still prints no exit marker
+  of its own and waits for its timeout. One that exits a shell an earlier
+  command started (`exit` sent to ssh's remote shell or a nested `bash`)
+  ends when that earlier command's line does, with the status that line ends
+  with: ssh's, when ssh ends it, which ssh takes from the remote shell.
+- **Every `runCommand` command goes through the temp-file path** (not just
+  multi-line ones), which also fixes single-line commands longer than the
+  tty's canonical-mode line buffer (1024 bytes on macOS) being silently
+  truncated, and translates the temp-file path to `/mnt/<drive>/...` form so
+  sourcing works under WSL on Windows. `startService` still types its
+  command. A command whose temp file can't be written (a missing or full
+  temp directory) fails alone with exitCode -1 and the reason, instead of
+  wedging the session; the file is created exclusively, so nothing planted
+  at its name is written through or reused.
+- **Commands reach a shell an earlier command started**, such as ssh's remote
+  shell, multi-line ones included (1.6.0 typed only single-line commands, so
+  only those ran there). Each typed line sources the temp file only if the
+  shell in front can read it, so a shell that can, such as the session's own
+  or a nested one run on this machine as the same user, keeps the file, and
+  long or multi-line bodies are never typed into it. A shell that can't, such
+  as a remote one, sets a variable named for the command to its own pid and
+  gets the body typed in, escaped for `printf '%b'` and run with `eval`, in
+  the order the commands were written, commands typed in behind a timed-out
+  one included. The lines typed run only in a shell where that variable
+  holds its own pid: a shell that reads them without it, such as the one
+  behind after an ssh connection drops, or one an earlier command started in
+  front meanwhile, runs nothing, and the command is given up rather than run
+  there. A body is typed in lines of at most 1,000 bytes, since a shell can
+  cut a longer line short (macOS's line limit is 1,024 bytes, and escaped, a
+  byte of the body can take up to five characters): a body that fits goes
+  as one line, and a longer one, such as a file written with a heredoc or a
+  short script, is put together in a shell variable from as many lines as
+  it takes, each typed once the shell has taken the one before (it prints a
+  marker for it), and each run only where the variable holds as many
+  characters as the lines before it typed, so a line that reached another shell, or was
+  cut or taken by something else reading the terminal, leaves a body that
+  never runs rather than one with a gap; the last line runs it. Bodies go
+  in one at a time, in the order the commands were written: the next
+  body's first line is typed once the shell has read the one before to its
+  end, so a short body can't pass a longer one that is still going in.
+  A body whose line something else reading the terminal took, such as a
+  program the body before it started, holds the ones behind it only until
+  the shell prints a marker for a line typed after that one, which shows
+  it has read past where the taken line would have been; the body is given
+  up then, the log says so, and the ones behind it go on. Typing takes a
+  round trip per line, which counts against the command's timeout; a body
+  still going in when its timeout passes is typed to its end and then runs,
+  as a timed-out command keeps running, and the next command's line waits
+  until it is in (or until no line of the body has been typed for two
+  seconds while it waits, or that command's own timeout), since a line
+  typed into a line editor
+  that is still handling a long one can leave it redrawing instead of
+  reading. 1.6.0 typed a
+  single-line command of any length as one line, which a shell could cut
+  short. A body that would take more than 128 lines (about 100 KB of ASCII
+  text; a byte at or above 0x7f, a single quote, a `!` or a control byte
+  other than a newline or tab takes five characters escaped, and a newline,
+  tab or backslash two, so text that is mostly made of the five-character ones reaches
+  the cap near 20 KB) isn't
+  typed, and the command ends with exitCode -1 and says why if it's still
+  waiting, and the session log says so too, as does a command given up
+  because its lines reached another shell. Such a command leaves the
+  variables set in the shell that asked, where nothing reads them. The
+  shell in front has to be a POSIX
+  shell (sh, bash, dash, zsh, ksh); in fish or csh the typed lines don't
+  parse, and a command there times out without running. The typed lines rely
+  on the standard behavior of the shell's `.`, `eval`, `[`, `echo`, `printf`
+  and `unset`, which they call by name. A function or alias in the shell in
+  front that changes how one of them behaves is outside what the transport
+  supports, since it can make a command end with a status the body didn't
+  produce: a function named `eval` that returns 0 ends every command typed
+  inline with 0, without running it. runCommand's description says so.
+- Exec plumbing (wrapper echoes, markers) is filtered out of session logs and
+  the `lines` of output events, so `tailLogs` shows `$ command`, its output
+  and the shell's prompts without the wrapper text. Only this session's own
+  plumbing is removed, and only its spans: output sharing a line with it
+  (text without a trailing newline, a timed-out command's late tail) stays,
+  marker-shaped text from anywhere else is output, and a wrapper echo
+  soft-wrapped at the terminal's edge (bash 3.2 on macOS), or ending exactly
+  at it (where bash 5 redraws its last character), is still recognized. A
+  line typed ahead behind a busy shell is echoed as it's typed, and output
+  the shell prints meanwhile can break that echo across lines; pieces of it
+  then stay in the logs. An output event's `chunk` stays the raw terminal
+  stream.
+- **A result is bounded by its own command's execution.** The shell prints a
+  start marker immediately before sourcing the command and the exit marker
+  immediately after, so a result no longer picks up the next prompt or what
+  a timed-out predecessor prints before this command starts (a background
+  job the predecessor left running can still print into it); a command that
+  never started returns no output of its own (it may still run later; its
+  output then reaches the logs), and one refused before it could be typed
+  returns the reason. A command that times out returns what it printed by
+  the end of the wait.
+- **A command queued behind a timed-out one still runs** once the shell
+  reaches it. Each command's temp file is kept until the shell has read past
+  its line (its own exit marker, a later command's start marker, or the
+  shell's exit), instead of being deleted when the next command is written,
+  and the server removes the files still pending when its process exits
+  normally, as the process-exit cleanup entry above says. A predecessor that
+  reads stdin can take the queued line as its input, and then that command
+  never runs. Interrupting the predecessor with Ctrl-C (`sendSignal` SIGINT)
+  discards the lines typed in behind it under the terminal's default
+  settings, so those never run either; the SIGINT entry below says what
+  becomes of them under `stty noflsh`.
+
+### Changed
+
+- **A timed-out command is left untouched.** Previously the marker machinery
+  incidentally poked blocked stdin-readers with garbage input. Now a command
+  that times out (exitCode -1) simply keeps running in the session, and
+  commands sent meanwhile are typed in behind it: they run when it ends, or
+  become its input if it reads any, and a shell it started, such as ssh's,
+  runs them. Check on it with `tailLogs`, answer it with `sendInput` once it
+  has started (see below), or
+  interrupt it with `sendSignal` (SIGINT, the default, sent as Ctrl-C, which
+  under the terminal's default settings also discards the commands typed in
+  behind it, as the SIGINT entry below says; other signals go to the
+  session's shell itself).
+  The `runCommand` tool's `timeout` parameter documents this.
+- **`sendInput` refuses input while a command is on its way in.** A command
+  for a shell that can't read the temp file starts only once its body has
+  been typed in (see above), and that shell would read input sent before then
+  as part of its own command lines. So `sendInput` sends nothing and throws
+  from the moment a command's line is typed, or held behind a body still
+  going in, until its start marker comes, it ends or it's given up, and while
+  a body goes in. A Ctrl-C sent alone, as the `C-c` key, isn't refused (see
+  the next entry). The refusal also lapses after two seconds in which the
+  server has typed no line and read no marker, as when a program took the
+  command's line, which doesn't mean the command has started. With a shell
+  that reads the temp file and waits at its prompt, the refusal lasts the
+  probe line's round trip, so a `sendInput` sent straight after `runCommand`
+  with a timeout of -1 can be refused where 1.6.0 sent it: send it again in a
+  moment.
+- **A SIGINT gives up a command still being typed in.** Before its Ctrl-C,
+  `sendSignal` with SIGINT gives up the commands on their way in that can't
+  have started, since a body's last line is what runs it: a body still being
+  typed in, the bodies waiting their turn, and a probe line held behind a
+  body, which is then never typed. Over a link, a Ctrl-C typed while a body
+  goes in mostly reaches the shell at its prompt between two of its lines and
+  takes nothing with it, so the rest of the body would be typed and run. The
+  session log gives each one's reason, `[command not run: interrupted before
+  its body was all typed in]`, or `[command not run: interrupted before its
+  line was typed]` for a probe line still held, and a caller still waiting
+  gets -1 with it, whatever `stty noflsh` says. A Ctrl-C sent alone with
+  `sendInput`, as the `C-c` key or a terminal's Ctrl+C keystroke, does the
+  same, and like `sendSignal`'s it isn't refused while a command goes in;
+  input that holds a ^C among other characters does it too, once input is
+  accepted. Every other command whose line is typed and that hasn't started
+  is marked, since the server can't tell whether its shell has read the line:
+  if a no-file marker comes for it, the mark gives it up there rather than
+  its body being typed. A body typed in whole may be running, and is left to
+  the Ctrl-C. The rest is the shell's and the terminal's, as without the
+  server: the Ctrl-C can stop a command as it runs, and a line nothing has
+  read yet is discarded with it under the terminal's default settings, or,
+  under `stty noflsh`, left to be read after it. A caller still waiting gets
+  the give-up's -1, the command's own exit code, or its timeout's -1,
+  whichever comes first; a command the Ctrl-C kills can end without its exit
+  marker, since bash 4 and later drop the rest of the line. Commands waiting
+  in the server's queue have no line typed and aren't given up: each goes in
+  after the Ctrl-C in its turn, as any queued command does.
+- Command bodies are sourced with `.` (POSIX) instead of the `source`
+  bashism, so plain sh/dash sessions work too.
+- Shell history records each command's typed line (a check that the shell
+  can read its temp file, which it then sources between two markers, or in a
+  shell that can't, the body escaped), not the command's own text.
 
 ## v1.6.1 - 2026-10-17
 
