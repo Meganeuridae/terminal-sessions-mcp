@@ -2283,7 +2283,11 @@ export class Session {
       this.extraTempFiles.delete(out);
     }
     const vars = redactSnapshot(parseEnvNul(text));
-    const ev = this.append({ type: 'env.snapshot', vars });
+    // The values stay in memory: nothing reads them back from the journal (after a restart the
+    // configured basis serves, and says so), so journaling them only kept a copy of the
+    // environment on disk (the house's review of #11, core finding 5). The event records that a
+    // capture happened, and how many variables it held.
+    const ev = this.append({ type: 'env.snapshot', count: Object.keys(vars).length });
     this.envSnapshot = { vars, seq: ev?.seq ?? this.journal.lastSeq, capturedAt: ev?.ts ?? this.now() };
     return this.envSnapshot;
   }

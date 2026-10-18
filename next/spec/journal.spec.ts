@@ -158,7 +158,7 @@ test('jr-21/G21: the memory ring bounds every event by its size, not just output
   const ring = new MemoryStore(1024 * 1024);
   const vars: Record<string, string> = {};
   for (let i = 0; i < 1000; i++) vars[`VAR_${i}`] = 'v'.repeat(1100);
-  for (let i = 0; i < 50; i++) ring.append({ type: 'env.snapshot', vars, seq: i + 1, ts: 0 });
+  for (let i = 0; i < 50; i++) ring.append({ type: 'env.snapshot', count: Object.keys(vars).length, vars, seq: i + 1, ts: 0 });
   assert.equal(ring.read().length, 1, 'only the newest ~1.1 MB snapshot fits a 1 MiB ring');
   const ring2 = new MemoryStore(64 * 1024);
   for (let i = 0; i < 100; i++) ring2.append({ type: 'run.admit', runId: `r${i}`, target: 'shell', line: 'l'.repeat(4000), principal: 'p', origin: 'self', queued: false, seq: i + 1, ts: 0 });

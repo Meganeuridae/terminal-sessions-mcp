@@ -37,7 +37,7 @@ export type EventInput =
   | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number }
   | { type: 'prompt'; cwd: string; phase: 'start' | 'end' }
   | { type: 'cwd'; path: string }
-  | { type: 'env.snapshot'; vars: Record<string, string> }
+  | { type: 'env.snapshot'; count: number; vars?: Record<string, string> }
   | { type: 'screen.mode'; alt: boolean }
   | { type: 'title'; text: string }
   | { type: 'resize'; cols: number; rows: number; principal: Principal }
