@@ -4,6 +4,7 @@
  */
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -237,5 +238,53 @@ test('/bin/sh: G5 fallback — no integration, marker strategy, observed exits, 
     // `exit` in a shell Run exits the session's shell — that is what a persistent shell means.
   } finally {
     await session.close();
+  }
+});
+
+test('/bin/bash: a process Run inherits no terminal master, and its line is not in any argv', async () => {
+  // Two sessions open: before, a process Run in either held both terminals' masters.
+  const a = await real('/bin/bash');
+  const b = await real('/bin/bash');
+  try {
+    const fds = a.session.admit({ target: 'process', line: 'ls /dev/fd | tr "\\n" " "', principal: AGENT });
+    assert.ok(fds.admitted);
+    const r = await a.session.awaitRun(fds.run.runId, 5000);
+    assert.equal(r.state, 'exited');
+    const out = a.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output' && e.runId === r.runId).map((e) => e.data).join('');
+    // Exactly what `ls /dev/fd` has when this test process spawns it directly (0, 1, 2 and the
+    // descriptors ls opens to read /dev/fd): nothing of the daemon's. On Linux the daemon's
+    // children inherited every session's terminal master before the launcher closed them.
+    const baseline = execFileSync('ls', ['/dev/fd'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\s+/).sort();
+    assert.deepEqual(out.trim().split(/\s+/).filter(Boolean).sort(), baseline, `descriptors open in a process Run: ${out.trim()}`);
+    // The line's text is in a file, not in the shell's argv: a pkill -f for a word of the line
+    // finds nothing but pkill itself, which it skips, and the line goes on.
+    const own = a.session.admit({ target: 'process', line: "pkill -f 'qz7-relaunch' >/dev/null 2>&1; echo after-the-pkill qz7-relaunch", principal: AGENT });
+    assert.ok(own.admitted);
+    const r2 = await a.session.awaitRun(own.run.runId, 5000);
+    assert.deepEqual([r2.state, r2.exit], ['exited', 0]);
+    const out2 = a.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output' && e.runId === r2.runId).map((e) => e.data).join('');
+    assert.equal(out2.trim(), 'after-the-pkill qz7-relaunch');
+    assert.deepEqual(r2.argv, ['/bin/sh', '/dev/fd/3'], 'the text reaches the shell on a descriptor, not on any command line or in a file');
+    // The descriptor the text came on is closed before the command's children run, and so are
+    // the daemon's: the command sees only what a directly spawned `ls /dev/fd` would.
+    const fds3 = a.session.admit({ target: 'process', line: 'ls /dev/fd | tr "\\n" " "', principal: AGENT });
+    assert.ok(fds3.admitted);
+    const r3 = await a.session.awaitRun(fds3.run.runId, 5000);
+    const out3 = a.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output' && e.runId === r3.runId).map((e) => e.data).join('');
+    assert.deepEqual(out3.trim().split(/\s+/).filter(Boolean).sort(), baseline, `descriptors open in a line's command: ${out3.trim()}`);
+    // A long line arrives whole: more than a pipe buffer's worth.
+    const big = a.session.admit({ target: 'process', line: `x='${'y'.repeat(100000)}'; echo "len=\${#x}"`, principal: AGENT });
+    assert.ok(big.admitted);
+    const rb = await a.session.awaitRun(big.run.runId, 8000);
+    assert.equal(a.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output' && e.runId === rb.runId).map((e) => e.data).join('').trim(), 'len=100000');
+    // The group leader is the command's own shell (exec keeps the pid): cancel reaches it.
+    const slow = a.session.admit({ target: 'process', line: 'sleep 30', principal: AGENT });
+    assert.ok(slow.admitted);
+    await until(() => a.session.run(slow.run.runId).state === 'running', 3000);
+    const c = await a.session.cancel(slow.run.runId, AGENT);
+    assert.equal(c.state, 'cancelled');
+  } finally {
+    await a.session.close({ graceful: false });
+    await b.session.close({ graceful: false });
   }
 });

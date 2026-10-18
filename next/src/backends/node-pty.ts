@@ -109,6 +109,47 @@ class NodePty implements PtyHandle {
   }
 }
 
+/**
+ * What every process Run starts through: `/bin/sh -c PROCESS_LAUNCH termd-process <argv…>`.
+ * It closes every descriptor above stderr before the command runs. node-pty opens each
+ * session's terminal master without close-on-exec, and Node passes a child every descriptor
+ * that isn't, so a process Run held the master of every session open when it started: it
+ * could have written into those terminals, another principal's included, and it kept a
+ * shell alive after the daemon died, since the terminal never hung up (the house's review
+ * of #11, and issue #18). The descriptors are listed through /dev/fd (Linux links it to
+ * /proc/self/fd); the glob is expanded, and its directory closed, before the loop runs. On
+ * Linux the Run is also made a likelier victim of the out-of-memory killer than the daemon,
+ * as the shells are. Only the daemon's constant text is on this command line: a Run given a
+ * line gets its text on descriptor 3 and runs it as `/bin/sh /dev/fd/3` (see Session.admit),
+ * the text's first line closing that descriptor so the command's own children never see it;
+ * nothing of the Run's is in any argv or in a file a crash and a fast restart could remove.
+ */
+/** Is `cmd` a file that may be executed, by path or on `PATH`? */
+function executable(cmd: string, PATH: string | undefined): boolean {
+  const ok = (p: string) => {
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+      return fs.statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (cmd.includes('/')) return ok(cmd);
+  return (PATH ?? '').split(':').some((d) => d !== '' && ok(`${d}/${cmd}`));
+}
+
+/**
+ * The launcher's text; with `keepsScriptFd`, descriptor 3 carries the Run's own text and is
+ * kept open for the shell to read (the text's first line closes it, see spawnProcess).
+ */
+function processLaunch(keepsScriptFd: boolean): string {
+  return [
+    `if [ -d /dev/fd ]; then for f in /dev/fd/*; do case "\${f##*/}" in ${keepsScriptFd ? '0|1|2|3' : '0|1|2'}) ;; *) eval "exec \${f##*/}>&-" 2>/dev/null || :;; esac; done; fi`,
+    'if [ -w /proc/self/oom_score_adj ]; then echo 500 > /proc/self/oom_score_adj 2>/dev/null || :; fi',
+    'exec "$@"',
+  ].join('\n');
+}
+
 export class NodePtyBackend implements ExecutionBackend {
   readonly kind = 'node-pty';
 
@@ -129,17 +170,32 @@ export class NodePtyBackend implements ExecutionBackend {
     if (!cmd) throw new Error('spawnProcess: empty argv');
     // detached: own process group, so cancel can signal the group (G29). stdin is
     // /dev/null: no verb writes to a process Run's stdin, so a reader sees EOF
-    // instead of hanging (core-12).
-    const child = spawnChild(cmd, args, { cwd: opts.cwd, env: opts.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    // instead of hanging (core-12). The command starts through PROCESS_LAUNCH (below),
+    // whose exec keeps the pid, so the group leader is the command itself. A command
+    // that cannot be found or run is spawned directly, so the failure is a spawn error,
+    // not the launcher's exit 127 (core-15: nothing ran, no signal was observed).
+    // A line's text goes to the child on a pipe at descriptor 3, which the launcher keeps and
+    // the text's own first line closes once the shell has it open (see processLaunch).
+    const script = opts.line !== undefined && cmd === '/bin/sh' && args[0] === '/dev/fd/3' ? `exec 3<&-\n${opts.line}\n` : undefined;
+    const launched = executable(cmd, opts.env.PATH) ? ['/bin/sh', ['-c', processLaunch(script !== undefined), 'termd-process', cmd, ...args]] as const : [cmd, args] as const;
+    const child = spawnChild(launched[0], [...launched[1]], { cwd: opts.cwd, env: opts.env, stdio: script !== undefined ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'], detached: true });
+    if (script !== undefined) {
+      const feed = child.stdio[3] as NodeJS.WritableStream | null;
+      feed?.on('error', () => undefined); // the shell may exit before reading it all
+      feed?.end(script);
+    }
+    // (Both streams are piped above; the conditional stdio array widens their types.)
+    const stdout = child.stdout!;
+    const stderr = child.stderr!;
     // The journal stores UTF-8 text, not arbitrary binary streams. Node's streaming
     // decoder preserves split characters and replaces invalid sequences with U+FFFD.
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
+    stdout.setEncoding('utf8');
+    stderr.setEncoding('utf8');
     const outL = new Set<(d: string) => void>();
     const errL = new Set<(d: string) => void>();
     const exitL = new Set<(e: PtyExit) => void>();
-    child.stdout.on('data', (d: string) => outL.forEach((l) => l(d)));
-    child.stderr.on('data', (d: string) => errL.forEach((l) => l(d)));
+    stdout.on('data', (d: string) => outL.forEach((l) => l(d)));
+    stderr.on('data', (d: string) => errL.forEach((l) => l(d)));
     const pgid = child.pid;
     let fired = false;
     let spawned = false;
@@ -161,8 +217,8 @@ export class NodePtyBackend implements ExecutionBackend {
         fire(pendingExit);
       }
     };
-    child.stdout.on('end', () => (open--, settle()));
-    child.stderr.on('end', () => (open--, settle()));
+    stdout.on('end', () => (open--, settle()));
+    stderr.on('end', () => (open--, settle()));
     child.on('exit', (code, signal) => {
       pendingExit = signal ? { exitCode: null, signal } : { exitCode: code };
       drainTimer = setTimeout(() => fire(pendingExit!), DRAIN_MS);

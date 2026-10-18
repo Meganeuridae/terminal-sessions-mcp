@@ -57,6 +57,13 @@ export interface PtyHandle {
 
 export interface SpawnProcessOptions {
   argv: string[];
+  /**
+   * The line the Run was given, when it was one. Its text reaches the child on descriptor 3
+   * (argv is then `/bin/sh /dev/fd/3`): never on a command line, where a `pkill -f` in the line
+   * itself would find it, and never in a file, which a daemon recovering after a crash within
+   * milliseconds of the spawn could remove before the shell had opened it.
+   */
+  line?: string;
   cwd: string;
   env: Record<string, string>;
 }

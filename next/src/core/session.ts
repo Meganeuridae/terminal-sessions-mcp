@@ -1357,7 +1357,11 @@ export class Session {
     const origin = opts.origin ?? (opts.principal === SYSTEM ? 'system' : 'self');
     if (opts.target === 'process') {
       this.assertAlive();
-      const argv = opts.argv ?? (opts.line !== undefined ? ['/bin/sh', '-c', opts.line] : undefined);
+      // A line's text reaches the shell on descriptor 3 (see SpawnProcessOptions.line): on
+      // `/bin/sh -c LINE` it was in the shell's argv, where a `pkill -f` in the line itself found
+      // and killed it (the house's review of #11), and a file could be removed under a shell
+      // that had not yet opened it.
+      const argv = opts.argv ?? (opts.line !== undefined ? ['/bin/sh', '/dev/fd/3'] : undefined);
       if (!argv || argv.length === 0) throw err('invalid_argument', 'process Run needs argv or line');
       const run = this.newRun({ target: 'process', principal: opts.principal, origin, argv, line: opts.line, envBasis: opts.envBasis, idem: opts.idem, queued: false });
       this.launchProcess(run);
@@ -1751,7 +1755,7 @@ export class Session {
     run.envBasis = snapshot ? 'snapshot' : 'configured';
     let proc: ProcessHandle;
     try {
-      proc = this.backend.spawnProcess({ argv: run.argv!, cwd: this.cwdPath, env: { ...(snapshot?.vars ?? this.configured) } });
+      proc = this.backend.spawnProcess({ argv: run.argv!, ...(run.line !== undefined && { line: run.line }), cwd: this.cwdPath, env: { ...(snapshot?.vars ?? this.configured) } });
     } catch (e) {
       // Nothing ran: no exit and no signal were observed (G2, G3).
       this.endRun(run, { state: 'lost', reason: `spawn-failed: ${errMessage(e)}` });

@@ -124,7 +124,7 @@ test('atc-5/tsg-2/atc-25/ux-18: a signal exits 128+N; await <runId>; durations; 
   };
   // Process Runs: `die SIG` is killed by that signal.
   backend.onSpawnProcess = (p) => {
-    const line = p.opts.argv.join(' ');
+    const line = p.opts.line ?? p.opts.argv.join(' ');
     const sig = /die (SIG[A-Z]+)/.exec(line)?.[1];
     if (sig) setTimeout(() => p.exit({ exitCode: null, signal: sig }), 20);
   };
