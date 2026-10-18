@@ -591,7 +591,7 @@ export const TOOLS: ToolDef[] = [
       'observed. A shell Run gets ^C, then ^\\, then SIGTERM and SIGKILL to its foreground job (never the shell); the result ' +
       'says `cancelled` only when the shell confirmed the job ended, and names the escalation (`session_close`) if it survived. ' +
       'A Run in a declared shell (ssh and the like) gets ^C, the end marker, ^\\ — no signals, its job may be on another machine — and the escalation names the enclosing Run to cancel. ' +
-      'A one-shot `ssh host cmd` without -t gives the remote command no terminal: cancelling it ends ssh and the remote command runs on; use `ssh -t host cmd` (`ssh -tt` with target process) so a cancel reaches it.',
+      'Cancelling a one-shot ssh only confirms the local client stopped. With ssh -t in the shell, terminal interrupts reach the remote job; with ssh -tt as a process Run, ending ssh hangs it up. The remote job may ignore these signals; a remote termd can observe and cancel that job directly.',
     inputSchema: {
       type: 'object',
       properties: { runId: { type: 'string' }, session: { ...session, description: 'Optional: the session the Run belongs to.' }, idempotencyKey },
