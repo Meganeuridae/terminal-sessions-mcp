@@ -59,6 +59,7 @@ const FLAGS = {
   'log-file': { type: 'string' },
   /** 1.x's flag; accepted so a 1.x unit starts termd, and changes nothing (see main). */
   headless: { type: 'boolean' },
+  'session-oom-score-adj': { type: 'string' },
 } as const;
 
 type Flags = { [K in keyof typeof FLAGS]?: (typeof FLAGS)[K] extends { multiple: true } ? string[] : (typeof FLAGS)[K] extends { type: 'boolean' } ? boolean : string };
@@ -304,7 +305,11 @@ const HELP = `termd — terminal sessions daemon
   --log-file <file>      write logs to this file (0600, rotated by size) instead of stderr
   --log-level <level>    debug|info|warn|error (default info)
   --headless             accepted for a 1.x command line; changes nothing (the GUI is at the daemon's address)
-Env: TSM_TOKEN (the shared token; removed from the environment once read), TSM_DATA_DIR, TSM_HOST, TSM_PORT;
+  --session-oom-score-adj <n>  Linux: sessions' processes get this oom_score_adj (default 200), so the kernel
+                         takes a build before termd; it counts against every process on the machine, so a
+                         shared host may want less, or 0
+Env: TSM_TOKEN (the shared token; removed from the environment once read), TSM_DATA_DIR, TSM_HOST, TSM_PORT,
+TSM_SESSION_OOM_SCORE_ADJ;
 the 1.x names SESSION_SERVER_HOST, SESSION_SERVER_PORT and SESSION_SERVER_TOKEN are read where those are not set.
 Logs are JSON lines on stderr. Sessions start in $HOME unless given a cwd. The GUI is served at
 http://<host>:<port>/ (add ?token=… when one is required).`;
@@ -427,6 +432,12 @@ async function main(): Promise<void> {
   const registryOpts: ConstructorParameters<typeof SessionRegistry>[0] = { dataDir, backend: groups, defaultCwd: os.homedir() };
   const shell = f.shell ?? process.env.SHELL;
   if (shell) registryOpts.defaultShell = shell;
+  // Linux: sessions' shells and process Runs raise their oom_score_adj so the kernel takes a
+  // build before the daemon, whose death loses every session. The preference counts against
+  // every process on the machine, so a shared host may want less, or 0.
+  const oomAdj = Number(f['session-oom-score-adj'] ?? process.env.TSM_SESSION_OOM_SCORE_ADJ ?? '200');
+  if (!Number.isInteger(oomAdj) || oomAdj < 0 || oomAdj > 1000) fail('--session-oom-score-adj must be an integer from 0 to 1000');
+  registryOpts.sessionOomScoreAdj = oomAdj;
   // G21: nothing is deleted by default; these flags set daemon-wide limits, and a session may set its own at creation.
   const retention: NonNullable<typeof registryOpts.retention> = {};
   const rb = f['retention-bytes'];

@@ -2,7 +2,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
+import { processLaunch } from '../src/backends/node-pty.js';
+import { prepareIntegration } from '../src/shell/integration.js';
 import { AGENT, hasShell, realSession, until } from './fake-shell.js';
 
 const shells = ['/bin/bash', '/bin/zsh', '/opt/homebrew/bin/fish', '/usr/bin/fish'].filter(hasShell);
@@ -128,5 +131,21 @@ test("the launcher's owner-only mask covers the key file alone: the shell starts
     fs.rmSync(file, { force: true });
   } finally {
     await x.close();
+  }
+});
+
+test("the shells' oom_score_adj is the daemon's setting: written when set, absent at 0 or unset", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-oom-'));
+  try {
+    const none = prepareIntegration('/bin/bash', { dir: path.join(dir, 'a'), noUserRc: true });
+    assert.doesNotMatch(fs.readFileSync(none.launcher!, 'utf8'), /oom_score_adj/);
+    const zero = prepareIntegration('/bin/bash', { dir: path.join(dir, 'b'), noUserRc: true, oomScoreAdj: 0 });
+    assert.doesNotMatch(fs.readFileSync(zero.launcher!, 'utf8'), /oom_score_adj/);
+    const some = prepareIntegration('/bin/bash', { dir: path.join(dir, 'c'), noUserRc: true, oomScoreAdj: 300 });
+    assert.match(fs.readFileSync(some.launcher!, 'utf8'), /echo 300 > \/proc\/self\/oom_score_adj/);
+    assert.doesNotMatch(processLaunch(false, 0), /oom_score_adj/);
+    assert.match(processLaunch(true, 200), /echo 200 > \/proc\/self\/oom_score_adj/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -177,8 +177,11 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   sessions near 45), and the launcher raises it where a supervisor didn't. Everything a
   session runs is the daemon's descendant: under systemd, the unit sets `OOMPolicy=continue`
   so a build the kernel kills for memory costs that Run, not every session (the default
-  stops the whole service), and on Linux the shells start with a raised `oom_score_adj`, so
-  the kernel takes one of them before the daemon. History on disk is kept forever unless
+  stops the whole service), and on Linux the shells and process Runs start with a raised
+  `oom_score_adj` (`--session-oom-score-adj`, default 200), so the kernel takes one of them
+  before the daemon. That preference counts against every process on the machine, not the
+  daemon alone: on a shared host, where an agent's build should not die before another
+  user's work, set it lower or to 0. History on disk is kept forever unless
   `--retention-days` or `--retention-bytes` says otherwise; a long-lived deployment should
   set one.
 - **Measure.** Every tool call is recorded (names and hashes, never contents) in

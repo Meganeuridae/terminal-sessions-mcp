@@ -39,6 +39,8 @@ export interface RegistryOptions {
   defaultCwd?: string;
   /** Skip the user's rc files when injecting integration (tests). */
   noUserRc?: boolean;
+  /** Linux: sessions' shells and process Runs get this oom_score_adj (0: unchanged; the daemon's --session-oom-score-adj). */
+  sessionOomScoreAdj?: number;
   /** The hot ring per session (default 8 MiB), never more than the session's disk retention. */
   memoryBytes?: number;
   daemonEnv?: NodeJS.ProcessEnv;
@@ -619,7 +621,7 @@ export class SessionRegistry {
       writeMeta(dir, meta);
       // The integration files live in the session's own directory: a daemon that dies leaves them for
       // the next life to overwrite, not in the system's temp dir.
-      if (options.integration !== false) integ = prepareIntegration(options.shell!, { dir: path.join(shellDir(dir), 'integration'), ...(this.opts.noUserRc || options.userRc === false ? { noUserRc: true } : {}) });
+      if (options.integration !== false) integ = prepareIntegration(options.shell!, { dir: path.join(shellDir(dir), 'integration'), ...(this.opts.noUserRc || options.userRc === false ? { noUserRc: true } : {}), ...(this.opts.sessionOomScoreAdj !== undefined && { oomScoreAdj: this.opts.sessionOomScoreAdj }) });
       const so: SessionOptions = {
         id,
         owner: o.owner,
@@ -644,6 +646,7 @@ export class SessionRegistry {
       };
       if (options.shellArgs) so.shellArgs = [...options.shellArgs];
       if (integ && integ.kind !== 'none') so.integration = integ;
+      if (this.opts.sessionOomScoreAdj !== undefined) so.oomScoreAdj = this.opts.sessionOomScoreAdj;
       session = await Session.start(so);
     } catch (e) {
       integ?.cleanup();

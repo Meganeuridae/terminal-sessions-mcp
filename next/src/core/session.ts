@@ -65,6 +65,8 @@ export interface SessionOptions {
   integrationGraceMs?: number;
   /** After the handshake, how long `start` waits for the first prompt at most (it then resolves in `starting`). */
   startupCapMs?: number;
+  /** Linux: process Runs' oom_score_adj (0 or unset: unchanged); see the daemon's --session-oom-score-adj. */
+  oomScoreAdj?: number;
   /** Temp files and the session's own shell history live here. */
   tempDir?: string;
   /** Where the command files the daemon sources live (default tempDir); keep it short, it is echoed at the prompt. */
@@ -1781,7 +1783,7 @@ export class Session {
     run.envBasis = snapshot ? 'snapshot' : 'configured';
     let proc: ProcessHandle;
     try {
-      proc = this.backend.spawnProcess({ argv: run.argv!, ...(run.line !== undefined && { line: run.line }), cwd: this.cwdPath, env: { ...(snapshot?.vars ?? this.configured) } });
+      proc = this.backend.spawnProcess({ argv: run.argv!, ...(run.line !== undefined && { line: run.line }), ...(this.opts.oomScoreAdj !== undefined && { oomScoreAdj: this.opts.oomScoreAdj }), cwd: this.cwdPath, env: { ...(snapshot?.vars ?? this.configured) } });
     } catch (e) {
       // Nothing ran: no exit and no signal were observed (G2, G3).
       this.endRun(run, { state: 'lost', reason: `spawn-failed: ${errMessage(e)}` });

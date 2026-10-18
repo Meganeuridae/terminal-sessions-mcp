@@ -66,6 +66,8 @@ export interface SpawnProcessOptions {
   line?: string;
   cwd: string;
   env: Record<string, string>;
+  /** Linux: raise the Run's oom_score_adj by this much (0: leave it), so the kernel takes it before the daemon. */
+  oomScoreAdj?: number;
 }
 
 export interface ProcessHandle {

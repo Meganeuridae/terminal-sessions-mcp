@@ -137,7 +137,7 @@ class NodePty implements PtyHandle {
  * of #11, and issue #18). The descriptors are listed through /dev/fd (Linux links it to
  * /proc/self/fd); the glob is expanded, and its directory closed, before the loop runs. On
  * Linux the Run is also made a likelier victim of the out-of-memory killer than the daemon,
- * as the shells are. Only the daemon's constant text is on this command line: a Run given a
+ * as the shells are (see oomLine). Only the daemon's constant text is on this command line: a Run given a
  * line gets its text on descriptor 3 and runs it as `/bin/sh /dev/fd/3` (see Session.admit),
  * the text's first line closing that descriptor so the command's own children never see it;
  * nothing of the Run's is in any argv or in a file a crash and a fast restart could remove.
@@ -160,12 +160,24 @@ function executable(cmd: string, PATH: string | undefined): boolean {
  * The launcher's text; with `keepsScriptFd`, descriptor 3 carries the Run's own text and is
  * kept open for the shell to read (the text's first line closes it, see spawnProcess).
  */
-export function processLaunch(keepsScriptFd: boolean): string {
+export function processLaunch(keepsScriptFd: boolean, oomScoreAdj = 0): string {
   return [
     `if [ -d /dev/fd ]; then for f in /dev/fd/*; do case "\${f##*/}" in ${keepsScriptFd ? '0|1|2|3' : '0|1|2'}) ;; *) eval "exec \${f##*/}>&-" 2>/dev/null || :;; esac; done; fi`,
-    'if [ -w /proc/self/oom_score_adj ]; then echo 500 > /proc/self/oom_score_adj 2>/dev/null || :; fi',
+    ...oomLine(oomScoreAdj),
     'exec "$@"',
   ].join('\n');
+}
+
+/**
+ * The line that raises a session process's oom_score_adj on Linux (no /proc elsewhere): the
+ * kernel then takes it before the daemon, whose death would lose every session. The preference
+ * is machine-wide, not relative to the daemon alone — a raised build is taken before other
+ * users' processes too — so the amount is the daemon's `--session-oom-score-adj` (default 200),
+ * and 0 writes nothing.
+ */
+export function oomLine(oomScoreAdj: number): string[] {
+  const n = Math.max(0, Math.min(1000, Math.floor(oomScoreAdj)));
+  return n > 0 ? [`if [ -w /proc/self/oom_score_adj ]; then echo ${n} > /proc/self/oom_score_adj 2>/dev/null || :; fi`] : [];
 }
 
 export class NodePtyBackend implements ExecutionBackend {
@@ -195,7 +207,7 @@ export class NodePtyBackend implements ExecutionBackend {
     // A line's text goes to the child on a pipe at descriptor 3, which the launcher keeps and
     // the text's own first line closes once the shell has it open (see processLaunch).
     const script = opts.line !== undefined && cmd === '/bin/sh' && args[0] === '/dev/fd/3' ? `exec 3<&-\n${opts.line}\n` : undefined;
-    const launched = executable(cmd, opts.env.PATH) ? ['/bin/sh', ['-c', processLaunch(script !== undefined), 'termd-process', cmd, ...args]] as const : [cmd, args] as const;
+    const launched = executable(cmd, opts.env.PATH) ? ['/bin/sh', ['-c', processLaunch(script !== undefined, opts.oomScoreAdj ?? 0), 'termd-process', cmd, ...args]] as const : [cmd, args] as const;
     const child = spawnChild(launched[0], [...launched[1]], { cwd: opts.cwd, env: opts.env, stdio: script !== undefined ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'], detached: true });
     if (script !== undefined) {
       const feed = child.stdio[3] as NodeJS.WritableStream | null;

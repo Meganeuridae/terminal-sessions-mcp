@@ -19,8 +19,10 @@ LimitNOFILE=65536
 # The sessions' shells and everything they run (builds, test suites) are in this service's
 # cgroup. When the kernel kills one of them for memory, systemd's default (OOMPolicy=stop)
 # stops the whole service: every live session is lost for one build's peak. With continue,
-# termd keeps serving and that one Run reports its process killed. On Linux the shells are
-# started with a raised oom_score_adj, so the kernel takes one of them before termd.
+# termd keeps serving and that one Run reports its process killed. The shells and process
+# Runs start with a raised oom_score_adj (--session-oom-score-adj, default 200), so the kernel
+# takes one of them before termd; on a shared host, where that preference counts against other
+# users' work too, pass a lower value or 0.
 OOMPolicy=continue
 # History on disk is kept forever by default. For a long-lived deployment, cap it:
 #   ExecStart=... --retention-days 30          (or --retention-bytes 200000000 per session)

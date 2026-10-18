@@ -41,6 +41,8 @@ export interface PrepareOptions {
   /** Skip the user's rc files (tests). */
   noUserRc?: boolean;
   userEnv?: NodeJS.ProcessEnv;
+  /** Linux: the shell's oom_score_adj (0 or unset: unchanged); see the daemon's --session-oom-score-adj. */
+  oomScoreAdj?: number;
 }
 
 let counter = 0;
@@ -62,12 +64,14 @@ export function prepareIntegration(shellPath: string, opts: PrepareOptions = {})
   // mask covers the key file alone and the shell starts with the mask it inherited: a mask
   // left at 077 made every file a session created owner-only, which breaks shared projects
   // and served build output (an outside review's finding). On Linux the shell, and so
-  // everything a session runs, is made a likelier victim of the kernel's out-of-memory
+  // everything a session runs, can be made a likelier victim of the kernel's out-of-memory
   // killer than the daemon (a build's peak then costs that Run, not every session); raising
-  // one's own oom_score_adj needs no privilege, and /proc is Linux's.
+  // one's own oom_score_adj needs no privilege, and /proc is Linux's. The amount is the
+  // daemon's setting: the preference is machine-wide, so a shared host may want none.
+  const oom = opts.oomScoreAdj !== undefined && opts.oomScoreAdj > 0 ? `if [ -w /proc/self/oom_score_adj ]; then echo ${Math.min(1000, Math.floor(opts.oomScoreAdj))} > /proc/self/oom_score_adj 2>/dev/null || :; fi\n` : '';
   fs.writeFileSync(launcher,
     `__tsm_umask=$(umask); umask 077\ncommand printf '%s\\n' '${key}' > "\${0%/*}/key-$$" || exit 1\numask "$__tsm_umask"; unset __tsm_umask\n` +
-    `if [ -w /proc/self/oom_score_adj ]; then echo 500 > /proc/self/oom_score_adj 2>/dev/null || :; fi\n` +
+    oom +
     `exec "$@"\n`, { mode: 0o600 });
   if (opts.noUserRc) env.TSM_NO_USER_RC = '1';
   const files = { 'bash-rc.sh': BASH_RC, '.zshenv': ZSH_ZSHENV, '.zprofile': ZSH_ZPROFILE, '.zshrc': ZSH_ZSHRC, '.zlogin': ZSH_ZLOGIN, 'fish/vendor_conf.d/tsm-integration.fish': FISH_CONF };
