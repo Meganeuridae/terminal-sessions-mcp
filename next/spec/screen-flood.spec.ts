@@ -126,7 +126,10 @@ test('emu-2: settled() after 25 000 small chunks takes parser time, not a timer 
 test('emu-2: a real PTY flood (`yes`) with the reader paused on pressure: bounded heap, nothing dropped, screen current at exit', async () => {
   // Low watermarks so the reader is certainly paused and resumed along the way.
   const s = new Screen({ cols: 100, rows: 30, highWater: 16 * 1024, lowWater: 4 * 1024 });
-  const p = pty.spawn('/bin/sh', ['-c', 'yes 0123456789abcdef | head -c 20000000; echo; echo FLOOD-END'], {
+  // node-pty can lose unread Linux PTY output if its producer exits while reading is paused.
+  // Keep the producer alive until its final marker reaches this reader to test Screen backpressure,
+  // rather than node-pty's separate exit/drain race. No timing grace or reduced flood.
+  const p = pty.spawn('/bin/sh', ['-c', 'stty -echo; yes 0123456789abcdef | head -c 20000000; echo; echo FLOOD-END; IFS= read -r received'], {
     name: 'xterm-256color',
     cols: 100,
     rows: 30,
@@ -135,6 +138,8 @@ test('emu-2: a real PTY flood (`yes`) with the reader paused on pressure: bounde
   });
   let seq = 0;
   let pauses = 0;
+  let tail = '';
+  let acknowledged = false;
   s.onPressure((paused) => {
     if (paused) {
       pauses++;
@@ -147,6 +152,11 @@ test('emu-2: a real PTY flood (`yes`) with the reader paused on pressure: bounde
   p.onData((d) => {
     void s.write(d, ++seq);
     maxBacklog = Math.max(maxBacklog, s.backlog);
+    tail = (tail + d).slice(-32);
+    if (!acknowledged && tail.includes('FLOOD-END')) {
+      acknowledged = true;
+      p.write('\n');
+    }
   });
   const started = Date.now();
   const { value: exitedAt, rise } = await peakHeapRise(async () => {
@@ -156,6 +166,7 @@ test('emu-2: a real PTY flood (`yes`) with the reader paused on pressure: bounde
   await s.settled();
   const caughtUp = Date.now() - exitedAt;
   assert.equal(s.droppedUnits, 0);
+  assert.ok(acknowledged, 'the complete flood reached the reader before its producer exited');
   assert.ok(pauses > 0 || maxBacklog <= 16 * 1024, `backlog peaked at ${maxBacklog} bytes without pausing the reader`);
   assert.ok(rise < 200 * MB, `heap rose ${Math.round(rise / MB)} MB`);
   assert.ok(caughtUp < 2000, `screen caught up ${caughtUp} ms after exit`);
