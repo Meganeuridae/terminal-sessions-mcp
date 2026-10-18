@@ -217,6 +217,7 @@ export class RunIndex {
         if (ev.exit !== undefined) r.exit = ev.exit;
         if (ev.signal) r.signal = ev.signal;
         if (ev.reason) r.reason = ev.reason;
+        if (ev.leftovers) r.leftovers = true;
         this.openIds.delete(ev.runId);
         return;
       }

@@ -1271,7 +1271,7 @@ export class Session {
     });
   }
 
-  private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string }): void {
+  private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; leftovers?: boolean }): void {
     if (isTerminal(run.state)) return;
     const endedAt = this.now();
     const durationMs = endedAt - (run.startedAt ?? run.admittedAt);
@@ -1280,6 +1280,7 @@ export class Session {
     if (outcome.exit !== undefined) ev.exit = outcome.exit;
     if (outcome.signal) ev.signal = outcome.signal;
     if (reason) ev.reason = reason;
+    if (outcome.leftovers) ev.leftovers = true;
     // G28: run.end is journaled while the waiting principals are still recorded as
     // awaiting; the waiters are released after it.
     const ended = this.append(ev);
@@ -1289,6 +1290,7 @@ export class Session {
     if (outcome.exit !== undefined) run.exit = outcome.exit;
     if (outcome.signal) run.signal = outcome.signal;
     if (reason) run.reason = reason;
+    if (outcome.leftovers) run.leftovers = true;
     // A line the shell never started goes with its file too: a late read of it sources a
     // missing file and never runs the command unawaited (ss-8). Close waits for the removal,
     // then removes the command directory.
@@ -1902,6 +1904,10 @@ export class Session {
       const outcome: Parameters<Session['endRun']>[1] = { state: run.cancelRequested ? 'cancelled' : 'exited' };
       if (e.exitCode !== null) outcome.exit = e.exitCode;
       if (e.signal) outcome.signal = e.signal;
+      // The leader is reaped by now (Node waits for it before this callback): a group that still
+      // answers is a child the Run left behind, and the result says so rather than reading as a
+      // clean end (the house's review of #11, shell tools 5). Its output, if any, is noted above.
+      if (proc.groupAlive?.()) outcome.leftovers = true;
       this.endRun(run, outcome);
     });
   }

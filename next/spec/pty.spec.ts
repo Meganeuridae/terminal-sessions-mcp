@@ -331,3 +331,34 @@ test('a process group whose leader exited is signalled only while it is still th
   // Nothing can list processes: nothing is signalled.
   assert.equal(groupStillOurs(4242, () => undefined), false);
 });
+
+test('/bin/bash: a process Run that leaves a child in the background says so (leftovers); cancel on the ended Run ends the child', async () => {
+  const { session, journal } = await real('/bin/bash');
+  try {
+    const clean = session.admit({ target: 'process', argv: ['/bin/sh', '-c', 'echo alone'], principal: AGENT });
+    assert.ok(clean.admitted);
+    const r0 = await session.awaitRun(clean.run.runId, 5000);
+    assert.deepEqual([r0.state, r0.exit, r0.leftovers], ['exited', 0, undefined], 'nothing left behind: no flag');
+    const a = session.admit({ target: 'process', argv: ['/bin/sh', '-c', 'sleep 30 & echo started'], principal: AGENT });
+    assert.ok(a.admitted);
+    const r = await session.awaitRun(a.run.runId, 5000);
+    assert.deepEqual([r.state, r.exit, r.leftovers], ['exited', 0, true], 'the sleep is still in the group');
+    const end = journal.since(0).events.find((e) => e.type === 'run.end' && e.runId === r.runId) as Extract<JournalEvent, { type: 'run.end' }>;
+    assert.equal(end.leftovers, true, 'journaled, so a reader of the history sees it too');
+    // The group is still the Run's: cancel on the ended Run reaches it (ss-10).
+    const c = await session.cancel(r.runId, AGENT);
+    assert.ok(c.steps.length > 0, JSON.stringify(c));
+    await until(() => !session.run(r.runId).pgid || !groupLives(session.run(r.runId).pgid!), 3000, 'the group to end');
+  } finally {
+    await session.close();
+  }
+});
+
+function groupLives(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}

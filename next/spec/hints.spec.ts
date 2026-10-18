@@ -45,3 +45,10 @@ test('the status line hints: set -e armed, a one-shot ssh running or cancelled, 
   assert.match(lost, /outcome unknown: shell-exited \(status 2\) — the shell running this command exited under it.*set -e is on in the shell and a command fails/);
   assert.doesNotMatch(text(base({ state: 'lost', reason: 'daemon-shutdown', line: 'npm test' })), /exited under it/);
 });
+
+test('the status line says when a process Run left children running in its group, and how to end them', () => {
+  const left = text(base({ target: 'process', line: 'sleep 30 & echo started', leftovers: true }));
+  assert.match(left, /exited 0 .* — it left processes running in its group/);
+  assert.match(left, /cancel r1 ends them, as does closing the session/);
+  assert.doesNotMatch(text(base({ target: 'process', line: 'echo alone' })), /left processes running/);
+});

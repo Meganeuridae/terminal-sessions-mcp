@@ -34,7 +34,7 @@ export type EventInput =
   /** `shell`/`within`: a Run declared for the shell in front of the terminal (§8.1): the kind of shell, and the Run whose program it is (null: what replaced the session's shell). */
   | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string; shell?: string; within?: string | null }
   | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number }
-  | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number }
+  | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number; leftovers?: true }
   | { type: 'prompt'; cwd: string; phase: 'start' | 'end' }
   | { type: 'cwd'; path: string }
   | { type: 'env.snapshot'; count: number; vars?: Record<string, string> }
@@ -112,6 +112,12 @@ export interface RunInfo {
   /** A process Run's pid and process group, from its run.start: recovery terminates a group a dead daemon left behind (G19c). */
   pid?: number;
   pgid?: number;
+  /**
+   * A process Run whose process group still had members when its own process exited (a child it
+   * left in the background): they run on, their output is journaled without the Run's id, and
+   * `cancel` on the Run or closing the session ends them (the house's review of #11, shell tools 5).
+   */
+  leftovers?: boolean;
 }
 
 export interface ScreenSnapshot {
