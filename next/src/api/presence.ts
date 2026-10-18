@@ -88,8 +88,9 @@ function lineFor(app: App, s: AnySession, principal: Principal, now: number): { 
   // declared `sleep 3` ran (an outside review's finding). The innermost one is the live one.
   const declared = runs.filter((r) => r.shell !== undefined && running(r));
   const front = declared.at(-1);
+  const enclosing = front?.within ? runs.find((r) => r.runId === front.within) : undefined;
   if (session.exit !== undefined) bits.push('shell exited');
-  else if (front) bits.push(`running \`${describe(front)}\` ${dur(now - (front.startedAt ?? front.admittedAt))} in the declared ${front.shell} shell${current ? ` (inside \`${describe(current)}\`)` : ''}`);
+  else if (front) bits.push(`running \`${describe(front)}\` ${dur(now - (front.startedAt ?? front.admittedAt))} in the declared ${front.shell} shell${enclosing ? ` (inside \`${describe(enclosing)}\`)` : ''}`);
   else if (shellBusy) bits.push(`${info.state === 'tui' ? 'full-screen' : 'running'} \`${describe(current)}\` ${dur(now - (current.startedAt ?? current.admittedAt))} (cwd ${info.cwd})${info.declared ? `, a declared ${info.declared.shell} shell at its prompt` : ''}`);
   else bits.push(`${info.state} (cwd ${info.cwd})${info.declared ? `, a declared ${info.declared.shell} shell in front` : ''}`);
 

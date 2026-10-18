@@ -94,6 +94,21 @@ test('mcpl-12: a background Run that failed behind thousands of events is report
   assert.match(text, /`sleep 0\.5; false` → 1/);
 });
 
+test('presence names the immediate enclosing shell in a second declared hop', { skip: !fs.existsSync('/bin/dash') }, async () => {
+  await app.sessionOpen(A, { id: 'two-hops' });
+  try {
+    await app.run(A, { session: 'two-hops', command: 'bash --norc --noprofile', wait: 100 });
+    await app.declareShell(A, { session: 'two-hops' });
+    await app.run(A, { session: 'two-hops', command: '/bin/dash', wait: 100 });
+    await app.declareShell(A, { session: 'two-hops' });
+    const inner = await app.run(A, { session: 'two-hops', command: 'sleep 30', wait: 100 });
+    assert.match(P(A, ['two-hops']), /running `sleep 30` .*inside `\/bin\/dash`/);
+    await app.cancel(A, { runId: inner.runId! });
+  } finally {
+    await app.sessionClose(A, { session: 'two-hops', force: true });
+  }
+});
+
 test('m2-8: presence names the newest ended Runs after the cursor, counts the rest exactly, and marks a bounded byte count', async () => {
   await app.sessionOpen(A, { id: 'busy', visibility: 'shared' });
   await app.run(A, { session: 'busy', command: 'echo ancient-one' });
