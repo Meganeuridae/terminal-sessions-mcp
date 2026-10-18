@@ -374,6 +374,21 @@ export class McplLane {
   }
 
   /** After the receipt: follow every visible live session, register channels, and catch up (G22) when delivery became possible. */
+  /**
+   * The connection can carry something again (a channel reopened): a retry that found nothing
+   * to carry it on when its timer fired is still owed, with no timer left; deliver it through a
+   * catch-up, as a grant that widens does. Without this, a completion refused once and then
+   * closed over waited for the next grant update (an outside review reproduced it).
+   */
+  private resumeOwed(): void {
+    if (this.disposed || this.catchingUp) return;
+    const stranded = [...this.states.values()].some((st) => st.owed.size > 0 && [...st.retries.values()].some((r) => !r.timer));
+    if (!stranded) return;
+    this.catchingUp = this.catchUpAll()
+      .catch((e) => this.log(`catch-up failed: ${(e as Error).message}`))
+      .finally(() => (this.catchingUp = undefined));
+  }
+
   private async activate(): Promise<void> {
     if (this.disposed) return;
     for (const s of this.app.registry.list()) if (s.kind === 'live' && !s.session.journal.closed && this.app.can(this.me, s, 'observe')) this.follow(s.session);
@@ -499,6 +514,7 @@ export class McplLane {
       if (!s.session.journal.closed) this.follow(s.session);
     }
     this.open.add(id);
+    this.resumeOwed();
     const res: { channel: ChannelDescriptor; history?: IncomingMessage[]; historyTruncated?: boolean } = { channel: this.descriptorFor(sid) };
     const limit = Math.min(params.history?.limit ?? 0, HISTORY_MAX);
     if (limit > 0) {

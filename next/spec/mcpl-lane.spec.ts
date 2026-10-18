@@ -381,6 +381,43 @@ test('G22: a connection that cannot carry a completion (no pushEvents, channel c
   }
 });
 
+test('a completion refused once, whose channel closed during the retry delay, is delivered when the channel reopens (no grant update needed)', async () => {
+  const d = await daemon();
+  try {
+    let refuse = 1;
+    const a = await d.host('ta', 'ro-a', {
+      grant: ['tools', 'channels.register', 'channels.lifecycle', 'channels.incoming'],
+      // The host refuses the first incoming that carries the completion, as a busy host does.
+      answer: (m) => {
+        if (m.method !== 'channels/incoming') return undefined;
+        const msgs = (m.params as { messages: Array<{ messageId: string; content: Array<{ text: string }> }> }).messages;
+        if (refuse > 0 && msgs.some((x) => x.content.some((c) => /refused-then-reopened/.test(c.text)))) {
+          refuse--;
+          return { results: msgs.map((x) => ({ messageId: x.messageId, accepted: false, reason: 'busy' })) };
+        }
+        return undefined;
+      },
+    });
+    await a.call('session_open', { session: 'ro' });
+    await a.request('channels/open', { channelId: 'terminal:ro' });
+    const r = await a.call('run', { session: 'ro', command: 'sleep 0.3; echo refused-then-reopened', wait: 20 });
+    const runId = r.structured?.runId as string;
+    await until(() => refuse === 0, 4000, 'the first delivery, refused');
+    // The channel closes before the retry fires; the retry then finds nothing to carry the message on.
+    await a.request('channels/close', { channelId: 'terminal:ro' });
+    await sleep(900);
+    assert.equal(a.deliveries().filter(aboutRun(runId)).filter((x) => x.via === 'incoming').length, 1, 'only the refused attempt so far');
+    await a.request('channels/open', { channelId: 'terminal:ro' });
+    await until(() => a.deliveries().filter(aboutRun(runId)).length >= 2, 4000, 'the completion delivered again, on the reopened channel');
+    const got = a.deliveries().filter(aboutRun(runId)).at(-1)!;
+    assert.equal(got.via, 'incoming');
+    assert.match(got.text, /refused-then-reopened/);
+    await a.close();
+  } finally {
+    await d.stop();
+  }
+});
+
 test('mcpl-8: a reconnect inside the completion settle window delivers the completion once', async () => {
   const d = await daemon({ segmenter: { runSettleMs: 600, cadenceMs: 10_000, needsInputMs: 5000 } });
   try {
