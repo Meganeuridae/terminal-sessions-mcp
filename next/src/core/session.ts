@@ -264,7 +264,7 @@ export function inlineLines(body: string, nonce: string, fish: boolean): string[
   const add = fish ? (c: string) => ` set -g __tsm_b "$__tsm_b"'${c}'` : (c: string) => ` __tsm_b=\${__tsm_b-}'${c}'`;
   // `then` … `else` … `fi` around what a line does once the text so far is whole.
   const whole = fish
-    ? (len: number, then: string) => `if set -q __tsm_b; and test (string length -- "$__tsm_b") = ${len}; ${then}; else ${gone}; end`
+    ? (len: number, then: string) => `if set -q __tsm_b; and test (string length -- "$__tsm_b") = ${len}; ${then}; else; ${gone}; end`
     : (len: number, then: string) => `if [ "\${__tsm_b+set}" = set ] && [ "\${#__tsm_b}" = "${len}" ]; then ${then}; else ${gone}; fi`;
   const ack = (k: number) => `printf '<<<AC''K:${nonce}:${k}>>>\\n'`;
   const finish = fish
