@@ -160,7 +160,7 @@ function executable(cmd: string, PATH: string | undefined): boolean {
  * The launcher's text; with `keepsScriptFd`, descriptor 3 carries the Run's own text and is
  * kept open for the shell to read (the text's first line closes it, see spawnProcess).
  */
-function processLaunch(keepsScriptFd: boolean): string {
+export function processLaunch(keepsScriptFd: boolean): string {
   return [
     `if [ -d /dev/fd ]; then for f in /dev/fd/*; do case "\${f##*/}" in ${keepsScriptFd ? '0|1|2|3' : '0|1|2'}) ;; *) eval "exec \${f##*/}>&-" 2>/dev/null || :;; esac; done; fi`,
     'if [ -w /proc/self/oom_score_adj ]; then echo 500 > /proc/self/oom_score_adj 2>/dev/null || :; fi',
