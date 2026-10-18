@@ -186,6 +186,22 @@
   discards the lines typed in behind it under the terminal's default
   settings, so those never run either; the SIGINT entry below says what
   becomes of them under `stty noflsh`.
+- **`runCommand` reports why it couldn't create a session.** A failed
+  creation, such as a shared server's session limit, was swallowed, and the
+  call then answered with exec's "Session … not found". The creation's own
+  error is now the answer, unless a second listing shows that the session
+  exists after all, and then the command runs in it. A first listing whose
+  connection is lost while it's in flight is tried once more on a fresh one,
+  which waits up to 10 s for the connection, and a listing that still fails
+  now fails the call with its error, where it used to go on to create the
+  session and run the command anyway.
+- **Calls that lose their connection together no longer end the MCP
+  server.** When the session server's socket dropped under two calls at
+  once, such as two `listSessions`, each call's retry replaced the client,
+  and the second closed the one the first had just opened while it was
+  still connecting. That raised an error nothing listened for, and the
+  process exited. Now only the first replaces the client, and closing a
+  client that's still connecting is safe.
 
 ### Changed
 

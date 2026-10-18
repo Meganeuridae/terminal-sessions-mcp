@@ -320,9 +320,11 @@ export class RobustSessionClient extends EventEmitter {
       this.reconnectTimer = null;
     }
     
-    // Close WebSocket
+    // Close WebSocket. A socket still connecting emits 'error' when closed,
+    // and with no listener left that would end the process.
     if (this.ws) {
       this.ws.removeAllListeners();
+      this.ws.on('error', () => {});
       this.ws.close();
       this.ws = null;
     }
