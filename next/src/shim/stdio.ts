@@ -40,7 +40,7 @@
  * spawned termd), TSM_CONNECT_TIMEOUT_MS (how long a request may wait for a
  * connection, default 15000).
  */
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -71,7 +71,7 @@ function target1x(env: NodeJS.ProcessEnv): { base: string; token: string | undef
   if (env.TSM_URL) return { base: env.TSM_URL, token, from: undefined };
   if (env.SESSION_SERVER_URL) return { base: env.SESSION_SERVER_URL, token, from: 'SESSION_SERVER_URL' };
   if (env.SESSION_SERVER_HOST || env.SESSION_SERVER_PORT) {
-    const h = env.SESSION_SERVER_HOST || '127.0.0.1';
+    const h = env.SESSION_SERVER_HOST || 'localhost'; // what 1.x's own frontend dialed when only the port was set
     const hostPart = h.includes(':') && !h.startsWith('[') ? `[${h}]` : h;
     const from = [env.SESSION_SERVER_HOST ? 'SESSION_SERVER_HOST' : '', env.SESSION_SERVER_PORT ? 'SESSION_SERVER_PORT' : ''].filter(Boolean).join(' + ');
     return { base: `ws://${hostPart}:${env.SESSION_SERVER_PORT || '3100'}`, token, from };
@@ -112,8 +112,30 @@ url.searchParams.set('connection', `shim-${process.pid}`);
 const target = `${url.protocol}//${url.host}`;
 const connectTimeoutMs = Number(process.env.TSM_CONNECT_TIMEOUT_MS ?? 15_000);
 const loopback = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(url.hostname);
-// A daemon started here serves only a loopback address that 2.0 settings named: never a 1.x one (atc-6).
-const mayStart = loopback && process.env.TSM_NO_SPAWN !== '1' && chosen.from === undefined;
+// A daemon started here serves only a loopback address that 2.0 settings named: never a 1.x one
+// (atc-6), and never one a supervisor manages: a daemon started here while the supervised one
+// was down (its restart delay, an update) took its port, left the unit failing with EADDRINUSE,
+// and ran on with nothing to restart it (the house's review of #11).
+const supervisor = loopback && process.env.TSM_NO_SPAWN !== '1' && chosen.from === undefined ? supervisedTermd() : undefined;
+if (supervisor) log(`termd is ${supervisor}'s to start: none is started here (TSM_NO_SPAWN=1 says so without the check)`);
+const mayStart = loopback && process.env.TSM_NO_SPAWN !== '1' && chosen.from === undefined && supervisor === undefined;
+
+/** The supervisor that manages a termd for this user, if one does: launchd's job on macOS, systemd's user unit on Linux. */
+function supervisedTermd(): string | undefined {
+  try {
+    if (process.platform === 'darwin') {
+      execFileSync('launchctl', ['print', `gui/${process.getuid?.() ?? 0}/com.animalabs.termd`], { stdio: 'ignore', timeout: 1500 });
+      return 'the launchd job com.animalabs.termd';
+    }
+    if (process.platform === 'linux') {
+      execFileSync('systemctl', ['--user', 'is-enabled', 'termd'], { stdio: 'ignore', timeout: 1500 });
+      return 'the systemd user unit termd';
+    }
+  } catch {
+    // not managed, or no supervisor to ask
+  }
+  return undefined;
+}
 
 const out = (m: unknown) => process.stdout.write(JSON.stringify(m) + '\n');
 const key = (id: Id) => `${typeof id}:${String(id)}`;
@@ -225,7 +247,7 @@ setInterval(expireQueue, 250).unref();
 
 /** What to do about an address that does not answer, when the answer is not "wait". */
 function unreachableHint(): string {
-  if (chosen.from && /ECONNREFUSED/.test(lastError)) {
+  if (chosen.from) {
     return `; the address came from ${chosen.from} (a 1.x setting), so no local daemon was started for it — 2.0's termd listens on 3101 by default: set TSM_URL, or start termd on that address`;
   }
   return '';
@@ -329,9 +351,12 @@ function connect(): void {
     process.stdout.write(text + '\n');
     maybeFinish();
   });
-  sock.on('error', (e: Error & { code?: string }) => {
-    const message = explain(e.message);
-    if (e.code === 'ECONNREFUSED' && !everOpened && mayStart && !started) startDaemon();
+  sock.on('error', (e: Error & { code?: string; errors?: Array<{ code?: string }> }) => {
+    // A name that resolves to both loopback addresses (localhost) fails as an AggregateError
+    // with an empty message and the attempts in `errors`: take the code from there.
+    const code = e.code ?? [...new Set((e.errors ?? []).map((x) => x.code).filter((c): c is string => c !== undefined))].join('/');
+    const message = explain(e.message || code || 'connection failed');
+    if (code.includes('ECONNREFUSED') && !everOpened && mayStart && !started) startDaemon();
     else if (message !== lastError) log(message);
     lastError = message;
   });

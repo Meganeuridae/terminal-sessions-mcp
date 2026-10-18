@@ -57,6 +57,8 @@ const FLAGS = {
   'no-usage-log': { type: 'boolean' },
   'log-level': { type: 'string' },
   'log-file': { type: 'string' },
+  /** 1.x's flag; accepted so a 1.x unit starts termd, and changes nothing (see main). */
+  headless: { type: 'boolean' },
 } as const;
 
 type Flags = { [K in keyof typeof FLAGS]?: (typeof FLAGS)[K] extends { multiple: true } ? string[] : (typeof FLAGS)[K] extends { type: 'boolean' } ? boolean : string };
@@ -301,7 +303,9 @@ const HELP = `termd — terminal sessions daemon
   --no-usage-log         do not record usage
   --log-file <file>      write logs to this file (0600, rotated by size) instead of stderr
   --log-level <level>    debug|info|warn|error (default info)
-Env: TSM_TOKEN (the shared token; removed from the environment once read), TSM_DATA_DIR, TSM_HOST, TSM_PORT.
+  --headless             accepted for a 1.x command line; changes nothing (the GUI is at the daemon's address)
+Env: TSM_TOKEN (the shared token; removed from the environment once read), TSM_DATA_DIR, TSM_HOST, TSM_PORT;
+the 1.x names SESSION_SERVER_HOST, SESSION_SERVER_PORT and SESSION_SERVER_TOKEN are read where those are not set.
 Logs are JSON lines on stderr. Sessions start in $HOME unless given a cwd. The GUI is served at
 http://<host>:<port>/ (add ?token=… when one is required).`;
 
@@ -341,8 +345,22 @@ async function main(): Promise<void> {
   process.on('unhandledRejection', (e) => stray('unhandled rejection (daemon keeps serving)', e));
 
   const dataDir = f['data-dir'] ?? process.env.TSM_DATA_DIR ?? path.join(os.homedir(), '.tsm');
-  const host = f.host ?? process.env.TSM_HOST ?? '127.0.0.1';
-  const port = Number(f.port ?? process.env.TSM_PORT ?? '3101');
+  // The 1.x names are read where the 2.0 ones are not set, so a daemon command written for 1.x
+  // (connectome-host's setup guide: `--host localhost --headless`, SESSION_SERVER_PORT in the
+  // unit) starts termd and says what it took from where (the house's review of #11).
+  if (f.headless) log('info', "--headless is a 1.x flag: termd has no separate GUI server (the GUI is served at the daemon's own address), so it changes nothing");
+  const oneX = (name: string, newName: string) => log('info', `using ${name} (a 1.x setting); ${newName} is the 2.0 name`);
+  if (f.host === undefined && process.env.TSM_HOST === undefined && process.env.SESSION_SERVER_HOST !== undefined) oneX('SESSION_SERVER_HOST', 'TSM_HOST');
+  if (f.port === undefined && process.env.TSM_PORT === undefined && process.env.SESSION_SERVER_PORT !== undefined) oneX('SESSION_SERVER_PORT', 'TSM_PORT');
+  let host = f.host ?? process.env.TSM_HOST ?? process.env.SESSION_SERVER_HOST ?? '127.0.0.1';
+  const port = Number(f.port ?? process.env.TSM_PORT ?? process.env.SESSION_SERVER_PORT ?? '3101');
+  if (host.toLowerCase() === 'localhost') {
+    // One address is bound, and a name resolves to one of two: on a host where localhost is
+    // ::1 first, a daemon told `localhost` bound only [::1], and a client dialing 127.0.0.1 (the
+    // shim's default) was refused. The IPv4 loopback is what every shipped config dials.
+    log('info', '--host localhost binds 127.0.0.1 (the address the shipped configs dial); give --host ::1 for the IPv6 loopback');
+    host = '127.0.0.1';
+  }
   if (!Number.isInteger(port) || port < 0 || port > 65535) fail('--port must be an integer from 0 to 65535');
   const profile = (f.profile ?? 'core') as Profile;
   if (!PROFILES.includes(profile)) fail(`--profile must be one of ${PROFILES.join(', ')}`);
@@ -364,7 +382,8 @@ async function main(): Promise<void> {
     }
   }
   const tokenOnArgv = f.token !== undefined;
-  const shared = f.token ?? process.env.TSM_TOKEN;
+  if (f.token === undefined && process.env.TSM_TOKEN === undefined && process.env.SESSION_SERVER_TOKEN !== undefined) oneX('SESSION_SERVER_TOKEN', 'TSM_TOKEN');
+  const shared = f.token ?? process.env.TSM_TOKEN ?? process.env.SESSION_SERVER_TOKEN;
   // tsg-20: argv is world-readable (ps). With a token on it, say so, and take the token out of
   // our own process title where the OS allows. The title is `termd …` in every case: a cleanup
   // such as `pkill -f node` run from a session would otherwise take the daemon, and every
@@ -379,6 +398,7 @@ async function main(): Promise<void> {
   // Runs inherit the daemon's env (G7's configured basis), so it leaves here, before any spawn:
   // otherwise every shell could `echo $TSM_TOKEN` and session_env_capture would journal it (jr-6).
   delete process.env.TSM_TOKEN;
+  delete process.env.SESSION_SERVER_TOKEN;
   const anonymous = f.anonymous;
   if (!loopback) {
     // §12: a network bind needs a real credential and a named Host. `--anonymous` is not a

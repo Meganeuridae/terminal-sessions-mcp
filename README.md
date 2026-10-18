@@ -29,7 +29,9 @@ Then connect a host (configurations in [`next/config/`](next/config/)):
 - **agent-framework**: the `mcplServers` entry from `next/config/agent-framework.recipe.json` and
   the gate policies from `next/config/agent-framework.gate.json`.
 - **Any MCP host** (Cursor, Claude Desktop, Claude Code without the bridge):
-  `next/config/mcp.json` — the stdio shim starts `termd` if nothing is listening.
+  `next/config/mcp.json` — the stdio shim starts `termd` if nothing is listening, unless a
+  termd launchd job or systemd user unit exists (then it is the supervisor's to start, and the
+  shim waits for it) or `TSM_NO_SPAWN=1` says never to.
 
 ## What an agent gets
 
@@ -150,6 +152,11 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   presence. The daemon log says which it is for each connection (`initialized: …`), what the
   grant came to (`grant received: … enabled … not enabled …`), and warns when a host has sent
   no grant five seconds after initializing.
+- **From 1.x.** A daemon command written for 1.x starts termd: `--headless` is accepted and
+  changes nothing (the GUI is at the daemon's address), `SESSION_SERVER_HOST`,
+  `SESSION_SERVER_PORT` and `SESSION_SERVER_TOKEN` are read where the `TSM_*` names are not
+  set, and `--host localhost` binds 127.0.0.1, the address the shipped configs dial. The 1.x
+  frontend's settings reach the shim the same way (`tsm-shim --help`).
 - **Permissions.** termd's own files (journals, logs, keys, the usage log) are owner-only by
   mode whatever the umask. Sessions' shells and process Runs inherit the umask termd was
   started with, so files a session creates get the usual permissions; start termd with the

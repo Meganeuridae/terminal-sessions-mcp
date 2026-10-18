@@ -151,6 +151,32 @@ test('mcpl-20: the shipped bridge entry registers sessions as channels (mcpl_ope
   }
 });
 
+test("a daemon command written for 1.x starts termd: --headless is accepted, SESSION_SERVER_PORT and _HOST are read, and `localhost` binds 127.0.0.1", async () => {
+  const dataDir = path.join(tmp, 'from-1x');
+  const env: NodeJS.ProcessEnv = { ...process.env, SESSION_SERVER_PORT: '0', SESSION_SERVER_HOST: 'localhost', SESSION_SERVER_TOKEN: 'old-token' };
+  for (const k of ['TSM_PORT', 'TSM_HOST', 'TSM_TOKEN']) delete env[k];
+  const child = spawn(process.execPath, [path.resolve(here, '../src/daemon.js'), '--headless', '--data-dir', dataDir, '--no-usage-log', '--shell', '/bin/bash'], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+  let stderr = '';
+  child.stderr!.on('data', (b: Buffer) => (stderr += b.toString()));
+  try {
+    const end = Date.now() + 15_000;
+    while (!stderr.includes('"listening"') && Date.now() < end && child.exitCode === null) await new Promise((r) => setTimeout(r, 50));
+    assert.ok(stderr.includes('"listening"'), `termd did not start: ${stderr}`);
+    const lines = stderr.split('\n').filter(Boolean).map((l) => JSON.parse(l) as { msg: string; url?: string; auth?: string });
+    assert.ok(lines.some((l) => /--headless is a 1\.x flag/.test(l.msg)), stderr);
+    assert.ok(lines.some((l) => /using SESSION_SERVER_PORT \(a 1\.x setting\)/.test(l.msg)), stderr);
+    assert.ok(lines.some((l) => /using SESSION_SERVER_HOST \(a 1\.x setting\)/.test(l.msg)), stderr);
+    assert.ok(lines.some((l) => /using SESSION_SERVER_TOKEN \(a 1\.x setting\)/.test(l.msg)), stderr);
+    assert.ok(lines.some((l) => /localhost binds 127\.0\.0\.1/.test(l.msg)), stderr);
+    const listening = lines.find((l) => l.msg === 'listening')!;
+    assert.match(listening.url!, /^ws:\/\/127\.0\.0\.1:\d+$/, 'bound to the IPv4 loopback, on the port the 1.x name gave (0: any)');
+    assert.equal(listening.auth, 'token', 'the 1.x token name counted as the shared token');
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((r) => child.once('exit', r));
+  }
+});
+
 test('tsg-21/ux-16: the supervisor launcher starts termd under a bare PATH, in $HOME, with the toolchain on PATH for process Runs and an owner-only log', async () => {
   const home = path.join(tmp, 'home');
   const volta = path.join(home, '.volta', 'bin');

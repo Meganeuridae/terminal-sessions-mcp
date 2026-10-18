@@ -351,6 +351,15 @@ test('atc-6/ux-15: the 1.x settings reach the daemon they name, TSM_* wins, and 
     viaPort.end();
     await viaPort.exited;
 
+    // The port alone, as connectome-host's guide sets it: the host is `localhost`, as 1.x's own
+    // frontend dialed, which reaches a daemon on either loopback address.
+    const portOnly = shim({ TSM_URL: '', TSM_TOKEN: '', SESSION_SERVER_PORT: String(d.port), SESSION_SERVER_TOKEN: 'tok-1x' });
+    portOnly.send(init(1));
+    portOnly.send(call(2, 'session_list', {}));
+    assert.ok((await portOnly.next(byId(2))).result, 'SESSION_SERVER_PORT alone');
+    portOnly.end();
+    await portOnly.exited;
+
     const both = shim({ TSM_URL: `ws://127.0.0.1:${d.port}`, TSM_TOKEN: 'tok-2x', SESSION_SERVER_URL: 'ws://127.0.0.1:9', SESSION_SERVER_TOKEN: 'tok-1x' });
     both.send(init(1));
     both.send(call(2, 'session_open', { session: 'new1' }));
