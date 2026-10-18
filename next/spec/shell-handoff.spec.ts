@@ -1,6 +1,8 @@
 /** Completion credentials must not travel with ordinary child environments. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -14,19 +16,25 @@ const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 for (const shell of shells) {
   test(`${shell}: quoted exec, exported prompts and delayed children cannot forge completion`, async () => {
     const rc = shell.endsWith('fish') ? {} : { [shell.endsWith('zsh') ? '.zshrc' : '.bashrc']: 'export PS1="exported> "\nset -a\n' };
-    const x = await realSession(shell, { rc, login: false });
+    const x = await realSession(shell, { rc, login: false, env: { UNRELATED_HEX: '0123456789abcdef0123456789abcdef' } });
     try {
+      assert.ok(x.integrationKey);
+      const expectedHash = createHash('sha256').update(x.integrationKey).digest('hex');
       const child = path.join(x.tmp, 'child.cjs');
       const receipt = path.join(x.tmp, 'receipt');
       fs.writeFileSync(child, `
 const fs = require('node:fs');
-const key = Object.values(process.env).flatMap(v => [...v.matchAll(/(?:^|;k=)([a-f0-9]{32})(?=\\x07|$)/g)]).map(m => m[1])[0];
+const { createHash } = require('node:crypto');
+const key = Object.values(process.env).flatMap(v => [...v.matchAll(/(?:^|;k=)([a-f0-9]{32})(?=\\x07|$)/g)]).map(m => m[1]).find(k => createHash('sha256').update(k).digest('hex') === ${JSON.stringify(expectedHash)});
 fs.writeFileSync(${JSON.stringify(receipt)}, key ? 'leaked' : 'private');
 setTimeout(() => {
   if (key) process.stdout.write('\\x1b]133;D;0;k=' + key + '\\x07');
   setTimeout(() => { console.log('ACTUAL-END'); process.exit(7); }, 200);
 }, process.argv[2] === 'later' ? 700 : 0);
 `);
+      const control = spawnSync(process.execPath, [child], { env: { ...process.env, CONTROL_MARK_KEY: x.integrationKey }, stdio: 'ignore' });
+      assert.equal(control.status, 7);
+      assert.equal(fs.readFileSync(receipt, 'utf8'), 'leaked', 'the probe detects the actual key when deliberately supplied');
       const cmd = `${quote(process.execPath)} ${quote(child)}`;
       const result = await x.run(`: ' exec '; ${cmd}`);
       assert.equal(fs.readFileSync(receipt, 'utf8'), 'private');

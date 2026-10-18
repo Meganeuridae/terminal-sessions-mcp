@@ -433,6 +433,8 @@ export interface Real {
   home: string;
   tmp: string;
   startMs: number;
+  /** Initial credential, available to tests for exact leak detection, never put in a child environment. */
+  integrationKey: string | undefined;
   /** Admit (waiting out prompt-pending), await, and return the Run with its transcript. */
   run(line: string, wait?: number): Promise<RunInfo & { text: string }>;
   close(): Promise<void>;
@@ -452,7 +454,14 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
   if (opts.userZdotdir !== undefined) userEnv.ZDOTDIR = opts.userZdotdir.replace(/^~\//, `${home}/`);
   const integ = prepareIntegration(shell, { noUserRc: opts.noUserRc ?? false, userEnv, dir: path.join(tmp, 'integration') });
   const journal = new Journal();
-  const daemonEnv = opts.daemonEnv ?? { ...process.env, HOME: home };
+  const daemonEnv = opts.daemonEnv ?? {
+    ...process.env,
+    HOME: home,
+    XDG_CONFIG_HOME: path.join(home, '.config'),
+    XDG_DATA_HOME: path.join(home, '.local', 'share'),
+    XDG_CACHE_HOME: path.join(home, '.cache'),
+    XDG_STATE_HOME: path.join(home, '.local', 'state'),
+  };
   delete daemonEnv.ZDOTDIR;
   const so: Parameters<typeof Session.start>[0] = {
     id: 'real',
@@ -483,6 +492,7 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
     home,
     tmp,
     startMs,
+    integrationKey: integ.key,
     async run(line, wait = 5000) {
       const a = await session.admitWhenAvailable({ target: 'shell', line, principal: AGENT }, 3000);
       if (!a.admitted) throw new Error(`not admitted (${a.reason}): ${line}`);
