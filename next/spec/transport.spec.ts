@@ -1685,11 +1685,14 @@ test('2f357bd paths: a journal that fails to read ends the subscription visibly 
     await c.request('terminal/subscribe', { session: 'eio' });
     c.ws.pause();
     const chunk = 'q'.repeat(8 * 1024);
-    for (let i = 0; i < 200; i++) {
+    // The client reads nothing, but the kernel's loopback buffers absorb megabytes before the server's own
+    // buffer grows past the high water (far more on Linux than on macOS): write until the follower pauses.
+    const follower = conn.followers.get('eio')!;
+    for (let i = 0; i < 8000 && follower.state !== 'paused'; i++) {
       s.journal.append({ type: 'note', text: `${i}:${chunk}`, principal: 'agent:a@test' });
       if (i % 50 === 0) await sleep(1);
     }
-    assert.equal(conn.followers.get('eio')!.state, 'paused');
+    assert.equal(follower.state, 'paused');
     failing = true;
     c.ws.resume();
     const ended = await c.next((m) => m.method === 'terminal/closed', 5000);

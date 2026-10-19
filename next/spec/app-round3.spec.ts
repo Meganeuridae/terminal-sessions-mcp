@@ -17,7 +17,7 @@ import { validate } from '../src/api/validate.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { until } from './testhost.js';
 
-const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-r8c-'));
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-the App read of 1cabc6a-'));
 let registry: SessionRegistry;
 let app: App;
 const A: Caller = { principal: 'agent:a@test', connectionId: 'ca' };

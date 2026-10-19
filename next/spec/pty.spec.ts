@@ -281,7 +281,8 @@ test('a shell started without an integration launcher gets the session oom_score
   const exited = new Promise<PtyExit>((r) => p.onExit(r));
   p.write('cat /proc/$$/oom_score_adj; exit\n');
   await exited;
-  assert.match(out.join(''), /\n321\r?\n/, out.join(''));
+  // The value stands at the start of a line, or after the prompt the shell prints once it has read the line (dash does).
+  assert.match(out.join(''), /(?:\n|\$ )321\r?\n/, out.join(''));
 });
 
 test('/bin/bash: a process Run inherits no terminal master, and its line is not in any argv', async () => {

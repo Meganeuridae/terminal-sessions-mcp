@@ -52,7 +52,9 @@ before(async () => {
   port = (await server.listen()).port;
   try {
     const mod = (await import('puppeteer' as string)) as { default: { launch(o: Record<string, unknown>): Promise<Browser> } };
-    browser = await mod.default.launch({ headless: true });
+    // GitHub's Ubuntu runners restrict unprivileged user namespaces, which Chrome's sandbox needs: under CI the
+    // browser runs without it (the page is the daemon's own GUI, loaded from the loopback address).
+    browser = await mod.default.launch({ headless: true, args: process.env.CI ? ['--no-sandbox', '--disable-setuid-sandbox'] : [] });
   } catch (e) {
     skip = `no headless browser: ${(e as Error).message.split('\n')[0]}`;
     // A machine without a browser skips; CI must not pass with the page never run (the house's read of 2f357bd, #22).
@@ -481,7 +483,7 @@ const controllerOf = (id: string) => {
   return s.session.currentController;
 };
 
-test('r9b: no bar before a selection; a paste goes to the session it was typed into, not the one clicked next; Release seat is not undone by a pending resize', async (t) => {
+test('2f357bd: no bar before a selection; a paste goes to the session it was typed into, not the one clicked next; Release seat is not undone by a pending resize', async (t) => {
   if (skip || !browser) return t.skip(skip || 'no browser');
   const a = await agent();
   await a.call('session_open', { session: 'pa', visibility: 'shared' });
@@ -519,7 +521,7 @@ test('r9b: no bar before a selection; a paste goes to the session it was typed i
   }
 });
 
-test('r9b: a process Run’s output from before the attach shows with stderr marked and in order; a cut pane says so; the title and the idle state belong to one session; the Open form says what was ignored', async (t) => {
+test('2f357bd: a process Run’s output from before the attach shows with stderr marked and in order; a cut pane says so; the title and the idle state belong to one session; the Open form says what was ignored', async (t) => {
   if (skip || !browser) return t.skip(skip || 'no browser');
   const a = await agent();
   await a.call('session_open', { session: 'pe', visibility: 'shared' });
@@ -581,7 +583,7 @@ test('r9b: a process Run’s output from before the attach shows with stderr mar
   }
 });
 
-test('r9b: ^C interrupts the foreground job; Close asks twice; the activity list keeps 200 items', async (t) => {
+test('2f357bd: ^C interrupts the foreground job; Close asks twice; the activity list keeps 200 items', async (t) => {
   if (skip || !browser) return t.skip(skip || 'no browser');
   const a = await agent();
   await a.call('session_open', { session: 'pc', visibility: 'shared' });
