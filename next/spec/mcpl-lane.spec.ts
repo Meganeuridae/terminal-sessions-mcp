@@ -1244,12 +1244,12 @@ test('a catch-up summary of omitted messages and a gone range names the two rang
   try {
     const t = { kind: 'history', id: 'sm', journal: { epoch: 'e1' } };
     const summary = (lane as unknown as { summary: (t: unknown, o: unknown, lost: unknown) => { seq: number; messageId: string; head: string; metadata: Record<string, unknown> } }).summary.bind(lane);
-    const both = summary(t, { count: 4, from: 228, to: 240, kinds: { run: 4 } }, { from: 1, to: 226 });
+    const both = summary(t, { count: 4, from: 228, to: 240, kinds: { run: 4 } }, [{ from: 1, to: 226 }]);
     assert.equal(both.seq, 240);
     assert.equal(both.messageId, 'sm~e1:summary:240');
     assert.match(both.head, /^\[terminal\] sm: 4 earlier messages .*\(4 completions\) · seq 228–240 · seq 1–226 gone past retention, with whatever happened then · read session=sm since=227 as=events$/);
     assert.deepEqual([both.metadata.count, both.metadata.from, both.metadata.to, both.metadata.lostFrom, both.metadata.lostTo], [4, 228, 240, 1, 226]);
-    const gapOnly = summary(t, undefined, { from: 1, to: 226 });
+    const gapOnly = summary(t, undefined, [{ from: 1, to: 226 }]);
     assert.equal(gapOnly.seq, 226);
     assert.deepEqual([gapOnly.metadata.count, gapOnly.metadata.lostFrom, gapOnly.metadata.lostTo], [0, 1, 226]);
     assert.match(gapOnly.head, /since=226 as=events$/);
