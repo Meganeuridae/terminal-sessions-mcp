@@ -51,7 +51,32 @@ const COMPAT_OUTPUT_BYTES = 1024 * 1024;
  * COMPAT_OUTPUT_BYTES with a visible marker when more was cut (er-14, atc-11). The bound
  * is counted in bytes, as the reader counts, not in UTF-16 units (the house's read of 1cabc6a, #22).
  */
-async function runOutput(ctx: ToolContext, session: string, runId: string, raw: boolean): Promise<string> {
+/**
+ * The App results a compat tool drew from beyond the one it answers with. Each staged its caller's
+ * read-cursor advance for delivery (App.advanceRead, G22); the tool's own result carries the commit
+ * for all of them, which the transport runs once that result is written. Without it a compat host's
+ * cursor stayed behind what tailLogs, launch and a paged output had shown it (a review of the
+ * consolidated branch).
+ */
+class Drawn {
+  private readonly results: unknown[] = [];
+  track<T>(r: T): T {
+    this.results.push(r);
+    return r;
+  }
+  /** The tool's result, carrying the commits (after `also`, when given). */
+  sent(res: ToolResult, also?: () => void): ToolResult {
+    const prior = res.onSent;
+    res.onSent = () => {
+      also?.();
+      prior?.();
+      for (const r of this.results) commitReadDelivery(r);
+    };
+    return res;
+  }
+}
+
+async function runOutput(ctx: ToolContext, session: string, runId: string, raw: boolean, d: Drawn): Promise<string> {
   const parts: string[] = [];
   let bytes = 0;
   let cut = false;
@@ -65,7 +90,7 @@ async function runOutput(ctx: ToolContext, session: string, runId: string, raw: 
       o.as = 'events';
       o.limit = 2000;
     }
-    const r = await ctx.app.read(ctx.caller, o);
+    const r = d.track(await ctx.app.read(ctx.caller, o));
     const text = raw ? (r.events ?? []).filter((e) => e.type === 'output').map((e) => (e as { data: string }).data).join('') : (r.text ?? '') + (r.text && !r.splitLine && r.more ? '\n' : '');
     parts.push(text);
     bytes += utf8Length(text);
@@ -118,7 +143,7 @@ const TAIL_PAGES = 64;
  * the pages. (A line count, where the reader's event tail counts events — the house's read of
  * 1cabc6a, #22.)
  */
-async function tailEvents(ctx: ToolContext, session: string, n: number, rows: number): Promise<{ events: JournalEvent[]; cut?: Seq }> {
+async function tailEvents(ctx: ToolContext, session: string, n: number, rows: number, d: Drawn): Promise<{ events: JournalEvent[]; cut?: Seq }> {
   const pages: JournalEvent[][] = [];
   let until: Seq | undefined;
   let lineEnds = 0;
@@ -126,7 +151,7 @@ async function tailEvents(ctx: ToolContext, session: string, n: number, rows: nu
   for (let page = 0; page < TAIL_PAGES; page++) {
     const o: Parameters<App['read']>[1] = { session, tail: 2000, as: 'events', maxBytes: TAIL_BYTES };
     if (until !== undefined) o.until = until;
-    const r = await ctx.app.read(ctx.caller, o);
+    const r = d.track(await ctx.app.read(ctx.caller, o));
     const ev = r.events ?? [];
     if (ev.length === 0) break;
     pages.push(ev);
@@ -154,10 +179,10 @@ const tailAsked = (n: number) => Math.min(2 * n + 50, 10_000);
  * its escape codes, from the session's last events. `cut` names the oldest event shown when
  * older output exists beyond the bound.
  */
-async function tailLines(ctx: ToolContext, session: string, n: number, raw: boolean): Promise<{ lines: string[]; cut?: Seq }> {
+async function tailLines(ctx: ToolContext, session: string, n: number, raw: boolean, d: Drawn): Promise<{ lines: string[]; cut?: Seq }> {
   const res = (lines: string[], cut: Seq | undefined) => (cut !== undefined ? { lines: lines.slice(-n), cut } : { lines: lines.slice(-n) });
   if (raw) {
-    const { events, cut } = await tailEvents(ctx, session, n, summaryOf(ctx, session)?.rows ?? DEFAULT_GEOMETRY.rows);
+    const { events, cut } = await tailEvents(ctx, session, n, summaryOf(ctx, session)?.rows ?? DEFAULT_GEOMETRY.rows, d);
     let text = '';
     for (const e of events) {
       if (e.type === 'output') text += e.data;
@@ -165,7 +190,7 @@ async function tailLines(ctx: ToolContext, session: string, n: number, raw: bool
     }
     return res(withoutPlumbingLines(text.split(/\r?\n/)), cut);
   }
-  const r = await ctx.app.read(ctx.caller, { session, tail: tailAsked(n), commands: true, maxBytes: TAIL_BYTES });
+  const r = d.track(await ctx.app.read(ctx.caller, { session, tail: tailAsked(n), commands: true, maxBytes: TAIL_BYTES }));
   return res(withoutPlumbingLines(r.text ? r.text.split('\n') : []), r.truncated ? r.seq[0] : undefined);
 }
 
@@ -243,8 +268,9 @@ export const COMPAT_TOOLS: ToolDef[] = [
       if (a.cwd !== undefined && !exists) o.cwd = a.cwd as string;
       if (ready) o.ready = { pattern: ready };
       if (fail) o.fail = { pattern: fail };
+      const d = new Drawn();
       try {
-        const r = await ctx.app.start(ctx.caller, o);
+        const r = d.track(await ctx.app.start(ctx.caller, o));
         if (r.state === 'busy') {
           const b = r.busy;
           return json({ status: 'error', logs: [`Failed to start service: session ${name} is busy${b?.runId ? ` running ${b.runId}${b.line ? ` (${b.line})` : ''}` : ''} (${b?.reason ?? 'busy'}); killSession it first, or use another name`], sessionId: name });
@@ -261,9 +287,9 @@ export const COMPAT_TOOLS: ToolDef[] = [
             evidence = later.evidence;
           }
         }
-        const res: Record<string, unknown> = { status: launchStatus(service), logs: (await tailLines(ctx, name, 50, a.raw === true)).lines, sessionId: name, runId: r.runId, service };
+        const res: Record<string, unknown> = { status: launchStatus(service), logs: (await tailLines(ctx, name, 50, a.raw === true, d)).lines, sessionId: name, runId: r.runId, service };
         if (evidence !== undefined) res.evidence = evidence;
-        return json(res);
+        return d.sent(json(res));
       } catch (e) {
         return json({ status: 'error', logs: [`Failed to start service: ${compatWords((e as Error).message)}`] });
       }
@@ -298,7 +324,8 @@ export const COMPAT_TOOLS: ToolDef[] = [
       const opener = shellOpenerInFront(summaryOf(ctx, session));
       const o: Parameters<App['run']>[1] = { session, command: a.command as string, wait: timeout < 0 ? 0 : Math.min(timeout, ctx.app.maxWaitMs), queue: opener === undefined };
       if (a.cwd !== undefined) o.cwd = a.cwd as string;
-      const r = await ctx.app.run(ctx.caller, o);
+      const d = new Drawn();
+      const r = d.track(await ctx.app.run(ctx.caller, o));
       if (r.state === 'busy') {
         const b = r.busy;
         const error = opener
@@ -308,7 +335,7 @@ export const COMPAT_TOOLS: ToolDef[] = [
           : `session ${r.session} is busy${b?.runId ? ` running ${b.runId}` : ''} (${b?.reason ?? 'busy'}); nothing was run: ${BUSY_NEXT[b?.reason ?? ''] ?? 'try again when it is done, or use another session'}`;
         return json({ output: '', exitCode: -1, duration: 0, state: 'busy', busy: r.busy, error });
       }
-      const output = r.runId ? await runOutput(ctx, r.session, r.runId, a.raw === true) : r.output.text;
+      const output = r.runId ? await runOutput(ctx, r.session, r.runId, a.raw === true, d) : r.output.text;
       const res: Record<string, unknown> = { output, exitCode: r.state === 'exited' ? (r.exit ?? -1) : -1, duration: r.durationMs ?? 0, runId: r.runId, state: r.state };
       if (r.shell !== undefined) {
         res.shell = r.shell;
@@ -321,12 +348,9 @@ export const COMPAT_TOOLS: ToolDef[] = [
       }
       if (r.state === 'queued') res.note = `queued behind the running command: it runs in the session's own shell when that ends; await {"runId": "${r.runId}"} gets its exit code`;
       if (r.state === 'lost' && r.reason) res.note = `outcome unknown: ${r.reason}`;
-      const out = json(res);
-      out.onSent = () => {
+      return d.sent(json(res), () => {
         if (r.runId !== undefined && (r.state === 'exited' || r.state === 'cancelled' || r.state === 'lost')) ctx.app.outcomeSent(ctx.caller, r);
-        commitReadDelivery(r);
-      };
-      return out;
+      });
     },
   },
   {
@@ -367,10 +391,11 @@ export const COMPAT_TOOLS: ToolDef[] = [
       const session = a.session as string;
       const asked = typeof a.lines === 'number' && a.lines > 0 ? Math.floor(a.lines) : 50;
       const n = Math.min(asked, 10_000);
-      const { lines, cut } = await tailLines(ctx, session, n, a.raw === true);
+      const d = new Drawn();
+      const { lines, cut } = await tailLines(ctx, session, n, a.raw === true, d);
       if (cut !== undefined) lines.unshift(`[earlier output not shown: these lines come from the last 1 MiB; read {"session": "${session}", "tail": ${n}, "until": ${cut - 1}} shows what came before]`);
       if (asked > 10_000) lines.unshift(`[tailLogs returns at most 10000 lines; ${asked} were asked]`);
-      return json(lines);
+      return d.sent(json(lines));
     },
   },
   {

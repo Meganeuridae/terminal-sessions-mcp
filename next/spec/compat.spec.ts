@@ -231,3 +231,26 @@ test('sendInput types text and keys as asked; sendSignal interrupts the foregrou
   const missing = await call('sendSignal', { session: 'no-such-session', signal: 'SIGINT' });
   assert.equal(missing.success, false);
 });
+
+test('a compat host whose delivery is deferred gets its read cursor advanced only once tailLogs or runCommand is written, and then for everything they drew', async () => {
+  // The transport defers the cursor advance of a WebSocket caller to the write (G22); the compat tools
+  // draw on several App results and must carry every one of their commits (a review of the branch).
+  const deferred: Caller = { principal: A.principal, connectionId: 'ca-ws', deferReadDelivery: true };
+  await call('runCommand', { session: 'cursor-c', command: 'echo first', timeout: 10_000 });
+  const live = registry.get('cursor-c');
+  assert.ok(live?.kind === 'live');
+  const before = live.session.cursorsOf(A.principal).read;
+  const tail = await callTool('tailLogs', { session: 'cursor-c', lines: 20 }, { app, caller: deferred, resultText: 'json' }, compat);
+  assert.match(tail.text, /first/);
+  assert.equal(live.session.cursorsOf(A.principal).read, before, 'nothing moved before the write');
+  assert.equal(typeof tail.onSent, 'function', 'the result carries its commit');
+  tail.onSent!();
+  const afterTail = live.session.cursorsOf(A.principal).read;
+  assert.ok(afterTail > before, 'written: the cursor covers what tailLogs showed');
+  const ran = await callTool('runCommand', { session: 'cursor-c', command: 'echo second', timeout: 10_000 }, { app, caller: deferred, resultText: 'json' }, compat);
+  assert.match(ran.text, /second/);
+  assert.equal(live.session.cursorsOf(A.principal).read, afterTail, 'the paged output moved nothing before the write');
+  ran.onSent!();
+  assert.ok(live.session.cursorsOf(A.principal).read > afterTail, 'written: the cursor covers the output pages too');
+  await call('killSession', { session: 'cursor-c' });
+});
