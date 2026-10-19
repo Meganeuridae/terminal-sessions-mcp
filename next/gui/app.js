@@ -490,7 +490,7 @@
    * new life). At most one a second, so a flapping stream cannot loop; one asked for sooner is deferred,
    * not dropped (a session closed and restarted within the second still gets its new life shown).
    */
-  let lastReattach = 0;
+  let lastReattach = -Infinity; // -Infinity, not 0: performance.now() counts from page load, so 0 would throttle a reconnect in the page's first second
   let deferredReattach = null;
   function reattach() {
     if (!state.current) return;
@@ -514,7 +514,7 @@
     refreshSessions();
     // Reattach after a reconnect: a fresh snapshot, then events after it.
     if (state.current) {
-      lastReattach = 0;
+      lastReattach = -Infinity;
       reattach();
     }
   });
@@ -532,7 +532,7 @@
     state.streamEnded = true;
     updateBar();
     if (reason === 'session-closed') {
-      lastReattach = 0;
+      lastReattach = -Infinity;
       reattach(); // the history view: transcript and Runs
     } else if (reason === 'session-removed') notice('This session was removed.');
     else if (reason === 'forbidden') notice('You may no longer observe this session: it was reopened private.');

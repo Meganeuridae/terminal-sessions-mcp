@@ -96,6 +96,11 @@ if [ "$\{1-}" = reinit ]; then
   # clear __tsm_reinit_pending (promptvars off never lets PS1 do it); with an appended part still to
   # run, PS1 clears it after that part, so the DEBUG trap stands down for it (#22 comment 6264958172).
   if [ "$\{#__tsm_pcs[@]}" -gt 0 ]; then PROMPT_COMMAND=("$\{__tsm_pcs[@]}"); __tsm_reinit_solo=; else __tsm_reinit_solo=1; fi
+  # The typed reinit (the daemon's line at the prompt of a bash whose rc replaced PROMPT_COMMAND
+  # outright) runs nothing of that value after our hook — precmd runs the folded user part itself —
+  # so it is solo too; left non-solo, promptvars off kept the flag set for good (the reviewer's read
+  # of the r16 commits, #22).
+  if [ "$\{2-}" = typed ]; then __tsm_reinit_solo=1; fi
   unset __tsm_pcs __tsm_e
   __tsm_reinit_pending=1
   if [ -z "$__tsm_key" ]; then return 0; fi
@@ -238,8 +243,11 @@ __tsm_preexec() {
   # typed \`PROMPT_COMMAND="history -a"; history -a; sleep 3\` read as idle, its heal mistaking the
   # line's own \`history -a\` for the prompt's). The heal stands down until the next precmd (ss-9).
   # A daemon line (sourced through \`.\`) suspends the DEBUG trap, so it has no later firings of its
-  # own; leaving the flag clear for it keeps the heal working at the prompt that follows it.
-  case $__line in ". '"*tsm-cmd-*"'") ;; *) __tsm_line_started=1 ;; esac
+  # own; leaving the text empty for it keeps the heal working at the prompt that follows it. The
+  # text is kept, not a flag: a later firing is the line's own only if the line runs that command
+  # (__tsm_line_has) — a flag alone stood the heal down at the next prompt too, where it was the only
+  # closer of a line that merely assigned PROMPT_COMMAND (the reviewer's read of the r16 commits).
+  case $__line in ". '"*tsm-cmd-*"'") __tsm_line_text= ;; *) __tsm_line_text=$__line ;; esac
   __tsm_opened=
   __tsm_text "$__line"
   # A command that may set a DEBUG trap — one that names trap, or sources a file or evals text that
@@ -253,7 +261,7 @@ __tsm_precmd() {
   set +eu
   # (An empty line ran no command since the last prompt armed pre-execution detection.)
   __tsm_prompt_active=
-  __tsm_line_started=
+  __tsm_line_text=
   __tsm_top=
   if [ -n "$__tsm_exec_armed" ]; then __tsm_exec_disarm; fi
   # Our DEBUG trap did not fire for the last command, or the command may have set a
@@ -291,6 +299,8 @@ __tsm_precmd() {
   # PS1 expands no command/arith substitution: when the hook stands alone (nothing of the inherited
   # value runs after it — __tsm_reinit_solo), clear it here too, so the DEBUG trap does not stand
   # down for good on the next Run after \`exec bash\` (the house's read, #22 comment 6264958172).
+  # With an appended part still to run and promptvars off, neither can clear it: the DEBUG trap then
+  # clears it at the first command that is not one of the user's prompt part (see __tsm_debug).
   if __tsm_pc_intact; then __tsm_top="$\{__tsm_top:+$__tsm_top; }$\{__tsm_reinit_solo:+__tsm_reinit_pending=0; }__tsm_prompt_active=1"; else __tsm_fold_pc; fi
   __tsm_restore "$__o"
   # Leave $? as the command left it (PS1 may show it); never under errexit, where
@@ -302,21 +312,30 @@ __tsm_debug() {
   set +eu
   __tsm_dbg_tick=1
   # At the prompt a handoff landed on, the rest of the inherited PROMPT_COMMAND still runs after
-  # the reinit: not a Run. PS1's end mark clears this before anyone can type.
+  # the reinit: not a Run. PS1's end mark clears this before anyone can type — except with
+  # promptvars off, where nothing else can: so the trap stands down while detection is not armed
+  # (the rc's own commands after the trap was set, and the hook itself) and for a command of the
+  # user's prompt part (the leftover is made of those); the first armed command that is neither is
+  # the line someone typed, and clears the flag (the reviewer's read of the r16 commits, #22).
   if [ "$\{__tsm_reinit_pending:-0}" != 0 ]; then
-    __tsm_restore "$__o"
-    return 0
+    if [ -z "$__tsm_prompt_active" ] || __tsm_word_in "$BASH_COMMAND" "$__tsm_user_pc"; then
+      __tsm_restore "$__o"
+      return 0
+    fi
+    __tsm_reinit_pending=0
   fi
   if [ -n "$__tsm_prev_debug" ]; then
     __tsm_setst "$__st"
     eval "$__tsm_prev_debug"
   fi
   if [ "$BASH_COMMAND" != __tsm_precmd ] && [ -z "$__tsm_exec_armed" ] && ! __tsm_pc_intact; then
-    if [ -n "$__tsm_line_started" ]; then
-      # A typed line's Run is running: a later command of the line that reassigned PROMPT_COMMAND is
-      # the line's own, not the prompt's (so no close here). Still fold the reassignment back behind
-      # our hook, so the next prompt's precmd runs and closes the Run — without it the Run read as
-      # idle while \`sleep 3\` ran on (the house's read, #22 comment 6264958172).
+    if [ -n "$__tsm_line_text" ] && __tsm_line_has "$BASH_COMMAND"; then
+      # A typed line's Run is running and this command is one the line runs itself: the line's own,
+      # not the prompt's (so no close here). Still fold the reassignment back behind our hook, so the
+      # next prompt's precmd runs and closes the Run — without it the Run read as idle while
+      # \`sleep 3\` ran on (the house's read, #22 comment 6264958172). A command the line does not
+      # run is the prompt's own at the next prompt, healed as before: for a line that only assigned
+      # PROMPT_COMMAND the heal is the only closer (the reviewer's read of the r16 commits).
       __tsm_fold_pc
     else
       # A command of the prompt's own (it stands in PROMPT_COMMAND) is never a Run.
@@ -375,6 +394,34 @@ __tsm_heal_pc() {
     __tsm_open
   fi
   [ -n "$__own" ]
+}
+# Is $1 (a simple command the DEBUG trap sees) a word of $2, bounded by blanks or list/group operators?
+__tsm_word_in() {
+  case " $2 " in *[[:space:]\\;\\(\\{\\&\\|]"$1"[[:space:]\\;\\)\\}\\&\\|]*) return 0 ;; esac
+  return 1
+}
+# Does the typed line now running (__tsm_line_text) run $1, a simple command the DEBUG trap sees,
+# itself? Matched as __tsm_heal_pc matches a PROMPT_COMMAND element: bounded by blanks or list/group
+# operators. The quoted value of each PROMPT_COMMAND assignment in the line is dropped first: it names
+# the prompt's commands whether or not the line runs them, and a compound value ("if …; then cmd; fi")
+# would otherwise match at the next prompt and leave that Run unclosed. The line's first command is
+# never a later firing, so it needs a separator before it. Residual: a line that runs a command and
+# then ends by assigning the same text to PROMPT_COMMAND reads the next prompt's run of it as its own.
+__tsm_line_has() {
+  local __t=$__tsm_line_text __h __v __q __dq=\\" __sq=\\'
+  while :; do
+    case $__t in
+      *PROMPT_COMMAND+=[$__dq$__sq]*) __h=$\{__t%%PROMPT_COMMAND+=[$__dq$__sq]*}; __v=$\{__t#"$__h"PROMPT_COMMAND+=} ;;
+      *PROMPT_COMMAND=[$__dq$__sq]*) __h=$\{__t%%PROMPT_COMMAND=[$__dq$__sq]*}; __v=$\{__t#"$__h"PROMPT_COMMAND=} ;;
+      *) break ;;
+    esac
+    __q=$\{__v%"$\{__v#?}"}
+    __v=$\{__v#?}
+    case $__v in *"$__q"*) __v=$\{__v#*"$__q"} ;; *) __v= ;; esac
+    __t=$__h$__v
+  done
+  case "$__t " in *[[:space:]\\;\\(\\{\\&\\|]"$1"[[:space:]\\;\\)\\}\\&\\|]*) return 0 ;; esac
+  return 1
 }
 # At top level ($1: "trap -p DEBUG" there). Succeeds when the DEBUG trap is no longer
 # ours: the replacement is kept, chained, and the caller reinstalls ours.
@@ -488,7 +535,7 @@ __tsm_own_history_keys() {
 
 __tsm_in_cmd=
 __tsm_prompt_active=
-__tsm_line_started=
+__tsm_line_text=
 __tsm_opened=
 __tsm_dbg_tick=
 __tsm_hist_n=

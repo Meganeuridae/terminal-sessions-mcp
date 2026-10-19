@@ -937,11 +937,14 @@ export class Session {
           if (kind === 'bash' && !reinitTyped) {
             // A new bash whose rc replaced the PROMPT_COMMAND the handoff left it never loaded the
             // integration (the house's read of 1d83ffa). The rc's path is still in its environment:
-            // load it from here, once, and wait for its hello again. But type it only when bash's
-            // line editor holds the terminal (ICANON off): an rc that reads a line before its first
-            // prompt (`read -p`, a password prompt) leaves it canonical, and the reinit would land in
-            // that read (the house's read, #22 comment 6264958172). While it stays canonical, or its
-            // mode cannot be read, wait a bounded time, then give up as a replacement, as before.
+            // load it from here, once, and wait for its hello again. But type it only while the
+            // terminal is in non-canonical mode (ICANON off), as readline leaves it at a prompt: an rc
+            // that reads a line before its first prompt (`read -p`, a password prompt) leaves it
+            // canonical, and the reinit would land in that read (the house's read, #22 comment
+            // 6264958172). Only canonical readers are excluded by this: `read -e`, vim, less and a
+            // raw-mode password tool turn ICANON off too, and the reinit would still land in those.
+            // While the mode stays canonical, or cannot be read, wait a bounded time, then give up
+            // as a replacement, as before.
             const canon = this.pty.canonicalInput?.();
             if (canon === false) {
               reinitTyped = true;
@@ -951,6 +954,9 @@ export class Session {
             } else {
               reinitWaitStart ??= clocks.monotonic();
               if (clocks.monotonic() - reinitWaitStart >= cap) {
+                // What holds is not "reports no marks" alone: the new bash reached no prompt within the cap
+                // while something read its input, so the integration was never loaded into it.
+                this.note(`the new bash reached no prompt within ${cap} ms while a program read its input (the terminal stayed in canonical mode): the shell integration was not loaded into it`);
                 this.stopExecWatch();
                 return this.onShellReplaced(now);
               }

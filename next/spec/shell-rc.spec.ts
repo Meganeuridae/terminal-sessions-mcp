@@ -313,3 +313,24 @@ test('/bin/bash: a typed line that sets PROMPT_COMMAND and runs one of its comma
     await x.close();
   }
 });
+
+for (const line of ['PROMPT_COMMAND="history -a"', 'PROMPT_COMMAND="if true; then history -a; fi"', 'echo x; PROMPT_COMMAND="history -a"']) {
+  test(`/bin/bash: a typed line ending in a PROMPT_COMMAND assignment (${line}) is closed at the next prompt, and the next Run goes on`, { skip: !hasShell('/bin/bash') }, async () => {
+    // Here the heal is the only closer: the new value runs at the next prompt in place of our hook.
+    // A flag that stood the heal down for the whole line left this Run open and the next command's
+    // start ignored (the reviewer's read of the r16 commits, #22); the heal now stands down only for
+    // a command the line itself runs, and a command named only inside the assignment's quoted value
+    // does not count.
+    const x = await realSession('/bin/bash', { login: false });
+    try {
+      x.session.input(`${line}\n`, { principal: AGENT });
+      await until(() => x.session.listRuns().some((r) => r.origin === 'agent' && r.state === 'exited'), 5000, 'the typed Run ended');
+      const back = await x.run('echo back');
+      assert.deepEqual([back.state, back.exit, back.text.trim()], ['exited', 0, 'back']);
+      assert.equal(x.session.listRuns().filter((r) => r.origin === 'agent').length, 1, 'one typed Run');
+      assert.ok(x.session.listRuns().every((r) => r.state === 'exited'), 'nothing left running');
+    } finally {
+      await x.close();
+    }
+  });
+}
