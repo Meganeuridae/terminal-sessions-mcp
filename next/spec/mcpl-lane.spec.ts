@@ -826,7 +826,7 @@ test("MCPL 2: a progress digest's id carries its Run, so two Runs digested at th
     for (const x of digests) {
       const runId = String(x.metadata.runId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       assert.match(x.messageId, new RegExp(`:output~${runId}:(\\d+)$`), x.messageId);
-      assert.equal(seqOfMessageId(x.messageId), Number(/:(\d+)$/.exec(x.messageId)![1]), x.messageId);
+      assert.equal(seqOfMessageId(x.messageId.slice(NODE_NAME.length + 1), 'dg', live(d.registry, 'dg').journal), Number(/:(\d+)$/.exec(x.messageId)![1]), x.messageId);
     }
     assert.equal(new Set(digests.map((x) => x.messageId)).size, digests.length, 'no two digests share an id');
     await a.close();
@@ -1158,5 +1158,101 @@ test("a lane disposed while an open reads history registers nothing, follows not
     lane.dispose();
     await registry.closeAll();
     fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+for (const recovery of ['retry', 'reconnect'] as const) {
+  test(`a catch-up summary of both omitted messages and a gone range pins the cursor below the range, and a refusal keeps the range (${recovery})`, { timeout: 60_000 }, async () => {
+    // With both, the summary pinned at the omitted range's start, the later one: the cursor passed the gone
+    // range while the host still refused the summary, and the reconnect's summary named only the omitted messages.
+    const d = await daemon({ retention: { maxBytes: 64 * 1024 } });
+    let allowSummary = false;
+    const answer = (m: Msg) => (m.method === 'push/event' && (m.params as { tags: string[] }).tags.includes('terminal:missed') ? { accepted: allowSummary, reason: 'queue_full' } : undefined);
+    try {
+      const m = await d.host('ta', 'bl-m', { mcpl: false });
+      await m.call('session_open', { session: 'bl' });
+      for (let i = 0; i < 4; i++) await m.call('run', { session: 'bl', command: 'seq 1 5000' });
+      const ids: string[] = [];
+      for (let i = 0; i < 30; i++) {
+        const r = await m.call('run', { session: 'bl', command: `echo bl-${i}`, target: 'process', wait: 0 });
+        ids.push(r.structured!.runId as string);
+      }
+      const s = live(d.registry, 'bl');
+      await until(() => ids.every((id) => s.run(id).state === 'exited'), 10_000, 'the thirty Runs to end');
+      await sleep(200);
+      await m.close();
+      const ends = ids.map((id) => s.run(id).seq.end!);
+      const oldest = s.journal.oldestSeq ?? 1;
+      assert.ok(oldest > 1 && oldest < Math.min(...ends), `retention took the start of the journal and none of the thirty (oldest ${oldest}, first end ${Math.min(...ends)})`);
+      let a = await d.host('ta', 'bl-a', { answer });
+      const summary = await a.delivery((v) => v.tags.includes('terminal:missed'), 8000);
+      const meta = summary.metadata as { count: number; from: number; lostFrom?: number; lostTo?: number };
+      assert.ok(meta.count >= 1 && meta.lostFrom === 1 && meta.lostTo !== undefined && meta.lostTo < meta.from, `both an omitted count and a gone range: ${JSON.stringify(meta)}`);
+      await until(() => a.deliveries().filter((v) => ids.includes(v.metadata.runId as string)).length >= 20, 8000, 'the replayed completions');
+      await sleep(100); // let the accepted newer messages advance the cursor
+      assert.ok(s.cursorsOf(A).delivered < meta.lostFrom, `the refused summary pins the cursor below the gone range (delivered ${s.cursorsOf(A).delivered})`);
+      if (recovery === 'reconnect') {
+        await a.close();
+        a = await d.host('ta', 'bl-a2', { answer });
+        const again = await a.delivery((v) => v.tags.includes('terminal:missed'), 8000);
+        assert.equal(again.messageId, summary.messageId);
+        assert.equal(again.metadata.count, meta.count, 'the omitted messages are still represented');
+        assert.equal(again.metadata.lostFrom, 1, 'and so is the gone range');
+        assert.ok((again.metadata.lostTo as number) >= meta.lostTo!, JSON.stringify(again.metadata));
+      }
+      allowSummary = true;
+      await until(() => s.cursorsOf(A).delivered >= Math.max(...ends), 10_000, 'the accepted summary to release the cursor');
+      await a.close();
+    } finally {
+      await d.stop();
+    }
+  });
+}
+
+test("a history boundary is an id of this channel: another session's id, this session's under another epoch, and this session's under another node's name are refused", async () => {
+  // The boundary was read by its suffix's shape, so any of the three paged this journal.
+  const d = await daemon();
+  try {
+    const a = await d.host('ta', 'bd-a');
+    const ids: Record<string, string> = {};
+    for (const sid of ['bd1', 'bd2']) {
+      await a.call('session_open', { session: sid });
+      await a.request('channels/open', { channelId: `terminal:${sid}` });
+      const r = await a.call('run', { session: sid, command: `sleep 0.2; echo ${sid}`, wait: 20 });
+      ids[sid] = (await a.delivery(aboutRun(r.structured?.runId), 4000)).messageId;
+    }
+    await a.request('channels/close', { channelId: 'terminal:bd1' });
+    const own = ids.bd1!;
+    assert.match(own, new RegExp(`^${NODE_NAME}/bd1~[^:/]+:run:\\d+$`), own);
+    const open = (before: string) => a.request('channels/open', { channelId: 'terminal:bd1', history: { limit: 10, beforeMessageId: before } }) as Promise<{ history?: Array<{ messageId: string }> }>;
+    const refused = (e: Error & { code?: number }) => e.code === -32602 && /beforeMessageId/.test(e.message);
+    await assert.rejects(open(ids.bd2!), refused, "another session's id");
+    await assert.rejects(open(own.replace(/~[^:/]+:/, '~other-epoch:')), refused, 'this session under another epoch');
+    await assert.rejects(open(own.replace(/^[^/]+\//, 'elsewhere/')), refused, "this session under another node's name");
+    const res = await open(own);
+    assert.ok(Array.isArray(res.history) && !res.history.some((x) => x.messageId === own), 'the real id pages before itself');
+    await a.close();
+  } finally {
+    await d.stop();
+  }
+});
+
+test('a catch-up summary of omitted messages and a gone range names the two ranges apart, in its text and its metadata', () => {
+  // The floor's pin at the earliest of the two is shown end to end above; this is the message itself (the house's read of 78c4d6e, #22).
+  const lane = new McplLane({} as unknown as App, { principal: A, connectionId: 'c-sum' }, new Outbound(() => undefined), () => undefined);
+  try {
+    const t = { kind: 'history', id: 'sm', journal: { epoch: 'e1' } };
+    const summary = (lane as unknown as { summary: (t: unknown, o: unknown, lost: unknown) => { seq: number; messageId: string; head: string; metadata: Record<string, unknown> } }).summary.bind(lane);
+    const both = summary(t, { count: 4, from: 228, to: 240, kinds: { run: 4 } }, { from: 1, to: 226 });
+    assert.equal(both.seq, 240);
+    assert.equal(both.messageId, 'sm~e1:summary:240');
+    assert.match(both.head, /^\[terminal\] sm: 4 earlier messages .*\(4 completions\) · seq 228–240 · seq 1–226 gone past retention, with whatever happened then · read session=sm since=227 as=events$/);
+    assert.deepEqual([both.metadata.count, both.metadata.from, both.metadata.to, both.metadata.lostFrom, both.metadata.lostTo], [4, 228, 240, 1, 226]);
+    const gapOnly = summary(t, undefined, { from: 1, to: 226 });
+    assert.equal(gapOnly.seq, 226);
+    assert.deepEqual([gapOnly.metadata.count, gapOnly.metadata.lostFrom, gapOnly.metadata.lostTo], [0, 1, 226]);
+    assert.match(gapOnly.head, /since=226 as=events$/);
+  } finally {
+    lane.dispose();
   }
 });

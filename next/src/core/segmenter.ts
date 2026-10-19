@@ -135,9 +135,17 @@ export function segmentId(session: string, journal: Journal, kind: SegmentKind, 
   return `${session}~${journal.epoch}:${kind}${qualifier !== undefined ? `~${qualifier}` : ''}:${seq}`;
 }
 
-/** The seq a message id reports, when it is one of ours. */
-export function seqOfMessageId(id: string): Seq | undefined {
-  const m = /~[^:/]+:[a-z-]+(?:~[^:]+)?:(\d+)$/.exec(id);
+/**
+ * The seq a message id reports, when it is one of this journal's: the id as `segmentId` made it
+ * (the lane strips its node first), with this session's name and this journal's epoch in front
+ * of the kind and the seq. Read from the suffix's shape alone, an id of another session, of
+ * another node, or of a forgotten life of this name passed as a cursor into this journal, which
+ * the epoch exists to rule out (mcpl-4; the house's read of 78c4d6e, #22).
+ */
+export function seqOfMessageId(id: string, session: string, journal: Pick<Journal, 'epoch'>): Seq | undefined {
+  const prefix = `${session}~${journal.epoch}:`;
+  if (!id.startsWith(prefix)) return undefined;
+  const m = /^[a-z-]+(?:~[^:]+)?:(\d+)$/.exec(id.slice(prefix.length));
   return m ? Number(m[1]) : undefined;
 }
 

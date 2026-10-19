@@ -163,6 +163,8 @@ export interface ChannelDescriptor {
 export const channelId = (session: string): string => `terminal:${session}`;
 export const sessionOf = (id: string): string | undefined => (id.startsWith('terminal:') ? id.slice('terminal:'.length) : undefined);
 const qualify = (id: string) => `${NODE_NAME}/${id}`;
+/** The id without this node's name, when it carries it; another node's id is never ours (mcpl-4). */
+const unqualify = (id: string): string | undefined => (id.startsWith(`${NODE_NAME}/`) ? id.slice(NODE_NAME.length + 1) : undefined);
 
 interface IncomingMessage {
   channelId: string;
@@ -583,12 +585,15 @@ export class McplLane {
     const limit = raw === undefined ? 0 : Math.min(HISTORY_MAX, Math.max(0, Math.floor(raw)));
     const t = targetOf(s);
     const boundary = limit > 0 ? params.history?.beforeMessageId : undefined;
-    const before = boundary !== undefined ? seqOfMessageId(String(boundary)) : undefined;
     // A boundary that is not one of our ids is refused, not ignored: ignored, it answered with the
     // newest page as if none had been given, and a host paging back got the same page again (the
-    // house's read of 07ab3dd, #22).
+    // house's read of 07ab3dd, #22). Ours means this node's, this session's, this journal's epoch:
+    // judged by its suffix's shape, another session's id, or this name's under a forgotten epoch,
+    // was taken as a cursor into this journal (the house's read of 78c4d6e, #22).
+    const own = boundary !== undefined ? unqualify(String(boundary)) : undefined;
+    const before = own !== undefined ? seqOfMessageId(own, sid, t.journal) : undefined;
     if (boundary !== undefined && before === undefined) {
-      throw new RpcError(INVALID_PARAMS, 'history.beforeMessageId is not a message id of this server; ids look like <node>/<session>~<epoch>:<kind>:<seq>, as channels/incoming and channels/open history give them', { beforeMessageId: String(boundary).slice(0, 200) });
+      throw new RpcError(INVALID_PARAMS, `history.beforeMessageId is not a message id of this channel: ids look like ${NODE_NAME}/${sid}~<epoch>:<kind>:<seq>, as channels/incoming and channels/open history give them, and the node, the session and the epoch must be this channel's`, { beforeMessageId: String(boundary).slice(0, 200) });
     }
     // The history is read before anything changes: a read that fails (a store error) refuses the
     // open with nothing opened, as a refused parameter does. While it is read, the channel is
@@ -1215,7 +1220,11 @@ export class McplLane {
       // (the segmenter's read, comment 6265082050 on #22: the catch-up never told the host of it).
       if (omitted || scan.lost?.length) {
         const gaps = scan.lost ?? [];
-        const from = omitted?.from ?? gaps[0]!.from;
+        // The summary pins at the earliest of what it names. Pinned at the omitted range's start, the
+        // later one, it let the cursor pass the gone range before the host acknowledged it, and the
+        // reconnect's rescan, starting past the gap, named only the omitted messages (the house's read
+        // of 78c4d6e, #22).
+        const from = Math.min(omitted?.from ?? Number.POSITIVE_INFINITY, ...gaps.map((g) => g.from));
         const to = omitted?.to ?? gaps[gaps.length - 1]!.to;
         this.owe(p.st, to);
         w.summary = this.summary(p.t, omitted, scan.lost);

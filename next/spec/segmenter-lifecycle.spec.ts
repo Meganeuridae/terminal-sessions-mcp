@@ -115,8 +115,13 @@ test('mcpl-4: message ids carry the journal epoch, so a re-created name never re
   const withEpoch = new Journal();
   Object.defineProperty(withEpoch, 'epoch', { value: 'e9f00d', enumerable: true });
   assert.equal(segmentId('s', withEpoch, 'session-exit', 3), 's~e9f00d:session-exit:3', "the journal's own epoch wins");
-  assert.equal(seqOfMessageId(`node/${e1}`), 17);
-  assert.equal(seqOfMessageId('someone-else:42'), undefined);
+  // The seq is read only from an id of this session and this journal's epoch: by the suffix's shape alone,
+  // another session's or another epoch's id paged this journal (the house's read of 78c4d6e, #22).
+  assert.equal(seqOfMessageId(e1, 's', j1), 17);
+  assert.equal(seqOfMessageId(e2, 's', j1), undefined, 'another epoch of the name');
+  assert.equal(seqOfMessageId(e1, 'other', j1), undefined, 'another session');
+  assert.equal(seqOfMessageId(`node/${e1}`, 's', j1), undefined, 'a qualified id is the lane\'s to strip');
+  assert.equal(seqOfMessageId('someone-else:42', 's', j1), undefined);
 });
 
 test('mcpl-3: a completion after more than 50,000 other events is found (the scan pages to the end)', async () => {
@@ -677,7 +682,7 @@ test('a compaction that leaves the visible text unchanged is a new screen: the l
   assert.equal(screens[1]!.supersedes, screens[0]!.messageId);
   // Taken at the same seq, it has an id of its own: a repeated id is one the lane's sent-set drops (the house's read of 78c4d6e, #22).
   assert.notEqual(screens[1]!.messageId, screens[0]!.messageId);
-  assert.equal(seqOfMessageId(screens[1]!.messageId), screens[1]!.seq, 'the seq still reads from the id');
+  assert.equal(seqOfMessageId(screens[1]!.messageId, src.id, src.journal), screens[1]!.seq, 'the seq still reads from the id');
   // Nothing else changed: no third screen.
   src.journal.append({ type: 'output', data: 'same', stream: 'pty' });
   await sleep(150);
