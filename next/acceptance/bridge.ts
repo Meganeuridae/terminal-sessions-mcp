@@ -175,7 +175,9 @@ try {
     const st = await call('await', { runId, wait: 0 })
     if (st.structured?.state !== 'running') fail(`the Run across the drop: ${st.text}`)
   })
-  // Shown or failed, the Run is released now, so the checks after this one see it end.
+  // Shown or failed, the Run is released now, so the checks after this one see it end. A completion
+  // that falls inside the disconnect is not staged here: mcpl-lane.spec's reconnect cases (mcpl-7,
+  // mcpl-8, m2-18, the channels-only host) cover it.
   fs.writeFileSync(released, '')
 
   let firstCompletionAt = 0
@@ -214,11 +216,16 @@ try {
     const answer = (await h.publish(`terminal:${SESSION}`, 'echo typed-by-publish')) as { delivered?: boolean; messageId?: string } | undefined
     if (answer?.delivered !== true || typeof answer.messageId !== 'string') fail(`publish answered ${JSON.stringify(answer)}`)
     await waitFor(() => obsDeliveries.some((d) => /typed-by-publish/.test(d.text)), 3000, 'the observer receiving the note')
-    await sleep(1200)
+    // The point where typing could have happened is shown, not slept past: the terminal takes input in
+    // order, so a command run after the note reached termd, whose output the screen then shows, comes
+    // after anything the publish had typed (the house's read, #22 comment 6274806357).
+    const marker = await call('run', { session: SESSION, command: 'echo after-the-note', wait: 5000 })
+    if (marker.structured?.state !== 'exited' || marker.structured?.exit !== 0) fail(`the marker command after the note: ${marker.text}`)
     const screen = await call('screen', { session: SESSION })
     // The screen must be the session's: a failed read, with no text to match, is no evidence.
     if (screen.isError) fail(`screen: ${screen.text}`)
     if (!/bridge-output/.test(screen.text)) fail(`the screen does not show the session's output:\n${screen.text}`)
+    if (!/after-the-note/.test(screen.text)) fail(`the screen does not show the marker command run after the note:\n${screen.text}`)
     if (/typed-by-publish/.test(screen.text)) fail(`typed into the shell:\n${screen.text}`)
     const echoes = deliveries.slice(before).filter((d) => /typed-by-publish/.test(d.text))
     if (echoes.length) fail('a note came back as a delivery (loop risk)')

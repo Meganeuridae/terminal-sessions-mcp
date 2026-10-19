@@ -167,7 +167,9 @@ try {
     assert.equal(scoutConnections(), before + 1, `termd accepted a new connection from the scout:\n${serverLog.slice(-10).join('\n')}`);
     assert.equal(registry.get(SESSION).session.run(runId).state, 'running', 'the Run was in flight across the drop');
   });
-  // Shown or failed, the Run is released now, so the checks after this one see it end.
+  // Shown or failed, the Run is released now, so the checks after this one see it end. A completion
+  // that falls inside the disconnect is not staged here: mcpl-lane.spec's reconnect cases (mcpl-7,
+  // mcpl-8, m2-18, the channels-only host) cover it.
   fs.writeFileSync(released, '');
 
   await check('a useful completion notification through the host, and the inference call it woke', async () => {
@@ -209,12 +211,18 @@ try {
     // prose in the same inference call; a host that infers again after the tool result makes a second)
     // and then the host's routing of the prose, which the turn awaits before the agent is idle. A fixed
     // second here let a publish that landed later pass unseen (the house's read, #22 comment
-    // 6269721389): the check waits for the host's idle, then for termd to have handed the tool call's
-    // note to the channel's open connections (the scout's host among them) and the host's idle again,
-    // so a publish from the prose, or a wake from the note's echo, is counted below rather than missed.
+    // 6269721389): the check waits for the host's idle, then for termd's own evidence that the note
+    // passed through the scout's lane: a principal's own note is never sent back to it (mcpl-14), so
+    // the lane settles it and the scout's delivered cursor moves past the note's seq. The observer's
+    // copy would show nothing of that lane (the house's read, #22 comment 6274806357). A note that
+    // never reached termd leaves the cursor where it was, and the wait ends quietly: the assertion
+    // below, with the host's channel_publish calls and routing in its message, is what says so.
     await within(framework.runUntilIdle(), 8000, 'the host going idle after the turn');
-    await observer.delivery((x) => x.text.includes(TOOL_NOTE), 3000);
-    await within(framework.runUntilIdle(), 8000, 'the host idle again after the note reached the channel');
+    const scoutDelivered = () => registry.get(SESSION).session.cursorsOf('agent:scout@test').delivered;
+    const noteSeq = () => byTool(scoutNotes(journal()))[0]?.seq;
+    for (const settle = Date.now() + 3000; (noteSeq() === undefined || scoutDelivered() < noteSeq()) && Date.now() < settle; ) await sleep(50);
+    log(`   the scout's delivered cursor: ${scoutDelivered()}; the note's seq: ${noteSeq() ?? 'no note'}`);
+    await within(framework.runUntilIdle(), 8000, 'the host idle again after the note passed its lane');
     const events = journal();
     assert.ok(!events.some((e) => e.type === 'input'), 'no input events');
     assert.ok(!fs.existsSync(marker), 'neither text executed');

@@ -34,8 +34,11 @@ OOMPolicy=continue
 # does: a foreground job ends with it, while a job a session detached on purpose (setsid, nohup,
 # disown) lives on, matching the header of daemon.ts. KillMode=mixed would SIGTERM termd and then,
 # on every stop, SIGKILL whatever is left in the cgroup once termd has exited, not only when the
-# stop times out: a run showed a setsid'd child and a background child killed in a stop that took
-# half a second (the house's read, #22 comments 6264958172 and 6269721389). What process costs: if
+# stop times out: systemd.kill(5) says that if processes still remain after the main process of a
+# unit has exited (which applies to KillMode=mixed), the termination request is repeated with
+# SIGKILL. A run on systemd 255 agreed: a setsid'd child and a background child were killed in a
+# stop that took half a second (the house's read, #22 comments 6264958172, 6269721389 and
+# 6274806357). What process costs: if
 # termd itself does not exit within TimeoutStopSec, systemd SIGKILLs termd alone, the sessions'
 # surviving jobs are left as they are, and the process Runs termd had not yet ended keep running
 # until the next start's recovery ends their groups (daemon.ts says so at its last-resort cleanup).
