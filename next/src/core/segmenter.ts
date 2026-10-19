@@ -22,10 +22,11 @@ import { cleanLine } from './ansi.js';
 import { clocks } from './clock.js';
 import type { Journal } from './journal.js';
 import type { RunOutput } from './runindex.js';
+import { cutPlumbing } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
-import { stripEscapes, tailStart } from './text.js';
+import { tailStart } from './text.js';
 import { project } from './transcript.js';
-import type { JournalEvent, OutputStream, Principal, RunInfo, ScreenSnapshot, Seq } from './types.js';
+import { DEFAULT_GEOMETRY, type EventOf, type JournalEvent, type OutputStream, type Principal, type RunInfo, type ScreenSnapshot, type Seq } from './types.js';
 
 export type SegmentKind =
   | 'run'
@@ -230,53 +231,30 @@ export function tailBytes(text: string, max: number): string {
 
 // ───────────── sources ─────────────
 
-type Output = Extract<JournalEvent, { type: 'output' }>;
-type RunEnd = Extract<JournalEvent, { type: 'run.end' }>;
-type Recovered = Extract<JournalEvent, { type: 'recovered' }>;
-type SessionExit = Extract<JournalEvent, { type: 'session.exit' }>;
+type Output = EventOf<'output'>;
+type RunEnd = EventOf<'run.end'>;
+type Recovered = EventOf<'recovered'>;
+type SessionExit = EventOf<'session.exit'>;
 
 /** Input read to render a Run of an earlier life or of history: its newest part (runOutput walks backwards). */
 const HISTORY_RUN_INPUT_BYTES = 64 * 1024;
 
-/** The shell integration's end marker as the shell prints it; the typed wrapper echoes it split (`<<<EXI""T:`), so this never matches the echo. */
-const END_MARKER = /<<<EXIT:[^:>\s]+:-?\d+>>>/g;
-/** A declared shell's Run opens with its start marker; what precedes its line is the typed wrapper. */
-const START_MARKER = /<<<START:[^:>\s]+>>>[^\n]*\n/;
-/** The echo of a typed wrapper line, in any of the shells' spellings. */
-const WRAPPER_ECHO = /<<<EXI(?:""|'')T:/g;
-
-/**
- * A shell Run's plumbing cut from its journaled output, as the live transcript cuts it (the
- * session knows the nonce; here the markers' shape is enough): the typed wrapper's echo, the
- * start marker and everything from the end marker on. A Run rendered from the journal kept both
- * (the house's read of 3eade8a, #22).
- */
-function cutPlumbing(raw: string): string {
-  const { text, map } = stripEscapes(raw);
-  let from = 0;
-  let to = text.length;
-  let lastEcho = -1;
-  for (const m of text.matchAll(WRAPPER_ECHO)) lastEcho = m.index!;
-  if (lastEcho !== -1) {
-    const nl = text.indexOf('\n', lastEcho);
-    if (nl === -1) return '';
-    from = nl + 1;
-  }
-  const start = START_MARKER.exec(text.slice(from));
-  if (start?.index === 0) from += start[0].length;
-  for (const m of text.matchAll(END_MARKER)) to = m.index!;
-  if (from >= to) return '';
-  return raw.slice(map[from]!, map[to] ?? raw.length);
+/** How a Run of history is rendered: the geometry to fall back on when the Run recorded none, and how much of its newest output is read. */
+export interface HistoryRender {
+  cols?: number;
+  rows?: number;
+  maxInputBytes?: number;
 }
 
 /**
- * A Run's text from the journal alone: the newest part of its attributed output, projected (§6)
- * at the width the Run started at when the journal recorded one (the live transcript's width).
+ * A Run's text from the journal alone (the one renderer of history, for completions and for
+ * results): the newest part of its attributed output, a shell Run's plumbing cut by shape, projected
+ * (§6) at the size the Run started at when the journal recorded one, else the caller's.
  */
-export async function journalRunText(o: RunOutput, cols = 120, run?: RunInfo): Promise<RunText> {
+export async function journalRunText(o: RunOutput, how: HistoryRender = {}, run?: RunInfo): Promise<RunText> {
   const events = o.events.filter((e): e is Output => e.type === 'output');
   const chunks = run?.target === 'shell' && events.every((e) => e.stream === 'pty') ? [{ data: cutPlumbing(events.map((e) => e.data).join('')), stream: 'pty' as const }] : events.map((e) => ({ data: e.data, stream: e.stream }));
-  const p = await project(chunks, { cols: run?.cols ?? cols, maxInputBytes: HISTORY_RUN_INPUT_BYTES, keep: 'tail' });
+  const p = await project(chunks, { cols: run?.cols ?? how.cols ?? DEFAULT_GEOMETRY.cols, rows: run?.rows ?? how.rows ?? DEFAULT_GEOMETRY.rows, maxInputBytes: how.maxInputBytes ?? HISTORY_RUN_INPUT_BYTES, keep: 'tail' });
   return { text: p.text, truncated: o.truncated || p.truncated, seq: [o.from, o.to], nextCursor: o.to };
 }
 
@@ -311,7 +289,7 @@ export function journalSource(o: {
       return o.controller?.() ?? null;
     },
     run: (runId) => (o.run ? o.run(runId) : o.journal.runs.run(runId)),
-    runText: (runId) => o.transcript?.(runId) ?? journalRunText(o.journal.runs.output(o.journal, runId, { maxBytes: HISTORY_RUN_INPUT_BYTES }), o.cols, runOf({ run: (id) => (o.run ? o.run(id) : o.journal.runs.run(id)) }, runId)),
+    runText: (runId) => o.transcript?.(runId) ?? journalRunText(o.journal.runs.output(o.journal, runId, { maxBytes: HISTORY_RUN_INPUT_BYTES }), { ...(o.cols !== undefined ? { cols: o.cols } : {}) }, runOf({ run: (id) => (o.run ? o.run(id) : o.journal.runs.run(id)) }, runId)),
   };
 }
 
@@ -390,7 +368,7 @@ class Render {
     return seg;
   }
 
-  service(ev: Extract<JournalEvent, { type: 'service' }>): Segment {
+  service(ev: EventOf<'service'>): Segment {
     const run = runOf(this.src, ev.runId);
     const desc = run ? describeRun(run) : ev.runId;
     const name = ev.name ? `${ev.name} ` : '';
@@ -404,7 +382,7 @@ class Render {
     };
   }
 
-  watch(ev: Extract<JournalEvent, { type: 'watch.fired' }>): Segment {
+  watch(ev: EventOf<'watch.fired'>): Segment {
     const what = ev.kind === 'pattern' ? `matched: ${oneLine(ev.line ?? ev.match ?? '', 160)}` : ev.kind === 'silence' ? (ev.match ?? 'output went quiet') : 'the shell is available';
     return {
       ...this.base('watch', ev.seq, { watchId: ev.watchId, label: ev.label, watchKind: ev.kind, match: ev.match, at: ev.at }, ev.ts),
@@ -448,7 +426,7 @@ class Render {
     };
   }
 
-  waiting(ev: Extract<JournalEvent, { type: 'run.waiting' }>): Segment | undefined {
+  waiting(ev: EventOf<'run.waiting'>): Segment | undefined {
     const run = runOf(this.src, ev.runId);
     if (!run) return undefined;
     return {
@@ -462,7 +440,7 @@ class Render {
   }
 
   /** A note (§10.1): what a principal said on the channel, for everyone else with it open (mcpl-14). */
-  note(ev: Extract<JournalEvent, { type: 'note' }>): Segment {
+  note(ev: EventOf<'note'>): Segment {
     const seg: Segment = {
       ...this.base('note', ev.seq, { principal: ev.principal }, ev.ts),
       lifecycle: false,
@@ -478,7 +456,7 @@ class Render {
 
 // ───────────── replay: catch-up and channel history ─────────────
 
-export type LifecycleEvent = Extract<JournalEvent, { type: 'run.end' | 'service' | 'watch.fired' | 'session.exit' | 'recovered' | 'run.waiting' | 'note' }>;
+export type LifecycleEvent = EventOf<'run.end' | 'service' | 'watch.fired' | 'session.exit' | 'recovered' | 'run.waiting' | 'note'>;
 
 /** The Runs a daemon restart made lost, and whose they were (they have explicit interest in its recovery, G28). */
 export interface Lost {
@@ -1194,7 +1172,7 @@ export class Segmenter {
    * edited (m2-22), shown only when the program echoed it and the prompt did not ask
    * for a secret; anything else is a placeholder (m2-2, G26).
    */
-  private onInput(ev: Extract<JournalEvent, { type: 'input' }>): void {
+  private onInput(ev: EventOf<'input'>): void {
     if (ev.kind === 'protocol-reply' || !ev.principal.startsWith('human:') || this.alt || this.disposing) return;
     let h = this.human.get(ev.principal);
     if (!h) {

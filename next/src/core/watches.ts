@@ -23,7 +23,7 @@ import { compileLinePattern, PARTIAL_QUIET_MS, StreamMatcher } from './ansi.js';
 import { clocks, MAX_TIMER_MS, timerMs } from './clock.js';
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
-import type { IntegrationLevel, JournalEvent, Principal, RunInfo, Seq } from './types.js';
+import type { EventOf, IntegrationLevel, JournalEvent, Principal, RunInfo, Seq } from './types.js';
 
 export type WatchKind = 'pattern' | 'silence' | 'idle';
 
@@ -99,7 +99,7 @@ export function kindOf(spec: WatchSpec): WatchKind {
 }
 
 /** Which matcher stream an output event belongs to: the PTY is one stream; each process pipe is its own. */
-const streamKey = (ev: Extract<JournalEvent, { type: 'output' }>) => (ev.stream === 'pty' ? 'pty' : `${ev.stream}:${ev.runId ?? ''}`);
+const streamKey = (ev: EventOf<'output'>) => (ev.stream === 'pty' ? 'pty' : `${ev.stream}:${ev.runId ?? ''}`);
 
 /** A matcher's hit as the predicate fires it; `clipped` travels only when set (the house's read of ed4ecac, #22: the flag was produced and dropped). */
 const hitOf = (hit: { match: string; line: string; clipped?: boolean }, seq: Seq): Hit => (hit.clipped ? { match: hit.match, line: hit.line.trim(), seq, clipped: true } : { match: hit.match, line: hit.line.trim(), seq });
@@ -135,7 +135,7 @@ class Predicate {
     private readonly host: WatchHost,
     private readonly fire: (hit: Hit) => void,
     /** The Run named by `runId` ended (after any trailing line was matched). */
-    private readonly onRunEnd?: (ev: Extract<JournalEvent, { type: 'run.end' }>) => void,
+    private readonly onRunEnd?: (ev: EventOf<'run.end'>) => void,
   ) {
     if (kind === 'pattern') this.re = compileLinePattern(spec.pattern!);
   }

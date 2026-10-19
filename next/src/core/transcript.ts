@@ -83,6 +83,7 @@
 import xterm from '@xterm/headless';
 import type { IBuffer, Terminal as TerminalType } from '@xterm/headless';
 import { persistentState } from './screen.js';
+import { DEFAULT_GEOMETRY } from './types.js';
 import { headIndex, sequenceEnd, tailStart, utf8Length } from './text.js';
 
 const { Terminal } = xterm;
@@ -718,7 +719,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
 
 /** The projection's text alone (the tail survives `maxLines`); see `project`. */
 export async function transcript(chunks: Iterable<ProjectChunk>, opts: TranscriptOptions = {}): Promise<string> {
-  const o: ProjectOptions = { cols: opts.cols ?? 120, rows: opts.rows ?? 30 };
+  const o: ProjectOptions = { cols: opts.cols ?? DEFAULT_GEOMETRY.cols, rows: opts.rows ?? DEFAULT_GEOMETRY.rows };
   if (opts.maxLines !== undefined) o.maxLines = opts.maxLines;
   return (await project(chunks, o)).text;
 }

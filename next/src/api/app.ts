@@ -11,12 +11,11 @@ import { createHash } from 'node:crypto';
 import { err, TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { validateServiceSpec, type ServiceSpec } from '../core/probes.js';
-import { promptLine, Segmenter, type SegmenterOptions } from '../core/segmenter.js';
+import { journalRunText, promptLine, Segmenter, type SegmenterOptions } from '../core/segmenter.js';
 import { ServiceManager, type ServiceInfo } from '../core/services.js';
 import { isTerminal, type Session } from '../core/session.js';
 import { cutTail } from '../core/text.js';
-import { project } from '../core/transcript.js';
-import type { Attribution, EnvBasis, JournalEvent, Principal, RunInfo, RunTarget, ScreenSnapshot, Seq, ServiceStatus, Visibility } from '../core/types.js';
+import { DEFAULT_GEOMETRY, type Attribution, type EnvBasis, type JournalEvent, type Principal, type RunInfo, type RunTarget, type ScreenSnapshot, type Seq, type ServiceStatus, type Visibility } from '../core/types.js';
 import { SYSTEM } from '../core/types.js';
 import { WatchManager, type WaitResult, type WatchInfo, type WatchSpec } from '../core/watches.js';
 import { guiActsFor } from './principals.js';
@@ -150,8 +149,6 @@ interface Extras {
 }
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
-type Output = Extract<JournalEvent, { type: 'output' }>;
-const isOutput = (e: JournalEvent): e is Output => e.type === 'output';
 
 /** The longest idempotency key accepted (a UUID fits with room to spare). */
 const MAX_KEY_LENGTH = 200;
@@ -896,18 +893,15 @@ export class App {
       to = t.seq[1];
       truncated = t.truncated;
     } else {
-      const o = s.runOutput(run.runId, { maxBytes: 1024 * 1024 });
-      const geometry = geometryOf(s);
-      const p = await project(
-        o.events.filter(isOutput).map((e) => ({ data: e.data, stream: e.stream, ...(e.runId !== undefined ? { runId: e.runId } : {}) })),
-        { cols: run.cols ?? geometry.cols, rows: run.rows ?? geometry.rows, maxInputBytes: 1024 * 1024, keep: 'tail' },
-      );
-      // The live transcript cuts a marker Run's plumbing with the Run's nonce; the journal keeps the
-      // plumbing and not the nonce, so history is cut by shape (the house's read of 1cabc6a, #22).
-      text = run.target === 'shell' ? cutMarkerPlumbing(p.text) : p.text;
-      from = o.from;
-      to = o.to;
-      truncated = o.truncated || p.truncated;
+      // History is rendered by the one renderer the segmenter uses too: the plumbing a marker Run
+      // left in the journal is cut by shape, since the nonce is gone with the live session (the
+      // house's read of 1cabc6a, #22), at the size the Run recorded, else the session's.
+      const o = s.runOutput(run.runId, { maxBytes: HISTORY_INPUT_BYTES });
+      const t = await journalRunText(o, { ...geometryOf(s), maxInputBytes: HISTORY_INPUT_BYTES }, run);
+      text = t.text;
+      from = t.seq[0];
+      to = t.seq[1];
+      truncated = t.truncated;
     }
     const cut = cutTail(text, this.resultBytes);
     if (cut.cut) text = `[… earlier output omitted · read runId=${run.runId} pages through all of it]\n${cut.text}`;
@@ -1213,38 +1207,14 @@ function head(line: string, max = 120): string {
  * session recorded at creation (a resize during its life is not kept there; a Run's pages use the
  * Run's own recorded geometry) — the house's read of 1cabc6a, #22.
  */
+/** How much of a Run's newest output a result rendered from history reads. */
+const HISTORY_INPUT_BYTES = 1024 * 1024;
+
 function geometryOf(s: AnySession): { cols: number; rows: number } {
   if (s.kind === 'live') return { cols: s.session.screen.cols, rows: s.session.screen.rows };
-  return { cols: s.options.cols ?? 120, rows: s.options.rows ?? 30 };
+  return { cols: s.options.cols ?? DEFAULT_GEOMETRY.cols, rows: s.options.rows ?? DEFAULT_GEOMETRY.rows };
 }
 
-const MARKER_END = /<<<EXIT:[0-9a-f]+:-?\d+>>>/;
-const MARKER_START = /<<<START:[0-9a-f]+>>>/;
-/** The echo of the end-marker probe typed after a ^C: the marker split differently from the wrapper's. */
-const PROBE_ECHO = /EX""IT:[0-9a-f]+:|EXI''T:[0-9a-f]+:/;
-
-/**
- * A marker Run's output read from history, cut as the live transcript cuts it (Session.runTranscript):
- * the echo of the wrapper that typed it (its last line ends in the marker's closing quote), a probe typed
- * after a ^C and what follows it, the end marker and the prompt after it. A declared shell's Run begins
- * after its start marker. Output with no end marker in it is not a marker Run's and is left whole.
- */
-export function cutMarkerPlumbing(text: string): string {
-  const lines = text.split('\n');
-  let end = lines.findIndex((l) => MARKER_END.test(l));
-  if (end === -1) return text;
-  const probe = lines.slice(0, end).findIndex((l) => PROBE_ECHO.test(l));
-  if (probe !== -1) end = probe;
-  let from = 0;
-  for (let i = end - 1; i >= 0; i--) {
-    const l = lines[i]!.trimEnd();
-    if (MARKER_START.test(l) || l.endsWith('>>>"')) {
-      from = i + 1;
-      break;
-    }
-  }
-  return lines.slice(from, end).join('\n');
-}
 
 function readSource(s: AnySession): ReadSource {
   const geometry = geometryOf(s);

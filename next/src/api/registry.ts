@@ -30,7 +30,7 @@ import { acquireDataDirLock, listProcesses, livingGroups, sleepSync, type DataDi
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { Session, trustedDir, type SessionOptions } from '../core/session.js';
 import { FileStore, FreeSpaceFloor, MemoryStore, type DiskFloor, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
-import { SYSTEM, type ControlPolicy, type Cursors, type JournalEvent, type Principal, type RunInfo, type Seq, type Visibility } from '../core/types.js';
+import { DEFAULT_GEOMETRY, SYSTEM, type ControlPolicy, type Cursors, type JournalEvent, type Principal, type RunInfo, type Seq, type Visibility } from '../core/types.js';
 import { prepareIntegration } from '../shell/integration.js';
 
 export interface RegistryOptions {
@@ -735,8 +735,8 @@ export class SessionRegistry {
       visibility: o.visibility ?? rec?.visibility ?? 'private',
       control: o.control ?? rec?.control ?? 'seat',
       cwd: o.cwd ?? rec?.cwd ?? this.opts.defaultCwd ?? process.cwd(),
-      cols: o.cols ?? rec?.cols ?? 120,
-      rows: o.rows ?? rec?.rows ?? 30,
+      cols: o.cols ?? rec?.cols ?? DEFAULT_GEOMETRY.cols,
+      rows: o.rows ?? rec?.rows ?? DEFAULT_GEOMETRY.rows,
       retention,
     };
     const shellArgs = o.shellArgs ?? rec?.shellArgs;

@@ -59,7 +59,7 @@ import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
 import { persistentState } from '../core/screen.js';
 import { countLines, cutTail, headIndex, indexAtByte, safeCut, sequenceEnd, unfinishedSequence, utf8Length } from '../core/text.js';
 import { project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
-import type { JournalEvent, RunInfo, Seq } from '../core/types.js';
+import { DEFAULT_GEOMETRY, type EventOf, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
 
 /** A hole in the journal (G11, G19), as a result reports it. */
 export interface GapInfo {
@@ -159,8 +159,8 @@ export interface ReadSource {
 }
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
-type Output = Extract<JournalEvent, { type: 'output' }>;
-type Gap = Extract<JournalEvent, { type: 'gap' }>;
+type Output = EventOf<'output'>;
+type Gap = EventOf<'gap'>;
 const isOutput = (e: JournalEvent): e is Output => e.type === 'output';
 const isGap = (e: JournalEvent): e is Gap => e.type === 'gap';
 const terminal = (s: RunInfo['state'] | undefined) => s === 'exited' || s === 'cancelled' || s === 'lost';
@@ -292,7 +292,7 @@ export async function readJournal(src: ReadSource, o: ReadOptions, defaults: { r
   };
   // The Run's record: the source's (a live Session's, with its recorded geometry), else the journal's index.
   const run = o.runId !== undefined ? (src.run?.(o.runId) ?? journal.runs.get(o.runId)) : undefined;
-  const geometry = { cols: run?.cols ?? src.cols, rows: run?.rows ?? src.rows ?? 30 };
+  const geometry = { cols: run?.cols ?? src.cols, rows: run?.rows ?? src.rows ?? DEFAULT_GEOMETRY.rows };
   if (o.tail !== undefined) return res(await tailRead(src, o, maxBytes, geometry));
   if (o.as === 'events') return res(eventsPage(src, o, maxBytes));
   return res(await textPage(src, o, maxBytes, geometry, run));

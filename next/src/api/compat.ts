@@ -9,9 +9,10 @@
  */
 import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
+import { exitMark, probeMark } from '../core/plumbing.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
 import { project, type ProjectChunk } from '../core/transcript.js';
-import type { JournalEvent, Seq, ServiceStatus } from '../core/types.js';
+import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
 import { commitReadDelivery, type App, type SessionSummary } from './app.js';
 import { looksLikeShellOpener } from './hints.js';
 import type { ToolContext, ToolDef, ToolResult } from './tools.js';
@@ -87,7 +88,8 @@ async function runOutput(ctx: ToolContext, session: string, runId: string, raw: 
  * `eval (__tsm_collect '…' $status)`, and the marker that strategy prints. 1.x kept these out of
  * its logs and logged `$ <command>` in their place (the house's read of 1cabc6a, #22).
  */
-const PLUMBING = /(?:command )?\. '(?:[^'\n]|'\\'')*\/tsm-cmd-\d+'(?:; echo "<<<EXI""T:[0-9a-f]+:\$\?>>>")?|eval \(__tsm_collect '(?:[^'\n]|'\\'')*\/tsm-cmd-\d+' \$status\)|<<<EXIT:[0-9a-f]+:\d+>>>/g;
+const TYPED_LINE = /(?:command )?\. '(?:[^'\n]|'\\'')*\/tsm-cmd-\d+'(?:; echo "<<<EXI""T:[0-9a-f]+:\$\?>>>")?|eval \(__tsm_collect '(?:[^'\n]|'\\'')*\/tsm-cmd-\d+' \$status\)/;
+const PLUMBING = new RegExp(`${TYPED_LINE.source}|${exitMark().source}|${probeMark().source}`, 'g');
 
 /** A log line without the plumbing; null when nothing else was on it (a soft wrap can leave part of a long echo). */
 function withoutPlumbing(line: string): string | null {
@@ -146,8 +148,8 @@ async function tailEvents(ctx: ToolContext, session: string, n: number, rows: nu
  */
 async function tailLines(ctx: ToolContext, session: string, n: number, raw: boolean): Promise<{ lines: string[]; cut?: Seq }> {
   const s = summaryOf(ctx, session);
-  const cols = s?.cols ?? 120;
-  const rows = s?.rows ?? 30;
+  const cols = s?.cols ?? DEFAULT_GEOMETRY.cols;
+  const rows = s?.rows ?? DEFAULT_GEOMETRY.rows;
   const { events, cut } = await tailEvents(ctx, session, n, rows);
   const res = (lines: string[]) => (cut !== undefined ? { lines: lines.slice(-n), cut } : { lines: lines.slice(-n) });
   if (raw) {

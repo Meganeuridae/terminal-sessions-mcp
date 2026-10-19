@@ -20,26 +20,10 @@ import { livingGroups } from './lock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
+import { exitMark, firstMark, probeMark, startMark } from './plumbing.js';
 import { stripEscapes } from './text.js';
 import { project, type ProjectChunk } from './transcript.js';
-import {
-  SYSTEM,
-  type AttachmentRole,
-  type ControlPolicy,
-  type Cursors,
-  type EnvBasis,
-  type IntegrationLevel,
-  type JournalEvent,
-  type Principal,
-  type RunInfo,
-  type RunOrigin,
-  type RunState,
-  type RunTarget,
-  type ScreenSnapshot,
-  type Seq,
-  type ShellState,
-  type Visibility,
-} from './types.js';
+import { type AttachmentRole, type ControlPolicy, type Cursors, DEFAULT_GEOMETRY, type EnvBasis, type EventOf, type IntegrationLevel, type JournalEvent, type Principal, type RunInfo, type RunOrigin, type RunState, type RunTarget, type ScreenSnapshot, type Seq, type ShellState, SYSTEM, type Visibility } from './types.js';
 
 export type { RunInfo } from './types.js';
 
@@ -217,6 +201,7 @@ const MAX_ORPHAN_LINES = 32;
  * The end-marker probe (marker strategy): a marker of its own, split so echoes never match. It
  * confirms the shell is back, never the command's status; and the command's own end marker,
  * arriving after a cancel that failed, still reads as the end it is (the house's read of a6d0c35, #22).
+ * The shapes printed here and by inlineLines are the ones plumbing.ts parses.
  */
 const probeLine = (nonce: string) => ` echo "<<<PRO""BE:${nonce}>>>"`;
 const publicRun = (r: RunRecord): RunInfo => {
@@ -398,15 +383,10 @@ function declaredFlavor(name: string): 'posix' | 'fish' {
   throw err('invalid_argument', `shell: "${name}" is not a shell the daemon can type for (sh, bash, zsh, dash, ash, ksh, fish)`, { shell: name });
 }
 
-type OutputEvent = Extract<JournalEvent, { type: 'output' }>;
+type OutputEvent = EventOf<'output'>;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 /** The position of whichever of `needles` comes first in `text`; -1 when none does. */
-const firstIndex = (text: string, needles: string[]): number => {
-  const found = needles.map((n) => text.indexOf(n)).filter((i) => i !== -1);
-  return found.length ? Math.min(...found) : -1;
-};
-
 /**
  * Create a command file that did not exist, never through a symlink (jr2-3). The directory
  * was checked to be ours, so an existing name is a file an earlier life of this session left
@@ -611,7 +591,7 @@ export class Session {
     this.markKey = opts.integration?.key || randomBytes(16).toString('hex');
     this.marks = new MarksParser(this.markKey);
     this.flavor = flavorOf(opts.shell);
-    this.screen = new Screen({ cols: opts.cols ?? 120, rows: opts.rows ?? 30 });
+    this.screen = new Screen({ cols: opts.cols ?? DEFAULT_GEOMETRY.cols, rows: opts.rows ?? DEFAULT_GEOMETRY.rows });
     this.readyPromise = new Promise<void>((resolve) => (this.readyResolve = resolve));
   }
 
@@ -1815,10 +1795,10 @@ export class Session {
       if (run.state === 'starting') {
         const t = `<<<GONE:${n}>>>`;
         consider(run, 'gone', window.indexOf(t), t.length);
-        numbered(run, 'start', new RegExp(`<<<START:${n}:(\\d+)>>>`));
+        numbered(run, 'start', startMark(n));
       }
-      if (run.state === 'running') numbered(run, 'exit', new RegExp(`<<<EXIT:${n}:(-?\\d+)>>>`));
-      if (run.probed) numbered(run, 'probe', new RegExp(`<<<PROBE:${n}:(\\d+)>>>`));
+      if (run.state === 'running') numbered(run, 'exit', exitMark(n));
+      if (run.probed) numbered(run, 'probe', probeMark(n));
     }
     return best;
   }
@@ -2108,8 +2088,8 @@ export class Session {
 
   private scanMarker(run: RunRecord, chunk: string): void {
     const window = (run.markerTail ?? '') + chunk;
-    const exit = new RegExp(`<<<EXIT:${run.markerNonce}:(-?\\d+)>>>`).exec(window);
-    const probe = run.probed ? window.indexOf(`<<<PROBE:${run.markerNonce}>>>`) : -1;
+    const exit = exitMark(run.markerNonce!).exec(window);
+    const probe = run.probed ? (probeMark(run.markerNonce!).exec(window)?.index ?? -1) : -1;
     if (exit && (probe === -1 || exit.index < probe)) {
       run.markerTail = '';
       // The marker chained on the command's line: its status, after a cancel that failed too.
@@ -2434,7 +2414,7 @@ export class Session {
       // resolved marker. A probe line (typed after an aborting ^C) is removed first. The
       // echo is found on the text without escape sequences (ss-12), then cut in the raw.
       const joined = chunks.join('');
-      const marker = firstIndex(joined, [`<<<EXIT:${run.markerNonce}:`, `<<<PROBE:${run.markerNonce}>>>`]);
+      const marker = firstMark(joined, run.markerNonce);
       let body = marker === -1 ? joined : joined.slice(0, marker);
       let plain = stripEscapes(body);
       const probe = plain.text.lastIndexOf(probeLine(run.markerNonce).slice(0, -4).trim());
@@ -2454,7 +2434,7 @@ export class Session {
       // ends the marker's line is the shell's) and ends at its end marker; a probe line typed after
       // a ^C is cut too.
       let body = chunks.join('');
-      const marker = firstIndex(body, [`<<<EXIT:${run.markerNonce}:`, `<<<PROBE:${run.markerNonce}:`]);
+      const marker = firstMark(body, run.markerNonce);
       if (marker !== -1) body = body.slice(0, marker);
       const plain = stripEscapes(body);
       const probe = plain.text.lastIndexOf(`printf '<<<PRO''BE:${run.markerNonce}`);

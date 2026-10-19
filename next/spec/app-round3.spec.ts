@@ -10,7 +10,8 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { App, cutMarkerPlumbing, type Caller } from '../src/api/app.js';
+import { App, type Caller } from '../src/api/app.js';
+import { cutPlumbing } from '../src/core/plumbing.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { callTool, TOOLS, type ResultText, type ToolResult } from '../src/api/tools.js';
 import { validate } from '../src/api/validate.js';
@@ -160,13 +161,13 @@ test('defect 10: a marker Run read from history has the daemon’s wrapper cut, 
     'MARKED-OUTPUT\n' +
     '<<<EXIT:74ef5182:0>>>\n' +
     'bash-3.2$';
-  assert.equal(cutMarkerPlumbing(fromHistory), 'MARKED-OUTPUT', 'wrapper, end marker and prompt are cut');
-  // A probe line typed after a ^C (the marker split differently) and what follows it go too.
-  const withProbe = 'OUT\n echo "<<<EX""IT:74ef5182:$?>>>"\nleftover\n<<<EXIT:74ef5182:130>>>\nbash-3.2$';
-  assert.equal(cutMarkerPlumbing(withProbe), 'OUT');
+  assert.equal(cutPlumbing(fromHistory), 'MARKED-OUTPUT\n', 'wrapper, end marker and prompt are cut');
+  // The end-marker probe typed after a ^C (its own mark, split in the echo) and what follows it go too.
+  const withProbe = 'OUT\n echo "<<<PRO""BE:74ef5182>>>"\nleftover\n<<<PROBE:74ef5182>>>\n<<<EXIT:74ef5182:130>>>\nbash-3.2$';
+  assert.equal(cutPlumbing(withProbe), 'OUT\n');
   // Ordinary output with no marker in it is left whole.
   const plain = 'line one\nline two\n';
-  assert.equal(cutMarkerPlumbing(plain), plain);
+  assert.equal(cutPlumbing(plain), plain);
 });
 
 test('texts: session and run errors name a next step, and no guarantee label leaks into agent text', async () => {

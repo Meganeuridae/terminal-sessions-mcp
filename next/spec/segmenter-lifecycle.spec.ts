@@ -626,7 +626,8 @@ test("a Run rendered from the journal loses the typed wrapper's echo and the end
   // A declared shell's Run: start marker and the printf wrapper go too.
   src.journal.append({ type: 'run.admit', runId: 'inl', target: 'shell', line: 'uname', principal: A, origin: 'self', queued: false, shell: 'sh', within: 'ssh1' });
   src.journal.append({ type: 'run.start', runId: 'inl', cwd: '/w' });
-  src.journal.append({ type: 'output', data: `printf '<<<STAR''T:n1>>>\\n'; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:n1:%s>>>\\n' "$?"\r\n<<<START:n1>>>\r\nLinux\r\n<<<EXIT:n1:0>>>\r\n`, stream: 'pty', runId: 'inl' });
+  // The shapes the session prints today: the start marker names the shell's pid (the house's read of a6d0c35, #22).
+  src.journal.append({ type: 'output', data: `printf '<<<STAR''T:n1:%s>>>\\n' "$$"; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:n1:%s>>>\\n' "$?"\r\n<<<START:n1:4242>>>\r\nLinux\r\n<<<EXIT:n1:0>>>\r\n`, stream: 'pty', runId: 'inl' });
   src.journal.append({ type: 'run.end', runId: 'inl', state: 'exited', exit: 0, durationMs: 3 });
   const r2 = await replay(src);
   assert.equal(r2.at(-1)?.body, 'Linux');

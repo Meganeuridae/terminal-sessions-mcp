@@ -80,6 +80,9 @@ export type JournalEvent = EventInput & { seq: Seq; ts: number };
 export type EventType = JournalEvent['type'];
 export type EventOf<T extends EventType> = Extract<JournalEvent, { type: T }>;
 
+/** The terminal size a session, a transcript or a history read gets when nothing recorded one. */
+export const DEFAULT_GEOMETRY = { cols: 120, rows: 30 } as const;
+
 /** A Run as exposed by the core (G1–G3). */
 export interface RunInfo {
   runId: string;

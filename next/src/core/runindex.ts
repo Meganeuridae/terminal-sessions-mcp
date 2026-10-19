@@ -8,9 +8,9 @@
  */
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
-import type { JournalEvent, RunInfo, Seq } from './types.js';
+import type { EventOf, JournalEvent, RunInfo, Seq } from './types.js';
 
-type OutputEvent = Extract<JournalEvent, { type: 'output' }>;
+type OutputEvent = EventOf<'output'>;
 
 /**
  * Written at the head of each file the file store rotates into: the Runs still
@@ -62,7 +62,7 @@ export function boundHeader(h: RotationHeader, maxBytes = Number.POSITIVE_INFINI
   return { v: 1, openRuns: runs.slice(k) };
 }
 
-type GapEvent = Extract<JournalEvent, { type: 'gap' }>;
+type GapEvent = EventOf<'gap'>;
 
 /** A Run's attributed output, the same shape as `Session.runOutput` (G12), holes included: `gaps` is part of what the reader relies on. */
 export interface RunOutput {
