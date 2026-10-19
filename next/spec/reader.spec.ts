@@ -381,6 +381,34 @@ test('er-2: the tail of apt-style output reads as the terminal shows it, though 
   }
 });
 
+// ───────────── the house's read of ed4ecac (#22): a hole ends an open sequence ─────────────
+
+test('ed4ecac 3: output that ends inside a control sequence before a hole hides neither the hole nor what follows it', async () => {
+  for (const open of ['\x1b]0;my tit', '\x1b[', '\x1bPq1', '\x1b_x']) {
+    const many = source();
+    out(many.journal, 'line 1\r\n');
+    out(many.journal, `prompt ${open}`);
+    many.journal.append({ type: 'gap', from: 3, to: 3, reason: 'torn-write' });
+    for (let i = 0; i < 1000; i++) out(many.journal, `after ${i}\r\n`);
+    const { text, pages } = await readAll(many, { since: 0 });
+    const lines = text.split('\n');
+    assert.deepEqual(lines.slice(0, 4), ['line 1', 'prompt', '[… 1 journal event missing (seq 3–3: a torn write) …]', 'after 0'], JSON.stringify(open));
+    assert.equal(lines.length, 1003, JSON.stringify(open));
+    assert.deepEqual(pages[0]!.gap, { from: 3, to: 3, reason: 'torn-write' });
+    // Two lines after the hole, in a live range: nothing waits for the sequence's end, which is gone.
+    const few = source();
+    out(few.journal, 'line 1\r\n');
+    out(few.journal, `prompt ${open}`);
+    few.journal.append({ type: 'gap', from: 3, to: 3, reason: 'torn-write' });
+    out(few.journal, 'a\r\nb\r\n');
+    const r = await readJournal(few, { since: 0 }, { resultBytes: 16384 });
+    assert.equal(r.text, 'line 1\nprompt\n[… 1 journal event missing (seq 3–3: a torn write) …]\na\nb', JSON.stringify(open));
+    assert.deepEqual(r.gap, { from: 3, to: 3, reason: 'torn-write' });
+    assert.equal(r.more, false);
+    assert.equal(r.nextCursor, 4);
+  }
+});
+
 // ───────────── through the App, against real bash ─────────────
 
 test('G11 / er-1 / er-8 / er-12 through the App and a real shell: pages by since/offset read every line once; process Runs never mix mid-line', async () => {

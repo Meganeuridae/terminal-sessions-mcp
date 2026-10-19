@@ -456,6 +456,21 @@ test('emu-3: many tiny chunks cost parser time, not a timer each', async () => {
   assert.equal(r.truncated, false);
 });
 
+test('a note after output that ends inside a control sequence is a line of its own, and nothing after it is swallowed (the house\'s read of ed4ecac)', async () => {
+  // The sequence's end was lost with the events the note stands for: the marker, and every line after it, must show.
+  for (const open of ['\x1b]0;my tit', '\x1b[', '\x1bPq12', '\x1b_x', '\x1b']) {
+    const after = Array.from({ length: 40 }, (_, i) => `after ${i}\r\n`).join('');
+    const p = await project([{ data: `line 1\r\nprompt ${open}` }, { note: '[… 1 journal event missing (seq 3–3: a torn write) …]' }, { data: after }], { cols: 80, rows: 24, keep: 'head' });
+    const lines = p.text.split('\n');
+    assert.deepEqual(lines.slice(0, 4), ['line 1', 'prompt', '[… 1 journal event missing (seq 3–3: a torn write) …]', 'after 0'], JSON.stringify(open));
+    assert.equal(lines.length, 43, JSON.stringify(open));
+    assert.equal(p.truncated, false);
+  }
+  // A header line (a change of source) is never part of a source either.
+  const labelled = await project([{ data: 'shell \x1b]0;t', stream: 'pty' }, { data: 'proc line\n', stream: 'stdout', runId: 'r1' }], { cols: 80, rows: 24, label: (s) => (s.stream === 'pty' ? '[terminal]' : `[run ${s.runId}]`) });
+  assert.deepEqual(labelled.text.split('\n'), ['[run r1]', 'proc line', '[terminal]', 'shell']);
+});
+
 test('transcript() is project().text with the old defaults', async () => {
   assert.equal(await transcript([{ data: 'a\nb\n', stream: 'stdout' }]), 'a\nb');
   assert.equal(await transcript([numbered(10)], { maxLines: 3 }), 'L7\nL8\nL9');

@@ -698,10 +698,17 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
           slice = performance.now();
         }
       }
-      // The next source starts on a fresh line (rule 6).
-      if (s + 1 < segs.length && pr.cursorX > 0) {
-        await pr.feed('\r\n');
-        await pr.afterBatch();
+      // The next source starts on a fresh line (rule 6). A note or header is never part of any
+      // source: a control sequence the output before it left open (its end lost with the events a
+      // gap stands for) must not take the note as its payload, so CAN ends anything in progress
+      // first (the house's read of ed4ecac, #22).
+      if (s + 1 < segs.length) {
+        const cancel = segs[s + 1]!.key.startsWith('n:') ? '\x18' : '';
+        const fresh = pr.cursorX > 0 ? '\r\n' : '';
+        if (cancel || fresh) {
+          await pr.feed(cancel + fresh);
+          await pr.afterBatch();
+        }
       }
     }
     let lines = pr.finish(opts.open === true);

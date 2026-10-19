@@ -18,7 +18,8 @@
  *   than the rest of the page, at the budget (mid-line: `splitLine`); else at
  *   an earlier line end. A cut is never inside a character, a control sequence
  *   or a CRLF: a sequence longer than a page is taken whole, and a live page
- *   that ends inside one stops before it. The budget holds for the projected
+ *   that ends inside one stops before it. A hole ends any sequence open before
+ *   it: nothing continues across lost events. The budget holds for the projected
  *   text: a page whose projection grows past `maxBytes` (tabs, cursor-addressed
  *   output) is taken again from less input, so the head of a page is never cut
  *   away. A page the next one continues keeps its trailing blank lines and an
@@ -436,20 +437,22 @@ function sourceContext(pieces: Piece[], pos: Pos): { text: string; rest: string;
   let len = pos.at;
   for (let i = pos.j - 1; i >= 0 && len < 4096; i--) {
     const q = pieces[i]!;
-    if (q.kind !== 'out' || sourceKey(q.ev) !== key) continue;
+    if (q.kind === 'gap') break; // nothing continues across a hole (the house's read of ed4ecac, #22)
+    if (sourceKey(q.ev) !== key) continue;
     segs.unshift({ j: i, data: q.data });
     len += q.data.length;
   }
   return { ...joined(segs, pos), rest: pc.data.slice(pos.at) };
 }
 
-/** The data of piece `j`'s source from the start of piece `j` on. */
+/** The data of piece `j`'s source from the start of piece `j` on, up to the next hole. */
 function sourceForward(pieces: Piece[], j: number): { text: string; locate(i: number): Pos } {
   const key = sourceKey((pieces[j] as OutPiece).ev);
   const segs: Array<{ j: number; data: string }> = [];
   for (let i = j; i < pieces.length; i++) {
     const q = pieces[i]!;
-    if (q.kind === 'out' && sourceKey(q.ev) === key) segs.push({ j: i, data: q.data });
+    if (q.kind === 'gap') break;
+    if (sourceKey(q.ev) === key) segs.push({ j: i, data: q.data });
   }
   const last = segs[segs.length - 1]!;
   return joined(segs, { j: last.j, at: last.data.length });
@@ -478,11 +481,14 @@ function throughLineEnd(pieces: Piece[], pos: Pos): Pos {
   return d[i] === '\n' ? fwd.locate(i + 1) : pos;
 }
 
-/** Where a control sequence left open at the end of the pieces (in the last output's source) starts; undefined when none is. */
+/**
+ * Where a control sequence left open at the end of the pieces (in the last output's source) starts;
+ * undefined when none is. A hole at the end ends it: its end was lost with the events the hole stands
+ * for, and what follows is no continuation (the house's read of ed4ecac, #22).
+ */
 function openSequence(pieces: Piece[]): Pos | undefined {
-  let last = pieces.length - 1;
-  while (last >= 0 && pieces[last]!.kind !== 'out') last--;
-  if (last < 0) return undefined;
+  const last = pieces.length - 1;
+  if (last < 0 || pieces[last]!.kind !== 'out') return undefined;
   const ctx = sourceContext(pieces, { j: last, at: (pieces[last] as OutPiece).data.length });
   const e = unfinishedSequence(ctx.text);
   return e < ctx.text.length ? ctx.locate(e) : undefined;
@@ -554,8 +560,9 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
       const c0 = fwd.text.charCodeAt(0);
       const e = c0 === 0x1b || c0 === 0x9b ? sequenceEnd(fwd.text, 0) : 0;
       if (e === undefined) {
-        // It does not end in what was collected: all of it.
-        end = pieces.length;
+        // It does not end in what was collected: all of it, or up to the hole that ends it.
+        const hole = pieces.findIndex((q, i) => i > first && q.kind === 'gap');
+        end = hole === -1 ? pieces.length : hole + 1;
         cut = undefined;
       } else {
         const after = headIndex(fwd.text.slice(e), budget);
@@ -588,22 +595,26 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
   const chunks: ProjectChunk[] = [];
   /** Per source: its data from the last piece that holds a LF on. */
   const lastBySource = new Map<string, string>();
+  const sources = new Set<string>();
   const c: Chosen = { chunks, labelled: false, inputBytes: 0, taken: end, gapsTaken: 0, midLine: false, held };
   for (const pc of taken) {
     if (pc.kind === 'gap') {
       chunks.push({ note: gapNote(pc.gap) });
       c.gapsTaken++;
       if (!pc.atStart) c.lastSeq = pc.seq;
+      lastBySource.clear(); // a hole ends every line
       continue;
     }
     chunks.push(chunkOf(pc.ev, pc.data));
-    const prior = lastBySource.get(sourceKey(pc.ev));
-    lastBySource.set(sourceKey(pc.ev), prior === undefined || pc.data.includes('\n') ? pc.data : prior + pc.data);
+    const key = sourceKey(pc.ev);
+    sources.add(key);
+    const prior = lastBySource.get(key);
+    lastBySource.set(key, prior === undefined || pc.data.includes('\n') ? pc.data : prior + pc.data);
     c.firstSeq ??= pc.ev.seq;
     c.lastSeq = pc.ev.seq;
     c.inputBytes += pc.bytes;
   }
-  c.labelled = lastBySource.size > 1;
+  c.labelled = sources.size > 1;
   c.midLine = [...lastBySource.values()].some((d) => !endsLine(d));
   // The page ends inside an event: in the part it took, or where the first piece began (a page that took
   // nothing of the event it was continuing keeps the offset it was given).
