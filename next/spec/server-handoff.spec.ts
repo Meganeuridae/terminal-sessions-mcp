@@ -50,6 +50,14 @@ function request(ws: WebSocket, id: number, method: string, params: unknown): Pr
   });
 }
 
+async function until(pred: () => boolean, what: string, ms = 3000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!pred()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(10);
+  }
+}
+
 const opens = (ws: WebSocket): Promise<void> =>
   new Promise((r, j) => {
     ws.once('open', () => r());
@@ -70,9 +78,8 @@ test('API 3: clients that connected while the port was held are answered once th
     raw.write('GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
     const early = new WebSocket(`ws://127.0.0.1:${held.port}/?token=ta&connection=early`);
     const earlyOpen = opens(early);
-    await sleep(300);
-    assert.equal(held.parked.length, 2, 'both wait, neither refused nor reset');
-    assert.equal(answer, '', 'and neither is answered before the endpoint exists');
+    await until(() => held.parked.length === 2, 'both connections to be parked');
+    assert.equal(answer, '', 'neither is answered before the endpoint exists');
     // Recovery done: the endpoint takes the socket over and serves what waited.
     const bound = await server.listen(held.server);
     assert.equal(bound.port, held.port);
@@ -80,9 +87,10 @@ test('API 3: clients that connected while the port was held are answered once th
     await earlyOpen;
     const init = (await request(early, 1, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'early', version: '0' } })) as { serverInfo?: { version?: string } };
     assert.equal(init.serverInfo?.version, 'handoff', JSON.stringify(init));
-    const end = Date.now() + 3000;
-    while (!/^HTTP\/1\.1 \d{3}/.test(answer) && Date.now() < end) await sleep(20);
-    assert.match(answer, /^HTTP\/1\.1 \d{3}/, `the request that waited is answered: ${JSON.stringify(answer)}`);
+    await until(() => /^HTTP\/1\.1 \d{3}/.test(answer), 'the request that waited to be answered');
+    // Served, not refused: the health check it asked for, with a body (the house's read of 2f357bd, #22).
+    assert.match(answer, /^HTTP\/1\.1 200 OK/, `the request that waited is served: ${JSON.stringify(answer.slice(0, 80))}`);
+    assert.match(answer, /"status":"ok"/);
     early.close(1000);
     // A client connecting after the handoff is served the ordinary way.
     const later = new WebSocket(`ws://127.0.0.1:${held.port}/?token=ta&connection=later`);
@@ -118,15 +126,16 @@ test('API 3: a paused socket keeps its bytes until it is resumed, which is what 
     const c = net.connect(held.port, '127.0.0.1');
     await new Promise<void>((r) => c.once('connect', () => r()));
     c.write('kept until resumed');
-    await sleep(100);
-    assert.equal(held.parked.length, 1);
+    await until(() => held.parked.length === 1, 'the connection to be parked');
     const sock = held.parked[0]!;
     let got = '';
     sock.on('data', (d) => (got += d.toString()));
+    // The bytes are in the kernel by now (written before the connection was even parked); a socket that
+    // was not paused would deliver them on the next turn, so the check gives it one (2f357bd, #22).
+    await sleep(50);
     assert.equal(got, '', 'paused: nothing read yet');
     sock.resume();
-    const end = Date.now() + 2000;
-    while (got === '' && Date.now() < end) await sleep(10);
+    await until(() => got !== '', 'the bytes after resume');
     assert.equal(got, 'kept until resumed');
     c.destroy();
     sock.destroy();

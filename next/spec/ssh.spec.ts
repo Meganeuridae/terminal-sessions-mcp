@@ -17,6 +17,14 @@ import { TestHost, sleep } from './testhost.js';
 
 const SSH = '/usr/bin/ssh', SSHD = '/usr/sbin/sshd', KEYGEN = '/usr/bin/ssh-keygen';
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+/** What a terminal shows for `s` printed from column 0: each tab moves to the next multiple of 8. */
+function renderTabs(s: string): string {
+  return s.split('\n').map((line) => {
+    let out = '';
+    for (const ch of line) out += ch === '\t' ? ' '.repeat(8 - (out.length % 8)) : ch;
+    return out;
+  }).join('\n');
+}
 async function freePort(): Promise<number> {
   const server = createServer();
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
@@ -97,7 +105,8 @@ describe('SSH workflows', { skip: process.env.SSH_REQUIRED !== '1' && ![SSH, SSH
       assert.equal(where.text.split('\n')[0], remote, 'the command ran on the remote side');
       const payload = `it's "quoted" \\back\\slash %d\ttab ünïcødé 😀 $HOME \`x\` !bang`;
       const exact = await x.run(`cat <<'TSM_EOF'\n${payload}\nTSM_EOF`);
-      assert.equal(exact.text.replace(/\s+/g, ' '), payload.replace(/\s+/g, ' '));
+      // The text is the screen's: a tab lands on the next tab stop; everything else, spaces included, is exact.
+      assert.equal(exact.text, renderTabs(payload));
       const long = await x.run(`f() {\n${Array.from({ length: 80 }, (_, i) => `  echo remote-${i}-${'y'.repeat(40)}`).join('\n')}\n}\nf | wc -l`, 10_000);
       assert.deepEqual([long.state, long.text.trim()], ['exited', '80']);
       assert.equal((await x.run('cd /; pwd')).text.trim(), '/');
@@ -144,11 +153,15 @@ describe('SSH workflows', { skip: process.env.SSH_REQUIRED !== '1' && ![SSH, SSH
     try {
       connection = tunnel(); await ready();
       a = await new TestHost({ port: forwarded, token: 'test', connection: 'before', mcpl: true }).connect();
-      const run = await a.call('run', { session: 'remote-build', command: 'sleep 1; echo survived-tunnel', wait: 0 });
-      const id = run.structured!.runId;
+      // The Run ends only when told to, and it is told once the tunnel is down: its completion falls
+      // inside the outage by construction, not by timing (the house's read of 2f357bd, #22).
+      const flag = path.join(dir, 'tunnel-down');
+      const run = await a.call('run', { session: 'remote-build', command: `while [ ! -e ${quote(flag)} ]; do sleep 0.1; done; echo survived-tunnel`, wait: 0 });
+      const id = run.structured!.runId as string;
       await stop(connection);
       await until(() => a!.closed, 2000, 'client to observe the tunnel loss');
-      await sleep(1200); // completion occurs while the tunnel is absent
+      fs.writeFileSync(flag, '');
+      await until(() => registry.get('remote-build')!.run(id).state === 'exited', 5000, 'the Run to end while the tunnel is absent');
       connection = tunnel(); await ready();
       b = await new TestHost({ port: forwarded, token: 'test', connection: 'after', mcpl: true }).connect();
       const delivery = await b.delivery((d) => d.metadata.runId === id);
