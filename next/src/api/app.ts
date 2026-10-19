@@ -1,9 +1,11 @@
 /**
  * The typed application API (§11): every adapter — MCP/MCPL, native, CLI — is a
  * thin translation of these operations. Verbs are enforced here for every
- * adapter (G18); the seat is enforced in the core. Every mutating operation
- * takes an optional idempotency key (G16): a retry within the window gets the
- * original outcome instead of a second execution.
+ * adapter (G18); the seat is enforced in the core. Every operation that runs,
+ * types, declares or changes something takes an optional idempotency key (G16): a
+ * retry within the window gets the original outcome instead of a second execution.
+ * `note` takes none: it records an annotation, and a repeated note is a repeated
+ * annotation, nothing worse (the house's read of 1cabc6a, #22).
  */
 import { createHash } from 'node:crypto';
 import { err, TermError } from '../core/errors.js';
@@ -105,8 +107,10 @@ export interface SessionSummary {
   rows?: number;
   services?: Array<{ runId: string; name?: string; status: ServiceStatus; evidence?: string }>;
   watches?: number;
-  /** Runs that have not ended (shell and process), newest last, so a lost runId can be found again. */
+  /** Runs that have not ended (shell and process), newest last, so a lost runId can be found again; the 20 newest. */
   runs?: Array<{ runId: string; target: RunTarget; state: RunInfo['state']; principal: Principal; line?: string; admittedAt: number }>;
+  /** Runs not ended that `runs` left out, older than the ones listed (the house's read of 1cabc6a, #22). */
+  runsOmitted?: number;
 }
 
 export interface Caller {
@@ -154,7 +158,8 @@ function idemIdentity(idem: string): { key: string; tool: string; digest: string
 /**
  * Per-principal memory of idempotency keys (G16). A replay returns the original outcome,
  * success or failure; a key reused for another tool or other arguments is refused. Nothing
- * is kept for a call that admitted nothing (`busy`), so its retry can run. Bounded: keys are
+ * is kept for a call that admitted nothing (`busy`), so its retry can run — except the one
+ * refusal that exists to be seen (see `remembered`). Bounded: keys are
  * at most 200 characters, a principal holds at most `perPrincipal` keys and the daemon
  * `total`, the oldest evicted first, and outcomes are stored compactly. Keys of `run` and
  * `start` also reach the journal (`run.admit.idem`), so a retry after a restart finds its Run.
@@ -250,7 +255,13 @@ class Idempotency {
 
 /** A RunResult without its output text: what an idempotency entry keeps (the replay awaits the Run again). */
 const compactRun = (r: RunResult): RunResult => ({ ...r, output: { ...r.output, text: '' } });
-const admitted = (r: RunResult) => r.state !== 'busy';
+/**
+ * A busy outcome admitted nothing, so the key forgets it and the retry can run — except the once-only
+ * refusal `declared-shell-ended` (§8.1), which fails closed because the declared shell the line may have
+ * been meant for is gone: a retry that lost the first answer must get that refusal again, not a Run in
+ * the local shell (the house's read of 1cabc6a, #22). A new key says "local is what I mean".
+ */
+const remembered = (r: RunResult) => r.state !== 'busy' || r.busy?.reason === 'declared-shell-ended';
 
 export class App {
   readonly registry: SessionRegistry;
@@ -262,6 +273,8 @@ export class App {
   private readonly segmenterOptions: SegmenterOptions;
   private recoveredIdem: Map<string, { session: string; run: RunInfo }> | undefined;
   private readonly recoveredKeys = new Map<string, { tool: string; digest: string; at: number }>();
+  /** Names whose shell ended and whose new life is being started: the old life's watches, as they stand when it closes (m2-14). */
+  private readonly carried = new Map<string, WatchInfo[]>();
 
   constructor(opts: AppOptions) {
     this.segmenterOptions = opts.segmenter ?? {};
@@ -278,6 +291,9 @@ export class App {
       if (c.type === 'created') return;
       for (const [s, x] of this.extrasBySession) {
         if (s.id !== c.id) continue;
+        // A new life is starting under this name (liveSession): its watches move over as they stand at this
+        // moment, so an unwatch answered during the reopen stays done (the house's read of 1cabc6a, #22).
+        if (this.carried.has(c.id)) this.carried.set(c.id, x.watches.list());
         x.segmenter?.dispose();
         x.services.dispose();
         x.watches.dispose();
@@ -328,14 +344,18 @@ export class App {
 
   private find(caller: Caller, id: string, verb: Verb): AnySession {
     const s = this.registry.get(id);
-    if (!s) throw err('session_not_found', `session ${id} not found`, { session: id });
+    if (!s) throw err('session_not_found', `session ${id} not found: session_list shows the sessions you can see; run or session_open creates one by this name`, { session: id });
     this.authorize(caller.principal, s, verb);
     return s;
   }
 
   private liveFor(caller: Caller, id: string, verb: Verb): Session {
     const s = this.find(caller, id, verb);
-    if (s.kind !== 'live') throw err('session_exited', `session ${id} has ended; its history is readable with read, and session_open starts a new shell under this name`, { session: id });
+    if (s.kind !== 'live') {
+      // Only the owner starts a new life (G30): an observer is not sent to a tool that refuses them (the house's read of 1cabc6a, #22).
+      const again = this.can(caller.principal, s, 'run') ? 'session_open starts a new shell under this name' : `only its owner (${s.owner}) can start a new shell under this name`;
+      throw err('session_exited', `session ${id} has ended; its history is readable with read, and ${again}`, { session: id });
+    }
     return s.session;
   }
 
@@ -350,17 +370,29 @@ export class App {
     }
   }
 
-  /** Find a Run by id across the sessions the caller may observe (runIds are unique per daemon). */
-  private findRun(caller: Caller, runId: string, sessionId?: string): { s: AnySession; run: RunInfo } {
-    const candidates = sessionId !== undefined ? [this.find(caller, sessionId, 'observe')] : this.registry.list().filter((s) => this.can(caller.principal, s, 'observe'));
+  /**
+   * Find a Run by id across the sessions the caller may observe, history included. A runId is a per-session
+   * counter with a short random suffix, so two sessions can hold the same id: an id alone that matches in
+   * more than one session is refused, naming them, rather than reaching whichever comes first (the house's
+   * read of 1cabc6a, #22).
+   */
+  private findRun(caller: Caller, runId: string, inSession?: string): { s: AnySession; run: RunInfo } {
+    const candidates = inSession !== undefined ? [this.find(caller, inSession, 'observe')] : this.registry.list().filter((s) => this.can(caller.principal, s, 'observe'));
+    const found: Array<{ s: AnySession; run: RunInfo }> = [];
     for (const s of candidates) {
       try {
-        return { s, run: s.run(runId) };
+        found.push({ s, run: s.run(runId) });
       } catch (e) {
         if (!(e instanceof TermError && e.code === 'run_not_found')) throw e;
       }
     }
-    throw err('run_not_found', `run ${runId} not found${sessionId !== undefined ? ` in session ${sessionId}` : ''}`, { runId });
+    if (found.length > 1) {
+      const names = found.map((f) => sessionId(f.s));
+      throw err('invalid_argument', `run ${runId} exists in more than one session (${names.join(', ')}): pass session to say which`, { runId, sessions: names });
+    }
+    if (found.length === 1) return found[0]!;
+    const where = inSession !== undefined ? ` in session ${inSession}` : '';
+    throw err('run_not_found', `run ${runId} not found${where}: the id comes from a run or start result; session_list shows the Runs that have not ended, and a forgotten session's Runs are gone with it`, { runId });
   }
 
   // ───────────── sessions ─────────────
@@ -396,12 +428,11 @@ export class App {
         const w = x.watches.list().length;
         if (w) out.watches = w;
       }
-      const runs = s.session
-        .listRuns()
-        .filter((r) => !isTerminal(r.state))
-        .slice(-20)
-        .map((r) => ({ runId: r.runId, target: r.target, state: r.state, principal: r.principal, admittedAt: r.admittedAt, ...(r.line !== undefined ? { line: head(r.line) } : {}) }));
+      const open = s.session.listRuns().filter((r) => !isTerminal(r.state));
+      const runs = open.slice(-20).map((r) => ({ runId: r.runId, target: r.target, state: r.state, principal: r.principal, admittedAt: r.admittedAt, ...(r.line !== undefined ? { line: head(r.line) } : {}) }));
       if (runs.length) out.runs = runs;
+      // The list is bounded; what it leaves out is counted, not dropped in silence (the house's read of 1cabc6a, #22).
+      if (open.length > runs.length) out.runsOmitted = open.length - runs.length;
       return out;
     }
     const out: SessionSummary = { id: s.id, owner: s.owner, visibility: s.visibility, state: 'exited', controller: null, lastSeq: s.journal.lastSeq };
@@ -432,8 +463,16 @@ export class App {
       async () => {
         const { idempotencyKey: _k, role: _r, id, ...create } = o;
         const { session, created } = await this.liveSession(caller, id, 'observe', create);
-        const att = session.attach(caller.principal, caller.connectionId, o.role ?? 'auto');
-        const res: { created: boolean; info: SessionSummary; role: 'observer' | 'controller'; ignored?: string[] } = { created, info: this.summary(this.entry(session)), role: att.role };
+        // `role: controller` asks for the seat. attach grants a free seat; the owner (and its GUI, like `run`)
+        // also takes a held seat over, under owner-priority or from a dropped holder — the same rule `run` uses,
+        // which attach alone did not apply (the house's read of 1cabc6a, #22). Anyone else is refused (not_controller).
+        const att = session.attach(caller.principal, caller.connectionId, o.role === 'controller' ? 'auto' : (o.role ?? 'auto'));
+        let role = att.role;
+        if (o.role === 'controller' && role !== 'controller') {
+          session.takeControl(caller.principal, this.seat(caller, session));
+          role = 'controller';
+        }
+        const res: { created: boolean; info: SessionSummary; role: 'observer' | 'controller'; ignored?: string[] } = { created, info: this.summary(this.entry(session)), role };
         const ignored = created ? [] : CREATION_OPTIONS.filter((k) => create[k] !== undefined);
         if (ignored.length) res.ignored = ignored;
         return res;
@@ -449,8 +488,11 @@ export class App {
       'session_close',
       o,
       async () => {
-        const s = this.find(caller, o.session, 'destroy');
-        if (s.kind === 'live') await this.registry.close(o.session, { graceful: !o.force });
+        this.find(caller, o.session, 'destroy');
+        // Always through the registry, under the name's lock: a reopen in flight lands first and is closed
+        // too, so `closed: true` is true when it is said (the house's read of 1cabc6a, #22). A history
+        // entry closes to nothing.
+        await this.registry.close(o.session, { graceful: !o.force });
         if (o.forget) await this.registry.remove(o.session);
         return { closed: true, forgotten: o.forget === true };
       },
@@ -483,12 +525,25 @@ export class App {
       this.authorizeName(caller, existing, verb);
       return { session: existing.session, created: false };
     }
-    const carried = existing?.kind === 'live' ? (this.extrasBySession.get(existing.session)?.watches.list() ?? []) : [];
-    const r = await this.registry.ensure({ ...create, id, owner: this.newLifeOwner(caller, existing, id) });
+    // The watches of a shell that ended move to the new life (m2-14) as they stand when the old life
+    // closes (the registry listener in the constructor fills `carried` then), with their ids, so an
+    // unwatch answered meanwhile stays done and the ids callers hold stay valid (the house's read of 1cabc6a, #22).
+    const carrying = existing?.kind === 'live' && !this.carried.has(id);
+    if (carrying) this.carried.set(id, []);
+    let r: { session: Session; created: boolean };
+    let carried: WatchInfo[] = [];
+    try {
+      r = await this.registry.ensure({ ...create, id, owner: this.newLifeOwner(caller, existing, id) });
+    } finally {
+      if (carrying) {
+        carried = this.carried.get(id) ?? [];
+        this.carried.delete(id);
+      }
+    }
     if (!r.created) this.authorizeName(caller, this.entry(r.session), verb);
     for (const w of r.created ? carried : []) {
       try {
-        this.extras(r.session).watches.add(w.spec, w.owner);
+        this.extras(r.session).watches.add(w.spec, w.owner, { watchId: w.watchId, createdAt: w.createdAt });
       } catch {
         // a spec that no longer compiles is dropped; its owner sees it missing from `watches`
       }
@@ -516,7 +571,7 @@ export class App {
     const owner = existing.kind === 'live' ? existing.session.owner : existing.owner;
     if (caller.principal === owner || guiActsFor(caller.principal, owner)) return owner;
     if (!this.can(caller.principal, existing, 'observe')) throw err('session_exists', `the name ${id} belongs to another principal; choose another name`, { session: id });
-    throw err('forbidden', `session ${id} has ended; only its owner (${owner}) may start it again (G30) — its history stays readable with read`, { session: id, owner });
+    throw err('forbidden', `session ${id} has ended; only its owner (${owner}) may start it again — its history stays readable with read`, { session: id, owner });
   }
 
   private busyResult(session: Session, target: RunTarget, reason: string, occupant: RunInfo | null | undefined, created: boolean): RunResult {
@@ -567,22 +622,37 @@ export class App {
         return result;
       },
       (prev) => this.replayRun(caller, prev, o.wait),
-      { keep: admitted, compact: compactRun, recover: (idem) => this.recoverRun(idem) },
+      { keep: remembered, compact: compactRun, recover: (idem) => this.recoverRun(idem) },
     );
   }
 
   /**
    * Declare the program in front of a session's terminal a shell (§8.1), or take the last
    * declaration back with `none`. Shell Runs then go to it until the Run whose program it is ends.
+   * Keyed like the other operations: a retried `none` must not take a second declaration back.
    */
-  async declareShell(caller: Caller, o: { session: string; shell?: string; within?: string }): Promise<{ session: string; shell: string | null; within: string | null; depth: number; line?: string }> {
-    const { session } = await this.liveSession(caller, o.session, 'run', {});
-    this.ensureAttached(caller, session);
-    const r = session.declareShell({ principal: caller.principal, ...(o.shell !== undefined && { shell: o.shell }), ...(o.within !== undefined && { within: o.within }), ...this.seat(caller, session) });
-    const res: { session: string; shell: string | null; within: string | null; depth: number; line?: string } = { session: session.id, ...r };
-    const line = r.within ? session.run(r.within).line : undefined;
-    if (line !== undefined) res.line = head(line, 80);
-    return res;
+  async declareShell(
+    caller: Caller,
+    o: { session: string; shell?: string; within?: string; idempotencyKey?: string },
+  ): Promise<{ session: string; shell: string | null; within: string | null; depth: number; line?: string; replayed?: boolean }> {
+    return this.idem.run(
+      caller.principal,
+      o.idempotencyKey,
+      'session_declare_shell',
+      o,
+      async () => {
+        // A declaration names what is in front of an existing terminal: a name with no live session has
+        // nothing to declare, and a refusal must not leave a shell it started (the house's read of 1cabc6a, #22).
+        const session = this.liveFor(caller, o.session, 'run');
+        this.ensureAttached(caller, session);
+        const r = session.declareShell({ principal: caller.principal, ...(o.shell !== undefined && { shell: o.shell }), ...(o.within !== undefined && { within: o.within }), ...this.seat(caller, session) });
+        const res: { session: string; shell: string | null; within: string | null; depth: number; line?: string } = { session: session.id, ...r };
+        const line = r.within ? session.run(r.within).line : undefined;
+        if (line !== undefined) res.line = head(line, 80);
+        return res;
+      },
+      async (prev) => ({ ...prev, replayed: true }),
+    );
   }
 
   /**
@@ -622,8 +692,9 @@ export class App {
     try {
       again = await this.awaitRun(caller, { session: prev.session, runId: prev.runId, ...(wait !== undefined ? { wait } : {}) });
     } catch (e) {
-      // The session was forgotten since: the first outcome is all there is (atc-21).
-      if (e instanceof TermError && (e.code === 'session_not_found' || e.code === 'run_not_found')) return { ...prev, replayed: true };
+      // The session was forgotten since: the first outcome is all there is (atc-21), and its text went with
+      // the session — the empty text is a cut, and says so (the house's read of 1cabc6a, #22).
+      if (e instanceof TermError && (e.code === 'session_not_found' || e.code === 'run_not_found')) return { ...prev, replayed: true, output: { ...prev.output, truncated: true } };
       throw e;
     }
     const res: RunResult = { ...again, replayed: true };
@@ -765,11 +836,14 @@ export class App {
       truncated = t.truncated;
     } else {
       const o = s.runOutput(run.runId, { maxBytes: 1024 * 1024 });
+      const geometry = geometryOf(s);
       const p = await project(
         o.events.filter(isOutput).map((e) => ({ data: e.data, stream: e.stream, ...(e.runId !== undefined ? { runId: e.runId } : {}) })),
-        { cols: run.cols ?? 120, rows: run.rows ?? 30, maxInputBytes: 1024 * 1024, keep: 'tail' },
+        { cols: run.cols ?? geometry.cols, rows: run.rows ?? geometry.rows, maxInputBytes: 1024 * 1024, keep: 'tail' },
       );
-      text = p.text;
+      // The live transcript cuts a marker Run's plumbing with the Run's nonce; the journal keeps the
+      // plumbing and not the nonce, so history is cut by shape (the house's read of 1cabc6a, #22).
+      text = run.target === 'shell' ? cutMarkerPlumbing(p.text) : p.text;
       from = o.from;
       to = o.to;
       truncated = o.truncated || p.truncated;
@@ -824,8 +898,7 @@ export class App {
         if (o.fail) spec.fail = o.fail;
         if (o.health) spec.health = o.health;
         const monitor = this.extras(session).services.watch(a.run.runId, spec, caller.principal, o.name);
-        const info = await monitor.waitSettled(clamp(o.wait ?? this.defaultWaitMs, 0, this.maxWaitMs));
-        const res = await this.serviceResult(caller, session, a.run.runId, info);
+        const res = await this.serviceResult(caller, session, a.run.runId, await this.settled(monitor, o.wait));
         if (created) res.created = true;
         else if (o.cwd !== undefined && o.cwd !== session.cwd) res.ignored = ['cwd'];
         return res;
@@ -835,11 +908,23 @@ export class App {
         const s = this.registry.get(prev.session);
         const monitor = s?.kind === 'live' ? this.extras(s.session).services.get(prev.runId) : undefined;
         if (!s || s.kind !== 'live' || !monitor) return this.replayRun(caller, prev, o.wait);
-        const info = await monitor.waitSettled(clamp(o.wait ?? this.defaultWaitMs, 0, this.maxWaitMs));
-        return { ...(await this.serviceResult(caller, s.session, prev.runId, info)), replayed: true };
+        const res: RunResult = { ...(await this.serviceResult(caller, s.session, prev.runId, await this.settled(monitor, o.wait))), replayed: true };
+        // The first call created the session: its replay says so too, as a replayed run does (the house's read of 1cabc6a, #22).
+        if (prev.created) res.created = true;
+        return res;
       },
-      { keep: admitted, compact: compactRun, recover: (idem) => this.recoverRun(idem) },
+      { keep: remembered, compact: compactRun, recover: (idem) => this.recoverRun(idem) },
     );
+  }
+
+  /**
+   * The service's status once it has settled or the wait is up. The status as it stands then, not as it
+   * was when the waiter woke: a ready line wakes it in the middle of an output chunk, and a fail line
+   * later in the same chunk is matched before this continuation runs (the house's read of 1cabc6a, #22).
+   */
+  private async settled(monitor: { waitSettled(ms: number): Promise<ServiceInfo>; info(): ServiceInfo }, wait: number | undefined): Promise<ServiceInfo> {
+    await monitor.waitSettled(clamp(wait ?? this.defaultWaitMs, 0, this.maxWaitMs));
+    return monitor.info();
   }
 
   private async serviceResult(caller: Caller, session: Session, runId: string, info: ServiceInfo): Promise<RunResult> {
@@ -850,7 +935,8 @@ export class App {
       session: session.id,
       target: run.target,
       state: run.state,
-      cwd: session.cwd,
+      // A declared shell's cwd is not tracked (§8.1), for a service as for a run (the house's read of 1cabc6a, #22).
+      cwd: run.shell !== undefined ? '' : session.cwd,
       origin: run.origin,
       principal: run.principal,
       attribution: run.attribution,
@@ -919,7 +1005,9 @@ export class App {
     const session = this.liveFor(caller, o.session, 'observe');
     const { session: _s, wait, since, ...spec } = o;
     const r = await this.extras(session).watches.waitFor(spec, clamp(wait ?? this.defaultWaitMs, 0, this.maxWaitMs), since);
-    return { ...r, session: session.id, nextCursor: session.journal.lastSeq };
+    // Continue after the event that satisfied the wait, not after whatever the journal holds by now: a
+    // line printed after the match is still ahead of the next wait's `since` (the house's read of 1cabc6a, #22).
+    return { ...r, session: session.id, nextCursor: r.matched && r.seq !== undefined ? r.seq : session.journal.lastSeq };
   }
 
   // ───────────── terminal capabilities ─────────────
@@ -1046,7 +1134,7 @@ export type { ReadResult, SearchResult } from './reader.js';
 const sessionId = (s: AnySession): string => (s.kind === 'live' ? s.session.id : s.id);
 
 /** Options that apply only when a call creates the session: listed as ignored otherwise. */
-const CREATION_OPTIONS = ['cwd', 'shell', 'env', 'visibility', 'control', 'cols', 'rows', 'retention', 'login'] as const;
+const CREATION_OPTIONS = ['cwd', 'shell', 'shellArgs', 'env', 'visibility', 'control', 'cols', 'rows', 'retention', 'login', 'integration', 'userRc'] as const;
 
 /** A command line shortened for results and lists: the journal keeps the whole of it (ux-19). */
 function head(line: string, max = 120): string {
@@ -1055,12 +1143,51 @@ function head(line: string, max = 120): string {
 }
 
 
+/**
+ * The geometry a session's pages project at (§6 rule 1): a live session's screen; for history, what the
+ * session recorded at creation (a resize during its life is not kept there; a Run's pages use the
+ * Run's own recorded geometry) — the house's read of 1cabc6a, #22.
+ */
+function geometryOf(s: AnySession): { cols: number; rows: number } {
+  if (s.kind === 'live') return { cols: s.session.screen.cols, rows: s.session.screen.rows };
+  return { cols: s.options.cols ?? 120, rows: s.options.rows ?? 30 };
+}
+
+const MARKER_END = /<<<EXIT:[0-9a-f]+:-?\d+>>>/;
+const MARKER_START = /<<<START:[0-9a-f]+>>>/;
+/** The echo of the end-marker probe typed after a ^C: the marker split differently from the wrapper's. */
+const PROBE_ECHO = /EX""IT:[0-9a-f]+:|EXI''T:[0-9a-f]+:/;
+
+/**
+ * A marker Run's output read from history, cut as the live transcript cuts it (Session.runTranscript):
+ * the echo of the wrapper that typed it (its last line ends in the marker's closing quote), a probe typed
+ * after a ^C and what follows it, the end marker and the prompt after it. A declared shell's Run begins
+ * after its start marker. Output with no end marker in it is not a marker Run's and is left whole.
+ */
+export function cutMarkerPlumbing(text: string): string {
+  const lines = text.split('\n');
+  let end = lines.findIndex((l) => MARKER_END.test(l));
+  if (end === -1) return text;
+  const probe = lines.slice(0, end).findIndex((l) => PROBE_ECHO.test(l));
+  if (probe !== -1) end = probe;
+  let from = 0;
+  for (let i = end - 1; i >= 0; i--) {
+    const l = lines[i]!.trimEnd();
+    if (MARKER_START.test(l) || l.endsWith('>>>"')) {
+      from = i + 1;
+      break;
+    }
+  }
+  return lines.slice(from, end).join('\n');
+}
+
 function readSource(s: AnySession): ReadSource {
+  const geometry = geometryOf(s);
   return {
     id: sessionId(s),
     journal: s.kind === 'live' ? s.session.journal : s.journal,
-    cols: s.kind === 'live' ? s.session.screen.cols : 120,
-    rows: s.kind === 'live' ? s.session.screen.rows : 30,
+    cols: geometry.cols,
+    rows: geometry.rows,
     run: (runId) => {
       try {
         return s.run(runId);

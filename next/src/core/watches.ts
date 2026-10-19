@@ -333,13 +333,15 @@ export class WatchManager {
     return Math.max(0, Date.now() - ev.ts);
   }
 
-  add(spec: WatchSpec, owner: Principal): WatchInfo {
+  /** `keep`: a watch moving to a new life of its session keeps its id and creation time, so the id its caller holds stays valid (the house's read of 1cabc6a, #22). */
+  add(spec: WatchSpec, owner: Principal, keep?: { watchId: string; createdAt: number }): WatchInfo {
     const kind = kindOf(spec);
     const run = spec.runId !== undefined && kind !== 'idle' ? this.requireRun(spec.runId) : undefined;
     if (run && isTerminal(run.state)) throw err('invalid_argument', `${endText(run)}: a watch on it would never fire; read its output with read {runId}`, { runId: run.runId });
-    const watchId = `w${++this.counter}-${randomBytes(2).toString('hex')}`;
+    if (keep) this.counter = Math.max(this.counter, Number(/^w(\d+)-/.exec(keep.watchId)?.[1] ?? 0));
+    const watchId = keep?.watchId ?? `w${++this.counter}-${randomBytes(2).toString('hex')}`;
     const label = spec.label ?? (kind === 'pattern' ? spec.pattern! : kind === 'silence' ? `silence ${spec.silenceMs}ms` : 'idle');
-    const rec: WatchRecord = { watchId, kind, label, owner, spec: { ...spec }, createdAt: Date.now(), fired: 0, heldCount: 0, predicate: undefined as never };
+    const rec: WatchRecord = { watchId, kind, label, owner, spec: { ...spec }, createdAt: keep?.createdAt ?? Date.now(), fired: 0, heldCount: 0, predicate: undefined as never };
     rec.predicate = new Predicate(kind, spec, this.host, (hit) => this.onHit(rec, hit));
     this.watches.set(watchId, rec);
     if (kind === 'silence') {

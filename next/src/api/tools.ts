@@ -51,8 +51,10 @@ const idempotencyKey = {
   minLength: 1,
   description:
     'Optional; use a fresh unique value (a UUID) per operation. Retrying the same call with the same key within 15 minutes returns the first ' +
-    'call’s outcome instead of doing it again (for run and start: the same Run, awaited again — also after a daemon restart). A key reused ' +
-    'with other arguments is refused. A `busy` outcome (nothing ran) is not remembered, so its retry can run.',
+    'call’s outcome instead of doing it again (for run and start: the same Run, awaited again — also after a daemon restart); the daemon keeps ' +
+    'the newest 1,024 keys per caller and 16,384 in all, so under that load a key can be forgotten sooner. A key reused with other arguments is ' +
+    'refused. A `busy` outcome (nothing ran) is not remembered, so its retry can run — except `busy: declared-shell-ended`, which the retry gets ' +
+    'again: use a new key once you mean the session’s own shell.',
 } as const satisfies Schema;
 const fmt = (ms: number) => (ms >= 60_000 ? `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s` : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`);
 const env = (r: object) => r as unknown as Record<string, unknown>;
@@ -89,7 +91,7 @@ const BUSY_NEXT: Record<string, string> = {
     'input and screen work regardless; or open a new session',
   'declared-shell-ended':
     'the declared shell (ssh, sudo -i, a nested shell) ended without your asking — the connection dropped, or that shell died — so this command would have run in the shell underneath, not where you meant it: ' +
-    'run it again if the session’s own shell is what you mean, or run the opener and declare again',
+    'run it again if the session’s own shell is what you mean (with a new idempotencyKey, if you used one: a retry with the same key gets this refusal again), or run the opener and declare again',
   'human-editing': 'a partial command line sits at the prompt: clear it with input keys:["C-u"] (needs the seat), or pass queue:true',
   'human-submitted':
     'a command someone typed at this prompt by hand was submitted and may still be running (no end mark comes for a hand-typed command): read `screen` to see; ' +
@@ -323,12 +325,14 @@ const SUMMARY: Schema = {
     watches: { type: 'integer' },
     runs: {
       type: 'array',
+      description: 'The Runs that have not ended, the 20 newest.',
       items: {
         type: 'object',
         properties: { runId: { type: 'string' }, target: { type: 'string' }, state: { type: 'string' }, principal: { type: 'string' }, line: { type: 'string' }, admittedAt: { type: 'number' } },
         required: ['runId', 'target', 'state', 'principal', 'admittedAt'],
       },
     },
+    runsOmitted: { type: 'integer', description: 'Runs that have not ended beyond the 20 listed in runs.' },
   },
   required: ['id', 'owner', 'visibility', 'state', 'lastSeq'],
 };
@@ -401,7 +405,8 @@ const WATCH_OUTPUT: Schema = {
 
 const summaryLine = (s: SessionSummary) => {
   const others = (s.runs ?? []).filter((r) => r.runId !== s.currentRun);
-  const runs = others.length ? ` · runs ${others.map((r) => `${r.runId} ${r.state}${r.target === 'process' ? ' (process)' : ''}${r.line ? ` "${r.line}"` : ''}`).join(', ')}` : '';
+  const omitted = s.runsOmitted ? ` (+${s.runsOmitted} older not listed)` : '';
+  const runs = others.length ? ` · runs ${others.map((r) => `${r.runId} ${r.state}${r.target === 'process' ? ' (process)' : ''}${r.line ? ` "${r.line}"` : ''}`).join(', ')}${omitted}` : '';
   return `${s.id}: ${s.state}${s.recovered ? ` (${s.recovered})` : s.closed ? ' (closed)' : ''} · owner ${s.owner} · seat ${s.controller ?? 'free'}${s.cwd ? ` · cwd ${s.cwd}` : ''}${s.currentRun ? ` · running ${s.currentRun}` : ''}${runs}${s.services?.length ? ` · services ${s.services.map((v) => `${v.name ?? v.runId}=${v.status}`).join(', ')}` : ''}${s.watches ? ` · ${s.watches} watch${s.watches > 1 ? 'es' : ''}` : ''} · seq ${s.lastSeq}`;
 };
 
@@ -464,6 +469,7 @@ export const TOOLS: ToolDef[] = [
             'none takes the last declaration back.',
         },
         within: { type: 'string', description: 'Optional: the runId whose program is that shell. Default: the innermost running Run (what holds the terminal now).' },
+        idempotencyKey,
       },
       required: ['session'],
       additionalProperties: false,
@@ -476,13 +482,14 @@ export const TOOLS: ToolDef[] = [
         within: { description: 'The runId whose program it is; null for the program that replaced the session’s shell.' },
         depth: { type: 'integer', description: 'How many declarations are stacked (a second hop is 2).' },
         line: { type: 'string', description: 'The command line of that Run.' },
+        replayed: { type: 'boolean' },
       },
       required: ['session', 'shell', 'within', 'depth'],
     },
     async run(ctx, a) {
-      const r = await ctx.app.declareShell(ctx.caller, pick(a, ['session', 'shell', 'within']));
+      const r = await ctx.app.declareShell(ctx.caller, pick(a, ['session', 'shell', 'within', 'idempotencyKey']));
       const where = r.shell === null ? 'the session’s own shell' : `the declared ${r.shell} shell${r.within ? ` in front (${r.within}${r.line ? ` ${r.line}` : ''}), until ${r.within} ends` : ' that replaced the session’s shell'}`;
-      return render(ctx, `[declared: run in ${r.session} now goes to ${where}${r.depth > 1 ? ` · depth ${r.depth}` : ''}]`, env(r));
+      return render(ctx, `[declared: run in ${r.session} now goes to ${where}${r.depth > 1 ? ` · depth ${r.depth}` : ''}${r.replayed ? ' · replayed' : ''}]`, env(r));
     },
   },
   {
@@ -631,7 +638,7 @@ export const TOOLS: ToolDef[] = [
           type: 'object',
           properties: { maxBytes: { type: 'integer', minimum: 16384 }, maxAgeMs: { type: 'integer', minimum: 1000 } },
           additionalProperties: false,
-          description: 'Limits on the history kept on disk (G21). Default: the daemon’s, which keeps everything unless it was started with limits.',
+          description: 'Limits on the history kept on disk. Default: the daemon’s, which keeps everything unless it was started with limits.',
         },
         visibility: { type: 'string', enum: ['private', 'shared'] },
         control: { type: 'string', enum: ['seat', 'owner-priority', 'open'] },
@@ -815,7 +822,8 @@ export const TOOLS: ToolDef[] = [
     description:
       'Block up to `wait` ms until a session shows `pattern` in its output, goes quiet for `silenceMs`, or becomes `idle`. With `since`, output ' +
       'already printed after that cursor counts, so a line printed before the call is not missed. Patterns match per output line. Returns ' +
-      'matched: false when the wait ends first, and at once with a `reason` when it can no longer be met (the shell exited, the Run ended).',
+      'matched: false when the wait ends first, and at once with a `reason` when it can no longer be met (the shell exited, the Run ended). ' +
+      '`nextCursor` is the position of the match (or the journal’s end when nothing matched): pass it as the next wait’s `since` to go on from there.',
     inputSchema: {
       type: 'object',
       properties: {
