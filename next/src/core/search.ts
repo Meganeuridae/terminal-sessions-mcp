@@ -90,6 +90,8 @@ interface Carry {
   linesAt: number;
 }
 
+const before = (a: Resume, b: Resume): boolean => a.cursor < b.cursor || (a.cursor === b.cursor && a.offset < b.offset);
+
 const shown = (s: string): { text: string; cut: boolean } => (s.length > MAX_SHOWN ? { text: `${s.slice(0, MAX_SHOWN)}…`, cut: true } : { text: s, cut: false });
 
 /** Rule 3: control sequences out, trailing CRs dropped, the last carriage return starts the line over. */
@@ -110,8 +112,8 @@ export class LineScanner {
   clippedLines = 0;
   /** Where the first match past `limit` starts (set once the limit is reached). */
   stop: Resume | undefined;
-  /** The limit was reached: lines still complete the last matches' after-context, but nothing more is matched. */
-  private limited = false;
+  /** A match past `limit` was found (`stop` says where): lines still complete the last matches' after-context, but nothing more is matched. */
+  limited = false;
   private readonly context: number;
   private readonly limit: number;
   private readonly recent: Array<{ text: string; cut: boolean }> = [];
@@ -177,6 +179,9 @@ export class LineScanner {
   settle(last: Seq): void {
     const lines = this.lines;
     for (const [key, c] of this.carries) {
+      // A line begun at or after the match past the limit is the continuation's whole (the scan went
+      // on past that match only for the last matches' after-context): it stays as it is.
+      if (this.stop !== undefined && !before(c.start, this.stop)) continue;
       if (this.progressed(c.start) && c.linesAt === lines) continue;
       if (c.raw) this.complete(c, last, true);
       this.carries.delete(key);

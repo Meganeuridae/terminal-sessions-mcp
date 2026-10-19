@@ -1040,12 +1040,12 @@ export async function searchJournal(src: ReadSource, o: SearchOptions, limits: P
     }
   }
   let resume: Resume | undefined;
-  if (stoppedBy === undefined) {
-    scanner.flush(lastSeq ?? w.end);
-    // The flush can find the match past the limit in an unfinished last line: the scan stops
-    // there, with more (the house's read of 1cabc6a, #22).
-    if (scanner.full) stoppedBy = 'limit';
-  }
+  if (stoppedBy === undefined) scanner.flush(lastSeq ?? w.end);
+  // The match past the limit may have come in the loop (the scan then went on only for the last
+  // matches' after-context, and may have met a budget doing so) or from the flush, in an unfinished
+  // last line: either way the scan stops at that match, with more (the house's reads of ed4ecac and
+  // 1cabc6a, #22).
+  if (scanner.limited) stoppedBy = 'limit';
   if (stoppedBy !== undefined) {
     // Lines open since the scan began, or with other lines completed after them, are matched now
     // (search.ts rule 6); then the scan continues at the earliest point where nothing is lost or
