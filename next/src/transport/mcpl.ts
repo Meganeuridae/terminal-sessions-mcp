@@ -451,7 +451,9 @@ export class McplLane {
 
   /** A session's channel descriptor: its metadata is the App's own summary of the entry (one look per session, not a list per session — the house's read of 2f357bd, #22). */
   private descriptorFor(entry: AnySession): ChannelDescriptor {
-    const s = this.app.summary(entry);
+    // The header alone: the full summary lists the session's Runs, Services and Watches, which made a
+    // channel listing cost every session's Runs (a review of the consolidated branch of #22).
+    const s = this.app.summaryHeader(entry);
     // `speech: 'none'` asks hosts not to route an agent's ordinary replies here (UPSTREAM-CHANGES A6).
     const metadata: Record<string, unknown> = { node: NODE_NAME, speech: 'none', owner: s.owner, state: s.state };
     if (s.controller !== null) metadata.controller = s.controller;

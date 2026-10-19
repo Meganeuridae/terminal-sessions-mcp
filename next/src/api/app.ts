@@ -13,7 +13,7 @@ import { inputBytes } from '../core/keys.js';
 import { validateServiceSpec, type ServiceSpec } from '../core/probes.js';
 import { journalRunText, promptLine, Segmenter, type SegmenterOptions } from '../core/segmenter.js';
 import { ServiceManager, type ServiceInfo } from '../core/services.js';
-import { isTerminal, serviceOutcomeKey, type Session } from '../core/session.js';
+import { isTerminal, serviceOutcomeKey, type Session, type SessionInfo } from '../core/session.js';
 import { cutTail } from '../core/text.js';
 import { DEFAULT_GEOMETRY, type Attribution, type EnvBasis, type JournalEvent, type Principal, type RunInfo, type RunTarget, type ScreenSnapshot, type Seq, type ServiceStatus, type Visibility } from '../core/types.js';
 import { SYSTEM } from '../core/types.js';
@@ -80,14 +80,26 @@ export interface RunResult {
   replayed?: boolean;
 }
 
-export interface SessionSummary {
+/**
+ * The fields every look at a session starts with: the head of its summary, and all a channel
+ * descriptor needs. One cheap read of the entry — no Runs, Services or Watches listed — so a
+ * channel listing costs one look per session, not a walk of every Run (a review of the
+ * consolidated branch of #22).
+ */
+export interface SessionHeader {
   id: string;
   owner: Principal;
-  visibility: Visibility;
   state: string;
   controller: Principal | null;
   cwd?: string;
   integration?: string;
+  recovered?: 'continuous' | 'reattached' | 'history-only';
+}
+
+const headerOf = (i: SessionInfo): SessionHeader => ({ id: i.id, owner: i.owner, state: i.state, controller: i.controller, cwd: i.cwd, integration: i.integration });
+
+export interface SessionSummary extends SessionHeader {
+  visibility: Visibility;
   backend?: string;
   pid?: number;
   currentRun?: string | null;
@@ -95,7 +107,6 @@ export interface SessionSummary {
   oldestSeq?: Seq;
   /** What the session keeps on disk (G21). */
   retention?: { maxBytes?: number; maxAgeMs?: number };
-  recovered?: 'continuous' | 'reattached' | 'history-only';
   closed?: boolean;
   createdAt?: number;
   lastActivity?: number;
@@ -415,18 +426,21 @@ export class App {
 
   // ───────────── sessions ─────────────
 
-  /** What a session looks like from outside (session_list, session_open, a channel's descriptor): one rendering of an entry. */
+  /** The head of a session's summary (see SessionHeader): what a channel listing and a descriptor show, read cheaply. */
+  summaryHeader(s: AnySession): SessionHeader {
+    if (s.kind === 'live') return headerOf(s.session.info());
+    const out: SessionHeader = { id: s.id, owner: s.owner, state: 'exited', controller: null };
+    if (!s.closed) out.recovered = s.recovered;
+    return out;
+  }
+
+  /** What a session looks like from outside (session_list, session_open): the header, then everything else of an entry. */
   summary(s: AnySession): SessionSummary {
     if (s.kind === 'live') {
       const i = s.session.info();
       const out: SessionSummary = {
-        id: i.id,
-        owner: i.owner,
+        ...headerOf(i),
         visibility: i.visibility,
-        state: i.state,
-        controller: i.controller,
-        cwd: i.cwd,
-        integration: i.integration,
         backend: i.backend,
         pid: i.pid,
         currentRun: i.currentRun,
@@ -454,9 +468,8 @@ export class App {
       if (open.length > runs.length) out.runsOmitted = open.length - runs.length;
       return out;
     }
-    const out: SessionSummary = { id: s.id, owner: s.owner, visibility: s.visibility, state: 'exited', controller: null, lastSeq: s.journal.lastSeq };
+    const out: SessionSummary = { ...this.summaryHeader(s), visibility: s.visibility, lastSeq: s.journal.lastSeq };
     if (s.closed) out.closed = true;
-    else out.recovered = s.recovered;
     out.retention = { ...s.retention };
     const oldest = s.journal.oldestSeq;
     if (oldest !== undefined) out.oldestSeq = oldest;

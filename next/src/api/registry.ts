@@ -340,7 +340,9 @@ const UNOWNED: Principal = 'unknown';
  * The one text for a name whose shell is gone (G19, G30): why — closed by its owner, left by a daemon
  * that stopped, or a shell that exited — that its history still reads, and who starts a new life of
  * the name: the caller (`canReopen`), only its owner (false), or its owner, when the caller is not
- * known (undefined). The App and the registry both say it.
+ * known (undefined). The App and the registry both say it. The live case is reached: an entry whose
+ * shell exited stays live until its owner starts a new life, and the App's `newLifeOwner` refuses
+ * anyone else with this text meanwhile.
  */
 export function endedMessage(s: AnySession, canReopen: boolean | undefined): string {
   const id = s.kind === 'live' ? s.session.id : s.id;

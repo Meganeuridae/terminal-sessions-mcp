@@ -52,10 +52,6 @@ export interface JournalStore {
   setHighWater?(seq: Seq, failed: boolean): boolean;
 }
 
-/**
- * Approximate serialized size: every string, number and nested value counts, so
- * an `env.snapshot` or a long `run.admit` line weighs what it holds (jr-21).
- */
 /** The line the file store writes for a record (an event, a rotation header): its JSON and a newline. */
 const lineOf = (record: object): string => JSON.stringify(record) + '\n';
 
@@ -66,6 +62,10 @@ const lineOf = (record: object): string => JSON.stringify(record) + '\n';
  */
 export const lineBytes = (record: object): number => Buffer.byteLength(lineOf(record));
 
+/**
+ * Approximate serialized size: every string, number and nested value counts, so
+ * an `env.snapshot` or a long `run.admit` line weighs what it holds (jr-21).
+ */
 export function approxBytes(v: unknown): number {
   switch (typeof v) {
     case 'string':
@@ -95,10 +95,6 @@ export interface MemoryStoreOptions {
   now?: () => number;
 }
 
-/**
- * The hot ring. Bounded by approximate bytes over every event; eviction moves a
- * head index and compacts occasionally, so appends are O(1) amortized.
- */
 /**
  * Write `text` through a temp file beside `file`, synced to disk, then renamed over it, with the
  * directory synced too: after a crash of the process or the machine the file is the old one or the
@@ -133,6 +129,10 @@ export function writeDurably(file: string, text: string): void {
   }
 }
 
+/**
+ * The hot ring. Bounded by approximate bytes over every event; eviction moves a
+ * head index and compacts occasionally, so appends are O(1) amortized.
+ */
 export class MemoryStore implements JournalStore {
   readonly kind = 'memory';
   private events: Array<JournalEvent | undefined> = [];
