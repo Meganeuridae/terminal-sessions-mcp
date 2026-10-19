@@ -32,7 +32,9 @@ const PAYLOAD = `it's "quoted" \\back\\slash %d\ttab ünïcødé 😀 $HOME \`x\
 const LINES = Array.from({ length: 120 }, (_, i) => `  echo line-${i}-${'x'.repeat(40)}`).join('\n');
 
 const declare = (s: Session, shell: string, within?: string) => s.declareShell({ shell, principal: AGENT, ...(within !== undefined && { within }) });
-const notes = (x: Real) => x.journal.since(0).events.filter((e) => e.type === 'note').map((e) => (e as { text: string }).text);
+const notes = (x: { journal: Real['journal'] }) => x.journal.since(0).events.filter((e) => e.type === 'note').map((e) => (e as { text: string }).text);
+/** The start marker now names the shell's pid (so a cancel's probe answer is keyed to the shell): drop it to compare the shape. */
+const stripStartPid = (s: string, nonce: string) => s.replace(new RegExp(`(<<<START:${nonce}):\\d+>>>`, 'g'), '$1>>>');
 const invalid = (re: RegExp) => (e: TermError) => e.code === 'invalid_argument' && re.test(e.message);
 
 /** Start a program in the session's shell as a Run and wait until its line started. */
@@ -255,7 +257,7 @@ test('a typed line prints its marker only where the shell holds exactly the text
   for (const shell of ['/bin/sh', '/bin/bash', '/bin/zsh'].filter(hasShell)) {
     const one = inlineLines(short, n, false);
     assert.equal(one.length, 1, shell);
-    assert.equal(runScript(shell, `${one[0]}\n`), `<<<START:${n}>>>\nCONTROL\n<<<EXIT:${n}:3>>>\n`, `${shell}: a clean prompt`);
+    assert.equal(stripStartPid(runScript(shell, `${one[0]}\n`), n), `<<<START:${n}>>>\nCONTROL\n<<<EXIT:${n}:3>>>\n`, `${shell}: a clean prompt`);
     // Text someone had typed at the prompt swallows the assignment (the review's case): the
     // variable is unset or not the text, so the gone marker prints, no start, and nothing runs.
     for (const prefix of ['echo partial ', 'set -u\necho partial ']) {
@@ -269,7 +271,7 @@ test('a typed line prints its marker only where the shell holds exactly the text
     assert.ok(many.length >= 3, `${shell}: ${many.length} lines`);
     for (const line of many) assert.ok(Buffer.byteLength(line) <= 900, `a line of ${Buffer.byteLength(line)} bytes`);
     const acks = Array.from({ length: many.length - 1 }, (_, i) => `<<<ACK:${n}:${i + 1}>>>\n`).join('');
-    assert.equal(runScript(shell, `${many.join('\n')}\n`).replace(/\n +120\n/, '\n120\n'), `${acks}<<<START:${n}>>>\n120\n<<<EXIT:${n}:0>>>\n`, `${shell}: pieces (wc pads its count on macOS)`);
+    assert.equal(stripStartPid(runScript(shell, `${many.join('\n')}\n`), n).replace(/\n +120\n/, '\n120\n'), `${acks}<<<START:${n}>>>\n120\n<<<EXIT:${n}:0>>>\n`, `${shell}: pieces (wc pads its count on macOS)`);
     // A piece missing: every line after it finds the text short and prints the gone marker.
     const missing = runScript(shell, `${[many[0], ...many.slice(2)].join('\n')}\n`);
     assert.equal(missing, `<<<ACK:${n}:1>>>\n` + `<<<GONE:${n}>>>\n`.repeat(many.length - 2), `${shell}: a piece missing`);
@@ -279,7 +281,7 @@ test('a typed line prints its marker only where the shell holds exactly the text
   }
   if (FISH) {
     const one = inlineLines(`printf '%s\\n' CONTROL; false`, n, true);
-    assert.equal(runScript(FISH, `${one[0]}\n`), `<<<START:${n}>>>\nCONTROL\n<<<EXIT:${n}:1>>>\n`, 'fish: a clean prompt');
+    assert.equal(stripStartPid(runScript(FISH, `${one[0]}\n`), n), `<<<START:${n}>>>\nCONTROL\n<<<EXIT:${n}:1>>>\n`, 'fish: a clean prompt');
     const out = runScript(FISH, `echo partial ${one[0]!.trimStart()}\n`);
     assert.ok(!out.includes('<<<START') && out.includes(`<<<GONE:${n}>>>`), `fish: a prefix: ${JSON.stringify(out)}`);
   }
@@ -345,14 +347,14 @@ test('declared cancellation probes again after quit flushes an earlier probe', a
     const admitted = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
     assert.ok(admitted.admitted);
     const nonce = /<<<GON''E:([0-9a-f]+)>>>/.exec(h.pty.writes.at(-1)!)![1]!;
-    h.pty.emit(`<<<START:${nonce}>>>\r\n`);
+    h.pty.emit(`<<<START:${nonce}:900>>>\r\n`);
     let quit = false;
     h.pty.write = (data) => {
       if (data === '\x03') return; // this job ignores interrupt
       if (data === '\x1c') { quit = true; return; }
-      if (data.includes(`<<<EXI''T:${nonce}`)) {
-        // Its first probe was flushed by quit; only one typed afterwards can answer.
-        if (quit) h.pty.emit(`<<<EXIT:${nonce}:131>>>\r\n`);
+      if (data.includes(`<<<PRO''BE:${nonce}`)) {
+        // Its first probe was flushed by quit; only one typed afterwards can answer, from the declared shell itself (pid 900).
+        if (quit) h.pty.emit(`<<<PROBE:${nonce}:900>>>\r\n`);
         return;
       }
       write(data);
@@ -428,8 +430,8 @@ test('a declared shell that ends without its caller asking refuses the next shel
     assert.ok(leave.admitted);
     await until(() => typed.some((t) => t.includes("__tsm_b='exit'")), 3000, 'exit typed into the declared shell');
     const exitLine = typed.find((t) => t.includes("__tsm_b='exit'"))!;
-    const exitNonce = /<<<STAR''T:([0-9a-f]+)>>>/.exec(exitLine)![1]!;
-    h.pty.emit(`<<<START:${exitNonce}>>>\r\n`);
+    const exitNonce = /<<<STAR''T:([0-9a-f]+):/.exec(exitLine)![1]!;
+    h.pty.emit(`<<<START:${exitNonce}:900>>>\r\n`);
     h.shell.finishHung(0);
     await until(() => h.session.run(second).state === 'exited', 3000, 'the opener ended');
     assert.doesNotMatch(notes().split('\n').at(-1) ?? '', /refused/, 'the note after the caller’s own exit');
@@ -456,6 +458,159 @@ test('a Run queued for the session’s own shell before a declaration runs when 
     assert.deepEqual([ran.state, ran.exit], ['exited', 0], 'the fail-closed hold has nothing to protect in a Run admitted before the declaration');
     const refused = h.session.admit({ target: 'shell', line: 'echo next', principal: AGENT });
     assert.ok(!refused.admitted && refused.reason === 'declared-shell-ended');
+  } finally {
+    await h.session.close();
+  }
+});
+
+test('at a shell declared through a client that holds the foreground (ssh), a submitted line holds the next Run until it goes stale, not after 200 ms', async () => {
+  // Through ssh the client's group holds the terminal for the whole remote session, so the group
+  // learned at the declaration never gives way: the shell's own group is never seen to come back,
+  // and the hold must not end on that alone (the house's read of a6d0c35, #22). The hung opener
+  // models it: the terminal's foreground stays its group throughout.
+  const h = await scriptedSession({ editingStaleMs: 700 });
+  try {
+    const front = h.session.admit({ target: 'shell', line: 'sleep 100', principal: AGENT });
+    assert.ok(front.admitted);
+    await until(() => h.session.run(front.run.runId).state === 'running');
+    h.session.declareShell({ principal: AGENT });
+    h.session.input('make deploy\n', { principal: AGENT });
+    const held = h.session.admit({ target: 'shell', line: 'echo agent', principal: AGENT });
+    assert.ok(!held.admitted && held.reason === 'human-submitted', JSON.stringify(held));
+    await new Promise((r) => setTimeout(r, 350)); // past the 200 ms foreground-settle window
+    const still = h.session.admit({ target: 'shell', line: 'echo agent', principal: AGENT });
+    assert.ok(!still.admitted && still.reason === 'human-submitted', `held past 200 ms with no evidence the command ended: ${JSON.stringify(still)}`);
+    await new Promise((r) => setTimeout(r, 450)); // now past the stale period
+    const after = h.session.admit({ target: 'shell', line: 'echo agent', principal: AGENT });
+    assert.ok(after.admitted, `admitted once stale, with no evidence either way: ${JSON.stringify(after)}`);
+  } finally {
+    await h.session.close();
+  }
+});
+
+test('a cancel is answered only by the shell the Run was typed into: a nested shell’s probe answer does not end it, and a later natural end reads as itself', async () => {
+  const h = await scriptedSession();
+  const write = h.pty.write.bind(h.pty);
+  try {
+    const opener = await open(h.session, 'sleep 100');
+    declare(h.session, 'sh', opener);
+    const admitted = h.session.admit({ target: 'shell', line: 'bash', principal: AGENT });
+    assert.ok(admitted.admitted);
+    const nonce = /<<<STAR''T:([0-9a-f]+):/.exec(h.pty.writes.at(-1)!)![1]!;
+    // The declared shell (pid 1000) printed the start marker; a nested bash it started is in front of it now.
+    h.pty.emit(`<<<START:${nonce}:1000>>>\r\n`);
+    await until(() => h.session.run(admitted.run.runId).state === 'running', 2000);
+    let probes = 0;
+    h.pty.write = (data) => {
+      if (data === '\x03' || data === '\x1c') return; // the nested bash at its own prompt ignores them
+      if (data.includes(`<<<PRO''BE:${nonce}`)) {
+        probes++;
+        h.pty.emit(`<<<PROBE:${nonce}:2000>>>\r\n`); // answered by the nested bash (pid 2000), not the declared shell
+        return;
+      }
+      write(data);
+    };
+    const result = await h.session.cancel(admitted.run.runId, AGENT, { graceMs: 5 });
+    assert.equal(result.state, 'running', 'the nested shell’s probe answer did not end the Run');
+    assert.ok(probes >= 1, 'a probe was typed');
+    assert.equal(result.escalation, `cancel ${opener}`, 'cancel names the enclosing Run as the next thing to cancel');
+    assert.match(notes(h).at(-1) ?? '', /answered by another shell/);
+    // The nested bash exits and the declared shell prints the Run's own end marker: reported as itself (core-14).
+    h.pty.write = write;
+    h.pty.emit(`<<<EXIT:${nonce}:42>>>\r\n`);
+    await until(() => h.session.run(admitted.run.runId).state !== 'running', 2000);
+    assert.deepEqual([h.session.run(admitted.run.runId).state, h.session.run(admitted.run.runId).exit], ['exited', 42]);
+  } finally {
+    h.pty.write = write;
+    await h.session.close();
+  }
+});
+
+test('redeclaring the outer shell ends the inner layer’s Runs, in flight and queued', async () => {
+  const h = await scriptedSession();
+  try {
+    const opener = await open(h.session, 'sleep 100');
+    declare(h.session, 'sh', opener);
+    // A nested shell, declared in turn (a second hop).
+    const innerOpen = h.session.admit({ target: 'shell', line: 'bash', principal: AGENT });
+    assert.ok(innerOpen.admitted);
+    const n1 = /<<<STAR''T:([0-9a-f]+):/.exec(h.pty.writes.at(-1)!)![1]!;
+    h.pty.emit(`<<<START:${n1}:1000>>>\r\n`);
+    await until(() => h.session.run(innerOpen.run.runId).state === 'running', 2000);
+    declare(h.session, 'sh', innerOpen.run.runId);
+    // A Run running in the inner shell, and one queued behind it.
+    const deep = h.session.admit({ target: 'shell', line: 'sleep 50', principal: AGENT });
+    assert.ok(deep.admitted);
+    const n2 = /<<<STAR''T:([0-9a-f]+):/.exec(h.pty.writes.at(-1)!)![1]!;
+    h.pty.emit(`<<<START:${n2}:2000>>>\r\n`);
+    await until(() => h.session.run(deep.run.runId).state === 'running', 2000);
+    const queued = h.session.admit({ target: 'shell', line: 'echo inner-queued', principal: AGENT, queue: true });
+    assert.ok(queued.admitted && queued.run.state === 'queued');
+    // Redeclaring the program the outer layer is on: the inner layer and its Runs go with the old word.
+    declare(h.session, 'sh', opener);
+    assert.equal(h.session.run(deep.run.runId).state, 'lost', 'the inner shell’s in-flight Run ended');
+    assert.equal(h.session.run(deep.run.runId).reason, 'undeclared');
+    assert.equal(h.session.run(queued.run.runId).state, 'lost', 'the inner shell’s queued Run ended');
+    assert.match(h.session.run(queued.run.runId).reason ?? '', /undeclared/);
+    assert.deepEqual(h.session.info().declared, { shell: 'sh', within: opener }, 'back to the outer declaration');
+    assert.equal(h.session.run(innerOpen.run.runId).state, 'running', 'the nested bash itself is untouched');
+    assert.ok(notes(h).some((t) => /inside .* goes with the new declaration/.test(t)));
+  } finally {
+    await h.session.close();
+  }
+});
+
+test('each piece of a multi-piece inline Run is cleared before it is typed, so keys typed between pieces do not join the next one', async () => {
+  const h = await scriptedSession();
+  try {
+    const typed: string[] = [];
+    h.pty.onWrite((d) => typed.push(d));
+    const opener = await open(h.session, 'sleep 100');
+    declare(h.session, 'sh', opener);
+    const body = Array.from({ length: 120 }, (_, i) => `echo line-${i}-${'x'.repeat(40)}`).join('\n');
+    const a = h.session.admit({ target: 'shell', line: body, principal: AGENT });
+    assert.ok(a.admitted);
+    await until(() => typed.some((t) => /<<<GON''E:[0-9a-f]+>>>/.test(t)), 2000, "the first piece");
+    const nonce = /<<<GON''E:([0-9a-f]+)>>>/.exec(typed.find((t) => /<<<GON''E:[0-9a-f]+>>>/.test(t))!)![1]!;
+    assert.ok(typed.at(-1)!.startsWith('\x05\x15'), 'the first piece is preceded by the clear keys');
+    const before = typed.length;
+    h.pty.emit(`<<<ACK:${nonce}:1>>>\r\n`);
+    await until(() => typed.length > before, 2000, 'the next piece');
+    assert.ok(typed.slice(before).some((t) => t.startsWith('\x05\x15')), 'the next piece is cleared before it is typed');
+  } finally {
+    await h.session.close();
+  }
+});
+
+test('spending the one-shot fail-closed refusal restarts a declared queue the refusal had held', async () => {
+  // A Run queued for a surviving outer layer is held while declaredEnded stands (drainDeclared returns
+  // early then); spending the refusal did not restart it (the house's read of a6d0c35, #22).
+  const h = await scriptedSession();
+  try {
+    const typed: string[] = [];
+    h.pty.onWrite((d) => typed.push(d));
+    const opener = await open(h.session, 'sleep 100');
+    declare(h.session, 'sh', opener);
+    const run1 = h.session.admit({ target: 'shell', line: 'sleep 50', principal: AGENT });
+    assert.ok(run1.admitted);
+    const n1 = /<<<STAR''T:([0-9a-f]+):/.exec(h.pty.writes.at(-1)!)![1]!;
+    h.pty.emit(`<<<START:${n1}:1000>>>\r\n`);
+    await until(() => h.session.run(run1.run.runId).state === 'running', 2000);
+    // A Run queued behind it, for this same (outer) declared shell.
+    const held = h.session.admit({ target: 'shell', line: 'echo later-A', principal: AGENT, queue: true });
+    assert.ok(held.admitted && held.run.state === 'queued');
+    // A second hop is declared on run1; run1 then ends by itself (an end the caller did not ask for),
+    // so that inner layer fails closed while the outer layer and its queued Run survive.
+    declare(h.session, 'sh', run1.run.runId);
+    h.pty.emit(`<<<EXIT:${n1}:0>>>\r\n`);
+    await until(() => h.session.run(run1.run.runId).state !== 'running', 2000);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(h.session.run(held.run.runId).state, 'queued', 'held while the fail-closed refusal stands');
+    const before = typed.length;
+    const refused = h.session.admit({ target: 'shell', line: 'echo new', principal: AGENT });
+    assert.ok(!refused.admitted && refused.reason === 'declared-shell-ended');
+    await until(() => h.session.run(held.run.runId).state !== 'queued', 2000, 'the held Run launched');
+    assert.ok(typed.slice(before).some((t) => t.includes("__tsm_b='echo later-A'")), 'the held Run was finally typed');
   } finally {
     await h.session.close();
   }

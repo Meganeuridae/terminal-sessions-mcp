@@ -381,6 +381,22 @@ test('G26/G17 (api-3, core-7): env capture needs the seat, keeps values out of r
   await h.session.close();
 });
 
+test('core-7: an env capture whose `env -0` failed is not installed as the snapshot', async () => {
+  // A failed capture (no `env` on the PATH, a full disk) leaves an empty or partial file: it must be
+  // refused, not become the process basis (the house's read of a6d0c35, #22). The exit status is the check.
+  const h = await harness({
+    setup: (s) =>
+      s.on(/^env -0 > '(.*)'$/, (l) => {
+        fs.writeFileSync(/^env -0 > '(.*)'$/.exec(l)![1]!, 'PARTIAL=only\0');
+        return { exit: 127 };
+      }),
+  });
+  await assert.rejects(h.session.captureEnv(AGENT), /env capture failed: env -0 exited 127/);
+  assert.ok(!h.journal.since(0).events.some((e) => e.type === 'env.snapshot'), 'no snapshot was journaled');
+  assert.ok(!JSON.stringify(h.journal.since(0).events).includes('PARTIAL'));
+  await h.session.close();
+});
+
 test('G17 (api-14): signal validates names; control characters for INT/TSTP/QUIT; others to the foreground job, never the shell', async () => {
   const h = await harness();
   const before = h.journal.lastSeq;
@@ -401,6 +417,20 @@ test('G17 (api-14): signal validates names; control characters for INT/TSTP/QUIT
   await h.session.close();
 });
 
+test('api-14: a signal that is not delivered says why — a job running as another user (EPERM), not one that ended', async () => {
+  // signal() used to say "(the job ended)" for any failure, EPERM included (the house's read of a6d0c35, #22).
+  const h = await harness();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 10', principal: AGENT });
+  assert.ok(a.admitted);
+  h.pty.signalGroup = () => false; // the kernel refuses it
+  h.pty.groupAlive = () => true; // but the group still has a member: it is another user's
+  const before = h.journal.lastSeq;
+  h.session.signal('SIGTERM', AGENT);
+  const note = ofType(h.journal.since(before).events, 'note')[0];
+  assert.match(note?.text ?? '', /not permitted: the job runs as another user/);
+  await h.session.close();
+});
+
 test('G15/G2 (core-15): a process that never spawned is lost with the reason, with no invented signal', async () => {
   const h = await harness();
   h.backend.onSpawnProcess = (p) => p.exit({ exitCode: null, spawnError: 'ENOENT spawn /nonexistent/binary ENOENT' });
@@ -411,6 +441,23 @@ test('G15/G2 (core-15): a process that never spawned is lost with the reason, wi
   assert.equal(r.signal, undefined);
   assert.equal(r.exit, undefined);
   assert.match(r.reason ?? '', /^spawn-failed: ENOENT/);
+  await h.session.close();
+});
+
+test('core-15: a synchronous throw from the backend\'s spawnProcess ends the Run lost, not an unhandled error', async () => {
+  // launchProcess catches a synchronous throw too, not only the asynchronous spawn error above
+  // (the house's read of a6d0c35, #22: only the async path had a test).
+  const h = await harness();
+  h.backend.spawnProcess = () => {
+    throw new Error('EACCES: the backend refused synchronously');
+  };
+  const a = h.session.admit({ target: 'process', argv: ['/bin/true'], principal: AGENT });
+  assert.ok(a.admitted);
+  const r = await h.session.awaitRun(a.run.runId, 1000);
+  assert.equal(r.state, 'lost');
+  assert.equal(r.signal, undefined);
+  assert.equal(r.exit, undefined);
+  assert.match(r.reason ?? '', /^spawn-failed: EACCES/);
   await h.session.close();
 });
 
@@ -442,6 +489,23 @@ test('G28: awaitRun records the waiting principal until its waiter resolves; run
   assert.equal((await waiting).state, 'exited');
   assert.deepEqual(seenAtEnd, [true, false]);
   assert.equal(h.session.isAwaitedBy(a.run.runId, AGENT), false, 'removed after the waiter resolved');
+  await h.session.close();
+});
+
+test('core: a wait that times out leaves no callback behind on a long Run (bounded memory while it is polled)', async () => {
+  // awaitRun and waitAvailable used to keep each timed-out wait's callback until the next event
+  // (the house's read of a6d0c35, #22): a long Run polled every few seconds collected one per poll.
+  const h = await harness();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 100', principal: AGENT });
+  assert.ok(a.admitted);
+  const runs = (h.session as unknown as { runs: Map<string, { waiters: unknown[] }>; availabilityWaiters: unknown[] }).runs;
+  const session = h.session as unknown as { availabilityWaiters: unknown[] };
+  for (let i = 0; i < 6; i++) {
+    await h.session.awaitRun(a.run.runId, 3);
+    await h.session.waitAvailable(3);
+  }
+  assert.equal(runs.get(a.run.runId)!.waiters.length, 0, 'awaitRun removed each timed-out waiter');
+  assert.equal(session.availabilityWaiters.length, 0, 'waitAvailable removed each timed-out waiter');
   await h.session.close();
 });
 

@@ -129,8 +129,10 @@ go on. A second hop (`ssh` from the remote) is declared again; `tsm declare work
 takes a declaration back. A partial line someone is typing at its prompt makes a new Run
 busy (`human-editing`), or queued until the line is cleared or goes stale; a line they
 submitted holds the next Run (`human-submitted`) until their command is seen to end — from the
-terminal's foreground where the declared shell runs on this machine (a nested shell, `sudo -i`),
-or after 30 s of quiet where nothing can be seen (`ssh`). Cancel inside a
+terminal's foreground where the declared shell runs on this machine (a nested shell, `sudo -i`:
+once a job has been seen in front, the shell's own group in front again means done), or after
+30 s of quiet where nothing can be seen (`ssh`, whose client holds the foreground throughout).
+Cancel inside a
 declared shell types `^C`, the end marker and then `^\`: the daemon cannot signal a job
 on another machine, and says so.
 

@@ -55,6 +55,10 @@ for (const shell of shells) {
         // A terminated heredoc feeding a pipeline still gets its statuses.
         const closed = await x.run(`sh -c 'cat; exit 4' <<EOF | tail -n 1\nbody\nEOF`);
         assert.deepEqual([closed.exit, closed.pipeStatus, closed.text.trim()], [0, [4, 0], 'body']);
+        // A `<<` inside a closed quoted heredoc body is text, not a second heredoc: the statuses are still captured
+        // (the house's read of a6d0c35, #22: this came back with no pipeStatus).
+        const bodyShift = await x.run(`cat <<'A' | tail -n 1\nx << y\nA`);
+        assert.deepEqual([bodyShift.exit, bodyShift.pipeStatus, bodyShift.text.trim()], [0, [0, 0], 'x << y']);
       }
     } finally {
       await x.close();
@@ -73,4 +77,15 @@ test('an open heredoc is recognised, quoted or not, with <<- and tab-indented te
   assert.equal(hasOpenHeredoc('cat <<< "a string"\n'), false);
   assert.equal(hasOpenHeredoc('echo plain | tail -n 1\n'), false);
   assert.equal(hasOpenHeredoc('cat <<A\nx\nA\ncat <<B\ny\n'), true, 'the second heredoc is open');
+  // The delimiter is the whole word the shell reads, not just an identifier (the house's read of a6d0c35, #22).
+  assert.equal(hasOpenHeredoc('cat > out <<123\nkey=value\n'), true, 'a numeric delimiter still opens a heredoc');
+  assert.equal(hasOpenHeredoc('cat > out <<123\nkey=value\n123\n'), false, 'and its own terminator closes it');
+  assert.equal(hasOpenHeredoc('cat > out <<EOF.txt\nkey=value\nEOF\n'), true, 'EOF does not close a heredoc whose delimiter is EOF.txt');
+  assert.equal(hasOpenHeredoc('cat > out <<EOF.txt\nkey=value\nEOF.txt\n'), false);
+  assert.equal(hasOpenHeredoc('cat <<"E"OF\nbody\nEOF\n'), false, 'quotes in the delimiter are removed');
+  // A `<<` inside a closed heredoc body is text, not a second heredoc (it dropped the pipeline statuses).
+  assert.equal(hasOpenHeredoc("cat <<'A' | tail -n 1\nx << y\nA\n"), false, 'the << in a closed heredoc body is not a heredoc');
+  assert.equal(hasOpenHeredoc('echo "a << b"\n'), false, 'a << inside a double-quoted string is not a heredoc');
+  assert.equal(hasOpenHeredoc('x=$((1 << 4))\n'), false, 'a left shift in arithmetic is not a heredoc');
+  assert.equal(hasOpenHeredoc('echo hi # cat <<EOF\n'), false, 'a << in a comment is not a heredoc');
 });

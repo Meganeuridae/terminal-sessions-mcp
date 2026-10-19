@@ -71,7 +71,6 @@ export class FakeShell {
   private held = '';
   /** Typeahead, in arrival order, read after the running command ends. */
   private queued = '';
-  private lastExit = 0;
   /** Lines the fake shell has executed, in order (the sourced text for temp-file lines). */
   readonly executed: string[] = [];
   /** Lines typed at its prompt, exactly as read. */
@@ -245,9 +244,10 @@ export class FakeShell {
         line = `echo "${file}: No such file or directory"; false`;
       }
     } else {
-      const probe = /^\s*echo "<<<EX""IT:([0-9a-f]+):\$(?:\?|status)>>>"$/.exec(typedLine);
+      // The marker strategy's end-marker probe: a marker of its own (the house's read of a6d0c35, #22).
+      const probe = /^\s*echo "<<<PRO""BE:([0-9a-f]+)>>>"$/.exec(typedLine);
       if (probe) {
-        this.pty.emit(`<<<EXIT:${probe[1]}:${this.lastExit}>>>\r\n`);
+        this.pty.emit(`<<<PROBE:${probe[1]}>>>\r\n`);
         this.prompt();
         return;
       }
@@ -271,7 +271,6 @@ export class FakeShell {
       this.running = undefined;
       this.hung = undefined;
       this.pty.foregroundPgid = this.pty.pid;
-      this.lastExit = exit;
       if (output) this.pty.emit(output);
       // The marker tail (`; echo "<<<EXI""T:nonce:$?>>>"`) executes after the sourced file,
       // unless an interrupt aborted the rest of the line (dash).
@@ -522,12 +521,13 @@ export async function until(fn: () => boolean, ms = 3000, what = 'condition'): P
 
 export const hasShell = (p: string): boolean => fs.existsSync(p);
 
-/** Pids of processes whose command line matches `pattern` (pgrep -f). */
+/** Pids of processes whose command line matches `pattern` (pgrep -f). No match is `[]`; a pgrep that failed to run is an error, never an absence (the house's read of a6d0c35, #22). */
 export const pgrep = (pattern: string): number[] => {
   try {
-    return execFileSync('pgrep', ['-f', pattern], { encoding: 'utf8' }).split('\n').filter(Boolean).map(Number);
-  } catch {
-    return [];
+    return execFileSync('pgrep', ['-f', pattern], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).split('\n').filter(Boolean).map(Number);
+  } catch (e) {
+    if ((e as { status?: number }).status === 1) return [];
+    throw e;
   }
 };
 export const reap = (pattern: string) => {

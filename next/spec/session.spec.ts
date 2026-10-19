@@ -113,7 +113,9 @@ test('G5: integration level is observed: rich, basic, none', async () => {
 });
 
 test('G5/§8.1 fallback: without marks the marker strategy still yields an observed exit and a clean transcript', async () => {
-  const h = await harness({ marks: 'none', setup: (s) => s.on('printf hi', () => ({ output: 'hi', exit: 0 })) });
+  // A line that returns 7 without exiting the shell (the house's read of a6d0c35, #22: the test used
+  // `exit 7`, which a real shell would obey by exiting, and relied on the FakeShell treating it as a return).
+  const h = await harness({ marks: 'none', setup: (s) => s.on('printf hi', () => ({ output: 'hi', exit: 0 })).on('status7', () => ({ exit: 7 })) });
   const a = h.session.admit({ target: 'shell', line: 'printf hi', principal: AGENT });
   assert.ok(a.admitted);
   const written = h.pty.written;
@@ -124,7 +126,7 @@ test('G5/§8.1 fallback: without marks the marker strategy still yields an obser
   assert.equal(r.exit, 0);
   const t = await h.session.runTranscript(r.runId);
   assert.equal(t.text, 'hi');
-  const b = h.session.admit({ target: 'shell', line: 'exit 7', principal: AGENT });
+  const b = h.session.admit({ target: 'shell', line: 'status7', principal: AGENT });
   assert.ok(b.admitted);
   assert.equal((await h.session.awaitRun(b.run.runId, 1000)).exit, 7);
   await h.session.close();

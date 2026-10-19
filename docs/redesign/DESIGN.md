@@ -595,9 +595,11 @@ declared Runs carry `shell` and `within` and report the cwd as unknown. G4 holds
 prompt too: a partial line someone typed there makes a declared Run busy (`human-editing`) or
 queued, a submitted one holds it (`human-submitted`) until the person's command is seen to end —
 by the terminal's foreground process group where the declared shell runs on this terminal (a
-nested shell, `sudo -i`: the shell's own group in front again means done, another group in front
-means not yet, however long), or, where a client such as `ssh` holds the foreground throughout
-and nothing can be seen, after the stale period (30 s) of quiet.
+nested shell, `sudo -i`: a group other than the shell's own in front means not yet, however long,
+and the shell's own group in front again means done — but only once a different group has been seen
+there, which is what shows the declared shell's jobs run on this terminal at all). Where a client
+such as `ssh` holds the foreground throughout, its group reads the same as the shell's own and
+nothing can be seen, so the hold ends only after the stale period (30 s) of quiet.
 
 ### 8.2 Process target
 
