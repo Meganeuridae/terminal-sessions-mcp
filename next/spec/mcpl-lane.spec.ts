@@ -23,7 +23,7 @@ import type { SegmenterOptions } from '../src/core/segmenter.js';
 import { seqOfMessageId } from '../src/core/segmenter.js';
 import type { Session } from '../src/core/session.js';
 import { Outbound, type Message } from '../src/transport/jsonrpc.js';
-import { FEATURE_SETS, manifest, McplLane, NODE_NAME, summaryFloor } from '../src/transport/mcpl.js';
+import { FEATURE_SETS, manifest, McplLane, NODE_NAME, noteBudgets, summaryFloor } from '../src/transport/mcpl.js';
 import { TermServer } from '../src/transport/server.js';
 import { FULL_GRANT, TestHost, sleep, until, type Delivery, type Msg } from './testhost.js';
 
@@ -1105,9 +1105,21 @@ test("a channel opened while its session runs gets the Run that ended during the
       const hold = held ? holdTranscripts(s, first.structured?.runId) : undefined;
       const opening = a.request('channels/open', { channelId: 'terminal:or', history: { limit: 10 } }) as Promise<{ history?: Array<{ metadata: Record<string, unknown> }> }>;
       if (hold) await hold.reached;
+      // The second Run's message, once built, has reached every listener of the session's segmenter, the lane's
+      // among them, before this promise settles: waiting on it, not on time, is what shows the hold (the house's
+      // read of the 38 commits, PR #22, comment 6274370651).
+      const built = hold
+        ? new Promise<void>((r) => {
+            const off = d.app.segmenter(s).subscribe((x) => {
+              if (x.kind !== 'run' || x.runId === first.structured?.runId) return;
+              off();
+              r();
+            });
+          })
+        : undefined;
       const second = await b.call('run', { session: 'or', command: 'echo or-second' });
       if (hold) {
-        await sleep(150); // the segmenter builds the Run's message while the open still reads
+        await built;
         hold.release();
       }
       const res = await opening;
@@ -1305,9 +1317,10 @@ test('the hold for a synchronous call is measured on the monotonic clock: a wall
 /**
  * A lane over a real App with no endpoint, as the reviewer's probe drives it: the host accepts every
  * request until `refuse.value` is set. Registry changes reach the lane as the endpoint would send them
- * (`announce`), except a close, which the test orders itself (`closed` records them).
+ * (`announce`), except a close, which the test orders itself (`closed` records them), and a removal
+ * when `removals` is manual (`removed` records them).
  */
-async function bareLane(connection: string, o: { announce?: boolean } = {}) {
+async function bareLane(connection: string, o: { announce?: boolean; removals?: 'manual' } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-lane-'));
   const registry = new SessionRegistry({ dataDir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
   const app = new App({ registry, segmenter: { runSettleMs: 10 } });
@@ -1328,21 +1341,23 @@ async function bareLane(connection: string, o: { announce?: boolean } = {}) {
   const caller = { principal: A, connectionId: connection };
   const lane = new McplLane(app, caller, out, () => undefined);
   const closed: string[] = [];
+  const removed: string[] = [];
   if (o.announce !== false) {
     registry.onChange((c) => {
       if (c.type === 'created') lane.sessionCreated(c.id);
       else if (c.type === 'closed') closed.push(c.id);
+      else if (o.removals === 'manual') removed.push(c.id);
       else void lane.sessionRemoved(c.id);
     });
   }
   const ctx = { isRequest: true, after: (fn: () => void) => fn() };
   await lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, ctx);
   const inside = lane as unknown as {
-    opening: Map<string, unknown>;
+    opening: Map<string, { held: Map<string, unknown> }>;
     open: Set<string>;
     registered: Set<string>;
     watched: Map<string, unknown>;
-    states: Map<string, { owed: Set<number> }>;
+    states: Map<string, { owed: Set<number>; retries: Map<string, unknown> }>;
     startCatchUp(sessions: string[]): Promise<void>;
   };
   /** A Run whose outcome counts as returned by its call: once settled, nothing of it is held or owed. */
@@ -1358,7 +1373,7 @@ async function bareLane(connection: string, o: { announce?: boolean } = {}) {
     await registry.closeAll();
     fs.rmSync(dataDir, { recursive: true, force: true });
   };
-  return { registry, app, lane, caller, ctx, sent, refuse, closed, inside, settledRun, close };
+  return { registry, app, lane, caller, ctx, sent, refuse, closed, removed, inside, settledRun, close };
 }
 
 test("a message held for an open in flight keeps its debt when the session closes during the read, and the host's later refusal keeps it owed", { timeout: 20_000 }, async () => {
@@ -1375,7 +1390,7 @@ test("a message held for an open in flight keeps its debt when the session close
     await hold.reached;
     await f.app.sessionClose(f.caller, { session: 'oc' });
     await until(() => f.closed.includes('oc'), 3000, 'the close to be announced');
-    await sleep(200); // the exit's message is rendered and held for the opening channel
+    await until(() => (f.inside.opening.get('terminal:oc')?.held.size ?? 0) >= 1, 3000, 'the exit held for the opening channel');
     const exit = s.journal.since(0).events.find((e) => e.type === 'session.exit');
     assert.ok(exit, 'the exit is journaled');
     const st = f.inside.states.get('oc')!;
@@ -1392,7 +1407,7 @@ test("a message held for an open in flight keeps its debt when the session close
     await assert.rejects(opening, (e: Error & { code?: number }) => e.code === -32023);
     hold.restore();
     await until(() => f.sent.some((m) => m.method === 'push/event' && /session-exit/.test(String((m.params as { eventId: string }).eventId))), 3000, 'the exit pushed');
-    await sleep(200);
+    await until(() => st.retries.size >= 1, 3000, 'the refused exit queued for a retry');
     assert.ok(st.owed.has(exit.seq), 'refused, the exit stays owed');
     assert.ok(s.cursorsOf(A).delivered < exit.seq);
   } finally {
@@ -1469,5 +1484,83 @@ test("a young service Run stays hold-eligible across a wall-clock step: the read
     await a.close();
   } finally {
     await d.stop();
+  }
+});
+
+// ───────────── the house's read of the 38 commits (PR #22, comment 6274370651) ─────────────
+
+test("a close sent while the channel's history is read stands: it answers closed, what was held goes a closed channel's way, and the open leaves the channel closed", { timeout: 20_000 }, async () => {
+  // closeChannel answered from `open` alone, false while the channel was opening, and the returning open
+  // registered, opened and delivered what it held: the host's close was undone, while the host kept it.
+  const f = await bareLane('c-close-mid');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'cm', visibility: 'shared' });
+    const one = await f.settledRun('cm', 'echo one');
+    const s = live(f.registry, 'cm');
+    const hold = holdTranscripts(s, one);
+    const opening = f.lane.handle('channels/open', { channelId: 'terminal:cm', history: { limit: 5 } }, f.ctx) as Promise<{ history?: unknown[] }>;
+    await hold.reached;
+    s.journal.append({ type: 'control', controller: null, by: A, how: 'release' }); // a message for the opening channel
+    await until(() => (f.inside.opening.get('terminal:cm')?.held.size ?? 0) >= 1, 3000, 'the seat change held for the opening channel');
+    const closed = await f.lane.handle('channels/close', { channelId: 'terminal:cm' }, f.ctx);
+    assert.deepEqual(closed, { closed: true });
+    assert.equal(f.inside.opening.size, 0, 'the opening is abandoned');
+    hold.release();
+    const res = await opening;
+    hold.restore();
+    assert.ok(Array.isArray(res.history), 'the open still answers with its page');
+    assert.equal(f.inside.open.has('terminal:cm'), false, 'and leaves the channel closed');
+    await sleep(200);
+    assert.ok(!f.sent.some((m) => m.method === 'channels/incoming'), 'nothing went on the closed channel');
+  } finally {
+    await f.close();
+  }
+});
+
+test("a name forgotten and re-created while its channel's history is read: the gone life's held messages go nowhere, and the new life's open starts its own opening", { timeout: 20_000 }, async () => {
+  // The endpoint's sessionRemoved lands after the name is re-created and returned early, leaving the old
+  // opening and its held messages; the new life's open joined it, and finishOpening sent the gone life's
+  // messages on the channel the name now names.
+  const f = await bareLane('c-recreate', { removals: 'manual' });
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'rc', visibility: 'shared' });
+    const one = await f.settledRun('rc', 'echo one');
+    const old = live(f.registry, 'rc');
+    const hold = holdTranscripts(old, one);
+    const first = f.lane.handle('channels/open', { channelId: 'terminal:rc', history: { limit: 5 } }, f.ctx);
+    await hold.reached;
+    old.journal.append({ type: 'control', controller: null, by: A, how: 'release' }); // the gone life's message, held
+    await until(() => (f.inside.opening.get('terminal:rc')?.held.size ?? 0) >= 1, 3000, 'held for the opening channel');
+    await f.app.sessionClose(f.caller, { session: 'rc', forget: true });
+    await until(() => f.removed.includes('rc'), 3000, 'the name forgotten');
+    await f.app.sessionOpen(f.caller, { id: 'rc', visibility: 'shared' });
+    await f.lane.sessionRemoved('rc'); // the endpoint's call, landing after the re-creation
+    assert.equal(f.inside.opening.size, 0, "the gone life's opening is dropped");
+    await f.lane.handle('channels/open', { channelId: 'terminal:rc', history: { limit: 5 } }, f.ctx);
+    assert.equal(f.inside.open.has('terminal:rc'), true, "the new life's channel is open");
+    hold.release();
+    await assert.rejects(first, (e: Error & { code?: number }) => e.code === -32023);
+    hold.restore();
+    await sleep(200);
+    const controls = f.sent.filter((m) => m.method === 'channels/incoming').flatMap((m) => (m.params as { messages: Array<{ tags: string[] }> }).messages).filter((x) => x.tags.includes('terminal:control'));
+    assert.equal(controls.length, 0, "the gone life's seat change never reached the new session's channel");
+  } finally {
+    await f.close();
+  }
+});
+
+test('without a byte cap the note budget keeps no sizes, only the rates apply; under a cap each retained note counts', async () => {
+  // Every note was recorded, and without retention nothing is ever pruned: a pair per note for the daemon's life.
+  const f = await bareLane('c-notes');
+  try {
+    const publish = (channel: string, text: string) => f.lane.handle('channels/publish', { channelId: channel, content: [{ type: 'text', text }] }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'nn', visibility: 'shared' });
+    for (let i = 0; i < 4; i++) await publish('terminal:nn', `note ${i}`);
+    assert.equal(noteBudgets.get(live(f.registry, 'nn').journal.runs)?.retainedNotes ?? 0, 0, 'no cap: nothing to evict, nothing kept');
+    await f.app.sessionOpen(f.caller, { id: 'nc', visibility: 'shared', retention: { maxBytes: 64 * 1024 } });
+    for (let i = 0; i < 2; i++) await publish('terminal:nc', `note ${i}`);
+    assert.equal(noteBudgets.get(live(f.registry, 'nc').journal.runs)?.retainedNotes, 2, 'a cap: each retained note counts');
+  } finally {
+    await f.close();
   }
 });

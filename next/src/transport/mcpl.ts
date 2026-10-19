@@ -242,6 +242,8 @@ type Target = Session | HistorySession;
 interface Opening {
   held: Map<string, { t: Target; seg: Segment }>;
   opens: number;
+  /** The host closed the channel while it was read: the close stands, and the open leaves the channel closed. */
+  closed?: true;
 }
 
 /**
@@ -253,8 +255,8 @@ export const summaryFloor = (o: Omitted | undefined, gaps: ReadonlyArray<{ from:
 const targetOf = (entry: AnySession): Target => (entry.kind === 'live' ? entry.session : entry);
 const liveOf = (t: Target): Session | undefined => ('kind' in t && t.kind === 'history' ? undefined : (t as Session));
 
-/** Note budgets by lineage (mcpl-5). */
-const noteBudgets = new WeakMap<object, NoteBudget>();
+/** Note budgets by lineage (mcpl-5); exported for the spec that checks what a budget retains. */
+export const noteBudgets = new WeakMap<object, NoteBudget>();
 
 /**
  * The lanes of one App, by principal. A principal's `delivered` cursor is one across its
@@ -561,14 +563,17 @@ export class McplLane {
   /** A session and its journal are gone (`forget`, retention). A name opened again meanwhile is a different session and stays. */
   async sessionRemoved(sessionId: string): Promise<void> {
     await this.letGo(sessionId);
+    const id = channelId(sessionId);
+    // An open of the gone life's channel still reading history holds that life's messages: they go
+    // nowhere, and a name re-created meanwhile starts an opening of its own, where a second open had
+    // joined the old one and sent its messages on the new session's channel (the house's read of the 38 commits (PR #22, comment 6274370651)).
+    this.opening.delete(id);
     if (this.app.registry.get(sessionId)) return; // re-created meanwhile: sessionCreated announced it (mcpl-10)
     const st = this.states.get(sessionId);
     if (st) for (const h of st.held.values()) if (h.timer) clearTimeout(h.timer);
     if (st) for (const r of st.retries.values()) if (r.timer) clearTimeout(r.timer);
     this.states.delete(sessionId);
-    const id = channelId(sessionId);
     this.open.delete(id);
-    this.opening.delete(id);
     if (this.registered.delete(id) && this.channelsOn()) this.out.notify('channels/changed', { removed: [id] });
   }
 
@@ -623,6 +628,9 @@ export class McplLane {
         if (this.app.registry.get(sid) !== s) throw new RpcError(UNKNOWN_CHANNEL, `session ${sid} was closed or replaced while its history was read; nothing was opened`, { channelId: id });
         res.history = r.segments.map((seg) => this.message(t, seg));
         if (r.truncated) res.historyTruncated = true;
+        // The host closed the channel during the read (see `closeChannel`): the close stands. The page
+        // is still the open's answer; nothing is attached, followed or opened.
+        if (pending?.closed) return res;
       }
       if (s.kind === 'live') {
         // §9: the owner's connection takes a free seat; everyone else observes. Opening never starts a
@@ -681,7 +689,18 @@ export class McplLane {
   closeChannel(id: string): { closed: boolean } {
     // §14.1: lifecycle methods need channels.lifecycle, close as much as open (the house's review of #11).
     if (!this.has('channels.lifecycle')) throw new RpcError(CAPABILITY_DENIED, 'channels.lifecycle not granted', { capability: 'channels.lifecycle' });
-    return { closed: this.open.delete(id) };
+    // A close while the channel's history is read stands: the opening is abandoned, what it held goes
+    // a closed channel's way, and the open leaves the channel closed when its read returns. Answered
+    // from `open` alone, the close said false and the returning open undid it, while the host kept the
+    // close as standing, so a reconnect dropped a channel this connection still delivered on (the house's read of the 38 commits (PR #22, comment 6274370651)).
+    const p = this.opening.get(id);
+    if (p) {
+      p.closed = true;
+      this.opening.delete(id);
+      for (const h of p.held.values()) this.deliver(h.t, h.seg, { released: true });
+    }
+    const wasOpen = this.open.delete(id);
+    return { closed: wasOpen || p !== undefined };
   }
 
   private attach(session: Session): void {
@@ -712,6 +731,7 @@ export class McplLane {
       throw new RpcError(INVALID_PARAMS, `a note is at most ${NOTE_MAX_BYTES} bytes (this one is ${bytes}); write longer text to a file and point to it`, { channelId: params.channelId, bytes, maxBytes: NOTE_MAX_BYTES });
     }
     let budget: NoteBudget | undefined;
+    let capped = false;
     let stored = bytes;
     if (s.kind === 'live' && !s.session.journal.closed) {
       const journal = s.session.journal;
@@ -727,13 +747,16 @@ export class McplLane {
       budget = noteBudgets.get(lineage);
       if (!budget) noteBudgets.set(lineage, (budget = new NoteBudget()));
       // After a daemon restart the budget starts empty while the journal still holds every note it kept.
-      if (Number.isFinite(retention)) await budget.seed(journal);
+      capped = Number.isFinite(retention);
+      if (capped) await budget.seed(journal);
       const refused = budget.take(this.me, stored, journal, retention, clocks.monotonic());
       if (refused) throw new RpcError(OVERLOADED, refused.message, { channelId: params.channelId, retryAfterMs: refused.retryAfterMs });
     }
     try {
       const r = this.app.note(this.caller, { session: sid, text, channel: params.channelId });
-      budget?.record(r.seq, stored);
+      // Only under a byte cap is a note's size kept: without one nothing is ever evicted and the list
+      // only grew, a pair per note for the daemon's life (the house's read of the 38 commits (PR #22, comment 6274370651)).
+      if (capped) budget?.record(r.seq, stored);
       // Delivered means recorded (mcpl-14): the note is in the session's journal, where the GUI, `read`
       // and other principals' open channels see it. Nobody watching right now is not a failure to report.
       return { delivered: true, messageId: qualify(segmentId(sid, targetOf(s).journal, 'note', r.seq)) };
@@ -1361,7 +1384,7 @@ export class McplLane {
  * house's read of 2f357bd, #22). Without a byte cap there is nothing to evict: the share is
  * unbounded and only the rates apply.
  */
-class NoteBudget {
+export class NoteBudget {
   private readonly buckets = new Map<Principal, { tokens: number; at: number; minute: number[] }>();
   private readonly retained: Array<[Seq, number]> = [];
   private bytes = 0;
@@ -1409,6 +1432,11 @@ class NoteBudget {
   record(seq: Seq, bytes: number): void {
     this.retained.push([seq, bytes]);
     this.bytes += bytes;
+  }
+
+  /** How many notes' sizes the budget keeps (those still retained under a byte cap). */
+  get retainedNotes(): number {
+    return this.retained.length;
   }
 }
 
