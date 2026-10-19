@@ -116,6 +116,8 @@ export interface SessionSummary extends SessionHeader {
   cols?: number;
   rows?: number;
   services?: Array<{ runId: string; name?: string; status: ServiceStatus; evidence?: string }>;
+  /** Services that `services` left out, older than the ones listed (the house's read of the 36 commits, #22). */
+  servicesOmitted?: number;
   watches?: number;
   /** Runs that have not ended (shell and process), newest last, so a lost runId can be found again; the 20 newest. */
   runs?: Array<{ runId: string; target: RunTarget; state: RunInfo['state']; principal: Principal; line?: string; admittedAt: number }>;
@@ -456,8 +458,12 @@ export class App {
       out.retention = { ...s.retention };
       const x = this.extrasBySession.get(s.session);
       if (x) {
-        const services = x.services.list().map((v) => ({ runId: v.runId, status: v.status, ...(v.name !== undefined ? { name: v.name } : {}), ...(v.evidence !== undefined ? { evidence: v.evidence } : {}) }));
+        // The list is bounded like `runs`: a life that starts many services does not grow this without
+        // limit (the house's read of the 36 commits, #22). The newest few are shown, the rest counted.
+        const allServices = x.services.list();
+        const services = allServices.slice(-20).map((v) => ({ runId: v.runId, status: v.status, ...(v.name !== undefined ? { name: v.name } : {}), ...(v.evidence !== undefined ? { evidence: v.evidence } : {}) }));
         if (services.length) out.services = services;
+        if (allServices.length > services.length) out.servicesOmitted = allServices.length - services.length;
         const w = x.watches.list().length;
         if (w) out.watches = w;
       }

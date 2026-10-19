@@ -331,3 +331,15 @@ test('m2-5: a start whose pattern the engine refuses fails with invalid_argument
   const s = registry.get('svc-bad');
   if (s?.kind === 'live') await until(() => s.session.listRuns().every((r) => r.state !== 'running' && r.state !== 'starting'), 3000, 'no Run left running');
 });
+
+test('a fail-pattern match on a line longer than the pattern\'s window says it matched on the line\'s head (the house\'s read of the 36 commits, #22)', () => {
+  const f = fake('process');
+  // A costly pattern gets a small match window, so a moderate line is matched on its head.
+  const m = f.monitor({ ready: { pattern: 'up' }, fail: { pattern: `${'.'.repeat(999)}0` } });
+  f.start();
+  f.out('up\n');
+  f.out(`${'x'.repeat(999)}0${'y'.repeat(20_000)}\n`, 'stdout');
+  assert.equal(m.status, 'unhealthy');
+  assert.match(String(m.info().evidence), /\(matched on the line's head\)$/);
+  m.dispose();
+});

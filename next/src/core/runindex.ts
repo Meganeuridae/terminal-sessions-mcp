@@ -100,7 +100,13 @@ export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
   if (range.since === undefined && range.until === undefined && range.limit === undefined && range.maxBytes === undefined) return o;
   const within = (e: JournalEvent) => (range.since === undefined || e.seq > range.since) && (range.until === undefined || e.seq <= range.until);
   let events = o.events.filter(within);
-  let gaps = o.gaps?.filter(within);
+  // A gap is kept when its hole [from, to] intersects the window, not only when its seat falls inside
+  // it: a read bounded by `until` that ends inside a hole would otherwise lose the gap seated past
+  // `until` and read as complete. A kept gap is re-seated at `until` so the reader places the hole
+  // where the window ends (the house's read of the 36 commits, #22, comment 6269992150).
+  let gaps = o.gaps
+    ?.filter((g) => (range.since === undefined || g.to > range.since) && (range.until === undefined || g.from <= range.until))
+    .map((g) => (range.until !== undefined && g.seq > range.until ? { ...g, seq: range.until } : g));
   let more = false;
   if (range.limit !== undefined && events.length > range.limit) {
     // The holes kept are those before the first output dropped.

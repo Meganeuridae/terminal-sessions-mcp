@@ -391,11 +391,14 @@ class Render {
 
   watch(ev: EventOf<'watch.fired'>): Segment {
     const what = ev.kind === 'pattern' ? `matched: ${oneLine(ev.line ?? ev.match ?? '', 160)}` : ev.kind === 'silence' ? (ev.match ?? 'output went quiet') : 'the shell is available';
+    // `clipped`: the line was longer than the pattern's match window and matched on its head; carried
+    // to the reader, as the hit and waitFor's result carry it (the house's read of the 36 commits, #22).
+    const clip = ev.clipped ? ' (matched on the line\'s head)' : '';
     return {
-      ...this.base('watch', ev.seq, { watchId: ev.watchId, label: ev.label, watchKind: ev.kind, match: ev.match, at: ev.at }, ev.ts),
+      ...this.base('watch', ev.seq, { watchId: ev.watchId, label: ev.label, watchKind: ev.kind, match: ev.match, at: ev.at, ...(ev.clipped ? { clipped: true } : {}) }, ev.ts),
       lifecycle: true,
       tags: [`terminal:watch=${ev.label}`, 'terminal:watch', `terminal:${ev.kind}`],
-      head: `[terminal] ${this.src.id}: watch "${oneLine(ev.label, 60)}" fired · ${what}${ev.suppressed ? ` (+${ev.suppressed} more)` : ''} · read since=${Math.max(0, ev.at - 1)}`,
+      head: `[terminal] ${this.src.id}: watch "${oneLine(ev.label, 60)}" fired · ${what}${clip}${ev.suppressed ? ` (+${ev.suppressed} more)` : ''} · read since=${Math.max(0, ev.at - 1)}`,
       interested: [ev.principal],
     };
   }
@@ -494,11 +497,12 @@ export interface LifecycleScan {
   /** The last seq the scan covered. */
   end: Seq;
   /**
-   * The scan began inside a retention gap: these seqs are gone, and how many lifecycle events
-   * they held is unknown. A catch-up from an old cursor over a small memory ring returned a
-   * handful of completions as if they were all (the house's read of 3eade8a, #22).
+   * Seqs the scan found gone (retention, or a hole a cold-store failure left): a catch-up from an old
+   * cursor over a small memory ring returned a handful of completions as if they were all (the house's
+   * read of 3eade8a, #22). Every page's gap is kept, not only the first page's, so a hole in a later
+   * page is not silently skipped (the house's read of the 36 commits, #22, comment 6269992150).
    */
-  lost?: { from: Seq; to: Seq };
+  lost?: Array<{ from: Seq; to: Seq }>;
 }
 
 /** Events only a running shell journals: after an exit or recovery they mean a new life began, which supersedes it (a viewer attaching to an ended shell is not one). */
@@ -553,11 +557,15 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
     if (kept.length > Math.max(64, keep * 4)) trim();
   };
 
-  let gone: LifecycleScan['lost'];
-  let first = true;
+  const gones: Array<{ from: Seq; to: Seq }> = [];
   for (const page of src.journal.pages(since, SCAN_PAGE)) {
-    if (first && page.gap) gone = { from: page.gap.from, to: page.gap.to };
-    first = false;
+    // Every page's gap, not only the first: a hole a cold-store failure left is reported as the gap of
+    // the later page that starts inside it, and dropping it moved the catch-up past the hole with no
+    // notice (the house's read of the 36 commits, #22, comment 6269992150).
+    if (page.gap) {
+      const g = { from: page.gap.from, to: page.gap.to };
+      if (!gones.some((x) => x.from === g.from && x.to === g.to)) gones.push(g);
+    }
     const events = page.events;
     if (!events.length) break;
     for (const ev of events) {
@@ -593,7 +601,7 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
   trim();
   const out: LifecycleScan = { picked: kept, end };
   if (omitted) out.omitted = omitted;
-  if (gone) out.lost = gone;
+  if (gones.length) out.lost = gones;
   return out;
 }
 

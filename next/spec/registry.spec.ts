@@ -269,12 +269,17 @@ test('jr-10: a closed session\'s late events never reach the journal, and a new 
   await new Promise((res) => setTimeout(res, 10));
   const proc = r.backend.processes[0] as ScriptedProcess;
   const kill = proc.kill.bind(proc);
+  // On SIGINT the process exits promptly (so close returns and a new life can start), then emits a
+  // straggler well after the reopen — the case jr-10 is about: the straggler must reach neither the
+  // sealed journal nor the new life's (the house's read of the 36 commits, #22: the old emit landed
+  // inside close's grace, before the reopen, so nothing arrived after it).
+  let straggle: (() => void) | undefined;
   proc.kill = (sig) => {
     kill(sig);
-    if (sig === 'SIGINT') setTimeout(() => {
-      proc.emitStdout('shutting down\n');
-      proc.exit({ exitCode: 0 });
-    }, 150);
+    if (sig === 'SIGINT') {
+      setTimeout(() => proc.exit({ exitCode: 0 }), 0);
+      straggle = () => proc.emitStdout('shutting down\n');
+    }
   };
   await r.reg.close('p');
   const h = hist(r.reg.get('p'));
@@ -282,7 +287,8 @@ test('jr-10: a closed session\'s late events never reach the journal, and a new 
   const outcome = h.run(a.run.runId);
   assert.ok(['exited', 'cancelled', 'lost'].includes(outcome.state), `the Run is terminal in history: ${outcome.state}`);
   await r.reg.ensure({ id: 'p', owner: A });
-  await new Promise((res) => setTimeout(res, 400));
+  straggle?.(); // the old life's process speaks after the reopen
+  await new Promise((res) => setTimeout(res, 100));
   assert.equal(h.lastSeq, atClose, 'nothing appended to the closed journal');
   const seqs = seqsOnDisk(path.join(r.dir, 'sessions/p'));
   assert.equal(new Set(seqs).size, seqs.length, `no duplicate seqs: ${seqs.join(',')}`);

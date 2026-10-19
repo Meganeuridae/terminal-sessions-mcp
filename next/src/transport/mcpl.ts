@@ -1140,9 +1140,10 @@ export class McplLane {
       // One summary for what the host will not see replayed: the messages past the cap, and the
       // range retention took before the scan began, which the scan reports and nothing can replay
       // (the segmenter's read, comment 6265082050 on #22: the catch-up never told the host of it).
-      if (omitted || scan.lost) {
-        const from = omitted?.from ?? scan.lost!.from;
-        const to = omitted?.to ?? scan.lost!.to;
+      if (omitted || scan.lost?.length) {
+        const gaps = scan.lost ?? [];
+        const from = omitted?.from ?? gaps[0]!.from;
+        const to = omitted?.to ?? gaps[gaps.length - 1]!.to;
         this.owe(p.st, to);
         w.summary = this.summary(p.t, omitted, scan.lost);
         p.st.summaries.set(qualify(w.summary.messageId), { from, covered: p.covered });
@@ -1174,19 +1175,22 @@ export class McplLane {
 
   /**
    * One message for what a catch-up did not replay (ux-25): how many of each and where to read them,
-   * and the range the scan began inside of, gone past retention with whatever it held, which no
-   * read brings back (the segmenter's read, comment 6265082050 on #22). One of the two is given.
+   * and the ranges the scan found gone past retention (or a hole a cold-store failure left), with
+   * whatever they held, which no read brings back (the segmenter's read, comment 6265082050 on #22).
+   * Every gap the scan kept is named, not only the first (comment 6269992150); at least one of the two
+   * is given.
    */
   private summary(t: Target, o: Omitted | undefined, lost: LifecycleScan['lost']): Segment {
     const names: Record<string, string> = { run: 'completions', service: 'service changes', watch: 'watch firings', 'session-exit': 'shell exits', recovered: 'restarts', 'needs-input': 'input prompts' };
+    const gaps = lost ?? [];
     const parts: string[] = [];
     if (o) parts.push(`${o.count} earlier message${o.count > 1 ? 's' : ''} while you were away not replayed (${Object.entries(o.kinds).map(([k, n]) => `${n} ${names[k] ?? k}`).join(', ')}) · seq ${o.from}–${o.to}`);
-    if (lost) parts.push(`seq ${lost.from}–${lost.to} gone past retention, with whatever happened then`);
-    const to = o?.to ?? lost!.to;
-    const since = o ? Math.max(0, o.from - 1) : lost!.to;
-    const metadata: Record<string, unknown> = { session: t.id, state: liveOf(t)?.state ?? 'exited', count: o?.count ?? 0, from: o?.from ?? lost!.from, to, kinds: o?.kinds ?? {} };
-    // Two scalars, not a range object: a push event's origin carries scalar metadata only.
-    if (lost) Object.assign(metadata, { lostFrom: lost.from, lostTo: lost.to });
+    if (gaps.length) parts.push(`seq ${gaps.map((g) => `${g.from}–${g.to}`).join(', ')} gone past retention, with whatever happened then`);
+    const to = o?.to ?? gaps[gaps.length - 1]!.to;
+    const since = o ? Math.max(0, o.from - 1) : gaps[gaps.length - 1]!.to;
+    const metadata: Record<string, unknown> = { session: t.id, state: liveOf(t)?.state ?? 'exited', count: o?.count ?? 0, from: o?.from ?? gaps[0]!.from, to, kinds: o?.kinds ?? {} };
+    // Two scalars, not a range object: a push event's origin carries scalar metadata only; they span the first gap's start to the last gap's end.
+    if (gaps.length) Object.assign(metadata, { lostFrom: gaps[0]!.from, lostTo: gaps[gaps.length - 1]!.to });
     return {
       kind: 'summary',
       lifecycle: true,

@@ -341,6 +341,7 @@ const SUMMARY: Schema = {
       },
     },
     runsOmitted: { type: 'integer', description: 'Runs that have not ended beyond the 20 listed in runs.' },
+    servicesOmitted: { type: 'integer', description: 'Services beyond the 20 listed in services.' },
   },
   required: ['id', 'owner', 'visibility', 'state', 'lastSeq'],
 };
@@ -415,7 +416,7 @@ const summaryLine = (s: SessionSummary) => {
   const others = (s.runs ?? []).filter((r) => r.runId !== s.currentRun);
   const omitted = s.runsOmitted ? ` (+${s.runsOmitted} older not listed)` : '';
   const runs = others.length ? ` · runs ${others.map((r) => `${r.runId} ${r.state}${r.target === 'process' ? ' (process)' : ''}${r.line ? ` "${r.line}"` : ''}`).join(', ')}${omitted}` : '';
-  return `${s.id}: ${s.state}${s.recovered ? ` (${s.recovered})` : s.closed ? ' (closed)' : ''} · owner ${s.owner} · seat ${s.controller ?? 'free'}${s.cwd ? ` · cwd ${s.cwd}` : ''}${s.currentRun ? ` · running ${s.currentRun}` : ''}${runs}${s.services?.length ? ` · services ${s.services.map((v) => `${v.name ?? v.runId}=${v.status}`).join(', ')}` : ''}${s.watches ? ` · ${s.watches} watch${s.watches > 1 ? 'es' : ''}` : ''} · seq ${s.lastSeq}`;
+  return `${s.id}: ${s.state}${s.recovered ? ` (${s.recovered})` : s.closed ? ' (closed)' : ''} · owner ${s.owner} · seat ${s.controller ?? 'free'}${s.cwd ? ` · cwd ${s.cwd}` : ''}${s.currentRun ? ` · running ${s.currentRun}` : ''}${runs}${s.services?.length ? ` · services ${s.services.map((v) => `${v.name ?? v.runId}=${v.status}`).join(', ')}${s.servicesOmitted ? ` (+${s.servicesOmitted} older not listed)` : ''}` : ''}${s.watches ? ` · ${s.watches} watch${s.watches > 1 ? 'es' : ''}` : ''} · seq ${s.lastSeq}`;
 };
 
 const TCP: Schema = { type: 'object', properties: { port: { type: 'integer', minimum: 1, maximum: 65535 }, host: { type: 'string' } }, required: ['port'], additionalProperties: false };

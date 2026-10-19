@@ -10,5 +10,11 @@ export const MAX_TIMER_MS = 2 ** 31 - 1;
 /** A timer delay Node honours: never past MAX_TIMER_MS, never negative. */
 export const timerMs = (ms: number): number => Math.min(MAX_TIMER_MS, Math.max(0, ms));
 
-/** The monotonic clock intervals are measured on, which a wall-clock step never moves; a test may replace it. */
+/**
+ * The monotonic clock intervals are measured on, which a wall-clock step never moves; a test may
+ * replace it. One exception: a watch's age for output the manager did not stamp on arrival — output
+ * from before the manager existed — falls back to the journal's wall-clock age, clamped at zero
+ * (watches.ts `ageOf`), since there is no monotonic stamp for it (the house's read of the 36 commits,
+ * #22, comment 6269992150).
+ */
 export const clocks = { monotonic: (): number => performance.now() };

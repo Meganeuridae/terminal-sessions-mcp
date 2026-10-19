@@ -9,8 +9,11 @@
 import { cleanLine } from '../src/core/ansi.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { Journal } from '../src/core/journal.js';
-import { MemoryStore } from '../src/core/stores.js';
+import { FileStore, MemoryStore } from '../src/core/stores.js';
 import {
   columnIndex,
   journalSource,
@@ -709,8 +712,8 @@ test('a catch-up scan that starts inside a retention gap says what range is gone
   }
   const scan = await scanLifecycle(liveSource(src), 0);
   assert.ok(scan.picked.length < 40, `the ring kept only some: ${scan.picked.length}`);
-  assert.ok(scan.lost && scan.lost.from === 1 && scan.lost.to >= 1, `the gap is reported: ${JSON.stringify(scan.lost)}`);
-  assert.equal(scan.lost.to, (src.journal.oldestSeq ?? 1) - 1);
+  assert.ok(scan.lost && scan.lost[0]!.from === 1 && scan.lost[0]!.to >= 1, `the gap is reported: ${JSON.stringify(scan.lost)}`);
+  assert.equal(scan.lost[scan.lost.length - 1]!.to, (src.journal.oldestSeq ?? 1) - 1);
 });
 
 test("a human's line is a command only when a Run of their own follows it; lines pasted together each take a Run", async () => {
@@ -790,4 +793,38 @@ test('the carry is cut on a safe boundary: a digest never begins with half a sur
   assert.ok(!/[\ud800-\udfff]/.test(pair!.body!.replace(/😀/g, '')), 'no lone surrogate anywhere');
   const csi = out.find((s) => s.kind === 'output' && s.runId === 'csi');
   assert.match(csi!.body!, /^z+$/, `the colour is applied, not shown: ${JSON.stringify(csi?.body?.slice(0, 12))}`);
+});
+
+test('a hole a cold-store failure left on a later page of the scan is reported, not silently skipped (the house\'s read of the 36 commits, #22)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-seg-gap-'));
+  try {
+    const cold = new FileStore(dir);
+    const journal = new Journal({ hot: new MemoryStore(2048), cold });
+    const src = fakeSource(journal);
+    // A prefix persists to disk.
+    for (let i = 0; i < 3; i++) {
+      startRun(src, `a${i}`);
+      endRun(src, `a${i}`, { state: 'lost', reason: 'daemon-shutdown' });
+    }
+    const persisted = journal.lastSeq;
+    // The disk refuses; later events go to the ring only, and the small ring drops the oldest, leaving
+    // a hole between what the disk has and what the ring still holds — reported on a page after the first.
+    const orig = cold.append.bind(cold);
+    cold.append = () => {
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+    };
+    try {
+      for (let i = 0; i < 60; i++) {
+        startRun(src, `b${i}`);
+        endRun(src, `b${i}`, { state: 'lost', reason: 'daemon-shutdown' });
+      }
+    } finally {
+      cold.append = orig;
+    }
+    const scan = await scanLifecycle(liveSource(src), 0);
+    assert.ok(scan.lost && scan.lost.length >= 1, `a gap is reported: ${JSON.stringify(scan.lost)}`);
+    assert.ok(scan.lost!.some((g) => g.from > persisted), `the later-page hole is kept: ${JSON.stringify(scan.lost)} (persisted ${persisted})`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

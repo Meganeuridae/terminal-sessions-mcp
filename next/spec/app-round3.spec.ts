@@ -138,6 +138,24 @@ test('defect 9: session_list shows the 20 newest Runs and counts the rest', asyn
   for (const id of ids) await tool('cancel', { runId: id });
 });
 
+test('item 19: session_list shows the 20 newest services and counts the rest (the house\'s read of the 36 commits, #22)', async () => {
+  const s = 'manysvc';
+  await tool('session_open', { session: s });
+  const ids: string[] = [];
+  for (let i = 0; i < 23; i++) {
+    // A readiness pattern that never matches keeps each service in `starting` with no polling; the
+    // process stays alive, so the monitor is retained. ServiceManager grows without bound before the fix.
+    const r = await tool('start', { session: s, command: 'sleep 30', target: 'process', ready: { pattern: 'never-matches-xyz' }, wait: 0 });
+    ids.push(r.structured?.runId as string);
+  }
+  const list = await tool('session_list', {});
+  const summary = (list.structured?.sessions as Array<Record<string, unknown>>).find((x) => x.id === s)!;
+  assert.equal((summary.services as unknown[]).length, 20, 'the 20 newest');
+  assert.equal(summary.servicesOmitted, 3, 'the other three are counted, not dropped silently');
+  assert.match(list.text, /\(\+3 older not listed\)/);
+  for (const id of ids) await tool('cancel', { runId: id });
+});
+
 test('defect 11: a closed session’s page is drawn at the width it recorded, not the history default', async () => {
   // 60 columns recorded. 70 W's then a carriage return and an X: at 60 cols the X lands at column 60
   // (the start of the wrapped second row); at the history default 120 it would land at column 0.

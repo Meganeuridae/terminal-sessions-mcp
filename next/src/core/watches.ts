@@ -63,6 +63,8 @@ export interface WaitResult {
   kind: WatchKind;
   match?: string;
   line?: string;
+  /** The line was longer than the pattern's match window and matched on its head only (the house's read of the 36 commits, #22). */
+  clipped?: boolean;
   /** Journal position of the event that satisfied the wait. */
   seq?: Seq;
   elapsedMs: number;
@@ -503,6 +505,7 @@ export class WatchManager {
           const r: Omit<WaitResult, 'elapsedMs' | 'kind'> = { matched: true, seq: hit.seq };
           if (hit.match !== undefined) r.match = hit.match;
           if (hit.line !== undefined) r.line = hit.line;
+          if (hit.clipped) r.clipped = true;
           finish(result(r));
         },
         (ev) => abort(endText(ev)),

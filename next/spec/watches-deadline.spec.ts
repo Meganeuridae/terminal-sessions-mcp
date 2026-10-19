@@ -250,15 +250,20 @@ test('an idle watch stands down once the shell has exited: no recheck loop again
     asked++;
     return false;
   };
+  // Drain microtasks rather than wait on a timer: without the stand-down guard the recheck chain is a
+  // run of microtasks that starves timers, so a timer-based wait would hang; draining fails instead.
+  const drain = async () => {
+    for (let i = 0; i < 200; i++) await Promise.resolve();
+  };
   try {
     const w = x.manager.add({ idle: true }, A);
     x.startRun('r1');
     host.exit = { exitCode: 0 };
     x.journal.append({ type: 'run.end', runId: 'r1', state: 'exited', exit: 0, durationMs: 1 });
-    await sleep(20);
+    await drain();
     assert.ok(asked <= 1, `the host was asked ${asked} times`);
     x.journal.append({ type: 'session.exit', code: 0 });
-    await sleep(20);
+    await drain();
     assert.ok(asked <= 1, `the host was asked ${asked} times after the exit`);
     assert.equal(x.firings(w.watchId).length, 0);
   } finally {
@@ -284,5 +289,82 @@ test('a pattern watch says when it matched a line on its head only', async () =>
     assert.equal(x.firings(w.watchId)[1]!.clipped, undefined);
   } finally {
     x.close();
+  }
+});
+
+test('clipped survives when a hit is completed by flush or at stream end, and reaches wait_for (the house\'s read of the 36 commits, #22)', async () => {
+  const pat = `${'.'.repeat(999)}0`;
+  const clippedLine = `${'x'.repeat(999)}0${'y'.repeat(20_000)}`;
+  // Stream end: an unscoped watch completes a process Run's unterminated clipped line at the Run's end.
+  {
+    const x = bare();
+    try {
+      const w = x.manager.add({ pattern: pat }, A);
+      x.startRun('p', 'process');
+      x.out(clippedLine, 'p', 'stdout'); // no newline
+      x.journal.append({ type: 'run.end', runId: 'p', state: 'exited', exit: 0, durationMs: 1 });
+      await sleep(40);
+      const hits = x.firings(w.watchId);
+      assert.equal(hits.length, 1);
+      assert.equal(hits[0]!.clipped, true, 'clipped survives the stream-end flush');
+    } finally {
+      x.close();
+    }
+  }
+  // flush: a watch scoped to a Run completes its clipped last line when that Run ends.
+  {
+    const x = bare();
+    try {
+      x.startRun('r');
+      const w = x.manager.add({ pattern: pat, runId: 'r' }, A);
+      x.out(clippedLine, 'r'); // no newline, pty stream
+      x.journal.append({ type: 'run.end', runId: 'r', state: 'exited', exit: 0, durationMs: 1 });
+      await sleep(40);
+      const hits = x.firings(w.watchId);
+      assert.equal(hits.length, 1);
+      assert.equal(hits[0]!.clipped, true, 'clipped survives the flush at the watched Run\'s end');
+    } finally {
+      x.close();
+    }
+  }
+  // wait_for carries clipped in its result.
+  {
+    const x = bare();
+    try {
+      const p = x.manager.waitFor({ pattern: pat }, 1000);
+      await sleep(10);
+      x.out(`${clippedLine}\n`);
+      const r = await p;
+      assert.equal(r.matched, true);
+      assert.equal(r.clipped, true, 'wait_for reports clipped');
+    } finally {
+      x.close();
+    }
+  }
+});
+
+test('silence rechecks its deadline deterministically under mock timers, beside the mocked monotonic clock (the house\'s read of the 36 commits, #22)', (t) => {
+  // The real-scheduling version above can fail under a 40–60 ms event-loop stall; this one drives the
+  // timers and the monotonic clock together, so the recheck-on-early-wake is deterministic.
+  let vnow = 0;
+  t.mock.method(clocks, 'monotonic', () => vnow);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const journal = new Journal();
+  const host: WatchHost = { journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
+  const manager = new WatchManager(host);
+  const firingsOf = (id: string) => journal.since(0).events.filter((e) => e.type === 'watch.fired' && (e as Extract<JournalEvent, { type: 'watch.fired' }>).watchId === id);
+  try {
+    const w = manager.add({ silenceMs: 100 }, A);
+    // The 100 ms timer wakes, but only 60 ms of monotonic time has passed: it re-arms for the remainder.
+    vnow = 60;
+    t.mock.timers.tick(100);
+    assert.equal(firingsOf(w.watchId).length, 0, 'an early wake does not certify silence');
+    // The remainder elapses: it fires, with 100 ms of quiet.
+    vnow = 100;
+    t.mock.timers.tick(40);
+    assert.equal(firingsOf(w.watchId).length, 1, 're-armed, then fired');
+  } finally {
+    manager.dispose();
+    journal.close();
   }
 });

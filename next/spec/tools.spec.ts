@@ -45,7 +45,7 @@ test('the session_list schema declares every field a summary may carry, services
   const full: Required<SessionSummary> = {
     id: 's', owner: 'agent:a@test', visibility: 'private', state: 'idle', controller: null, cwd: '/', integration: 'rich', backend: 'node-pty', pid: 1, currentRun: null, lastSeq: 9, oldestSeq: 1,
     retention: { maxBytes: 1 << 20 }, recovered: 'continuous', closed: false, createdAt: 0, lastActivity: 0, declared: { shell: 'sh', within: null }, cols: 80, rows: 24,
-    services: [{ runId: 'r1', name: 'svc', status: 'ready', evidence: 'listening' }], watches: 1, runs: [{ runId: 'r1', target: 'shell', state: 'running', principal: 'agent:a@test', line: 'x', admittedAt: 0 }], runsOmitted: 0,
+    services: [{ runId: 'r1', name: 'svc', status: 'ready', evidence: 'listening' }], servicesOmitted: 0, watches: 1, runs: [{ runId: 'r1', target: 'shell', state: 'running', principal: 'agent:a@test', line: 'x', admittedAt: 0 }], runsOmitted: 0,
   };
   const schema = TOOLS.find((t) => t.name === 'session_list')!.outputSchema!;
   validate({ sessions: [full] }, schema);

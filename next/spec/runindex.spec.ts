@@ -240,10 +240,27 @@ test('a gap recorded after a Run ended, for seqs inside its range, cuts its outp
   // Narrowed as every gap is: a range of the Run the hole does not touch has none.
   assert.deepEqual([j.runs.output(j, runId, { until: a }).gaps, j.runs.output(j, runId, { until: a }).truncated], [undefined, false]);
   assert.deepEqual(j.runs.output(j, runId, { since: a }).gaps?.map((g) => g.seq), [n3]);
-  for (const range of [{}, { limit: 1 }, { maxBytes: 2 }, { since: a }, { until: n1 }] as RunOutputRange[]) {
+  // A read bounded by `until` that ends inside the hole keeps the gap, re-seated at `until`, so the
+  // reader places the hole instead of reading the Run as complete (the house's read of the 36 commits, #22).
+  const mid = n1 + 1; // a note inside the hole [n1, n3]
+  const bounded = j.runs.output(j, runId, { until: mid });
+  assert.equal(bounded.truncated, true, 'the hole the read ends inside of truncates it');
+  assert.deepEqual(bounded.gaps?.map((g) => [g.seq, g.from, g.to]), [[mid, n1, n3]], 'the gap is kept, seated at until');
+  for (const range of [{}, { limit: 1 }, { maxBytes: 2 }, { since: a }, { until: n1 }, { until: mid }] as RunOutputRange[]) {
     assert.deepEqual(j.runs.output(j, runId, range), narrowOutput(whole, range), JSON.stringify(range));
   }
   // A gap for seqs past the Run says nothing of it.
   j.append({ type: 'gap', from: late.seq + 1, to: late.seq + 1, reason: 'torn-write' });
   assert.equal(j.runs.output(j, runId).gaps?.length, 1);
+});
+
+test('the run index drops a gap line claiming seqs at or past its own seq — a line that is not the journal\'s (the house\'s read of the 36 commits, #22)', () => {
+  const idx = new RunIndex('s');
+  // A valid gap describes seqs issued before it.
+  idx.feed({ type: 'gap', from: 1, to: 40, reason: 'store-error', seq: 50, ts: 0 } as JournalEvent);
+  assert.equal(idx.gapsWithin(1, 40).length, 1, 'a gap behind its own seq is kept');
+  // A gap claiming its own seq or later is not the journal's: the validation guard drops it.
+  idx.feed({ type: 'gap', from: 1, to: 60, reason: 'store-error', seq: 55, ts: 0 } as JournalEvent);
+  idx.feed({ type: 'gap', from: 70, to: 70, reason: 'store-error', seq: 70, ts: 0 } as JournalEvent);
+  assert.equal(idx.gapsWithin(1, 100).length, 1, 'neither over-reaching gap was kept');
 });
