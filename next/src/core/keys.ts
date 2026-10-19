@@ -113,7 +113,7 @@ const SUGGESTABLE = [
 ];
 
 /** Levenshtein distance, for suggesting close names. */
-function distance(a: string, b: string): number {
+export function distance(a: string, b: string): number {
   let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
   for (let i = 1; i <= a.length; i++) {
     const cur = [i];

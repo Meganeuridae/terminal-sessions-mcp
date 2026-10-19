@@ -506,9 +506,11 @@ export const COMPAT_TOOLS: ToolDef[] = [
       try {
         const s = await ctx.app.screen(ctx.caller, { session: a.session as string });
         const text = s.lines.join('\n').replace(/\n+$/, '');
+        const structured = { success: true, text, cols: s.cols, rows: s.rows, alt: s.alt, cursor: s.cursor };
         // 1.x wrote a PNG there; a `success: true` without the file would be a lie (the house's read of 1cabc6a, #22).
         if (typeof a.outputPath === 'string') return json({ success: false, error: `outputPath ${a.outputPath}: ${SCREEN_TEXT_ONLY}; call again without outputPath for the text`, text });
-        return { text, structured: { success: true, text, cols: s.cols, rows: s.rows, alt: s.alt, cursor: s.cursor } };
+        // In json mode the text is the envelope, as for every other tool (the house's read of 1cabc6a, #22).
+        return { text: ctx.resultText === 'json' ? JSON.stringify(structured, null, 2) : text, structured };
       } catch (e) {
         if (e instanceof TermError) return json({ success: false, error: e.message });
         throw e;

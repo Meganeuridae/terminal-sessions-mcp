@@ -112,3 +112,24 @@ test('api-21: additionalProperties may be a schema, so env values are typed as s
   validate({ session: 's', extra: 1 }, { type: 'object', properties: { session: { type: 'string' } } });
   validate({ a: 'x' }, { type: 'object', additionalProperties: true });
 });
+
+test('a tokens file the daemon cannot read is a read failure, not bad JSON', { skip: process.getuid?.() === 0 }, () => {
+  const f = path.join(tmp, 'unreadable.json');
+  fs.writeFileSync(f, '{}');
+  fs.chmodSync(f, 0o000);
+  try {
+    assert.throws(() => readTokensFile(f), (e: Error) => /cannot read tokens file/.test(e.message) && /EACCES/.test(e.message) && !/valid JSON/.test(e.message));
+  } finally {
+    fs.chmodSync(f, 0o600);
+  }
+});
+
+test('a credential cannot name a human:gui: principal: that form is derived from the token’s own', () => {
+  assert.throws(() => new TokenMapResolver({ tokens: { t: 'human:gui:agent:alice@corp' } }), /derived from the token/);
+  assert.throws(() => new TokenMapResolver({ anonymous: 'human:gui:token:default' }), /derived from the token/);
+  const f = path.join(tmp, 'gui.json');
+  fs.writeFileSync(f, JSON.stringify({ 'sekrit-token-3': 'human:gui:agent:alice@corp' }));
+  fs.chmodSync(f, 0o600);
+  assert.throws(() => readTokensFile(f), (e: Error) => /derived from the token/.test(e.message) && !e.message.includes('sekrit'));
+  assert.ok(isValidPrincipal(guiPrincipal('agent:alice@corp')), 'the derived form itself stays a valid principal');
+});

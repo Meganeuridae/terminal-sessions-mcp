@@ -8,6 +8,7 @@
  */
 import { TermError } from '../core/errors.js';
 import type { App, Caller, ReadResult, RunResult, SearchResult, SessionSummary } from './app.js';
+import type { GapInfo } from './reader.js';
 import { COMPAT_TOOLS } from './compat.js';
 import { looksLikeErrexit, looksLikeShellOpener, oneShotSshWithoutTty } from './hints.js';
 import { validate, ValidationError, type Schema } from './validate.js';
@@ -180,9 +181,29 @@ export function renderRead(r: ReadResult, mode: ResultText): ToolResult {
   const body = r.text !== undefined ? r.text : JSON.stringify(r.events, null, 1);
   const next = `since=${r.nextCursor}${r.nextOffset ? ` offset=${r.nextOffset}` : ''}`;
   const lines = r.lines ? ` · ${r.lines.returned} of ${r.lines.requested} lines` : '';
-  const gaps = r.gaps?.length ? ` · ${r.gaps.length} gaps not retained` : r.gap ? ` · gap ${r.gap.from}–${r.gap.to} not retained` : '';
-  const status = `[read ${r.session}${r.runId ? ` run ${r.runId}` : ''} seq ${r.seq[0]}–${r.seq[1]}${lines} · next: ${next}${r.more ? ` · more: read ${next}` : ''}${r.splitLine ? ' · last line continues' : ''}${gaps}${r.truncated ? ' · truncated' : ''}]`;
+  const status = `[read ${r.session}${r.runId ? ` run ${r.runId}` : ''} seq ${r.seq[0]}–${r.seq[1]}${lines} · next: ${next}${r.more ? ` · more: read ${next}` : ''}${r.splitLine ? ' · last line continues' : ''}${gapsBit(r)}${r.truncated ? ' · truncated' : ''}]`;
   return { text: (body ? body + '\n' : '') + status, structured };
+}
+
+/** The holes a read or a search spanned, for its status line: output lost to retention, a torn write or a store failure. */
+function gapsBit(r: { gap?: GapInfo; gaps?: GapInfo[] }): string {
+  const one = (g: GapInfo) => `gap ${g.from}–${g.to} ${g.reason && g.reason !== 'retention' ? `missing (${g.reason})` : 'not retained'}`;
+  if (r.gaps?.length) return ` · ${r.gaps.length} gaps: ${r.gaps.slice(0, 3).map(one).join(', ')}${r.gaps.length > 3 ? ', …' : ''}`;
+  return r.gap ? ` · ${one(r.gap)}` : '';
+}
+
+export function renderSearch(r: SearchResult, mode: ResultText): ToolResult {
+  const structured = env(r);
+  if (mode === 'json') return { text: JSON.stringify(r, null, 2), structured };
+  const at = (c: number, o?: number) => `since=${c}${o ? ` offset=${o}` : ''}`;
+  const body = r.matches.map((m) => [...m.before.map((l) => `  ${l}`), `> ${m.line}   [read ${at(m.cursor, m.offset)}]`, ...m.after.map((l) => `  ${l}`)].join('\n')).join('\n--\n');
+  const more = r.more ? ` · more (${r.stoppedBy ?? 'limit'}): search ${at(r.nextCursor ?? r.scanned[1], r.nextOffset)}` : '';
+  // What the scan did not see, as the envelope says it and as read's status line does: the holes it
+  // spanned, and the lines longer than the match window, searched on their head only; without
+  // these, `(no matches)` read as a whole answer (the house's read of 1cabc6a, #22).
+  const clipped = r.clippedLines ? ` · ${r.clippedLines} line${r.clippedLines === 1 ? '' : 's'} longer than the match window, searched on ${r.clippedLines === 1 ? 'its' : 'their'} head only` : '';
+  const status = `[search ${r.session} · ${r.matches.length} match${r.matches.length === 1 ? '' : 'es'}${more} · scanned seq ${r.scanned[0]}–${r.scanned[1]}${r.bounded ? ' · older history not scanned: pass since' : ''}${gapsBit(r)}${clipped}]`;
+  return { text: `${body || '(no matches)'}\n${status}`, structured };
 }
 
 const SERVICE_STATUS = ['starting', 'ready', 'running', 'unhealthy', 'exited', 'lost'];
@@ -820,9 +841,10 @@ export const TOOLS: ToolDef[] = [
     name: 'search',
     tier: 'search',
     description:
-      "Search a session's output history with a regex, line by line: each match comes with lines of context and a `cursor` — `read since=<cursor>` " +
-      'reads on from the matching line. Patterns run on a linear-time engine: no back-references or lookahead. Without `since`, the recent past is ' +
-      'scanned and the result says if older history was left out. Use `read` to page through output.',
+      "Search a session's output history with a regex, line by line: each match comes with lines of context and a `cursor`, plus an `offset` when the line " +
+      'lies inside a long output event — `read since=<cursor> offset=<offset>` reads on from the matching line (each match’s own `[read …]` hint spells it out). ' +
+      'Patterns run on a linear-time engine: no back-references or lookahead. Without `since`, the recent past is ' +
+      'scanned and the result says if older history was left out, as it says what it skipped (gaps, over-long lines). Use `read` to page through output.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -841,11 +863,7 @@ export const TOOLS: ToolDef[] = [
     },
     outputSchema: SEARCH_OUTPUT,
     async run(ctx, a) {
-      const r: SearchResult = await ctx.app.search(ctx.caller, pick(a, ['session', 'pattern', 'flags', 'context', 'since', 'offset', 'until', 'runId', 'limit']));
-      const at = (c: number, o?: number) => `since=${c}${o ? ` offset=${o}` : ''}`;
-      const body = r.matches.map((m) => [...m.before.map((l) => `  ${l}`), `> ${m.line}   [read ${at(m.cursor, m.offset)}]`, ...m.after.map((l) => `  ${l}`)].join('\n')).join('\n--\n');
-      const more = r.more ? ` · more (${r.stoppedBy ?? 'limit'}): search ${at(r.nextCursor ?? r.scanned[1], r.nextOffset)}` : '';
-      return render(ctx, `${body || '(no matches)'}\n[search ${r.session} · ${r.matches.length} match${r.matches.length === 1 ? '' : 'es'}${more} · scanned seq ${r.scanned[0]}–${r.scanned[1]}${r.bounded ? ' · older history not scanned: pass since' : ''}]`, env(r));
+      return renderSearch(await ctx.app.search(ctx.caller, pick(a, ['session', 'pattern', 'flags', 'context', 'since', 'offset', 'until', 'runId', 'limit'])), ctx.resultText);
     },
   },
   ...COMPAT_TOOLS,

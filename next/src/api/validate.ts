@@ -5,9 +5,13 @@
  * with items, minimum/maximum, oneOf-free. Zero dependencies.
  *
  * Property lookups are own-property only, and the prototype-named keys
- * `__proto__`, `constructor` and `prototype` are refused in every object, so
- * nothing inherited from Object.prototype can pass as a declared parameter.
+ * `__proto__`, `constructor` and `prototype` are refused in every object — the
+ * ones the schema walks and, inside values it does not describe, the ones it
+ * would not have looked into — so nothing inherited from Object.prototype can
+ * pass as a declared parameter.
  */
+import { distance } from '../core/keys.js';
+
 export interface Schema {
   type?: 'object' | 'string' | 'number' | 'integer' | 'boolean' | 'array';
   description?: string;
@@ -33,6 +37,29 @@ const RESERVED_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 
 
 const own = <T>(o: Record<string, T> | undefined, key: string): T | undefined => (o !== undefined && Object.hasOwn(o, key) ? o[key] : undefined);
 
+/**
+ * Why `key` is not a parameter: the declared names within a small edit distance (`wiat` →
+ * `wait`), or all of them, the way an unknown key name is answered (the house's read of 1cabc6a, #22).
+ */
+function unknownKey(key: string, properties: Record<string, Schema> | undefined): string {
+  const names = Object.keys(properties ?? {});
+  const k = key.toLowerCase();
+  const close = names.filter((n) => distance(k, n.toLowerCase()) <= (n.length >= 4 ? 2 : 1)).slice(0, 3);
+  if (close.length) return `is not a known parameter; did you mean ${close.map((c) => `\`${c}\``).join(' or ')}?`;
+  return names.length ? `is not a known parameter; the parameters are ${names.join(', ')}` : 'is not a known parameter; this tool takes none';
+}
+
+/** Reserved names refused inside a value the schema does not describe (an array, a nested object). */
+function rejectReserved(value: unknown, path: string): void {
+  if (Array.isArray(value)) value.forEach((v, i) => rejectReserved(v, `${path}[${i}]`));
+  else if (typeof value === 'object' && value !== null) {
+    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+      if (RESERVED_KEYS.has(key)) throw new ValidationError(`${path}.${key}`, 'is a reserved name');
+      rejectReserved(v, `${path}.${key}`);
+    }
+  }
+}
+
 export function validate(value: unknown, schema: Schema, path = ''): void {
   if (schema.enum && !schema.enum.includes(value as string)) throw new ValidationError(path, `must be one of ${schema.enum.map(String).join(', ')}`);
   switch (schema.type) {
@@ -45,8 +72,9 @@ export function validate(value: unknown, schema: Schema, path = ''): void {
         const sub = own(schema.properties, key);
         if (!sub) {
           const extra = schema.additionalProperties;
-          if (extra === false) throw new ValidationError(`${path}.${key}`, 'is not a known parameter');
+          if (extra === false) throw new ValidationError(`${path}.${key}`, unknownKey(key, schema.properties));
           if (typeof extra === 'object' && v !== undefined) validate(v, extra, `${path}.${key}`);
+          else rejectReserved(v, `${path}.${key}`);
           continue;
         }
         if (v !== undefined) validate(v, sub, `${path}.${key}`);
@@ -70,8 +98,11 @@ export function validate(value: unknown, schema: Schema, path = ''): void {
     case 'array':
       if (!Array.isArray(value)) throw new ValidationError(path, 'must be an array');
       if (schema.items) value.forEach((v, i) => validate(v, schema.items!, `${path}[${i}]`));
+      else rejectReserved(value, path);
       return;
     default:
+      // A value the schema leaves undescribed is still no place for a reserved name.
+      rejectReserved(value, path);
       return;
   }
 }

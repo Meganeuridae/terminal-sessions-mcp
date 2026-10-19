@@ -5,7 +5,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { looksLikeErrexit, oneShotSshWithoutTty, renderRun } from '../src/api/tools.js';
+import { looksLikeErrexit, looksLikeShellOpener, oneShotSshWithoutTty, renderRun } from '../src/api/tools.js';
 import type { RunResult } from '../src/api/app.js';
 
 const base = (over: Partial<RunResult>): RunResult => ({
@@ -71,4 +71,42 @@ test('a producer that the next command stopped reading (141, SIGPIPE) is not a f
   const mixed = text(base({ line: 'a | b | c', pipeStatus: [141, 2, 0] }));
   assert.match(mixed, /pipeline statuses 141 \| 2 \| 0: a command before the last one failed/);
   assert.doesNotMatch(mixed, /SIGPIPE/, 'the 141 is the normal end here; the 2 is the failure');
+});
+
+test('set -e inside quotes, a subshell, a substitution or a heredoc body arms nothing in the shell; in a loop, a branch or a brace group it does', () => {
+  const quiet = [
+    'echo "build; set -e"',
+    "bash -c 'cd /tmp && set -e && make'",
+    '(cd sub; set -e; make)',
+    'grep -n "x; set -e" build.sh',
+    "ssh host 'set -e; make'",
+    'x=$(set -e; cmd)',
+    'echo `set -e`',
+    'cat <<EOF\nset -e\nEOF',
+    "cat <<'EOF' > run.sh\nset -euo pipefail\nmake\nEOF",
+    'echo \\; set -e',
+  ];
+  for (const line of quiet) assert.ok(!looksLikeErrexit(line), JSON.stringify(line));
+  const armed = ['for f in a b; do set -e; done', 'if false; then :; else set -e; fi', '{ set -e; make; }', 'cat <<EOF\nhello\nEOF\nset -e', 'echo "a"; set -e', "echo 'quoted' && set -eu"];
+  for (const line of armed) assert.ok(looksLikeErrexit(line), JSON.stringify(line));
+  assert.doesNotMatch(text(base({ line: 'echo "build; set -e"' })), /set -e/);
+  assert.doesNotMatch(text(base({ line: '(cd sub; set -e; make)' })), /set -e/);
+  assert.match(text(base({ line: 'for f in a; do set -e; done' })), /turned on set -e in the shell itself/);
+});
+
+test('an ssh option with its value attached is a value, not flags: the one-shot warning stays; RequestTTY asks for a terminal', () => {
+  const attached = ['ssh -oStrictHostKeyChecking=no host cmd', 'ssh -oBatchMode=yes host cmd', 'ssh -oConnectTimeout=5 host cmd', 'ssh -oPort=22 host cmd', 'ssh -lterry host cmd', 'ssh -p2222 host cmd', 'ssh -i ~/.ssh/id_test -lterry host cmd', 'ssh -4 -oBatchMode=yes -- host cmd'];
+  for (const line of attached) assert.equal(oneShotSshWithoutTty(line), 'host', line);
+  for (const line of ['ssh -oRequestTTY=yes host cmd', 'ssh -o RequestTTY=force host cmd', 'ssh -4At host cmd', 'ssh -lterry -t host cmd', 'ssh -oBatchMode=yes host']) assert.equal(oneShotSshWithoutTty(line), undefined, line);
+  assert.match(text(base({ state: 'running', line: 'ssh -oStrictHostKeyChecking=no build01 make', durationMs: 3000 })), /a cancel would end the local ssh client, not the command on build01/);
+});
+
+test('a word that begins with ssh opens no shell (ssh-keygen, ssh-add, sshfs, ssh-copy-id), and a process Run never gets the declare hint', () => {
+  for (const line of ['ssh-keygen -t ed25519', 'ssh-add ~/.ssh/id', 'sshfs host:/srv /mnt', 'ssh-copy-id host', 'sudo ssh-keygen', 'su-helper', 'mosh-server', 'vagrant ssh-config']) {
+    assert.ok(!looksLikeShellOpener(line), line);
+    assert.doesNotMatch(text(base({ state: 'running', line, durationMs: 1500 })), /session_declare_shell/, line);
+  }
+  for (const line of ['ssh host', 'mosh host', 'su', 'su -', 'vagrant ssh', 'ssh']) assert.ok(looksLikeShellOpener(line), line);
+  assert.match(text(base({ state: 'running', line: 'ssh host', durationMs: 1500 })), /declare that with session_declare_shell/);
+  assert.doesNotMatch(text(base({ state: 'running', target: 'process', line: 'ssh host', durationMs: 1500 })), /session_declare_shell/, 'a process Run is not in front of the session’s terminal');
 });
