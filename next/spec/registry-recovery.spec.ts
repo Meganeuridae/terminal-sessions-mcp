@@ -184,7 +184,18 @@ test('jr2-4/G19c/G20/G29: recovery terminates the process groups a dead daemon l
     assert.ok(!notes.some((t) => /outlived r1-(polite|stubborn)/.test(t)), `no note says a group recovery ended outlived its Run: ${JSON.stringify(notes)}`);
     assert.ok(groupAlive(strangers), 'a leaderless group whose members started after the Run ended is a stranger\'s');
     assert.ok(groupAlive(clean), 'a Run that exited with its group empty vouches for nothing now in it');
-    assert.ok(!notes.some((t) => t.includes(`${strangers}`) || t.includes(`${clean}`)), JSON.stringify(notes));
+    // A candidate group recovery left running because it could not be told from a stranger's reuse of
+    // the id is recorded, not left silently (the house's read of the 36 commits, #22).
+    assert.ok(
+      notes.some((t) => t.includes(`process group ${strangers} left running`) && t.includes('cannot be told apart') && t.includes('r6-strangers')),
+      `the left leftover group is recorded: ${JSON.stringify(notes)}`,
+    );
+    assert.ok(
+      notes.some((t) => t.includes(`process group ${stranger} left running`) && t.includes('r4-stranger')),
+      `the left in-flight group is recorded: ${JSON.stringify(notes)}`,
+    );
+    // `clean` is not even a candidate (it exited with its group empty): nothing is said of it.
+    assert.ok(!notes.some((t) => t.includes(`${clean}`)), `clean is not a candidate: ${JSON.stringify(notes)}`);
     await r.reg.closeAll();
     // A scripted backend's pids are not real processes: by default nothing is signalled, even a
     // living group a journal names.
@@ -253,9 +264,10 @@ test('jr2-4: which groups recovery signals — never its own, never 1, a leader 
   assert.deepEqual(select([run('j', 2001, T, ended)], [row(2101, 2001, T), row(2102, 2001, T + 5000)]), [2001], 'a child forked as the Run exited is within its life');
   // A member that started after the Run ended descends from one that was there — a loop's newest
   // child; asking every member to predate the end left such a loop running (the house's read of
-  // cc8c909..39787b3, #22). When every member started after the Run ended, the group id is a reused one.
+  // cc8c909..39787b3, #22). When every member started after the Run ended, the group cannot be told
+  // apart from a stranger's reuse of the id, so it is left (the house's read of the 36 commits, #22).
   assert.deepEqual(select([run('k', 2001, T, ended)], [row(2101, 2001, T), row(2102, 2001, T + 6000)]), [2001], 'a member started within the Run: the later one is its descendant');
-  assert.deepEqual(select([run('k2', 2001, T, ended)], [row(2101, 2001, T + 6000), row(2102, 2001, T + 7000)]), [], 'every member started after the Run ended: a reused group id');
+  assert.deepEqual(select([run('k2', 2001, T, ended)], [row(2101, 2001, T + 6000), row(2102, 2001, T + 7000)]), [], 'every member started after the Run ended: cannot be told from a reused id');
   assert.deepEqual(select([run('l', 2001, T, ended)], [row(2101, 2001, T - 3000), row(2102, 2001, T)]), [], 'one member predates the Run');
   assert.deepEqual(select([run('m', 2001, T, { endedAt: T + 5000, state: 'cancelled' })], [row(2101, 2001, T + 1000)]), [2001], 'a cancelled Run\'s group too');
   assert.deepEqual(select([run('n', 2001, T, { endedAt: T + 5000, state: 'lost' })], [row(2101, 2001, T + 1000)]), [2001], 'and a lost one\'s');
@@ -266,6 +278,53 @@ test('jr2-4: which groups recovery signals — never its own, never 1, a leader 
   assert.deepEqual(select([run('q', 4001, T)], [row(4001, 4001, T, true), row(4101, 4001, T, true)]), []);
   // One group, two Runs: both named.
   assert.deepEqual([...orphanGroups([run('r', 1001, T), run('s', 1001, T)], leaders, self).get(1001)!], ['s\0r', 's\0s']);
+});
+
+test('jr2-4/G21: a journal holding only a rotation header still ends its open Runs\' process groups — age retention had left just the header, read as empty (the house\'s read of the 36 commits, #22)', { timeout: 10_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'hdr');
+  fs.mkdirSync(sdir, { recursive: true, mode: 0o700 });
+  const kids = detachedKids();
+  try {
+    const child = kids.spawn('sleep', ['409']);
+    await until(() => groupAlive(child));
+    const started = Date.now();
+    // Every event has aged out; the active file holds only the rotation header the last rotation wrote,
+    // naming a process Run still open with pgid `child`. The high water (a drop kept the numbering) makes
+    // the session past its age, so the old code removed it — with the Run's process group running.
+    const openRun = { runId: 'r1-headeronly', sessionId: 'hdr', target: 'process', origin: 'self', principal: A, state: 'running', admittedAt: started - 10, startedAt: started, seq: { admit: 1, start: 2 }, attribution: 'exact', pgid: child };
+    fs.writeFileSync(path.join(sdir, 'journal.jsonl'), JSON.stringify({ header: { v: 1, openRuns: [openRun] } }) + '\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(sdir, 'journal.meta.json'), JSON.stringify({ v: 1, epoch: 'a'.repeat(16), highWater: 5 }) + '\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', retention: { maxAgeMs: 1000 } }), { mode: 0o600 });
+    const r = rig(dir, { terminateOrphans: true });
+    assert.equal(r.reg.get('hdr'), undefined, 'past its age, the header-only session is removed');
+    assert.equal(fs.existsSync(sdir), false, 'and its files are gone');
+    await kids.exited(child);
+    assert.ok(!groupAlive(child), 'but its open Run\'s process group was ended first');
+    await r.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
+test('jr2-4: on Linux recovery compares process starts frame-free — a boot id and clock ticks a wall-clock step cannot move (the house\'s read of the 36 commits, #22)', () => {
+  const self = { pid: 500, pgid: 400 };
+  const T = 50_000;
+  const run = (over: Partial<RunInfo>): OrphanCandidate => ({
+    key: 's\0r',
+    run: { runId: 'r', sessionId: 's', target: 'process', origin: 'self', principal: A, state: 'running', admittedAt: T - 10, startedAt: T, seq: { admit: 1, start: 2 }, attribution: 'exact', pgid: 1001, ...over },
+    lastTs: 100_000,
+  });
+  const row = (over: Partial<ProcessRow>): ProcessRow => ({ pid: 1001, pgid: 1001, startMs: T, zombie: false, ...over });
+  const sel = (c: OrphanCandidate, procs: ProcessRow[]) => [...orphanGroups([c], procs, self).keys()];
+  // Same boot, matching ticks: the Run's, even though the listing's wall-clock start was stepped far off.
+  assert.deepEqual(sel(run({ bootId: 'boot-A', startTicks: 7777 }), [row({ bootId: 'boot-A', startTicks: 7777, startMs: T + 600_000 })]), [1001], 'ticks match across a wall-clock step');
+  // A different boot id: nothing of a pre-restart Run survives, whatever the wall clock says.
+  assert.deepEqual(sel(run({ bootId: 'boot-A', startTicks: 7777 }), [row({ bootId: 'boot-B', startTicks: 7777, startMs: T })]), [], 'a reboot leaves nothing of the Run');
+  // Same boot, a leader whose ticks differ: the pid was reused, even with a wall-clock start that would pass.
+  assert.deepEqual(sel(run({ bootId: 'boot-A', startTicks: 7777 }), [row({ bootId: 'boot-A', startTicks: 9999, startMs: T })]), [], 'ticks say the pid was reused');
+  // No ticks recorded (macOS, or an older build): the wall-clock comparison with its tolerance stands.
+  assert.deepEqual(sel(run({}), [row({ startMs: T })]), [1001], 'wall-clock fallback when ticks are absent');
 });
 
 // ───────────── jr2-12: command files ─────────────

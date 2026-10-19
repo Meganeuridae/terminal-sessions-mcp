@@ -110,8 +110,10 @@ test('tg-11/G20: after a SIGKILLed daemon, every admitted Run is terminal and ea
       // Its note says the group went with the Run recovery ended, not that it outlived a Run that had ended (the house's read of cc8c909..39787b3, #22).
       assert.ok(notes.includes(`recovery: process group ${orphan.pgid} terminated with ${ids.orphan}, which recovery ended lost`), JSON.stringify(notes));
       assert.ok(!notes.some((t) => t.includes(`outlived ${ids.orphan}`)), JSON.stringify(notes));
+    } else if (process.platform === 'linux') {
+      assert.fail('run.start recorded no pgid on Linux: the orphan could not be terminated (process Runs record pgid at run.start)');
     } else {
-      console.log('# run.start carries no pgid in this build: the orphan check is skipped (the session workstream records it)');
+      console.log('# run.start carries no pgid on this platform: the orphan check is skipped');
     }
     // A Run that had ended leaving a loop in its group, whose newest child started after the Run ended:
     // the whole group is the Run's, and goes (the house's read of cc8c909..39787b3, #22).

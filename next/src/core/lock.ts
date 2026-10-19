@@ -46,8 +46,27 @@ export interface ProcessRow {
   pgid: number;
   /** Start time, truncated to the second (ms since the epoch). */
   startMs: number;
+  /**
+   * The process's start in clock ticks after boot, read from /proc on Linux (undefined with `ps`,
+   * and on macOS): a wall-clock step does not move it, so recovery compares it frame-free against a
+   * Run's recorded ticks (the house's read of the 36 commits, #22, comment 6269992150).
+   */
+  startTicks?: number;
+  /** The boot id this listing was taken under (Linux): a different one means the process cannot be a pre-restart Run's. */
+  bootId?: string;
   /** Exited, not yet reaped by its parent: it counts as gone. */
   zombie: boolean;
+}
+
+/** The machine's boot id (Linux), read once: /proc/sys/kernel/random/boot_id, trimmed. Undefined elsewhere or when unreadable. */
+function readBootId(): string | undefined {
+  if (process.platform !== 'linux') return undefined;
+  try {
+    const id = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return id.length ? id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Block the thread: only for startup paths bounded to a few seconds, before the daemon serves anyone. */
@@ -75,6 +94,7 @@ function procRows(): ProcessRow[] | undefined {
     const btime = Number(/^btime (\d+)$/m.exec(fs.readFileSync('/proc/stat', 'utf8'))?.[1]);
     if (!Number.isFinite(btime)) return undefined;
     const hz = 100; // USER_HZ: 100 on every mainstream Linux ABI
+    const bootId = readBootId();
     const out: ProcessRow[] = [];
     for (const name of fs.readdirSync('/proc').filter((n) => /^\d+$/.test(n))) {
       let stat: string;
@@ -87,7 +107,8 @@ function procRows(): ProcessRow[] | undefined {
       const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
       const pgid = Number(f[2]);
       const start = Number(f[19]);
-      if (Number.isFinite(pgid) && Number.isFinite(start)) out.push({ pid: Number(name), pgid, startMs: Math.floor(btime + start / hz) * 1000, zombie: f[0] === 'Z' });
+      // starttime is in clock ticks after boot: frame-free, so recovery compares it without a wall-clock frame.
+      if (Number.isFinite(pgid) && Number.isFinite(start)) out.push({ pid: Number(name), pgid, startMs: Math.floor(btime + start / hz) * 1000, startTicks: start, ...(bootId !== undefined && { bootId }), zombie: f[0] === 'Z' });
     }
     return out;
   } catch {

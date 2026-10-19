@@ -263,6 +263,9 @@ export class RunIndex {
         if (ev.rows !== undefined) r.rows = ev.rows;
         if (ev.pid !== undefined) r.pid = ev.pid;
         if (ev.pgid !== undefined) r.pgid = ev.pgid;
+        // The leader's frame-free start on Linux, so recovery can judge its group across a clock step.
+        if (ev.startTicks !== undefined) r.startTicks = ev.startTicks;
+        if (ev.bootId !== undefined) r.bootId = ev.bootId;
         // How the Run was launched and the nonce in its marks: what history cuts its plumbing by.
         if (ev.strategy !== undefined) r.strategy = ev.strategy;
         if (ev.nonce !== undefined) r.nonce = ev.nonce;
@@ -278,6 +281,10 @@ export class RunIndex {
         if (ev.reason) r.reason = ev.reason;
         if (ev.leftovers) r.leftovers = true;
         if (ev.pipeStatus) r.pipeStatus = [...ev.pipeStatus];
+        // A recovery-written end carries the recovery's time, not evidence of when the group could form,
+        // and once recovery has judged the group a later restart does not judge it again (comment 6269992150).
+        if (ev.recoveredEnd) r.recoveredEnd = true;
+        if (ev.groupJudged) r.groupJudged = true;
         this.openIds.delete(ev.runId);
         return;
       }
