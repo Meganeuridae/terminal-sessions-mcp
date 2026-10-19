@@ -117,3 +117,32 @@ test('service and watch events become lifecycle messages for the principal who s
   assert.equal(r[0]!.messageId, out[0]!.messageId, 'replayed messages keep their ids, so hosts can deduplicate');
   seg.dispose();
 });
+
+test('G23: no segment claims chat:addressed — a Run’s end, a service, a watch, a human’s input carry terminal:* tags and at most a chat:from-* sender', async () => {
+  // Tags describe and never authorize (G23): whether a finished run deserves attention is the
+  // consumer's rule. Nothing checked this, so a run message tagged chat:addressed passed the
+  // suite (the house's read of 07ab3dd, #22).
+  const src = fakeSource();
+  const seg = new Segmenter(src, { runSettleMs: 5 });
+  const out = collect(seg);
+  src.journal.append({ type: 'input', data: 'y', principal: 'human:gui:aster', kind: 'text' });
+  src.screen.lines = ['Continue? [y/N] y', '', '', '', ''];
+  src.screen.cursor = { x: 17, y: 0 };
+  src.journal.append({ type: 'input', data: '\r', principal: 'human:gui:aster', kind: 'text' });
+  await sleep(400);
+  src.runs.set('r1', { runId: 'r1', sessionId: 's1', target: 'process', origin: 'self', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'exact', line: 'npm run dev' });
+  src.journal.append({ type: 'service', runId: 'r1', status: 'ready', probe: 'pattern /ready/', principal: 'agent:a@t', evidence: 'ready on :3000' });
+  src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 3, match: 'ERROR', line: 'ERROR: boom' });
+  const admit = src.journal.append({ type: 'run.admit', runId: 'r2', target: 'shell', principal: 'human:gui:aster', origin: 'human', queued: false });
+  const start = src.journal.append({ type: 'run.start', runId: 'r2', cwd: '/w' });
+  src.runs.set('r2', { runId: 'r2', sessionId: 's1', target: 'shell', origin: 'human', principal: 'human:gui:aster', state: 'exited', exit: 1, admittedAt: admit.ts, startedAt: start.ts, seq: { admit: admit.seq, start: start.seq }, attribution: 'temporal', line: 'make' });
+  src.journal.append({ type: 'run.end', runId: 'r2', state: 'exited', exit: 1, durationMs: 10 });
+  await sleep(400);
+  const kinds = new Set<string>(out.map((s) => s.kind));
+  for (const k of ['human-input', 'service', 'watch', 'run']) assert.ok(kinds.has(k), `a ${k} segment was produced: ${[...kinds].join(', ')}`);
+  for (const s of out) {
+    assert.ok(!s.tags.includes('chat:addressed'), `${s.kind} claims chat:addressed: ${s.tags.join(', ')}`);
+    for (const t of s.tags) assert.ok(t.startsWith('terminal:') || /^chat:from-(human|agent|self)$/.test(t), `${s.kind}: ${t} is neither a terminal:* tag nor a sender facet`);
+  }
+  seg.dispose();
+});

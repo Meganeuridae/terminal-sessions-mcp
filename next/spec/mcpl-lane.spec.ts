@@ -22,7 +22,7 @@ import type { SegmenterOptions } from '../src/core/segmenter.js';
 import { seqOfMessageId } from '../src/core/segmenter.js';
 import type { Session } from '../src/core/session.js';
 import { Outbound, type Message } from '../src/transport/jsonrpc.js';
-import { FEATURE_SETS, McplLane, NODE_NAME } from '../src/transport/mcpl.js';
+import { FEATURE_SETS, manifest, McplLane, NODE_NAME } from '../src/transport/mcpl.js';
 import { TermServer } from '../src/transport/server.js';
 import { FULL_GRANT, TestHost, sleep, until, type Delivery, type Msg } from './testhost.js';
 
@@ -977,4 +977,36 @@ test('listing channels reads the sessions once, not once per session, and the co
     lane.dispose();
   }
   for (const name of CORE_TOOLS) assert.ok(FEATURE_SETS['terminal.core'].description.includes(name), `terminal.core names ${name}`);
+});
+
+test('G23: a completion reaches the host with terminal:* tags and its sender facet, never chat:addressed; the declared ontology names no such tag', async () => {
+  // The lane adds the per-recipient tags (origin, chat:from-*); nothing checked that the set
+  // stays descriptive (the house's read of 07ab3dd, #22: a run message tagged chat:addressed
+  // passed the suite).
+  const d = await daemon();
+  try {
+    const a = await d.host('ta', 'g23');
+    await a.call('session_open', { session: 'g23' });
+    await a.request('channels/open', { channelId: 'terminal:g23' });
+    const r = await a.call('run', { session: 'g23', command: 'sleep 0.3; echo g23-done', wait: 20 });
+    const got = await a.delivery(aboutRun(r.structured?.runId), 4000);
+    assert.ok(got.tags.includes('terminal:run-finished') && got.tags.includes('terminal:origin=self') && got.tags.includes('chat:from-self'), got.tags.join(', '));
+    assert.ok(!got.tags.includes('chat:addressed'), got.tags.join(', '));
+    for (const t of got.tags) assert.ok(t.startsWith('terminal:') || /^chat:from-(human|agent|self)$/.test(t), t);
+    assert.doesNotMatch(JSON.stringify(manifest()), /chat:addressed/, 'the manifest declares no chat:addressed');
+    await a.close();
+  } finally {
+    await d.stop();
+  }
+});
+
+test('G24: no feature set declares rollback, in the declarations and in the manifest the host receives', () => {
+  // A journal position is evidence, not a checkpoint of shell side effects (G24). The built
+  // code could declare `rollback: true` on terminal.core without a test noticing (the house's
+  // read of 07ab3dd, #22). `manifest()` is what initialize sends.
+  for (const [name, decl] of Object.entries(FEATURE_SETS)) assert.equal((decl as { rollback?: unknown }).rollback, undefined, `${name} declares rollback`);
+  const sets = (manifest().featureSets ?? {}) as Record<string, { rollback?: unknown }>;
+  assert.ok(Object.keys(sets).length >= 9, 'the manifest carries the feature sets');
+  for (const [name, decl] of Object.entries(sets)) assert.ok(!decl.rollback, `${name} declares rollback in the manifest`);
+  assert.doesNotMatch(JSON.stringify(manifest()), /"rollback"\s*:\s*true/);
 });

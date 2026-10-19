@@ -223,8 +223,9 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 ### Identity and lifecycle
 
 - **G1.** Every execution is a Run with a `runId` assigned before anything is written to a
-  PTY or spawned. Every later operation — await, read, cancel, signal, evidence — refers to
-  it. Marks-detected human commands become Runs at their pre-execution mark.
+  PTY or spawned. Every later operation on it — await, read, cancel, evidence — refers to
+  it (`signal` addresses the terminal's foreground job, not a Run, §8.4; given a Run it points
+  at `cancel`). Marks-detected human commands become Runs at their pre-execution mark.
 - **G2.** Run state transitions are journaled. `exited` carries an exit code or a signal
   that was *observed*: from the shell's end mark for a shell Run, from the process for a
   process Run. No other source of an exit status exists.
@@ -351,14 +352,16 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 
 - **G19.** Three promises, reported separately: (a) sessions and Runs outlive any client
   connection; (b) journals and metadata survive a daemon restart; (c) live processes
-  survive a daemon restart only under the keeper backend. Session state names its backend.
+  survive a daemon restart only under the keeper backend. A live session's state names its
+  backend; a session whose shell ended reports `closed` or `recovered` in its place.
   A disk that refuses writes never takes the daemon or a session down: the ring carries
   on, the failure is reported (`/health`, journal stats), and the file store catches up
   from the ring when writes succeed again; a torn last line is cut on open, never
   reissued, and marked by a `gap`. Closing a session keeps its history readable (`read`,
   `await` on its Runs) until retention or an explicit `forget` removes it.
-- **G20.** After a daemon restart every session reports `recovered: continuous |
-  reattached | history-only`, and every Run that was running is reported `exited` if its
+- **G20.** After a daemon restart every session whose shell was alive at the restart
+  reports `recovered: continuous | reattached | history-only` (one closed before it reports
+  `closed`, not a recovery class), and every Run that was running is reported `exited` if its
   end was observed, otherwise `lost` with reason `daemon-restart`. Never `running` by
   assumption.
 - **G21.** Nothing is deleted by default: history stays on disk until its session is
@@ -720,8 +723,8 @@ A `Segmenter` turns journal events into messages. One default policy, replaceabl
 
 | Segment | Trigger | Content | Tags |
 |---|---|---|---|
-| run | `run.end` | ``[terminal] <s>: `<line>` → exit N in 1.2s · run <id> · read since=<seq>`` + the output's tail (4 KiB) | `terminal:run-finished` or `terminal:run-lost`, `terminal:exit=ok\|nonzero\|signal` (exactly one), `terminal:target=shell\|process`, and per recipient `terminal:origin=self\|human\|agent\|system` with the matching `chat:from-*` |
-| service | a Service's status changes | status line with the probe's evidence | `terminal:service-ready`, `terminal:service-unhealthy`, `terminal:service-exited` |
+| run | `run.end` | ``[terminal] <s>: `<line>` → exit N in 1.2s · run <id> · read since=<seq>`` + the output's tail (4 KiB) | `terminal:run-finished` or `terminal:run-lost`, `terminal:exit=ok\|nonzero\|signal` (at most one: a lost Run, a cancellation without a signal and an end mark without a status carry none), `terminal:target=shell\|process`, and per recipient `terminal:origin=self\|human\|agent\|system` with the matching `chat:from-*` |
+| service | a Service's status changes (`starting` is journaled, not a message) | status line with the probe's evidence | `terminal:service-<status>`: `-ready`, `-running`, `-unhealthy`, `-exited`, `-lost` |
 | output | while running, at most once per cadence (default 10 s) | digest: elapsed, bytes since the agent last read, the tail; `metadata.supersedes` names the previous digest | `terminal:output`, `terminal:running` |
 | screen | in alt-screen, 500 ms after last change | full screen text | `terminal:screen` |
 | needs-input | running, silent ≥ 5 s, last line unterminated and prompt-like | last lines + evidence | `terminal:needs-input` |
@@ -762,12 +765,16 @@ and hosts match them with globs; bare tags name distinct event classes
 
 ```jsonc
 "suggestedTreatment": [
-  { "tagsAny": ["terminal:needs-input", "terminal:watch", "terminal:session-exited",
-                "terminal:service-unhealthy", "terminal:service-exited"], "behavior": "immediate" },
-  { "tagsAny": ["terminal:run-finished", "terminal:run-lost", "terminal:service-ready",
-                "terminal:human-input"], "behavior": "immediate" },
-  { "tagsAny": ["terminal:output", "terminal:screen", "terminal:control"], "behavior": "throttle" } ]
+  { "tagsAny": ["terminal:needs-input", "terminal:watch", "terminal:session-exited", "terminal:recovered",
+                "terminal:service-unhealthy", "terminal:service-exited", "terminal:service-lost"], "behavior": "immediate" },
+  { "tagsAny": ["terminal:run-finished", "terminal:run-lost", "terminal:service-ready", "terminal:service-running",
+                "terminal:human-input", "terminal:missed"], "behavior": "immediate" },
+  { "tagsAny": ["terminal:output", "terminal:screen", "terminal:control", "terminal:note"], "behavior": "throttle" } ]
 ```
+
+The five service classes are the statuses a Service reports after `starting` (§10.2):
+`ready`, `running`, `unhealthy`, `exited`, `lost`; the shipped bridge configuration wakes on
+every one of them.
 
 The manifest digest (§17.2) admits only `[A-Za-z0-9._:*-]` in declared identifiers, so a
 keyed value cannot appear in `suggestedTreatment`; that is why service statuses are distinct
@@ -955,8 +962,10 @@ feature sets are descriptive bundles and not authorization (SPEC §6): the serve
 `featureSetForTool` map, and the host enforces its own tool policy at listing and dispatch —
 agent-framework's `enabledTools` / `disabledTools` on the server entry, the bridge's
 `enableFeatureSets`. The core is the default in every host, not a documented option: the
-shipped recipe and bridge entries (`next/config/`) enable `terminal.core`, `terminal.live`
-and `terminal.presence` and nothing else, and plain MCP starts in `--profile core`
+shipped recipe (`next/config/agent-framework.recipe.json`) enables `terminal.core`,
+`terminal.live` and `terminal.presence` and nothing else; the bridge entry
+(`next/config/mcpl-bridge.json`) adds `terminal.channels` and `terminal.annotate`, which
+its `mcpl_open` and `mcpl_send` use; and plain MCP starts in `--profile core`
 (`full` adds every tier; `compat` serves the 1.x names instead). Names are
 short verbs in `snake_case`, the org's convention.
 
@@ -994,7 +1003,7 @@ opposite: a mode that changes meaning, learned wrong once and over-specified for
    the journal can answer (§16, Measure).
 
 A compatibility pack (`runCommand`, `tailLogs`, `searchLogs`, `sendInput`, `sendSignal`,
-`listSessions`, `killSession`, `launch`, `takeScreenshot`) maps onto the above for one
+`listSessions`, `killSession`, `killAll`, `launch`, `takeScreenshot`) maps onto the above for one
 release so existing recipes keep working, and is removed in the release after.
 
 ---
@@ -1020,7 +1029,12 @@ release so existing recipes keep working, and is removed in the release after.
 ```
 
 - **termd**: supervised by launchd/systemd as today (units in `next/config/`); loopback plus
-  token by default, `aid1` when available. Serves the GUI's static files; the GUI is a
+  token by default, `aid1` when available. A connection names itself in its URL's query:
+  `token` (or an `Authorization: Bearer` header), `profile` (plain MCP only: `core | full |
+  compat`), `resultText` (`json | transcript`, §11), `connection` (a label for logs and usage
+  records; the daemon generates the identity), and `client=cli`, which the `tsm` CLI sends so
+  usage records count it with the GUI as the native family rather than as an agent surface.
+  Serves the GUI's static files; the GUI is a
   client of the `terminal/*` family over the same WebSocket. socket.io and express go away.
   Every HTTP request and upgrade must name an allowed Host (loopback names, the bind
   address, `--allow-host`; non-loopback binds require both a credential and
@@ -1049,7 +1063,7 @@ release so existing recipes keep working, and is removed in the release after.
 ## 13. Internal architecture and seams
 
 One npm package, four bins, hard internal layering enforced by directory and by a test that
-fails on cross-layer imports:
+fails on cross-layer imports (`next/spec/layering.spec.ts`, type-only imports included):
 
 ```
 src/core/        Session, Run, Service, Journal, JournalStore, views, Screen, Marks,
@@ -1098,8 +1112,10 @@ addition; nothing about them touches the live PTY.
 ## 15. Quality bar
 
 - TypeScript strict, ESM, Node ≥ 20. No `any` at boundaries. Every operation validated
-  against its schema before dispatch. Errors are typed with codes and reach hosts as
-  JSON-RPC errors, never as `{success: false}`.
+  against its schema before dispatch. Errors are typed with codes. A tool's failure reaches
+  hosts as MCP carries one: an `isError` result whose text opens with the code
+  (`session_not_found: …`) and carries no envelope; a protocol failure is a JSON-RPC error.
+  Only the compat pack answers in 1.x's `{success: false}` shape, for its one release.
   Regex support is capability-checked: Node 20's linear engine refuses lookbehind, and
   misorders some nullable bounded repetitions. Such patterns receive an explicit error
   on that engine instead of a wrong match or an automatic switch to backtracking.
@@ -1136,8 +1152,9 @@ be made on evidence the first milestone will produce. Each deferral below says w
 `terminal-sessions-mcp` is the stdio shim serving the compat pack, `session-server` starts
 `termd`). Milestone 1's exit criterion passes: the acceptance sentence runs against
 agent-framework's real host code and against mcpl-cc-bridge's host classes
-(`next/acceptance/`), and the suite (285 tests: scripted, real bash 3.2 / zsh / sh / dash /
-fish, end to end over the endpoint, a headless browser for the GUI, daemon restarts) passes.
+(`next/acceptance/`), and the suite (285 tests then; 717 at #22's `dbf3efc`: scripted, real
+bash 3.2 / zsh / sh / dash / fish, end to end over the endpoint, a headless browser for the
+GUI, daemon restarts) passes.
 Milestone 2's contents are in: the compat pack, services with pattern/tcp/alive probes,
 watches and `wait_for`, digests with `supersedes`, screens, needs-input, presence, the GUI
 as a native client, socket.io/express/puppeteer gone from the runtime, tiers and profiles,
@@ -1296,7 +1313,7 @@ type JournalEvent =
   | { seq; ts; type: 'run.admit';   runId; target: 'shell'|'process'; line?|argv?; principal; queued: boolean; idem?; shell?; within? }  // idem: key identity (G16); shell/within: a declared shell's Run (§8.1)
   | { seq; ts; type: 'run.start';   runId; cwd; line?; envBasis?: 'configured'|'snapshot' }   // C mark, or spawn
   | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs }
-  | { seq; ts; type: 'service';     runId; status: 'ready'|'unhealthy'|'exited'; probe; evidence? }
+  | { seq; ts; type: 'service';     runId; status: 'starting'|'ready'|'running'|'unhealthy'|'exited'|'lost'; probe; evidence?; name?; principal? }
   | { seq; ts; type: 'prompt';      cwd; phase: 'start'|'end' }                              // A and B marks
   | { seq; ts; type: 'cwd';         path }                                                    // OSC 7
   | { seq; ts; type: 'env.snapshot';vars: Record<string,string> }                             // session_env_capture
