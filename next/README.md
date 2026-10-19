@@ -39,10 +39,13 @@ Then connect a host (configurations in [`next/config/`](config/)):
 - **agent-framework**: the `mcplServers` entry from `next/config/agent-framework.recipe.json` and
   the gate policies from `next/config/agent-framework.gate.json`.
 - **Any MCP host** (Cursor, Claude Desktop, Claude Code without the bridge):
-  `next/config/mcp.json` — the stdio shim starts `termd` if nothing is listening, unless a
-  termd systemd user unit is enabled or a launchd job is loaded (then it is the supervisor's to
-  start, and the shim waits for it) or `TSM_NO_SPAWN=1` says never to. With a supervisor unit of your own
-  name, set `TSM_NO_SPAWN=1` in the shim's configuration.
+  `next/config/mcp.json` — the stdio shim starts `termd` if nothing is listening on its (plain
+  `ws://`, loopback) address, unless a termd systemd user unit or launchd job manages a termd
+  for that port (then it is the supervisor's to start, and the shim waits for it; a check that
+  does not answer counts as a supervisor) or `TSM_NO_SPAWN=1` says never to. With a supervisor
+  unit of your own name, set `TSM_NO_SPAWN=1` in the shim's configuration. A termd the shim
+  started that exits is reported on the shim's stderr with what termd said (kept in
+  `<data-dir>/termd.stderr.log`), and started again when the port is refused later.
 
 ## What an agent gets
 
