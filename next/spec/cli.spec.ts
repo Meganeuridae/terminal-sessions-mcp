@@ -21,6 +21,7 @@ import type { UsageRecord } from '../src/api/usage.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermServer } from '../src/transport/server.js';
 import { fakeShellBackend, until, type FakeShell } from './fake-shell.js';
+import { unusedPort } from './testhost.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const TSM = path.resolve(here, '../src/cli/tsm.js');
@@ -479,4 +480,13 @@ test('tsm usage: the report and --since; a date that does not parse or a log tha
   const unknown = await tsm(['usage', '--bogus'], {});
   assert.equal(unknown.code, 1);
   assert.match(unknown.stderr, /unknown argument --bogus/);
+});
+
+test('a stray word on a flags-only tool is a usage error even when no daemon answers: the generic hint, not a connection error', async () => {
+  // The schema-built hint needs the daemon; without one the stray word is still said first (the
+  // reviewer's read of the r16 commits, #22).
+  const r = await tsm(['session_list', 'foo'], { TSM_URL: `ws://127.0.0.1:${await unusedPort()}` });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /session_list takes --flags only \(unexpected word foo\)/);
+  assert.doesNotMatch(r.stderr, /cannot reach|--session/);
 });

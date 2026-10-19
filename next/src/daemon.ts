@@ -237,8 +237,12 @@ function boundedLogger(limit: number): (msg: string, e: unknown) => void {
   };
 }
 
-/** A group exists while any member lives; EPERM means a stranger's (a reused id), so not ours. */
-function groupAlive(pgid: number): boolean {
+/**
+ * Does a process group we may still signal exist? True while any member lives; EPERM means the id is
+ * now a stranger's (reused), so false. Named for what it answers: the backend's groupAlive answers
+ * "does any process of the group remain", where EPERM is true (the reviewer's read of the r16 commits).
+ */
+function ourGroupAlive(pgid: number): boolean {
   try {
     process.kill(-pgid, 0);
     return true;
@@ -267,7 +271,7 @@ class OwnedProcessGroups implements ExecutionBackend {
     this.kind = inner.kind;
     // Forget dead groups promptly: a pgid kept after its group died could be reused by a stranger's.
     setInterval(() => {
-      for (const [g, h] of this.groups) if (!(h.groupAlive?.() ?? groupAlive(g))) this.groups.delete(g);
+      for (const [g, h] of this.groups) if (!(h.groupAlive?.() ?? ourGroupAlive(g))) this.groups.delete(g);
     }, 2000).unref();
   }
 
@@ -285,14 +289,14 @@ class OwnedProcessGroups implements ExecutionBackend {
     if (pgid > 0) {
       this.groups.set(pgid, h);
       h.onExit(() => {
-        if (!(h.groupAlive?.() ?? groupAlive(pgid))) this.groups.delete(pgid);
+        if (!(h.groupAlive?.() ?? ourGroupAlive(pgid))) this.groups.delete(pgid);
       });
     }
     return h;
   }
 
   live(): number[] {
-    return [...this.groups].filter(([g, h]) => h.groupAlive?.() ?? groupAlive(g)).map(([g]) => g);
+    return [...this.groups].filter(([g, h]) => h.groupAlive?.() ?? ourGroupAlive(g)).map(([g]) => g);
   }
 
   signalAll(signal: NodeJS.Signals): void {
@@ -300,7 +304,7 @@ class OwnedProcessGroups implements ExecutionBackend {
       // The handle signals the group only while it is still the Run's; once it is gone the handle
       // latches and the group is forgotten here.
       h.kill(signal);
-      if (!(h.groupAlive?.() ?? groupAlive(g))) this.groups.delete(g);
+      if (!(h.groupAlive?.() ?? ourGroupAlive(g))) this.groups.delete(g);
     }
   }
 

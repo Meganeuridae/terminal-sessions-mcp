@@ -300,8 +300,9 @@ __tsm_precmd() {
   # value runs after it — __tsm_reinit_solo), clear it here too, so the DEBUG trap does not stand
   # down for good on the next Run after \`exec bash\` (the house's read, #22 comment 6264958172).
   # With an appended part still to run and promptvars off, neither can clear it: the DEBUG trap then
-  # clears it at the first command that is not one of the user's prompt part (see __tsm_debug).
-  if __tsm_pc_intact; then __tsm_top="$\{__tsm_top:+$__tsm_top; }$\{__tsm_reinit_solo:+__tsm_reinit_pending=0; }__tsm_prompt_active=1"; else __tsm_fold_pc; fi
+  # clears it at the first command that is not one of the user's prompt part (see __tsm_debug). The
+  # solo mark is consumed here, so later prompts do not carry the clear for the shell's life.
+  if __tsm_pc_intact; then __tsm_top="$\{__tsm_top:+$__tsm_top; }$\{__tsm_reinit_solo:+__tsm_reinit_pending=0; }__tsm_prompt_active=1"; __tsm_reinit_solo=; else __tsm_fold_pc; fi
   __tsm_restore "$__o"
   # Leave $? as the command left it (PS1 may show it); never under errexit, where
   # returning a failure would end the shell.
@@ -474,6 +475,7 @@ __tsm_bp_first() {
   set +eu
   if [ -n "$\{__tsm_exec_armed-}" ]; then __tsm_exec_disarm; fi
   __tsm_prompt_active=
+  __tsm_line_text=  # only the trap path reads it (bash-preexec never installs __tsm_debug); cleared as precmd does
   __tsm_close "$__st"
   __tsm_restore "$__o"
 }

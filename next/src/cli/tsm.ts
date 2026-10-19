@@ -365,8 +365,11 @@ async function main(): Promise<void> {
   if (!cmd || cmd === '--help' || cmd === '-h') return end(0, USAGE);
   if (cmd === 'gui') return end(0, parse(argv, undefined).json ? JSON.stringify({ url: guiUrl() }, null, 2) : guiUrl());
   if (cmd === 'usage') return usageReport(argv.slice(1));
-  // The syntax is checked before any daemon is asked: a stray word or a flag without its value is a
-  // usage error whether or not termd runs, and `--json` means tsm's own flag only before `--`.
+  // The syntax is checked before any daemon is asked: a shorthand's extra word or a flag without its
+  // value is a usage error whether or not termd runs, and `--json` means tsm's own flag only before
+  // `--`. A flags-only tool's stray word waits for the daemon's schema, so its hint can name the
+  // tool's parameters; when no daemon answers, the generic hint is given instead (the reviewer's
+  // read of the r16 commits, #22).
   const syntax = parse(argv, undefined);
   const url = new URL(setting('TSM_URL') ?? 'ws://127.0.0.1:3101');
   const token = setting('TSM_TOKEN');
@@ -409,7 +412,8 @@ async function main(): Promise<void> {
   };
   await new Promise<void>((resolve, reject) => {
     ws.once('open', () => resolve());
-    ws.once('error', (e) => reject(new Error(connectError(url, e.message))));
+    // A stray word is a usage error before it is a connection problem: said even when no daemon answers.
+    ws.once('error', (e) => reject(new Error(syntax.stray !== undefined ? strayHint(cmd, syntax.stray, undefined) : connectError(url, e.message))));
   });
   ws.on('error', (e) => failAll(`failed (${e.message})`));
   ws.on('close', (code) => failAll(`closed (${code})`));

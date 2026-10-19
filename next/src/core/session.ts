@@ -1262,7 +1262,9 @@ export class Session {
       // The job is known now; once the shell is gone nothing can ask the terminal for it.
       const job = this.foregroundJob();
       const total = opts.timeoutMs ?? 3000;
-      const started = Date.now();
+      // The close wait is the longest wait on the shutdown path: measured on the monotonic clock, as is
+      // the reapJob deadline it hands on (the reviewer's read of the r16 commits, #22).
+      const started = clocks.monotonic();
       const graceful = opts.graceful ?? true;
       if (graceful) {
         foregroundJob('SIGHUP');
@@ -1273,7 +1275,7 @@ export class Session {
           // forked outside any job), and the shell once more.
           if (!gone()) this.pty.signalGroup?.(this.pty.pid, 'SIGHUP');
           if (!gone()) this.pty.kill('SIGHUP');
-          await wait(Math.max(0, total - (Date.now() - started)));
+          await wait(Math.max(0, total - (clocks.monotonic() - started)));
         }
       }
       if (!gone()) {
@@ -1299,22 +1301,22 @@ export class Session {
   /**
    * ss-6: the foreground job survived its hangup (it ignores SIGHUP, or handles it as
    * "reload"): SIGTERM, then SIGKILL, to its process group — never the daemon's — before
-   * `deadline`. What was done is journaled.
+   * `deadline` (a clocks.monotonic() instant). What was done is journaled.
    */
   private async reapJob(pgid: number, deadline: number): Promise<void> {
     const alive = () => this.pty.groupAlive?.(pgid) ?? false;
     if (!this.pty.groupAlive || pgid === process.pid) return;
     const waitGone = async (until: number) => {
-      while (alive() && Date.now() < until) await sleep(20);
+      while (alive() && clocks.monotonic() < until) await sleep(20);
       return !alive();
     };
-    const left = () => Math.max(0, deadline - Date.now());
-    if (await waitGone(Date.now() + Math.min(300, left()))) return;
+    const left = () => Math.max(0, deadline - clocks.monotonic());
+    if (await waitGone(clocks.monotonic() + Math.min(300, left()))) return;
     const steps: string[] = [];
     for (const sig of ['SIGTERM', 'SIGKILL'] as const) {
       if (!alive()) break;
       if (this.pty.signalGroup?.(pgid, sig)) steps.push(sig);
-      if (sig === 'SIGTERM' && (await waitGone(Date.now() + Math.max(100, Math.min(1000, left()))))) break;
+      if (sig === 'SIGTERM' && (await waitGone(clocks.monotonic() + Math.max(100, Math.min(1000, left()))))) break;
     }
     if (steps.length) this.note(`close: the foreground job (process group ${pgid}) survived the hangup; sent ${steps.join(', then ')}`);
   }
@@ -1585,7 +1587,7 @@ export class Session {
 
   /** The terminal's foreground group, read at most every 100 ms (it is a `ps` on macOS). */
   private foregroundNow(): number | undefined {
-    const now = this.now();
+    const now = clocks.monotonic(); // a cache age, not a timestamp: never set back by a clock step
     if (this.fgRead && now - this.fgRead.at < 100) return this.fgRead.pgid;
     const pgid = this.pty.foreground?.()?.foregroundPgid;
     this.fgRead = { at: now, pgid };
