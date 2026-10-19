@@ -1,6 +1,6 @@
 # Upstream changes the terminal redesign asks of the bridge and the host
 
-**Status:** Proposal backlog; A1 implemented in draft [agent-framework #181](https://github.com/anima-research/agent-framework/pull/181), not merged or deployed. B3 and A2 corrected after Codex's review (acceptance is invalidated by an ontology change, never recompiled); A5 and A6 added 2026-09-23 from the milestone-1 review, which exercised both hosts' real code against termd
+**Status:** Proposal backlog; A1 landed in agent-framework through [#262](https://github.com/anima-research/agent-framework/pull/262) (merged 2026-10-18), which superseded our draft [#181](https://github.com/anima-research/agent-framework/pull/181) (closed) — in a wrapper shape, not the bare object proposed below: see "Landed" under A1. B3 and A2 corrected after Codex's review (acceptance is invalidated by an ontology change, never recompiled); A5 and A6 added 2026-09-23 from the milestone-1 review, which exercised both hosts' real code against termd
 **Date:** 2026-09-17, amended 2026-09-24
 **Companion:** `DESIGN.md` draft 4 (§10.6 host profiles, §11 result shape and tiers)
 **Audience:** an agent writing the PRs. Every claim below carries a `file:line` anchor as of
@@ -155,6 +155,8 @@ or switch to the package. Not required by the terminal work; it is where the
 Repo: `github.com/anima-research/agent-framework`.
 
 ### A1 — `code_execution` hands scripts `structuredContent` when a tool provides it (S–M)
+
+**Landed (2026-10-18).** agent-framework #262 carries A1, with a shape of its own: for a tool that returns structured content, the string a script's tool function gets is a JSON object `{"content": [...], "structuredContent": ..., "isError": false}`, with `"error"` added when `isError` is true; a reference to a payload appears in `content` as `{"type", "refId", "savedTo"}` (`savedTo` the workspace path, or null); a structured result over 5 MB is saved to the workspace and the string becomes `{"isError", "oversized": {"chars", "savedTo"}}`; a result that cannot be serialized reaches the script as an error that names the tool. Scripts therefore read `json.loads(text)["structuredContent"]` for termd's envelope rather than the bare object. Our #181 is closed; its scripts and tests are not needed. The paragraph below is the history of the earlier draft.
 
 **Implementation (2026-09-24).** Draft [agent-framework #181](https://github.com/anima-research/agent-framework/pull/181), commit `cccb0f2`, implements this against main `359cbc5`, independently of the earlier lifecycle PR #155. Both dispatch paths preserve the envelope; Python gets JSON, direct model calls retain readable content, and legacy results retain their existing serialization. The existing cap is 5,000,000 characters; structured overflow reports an explicit error rather than incomplete JSON. Full suite: 956 passed / 4 skipped / 0 failed (baseline 954 / 4 / 0). Both new tests fail on baseline. Real termd → framework → Python acceptance and the existing host lifecycle acceptance pass. No deployed host or live LLM was exercised. The proposal below is retained as context for reviewing and continuing the implementation; any collaborator may do so.
 
