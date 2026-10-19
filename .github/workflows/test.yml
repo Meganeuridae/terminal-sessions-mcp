@@ -1,0 +1,98 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main, redesign/m1, land/2.0]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [20, 22, 24]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install shells (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh fish openssh-server
+      - name: Secure zsh completion paths (Linux)
+        if: runner.os == 'Linux'
+        # Ubuntu's global compinit otherwise waits for an answer about the hosted
+        # runner's writable completion paths. Repair them, keeping the audit on.
+        run: |
+          audit=$(mktemp)
+          trap 'rm -f "$audit"' EXIT
+          zsh -fc 'autoload -Uz compaudit; compaudit' > "$audit" || true
+          cat "$audit"
+          while IFS= read -r completion_path; do
+            sudo chmod go-w -- "$completion_path"
+          done < "$audit"
+          zsh -fc 'autoload -Uz compaudit; compaudit'
+      - name: Install fish (macOS)
+        if: runner.os == 'macOS'
+        run: brew list fish >/dev/null 2>&1 || brew install fish
+      - run: npm ci
+      # Fail early with the shell's startup output instead of leaving later
+      # interactive-shell tests waiting behind an unread startup prompt.
+      - name: Check shell startup
+        run: npm run build:next && node --test --test-name-pattern='G5 rich integration is observed' next/dist/spec/pty.spec.js
+      # 1.x's suite (src/, cli/, gui/, test/) and 2.0's (next/): both ship in this package.
+      - run: npm test
+      - run: npm run test:next
+
+  # The two checks against real MCPL hosts (next/acceptance), which `npm test` does not run: the
+  # agent-framework host with a mock model, and mcpl-cc-bridge's own host classes under bun. Each
+  # host is checked out at a pinned commit of its main and built as its README says; a host that
+  # is missing fails the job rather than skipping (ACCEPTANCE_REQUIRED). Move a pin when the host
+  # changes something the check depends on, and say so in the commit.
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: anima-research/agent-framework
+          ref: 0d19f7c8996433ffd1d7adbd45842559dad1c8bd
+          path: .hosts/agent-framework
+      - uses: actions/checkout@v4
+        with:
+          repository: anima-research/mcpl-cc-bridge
+          ref: b4d566fa1771f4547873054c83b9bccde4e02ff4
+          path: .hosts/mcpl-cc-bridge
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+      - run: npm ci
+      - name: Build agent-framework
+        working-directory: .hosts/agent-framework
+        # Its repository ships no lockfile; the one kept beside the checks pins its dependencies for
+        # this job, so a dependency release cannot change the result. When moving the pin: `npm
+        # install` in a checkout of the new commit, then copy its package-lock.json over ours.
+        run: cp "$GITHUB_WORKSPACE/next/acceptance/agent-framework.package-lock.json" package-lock.json && npm ci --no-audit --no-fund && npm run build
+      - name: Install the bridge plugin
+        working-directory: .hosts/mcpl-cc-bridge/plugins/mcpl-bridge
+        run: bun install --frozen-lockfile
+      - name: Acceptance against agent-framework
+        run: npm run acceptance:af
+        env:
+          ACCEPTANCE_REQUIRED: '1'
+          AGENT_FRAMEWORK: ${{ github.workspace }}/.hosts/agent-framework
+      - name: Acceptance against mcpl-cc-bridge
+        run: npm run acceptance:bridge
+        env:
+          ACCEPTANCE_REQUIRED: '1'
+          MCPL_BRIDGE: ${{ github.workspace }}/.hosts/mcpl-cc-bridge/plugins/mcpl-bridge/src
