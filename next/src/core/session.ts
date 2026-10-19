@@ -676,6 +676,7 @@ export class Session {
     this.readyTimer = this.capTimer = undefined;
     this.ready = true;
     this.readyResolve();
+    this.armTypeaheadGrace();
   }
 
   private settleNone(): void {
@@ -976,20 +977,25 @@ export class Session {
     // 4). The queue waits for the echo (then the line is being edited: G4 holds the shell
     // until it is submitted, cleared or stale) or for a short grace without it (the program
     // took the keys).
-    if (this.typeaheadWatch !== undefined) {
-      if (this.typeaheadTimer) clearTimeout(this.typeaheadTimer);
-      this.typeaheadTimer = setTimeout(() => {
-        this.typeaheadTimer = undefined;
-        this.typeaheadWatch = undefined;
-        this.idleEcho = '';
-        this.drainQueue();
-        this.notifyAvailable();
-      }, TYPEAHEAD_GRACE_MS);
-      this.typeaheadTimer.unref();
-      return;
-    }
+    // The grace starts at the prompt's end mark (B), after PS1 is expanded: readline shows the
+    // typed text only then, and a PS1 with a command substitution ate a grace that started here
+    // (the house's read of f6fe640). Until then the shell is `prompt-pending` (shellAvailable).
+    if (this.typeaheadWatch !== undefined) return;
     this.drainQueue();
     this.notifyAvailable();
+  }
+
+  /** Start the typed-ahead grace (see onPromptStart), once the prompt is fully printed: the B mark, or the 500 ms fallback for a PS1 that lost it. */
+  private armTypeaheadGrace(): void {
+    if (this.typeaheadWatch === undefined || this.typeaheadTimer) return;
+    this.typeaheadTimer = setTimeout(() => {
+      this.typeaheadTimer = undefined;
+      this.typeaheadWatch = undefined;
+      this.idleEcho = '';
+      this.drainQueue();
+      this.notifyAvailable();
+    }, TYPEAHEAD_GRACE_MS);
+    this.typeaheadTimer.unref();
   }
 
   private onPreExec(): void {
@@ -1387,8 +1393,9 @@ export class Session {
     if (this.pendingShellRun || (this.currentShellRun && !isTerminal(this.currentShellRun.state))) return { ok: false, reason: 'running' };
     // The last Run ended but the prompt that confirms the shell is back has not arrived.
     if (this.shellState === 'busy') return { ok: false, reason: 'prompt-pending' };
-    // The prompt is here, and keys typed during the last Run may be in its editor (see onPromptStart).
-    if (this.typeaheadWatch !== undefined && this.typeaheadTimer !== undefined) return { ok: false, reason: 'prompt-pending' };
+    // The prompt is here, and keys typed during the last Run may be in its editor (see onPromptStart): until
+    // the prompt's end mark and the grace after it, nothing says whether the editor shows them.
+    if (this.typeaheadWatch !== undefined) return { ok: false, reason: 'prompt-pending' };
     if (this.editingBlocks()) return { ok: false, reason: this.editingReason() };
     return { ok: true };
   }
