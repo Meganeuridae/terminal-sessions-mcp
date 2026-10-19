@@ -356,3 +356,23 @@ test('78c4d6e: searchLogs reports the holes it spanned and the lines it matched 
   const note = out.find((m) => m.note !== undefined)?.note;
   assert.ok(note && /missing/.test(note), `the hole is noted: ${JSON.stringify(out)}`);
 });
+
+test('6270946953: launch’s watch for error patterns is measured on the monotonic clock: a wall-clock jump neither ends it early nor stretches it', async (t) => {
+  const real = Date.now.bind(Date);
+  let lag = 0;
+  t.mock.method(Date, 'now', () => real() + lag);
+  try {
+    // The error line comes after the 2 s liveness window, so launch has answered `running` to itself and is polling when it appears.
+    const launching = call('launch', { name: 'mono', command: 'sleep 3; echo FATAL-77; sleep 30', errorPatterns: ['FATAL-77'] });
+    await until(() => summary('mono')?.services?.some((v) => v.status === 'running') === true, 8000, 'the service to be running (the poll has begun)');
+    // The wall clock jumps an hour ahead: a watch measured on it would be past its deadline at once and answer `running`.
+    lag = 3_600_000;
+    const r = await launching;
+    assert.equal(r.status, 'error', JSON.stringify(r));
+    assert.equal(r.service, 'unhealthy');
+    assert.match(String(r.evidence), /FATAL-77/);
+  } finally {
+    lag = 0;
+    await call('killSession', { session: 'mono', graceful: false });
+  }
+});

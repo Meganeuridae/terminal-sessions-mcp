@@ -8,6 +8,7 @@
  * result adds to it: runCommand carries `runId` and `state`, launch the
  * service's status and evidence, listSessions the session's state.
  */
+import { clocks } from '../core/clock.js';
 import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
 import { exitMark, probeMark } from '../core/plumbing.js';
@@ -333,10 +334,15 @@ async function tailLogLines(ctx: ToolContext, session: string, n: number, raw: b
 /** 1.x's launch statuses from a service's. */
 const launchStatus = (s: ServiceStatus | undefined): 'ready' | 'running' | 'error' => (s === 'ready' ? 'ready' : s === 'starting' || s === 'running' ? 'running' : 'error');
 
-/** The service's status from the session summary, looked at every 200 ms until it leaves `running`/`starting` or the deadline passes. */
+/**
+ * The service's status from the session summary, looked at every 200 ms until it leaves
+ * `running`/`starting` or the deadline passes. The deadline is on the monotonic clock, as the
+ * watches and the segmenter measure: a wall-clock step neither ends the watch at once nor stretches
+ * it (the house's correction 6270946953, #22). Date.now stays for the timestamps that are reported.
+ */
 async function pollService(ctx: ToolContext, session: string, runId: string, deadline: number): Promise<{ status: ServiceStatus; evidence?: string } | undefined> {
   let last: { status: ServiceStatus; evidence?: string } | undefined;
-  while (Date.now() < deadline) {
+  while (clocks.monotonic() < deadline) {
     await sleep(200);
     const svc = summaryOf(ctx, session)?.services?.find((v) => v.runId === runId);
     if (!svc) return last;
@@ -392,7 +398,8 @@ export const COMPAT_TOOLS: ToolDef[] = [
       const ready = anyOf(a.readyPatterns);
       const fail = anyOf(a.errorPatterns);
       const name = a.name as string;
-      const began = Date.now();
+      // Only ever compared with the monotonic deadline below, never with a wall-clock time.
+      const began = clocks.monotonic();
       // 1.x launched into a fresh session in `cwd`; into an existing one, change there first (atc-22). The command
       // goes in a group of its own, so a `&` or `;` in it cannot split it from the cd and run in the old directory;
       // the newline before the closing brace keeps a trailing `&` or comment from taking it (the house's read of 1cabc6a, #22).
