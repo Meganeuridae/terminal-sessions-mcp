@@ -124,12 +124,15 @@ test('jr-11/sec-6: SIGTERM drains — Runs end in the journal and no process gro
     const endOf = (runId: unknown) => events.find((e): e is Extract<JournalEvent, { type: 'run.end' }> => e.type === 'run.end' && e.runId === runId);
     const pe = endOf(proc.structuredContent.runId);
     const se = endOf(shell.structuredContent.runId);
-    assert.ok(pe && pe.reason !== 'daemon-restart', `process Run ended before exit: ${JSON.stringify(pe)}`);
-    assert.ok(se && se.reason !== 'daemon-restart', `shell Run ended before exit: ${JSON.stringify(se)}`);
-    // G20's wording: the drain's reason reaches Runs once the registry carries it (the journal workstream's plumbing).
-    if (SessionRegistry.prototype.closeAll.toString().includes('reason')) {
-      assert.equal(se.reason, 'daemon-shutdown', JSON.stringify(se));
-    }
+    // G20's wording: the drain's reason reaches every Run it ends, the process Run's too. (A guard on
+    // `closeAll`'s source text once kept this check from running: the house's read of 59f660b, #22.)
+    assert.ok(pe, 'the process Run ended before exit');
+    assert.ok(se, 'the shell Run ended before exit');
+    // The process Run was killed by the drain and its exit seen (`cancelled`); the shell Run went with its shell (`lost`).
+    assert.ok(pe.state === 'cancelled' || pe.state === 'lost', JSON.stringify(pe));
+    assert.equal(pe.reason, 'daemon-shutdown', JSON.stringify(pe));
+    assert.equal(se.state, 'lost', JSON.stringify(se));
+    assert.equal(se.reason, 'daemon-shutdown', JSON.stringify(se));
     await again.closeAll();
     ws.terminate();
   } finally {

@@ -269,9 +269,10 @@ test('tg-19: on loopback with nothing listening the shim starts termd (unless TS
     assert.ok(r.result, JSON.stringify(r));
     assert.match(s.err.join(''), /started termd/);
     const health = (await (await fetch(`http://127.0.0.1:${port}/health`)).json()) as { pid: number };
-    // Only ever signal the termd this shim started: its command line names our data dir.
+    // Only ever signal the termd this shim started: the one whose `listening` record is in the log the shim gave it, in our data dir.
     assert.ok(health.pid > 0 && health.pid !== process.pid && health.pid !== s.child.pid);
-    assert.ok(commandOf(health.pid).includes(dataDir), `the daemon on :${port} is not the one the shim started: ${commandOf(health.pid)}`);
+    assert.ok(spawnedPids(dataDir).includes(health.pid), `the daemon on :${port} is not the one the shim started: ${commandOf(health.pid)}; ours: ${spawnedPids(dataDir).join(' ')}`);
+    assert.match(commandOf(health.pid), /^termd --port \d+$/, 'the title says termd and the port, and nothing a flag value could carry');
     pid = health.pid;
     assert.ok(fs.existsSync(path.join(dataDir, 'termd.log')));
     s.end();
@@ -280,11 +281,7 @@ test('tg-19: on loopback with nothing listening the shim starts termd (unless TS
     s.child.kill();
     // Stop every termd this shim started — found by its unique data dir, never anything else —
     // even when the test failed before it learned the pid.
-    const ours = execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' })
-      .split('\n')
-      .filter((l) => l.includes(`--data-dir ${dataDir}`))
-      .map((l) => Number(l.trim().split(/\s+/)[0]));
-    for (const p of new Set([...ours, ...(pid ? [pid] : [])])) {
+    for (const p of new Set([...spawnedPids(dataDir), ...(pid ? [pid] : [])])) {
       try {
         process.kill(p, 'SIGTERM');
       } catch {
@@ -303,13 +300,34 @@ test('tg-19: on loopback with nothing listening the shim starts termd (unless TS
   }
 });
 
+/**
+ * The termd processes started with this data dir: each wrote its `listening` record, with its pid,
+ * into the log the shim gave it there. (The process title names only the port, so that a path with
+ * "node" in it never makes `pkill -f node` take the daemon: the house's read of 59f660b, #22.)
+ */
+function spawnedPids(dataDir: string): number[] {
+  let text = '';
+  try {
+    text = fs.readFileSync(path.join(dataDir, 'termd.log'), 'utf8');
+  } catch {
+    return [];
+  }
+  const pids = new Set<number>();
+  for (const line of text.split('\n')) {
+    if (!line.includes('"msg":"listening"')) continue;
+    try {
+      const pid = (JSON.parse(line) as { pid?: number }).pid;
+      if (pid && /^termd( |$)/.test(commandOf(pid))) pids.add(pid);
+    } catch {
+      // a torn line
+    }
+  }
+  return [...pids];
+}
+
 /** Stop every termd started with this data dir — found by its unique path, never anything else. */
 async function stopSpawned(dataDir: string): Promise<void> {
-  const ours = execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' })
-    .split('\n')
-    .filter((l) => l.includes(`--data-dir ${dataDir}`))
-    .map((l) => Number(l.trim().split(/\s+/)[0]));
-  for (const p of ours) {
+  for (const p of spawnedPids(dataDir)) {
     try {
       process.kill(p, 'SIGTERM');
     } catch {

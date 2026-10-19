@@ -8,10 +8,14 @@
  * a usage log for §16 Measure, and no client and no stray exception ends the
  * process — only a signal does, and then it drains: stop accepting, close
  * connections (terminating stragglers), close every session so its Runs end with
- * reason `daemon-shutdown`, and kill any process group a process Run left
- * behind, so no child outlives the daemon (G19c: without the keeper, live
- * processes do not survive a restart). A log stream whose reader went away
- * (EPIPE) is dropped, never retried in a loop (tsg-5).
+ * reason `daemon-shutdown`, and kill every process group a process Run started,
+ * so no process Run outlives the daemon (G19c: without the keeper, live
+ * processes do not survive a restart). A session's shell is hung up as a closing
+ * terminal hangs it up: its foreground job ends with it, and a job the shell
+ * detached on purpose (nohup, setsid, disown) lives on, as it would there. After
+ * a SIGKILL nothing here runs; the next start's recovery ends the process Runs'
+ * groups instead. A log stream whose reader went away (EPIPE) is dropped, never
+ * retried in a loop (tsg-5).
  *
  * Startup order keeps a second daemon from touching a live one's journals
  * (G10, G20; jr2-2, tsg-1): the port is held before the data dir is read, so a
@@ -96,7 +100,13 @@ let minLevel: LogLevel = 'info';
 let stderrGone = false;
 let logFile: RotatingFile | undefined;
 
-/** An append-only 0600 file that rotates to `.1` … `.N` past `maxBytes`, so a long-lived log stays bounded. */
+/**
+ * An append-only 0600 file that rotates to `.1` … `.N` past `maxBytes`, so a long-lived log stays
+ * bounded. A file that already exists is made 0600 too, and a torn last line (a crash mid-write) is
+ * ended before the first new record, so every record has a line of its own. A rotation that fails is
+ * said through `report` and the file is kept, growing, until the next attempt a cap later: a lost
+ * generation or a silent move elsewhere is worse than an oversized file (the house's read of 59f660b, #22).
+ */
 class RotatingFile {
   private fd: number | undefined;
   private bytes = 0;
@@ -105,33 +115,68 @@ class RotatingFile {
     readonly file: string,
     private readonly maxBytes: number,
     private readonly generations: number,
+    private readonly report: (msg: string, fields: Record<string, unknown>) => void,
   ) {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     this.open();
   }
 
   private open(): void {
-    this.fd = fs.openSync(this.file, 'a', 0o600);
-    this.bytes = fs.fstatSync(this.fd).size;
+    // 'a+': every write goes to the end, and the last byte can be read back.
+    const fd = fs.openSync(this.file, 'a+', 0o600);
+    this.fd = fd;
+    const st = fs.fstatSync(fd);
+    this.bytes = st.size;
+    if (st.mode & 0o077) {
+      try {
+        fs.fchmodSync(fd, 0o600);
+      } catch (e) {
+        this.report('log file is not owner-only and could not be made so', { file: this.file, error: errText(e) });
+      }
+    }
+    if (st.size > 0) {
+      const last = Buffer.alloc(1);
+      fs.readSync(fd, last, 0, 1, st.size - 1);
+      if (last[0] !== 0x0a) {
+        fs.writeSync(fd, '\n');
+        this.bytes++;
+      }
+    }
   }
 
-  /** Throws on a write error; the caller decides what that means. */
+  /** Throws on a write error (and when a rotation left nothing open); the caller decides what that means. */
   write(line: string): void {
     if (this.fd === undefined) return;
     fs.writeSync(this.fd, line);
     this.bytes += Buffer.byteLength(line);
-    if (this.bytes <= this.maxBytes) return;
-    fs.closeSync(this.fd);
-    this.fd = undefined;
-    for (let i = this.generations - 1; i >= 1; i--) {
-      try {
-        fs.renameSync(`${this.file}.${i}`, `${this.file}.${i + 1}`);
-      } catch {
-        // that generation does not exist yet
+    if (this.bytes > this.maxBytes) this.rotate();
+  }
+
+  /** Older generations shift up, the file becomes `.1`, and a fresh one is opened. */
+  private rotate(): void {
+    const fd = this.fd;
+    if (fd === undefined) return;
+    try {
+      for (let i = this.generations - 1; i >= 1; i--) {
+        try {
+          fs.renameSync(`${this.file}.${i}`, `${this.file}.${i + 1}`);
+        } catch (e) {
+          // That generation does not exist yet. Anything else (a directory in the way, a read-only
+          // directory) is given up before the file is renamed over `.1` and a generation lost.
+          if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+        }
       }
+      fs.renameSync(this.file, `${this.file}.1`);
+    } catch (e) {
+      // Said once per cap: the counter restarts, so the next attempt is a cap of bytes away. The
+      // report may log through this very file, which stays open.
+      this.bytes = 0;
+      this.report('log rotation failed; the file keeps growing until the next attempt', { file: this.file, error: errText(e), nextAttemptBytes: this.maxBytes });
+      return;
     }
-    fs.renameSync(this.file, `${this.file}.1`);
-    this.open();
+    fs.closeSync(fd);
+    this.fd = undefined;
+    this.open(); // a failure here is the caller's: the file is `.1` now and nothing is open
   }
 
   close(): void {
@@ -153,9 +198,12 @@ function write(rec: LogRecord): void {
     try {
       logFile.write(line);
       return;
-    } catch {
+    } catch (e) {
+      // Once: the file is given up and stderr takes over, starting with why (the house's read of 59f660b, #22).
+      const file = logFile.file;
       logFile.close();
-      logFile = undefined; // fall back to stderr, once
+      logFile = undefined;
+      log('warn', 'log file given up after a write error; logging to stderr', { file, error: errText(e) });
     }
   }
   if (stderrGone) return;
@@ -172,11 +220,8 @@ function log(level: LogLevel, msg: string, fields: Record<string, unknown> = {})
   write(rec);
 }
 
-/** A stream error from a log stream whose reader went away: not a daemon problem, and never logged through that stream. */
-const isDeadStream = (e: unknown): boolean => {
-  const code = (e as NodeJS.ErrnoException | undefined)?.code;
-  return code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED' || code === 'ERR_STREAM_WRITE_AFTER_END' || code === 'ECONNRESET';
-};
+/** An environment variable that is set to something: an empty one is unset, not a value (the house's read of 59f660b, #22). */
+const env = (name: string): string | undefined => process.env[name] || undefined;
 
 /** At most `limit` stray-exception lines a minute, and a line a minute saying how many more were dropped (tsg-5). */
 function boundedLogger(limit: number): (msg: string, e: unknown) => void {
@@ -329,7 +374,8 @@ const HELP = `termd — terminal sessions daemon
   --disk-floor-bytes <n> stop writing history to disk while the data dir's filesystem has less than n bytes
                          free (default 209715200, 200 MiB; 0: never): the recent part stays in memory and is
                          written once space returns; what the memory ring had to drop meanwhile reads as a gap
-  --usage-log <file>     usage records, one JSON line per tool call (default <data-dir>/usage.jsonl)
+  --usage-log <file>     usage records, one JSON line per tool call, except the GUI's successful read-only
+                         ones (default <data-dir>/usage.jsonl)
   --no-usage-log         do not record usage
   --log-file <file>      write logs to this file (0600, rotated by size) instead of stderr
   --log-level <level>    debug|info|warn|error (default info)
@@ -355,40 +401,46 @@ async function main(): Promise<void> {
     if (!stderrGone) process.stdout.write(HELP + '\n');
     return;
   }
+  // An empty value is a mistake, not a setting: `--port ''` would have meant port 0 (any), `--host ''`
+  // a bind on every address, `--data-dir ''` the working directory (the house's read of 59f660b, #22).
+  for (const [name, value] of Object.entries(f)) {
+    if (value === '' || (Array.isArray(value) && value.includes(''))) fail(`--${name} is empty: give it a value or leave it out (termd --help lists the flags)`);
+  }
   const level = f['log-level'] ?? 'info';
-  if (!(level in LEVELS)) fail(`--log-level must be one of ${Object.keys(LEVELS).join(', ')}`);
+  // Own keys only: `toString` is in every object (the house's read of 59f660b, #22).
+  if (!Object.hasOwn(LEVELS, level)) fail(`--log-level must be one of ${Object.keys(LEVELS).join(', ')}`);
   minLevel = level as LogLevel;
   if (f['log-file'] !== undefined) {
     try {
-      logFile = new RotatingFile(path.resolve(f['log-file']), 16 * 1024 * 1024, 2);
+      logFile = new RotatingFile(path.resolve(f['log-file']), 16 * 1024 * 1024, 2, (msg, fields) => log('warn', msg, fields));
     } catch (e) {
       fail(`cannot open --log-file ${f['log-file']}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
     }
   }
 
   // Nothing but a signal ends the daemon: a stray exception is logged (a bounded number of
-  // times), and the sessions live on. A dead log stream is not logged through itself.
+  // times), and the sessions live on. stderr's own failures never arrive here (its 'error'
+  // listener and write()'s catch take them), so an EPIPE or ECONNRESET thrown by anything else
+  // is a stray exception like any other, and no reason to stop logging (the house's read of 59f660b, #22).
   const stray = boundedLogger(50);
-  process.on('uncaughtException', (e) => {
-    if (isDeadStream(e)) {
-      stderrGone = true;
-      return;
-    }
-    stray('uncaught exception (daemon keeps serving)', e);
-  });
+  process.on('uncaughtException', (e) => stray('uncaught exception (daemon keeps serving)', e));
   process.on('unhandledRejection', (e) => stray('unhandled rejection (daemon keeps serving)', e));
 
   // Resolved here: the integration builds launcher paths from it, and the shell starts in the session's cwd (the house's read of 1d83ffa).
-  const dataDir = path.resolve(f['data-dir'] ?? process.env.TSM_DATA_DIR ?? path.join(os.homedir(), '.tsm'));
+  const dataDir = path.resolve(f['data-dir'] ?? env('TSM_DATA_DIR') ?? path.join(os.homedir(), '.tsm'));
   // The 1.x names are read where the 2.0 ones are not set, so a daemon command written for 1.x
   // (connectome-host's setup guide: `--host localhost --headless`, SESSION_SERVER_PORT in the
   // unit) starts termd and says what it took from where (the house's review of #11).
   if (f.headless) log('info', "--headless is a 1.x flag: termd has no separate GUI server (the GUI is served at the daemon's own address), so it changes nothing");
   const oneX = (name: string, newName: string) => log('info', `using ${name} (a 1.x setting); ${newName} is the 2.0 name`);
-  if (f.host === undefined && process.env.TSM_HOST === undefined && process.env.SESSION_SERVER_HOST !== undefined) oneX('SESSION_SERVER_HOST', 'TSM_HOST');
-  if (f.port === undefined && process.env.TSM_PORT === undefined && process.env.SESSION_SERVER_PORT !== undefined) oneX('SESSION_SERVER_PORT', 'TSM_PORT');
-  let host = f.host ?? process.env.TSM_HOST ?? process.env.SESSION_SERVER_HOST ?? '127.0.0.1';
-  const port = Number(f.port ?? process.env.TSM_PORT ?? process.env.SESSION_SERVER_PORT ?? '3101');
+  if (f.host === undefined && env('TSM_HOST') === undefined && env('SESSION_SERVER_HOST') !== undefined) oneX('SESSION_SERVER_HOST', 'TSM_HOST');
+  if (f.port === undefined && env('TSM_PORT') === undefined && env('SESSION_SERVER_PORT') !== undefined) oneX('SESSION_SERVER_PORT', 'TSM_PORT');
+  let host = (f.host ?? env('TSM_HOST') ?? env('SESSION_SERVER_HOST') ?? '127.0.0.1').trim();
+  // `[::1]` is a URL's spelling of an IPv6 address; the bind wants it bare (the house's read of 59f660b, #22).
+  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+  if (!host) fail('--host must be an address');
+  const portSetting = (f.port ?? env('TSM_PORT') ?? env('SESSION_SERVER_PORT') ?? '3101').trim();
+  const port = /^\d+$/.test(portSetting) ? Number(portSetting) : NaN;
   if (host.toLowerCase() === 'localhost') {
     // One address is bound, and a name resolves to one of two: on a host where localhost is
     // ::1 first, a daemon told `localhost` bound only [::1], and a client dialing 127.0.0.1 (the
@@ -396,7 +448,7 @@ async function main(): Promise<void> {
     log('info', '--host localhost binds 127.0.0.1 (the address the shipped configs dial); give --host ::1 for the IPv6 loopback');
     host = '127.0.0.1';
   }
-  if (!Number.isInteger(port) || port < 0 || port > 65535) fail('--port must be an integer from 0 to 65535');
+  if (!Number.isInteger(port) || port > 65535) fail('--port must be an integer from 0 to 65535');
   const profile = (f.profile ?? 'core') as Profile;
   if (!PROFILES.includes(profile)) fail(`--profile must be one of ${PROFILES.join(', ')}`);
   const resultText = f['result-text'] ?? 'json';
@@ -417,18 +469,21 @@ async function main(): Promise<void> {
     }
   }
   const tokenOnArgv = f.token !== undefined;
-  if (f.token === undefined && process.env.TSM_TOKEN === undefined && process.env.SESSION_SERVER_TOKEN !== undefined) oneX('SESSION_SERVER_TOKEN', 'TSM_TOKEN');
-  const shared = f.token ?? process.env.TSM_TOKEN ?? process.env.SESSION_SERVER_TOKEN;
-  // tsg-20: argv is world-readable (ps). With a token on it, say so, and take the token out of
-  // our own process title where the OS allows. The title is `termd …` in every case: a cleanup
-  // such as `pkill -f node` run from a session would otherwise take the daemon, and every
-  // principal's sessions with it (the house's review of #11).
+  if (f.token === undefined && env('TSM_TOKEN') === undefined && env('SESSION_SERVER_TOKEN') !== undefined) oneX('SESSION_SERVER_TOKEN', 'TSM_TOKEN');
+  const shared = f.token ?? env('TSM_TOKEN') ?? env('SESSION_SERVER_TOKEN');
+  // tsg-20: argv is world-readable (ps). With a token on it, say so. The process title is `termd`
+  // and the port, and nothing a flag value could carry: a cleanup such as `pkill -f node` run from
+  // a session would otherwise take a daemon whose data dir or host has "node" in its name, and
+  // every principal's sessions with it (the house's review of #11; its read of 59f660b, #22).
   if (tokenOnArgv) log('warn', '--token on the command line is visible to every local user (ps); prefer TSM_TOKEN or --tokens-file');
-  try {
-    process.title = ['termd', ...argv.map((a, i) => (argv[i - 1] === '--token' ? '[redacted]' : a.startsWith('--token=') ? '--token=[redacted]' : a))].join(' ');
-  } catch {
-    // not settable here
-  }
+  const title = (p: number) => {
+    try {
+      process.title = p ? `termd --port ${p}` : 'termd';
+    } catch {
+      // not settable here
+    }
+  };
+  title(port);
   // G26: the daemon's credential is not part of any session's environment. Sessions and process
   // Runs inherit the daemon's env (G7's configured basis), so it leaves here, before any spawn:
   // otherwise every shell could `echo $TSM_TOKEN` and session_env_capture would journal it (jr-6).
@@ -469,7 +524,7 @@ async function main(): Promise<void> {
   // build before the daemon, whose death loses every session. The preference counts against
   // every process on the machine, so a shared host may want less, or 0.
   // An empty TSM_SESSION_OOM_SCORE_ADJ is unset (the default), not 0; an empty flag value is an error like any other.
-  const oomSetting = f['session-oom-score-adj'] ?? (process.env.TSM_SESSION_OOM_SCORE_ADJ || undefined) ?? '200';
+  const oomSetting = f['session-oom-score-adj'] ?? env('TSM_SESSION_OOM_SCORE_ADJ') ?? '200';
   const oomAdj = /^\d+$/.test(oomSetting.trim()) ? Number(oomSetting) : NaN;
   if (!Number.isInteger(oomAdj) || oomAdj < 0 || oomAdj > 1000) fail('--session-oom-score-adj must be an integer from 0 to 1000');
   registryOpts.sessionOomScoreAdj = oomAdj;
@@ -490,7 +545,7 @@ async function main(): Promise<void> {
   if (rb !== undefined || ra !== undefined) registryOpts.retention = retention;
   // A cap bounds one session; the floor bounds the machine (the house's review of #11, shell tools
   // 4). Below it, journals keep their ring and leave the disk alone until space returns.
-  const floorSetting = f['disk-floor-bytes'] ?? (process.env.TSM_DISK_FLOOR_BYTES || undefined) ?? String(200 * 1024 * 1024);
+  const floorSetting = f['disk-floor-bytes'] ?? env('TSM_DISK_FLOOR_BYTES') ?? String(200 * 1024 * 1024);
   const floor = /^\d+$/.test(floorSetting.trim()) ? Number(floorSetting) : NaN;
   if (!Number.isInteger(floor) || floor < 0) fail('--disk-floor-bytes must be a whole number of bytes (0 turns the floor off)');
   if (floor > 0) registryOpts.diskFloorBytes = floor;
@@ -541,20 +596,23 @@ async function main(): Promise<void> {
     if (c.type === 'created') {
       watch(c.id);
       log('info', 'session created', { session: c.id });
-    } else {
-      watched.get(c.id)?.();
-      watched.delete(c.id);
-      log('info', 'session removed', { session: c.id });
+      return;
     }
+    watched.get(c.id)?.();
+    watched.delete(c.id);
+    // `closed`: the shell ended and the history stays listed (`closed: true`); `removed`: the entry
+    // and its files are gone. Two events, two lines (the house's read of 59f660b, #22).
+    log('info', c.type === 'closed' ? 'session closed' : 'session removed', { session: c.id });
   });
 
-  // §16 Measure: one JSON line per tools/call, owner-only, rotated by size keeping USAGE_GENERATIONS
-  // old files (16 MiB each) so a week of traces fits. A write error disables it; it never breaks a call.
+  // §16 Measure: one JSON line per tools/call (the GUI's successful read-only calls excepted:
+  // transport/server.ts), owner-only, rotated by size keeping USAGE_GENERATIONS old files (16 MiB
+  // each) so a week of traces fits. A write error disables it; it never breaks a call.
   let usage: RotatingFile | undefined;
   if (!f['no-usage-log']) {
-    const file = f['usage-log'] ?? path.join(dataDir, 'usage.jsonl');
+    const file = path.resolve(f['usage-log'] ?? path.join(dataDir, 'usage.jsonl'));
     try {
-      usage = new RotatingFile(file, 16 * 1024 * 1024, USAGE_GENERATIONS);
+      usage = new RotatingFile(file, 16 * 1024 * 1024, USAGE_GENERATIONS, (msg, fields) => log('warn', msg, fields));
     } catch (e) {
       log('warn', 'usage log unavailable', { file, error: (e as Error).message });
     }
@@ -595,6 +653,7 @@ async function main(): Promise<void> {
   } catch (e) {
     fail(`cannot listen on ${host}:${port}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
   }
+  title(bound.port); // port 0: the one the kernel gave
   let stopping = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (stopping) {
@@ -620,7 +679,8 @@ async function main(): Promise<void> {
     process.exit(0);
   };
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(sig, () => void shutdown(sig));
-  // Last resort on any exit path: no process group the daemon owns survives it.
+  // Last resort on every exit path the process still runs through: no process Run's group survives
+  // it. (A SIGKILL runs nothing; the next start's recovery ends those groups.)
   process.on('exit', () => groups.signalAll('SIGKILL'));
 
   // Supervisors may stop us as soon as readiness is visible. Install the drain
