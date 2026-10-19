@@ -9,7 +9,7 @@
  */
 import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
-import { cutTail, utf8Length } from '../core/text.js';
+import { countLines, cutTail, utf8Length } from '../core/text.js';
 import { project, type ProjectChunk } from '../core/transcript.js';
 import type { JournalEvent, Seq, ServiceStatus } from '../core/types.js';
 import type { App, SessionSummary } from './app.js';
@@ -96,17 +96,13 @@ function withoutPlumbing(line: string): string | null {
   return kept.trim().length ? kept.trimEnd() : null;
 }
 
-const cleanLines = (lines: string[]): string[] =>
+/** Log lines with the plumbing removed; a line that held nothing else is dropped. */
+const withoutPlumbingLines = (lines: string[]): string[] =>
   lines.flatMap((l) => {
     const k = withoutPlumbing(l);
     return k === null ? [] : [k];
   });
 
-const count = (s: string): number => {
-  let c = 0;
-  for (let i = s.indexOf('\n'); i !== -1; i = s.indexOf('\n', i + 1)) c++;
-  return c;
-};
 
 /** The most output the compat tail reads back for its lines: the last 1 MiB. */
 const TAIL_BYTES = 1024 * 1024;
@@ -131,7 +127,7 @@ async function tailEvents(ctx: ToolContext, session: string, n: number, rows: nu
     pages.push(ev);
     for (const e of ev) {
       if (e.type !== 'output') continue;
-      lineEnds += count(e.data);
+      lineEnds += countLines(e.data);
       bytes += utf8Length(e.data);
     }
     const first = ev[0]!.seq;
@@ -160,7 +156,7 @@ async function tailLines(ctx: ToolContext, session: string, n: number, raw: bool
       if (e.type === 'output') text += e.data;
       else if (e.type === 'run.start' && e.line !== undefined) text += `${text === '' || text.endsWith('\n') ? '' : '\n'}$ ${e.line}\n`;
     }
-    return res(cleanLines(text.split(/\r?\n/)));
+    return res(withoutPlumbingLines(text.split(/\r?\n/)));
   }
   const chunks: ProjectChunk[] = [];
   for (const e of events) {
@@ -169,7 +165,7 @@ async function tailLines(ctx: ToolContext, session: string, n: number, raw: bool
   }
   // Lines the plumbing filter removes (about one per Run) come out of the slack above n.
   const p = await project(chunks, { cols, rows, keep: 'tail', maxLines: Math.min(2 * n + 50, 20_000), maxInputBytes: TAIL_BYTES });
-  return res(cleanLines(p.text === '' ? [] : p.text.split('\n')));
+  return res(withoutPlumbingLines(p.text === '' ? [] : p.text.split('\n')));
 }
 
 /** 1.x's launch statuses from a service's. */
@@ -478,7 +474,7 @@ export const COMPAT_TOOLS: ToolDef[] = [
         // the line is kept when what remains of it still matches.
         const line = withoutPlumbing(m.line);
         if (line === null || (line !== m.line && !re.test(line))) continue;
-        out.push({ lineNumber: m.lineNumber, line, context: cleanLines([...m.before, m.line, ...m.after]), seq: m.seq });
+        out.push({ lineNumber: m.lineNumber, line, context: withoutPlumbingLines([...m.before, m.line, ...m.after]), seq: m.seq });
       }
       const notes: string[] = [];
       if (r.bounded) notes.push(`older output was not searched (the search covers the last 50,000 journal events); read {"session": "${session}", "tail": 200, "until": ${r.scanned[0] - 1}} shows what came before`);

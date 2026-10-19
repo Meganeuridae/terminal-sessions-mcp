@@ -367,7 +367,7 @@ const HELP = `termd — terminal sessions daemon
   --allow-host <name>    a Host name clients may use besides localhost/127.0.0.1/[::1]
                          (repeatable or comma-separated; required for non-loopback binds)
   --shell <path>         default shell (default $SHELL)
-  --profile core|full    tool profile for plain MCP hosts (default core; compat where the 1.x names exist)
+  --profile core|full|compat  tool profile for plain MCP hosts (default core; compat serves the 1.x tool names)
   --result-text json|transcript   default result text rendering (default json)
   --retention-bytes <n>  cap each session's history on disk at n bytes (default: no cap)
   --retention-days <n>   delete history older than n days (default: never)

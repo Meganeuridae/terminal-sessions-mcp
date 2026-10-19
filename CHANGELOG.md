@@ -45,7 +45,7 @@ while `termd` listens on 3101. Making 2.0 the default — the 1.x names pointing
 
 ### Changed
 
-- Node 20 or later (`engines`): 2.0 needs it, and Node 18 reached its end of life.
+- Node 20.19 or later (`engines`): the earliest Node 20 that loads this package's dependencies (`strip-ansi` ships only as an ES module, which `require` loads from 20.19; `@animalabs/mcpl-core` asks for 20), and Node 18 reached its end of life.
 - `npm run build` compiles both trees; `npm test` runs 1.x's suite and `npm run test:next` 2.0's.
 - The `@xterm` packages and `ws` are pinned at the versions 2.0 uses (`@xterm/xterm` 6.0.0,
   `@xterm/addon-fit` 0.11.0, `@xterm/addon-web-links` 0.12.0, `ws` 8.21.3); the 1.x GUI loads

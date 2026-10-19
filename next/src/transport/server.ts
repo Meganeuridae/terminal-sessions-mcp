@@ -44,6 +44,7 @@
  * session, runId, …); client strings only ever appear JSON-encoded and
  * length-limited, and tokens never appear at all (G26).
  */
+import { isSessionId } from '../api/registry.js';
 import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
 import type { AddressInfo, Server as NetServer, Socket } from 'node:net';
@@ -122,7 +123,7 @@ interface AttachWait {
   waiting: number;
 }
 
-type ConnKind = 'pending' | 'mcp' | 'mcpl' | 'native' | 'gui';
+type ConnKind = 'pending' | 'mcp' | 'mcpl' | 'native' | 'gui' | 'cli';
 
 interface Conn {
   /** Server-generated, unique: the identity attachments are keyed by. */
@@ -140,8 +141,7 @@ interface Conn {
   initialized: boolean;
   /** A same-origin browser: the GUI. */
   gui: boolean;
-  /** The tsm CLI (`?client=cli`): with the GUI, the native family — not an agent surface — in usage records (the house's read of 4e37a11, #22). */
-  cli: boolean;
+  /** What this connection is: pending until initialize, then an MCP or MCPL host, the GUI, the tsm CLI (`?client=cli`), or a native client. The GUI and the CLI are the native family in usage records, not agent surfaces (the house's read of 4e37a11, #22). */
   kind: ConnKind;
   followers: Map<string, Follower>;
   /**
@@ -250,11 +250,9 @@ function plain(res: ServerResponse, status: number, text: string, extra: Record<
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-/** Session names are at most 64 characters (the registry's rule), so nothing keyed by one grows with what a client sends. */
-const MAX_SESSION_NAME = 64;
-
+/** A session name as the registry admits one, checked here too so nothing keyed by a name grows with what a client sends. */
 function sessionParam(p: Record<string, unknown>): string {
-  if (typeof p.session !== 'string' || p.session === '' || p.session.length > MAX_SESSION_NAME) throw new RpcError(INVALID_PARAMS, `session must be a string of 1 to ${MAX_SESSION_NAME} characters`);
+  if (typeof p.session !== 'string' || !isSessionId(p.session)) throw new RpcError(INVALID_PARAMS, 'session must be 1 to 64 characters of letters, digits, dot, underscore or dash, starting with a letter or digit');
   return p.session;
 }
 
@@ -333,7 +331,7 @@ export class TermServer {
           } else if (f) {
             // Removed: its journal is gone, and the subscriber is told so.
             this.unfollow(conn, c.id);
-            conn.out.notify('terminal/closed', { session: c.id, reason: `session-${c.type}` });
+            conn.out.notify('terminal/closed', { session: c.id, reason: 'session-removed' });
           }
           if (!conn.lane) continue;
           if (c.type === 'created') {
@@ -478,7 +476,7 @@ export class TermServer {
       ts: Date.now(),
       principal: clipField(conn.caller.principal, 256),
       connection: conn.label ?? conn.id,
-      host: conn.lane ? 'mcpl' : conn.gui || conn.cli || conn.kind === 'native' ? 'native' : 'mcp',
+      host: conn.lane ? 'mcpl' : conn.kind === 'mcp' || conn.kind === 'pending' ? 'mcp' : 'native',
       profile: conn.profile,
       tool: known ? tool : '(unknown)',
       ok: !r.isError,
@@ -580,7 +578,7 @@ export class TermServer {
     } else viewer = this.opts.resolver.resolve(undefined);
     const app = this.opts.app;
     const all = app.registry.list();
-    const byKind: Record<ConnKind, number> = { pending: 0, mcp: 0, mcpl: 0, native: 0, gui: 0 };
+    const byKind: Record<ConnKind, number> = { pending: 0, mcp: 0, mcpl: 0, native: 0, gui: 0, cli: 0 };
     for (const c of this.conns) byKind[c.kind]++;
     const recoveryErrors = app.registry.recoveryErrors;
     const body: Record<string, unknown> = {
@@ -699,8 +697,7 @@ export class TermServer {
       resultText: textQ === 'json' || textQ === 'transcript' ? textQ : (this.opts.resultText ?? 'json'),
       initialized: false,
       gui,
-      cli: q.get('client') === 'cli',
-      kind: gui ? 'gui' : 'pending',
+      kind: gui ? 'gui' : q.get('client') === 'cli' ? 'cli' : 'pending',
       followers: new Map(),
       attaching: new Map(),
       inFlight: 0,
@@ -868,9 +865,10 @@ export class TermServer {
     }
     // §12: work in flight per connection is bounded, notifications included. A request is in
     // flight until its reply reached the socket, not merely until it was queued: a client that
-    // stops reading is refused once `limit` replies wait for it, instead of the queue growing
-    // with every request it keeps sending (the house's read of 2f357bd, #22). The refusal says
-    // the request did not run, so sending it again is safe.
+    // stops reading is refused once `limit` replies wait for it, so what waits for it is `limit`
+    // replies plus one short refusal per request it keeps sending, instead of every reply (the
+    // house's read of 2f357bd, #22). The refusal says the request did not run, so sending it again
+    // is safe.
     const limit = this.opts.maxInFlight ?? 128;
     if (conn.inFlight >= limit) {
       if (isCall) this.reply(conn, id, { code: OVERLOADED, message: 'too many requests in flight on this connection; this one was not run: send it again once earlier ones have answered', data: { limit, executed: false } });
@@ -938,7 +936,7 @@ export class TermServer {
         if (conn.lane) conn.lane.dispose();
         conn.lane = wantsMcpl ? new McplLane(app, conn.caller, conn.out, (line, level = 'info') => this.emit(level, line, this.connFields(conn))) : null;
         conn.initialized = true;
-        conn.kind = conn.lane ? 'mcpl' : conn.gui ? 'gui' : 'mcp';
+        conn.kind = conn.lane ? 'mcpl' : conn.kind === 'gui' || conn.kind === 'cli' ? conn.kind : 'mcp';
         // Where this connection's tools come from (§11): the profile only for a
         // plain MCP host; an MCPL host's grant decides its tools and deliveries.
         if (conn.lane) {
@@ -981,7 +979,7 @@ export class TermServer {
         const t0 = Date.now();
         // A tool's advice about notifications holds only when this connection's grant delivers them for the
         // session it names; being an MCPL host is not enough (the house's read of 2f357bd, #22).
-        const notifications = conn.lane !== null && conn.lane.deliversTo(typeof args.session === 'string' ? args.session : '');
+        const notifications = conn.lane !== null && conn.lane.carries(typeof args.session === 'string' ? args.session : '');
         const r = await callTool(name, args, { app, caller: conn.caller, resultText: conn.resultText, notifications }, this.availableTools(conn));
         this.afterToolCall(conn, name, args, r, Date.now() - t0);
         if (r.onSent) onSent(r.onSent);

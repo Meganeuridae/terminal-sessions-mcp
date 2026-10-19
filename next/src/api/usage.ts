@@ -80,8 +80,8 @@ const SIGNATURES = {
   'busy-retry': 'run retried within 5 s of returning `busy`',
 } as const;
 
-/** Result states that mean the Run had not ended when the call returned. */
-const UNFINISHED: ReadonlySet<string> = new Set(['running', 'starting', 'queued']);
+/** Result states that mean the Run had not ended when the call returned (the CLI exits 124 on them). */
+export const UNFINISHED: ReadonlySet<string> = new Set(['running', 'starting', 'queued']);
 const RUN_TOOLS: ReadonlySet<string> = new Set(['run', 'runCommand', 'start', 'launch', 'await']);
 const READ_TOOLS: ReadonlySet<string> = new Set(['read', 'tailLogs']);
 const CANCEL_TOOLS: ReadonlySet<string> = new Set(['cancel', 'signal', 'sendSignal']);

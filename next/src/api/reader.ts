@@ -57,7 +57,7 @@ import { compileUserRegex } from '../core/regex.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
 import { persistentState } from '../core/screen.js';
-import { cutTail, headIndex, indexAtByte, safeCut, sequenceEnd, unfinishedSequence, utf8Length } from '../core/text.js';
+import { countLines, cutTail, headIndex, indexAtByte, safeCut, sequenceEnd, unfinishedSequence, utf8Length } from '../core/text.js';
 import { project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
 import type { JournalEvent, RunInfo, Seq } from '../core/types.js';
 
@@ -809,7 +809,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     let ro: RunOutput;
     for (;;) {
       ro = src.runOutput(o.runId, rangeOf(o.since, o.until, { maxBytes: want }));
-      const lineEnds = ro.events.reduce((a, e) => a + (isOutput(e) ? count(e.data) : 0), 0);
+      const lineEnds = ro.events.reduce((a, e) => a + (isOutput(e) ? countLines(e.data) : 0), 0);
       if (lineEnds >= need || !ro.truncated || want >= cap) break;
       want = Math.min(cap, want * 4);
     }
@@ -844,7 +844,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       examined += batch.length;
       for (const e of batch) {
         if (!isOutput(e)) continue;
-        lineEnds += count(e.data);
+        lineEnds += countLines(e.data);
         bytes += e.data.length;
       }
       cursor = batch[0]!.seq - 1;
@@ -909,12 +909,6 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const truncated = cutByBytes || (kept.length < n && older) || headCut;
   return withGapInfo<Omit<ReadResult, 'session'>>({ text, seq: [firstEventOf(outs, kept.length) ?? end, end], nextCursor: end, more: false, truncated, lines: { requested: n, returned: kept.length } }, gaps);
 }
-
-const count = (s: string): number => {
-  let c = 0;
-  for (let i = s.indexOf('\n'); i !== -1; i = s.indexOf('\n', i + 1)) c++;
-  return c;
-};
 
 /** UTF-8 bytes from the end of the output back to where its last `n` lines begin (by raw line ends); all of it when it holds no more lines. */
 function lastLinesBytes(outs: Output[], n: number): number {

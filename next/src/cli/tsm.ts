@@ -28,13 +28,15 @@
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
-import { analyze, readUsage } from '../api/usage.js';
+import { analyze, readUsage, UNFINISHED } from '../api/usage.js';
+
+/** A result state the usage module calls unfinished (running, starting, queued). */
+const isUnfinished = (state: unknown): boolean => typeof state === 'string' && UNFINISHED.has(state);
 
 /** Not finished (running, starting, queued): the wait ran out, like timeout(1). */
 const EXIT_UNFINISHED = 124;
 /** Busy: the shell is occupied by another Run or a person's line; try again (sysexits EX_TEMPFAIL). */
 const EXIT_BUSY = 75;
-const UNFINISHED: ReadonlySet<unknown> = new Set(['running', 'starting', 'queued']);
 
 const USAGE = `tsm <command> [args] [--key value ...] [--json]
   sessions                              list sessions
@@ -122,11 +124,10 @@ function parseJson(key: string, v: string): unknown {
 }
 
 /**
- * A flag's value, typed as the tool's parameter is. The schema decides, not the value's look:
- * `--pattern 404`, `--text 012345` and `--command true` were turned into a number and a boolean
- * and refused as "must be a string" (the house's read of 4e37a11, #22). Without a schema (a tool
- * the daemon did not list) the look decides, except for the keys that are always text. A value
- * its type cannot take stays a string, so the daemon's validation names the problem.
+ * A flag's value, typed as the tool's parameter is: the schema decides, not the value's look, so
+ * `--pattern 404` and `--command true` stay strings (the house's read of 4e37a11, #22). Without a
+ * schema (a tool the daemon did not list) the look decides, except for the keys that are always
+ * text. A value its type cannot take stays a string, so the daemon's validation names the problem.
  */
 function coerce(key: string, raw: string, type: ParamType | undefined): unknown {
   const duration = isDurationKey(key) ? parseDuration(raw) : undefined;
@@ -251,7 +252,7 @@ function exitCode(tool: string, structured: Record<string, unknown>): number {
       // Neither a code nor a signal: the status is unknown, which is never success.
       return signo !== undefined ? 128 + signo : 1;
     }
-    if (UNFINISHED.has(state)) return EXIT_UNFINISHED;
+    if (isUnfinished(state)) return EXIT_UNFINISHED;
     if (state === 'busy') return EXIT_BUSY;
     return 1;
   }
@@ -348,12 +349,15 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   if (!cmd || cmd === '--help' || cmd === '-h') return end(0, USAGE);
-  if (cmd === 'gui') return end(0, argv.includes('--json') ? JSON.stringify({ url: guiUrl() }, null, 2) : guiUrl());
+  if (cmd === 'gui') return end(0, parse(argv, undefined).json ? JSON.stringify({ url: guiUrl() }, null, 2) : guiUrl());
   if (cmd === 'usage') return usageReport(argv.slice(1));
+  // The syntax is checked before any daemon is asked: a stray word or a flag without its value is a
+  // usage error whether or not termd runs, and `--json` means tsm's own flag only before `--`.
+  const syntax = parse(argv, undefined);
   const url = new URL(process.env.TSM_URL ?? 'ws://127.0.0.1:3101');
   if (process.env.TSM_TOKEN) url.searchParams.set('token', process.env.TSM_TOKEN);
   url.searchParams.set('profile', 'full');
-  url.searchParams.set('resultText', argv.includes('--json') ? 'json' : 'transcript');
+  url.searchParams.set('resultText', syntax.json ? 'json' : 'transcript');
   url.searchParams.set('connection', `tsm-${process.pid}`);
   // The CLI is the native family, with the GUI: its calls are not an agent's in `tsm usage` (the house's read of 4e37a11, #22).
   url.searchParams.set('client', 'cli');
@@ -399,11 +403,12 @@ async function main(): Promise<void> {
   // lists nothing leaves the values to their look.
   const toolName = SHORT[cmd]?.tool ?? cmd;
   const listed = (await request('tools/list').catch(() => undefined)) as { tools?: Array<{ name: string; inputSchema?: Schema }> } | undefined;
-  const { tool, args, json, untilDone } = parse(argv, listed?.tools?.find((t) => t.name === toolName)?.inputSchema);
+  const { json, untilDone } = syntax;
+  const { tool, args } = parse(argv, listed?.tools?.find((t) => t.name === toolName)?.inputSchema);
   let r = (await request('tools/call', { name: tool, arguments: args })) as { content: Array<{ text: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
   // --until-done: after the initial observation, long-poll until the Run ends. A short
   // initial wait (including zero) must not turn this into a busy polling loop.
-  const unfinished = (x: typeof r) => !x.isError && UNFINISHED.has(x.structuredContent?.state);
+  const unfinished = (x: typeof r) => !x.isError && isUnfinished(x.structuredContent?.state);
   while (untilDone && (tool === 'run' || tool === 'await') && unfinished(r) && typeof r.structuredContent?.runId === 'string') {
     const again: Record<string, unknown> = { runId: r.structuredContent.runId, wait: 55_000 };
     if (typeof r.structuredContent.session === 'string') again.session = r.structuredContent.session;

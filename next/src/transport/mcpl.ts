@@ -241,10 +241,8 @@ const noteBudgets = new WeakMap<object, NoteBudget>();
 
 /**
  * The lanes of one App, by principal. A principal's `delivered` cursor is one across its
- * connections, so no lane moves it past what another lane of the same principal still owes:
- * a completion owed only through the channel one connection had open was lost when a second
- * connection, channel closed, settled it as none of its business and the first one's retry
- * then found the cursor already past it (the house's read of 2f357bd, #22).
+ * connections, so no lane moves it past what another lane of the same principal still owes
+ * (the house's read of 2f357bd, #22).
  */
 const lanesByApp = new WeakMap<App, Map<Principal, Set<McplLane>>>();
 
@@ -401,9 +399,7 @@ export class McplLane {
    * The connection can carry this session's lifecycle messages now (its channel opened): what is
    * owed since the principal's `delivered` cursor is caught up, as a grant that widens does — a
    * retry stranded when its timer found nothing to carry it on, and messages this connection
-   * never saw. Resuming only this lane's own retries lost a completion to a channels-only host
-   * that reconnected and opened the channel after its grant: the grant's catch-up had nothing to
-   * carry it on, and the open started none (the house's read of 2f357bd, #22).
+   * never saw (the house's read of 2f357bd, #22).
    */
   private carryNow(t: Target): void {
     if (this.disposed || !this.carries(t.id)) return;
@@ -452,11 +448,7 @@ export class McplLane {
 
   // ───────────── channels ─────────────
 
-  /**
-   * A session's channel descriptor, read from the session itself: a listing of every session
-   * through `sessionList`, which summarises services, watches and Runs, made the channel list
-   * quadratic in sessions (the house's read of 2f357bd, #22).
-   */
+  /** A session's channel descriptor, read from the session itself, so listing the channels costs one look per session (the house's read of 2f357bd, #22). */
   private descriptorFor(entry: AnySession): ChannelDescriptor {
     const sessionId = entry.kind === 'live' ? entry.session.id : entry.id;
     // `speech: 'none'` asks hosts not to route an agent's ordinary replies here (UPSTREAM-CHANGES A6).
@@ -842,15 +834,11 @@ export class McplLane {
     return f;
   }
 
-  /** Can this connection deliver the session's lifecycle messages: push events, or its channel open? */
-  private carries(sessionId: string): boolean {
+  /** Can this connection deliver the session's lifecycle messages: push events, or its channel open? The endpoint asks before a tool promises notifications about the session (the house's read of 2f357bd, #22). */
+  carries(sessionId: string): boolean {
     return this.enabled('terminal.live', 'pushEvents') || (this.open.has(channelId(sessionId)) && this.enabled('terminal.channels', 'channels.incoming'));
   }
 
-  /** `carries`, for the endpoint: whether a tool may promise this connection notifications about `sessionId` (the house's read of 2f357bd, #22). */
-  deliversTo(sessionId: string): boolean {
-    return this.carries(sessionId);
-  }
 
   /** A closed life's owed entries whose message will never come (its segmenter has drained) stop pinning the cursor (mcpl-7). */
   private releaseUnsettled(t: Target, upTo: Seq): void {

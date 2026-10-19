@@ -344,8 +344,7 @@
     const text = typedAhead;
     typedAhead = '';
     if (!text) return;
-    // The session it was typed into, not the one selected now: a paste followed at once by a click on
-    // another session went to that session, and took its free seat (the house's read of 2f357bd, #22).
+    // The session it was typed into, not the one selected now (the house's read of 2f357bd, #22).
     const args = { session: typedFor, text };
     if (typedSecret) args.sensitive = true;
     tool('input', args).catch((e) =>
@@ -535,6 +534,7 @@
       lastReattach = 0;
       reattach(); // the history view: transcript and Runs
     } else if (reason === 'session-removed') notice('This session was removed.');
+    else if (reason === 'forbidden') notice('You may no longer observe this session: it was reopened private.');
     else notice('The live stream ended; click the session to reattach.');
     refreshSessions();
   });

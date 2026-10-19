@@ -10,6 +10,7 @@
  * would not have looked into — so nothing inherited from Object.prototype can
  * pass as a declared parameter.
  */
+import { own } from '../core/keys.js';
 import { distance } from '../core/keys.js';
 
 export interface Schema {
@@ -35,7 +36,6 @@ export class ValidationError extends Error {
 /** Keys that name Object.prototype machinery; never a parameter, anywhere. */
 const RESERVED_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
-const own = <T>(o: Record<string, T> | undefined, key: string): T | undefined => (o !== undefined && Object.hasOwn(o, key) ? o[key] : undefined);
 
 /**
  * Why `key` is not a parameter: the declared names within a small edit distance (`wiat` →
