@@ -22,6 +22,7 @@ import type { App, Caller } from '../api/app.js';
 import { presence } from '../api/presence.js';
 import type { AnySession, HistorySession } from '../api/registry.js';
 import { CORE_TOOLS, TOOLS, type Tier } from '../api/tools.js';
+import { clocks } from '../core/clock.js';
 import { TermError } from '../core/errors.js';
 import type { Journal } from '../core/journal.js';
 import {
@@ -226,7 +227,7 @@ interface LaneState {
   retries: Map<string, { seq: Seq; attempt: number; timer?: NodeJS.Timeout | undefined }>;
   /** A summary pins at its oldest event until accepted, then settles the individual debts it covers. */
   summaries: Map<string, { from: Seq; covered: Set<Seq> }>;
-  /** Messages withheld while a synchronous call may still return them (G28): key (runId, or `runId:service=status@seq`) → since. */
+  /** Messages withheld while a synchronous call may still return them (G28): key (runId, or `runId:service=status@seq`) → since, on the monotonic clock. */
   held: Map<string, { since: number; seq?: Seq; timer?: NodeJS.Timeout | undefined }>;
   /** Everything up to here is settled for this principal except what is owed: `delivered` may advance to it. */
   clearTo: Seq;
@@ -718,7 +719,7 @@ export class McplLane {
       if (!budget) noteBudgets.set(lineage, (budget = new NoteBudget()));
       // After a daemon restart the budget starts empty while the journal still holds every note it kept.
       if (Number.isFinite(retention)) await budget.seed(journal);
-      const refused = budget.take(this.me, stored, journal, retention, Date.now());
+      const refused = budget.take(this.me, stored, journal, retention, clocks.monotonic());
       if (refused) throw new RpcError(OVERLOADED, refused.message, { channelId: params.channelId, retryAfterMs: refused.retryAfterMs });
     }
     try {
@@ -982,7 +983,7 @@ export class McplLane {
     if (ev.type === 'run.end' && !run) return;
     if (run && this.maySyncReturn(session, run)) {
       // Held, not dropped (mcpl-1): if the call that is waiting never returns the outcome, the message goes out.
-      st.held.set(run.runId, { since: Date.now(), seq: ev.seq });
+      st.held.set(run.runId, { since: clocks.monotonic(), seq: ev.seq });
       this.owe(st, ev.seq);
     } else if (this.owed(session, ev, this.openOrOpening(channelId(session.id)), session) || (ev.type === 'session.exit' && this.hasRunIn(session))) this.owe(st, ev.seq);
   }
@@ -1073,7 +1074,7 @@ export class McplLane {
   private hold(t: Target, st: LaneState, seg: Segment): void {
     const key = this.heldKey(seg)!;
     let h = st.held.get(key);
-    if (!h) st.held.set(key, (h = { since: Date.now(), seq: seg.seq }));
+    if (!h) st.held.set(key, (h = { since: clocks.monotonic(), seq: seg.seq }));
     if (h.timer) return; // already waiting on it
     this.owe(st, seg.seq);
     const held = h;
@@ -1084,7 +1085,9 @@ export class McplLane {
         st.held.delete(key);
         return this.settleSegment(t, seg, 'accepted');
       }
-      if (Date.now() - held.since >= HOLD_MS) {
+      // The hold's age is monotonic: on the wall clock a step forward released it at the next check and
+      // a step back stretched it by the step (the house's correction, comment 6270946953 on #22).
+      if (clocks.monotonic() - held.since >= HOLD_MS) {
         st.held.delete(key);
         return this.deliver(t, seg, { released: true });
       }
@@ -1369,6 +1372,7 @@ class NoteBudget {
     return this.seeded;
   }
 
+  /** `now` is on the monotonic clock: the buckets measure intervals, never a time of day. */
   take(p: Principal, bytes: number, journal: Journal, retentionBytes: number, now: number): { message: string; retryAfterMs: number } | undefined {
     const oldest = journal.oldestSeq ?? 0;
     while (this.retained.length && this.retained[0]![0] < oldest) this.bytes -= this.retained.shift()![1];

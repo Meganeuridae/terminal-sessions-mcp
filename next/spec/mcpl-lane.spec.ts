@@ -13,6 +13,7 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
@@ -1254,5 +1255,36 @@ test('a catch-up summary of omitted messages and a gone range names the two rang
     assert.match(gapOnly.head, /since=226 as=events$/);
   } finally {
     lane.dispose();
+  }
+});
+
+test('the hold for a synchronous call is measured on the monotonic clock: a wall-clock step neither ends it early nor stretches it', { timeout: 30_000 }, async (t) => {
+  // The hold's start and age were read from Date.now (the house's correction, comment 6270946953 on #22):
+  // stepped forward, the hold ended at its next check; stepped back, it lasted the step longer.
+  const d = await daemon();
+  const real = Date.now.bind(Date);
+  let offset = 0;
+  t.mock.method(Date, 'now', () => real() + offset);
+  try {
+    const a = await d.host('ta', 'hc');
+    await a.call('session_open', { session: 'hc' });
+    const s = live(d.registry, 'hc');
+    for (const step of [10_000, -10_000]) {
+      const r = await a.call('run', { session: 'hc', command: 'sleep 0.3; echo held', wait: 20 });
+      const runId = r.structured?.runId as string;
+      // As in mcpl-1: a synchronous wait of this principal is in flight at run.end, and its result never reaches the host.
+      await s.awaitRun(runId, 20_000, A);
+      const t0 = performance.now();
+      offset = step; // the wall clock steps right after the hold began
+      const got = await a.delivery(aboutRun(runId), 8000);
+      const took = performance.now() - t0;
+      assert.match(got.text, /held/);
+      assert.ok(took >= 1500, `stepped ${step} ms: the hold was not cut short (${took.toFixed(0)} ms)`);
+      assert.ok(took < 5000, `stepped ${step} ms: the hold was not stretched (${took.toFixed(0)} ms)`);
+      offset = 0;
+    }
+    await a.close();
+  } finally {
+    await d.stop();
   }
 });
