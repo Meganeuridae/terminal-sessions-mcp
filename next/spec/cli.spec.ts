@@ -5,7 +5,6 @@
  * forms (`await <runId>`, durations, `--`, values typed by the tool's schema),
  * its output to a slow reader, `tsm gui` and `tsm usage`.
  */
-import { until } from './testhost.js';
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
