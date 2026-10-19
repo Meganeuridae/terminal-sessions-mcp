@@ -419,6 +419,26 @@ test('jr2-4: a group recovery left for an ended Run with leftovers is judged onc
   }
 });
 
+test('jr2-4: a leader whose ticks equal a Run\'s recorded ticks is the Run\'s own process, still alive, even though recovery wrote the Run an end (a reviewer\'s read of the fixes for #22 comment 6269992150)', () => {
+  const self = { pid: 500, pgid: 400 };
+  const T = 50_000;
+  const run = (over: Partial<RunInfo>): OrphanCandidate => ({
+    key: 's\0r',
+    run: { runId: 'r', sessionId: 's', target: 'process', origin: 'self', principal: A, state: 'lost', admittedAt: T - 10, startedAt: T, endedAt: T + 60_000, seq: { admit: 1, start: 2, end: 3 }, attribution: 'exact', pgid: 1001, recoveredEnd: true, ...over },
+    lastTs: T + 5000,
+  });
+  const leader = (over: Partial<ProcessRow>): ProcessRow => ({ pid: 1001, pgid: 1001, startMs: T, zombie: false, ...over });
+  const sel = (c: OrphanCandidate, procs: ProcessRow[]) => [...orphanGroups([c], procs, self).keys()];
+  // A recovery that could not list processes ended the Run lost; the next one finds the leader itself alive, by ticks.
+  assert.deepEqual(sel(run({ bootId: 'boot-A', startTicks: 7777 }), [leader({ bootId: 'boot-A', startTicks: 7777 })]), [1001], 'the Run\'s own process: ended, not left at every restart');
+  assert.deepEqual(sel(run({ bootId: 'boot-A', startTicks: 7777 }), [leader({ bootId: 'boot-A', startTicks: 9999 })]), [], 'different ticks: a reused pid');
+  // Without ticks the wall clock cannot tell the Run's process from a reuse: the recorded end stands.
+  assert.deepEqual(sel(run({}), [leader({})]), [], 'no ticks: a leader after a recorded end is a stranger');
+  // An observed end means the leader was reaped: a present leader is a reuse whatever its ticks say of a lost pid.
+  const { recoveredEnd: _r, ...observed } = run({ bootId: 'boot-A', startTicks: 7777 }).run;
+  assert.deepEqual(sel({ key: 's\0r', run: { ...observed, state: 'exited', leftovers: true }, lastTs: T + 5000 }, [leader({ bootId: 'boot-A', startTicks: 7777 })]), [], 'an observed end: the leader is gone, so this one is not the Run\'s');
+});
+
 // ───────────── jr2-12: command files ─────────────
 
 test('jr2-12/G26: recovery deletes a crashed life\'s command files, and forget deletes the command directory', async () => {

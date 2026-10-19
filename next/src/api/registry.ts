@@ -27,7 +27,7 @@ import { configuredEnv } from '../core/env.js';
 import { clocks } from '../core/clock.js';
 import { err, TermError } from '../core/errors.js';
 import { Journal, type JournalOptions } from '../core/journal.js';
-import { acquireDataDirLock, listProcesses, livingGroups, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
+import { acquireDataDirLock, groupAlive, listProcesses, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { Session, trustedDir, type SessionOptions } from '../core/session.js';
 import { FileStore, FreeSpaceFloor, MemoryStore, type DiskFloor, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
@@ -614,7 +614,10 @@ export class SessionRegistry {
     // group that took the freed pgid during the grace (every such member started after `judgedAt`). The
     // deadline is on the monotonic clock, which a wall-clock step cannot move (comment 6269992150).
     const stillOurs = (gs: number[]): number[] => {
-      const alive = livingGroups(gs);
+      // A signal probe first (no listing); then one listing answers both questions for every group — a
+      // living member that is not a zombie, and one from before we judged — instead of two listings a poll,
+      // each a `ps` spawn on macOS (a reviewer's read of the fixes for #22 comment 6269992150).
+      const alive = gs.filter(groupAlive);
       if (!alive.length) return alive;
       const now = listProcesses();
       if (!now) return alive; // nothing can tell: best effort, as before
@@ -805,6 +808,11 @@ export class SessionRegistry {
     let integ: ReturnType<typeof prepareIntegration> | undefined;
     let session: Session;
     try {
+      // A brand-new name is owned from its first byte: its record is written before the start, so a daemon
+      // that dies mid-start leaves owned history, not a journal recovery refuses as owner-unknown (a
+      // reviewer's read of the fixes for #22 comment 6269992150). A name with a record keeps it until this
+      // life has started (below): a reopen must not overwrite the old retention before it succeeds.
+      if (recorded.owner === undefined) writeMeta(dir, meta);
       // The integration files live in the session's own directory: a daemon that dies leaves them for
       // the next life to overwrite, not in the system's temp dir. The user's environment the
       // integration preserves (zsh's ZDOTDIR, fish's XDG variables) is the one the shell starts
@@ -845,21 +853,14 @@ export class SessionRegistry {
       session = await Session.start(so);
     } catch (e) {
       integ?.cleanup();
-      // A start that failed is not a life: the record is written only once the start succeeds, so a
-      // reopen whose start failed never overwrote the old record — the history keeps the retention and
-      // the closedAt it had, on disk and in memory (the house's read of the 36 commits, #22, comment
-      // 6269992150). A name that had no record but journaled something keeps the attempt's, so its
-      // history stays owned and reopenable; a failed write is logged, not swallowed.
+      // A start that failed is not a life: a name with a record writes this life's only once the start
+      // succeeds, so a reopen whose start failed never overwrote the old record — the history keeps the
+      // retention and the closedAt it had, on disk and in memory (the house's read of the 36 commits, #22,
+      // comment 6269992150). A brand-new name wrote the attempt's record before the start, so whatever it
+      // journaled stays owned and reopenable.
       const kept = recorded.owner !== undefined ? recorded : meta;
       journal.seal();
       if (prev || journal.lastSeq > 0) {
-        if (recorded.owner === undefined) {
-          try {
-            writeMeta(dir, meta);
-          } catch (we) {
-            this.opts.log?.('warn', `could not record a failed new session's owner: ${we instanceof Error ? we.message : String(we)}`, { session: id });
-          }
-        }
         const view = new HistoryEntry(id, journal, kept.owner ?? o.owner, kept.visibility ?? options.visibility, kept.closedAt !== undefined, before, recordedOptions(kept, before), cursors);
         this.slots.set(id, { id, dir, store, meta: kept, cursors, view });
       } else {
@@ -867,13 +868,15 @@ export class SessionRegistry {
       }
       throw e;
     }
-    // Started: the record is written now (with this life's retention), and the history is kept under it
-    // from here on. A failed record write is logged, not swallowed; the session is live and the record
-    // is retried at its next change.
-    try {
-      writeMeta(dir, meta);
-    } catch (we) {
-      this.opts.log?.('warn', `history is live but its record could not be written: ${we instanceof Error ? we.message : String(we)}`, { session: id });
+    // Started: a name that had a record takes this life's now (with its retention), and the history is
+    // kept under it from here on; a brand-new name's was written before the start. A failed record write
+    // is logged, not swallowed; the session is live and the record is retried at its next change.
+    if (recorded.owner !== undefined) {
+      try {
+        writeMeta(dir, meta);
+      } catch (we) {
+        this.opts.log?.('warn', `history is live but its record could not be written: ${we instanceof Error ? we.message : String(we)}`, { session: id });
+      }
     }
     store.setRetention(retention);
     this.slots.set(id, { id, dir, store, meta, cursors, view: new LiveEntry(session, () => integ?.cleanup(), retention, options) });
@@ -1150,10 +1153,17 @@ export function orphanGroups(candidates: OrphanCandidate[], procs: ProcessRow[],
     const sinceStart = (p: ProcessRow) => p.startMs >= started - 2000;
     // The leader started with the Run: by ticks when both were recorded (same boot, no wall-clock
     // frame), else by the wall clock with the ps truncation tolerance (macOS, or an older build).
-    const leaderStartedWithRun = (l: ProcessRow): boolean =>
-      run.startTicks !== undefined && l.startTicks !== undefined ? l.startTicks === run.startTicks : sinceStart(l) && l.startMs <= started + 1000;
+    const byTicks = (l: ProcessRow): boolean => run.startTicks !== undefined && l.startTicks !== undefined && l.startTicks === run.startTicks;
+    const leaderStartedWithRun = (l: ProcessRow): boolean => (run.startTicks !== undefined && l.startTicks !== undefined ? byTicks(l) : sinceStart(l) && l.startMs <= started + 1000);
+    // A present leader after an observed end is a reuse (the Run's process was reaped before its end was
+    // written). A recovery-written end observed no exit: a leader whose ticks equal the Run's recorded
+    // ticks (same boot, by the guard above) is the Run's own process still alive, and the group is its —
+    // the recorded end alone left it running at every restart (a reviewer's read of the fixes for #22
+    // comment 6269992150). Without ticks the wall clock cannot say that much, and the end stands.
     const ours = leader
-      ? ended === undefined && leaderStartedWithRun(leader)
+      ? ended === undefined
+        ? leaderStartedWithRun(leader)
+        : run.recoveredEnd === true && byTicks(leader)
       : ended !== undefined
         ? members.every(sinceStart) && members.some((p) => p.startMs <= ended)
         : members.every(sinceStart) && members.some((p) => p.startMs + 1000 <= (lastTs ?? 0));

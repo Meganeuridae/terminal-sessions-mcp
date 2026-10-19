@@ -561,6 +561,25 @@ test('G21: a damaged record is recovered with retention off, so a repair brings 
   await cleanup(r2, r);
 });
 
+test('G18: a brand-new name is owned from its first byte — its record is written before the start, so a daemon that dies mid-start leaves owned history, not an unknown owner (a reviewer\'s read of the fixes for #22 comment 6269992150)', async () => {
+  const r = rig();
+  const spawn = r.backend.spawnShell.bind(r.backend);
+  r.backend.spawnShell = () => {
+    throw new Error('spawn failed');
+  };
+  await rejectsWith(r.reg.ensure({ id: 'fresh', owner: A }), 'Error: spawn failed');
+  // The record is on disk although the start never succeeded: whatever a dying daemon had journaled by
+  // then would recover as A's, not as owner-unknown.
+  const file = path.join(r.dir, 'sessions', 'fresh', 'session.json');
+  assert.ok(fs.existsSync(file), 'the record was written before the start');
+  assert.equal((JSON.parse(fs.readFileSync(file, 'utf8')) as { owner: string }).owner, A);
+  r.backend.spawnShell = spawn;
+  // The owner's next attempt starts the shell: the name is theirs.
+  assert.equal((await r.reg.ensure({ id: 'fresh', owner: A })).created, true);
+  await rejectsWith(r.reg.create({ id: 'fresh', owner: B }), 'session_exists');
+  await cleanup(r);
+});
+
 test('the integration preserves the environment the shell starts with — the session\'s over the daemon\'s — not the daemon\'s own', async () => {
   // zsh's ZDOTDIR and fish's XDG_DATA_DIRS were read from the daemon's environment, so a session's
   // own value appeared nowhere in its shell (the house's read of 2c35df8, #22).
