@@ -32,10 +32,13 @@ OOMPolicy=continue
 # On stop, systemd signals termd alone (KillMode=process), not the whole cgroup. termd drains its
 # sessions (Runs end with reason daemon-shutdown) and hangs up each shell as a closing terminal
 # does: a foreground job ends with it, while a job a session detached on purpose (setsid, nohup,
-# disown) lives on, matching the header of daemon.ts. KillMode=mixed would instead SIGKILL the
-# whole cgroup when the stop times out, taking those detached jobs with it (the house's read, #22
-# comment 6264958172). If termd itself does not exit within TimeoutStopSec it gets SIGKILL — only
-# termd, never the sessions' surviving jobs.
+# disown) lives on, matching the header of daemon.ts. KillMode=mixed would SIGTERM termd and then,
+# on every stop, SIGKILL whatever is left in the cgroup once termd has exited, not only when the
+# stop times out: a run showed a setsid'd child and a background child killed in a stop that took
+# half a second (the house's read, #22 comments 6264958172 and 6269721389). What process costs: if
+# termd itself does not exit within TimeoutStopSec, systemd SIGKILLs termd alone, the sessions'
+# surviving jobs are left as they are, and the process Runs termd had not yet ended keep running
+# until the next start's recovery ends their groups (daemon.ts says so at its last-resort cleanup).
 KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=20

@@ -146,14 +146,20 @@ try {
     if (names.length !== 10 || !names.includes('run') || !names.includes('input') || !names.includes('session_declare_shell')) fail(`tools: ${names.join(',')}`)
   })
 
-  const opened = await call('session_open', { session: SESSION, visibility: 'shared' })
+  const opened = await call('session_open', { session: SESSION, visibility: 'shared', cwd: tmp })
   if (opened.isError) fail(opened.text)
   await sleep(200)
   await observer.openChannel(`terminal:${SESSION}`)
 
+  // The Run ends when this file appears in the session's cwd, and the check creates it once the
+  // reconnect has been shown: a Run that slept 1.5 s raced the reconnect's own waits (3 s, then
+  // 5 s), so a correct reconnect slower than that failed the check on a slow runner (the house's
+  // read, #22 comment 6269721389). The command stays short: the completion head shows 100 characters.
+  const released = path.join(tmp, 'reconnected')
+  const COMMAND = 'until [ -e reconnected ]; do sleep 0.1; done; echo bridge-output'
   let runId = ''
   await check('start work, receive a run id, stop waiting', async () => {
-    const r = await call('run', { session: SESSION, command: 'sleep 1.5; echo bridge-output', wait: 100 })
+    const r = await call('run', { session: SESSION, command: COMMAND, wait: 100 })
     if (r.structured?.state !== 'running') fail(r.text)
     runId = r.structured.runId
   })
@@ -169,6 +175,8 @@ try {
     const st = await call('await', { runId, wait: 0 })
     if (st.structured?.state !== 'running') fail(`the Run across the drop: ${st.text}`)
   })
+  // Shown or failed, the Run is released now, so the checks after this one see it end.
+  fs.writeFileSync(released, '')
 
   let firstCompletionAt = 0
   await check('one useful completion notification, and it wakes the session', async () => {
@@ -178,7 +186,7 @@ try {
     if (mine.length !== 1) fail(`deliveries for the run: ${mine.length}`)
     const d = mine[0]
     if (!/bridge-output/.test(d.text)) fail(d.text)
-    if (!d.text.startsWith(`[terminal] ${SESSION}: \`sleep 1.5; echo bridge-output\` → exit 0`)) fail(`head: ${d.text.split('\n')[0]}`)
+    if (!d.text.startsWith(`[terminal] ${SESSION}: \`${COMMAND}\` → exit 0`)) fail(`head: ${d.text.split('\n')[0]}`)
     if (!String(d.meta.tags ?? '').split(' ').includes('terminal:run-finished')) fail(`tags reaching the bridge: ${d.meta.tags}`)
     if (gate.decide(d) !== 'wake') fail('a completion must wake the session by rule')
     if (gate.decide({ ...d, meta: { ...d.meta, tags: 'terminal:output terminal:running' } }) !== 'hold') fail('a digest must be held')

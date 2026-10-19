@@ -106,7 +106,7 @@ try {
     assert.ok(tools.some((n) => n.endsWith('run')) && tools.some((n) => n.endsWith('input')), tools.join(','));
   });
 
-  const opened = await call('session_open', { session: SESSION, visibility: 'shared' });
+  const opened = await call('session_open', { session: SESSION, visibility: 'shared', cwd: tmp });
   assert.equal(opened.isError, undefined, opened.text);
   const observer = await new TestHost({ port, token: 'tb', connection: 'observer', mcpl: true }).connect();
   await observer.request('channels/open', { channelId: CHANNEL });
@@ -115,8 +115,9 @@ try {
   // session's channel, as the agent's own channel_open tool does: the completion then arrives on that
   // channel, and the prose the model answers with reaches termd's channels/publish. On a closed channel
   // a completion is a push event with no channel to answer into; the host kept the prose in its archive,
-  // nothing reached termd, and the mcpl-1 check below passed with publish typing into the shell (the
-  // house's read of 9f168ff, #22). The channel registers with the host a moment after session_open.
+  // nothing reached termd, and the mcpl-1 check below passed vacuously, with no publish for it to catch
+  // (the house's read of 9f168ff and comment 6269721389, #22). The channel registers with the host a
+  // moment after session_open.
   await check("the scout's host opens the session's channel", async () => {
     let open;
     for (const until = Date.now() + 3000; ; await sleep(100)) {
@@ -137,9 +138,15 @@ try {
   membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'note-1', name: 'channel_publish', input: { channelId: CHANNEL, content: TOOL_NOTE } }], 'tool_use'));
   membrane.pushResponse(createMockResponse([{ type: 'text', text: PROSE }]));
 
+  // The Run ends when this file appears in the session's cwd, and the check creates it once the
+  // reconnect has been shown: a Run that slept 2 s raced the reconnect's own waits (3 s, then 5 s),
+  // so a correct reconnect slower than that failed the check on a slow runner (the house's read,
+  // #22 comment 6269721389). The command stays short: the completion head shows 100 characters.
+  const released = path.join(tmp, 'reconnected');
+  const COMMAND = 'until [ -e reconnected ]; do sleep 0.1; done; echo acceptance-output';
   let runId;
   await check('start work, receive a run id, stop waiting', async () => {
-    const r = await call('run', { session: SESSION, command: 'sleep 2; echo acceptance-output', wait: 100 });
+    const r = await call('run', { session: SESSION, command: COMMAND, wait: 100 });
     assert.equal(r.structured?.state, 'running', r.text);
     runId = r.structured.runId;
     assert.ok(runId);
@@ -160,12 +167,14 @@ try {
     assert.equal(scoutConnections(), before + 1, `termd accepted a new connection from the scout:\n${serverLog.slice(-10).join('\n')}`);
     assert.equal(registry.get(SESSION).session.run(runId).state, 'running', 'the Run was in flight across the drop');
   });
+  // Shown or failed, the Run is released now, so the checks after this one see it end.
+  fs.writeFileSync(released, '');
 
   await check('a useful completion notification through the host, and the inference call it woke', async () => {
     const until = Date.now() + 8000;
     while (!context().includes('acceptance-output') && Date.now() < until) await sleep(100);
     const ctx = context();
-    assert.match(ctx, new RegExp(`${SESSION}: \`sleep 2; echo acceptance-output\` → exit 0`), `agent context:\n${ctx.slice(-800)}`);
+    assert.ok(ctx.includes(`${SESSION}: \`${COMMAND}\` → exit 0`), `agent context:\n${ctx.slice(-800)}`);
     assert.match(ctx, /acceptance-output/);
     const pushes = traces.filter((t) => t.type === 'mcpl:push_event' || t.type === 'mcpl:channels-incoming');
     assert.ok(pushes.length >= 1, 'delivered through the host lane');
@@ -196,8 +205,16 @@ try {
     const byTool = (notes) => notes.filter((n) => n.text === TOOL_NOTE);
     const until = Date.now() + 8000;
     while (!byTool(scoutNotes(journal())).length && !journal().some((e) => e.type === 'input') && Date.now() < until) await sleep(100);
-    // A note from the prose, where the host routes it, follows the tool call's closely; a further wake would too.
-    await sleep(1000);
+    // The prose path is the rest of the turn after the tool call (the mock's yielding stream plays the
+    // prose in the same inference call; a host that infers again after the tool result makes a second)
+    // and then the host's routing of the prose, which the turn awaits before the agent is idle. A fixed
+    // second here let a publish that landed later pass unseen (the house's read, #22 comment
+    // 6269721389): the check waits for the host's idle, then for termd to have handed the tool call's
+    // note to the channel's open connections (the scout's host among them) and the host's idle again,
+    // so a publish from the prose, or a wake from the note's echo, is counted below rather than missed.
+    await within(framework.runUntilIdle(), 8000, 'the host going idle after the turn');
+    await observer.delivery((x) => x.text.includes(TOOL_NOTE), 3000);
+    await within(framework.runUntilIdle(), 8000, 'the host idle again after the note reached the channel');
     const events = journal();
     assert.ok(!events.some((e) => e.type === 'input'), 'no input events');
     assert.ok(!fs.existsSync(marker), 'neither text executed');

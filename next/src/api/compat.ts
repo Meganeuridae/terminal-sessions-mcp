@@ -1,7 +1,8 @@
 /**
  * The compatibility pack (§11): the 1.x tool names and result shapes, mapped
  * onto the application API for one release so existing recipes keep working.
- * Served as the `compat` profile (the `terminal-sessions-mcp` bin's default),
+ * Served as the `compat` profile (in this landing the `terminal-sessions-mcp` bin
+ * runs 1.x itself; only the shim, when invoked under that name, defaults to compat),
  * with `await`, `read` and `session_declare_shell` beside them; never mixed into
  * the core or full profiles. Where an old shape could not tell the truth, the
  * result adds to it: runCommand carries `runId` and `state`, launch the
