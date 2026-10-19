@@ -1208,14 +1208,14 @@ function head(line: string, max = 120): string {
 }
 
 
+/** How much of a Run's newest output a result rendered from history reads. */
+const HISTORY_INPUT_BYTES = 1024 * 1024;
+
 /**
  * The geometry a session's pages project at (§6 rule 1): a live session's screen; for history, what the
  * session recorded at creation (a resize during its life is not kept there; a Run's pages use the
  * Run's own recorded geometry) — the house's read of 1cabc6a, #22.
  */
-/** How much of a Run's newest output a result rendered from history reads. */
-const HISTORY_INPUT_BYTES = 1024 * 1024;
-
 function geometryOf(s: AnySession): { cols: number; rows: number } {
   if (s.kind === 'live') return { cols: s.session.screen.cols, rows: s.session.screen.rows };
   return { cols: s.options.cols ?? DEFAULT_GEOMETRY.cols, rows: s.options.rows ?? DEFAULT_GEOMETRY.rows };

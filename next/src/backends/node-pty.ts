@@ -255,14 +255,15 @@ export class NodePtyBackend implements ExecutionBackend {
     // leaves open to every child (the house's read of d5873f0). Without bash it runs under /bin/sh
     // and skips the loop. A shell without integration has no launcher: under bash the constant text
     // of shellLaunch closes the same descriptors and raises its oom_score_adj (the house's read of
-    // 2c35df8, #22), then execs the shell, which keeps its pid; without bash it starts bare.
+    // 2c35df8, #22), then execs the shell, which keeps its pid; under /bin/sh the same text skips the
+    // loop and still raises the preference.
     const through: [string, string[]] = launcher
       ? this.bash
         ? [this.bash, ['-p', launcher, opts.shell, ...opts.args]]
         : ['/bin/sh', [launcher, opts.shell, ...opts.args]]
       : this.bash
         ? viaBash(this.bash, shellLaunch(opts.oomScoreAdj ?? 0), 'termd-shell', [opts.shell, ...opts.args])
-        : [opts.shell, opts.args];
+        : ['/bin/sh', ['-c', shellLaunch(opts.oomScoreAdj ?? 0), 'termd-shell', opts.shell, ...opts.args]];
     const p = pty.spawn(through[0], through[1], {
       name: 'xterm-256color',
       cwd: opts.cwd,

@@ -1356,7 +1356,7 @@ type JournalEvent =
   | { seq; ts; type: 'signal';      signal; principal; runId? }
   | { seq; ts; type: 'control';     controller: principal|null; by: principal; how: 'take'|'release'|'override'|'auto' }
   | { seq; ts; type: 'attach';      attachmentId; principal; role }                           // and 'detach'
-  | { seq; ts; type: 'watch.fired'; watchId; label?; kind; match? }
+  | { seq; ts; type: 'watch.fired'; watchId; label; kind; principal; at; match?; line?; clipped?; suppressed? }
   | { seq; ts; type: 'gap';         from: seq; to: seq; reason: 'retention'|'keeper-overflow' }
   | { seq; ts; type: 'checkpoint';  screen: serialized }                                      // milestone 3
   | { seq; ts; type: 'recovered';   class: 'continuous'|'reattached'|'history-only' }

@@ -656,8 +656,8 @@ const yieldTurn = (): Promise<void> => new Promise((r) => setImmediate(r));
 /** Project a range of output to text (see the module comment for the exact semantics). */
 export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptions): Promise<Projection> {
   const int = (v: number | undefined, fallback: number, min: number) => (v !== undefined && Number.isFinite(v) ? Math.max(min, Math.floor(v)) : fallback);
-  const cols = int(opts.cols, 120, 2);
-  const rows = int(opts.rows, 30, 1);
+  const cols = int(opts.cols, DEFAULT_GEOMETRY.cols, 2);
+  const rows = int(opts.rows, DEFAULT_GEOMETRY.rows, 1);
   const maxLines = int(opts.maxLines, DEFAULT_MAX_LINES, 1);
   const keep = opts.keep ?? 'tail';
   const budget: Budget | undefined = opts.maxInputBytes !== undefined ? { max: Math.max(0, opts.maxInputBytes), keep, omitted: 0, state: '' } : undefined;
