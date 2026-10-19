@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cleanLine, compileLinePattern, LineSplitter, MAX_LINE, StreamMatcher, stripAnsi, type LineMatch } from '../src/core/ansi.js';
+import { cleanLine, compileLinePattern, LineSplitter, MAX_LINE, StreamMatcher, type LineMatch } from '../src/core/ansi.js';
 import { LINEAR_REGEX, MIN_WINDOW, matchWindow } from '../src/core/regex.js';
 import { TermError } from '../src/core/errors.js';
 import { sleep } from './testhost.js';
@@ -62,14 +62,46 @@ test('cleanLine applies overwrites on the raw text: a U+E000 in the output is te
   assert.equal(cleanLine('text\r\r'), 'text');
 });
 
-test('stripAnsi removes every escape sequence proper, including charset designations (`tput sgr0` is ESC ( B ESC [ m)', () => {
-  assert.equal(stripAnsi('\x1b[31merror: disk full\x1b(B\x1b[m'), 'error: disk full');
+test('cleanLine renders a line as the transcript does: erase in line and in-line cursor moves apply, everything else is dropped', () => {
+  // The house's read of 78c4d6e (#22): a progress line cleared with ESC [ K read `Doneress: 100%`.
+  assert.equal(cleanLine('Progress: 100%\r\x1b[KDone'), 'Done');
+  assert.equal(cleanLine('Progress: 100%\r\x1b[0KDone'), 'Done', '0K is K');
+  assert.equal(cleanLine('Progress: 100%\r\x1b[2KDone'), 'Done', '2K clears the whole row');
+  assert.equal(cleanLine('abcdef\x1b[3DXY'), 'abcXYf', 'cursor back, then overwrite');
+  assert.equal(cleanLine('abc\x1b[5Cz'), 'abc     z', 'cursor forward pads with blanks');
+  assert.equal(cleanLine('abcdef\x1b[2Gz'), 'azcdef', 'cursor to a column (1-based)');
+  assert.equal(cleanLine('abcdef\x1b[Gz'), 'zbcdef', 'to column 1 by default');
+  assert.equal(cleanLine('abcdef\x1b[Dz'), 'abcdez', 'back one by default');
+  assert.equal(cleanLine('x\x1b[1K\x1b[2Ky'), ' y', 'as the transcript shows it: 1K blanks through the cursor, 2K clears, y lands at column 1');
+  assert.equal(cleanLine('abcdef\x1b[3D\x1b[K'), 'abc', 'erase to the end from the cursor');
+  assert.equal(cleanLine('abcdef\x1b[3D\x1b[1K'), '    ef', 'erase to the start, the cursor cell included');
+  assert.equal(cleanLine('\x9b3Dq'), 'q', 'the C1 CSI form too');
+  // Moves that are not in-line, and every other sequence, are dropped without effect.
+  assert.equal(cleanLine('ab\x1b[2Acd\x1b[?25l\x1b[1;1Hef'), 'abcdef');
+  assert.equal(cleanLine(`a\x1b[${10 ** 9}Cb`).length <= 2 + 1024 + 1, true, 'a move far past the end pads a bounded number of cells');
+});
+
+test('cleanLine drops every escape sequence proper, including charset designations (`tput sgr0` is ESC ( B ESC [ m), and an unfinished one takes its payload with it', () => {
+  assert.equal(cleanLine('\x1b[31merror: disk full\x1b(B\x1b[m'), 'error: disk full');
   assert.deepEqual(new StreamMatcher(compileLinePattern('disk full$')).feed('\x1b[31merror: disk full\x1b(B\x1b[m\n').map((h) => h.match), ['disk full']);
   // Two-byte escapes beyond the 0x40–0x5f range, and three-byte ones with an intermediate.
-  assert.equal(stripAnsi('a\x1b=b\x1b>c\x1b7d\x1b8e\x1bcf\x1b#8g\x1b%Gh\x1b)0i'), 'abcdefghi');
-  assert.equal(stripAnsi('\x1bM\x1bD\x1bE\x1bHx'), 'x');
-  // CSI, OSC, DCS and the C1 CSI as before.
-  assert.equal(stripAnsi('\x1b[1;31mred\x1b]0;title\x07\x1bPq#0\x1b\\\x9b0mend'), 'redend');
+  assert.equal(cleanLine('a\x1b=b\x1b>c\x1b7d\x1b8e\x1bcf\x1b#8g\x1b%Gh\x1b)0i'), 'abcdefghi');
+  assert.equal(cleanLine('\x1bM\x1bD\x1bE\x1bHx'), 'x');
+  // CSI, OSC, DCS and the C1 CSI.
+  assert.equal(cleanLine('\x1b[1;31mred\x1b]0;title\x07\x1bPq#0\x1b\\\x9b0mend'), 'redend');
+  // A sequence left unfinished at the end: its payload is not text (the house's read of 78c4d6e, #22).
+  assert.equal(cleanLine('ready\x1b]0;title'), 'ready');
+  assert.equal(cleanLine('working \x1b[3'), 'working ');
+  assert.equal(cleanLine('tail\x1b'), 'tail');
+});
+
+test('a watch reads a frame as it displays: backspaces, erases and cursor moves apply, and a lone CR still ends a frame', () => {
+  // The house's read of 78c4d6e (#22): `ab\bc` was `abc` to a watch and `ac` to search, so /^ac$/ never fired.
+  assert.deepEqual(matches('^ac$', ['ab\bc\n']), ['ac']);
+  assert.deepEqual(matches('^Done$', ['Progress: 100%\r\x1b[KDone\n']), ['Done']);
+  // Frames: a progress bar matches as it moves, where search would read the line's last state (`XYCDE`).
+  assert.deepEqual(new LineSplitter().feed('ABCDE\rXY\n').map((l) => l.text), ['ABCDE', 'XY']);
+  assert.deepEqual(matches('^XYCDE$', ['ABCDE\rXY\n']), []);
 });
 
 test('a line is matched on its head within the pattern’s match window, and a hit on a longer line says so', () => {
@@ -135,11 +167,25 @@ test('m2-10: a prompt with no newline is matched after a quiet moment, once — 
   m.dispose();
 });
 
-test('m2-10: lines are bounded — a line longer than MAX_LINE is matched in pieces, holding no more than that', () => {
+test('m2-10: lines are bounded — a line longer than MAX_LINE is matched on its head only, the hit says clipped, and the rest is dropped', () => {
   const s = new LineSplitter();
-  const pieces = s.feed('x'.repeat(2.5 * MAX_LINE));
-  assert.deepEqual(pieces.map((p) => p.length), [MAX_LINE, MAX_LINE]);
-  assert.deepEqual(s.feed('\n').map((p) => p.length), [MAX_LINE / 2]);
+  assert.deepEqual(s.feed('x'.repeat(2.5 * MAX_LINE)), [], 'nothing comes out before the line ends');
+  const [line, ...rest] = s.feed('\n');
+  assert.deepEqual(rest, []);
+  assert.equal(line!.text.length, MAX_LINE, 'its head is kept');
+  assert.equal(line!.cut, true);
+  assert.deepEqual(s.feed('next\n'), [{ text: 'next' }], 'the line after it is whole and not cut');
   const m = matcher('needle');
-  assert.equal(m.feed('needle' + 'y'.repeat(3 * MAX_LINE) + '\n').length, 1, 'the piece holding the match reports it, the others nothing');
+  const hits = m.feed('needle' + 'y'.repeat(3 * MAX_LINE) + '\n');
+  assert.equal(hits.length, 1, 'one hit for one line, however long');
+  assert.equal(hits[0]!.clipped, true);
+  // The house's read of 78c4d6e (#22): matched in pieces, `^MATCH` hit on the second piece of a line that does not start with it.
+  const long = 'x'.repeat(MAX_LINE) + 'MATCH\n';
+  assert.deepEqual(matches('^MATCH', [long]), []);
+  assert.deepEqual(matches('xMATCH', [long]), [], 'past the head: not seen, as search would not see it past the head it keeps');
+  assert.deepEqual(matches('^x', [long]).length, 1);
+  // The head is cut before a sequence the cut would split, so no half of one is read as text.
+  const split = new LineSplitter();
+  const head = 'a'.repeat(MAX_LINE - 2) + '\x1b[31mb'.repeat(2) + '\n';
+  assert.equal(split.feed(head)[0]!.text, 'a'.repeat(MAX_LINE - 2));
 });

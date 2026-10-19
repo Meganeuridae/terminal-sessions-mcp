@@ -13,10 +13,12 @@
  * 2. Lines. A stream's raw bytes are joined across events and cut at LF, so a
  *    line is the same whatever the chunking: a CRLF, an escape sequence or a
  *    long line split across events reads as if it came in one piece.
- * 3. Cleaning. Control sequences are removed from the whole line, trailing CRs
- *    before the LF are dropped (a PTY writes a program's CRLF as CR CR LF), and
- *    a carriage return inside the line starts it over (a progress bar reads as
- *    its last state).
+ * 3. Cleaning. The line is read as the transcript displays it (`cleanLine`):
+ *    control sequences are removed, and a carriage return, a backspace, erase in
+ *    line and in-line cursor moves apply as overwrites, so `ABCDE\rXY` reads
+ *    `XYCDE`, a progress bar reads as its last state, and trailing CRs before the
+ *    LF leave nothing (a PTY writes a program's CRLF as CR CR LF). Watches split a
+ *    lone CR into frames instead (see LineSplitter), to match a bar as it moves.
  * 4. Gaps. A `gap` event (output lost to retention, a torn write or a store
  *    failure) ends every unfinished line: nothing is joined across a hole.
  * 5. Bounds. A line's raw bytes are kept up to MAX_LINE_RAW (cut before a

@@ -45,6 +45,10 @@ test('m2-9: a program\'s CRLF through a PTY (CR CR LF) is searchable, and a prog
   out(src.journal, 'progress 10%\rprogress 100% ERROR\r\n');
   assert.deepEqual(lines(await search(src, { pattern: 'ERROR', since: 0 })), ['beta ERROR here', 'progress 100% ERROR']);
   assert.equal(cleanLine('text\r\r'), 'text');
+  // A line cleared with ESC [ K after the carriage return reads as the transcript shows it (the house's read of 78c4d6e, #22: it read `Doneress: 100%`).
+  out(src.journal, 'Progress: 100%\r\x1b[KDone\r\n');
+  assert.deepEqual(lines(await search(src, { pattern: 'Done', since: 0 })), ['Done']);
+  assert.deepEqual(lines(await search(src, { pattern: 'Doneress', since: 0 })), [], 'the overwritten tail is gone');
 });
 
 test('er-5: stdout and stderr of a process Run are separate streams whose lines never mix, nor with the terminal\'s', async () => {

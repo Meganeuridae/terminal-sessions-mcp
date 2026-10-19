@@ -354,6 +354,12 @@ test('api-20: maxInputBytes keeps the tail or head, never splits a character, an
   // Under the cap nothing is omitted.
   const small = await project(['short\r\n'], { cols: 80, maxInputBytes: 100 });
   assert.deepEqual(small, { text: 'short', truncated: false, omittedInputBytes: 0 });
+  // The cut never lands inside a control sequence: no half of one shows as text (the house's read of
+  // 78c4d6e, #22: a cut inside ESC [ 31 m showed `31mHello`, one inside an OSC 8 link the link's tail).
+  const red = await project([`${'A'.repeat(1000)}\x1b[31mHello\r\n`], { cols: 80, maxInputBytes: 8 });
+  assert.equal(red.text, 'Hello');
+  const link = await project([`${'x'.repeat(200)}\x1b]8;;https://example.com/a/very/long/link\x1b\\link\x1b]8;;\x1b\\ tail\r\n`], { cols: 80, maxInputBytes: 40 });
+  assert.equal(link.text, 'link tail');
 });
 
 // ───────────── floods (emu-3, tg-4) ─────────────

@@ -74,12 +74,15 @@ export function cutTail(text: string, maxBytes: number): { text: string; cut: bo
  * Where the last `maxBytes` UTF-8 bytes of `text` start (0 when it all fits), moved to the line
  * boundary after a newline that lies in the first half of them, so a torn first line is dropped
  * only when it costs at most half the budget; a newline that is the text's last character begins
- * no line and never moves the start. The one rule for every tail cut: results, pages, the
- * segmenter's bodies and the transcript's input.
+ * no line and never moves the start. The start never falls inside a control sequence, a surrogate
+ * pair or a CRLF (`safeCut`: it moves earlier, by at most the sequence it would have split), so the
+ * kept tail begins with no half of an escape shown as text (the house's read of 78c4d6e, #22: a cut
+ * inside `ESC [ 31 m` kept `31mHello`, and one inside an OSC 8 link kept the link's tail). The one
+ * rule for every tail cut: results, pages, the segmenter's bodies and the transcript's input.
  */
 export function tailStart(text: string, maxBytes: number): number {
   if (utf8Length(text) <= maxBytes) return 0;
-  const start = tailIndex(text, Math.max(0, maxBytes));
+  const start = safeCut(text, tailIndex(text, Math.max(0, maxBytes)));
   const nl = text.indexOf('\n', start);
   return nl !== -1 && nl + 1 < text.length && utf8Length(text.slice(start, nl + 1)) <= maxBytes / 2 ? nl + 1 : start;
 }
@@ -92,8 +95,8 @@ export function countLines(s: string): number {
 }
 
 /**
- * Output with its control sequences and control characters (other than tab and newline) removed,
- * and where each kept character came from, for cuts in the raw text. The sequences are read by
+ * Output with its control sequences and control characters (other than tab and newline; DEL
+ * included) removed, and where each kept character came from, for cuts in the raw text. The sequences are read by
  * `sequenceEnd`, one grammar with `safeCut` and `unfinishedSequence`: a charset designation such as
  * `ESC ( B` goes whole (the house's read of ed4ecac, #22: a two-byte rule left its `B`). An
  * unfinished sequence takes the rest of the text with it.
@@ -109,7 +112,7 @@ export function stripEscapes(s: string): { text: string; map: number[] } {
       i = end;
       continue;
     }
-    if (c < 0x20 && c !== 0x09 && c !== 0x0a) {
+    if ((c < 0x20 && c !== 0x09 && c !== 0x0a) || c === 0x7f) {
       i++;
       continue;
     }

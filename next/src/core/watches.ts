@@ -5,12 +5,17 @@
  * block up to a deadline for the same predicates, without leaving a watch behind.
  *
  * Patterns match whole lines, as `search` does (see StreamMatcher): each line of
- * each stream is tested once, `^` and `$` are the line's ends (a line longer than
- * the pattern's match window is matched on its head, and the hit says `clipped`),
- * and a line with no newline yet (a prompt)
- * is tested once its stream has been quiet for a moment. Every pattern compiles
- * on the linear-time engine, and a bad one is refused with invalid_argument when
- * the watch or wait is created.
+ * each stream is tested once, `^` and `$` are the line's ends, and a line with no
+ * newline yet (a prompt) is tested once its stream has been quiet for a moment.
+ * A line is read as it displays (`cleanLine`: backspaces, erases and in-line
+ * cursor moves applied), with one difference from search: a lone carriage return
+ * ends a *frame* here, tested as a line of its own, so a progress bar matches as
+ * it moves, where search reads only the line's last state. A line is matched on
+ * its head: within the pattern's match window, and within the first 64 KiB of a
+ * longer line (the rest is dropped); such a hit says `clipped` (the house's read
+ * of 78c4d6e, #22: a longer line was matched in pieces, so `^` matched mid-line).
+ * Every pattern compiles on the linear-time engine, and a bad one is refused
+ * with invalid_argument when the watch or wait is created.
  *
  * Quiet is measured on the monotonic clock. Output the manager saw arrive is
  * stamped as it arrives, so a silence measured from an earlier output is as exact
@@ -28,7 +33,7 @@ import type { EventOf, IntegrationLevel, JournalEvent, Principal, RunInfo, Seq }
 export type WatchKind = 'pattern' | 'silence' | 'idle';
 
 export interface WatchSpec {
-  /** Regex over output lines (control sequences stripped). */
+  /** Regex over output lines as they display (control sequences gone, overwrites applied; see the module comment). */
   pattern?: string;
   /** Fire each time output stops for this many ms (re-arms on the next output). */
   silenceMs?: number;

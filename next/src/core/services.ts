@@ -19,7 +19,7 @@
  * Further fail-pattern lines while already unhealthy for that reason update the
  * evidence and a repeat count on the monitor, not the journal (m2-16).
  */
-import { compileLinePattern, LineSplitter } from './ansi.js';
+import { compileLinePattern, LineSplitter, type SplitLine } from './ansi.js';
 import { testBounded } from './regex.js';
 import type { Journal } from './journal.js';
 import { timerMs } from './clock.js';
@@ -213,18 +213,20 @@ export class ServiceMonitor {
   }
 
   /** One line of the Run's output; true when a pattern matched it. A fail match wins over a ready match on the same line. */
-  private onLine(line: string): boolean {
+  private onLine(line: SplitLine): boolean {
     if (this.disposed || ended(this.statusValue)) return false;
     // Matched on the line's head within the pattern's match window, as watches and search are
-    // (the house's read of ed4ecac, #22: a long pattern on a 64 KiB line held the thread for seconds);
-    // the evidence says when only the head was looked at.
-    const evidenceOf = (clipped: boolean) => (clipped ? `${line.trim()} (matched on the line's head)` : line.trim());
-    const fail = this.failRe ? testBounded(this.failRe, line) : undefined;
+    // (the house's read of ed4ecac, #22: a long pattern on a 64 KiB line held the thread for seconds),
+    // and on the head the splitter kept of a line longer than MAX_LINE; the evidence says when only
+    // the head was looked at.
+    const text = line.text;
+    const evidenceOf = (clipped: boolean) => (clipped || line.cut ? `${text.trim()} (matched on the line's head)` : text.trim());
+    const fail = this.failRe ? testBounded(this.failRe, text) : undefined;
     if (fail?.matched) {
       this.onFail(evidenceOf(fail.clipped));
       return true;
     }
-    const ready = this.readyRe ? testBounded(this.readyRe, line) : undefined;
+    const ready = this.readyRe ? testBounded(this.readyRe, text) : undefined;
     if (ready?.matched) {
       this.onReadyLine(evidenceOf(ready.clipped));
       return true;

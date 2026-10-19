@@ -1,7 +1,7 @@
 /** api-20: UTF-8-safe cutting (src/core/text.ts) for byte-capped results (G11). */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cutTail, headIndex, indexAtByte, tailIndex, utf8Length, safeCut, sequenceEnd, unfinishedSequence } from '../src/core/text.js';
+import { cutTail, headIndex, indexAtByte, tailIndex, tailStart, utf8Length, safeCut, sequenceEnd, stripEscapes, unfinishedSequence } from '../src/core/text.js';
 
 const bytes = (s: string) => Buffer.byteLength(s);
 const clean = (s: string) => !s.includes('�') && Buffer.from(s).toString() === s;
@@ -87,4 +87,47 @@ test('two-byte ESC sequences end after their one final byte; intermediates still
   assert.equal(unfinishedSequence('abc\x1b('), 3);
   assert.equal(sequenceEnd('\x1b[?1l', 0), 5);
   assert.equal(sequenceEnd('\x1b[?1h\x1b=', 5), 7, 'xterm turns keypad mode on with CSI ?1h ESC =');
+});
+
+test('a tail cut never starts inside a control sequence, a surrogate pair or a CRLF: it moves earlier, by at most the sequence it would have split', () => {
+  // The house's read of 78c4d6e (#22): `tailStart` over 1,000 A and `ESC [ 31 m Hello` with 8 bytes kept `31mHello`.
+  const red = `${'A'.repeat(1000)}\x1b[31mHello`;
+  assert.equal(red.slice(tailStart(red, 8)), '\x1b[31mHello');
+  assert.equal(cutTail(red, 8).text, '\x1b[31mHello');
+  // An OSC 8 link cut at 40 showed the link's tail as text.
+  const link = `${'x'.repeat(200)}\x1b]8;;https://example.com/a/very/long/link\x1b\\link\x1b]8;;\x1b\\ tail`;
+  const at40 = link.slice(tailStart(link, 40));
+  assert.ok(at40.startsWith('\x1b]8;;https://example.com/a/very/long/link\x1b\\'), JSON.stringify(at40));
+  assert.equal(unfinishedSequence(link.slice(0, tailStart(link, 40))), tailStart(link, 40), 'the dropped head ends at no open sequence');
+  // A pair and a CRLF at the cut.
+  const pair = `${'a'.repeat(100)}😀b`;
+  assert.equal(pair.slice(tailStart(pair, 5)), '😀b');
+  const crlf = `${'a'.repeat(100)}\r\nb`;
+  assert.equal(crlf.slice(tailStart(crlf, 2)), '\r\nb');
+  // The line-boundary rule still applies after the safe cut.
+  const lines = `${'a'.repeat(100)}\n\x1b[1mb\nc`;
+  assert.equal(lines.slice(tailStart(lines, 12)), '\x1b[1mb\nc');
+});
+
+test('stripEscapes: the one grammar, with a map from each kept character to its place in the raw text', () => {
+  // Readers: the typeahead echo, the secret-prompt check and the plumbing cut (the house's read of 78c4d6e, #22, found it unspecified).
+  const plain = stripEscapes('\x1b[1;31mred\x1b[0m ok');
+  assert.equal(plain.text, 'red ok');
+  assert.deepEqual(plain.map, [7, 8, 9, 14, 15, 16], 'each kept character maps to its raw index');
+  // Two-byte forms (ESC 7, ESC 8, ESC =, ESC >, ESC M, ESC c) take exactly one byte after ESC.
+  assert.equal(stripEscapes('a\x1b7b\x1b8c\x1b=d\x1b>e\x1bMf\x1bcg').text, 'abcdefg');
+  // Intermediate forms (charset designations, DECALN, UTF-8 select) take their final byte too: ESC ( B leaves no B.
+  assert.equal(stripEscapes('a\x1b(Bb\x1b)0c\x1b#8d\x1b%Ge').text, 'abcde');
+  // OSC to BEL or ST, DCS to ST, the C1 CSI.
+  assert.equal(stripEscapes('x\x1b]0;title\x07y\x1b]8;;u\x1b\\z\x1bPq#0\x1b\\w\x9b0mv').text, 'xyzwv');
+  // An unfinished sequence takes the rest of the text with it: its payload is not text.
+  assert.deepEqual(stripEscapes('ready\x1b]0;title'), { text: 'ready', map: [0, 1, 2, 3, 4] });
+  assert.equal(stripEscapes('working \x1b[3').text, 'working ');
+  assert.equal(stripEscapes('tail\x1b').text, 'tail');
+  // Controls other than tab and newline go (CR included: the readers compare echoes, not displays); the map skips them.
+  const ctl = stripEscapes('a\rb\x00c\td\ne\x7f');
+  assert.equal(ctl.text, 'abc\td\ne');
+  assert.deepEqual(ctl.map, [0, 2, 4, 5, 6, 7, 8]);
+  // A U+FFFD or a private-use character is text.
+  assert.equal(stripEscapes('\uE000\uFFFD').text, '\uE000\uFFFD');
 });

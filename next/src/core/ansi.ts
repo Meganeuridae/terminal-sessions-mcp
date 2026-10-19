@@ -1,47 +1,67 @@
 /**
- * Control-sequence stripping for *matching* only (probes, watches, search
- * previews). Rendering text for reading goes through the transcript projection
- * (§6), never through this.
+ * Lines of output for *matching*: `cleanLine` reads one line as the transcript
+ * would display it, and `LineSplitter`/`StreamMatcher` cut a stream into such
+ * lines for watches, wait_for and service probes; search reads its lines through
+ * `cleanLine` too. Rendering text for reading goes through the transcript
+ * projection (§6), never through this.
  */
 import { err } from './errors.js';
 import { compileUserRegex, execBounded } from './regex.js';
-import { sequenceEnd } from './text.js';
-
-// CSI, OSC (BEL or ST terminated), DCS/SOS/PM/APC strings, and escape sequences
-// proper: ESC, any intermediates (0x20–0x2f), one final byte (0x30–0x7e). The
-// last covers the two-byte forms (ESC 7, ESC =, ESC c) and the charset
-// designations (ESC ( B, which `tput sgr0` prints before ESC [ m: the house's
-// read of ed4ecac, #22, found `(B` left in the text).
-const SEQ = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[P^_X][^\x1b]*\x1b\\|\x1b[ -/]*[0-~]|\x9b[0-?]*[ -/]*[@-~]/g;
-// C0 controls other than tab and newline (CR is kept for the line splitter below).
-const CTRL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
-
-export function stripAnsi(s: string): string {
-  return s.replace(SEQ, '').replace(CTRL, '');
-}
+import { sequenceEnd, unfinishedSequence } from './text.js';
 
 /**
- * One line of output as a reader sees it: control sequences gone, carriage returns and backspaces
- * applied as overwrites, the way the transcript renders them, so `ABCDE\rXY` reads `XYCDE` and a
- * spinner's `|\b/\b-\b\\` reads its last frame. Trailing blanks stay (a pattern may anchor on them);
- * a display trims them. Search and the segmenter read lines through this one function (the house's
- * read of 3eade8a, #22). The overwrites are applied on the raw text, sequences skipped by
- * `sequenceEnd`, so no character stands in for a backspace: a U+E000 in the output is text (the
- * house's read of 39787b3, #22, found it taken for one).
+ * A move past the end of what a line holds pads it with blanks when the next character is
+ * written, as a terminal does up to its width; with no width here, this many cells at most.
+ */
+const MOVE_PAST_END = 1024;
+
+/** The in-line controls `cleanLine` applies: erase in line (K), cursor back (D), forward (C), to a column (G). */
+const LINE_CONTROL = /^(?:\x1b\[|\x9b)([0-9;]*)([KDCG])$/;
+
+/**
+ * One line of output as a reader sees it, rendered as the transcript renders a row: a cursor over
+ * a row of cells, to which a carriage return (column 0), a backspace (one cell left), erase in line
+ * (`ESC [ K` to the end, `1K` to the start, `2K` the whole row), and cursor back, forward and
+ * to-column moves (`ESC [ n D`, `n C`, `n G`) apply; every other sequence is dropped (the house's
+ * read of 78c4d6e, #22: `Progress: 100%\r\x1b[KDone` read `Doneress: 100%` where the transcript
+ * shows `Done`). So `ABCDE\rXY` reads `XYCDE`, `abcdef\x1b[3DXY` reads `abcXYf`, `abc\x1b[5Cz` reads
+ * `abc     z`, and a spinner's `|\b/\b-\b\\` reads its last frame. Trailing blanks stay (a pattern
+ * may anchor on them); a display trims them. Search, watches and the segmenter read lines through
+ * this one function (the house's read of 3eade8a, #22). The overwrites are applied on the raw
+ * text, sequences skipped by `sequenceEnd`, so no character stands in for a backspace: a U+E000 in
+ * the output is text (the house's read of 39787b3, #22, found it taken for one). A sequence left
+ * unfinished at the end takes the rest of the text with it: its payload is not text (the same
+ * read: `ready\x1b]0;title` read `ready]0;title`).
  */
 export function cleanLine(raw: string): string {
   const cells: string[] = [];
   let col = 0;
+  const moveTo = (c: number) => (col = Math.max(0, Math.min(c, cells.length + MOVE_PAST_END)));
   for (let i = 0; i < raw.length; ) {
     const c = raw.charCodeAt(i);
     if (c === 0x1b || c === 0x9b) {
-      i = sequenceEnd(raw, i) ?? i + 1; // an unfinished sequence loses its ESC alone, as stripAnsi drops it: the text after a stray ESC stays matchable
+      const end = sequenceEnd(raw, i);
+      if (end === undefined) break;
+      const m = LINE_CONTROL.exec(raw.slice(i, end));
+      if (m) {
+        const n = Number(m[1]!.split(';')[0]);
+        const arg = Number.isFinite(n) ? n : 0;
+        if (m[2] === 'K') {
+          if (arg === 0) cells.length = Math.min(cells.length, col);
+          else if (arg === 1) for (let k = 0; k <= col && k < cells.length; k++) cells[k] = ' ';
+          else if (arg === 2) cells.length = 0;
+        } else if (m[2] === 'D') moveTo(col - Math.max(1, arg));
+        else if (m[2] === 'C') moveTo(col + Math.max(1, arg));
+        else moveTo(Math.max(1, arg) - 1);
+      }
+      i = end;
       continue;
     }
     if (c === 0x0d) col = 0;
     else if (c === 0x08) col = Math.max(0, col - 1);
     else if ((c >= 0x20 && c !== 0x7f) || c === 0x09 || c === 0x0a) {
       const ch = String.fromCodePoint(raw.codePointAt(i)!);
+      while (cells.length < col) cells.push(' ');
       cells[col++] = ch;
       i += ch.length;
       continue;
@@ -51,7 +71,7 @@ export function cleanLine(raw: string): string {
   return cells.join('');
 }
 
-/** The longest line a StreamMatcher holds: a longer one is matched in pieces of this size. */
+/** The longest line a StreamMatcher holds: a longer one is matched on its first MAX_LINE, the hit says `clipped`, and the rest of the line is dropped. */
 export const MAX_LINE = 64 * 1024;
 
 /** How long a stream must be quiet before its unterminated line (a prompt like `Password:`) is matched. */
@@ -74,46 +94,61 @@ export function compileLinePattern(pattern: string): RegExp {
   return re;
 }
 
+/** One line (or frame) a LineSplitter cut, read through `cleanLine`. */
+export interface SplitLine {
+  text: string;
+  /** The line was longer than MAX_LINE: this is its head, and the rest was dropped. */
+  cut?: true;
+}
+
 export interface LineMatch {
   /** The text the pattern matched. */
   match: string;
-  /** The whole line it was found in, control sequences stripped. */
+  /** The whole line it was found in, as `cleanLine` reads it. */
   line: string;
-  /** The line is longer than the pattern's match window: only its head was searched (`$` meant the window's end). */
+  /** Only the line's head was searched: it is longer than the pattern's match window (`$` meant the window's end), or longer than MAX_LINE (the rest was dropped). */
   clipped?: true;
 }
 
 export interface LineSplitterOptions {
   /**
-   * Offered the unterminated line (stripped) once the stream has been quiet for
+   * Offered the unterminated line (cleaned) once the stream has been quiet for
    * `partialAfterMs`; it runs from a timer, not from `feed`. Returning true spends
    * the line: it is not returned again when it completes. Without it, only
    * terminated lines come out.
    */
-  onPartial?: (line: string) => boolean;
+  onPartial?: (line: SplitLine) => boolean;
   /** Quiet period before the unterminated line is offered (ms); default PARTIAL_QUIET_MS. */
   partialAfterMs?: number;
 }
 
 /**
- * Cuts one output stream into lines, the way `search` reads it: LF, CRLF or a lone
- * CR ends a line, and control sequences are stripped from each complete line (a
- * sequence split by a write completes before it is stripped). Empty lines are
- * dropped. A line longer than MAX_LINE comes out in pieces of that size, so memory
- * and a regex's work per line stay bounded. The unterminated line (a prompt:
+ * Cuts one output stream into lines for matching. LF or CRLF ends a line, as in
+ * `search`; a lone CR ends a *frame*, which is offered as a line too, so a progress
+ * bar's frames (`10%\r20%\r`) match as they come, where search reads only the
+ * line's last state (`ABCDE\rXY` is the frames `ABCDE` and `XY` here and the line
+ * `XYCDE` to search). Each line or frame is read through `cleanLine`, so backspaces,
+ * erases and in-line cursor moves apply as they display and `ab\bc` is `ac` to both
+ * (the house's read of 78c4d6e, #22: a watch read it as `abc`). A sequence split by
+ * a write completes before the line is read. Empty lines are dropped. A line longer
+ * than MAX_LINE is cut there: its head comes out marked `cut` and the rest of the
+ * line is dropped, as search keeps only a line's head (the same read: a line
+ * matched in pieces let `^MATCH` hit mid-line). The unterminated line (a prompt:
  * `Password: `, `>>> `) can be offered once the stream has gone quiet. One splitter
  * per stream: interleaving two streams' writes would join their partial lines.
  */
 export class LineSplitter {
-  /** The unterminated line, raw. */
+  /** The unterminated line, raw (its head, once `cut`). */
   private raw = '';
+  /** The unterminated line passed MAX_LINE: `raw` is its head, and the rest is dropped as it comes. */
+  private cut = false;
   /** The last chunk ended in CR: an LF opening the next one belongs to it. */
   private pendingCr = false;
   /** The unterminated line was consumed as a prompt. */
   private spent = false;
   private timer: NodeJS.Timeout | undefined;
   private readonly quietMs: number;
-  private readonly onPartial: ((line: string) => boolean) | undefined;
+  private readonly onPartial: ((line: SplitLine) => boolean) | undefined;
 
   constructor(opts: LineSplitterOptions = {}) {
     this.quietMs = opts.partialAfterMs ?? PARTIAL_QUIET_MS;
@@ -121,8 +156,8 @@ export class LineSplitter {
   }
 
   /** Feed a chunk; returns the lines it completed, in order. */
-  feed(chunk: string): string[] {
-    const out: string[] = [];
+  feed(chunk: string): SplitLine[] {
+    const out: SplitLine[] = [];
     if (!chunk) return out;
     let text = chunk;
     if (this.pendingCr && text.startsWith('\n')) text = text.slice(1);
@@ -130,24 +165,29 @@ export class LineSplitter {
     const parts = text.split(/\r\n|\r|\n/);
     const last = parts.pop()!;
     for (const part of parts) {
-      this.raw += part;
+      this.add(part);
       this.complete(out);
     }
-    this.raw += last;
-    while (this.raw.length > MAX_LINE) {
-      // A line this long is cut; the rest starts a new piece.
-      const rest = this.raw.slice(MAX_LINE);
-      this.raw = this.raw.slice(0, MAX_LINE);
-      this.complete(out);
-      this.raw = rest;
-    }
+    this.add(last);
     this.schedulePartial();
     return out;
   }
 
+  /** Append to the unterminated line, keeping only its first MAX_LINE (cut before a sequence the cut would split). */
+  private add(part: string): void {
+    if (this.cut || !part) return;
+    if (this.raw.length + part.length <= MAX_LINE) {
+      this.raw += part;
+      return;
+    }
+    const head = this.raw + part.slice(0, MAX_LINE - this.raw.length);
+    this.raw = head.slice(0, unfinishedSequence(head));
+    this.cut = true;
+  }
+
   /** The stream ended: the unterminated line is complete (unless it was spent as a prompt). */
-  flush(): string[] {
-    const out: string[] = [];
+  flush(): SplitLine[] {
+    const out: SplitLine[] = [];
     this.complete(out);
     this.pendingCr = false;
     if (this.timer) clearTimeout(this.timer);
@@ -161,16 +201,18 @@ export class LineSplitter {
     this.timer = undefined;
   }
 
-  private complete(out: string[]): void {
-    const raw = this.raw;
-    const spent = this.spent;
+  private current(): SplitLine | undefined {
+    const text = cleanLine(this.raw);
+    if (!text) return undefined;
+    return this.cut ? { text, cut: true } : { text };
+  }
+
+  private complete(out: SplitLine[]): void {
+    const line = this.spent ? undefined : this.current();
     this.raw = '';
+    this.cut = false;
     this.spent = false;
-    if (spent) return;
-    for (let i = 0; i < raw.length; i += MAX_LINE) {
-      const line = stripAnsi(raw.slice(i, i + MAX_LINE));
-      if (line) out.push(line);
-    }
+    if (line) out.push(line);
   }
 
   private schedulePartial(): void {
@@ -187,7 +229,7 @@ export class LineSplitter {
     }
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      const line = this.spent ? '' : stripAnsi(this.raw);
+      const line = this.spent ? undefined : this.current();
       if (line && this.onPartial?.(line)) this.spent = true;
     }, this.quietMs);
     // A pending prompt check never keeps the process alive; whoever waits on it has its own timer.
@@ -214,9 +256,10 @@ export interface StreamMatcherOptions {
  * cut short and no text is matched twice. An unterminated line is matched once
  * the stream has been quiet for `partialAfterMs` when `onPartial` is given; a
  * line that matched that way is not matched again when it completes. A line is
- * matched on its head within the pattern's match window (`execBounded`), as
+ * matched on its head: within the pattern's match window (`execBounded`), as
  * search matches it, so a long pattern on a long line costs a bounded match on
- * the daemon's thread; a hit on such a line says `clipped`.
+ * the daemon's thread, and within the first MAX_LINE the splitter kept; a hit on
+ * such a line says `clipped`.
  */
 export class StreamMatcher {
   private readonly lines: LineSplitter;
@@ -253,7 +296,7 @@ export class StreamMatcher {
     this.lines.dispose();
   }
 
-  private collect(lines: string[]): LineMatch[] {
+  private collect(lines: SplitLine[]): LineMatch[] {
     const out: LineMatch[] = [];
     for (const line of lines) {
       const hit = this.test(line);
@@ -262,11 +305,11 @@ export class StreamMatcher {
     return out;
   }
 
-  private test(line: string): LineMatch | undefined {
-    const r = execBounded(this.re, line);
+  private test(line: SplitLine): LineMatch | undefined {
+    const r = execBounded(this.re, line.text);
     if (!r.match) return undefined;
-    const hit: LineMatch = { match: r.match[0], line };
-    if (r.clipped) hit.clipped = true;
+    const hit: LineMatch = { match: r.match[0], line: line.text };
+    if (r.clipped || line.cut) hit.clipped = true;
     return hit;
   }
 }
