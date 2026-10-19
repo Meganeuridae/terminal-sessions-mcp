@@ -69,7 +69,8 @@ export interface PlumbingOf {
  * for history. Under `rich` nothing is cut: the output runs from the pre-execution mark to the
  * end mark, and the marks are not output. Under `basic` the first line is the echo of the typed
  * line. Under `marker` and `inline` the marks carry the Run's nonce, and the cut is by it: the
- * echo of the typed line (its last echo: typed ahead of the prompt it echoes twice), an inline
+ * echo of the typed line at the output's head (the lines echoing it without a break: typed ahead
+ * of the prompt it echoes twice, and a redraw shows it in pieces), an inline
  * Run's start-marker line or the rest of it (the output begins right after `>>>`), and
  * everything from the end marker on, or from the probe answer the session accepted. Before that
  * end, every probe's echo line and every rejected answer's line is struck on its own, and the
@@ -92,13 +93,17 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   const nonce = of.nonce ?? NONCE;
   const { text, map } = stripEscapes(raw);
   let from = 0;
-  // The end of the last echo of the typed line; the echo of a line longer than the terminal can
-  // show its nonce split by the editor's redraw, which the pattern allows for, so the newline
-  // looked for is the one after the match's end.
-  let lastEcho = -1;
-  for (const m of text.matchAll(wrapperEcho(nonce))) lastEcho = m.index + m[0].length;
-  if (lastEcho !== -1) {
-    const nl = text.indexOf('\n', lastEcho);
+  // The typed line's echo is the output's first line, and only the lines that follow it without a
+  // break are more of it: the same line echoed again (typed ahead of its prompt), or the pieces of
+  // a redraw, which can split the nonce across lines. A line in the echo's shape after the start
+  // marker or after output is the program's: `history 1` in a declared bash prints the typed line
+  // with the Run's own nonce, and the rule that took the last such line for the echo cut everything
+  // before it (the house's read of 78c4d6e, #22, comment 6269901528).
+  const echoes = [...text.matchAll(wrapperEcho(nonce))].map((m) => [m.index, m.index + m[0].length] as const);
+  for (;;) {
+    const nl = text.indexOf('\n', from);
+    const lineEnd = nl === -1 ? text.length : nl;
+    if (!echoes.some(([s, e]) => s < lineEnd && e > from)) break;
     if (nl === -1) return '';
     from = nl + 1;
   }
@@ -120,10 +125,14 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   for (const m of rest.matchAll(probeAnswer(nonce))) {
     if (m.index >= to) break;
     // Accepted as the session accepts it (applyInlineMarker): the marker strategy's answer names
-    // no pid; an inline answer must carry the Run's token, or no token with the very pid the start
-    // marker named (the declared shell replaced in place by an exec); from before tokens, that pid,
-    // or any when the output does not say which.
-    const ok = m[2] === undefined || (m[3] !== undefined ? m[3] === m[1] || (m[3] === '' && pid !== undefined && m[2] === pid) : pid === undefined || m[2] === pid);
+    // no pid. An inline answer is judged by the pid first: when the start marker (or the live
+    // session) named the declared shell's pid, only that pid answers for the Run, with the Run's
+    // token or none (no token is the declared shell replaced in place by an exec); the Run's token
+    // on another pid is a nested shell that inherited the variable (`set -a`), a stranger's answer
+    // the session rejects, and the cutter accepted, ending the result at it (the house's read of
+    // 78c4d6e, #22, comment 6269901528). With no pid known, the token is the one evidence: the
+    // Run's token is accepted, an empty one is not; from before tokens, any pid.
+    const ok = m[2] === undefined || (pid !== undefined ? m[2] === pid && (m[3] === undefined || m[3] === '' || m[3] === m[1]) : m[3] === undefined || m[3] === m[1]);
     if (ok) {
       to = m.index;
       break;

@@ -53,7 +53,7 @@ test('with the nonce the Run recorded, a program line in a mark’s shape is out
   // A program (history, a cat of a log) prints a line in the typed wrapper's shape, another Run's nonce.
   const echoShaped = `${typed(N)}line1\n${typed('0badf00d').trimStart()}line2\nline3\n<<<EXIT:${N}:0>>>\n`;
   assert.equal(cutPlumbing(echoShaped, marker), `line1\n${typed('0badf00d').trimStart()}line2\nline3\n`, 'the shaped line stays, and nothing before it is lost');
-  assert.equal(cutPlumbing(echoShaped), 'line2\nline3\n', 'by shape alone (no nonce recorded) it is taken for the echo, and line1 is lost');
+  assert.equal(cutPlumbing(echoShaped), `line1\n${typed('0badf00d').trimStart()}line2\nline3\n`, 'by shape alone (no nonce recorded) it is output too: only the lines at the head are the echo');
   // A running Run prints a line shaped like an end marker.
   const exitShaped = `${typed(N)}line1\n<<<EXIT:0badf00d:0>>>\nline3\n`;
   assert.equal(cutPlumbing(exitShaped, marker), 'line1\n<<<EXIT:0badf00d:0>>>\nline3\n', 'the Run is still running: nothing is cut after the echo');
@@ -137,4 +137,46 @@ test('a typed line the editor wraps inside its nonce is still cut: bash 5.2 at a
   assert.equal(cutPlumbing(inWord, { strategy: 'marker', nonce }), 'out\r\n');
   // The printed marks are never taken for echoes: the allowance adds nothing to `EXIT`.
   assert.equal(cutPlumbing(`${typed(nonce)}<<<EXIT:${nonce}:0>>>\n`, { strategy: 'marker', nonce }), '');
+});
+
+test('a probe answer with the Run’s token from another pid is a stranger’s: the pid the start marker named judges first, then the token', () => {
+  // The house's read of 78c4d6e (#22, comment 6269901528): with `set -a` in a declared sh, a nested sh inherited the
+  // token and answered with its own pid; the session rejected it and the Run went on, but the cutter ended the result there.
+  const inline = { strategy: 'inline' as const, nonce: N };
+  const echo = ` printf '<<<PRO''BE:${N}:%s:%s>>>\\n' "$$" "$\{__tsm_r-}"`;
+  const history = `<<<START:${N}:1000>>>\r\nA\r\n$ ^C\r\n$ ${echo}\r\n<<<PROBE:${N}:2000:${N}>>>\r\n$ echo after\r\nafter\r\n$ exit\r\n<<<EXIT:${N}:0>>>\r\n`;
+  assert.equal(cutPlumbing(history, inline), 'A\r\n$ ^C\r\n$ echo after\r\nafter\r\n$ exit\r\n');
+  // Live, by the pid the session knows: the same.
+  assert.equal(cutPlumbing(`\r\n$ ^C\r\n$ ${echo}\r\n<<<PROBE:${N}:2000:${N}>>>\r\n$ echo after\r\nafter\r\n$ exit\r\n<<<EXIT:${N}:0>>>`, { ...inline, pid: '1000' }), '$ ^C\r\n$ echo after\r\nafter\r\n$ exit\r\n');
+  // The declared shell's own pid with the token, or with none (replaced in place), still ends it.
+  assert.equal(cutPlumbing(`<<<START:${N}:1000>>>\r\nA\r\n$ ${echo}\r\n<<<PROBE:${N}:1000:${N}>>>\r\nB\r\n`, inline), 'A\r\n');
+  assert.equal(cutPlumbing(`<<<START:${N}:1000>>>\r\nA\r\n$ ${echo}\r\n<<<PROBE:${N}:1000:>>>\r\nB\r\n`, inline), 'A\r\n');
+  // That pid with another Run's token is a stranger's too.
+  assert.equal(cutPlumbing(`<<<START:${N}:1000>>>\r\nA\r\n$ ${echo}\r\n<<<PROBE:${N}:1000:0badf00d>>>\r\nB\r\n`, inline), 'A\r\nB\r\n');
+  // With no pid known (a read from after the start marker, no live pid), the token is the one evidence, as before.
+  assert.equal(cutPlumbing(`\r\nA\r\n$ ${echo}\r\n<<<PROBE:${N}:2000:${N}>>>\r\nB\r\n`, inline), 'A\r\n');
+});
+
+test('a wrapper-shaped line in a Run’s output is output: only the echo lines at the output’s head are the typed line', () => {
+  // The house's read of 78c4d6e (#22, comment 6269901528): in a declared bash, `echo before-$((1+1)); history 1` returned
+  // an empty result, because `history 1` printed the typed line with the Run's own nonce and the cut took it for the echo.
+  const inline = { strategy: 'inline' as const, nonce: N };
+  const typedStart = ` printf '<<<STAR''T:${N}:%s>>>\\n' "$$"; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:${N}:%s>>>\\n' "$?"`;
+  const recalled = `  502 ${typedStart}`;
+  // Live: the Run's output begins after the start marker.
+  assert.equal(cutPlumbing(`\r\nbefore-2\r\n${recalled}\r\n<<<EXIT:${N}:0>>>`, inline), `before-2\r\n${recalled}\r\n`);
+  // History: the echo line, the start marker, then the output with the recalled line in it.
+  assert.equal(cutPlumbing(`${typedStart}\r\n<<<START:${N}:4242>>>\r\nbefore-2\r\n${recalled}\r\n<<<EXIT:${N}:0>>>\r\n`, inline), `before-2\r\n${recalled}\r\n`);
+  // `history | tail -n 3` and `fc -l -1` print it among other lines, or with a tab.
+  const tail3 = `  500  ls\r\n  501  cd /tmp\r\n  502 ${typedStart}`;
+  assert.equal(cutPlumbing(`\r\nbefore-2\r\n${tail3}\r\n<<<EXIT:${N}:0>>>`, inline), `before-2\r\n${tail3}\r\n`);
+  const fc = `502\t${typedStart}`;
+  assert.equal(cutPlumbing(`\r\nbefore-2\r\n${fc}\r\n<<<EXIT:${N}:0>>>`, inline), `before-2\r\n${fc}\r\n`);
+  // The marker strategy: the same shape from a shell's history is output after the echo line.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  assert.equal(cutPlumbing(`${typed(N)}before-2\n  502 ${typed(N).trim()}\n<<<EXIT:${N}:0>>>\n$ `, marker), `before-2\n  502 ${typed(N).trim()}\n`);
+  // The echo typed ahead of its prompt shows twice at the head: both lines are the typed line.
+  assert.equal(cutPlumbing(`${typed(N)}$ ${typed(N)}out\n<<<EXIT:${N}:0>>>\n`, marker), 'out\n');
+  // Nothing but the echo (a Run cut off before any output) is no output.
+  assert.equal(cutPlumbing(typed(N).trimEnd(), marker), '');
 });
