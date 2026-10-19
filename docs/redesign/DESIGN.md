@@ -1151,9 +1151,9 @@ addition; nothing about them touches the live PTY.
 
 ## 15. Quality bar
 
-- TypeScript strict, ESM, Node ≥ 20.19 (`engines` says `>=20.19.0 <25.0.0`: 20.19 is the
-  earliest Node 20 that loads the package's dependencies, and Node 18 has reached its end of
-  life). No `any` at boundaries. Every operation validated
+- TypeScript strict, ESM, Node ≥ 20.19 (`engines` says `>=20.19.0 <21 || >=22.12.0 <25.0.0`: 20.19 is the
+  earliest Node 20 that loads the package's dependencies, Node 18 has reached its end of
+  life, and 21 and 22 before 22.12 are left out because the 1.x session-cli cannot run on them). No `any` at boundaries. Every operation validated
   against its schema before dispatch. Errors are typed with codes. A tool's failure reaches
   hosts as MCP carries one: an `isError` result whose text opens with the code
   (`session_not_found: …`) and carries no envelope; a protocol failure is a JSON-RPC error.
@@ -1367,11 +1367,13 @@ type JournalEvent =
   | { seq; ts; type: 'output';      data: string; runId?; stream: 'pty'|'stdout'|'stderr'; attribution?: 'exact'|'temporal' }
   | { seq; ts; type: 'input';       data: string; principal; kind: 'text'|'keys'|'paste'|'protocol-reply'; sensitive?: true; runId? }  // sensitive: data is '[redacted]'
   | { seq; ts; type: 'run.admit';   runId; target: 'shell'|'process'; line?|argv?; principal; origin: 'self'|'human'|'agent'|'system'; queued: boolean; idem?; shell?; within?: string|null }  // idem: key identity (G16); shell/within: a declared shell's Run (§8.1)
-  | { seq; ts; type: 'run.start';   runId; cwd; line?; envBasis?: 'configured'|'snapshot'; cols?; rows?; pid?; pgid?; strategy?: 'rich'|'basic'|'marker'|'inline'; nonce? }
+  | { seq; ts; type: 'run.start';   runId; cwd; line?; envBasis?: 'configured'|'snapshot'; cols?; rows?; pid?; pgid?; startTicks?; bootId?; strategy?: 'rich'|'basic'|'marker'|'inline'; nonce? }
                                     // C mark, or spawn. cols/rows: the geometry the transcript is projected at (§6); pid/pgid: a process Run's group, ended by recovery (G19c);
+                                    // startTicks/bootId: the leader's /proc start time in clock ticks and the boot id, so recovery judges its group without a clock frame (Linux);
                                     // strategy/nonce: how the Run's boundaries were observed and the nonce in its marks, so history cuts its plumbing as the live transcript did (§8.1)
-  | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs; leftovers?: true; pipeStatus?: number[] }
-                                    // leftovers: a process Run's group had members when its process exited; pipeStatus: a pipeline's statuses, one per command (§8.1)
+  | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true; lastAliveTs? }
+                                    // leftovers: a process Run's group had members when its process exited; pipeStatus: a pipeline's statuses, one per command (§8.1);
+                                    // recoveredEnd: recovery wrote this end; groupJudged: recovery ended or left its group; lastAliveTs: the dead daemon's last journal time, which bounds the group a later recovery may take for the Run's
   | { seq; ts; type: 'run.waiting'; runId; lastLine; silentMs; state }                        // G15's input-wanted heuristic, journaled with its evidence
   | { seq; ts; type: 'service';     runId; status: 'starting'|'ready'|'running'|'unhealthy'|'exited'|'lost'; probe; principal; name?; evidence?; exit? }  // §8.3; principal started it
   | { seq; ts; type: 'prompt';      cwd; phase: 'start'|'end' }                              // A and B marks

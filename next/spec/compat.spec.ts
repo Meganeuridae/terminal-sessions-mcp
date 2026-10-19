@@ -302,6 +302,9 @@ test('78c4d6e 18: a many-page runCommand advances the deferred cursor across eve
 
 test('78c4d6e 12: a program line in a mark’s shape with no Run’s nonce survives tailLogs and searchLogs; a real Run’s plumbing is still cut', async () => {
   await call('runCommand', { session: 'shape', command: 'echo real-output' });
+  // A process Run in the same window records no strategy and no nonce; that is not a Run from before the
+  // recording, and must not put the filter back on shapes (a review of the fix, #22).
+  await app.run(A, { session: 'shape', command: 'true', target: 'process', wait: 5000 });
   const live = registry.get('shape');
   assert.ok(live?.kind === 'live');
   // A program prints something shaped like an end marker, under a nonce no Run here recorded.

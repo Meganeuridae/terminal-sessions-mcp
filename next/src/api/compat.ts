@@ -284,7 +284,7 @@ async function textTail(ctx: ToolContext, session: string, n: number, d: Drawn |
     if (short && full && !r.truncated && asked < TAIL_MAX) continue;
     // The page's first line is shown: the reader says where what came before ends and whether the line is whole;
     // lines before the first shown were dropped as plumbing: the page before must include the first event read.
-    const cut = (why: string): TailCut => (kept.first === 0 ? { until: r.lines?.before ?? r.seq[0], cutHead: r.lines?.cutHead === true, why } : { until: r.seq[0], cutHead: false, why });
+    const cut = (why: string): TailCut => (kept.first === 0 ? { until: r.lines?.before ?? r.seq[0] - 1, cutHead: r.lines?.cutHead === true, why } : { until: r.seq[0], cutHead: false, why });
     if (r.truncated) return { lines: kept.lines, cut: cut(gapsText(r) ?? 'the tail reached a bound, or a line longer than it') };
     if (short && full) return { lines: kept.lines, cut: cut(`the daemon's own lines took the rest of the ${asked} lines read`) };
     return { lines: kept.lines };
@@ -308,7 +308,7 @@ async function rawTail(ctx: ToolContext, session: string, n: number, d: Drawn | 
     let k = starts.length - 1;
     while (k > 0 && starts[k]!.at > at) k--;
     const shown = starts[k]!;
-    const cutHead = k === 0 && at === 0 && older;
+    const cutHead = k === 0 && at === 0 && older && events[0]!.type === 'output';
     const tailCut = (why: string): TailCut => ({ until: shown.at === at && !cutHead ? shown.seq - 1 : shown.seq, cutHead, why });
     if (cut !== undefined) return { lines: kept.lines, cut: tailCut('the raw tail reached its byte or page bound') };
     if (short && older) return { lines: kept.lines, cut: tailCut("the daemon's own lines took the rest of what was read") };

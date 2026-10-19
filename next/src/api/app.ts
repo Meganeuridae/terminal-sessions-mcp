@@ -1267,6 +1267,9 @@ export class App {
     const out: Array<Pick<PlumbingOf, 'strategy' | 'nonce'>> = [];
     for (const r of s.listRuns()) {
       if ((r.seq.end ?? Number.POSITIVE_INFINITY) < o.from || r.seq.admit > o.to) continue;
+      // Only a shell Run prints marks; a process Run records no strategy, and reading its absence as "journaled
+      // before the recording" would cut program lines by shape whenever one is in the window.
+      if (r.target !== 'shell') continue;
       const p: Pick<PlumbingOf, 'strategy' | 'nonce'> = {};
       if (r.strategy !== undefined) p.strategy = r.strategy;
       if (r.nonce !== undefined) p.nonce = r.nonce;
