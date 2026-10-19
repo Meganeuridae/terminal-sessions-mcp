@@ -488,6 +488,7 @@ async function main(): Promise<void> {
   const floor = /^\d+$/.test(floorSetting.trim()) ? Number(floorSetting) : NaN;
   if (!Number.isInteger(floor) || floor < 0) fail('--disk-floor-bytes must be a whole number of bytes (0 turns the floor off)');
   if (floor > 0) registryOpts.diskFloorBytes = floor;
+  registryOpts.log = (level, text, fields) => log(level, text, fields);
 
   // The port first, then the data dir's lock, then recovery (see the header).
   let held: HeldPort | undefined;

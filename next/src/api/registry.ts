@@ -52,6 +52,8 @@ export interface RegistryOptions {
    * Absent or 0: no floor.
    */
   diskFloorBytes?: number;
+  /** The daemon's log, for what a session's journal has to say about its disk (writes refused, writing resumed). */
+  log?: (level: 'warn' | 'info', text: string, fields?: Record<string, unknown>) => void;
   /**
    * Take the data dir's lock (default true). Tests only: `false` lets a registry recover a
    * data dir another process holds — which a daemon must never do (jr2-2).
@@ -439,7 +441,7 @@ export class SessionRegistry {
     // Nothing runs under this name now: a dead life's command files (command text, env captures) go (jr2-12, G26).
     removeLeftovers(this.opts.dataDir, id, dir);
     const last = store.tail(1)[0];
-    const journal = new Journal({ hot: this.hotStore(retention), cold: store, sessionId: id });
+    const journal = new Journal({ hot: this.hotStore(retention), cold: store, sessionId: id, log: this.journalLog(id) });
     return { id, dir, store, meta, retention, journal, last };
   }
 
@@ -593,7 +595,7 @@ export class SessionRegistry {
     const id = o.id;
     const dir = prev?.dir ?? path.join(this.root, id);
     const retention = this.retentionFor(o.retention, prev?.meta.retention);
-    const jo: JournalOptions = { hot: this.hotStore(retention), sessionId: id };
+    const jo: JournalOptions = { hot: this.hotStore(retention), sessionId: id, log: this.journalLog(id) };
     let store: FileStore;
     let recorded: Meta;
     if (prev) {
@@ -704,6 +706,11 @@ export class SessionRegistry {
   }
 
   /** Requested over recorded over daemon defaults. A bad request is refused; a bad record falls back. */
+  private journalLog(id: string): JournalOptions['log'] {
+    const log = this.opts.log;
+    return log ? (level, text) => log(level, text, { session: id }) : undefined;
+  }
+
   private storeOptions(retention: Retention): FileStoreOptions {
     return this.floor ? { ...retention, floor: this.floor } : retention;
   }

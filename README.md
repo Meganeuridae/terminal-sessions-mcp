@@ -189,8 +189,10 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
 - **History on disk.** Kept whole by default; `--retention-bytes` and `--retention-days` cap it
   per session. Whatever the caps, the daemon stops writing history to disk while the data
   directory's filesystem has less than 200 MiB free (`--disk-floor-bytes`; 0 turns it off):
-  commands and their results are unaffected, the recent history stays in memory, writing resumes
-  when space returns, and what the memory ring had to drop meanwhile reads as a gap.
+  commands and their results are unaffected, the recent history stays in memory, the disk is
+  retried on a timer (so writing resumes when space returns, idle session or not), what the
+  memory ring had to drop meanwhile reads as a gap, and the daemon's log says when writes
+  stopped and when they resumed (`/health` shows a session's `journal.coldFailed` meanwhile).
 - **Limits and memory.** A session costs about five open files and, idle, about 0.3 MB in
   the daemon plus its shell (about 4 MB); a busy session holds up to 8 MiB of recent history
   in memory (`memoryBytes`) and the rest on disk. The daemon itself is about 170 MB. The

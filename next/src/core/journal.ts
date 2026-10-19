@@ -41,6 +41,8 @@ export interface JournalOptions {
   sessionId?: string;
   /** A run index to continue — a new life of a name. Otherwise one is built by streaming the stores once. */
   runs?: RunIndex;
+  /** Where to say that the cold store stopped taking writes, and that writing resumed (the daemon's log). */
+  log?: ((level: 'warn' | 'info', text: string) => void) | undefined;
 }
 
 /** What a journal retains and whether its disk is keeping up (G21, §6 backpressure). */
@@ -81,6 +83,9 @@ export class Journal {
   private persisted: Seq;
   private retryAt = 0;
   private retryMs = RETRY_MIN_MS;
+  /** Retries the cold store at `retryAt` even if no event arrives meanwhile: an idle session's unwritten history must not wait for its next event (the house's read of dd8b602). */
+  private retryTimer: NodeJS.Timeout | undefined;
+  private readonly log: JournalOptions['log'];
   private catchingUp = false;
   private dropped = 0;
   /** The seq reserved beside the cold store while it fails (0: none); numbering after a restart resumes above it. */
@@ -98,6 +103,7 @@ export class Journal {
   constructor(opts: JournalOptions = {}) {
     this.hot = opts.hot ?? new MemoryStore();
     this.cold = opts.cold;
+    this.log = opts.log;
     this.now = opts.now ?? Date.now;
     this.epoch = this.cold?.epoch?.() ?? newEpoch();
     const coldLast = this.cold?.lastSeq() ?? 0;
@@ -189,10 +195,23 @@ export class Journal {
   }
 
   private coldFailed(e: unknown): void {
+    const first = this.coldError === null;
     this.coldError = e instanceof Error ? e.message : String(e);
     this.retryAt = Date.now() + this.retryMs;
     this.retryMs = Math.min(this.retryMs * 2, RETRY_MAX_MS);
     this.reserve();
+    this.armRetry();
+    if (first) this.log?.('warn', `history is not being written to disk: ${this.coldError}; the recent part is kept in memory and the disk is retried`);
+  }
+
+  /** Try the cold store again at its backoff deadline, whether or not an event arrives first (an idle session would otherwise wait for one). */
+  private armRetry(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined;
+      if (this.coldError !== null && !this.catchingUp && !this.sealed) this.catchUp();
+    }, Math.max(0, this.retryAt - Date.now()));
+    this.retryTimer.unref();
   }
 
   /**
@@ -223,10 +242,12 @@ export class Journal {
     try {
       const hotOldest = this.hot.oldestSeq();
       const lost = hotOldest !== undefined && hotOldest > this.persisted + 1 ? { from: this.persisted + 1, to: hotOldest - 1 } : undefined;
+      let caught = 0;
       try {
         for (const ev of this.hot.read(this.persisted + 1)) {
           this.cold!.append(ev);
           this.persisted = ev.seq;
+          caught++;
         }
       } catch (e) {
         this.coldFailed(e);
@@ -234,6 +255,9 @@ export class Journal {
       }
       this.coldError = null;
       this.retryMs = RETRY_MIN_MS;
+      if (this.retryTimer) clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+      this.log?.('info', `history is being written to disk again: ${caught} events caught up${lost ? `, ${lost.to - lost.from + 1} lost from memory meanwhile (a gap records them)` : ''}`);
       // Even a sealed journal records what its ring lost, under the next seq (the next life numbers after it).
       if (lost) this.issue(gapEvent(lost.from, lost.to, 'store-error'));
       if (this.coldError === null) this.healed();
@@ -415,6 +439,8 @@ export class Journal {
    */
   seal(): void {
     if (this.sealed) return;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
     if (this.cold && this.coldError !== null && !this.catchUp()) {
       // Exact now: a sealed journal issues no more seqs. If the disk refuses this too, the reservation stands.
       if (this.cold.setHighWater?.(this.seq, true)) this.reserved = this.seq;

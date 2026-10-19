@@ -67,3 +67,36 @@ test('below the floor the journal keeps the ring and the disk is left alone; abo
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('the journal says when the disk stopped taking writes and when they resumed, and retries on a timer: an idle journal catches up when space returns, with no event to prompt it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-floor-'));
+  try {
+    let allowed = true;
+    const said: Array<[string, string]> = [];
+    const store = new FileStore(dir, { floor: { allow: () => allowed } });
+    const j = new Journal({ hot: new MemoryStore(4 * MiB), cold: store, log: (level, text) => said.push([level, text]) });
+    j.append(out('before'));
+    allowed = false;
+    for (let i = 0; i < 3; i++) j.append(out(`held-${i}`));
+    assert.equal(said.length, 1, 'said once, at the first refusal');
+    assert.equal(said[0]![0], 'warn');
+    assert.match(said[0]![1], /not being written to disk: .*below the floor.*kept in memory/);
+    // Space returns while the session is idle: nothing is appended, and the timer brings the catch-up.
+    allowed = true;
+    const end = Date.now() + 4000;
+    while (j.stats().coldFailed !== null && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(j.stats().coldFailed, null, 'caught up without an event');
+    assert.equal(said.length, 2);
+    assert.deepEqual(said[1]![0], 'info');
+    assert.match(said[1]![1], /written to disk again: 3 events caught up/);
+    const onDisk = fs
+      .readFileSync(path.join(dir, 'journal.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l.includes('"output"'))
+      .map((l) => (JSON.parse(l) as { data: string }).data);
+    assert.deepEqual(onDisk, ['before', 'held-0', 'held-1', 'held-2']);
+    j.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
