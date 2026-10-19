@@ -141,11 +141,17 @@ test('defect 3: a launch with error patterns alone watches 15 s for them and ans
 test('defect 4: takeScreenshot with outputPath does not claim a file it never wrote', async () => {
   await call('runCommand', { session: 'shot', command: 'echo on-screen' });
   const file = path.join(dataDir, 'never.png');
+  const live = registry.get('shot');
+  assert.ok(live?.kind === 'live');
+  const before = live.session.cursorsOf(A.principal).read;
   const refused = await call('takeScreenshot', { session: 'shot', outputPath: file, width: 800, height: 600 });
   assert.equal(refused.success, false);
-  assert.match(String(refused.error), /no file was written/);
+  assert.match(String(refused.error), /no file was written.*call again without outputPath for the text/);
   assert.ok(!fs.existsSync(file));
-  assert.match(String(refused.text), /on-screen/, 'the text still comes along');
+  // The refusal says to call again for the text, and hands none back: nothing was read for it, and the read
+  // cursor did not move (the house's read of 78c4d6e, #22).
+  assert.equal(refused.text, undefined, 'the refusal carries no screen');
+  assert.equal(live.session.cursorsOf(A.principal).read, before, 'no screen was read for the refusal');
   // Without outputPath the screen comes as plain text, with the envelope beside it.
   const shot = await callTool('takeScreenshot', { session: 'shot' }, { app, caller: A, resultText: 'json' }, compat);
   assert.match(shot.text, /on-screen/);
@@ -253,4 +259,100 @@ test('a compat host whose delivery is deferred gets its read cursor advanced onl
   ran.onSent!();
   assert.ok(live.session.cursorsOf(A.principal).read > afterTail, 'written: the cursor covers the output pages too');
   await call('killSession', { session: 'cursor-c' });
+});
+
+// ───────────── the house's read of 78c4d6e (#22): compat ─────────────
+
+test('78c4d6e 7 and 8: launch’s start keeps another Run’s unread output unread, and the tail it shows moves no cursor', async () => {
+  const deferred: Caller = { principal: A.principal, connectionId: 'ca-ws78', deferReadDelivery: true };
+  await callTool('session_open', { session: 'lc' }, { app, caller: A, resultText: 'json' }, compat);
+  // A process Run's output, left unread: a deferred runCommand whose result is never written.
+  const ran = JSON.parse((await callTool('runCommand', { session: 'lc', command: 'seq 1 300', timeout: 20_000 }, { app, caller: deferred, resultText: 'json' }, compat)).text) as { runId: string; state: string };
+  assert.equal(ran.state, 'exited');
+  const live = registry.get('lc');
+  assert.ok(live?.kind === 'live');
+  const firstOut = live.session.runOutput(ran.runId).events.find((e) => e.type === 'output')!.seq;
+  assert.equal(live.session.cursorsOf(A.principal).read, 0, 'the run’s output was never delivered: unread');
+  // A launch in the same session: its tail shows the last lines, its own service Run starts after them.
+  const launched = await callTool('launch', { name: 'lc', command: 'sleep 30' }, { app, caller: deferred, resultText: 'json' }, compat);
+  assert.equal(live.session.cursorsOf(A.principal).read, 0, 'nothing committed before the write');
+  launched.onSent!();
+  assert.ok(live.session.cursorsOf(A.principal).read < firstOut, `the start’s cursor stops before the earlier Run’s unread output (${live.session.cursorsOf(A.principal).read} < ${firstOut})`);
+  assert.notEqual(live.session.cursorsOf(A.principal).read, live.session.journal.lastSeq, 'not the journal end');
+  await call('killSession', { session: 'lc', graceful: false });
+});
+
+test('78c4d6e 18: a many-page runCommand advances the deferred cursor across every page once written', async () => {
+  const deferred: Caller = { principal: A.principal, connectionId: 'ca-ws18', deferReadDelivery: true };
+  // 1.5 MB of output: runOutput pages it (256 KiB a page), and Drawn carries every page's commit, not its text.
+  const ran = await callTool('runCommand', { session: 'pages', command: "awk 'BEGIN { for (i = 1; i <= 15000; i++) print i, \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" }'", timeout: 30_000 }, { app, caller: deferred, resultText: 'json' }, compat);
+  const runId = (JSON.parse(ran.text) as { runId: string }).runId;
+  const live = registry.get('pages');
+  assert.ok(live?.kind === 'live');
+  const outs = live.session.runOutput(runId).events.filter((e) => e.type === 'output');
+  const runEnd = outs[outs.length - 1]!.seq;
+  assert.ok(outs.length > 1, 'the output spans several events (pages)');
+  assert.equal(live.session.cursorsOf(A.principal).read, 0, 'nothing before the write');
+  assert.equal(typeof ran.onSent, 'function');
+  ran.onSent!();
+  // Every page's commit lands: the cursor covers the Run's whole output (and its end boundary), not a single page.
+  assert.ok(live.session.cursorsOf(A.principal).read >= runEnd, `the cursor covers all of the paged output once written (${live.session.cursorsOf(A.principal).read} >= ${runEnd})`);
+  await call('killSession', { session: 'pages', graceful: false });
+});
+
+test('78c4d6e 12: a program line in a mark’s shape with no Run’s nonce survives tailLogs and searchLogs; a real Run’s plumbing is still cut', async () => {
+  await call('runCommand', { session: 'shape', command: 'echo real-output' });
+  const live = registry.get('shape');
+  assert.ok(live?.kind === 'live');
+  // A program prints something shaped like an end marker, under a nonce no Run here recorded.
+  live.session.journal.append({ type: 'output', data: 'program prints <<<EXIT:deadbeef00:0>>> itself\r\n', stream: 'pty' });
+  const tail = lines(await call('tailLogs', { session: 'shape', lines: 50 }));
+  assert.ok(tail.some((l) => l.includes('<<<EXIT:deadbeef00:0>>>')), `the program’s own line is not the daemon’s plumbing: ${JSON.stringify(tail)}`);
+  assert.ok(!tail.some((l) => l.includes('tsm-cmd-')), 'the real typed line is still cut');
+  const found = (await call('searchLogs', { session: 'shape', pattern: 'program prints' })) as unknown as Array<{ line: string }>;
+  assert.ok(found.length >= 1 && found[0]!.line.includes('<<<EXIT:deadbeef00:0>>>'), JSON.stringify(found));
+});
+
+test('78c4d6e 14: a raw tail marks a hole where output was lost, rather than running lines across it', async () => {
+  await call('runCommand', { session: 'holes', command: 'echo before-hole' });
+  const live = registry.get('holes');
+  assert.ok(live?.kind === 'live');
+  const j = live.session.journal;
+  // A gap in the middle of the output, as a torn write or a store failure leaves one.
+  j.append({ type: 'gap', from: j.lastSeq + 1, to: j.lastSeq + 3, reason: 'store-error' });
+  j.append({ type: 'output', data: 'after-hole\r\n', stream: 'pty' });
+  const raw = lines(await call('tailLogs', { session: 'holes', lines: 50, raw: true }));
+  assert.ok(raw.some((l) => /journal event.*missing/.test(l)), `the hole is marked, not run across: ${JSON.stringify(raw)}`);
+  assert.ok(raw.some((l) => l.includes('before-hole')) && raw.some((l) => l.includes('after-hole')));
+});
+
+test('78c4d6e 15 and 16: launch carries tailLogs’ cut note, and the advised page reaches what came before', async () => {
+  // Sixty lines of 25,000 bytes: a 50-line tail is over the 1 MiB bound, so the tail is cut and names
+  // where a read of what came before ends (item 16). launch into the same session carries that note (item 15).
+  await call('runCommand', { session: 'cutnote', command: "awk 'BEGIN { for (i = 0; i < 25000; i++) s = s \"y\"; for (i = 1; i <= 60; i++) print i, s }'", timeout: 30_000 });
+  const tail = lines(await call('tailLogs', { session: 'cutnote', lines: 50 }));
+  const note = tail.find((l) => l.startsWith('[earlier output not shown'));
+  assert.ok(note, `the cut is said: ${JSON.stringify(tail.slice(0, 1))}`);
+  const m = /read \{"session": "cutnote", "tail": 50, "until": (\d+)\}/.exec(note!);
+  assert.ok(m, note);
+  const until = Number(m![1]);
+  // A read at that `until` reaches what came before: its range ends at or just before the advised cut,
+  // so no line falls in neither page.
+  const first = (await call('read', { session: 'cutnote', tail: 50, until })) as unknown as { seq: [number, number] };
+  assert.ok(first.seq[1] >= until - 1 && first.seq[1] <= until, JSON.stringify(first.seq));
+  const launched = await call('launch', { name: 'cutnote', command: 'echo started' });
+  assert.ok(lines(launched.logs).some((l) => l.startsWith('[earlier output not shown')), `launch keeps the note: ${JSON.stringify(lines(launched.logs).slice(0, 1))}`);
+  await call('killSession', { session: 'cutnote', graceful: false });
+});
+
+test('78c4d6e: searchLogs reports the holes it spanned and the lines it matched on their head only', async () => {
+  await call('runCommand', { session: 'snotes', command: 'echo findme-here' });
+  const live = registry.get('snotes');
+  assert.ok(live?.kind === 'live');
+  const j = live.session.journal;
+  j.append({ type: 'gap', from: j.lastSeq + 1, to: j.lastSeq + 2, reason: 'store-error' });
+  j.append({ type: 'output', data: 'findme-again\r\n', stream: 'pty' });
+  const out = (await call('searchLogs', { session: 'snotes', pattern: 'findme' })) as unknown as Array<{ line?: string; note?: string }>;
+  const note = out.find((m) => m.note !== undefined)?.note;
+  assert.ok(note && /missing/.test(note), `the hole is noted: ${JSON.stringify(out)}`);
 });
