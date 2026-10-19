@@ -5,16 +5,24 @@
  * block up to a deadline for the same predicates, without leaving a watch behind.
  *
  * Patterns match whole lines, as `search` does (see StreamMatcher): each line of
- * each stream is tested once, `^` and `$` are the line's ends, and a line with no
- * newline yet (a prompt) is tested once its stream has been quiet for a moment.
- * Every pattern compiles on the linear-time engine, and a bad one is refused
- * with invalid_argument when the watch or wait is created.
+ * each stream is tested once, `^` and `$` are the line's ends (a line over 64 KiB
+ * is matched in pieces of that size), and a line with no newline yet (a prompt)
+ * is tested once its stream has been quiet for a moment. Every pattern compiles
+ * on the linear-time engine, and a bad one is refused with invalid_argument when
+ * the watch or wait is created.
+ *
+ * Quiet is measured on the monotonic clock. Output the manager saw arrive is
+ * stamped as it arrives, so a silence measured from an earlier output is as exact
+ * as one measured from arming; only output from before the manager existed takes
+ * its age from the journal's wall-clock time, clamped at zero (the house's read of
+ * 3eade8a, #22: a forward step of 10 s certified 5 s of silence in 1 ms).
  */
 import { randomBytes } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { compileLinePattern, StreamMatcher } from './ansi.js';
+import { compileLinePattern, PARTIAL_QUIET_MS, StreamMatcher } from './ansi.js';
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
+import { MAX_TIMER_MS } from './probes.js';
 import type { IntegrationLevel, JournalEvent, Principal, RunInfo, Seq } from './types.js';
 
 export type WatchKind = 'pattern' | 'silence' | 'idle';
@@ -69,6 +77,13 @@ export interface WatchHost {
 /** Minimum spacing between two firings of one pattern watch; matches in between are counted. */
 const PATTERN_SPACING_MS = 1000;
 
+/**
+ * How long an armed idle watch waits on the host for availability before asking again. The shell
+ * becomes available on timers that journal nothing (the typed-ahead grace, a stale edit), so the
+ * journal alone would tell the watch only at the next journaled event (the house's read of 3eade8a, #22).
+ */
+const IDLE_RECHECK_MS = 30_000;
+
 /** Which kind a spec asks for; validates it (exactly one kind, a pattern the engine accepts, a sane silence). */
 export function kindOf(spec: WatchSpec): WatchKind {
   const kinds = [spec.pattern !== undefined && 'pattern', spec.silenceMs !== undefined && 'silence', spec.idle === true && 'idle'].filter(Boolean) as WatchKind[];
@@ -77,7 +92,8 @@ export function kindOf(spec: WatchSpec): WatchKind {
     if (typeof spec.pattern !== 'string') throw err('invalid_argument', '`pattern` must be a string');
     compileLinePattern(spec.pattern);
   }
-  if (spec.silenceMs !== undefined && !(spec.silenceMs >= 100)) throw err('invalid_argument', 'silenceMs must be at least 100');
+  // A timer past 2^31-1 ms fires at once in Node: a silence of 3e9 ms woke in a tight loop (the house's read of 3eade8a, #22).
+  if (spec.silenceMs !== undefined && !(spec.silenceMs >= 100 && spec.silenceMs <= MAX_TIMER_MS)) throw err('invalid_argument', `silenceMs must be between 100 and ${MAX_TIMER_MS}`);
   if (spec.runId !== undefined && typeof spec.runId !== 'string') throw err('invalid_argument', '`runId` must be a string');
   return kinds[0]!;
 }
@@ -94,20 +110,24 @@ const endText = (r: { runId: string; state: string; exit?: number; signal?: stri
 
 type Hit = { match?: string; line?: string; seq: Seq };
 
-/** Evaluates one predicate against journal events; shared by watches and waits. */
 /** The clock the quiet interval is measured on; a test may replace it. */
 export const clocks = { monotonic: (): number => performance.now() };
 
+/** A timer delay Node honours: never past 2^31-1 ms, never negative. */
+const timerMs = (ms: number) => Math.min(MAX_TIMER_MS, Math.max(0, ms));
+
+/** Evaluates one predicate against journal events; shared by watches and waits. */
 class Predicate {
   private readonly re: RegExp | undefined;
   private readonly matchers = new Map<string, { m: StreamMatcher; seq: Seq }>();
   private silenceTimer: NodeJS.Timeout | undefined;
-  /** When the current quiet stretch began (the last output, or when the silence clock was started): wall clock, for the record. */
-  private quietFrom = 0;
-  /** The same instant on the monotonic clock, which measures the quiet: a wall-clock step (NTP, a manual change) neither delays nor hastens silence (the house's read of 0891472). */
+  /** The silence clock has been started at least once. */
+  private armed = false;
+  /** When the current quiet stretch began, on the monotonic clock. */
   private quietSince = 0;
   private idleArmed = false;
   private idleCheck = false;
+  private idleWaiting = false;
   private runEnded = false;
   private disposed = false;
 
@@ -122,11 +142,11 @@ class Predicate {
     if (kind === 'pattern') this.re = compileLinePattern(spec.pattern!);
   }
 
-  /** Start (or restart) the silence clock: fire after `ms` unless output arrives; the quiet began at `from`. */
-  armSilence(ms = this.spec.silenceMs!, from = Date.now()): void {
+  /** Start (or restart) the silence clock: fire after `ms` unless output arrives; the quiet began at `since` on the monotonic clock. */
+  armSilence(ms = this.spec.silenceMs!, since = clocks.monotonic()): void {
     if (this.kind !== 'silence' || this.disposed || this.runEnded) return;
-    this.quietFrom = from;
-    this.quietSince = clocks.monotonic() - Math.max(0, Date.now() - from);
+    this.armed = true;
+    this.quietSince = since;
     this.schedule(ms);
   }
 
@@ -146,7 +166,7 @@ class Predicate {
         return;
       }
       this.fire({ match: `no output for ${quiet}ms`, seq: this.host.journal.lastSeq });
-    }, Math.max(0, ms));
+    }, timerMs(ms));
   }
 
   feed(ev: JournalEvent): void {
@@ -158,22 +178,28 @@ class Predicate {
           const s = this.matcher(streamKey(ev));
           s.seq = ev.seq;
           for (const hit of s.m.feed(ev.data)) this.fire({ match: hit.match, line: hit.line.trim(), seq: ev.seq });
-        } else if (ev.type === 'run.end' && ev.runId === this.spec.runId) {
-          // The Run's streams are over: its unterminated last line is complete.
-          this.flush();
-          this.onRunEnd?.(ev);
+        } else if (ev.type === 'run.end') {
+          if (ev.runId === this.spec.runId) {
+            // The Run's streams are over: its unterminated last line is complete.
+            this.flush();
+            this.onRunEnd?.(ev);
+          } else {
+            // Another Run's pipes are over too: their last line is complete now, not after the
+            // partial delay, and their matchers are not kept for the rest of the watch's life.
+            this.endStreams(`stdout:${ev.runId}`, `stderr:${ev.runId}`);
+          }
         } else if (ev.type === 'session.exit') {
           this.flush();
         }
         return;
       case 'silence':
-        if (ev.type === 'output' && (this.spec.runId === undefined || ev.runId === this.spec.runId)) this.armSilence(this.spec.silenceMs, ev.ts);
+        if (ev.type === 'output' && (this.spec.runId === undefined || ev.runId === this.spec.runId)) this.armSilence(this.spec.silenceMs, clocks.monotonic());
         else if (ev.type === 'run.end' && ev.runId === this.spec.runId && !this.runEnded) {
           // Output of this Run has stopped for good: fire once and stop the clock.
           if (this.silenceTimer) clearTimeout(this.silenceTimer);
           this.silenceTimer = undefined;
           this.runEnded = true;
-          const quiet = this.quietFrom ? ` no output for ${this.quietMs()}ms` : ' no output';
+          const quiet = this.armed ? ` no output for ${this.quietMs()}ms` : ' no output';
           this.fire({ match: `${endText(ev)};${quiet}`, seq: ev.seq });
           this.onRunEnd?.(ev);
         }
@@ -188,21 +214,56 @@ class Predicate {
     }
   }
 
-  /** The session updates its state after journaling the event that changed it, so availability is read a moment later. */
+  /**
+   * The session updates its state after journaling the event that changed it, so availability is
+   * read a moment later. While it is not available, the host is asked to say when it becomes so,
+   * since that can happen on a timer that journals nothing.
+   */
   private checkIdle(): void {
     if (this.idleCheck) return;
     this.idleCheck = true;
     queueMicrotask(() => {
       this.idleCheck = false;
-      if (this.disposed || !this.idleArmed || !this.host.shellAvailable().ok) return;
-      this.idleArmed = false;
-      this.fire({ seq: this.host.journal.lastSeq, match: 'shell available' });
+      if (this.disposed || !this.idleArmed) return;
+      if (this.host.shellAvailable().ok) {
+        this.idleArmed = false;
+        this.fire({ seq: this.host.journal.lastSeq, match: 'shell available' });
+        return;
+      }
+      if (this.idleWaiting) return;
+      this.idleWaiting = true;
+      void this.host.waitAvailable(IDLE_RECHECK_MS).then(
+        () => {
+          this.idleWaiting = false;
+          if (this.idleArmed) this.checkIdle();
+        },
+        () => {
+          this.idleWaiting = false;
+        },
+      );
     });
   }
 
   /** Complete every stream's unterminated line now (its stream ended). */
   flush(): void {
     for (const s of this.matchers.values()) for (const hit of s.m.flush()) this.fire({ match: hit.match, line: hit.line.trim(), seq: s.seq });
+  }
+
+  /** Complete one stream's unterminated line now, if it has one waiting (the stream has been quiet long enough). */
+  flushStream(key: string): void {
+    const s = this.matchers.get(key);
+    if (s) for (const hit of s.m.flush()) this.fire({ match: hit.match, line: hit.line.trim(), seq: s.seq });
+  }
+
+  /** These streams are over: complete their last lines and forget their matchers. */
+  private endStreams(...keys: string[]): void {
+    for (const key of keys) {
+      const s = this.matchers.get(key);
+      if (!s) continue;
+      this.flushStream(key);
+      s.m.dispose();
+      this.matchers.delete(key);
+    }
   }
 
   private matcher(key: string): { m: StreamMatcher; seq: Seq } {
@@ -233,6 +294,14 @@ interface WatchRecord extends WatchInfo {
   /** The latest hit held back by the spacing, and how many were held (m2-20). */
   held?: Hit | undefined;
   heldCount: number;
+  /** The last firing on the monotonic clock, which the spacing is measured on (`lastFiredAt` is the wall clock, for the record). */
+  lastFiredMono?: number | undefined;
+}
+
+/** The newest output the manager saw arrive, on the monotonic clock: by Run, and overall under `*`. */
+interface Stamp {
+  seq: Seq;
+  at: number;
 }
 
 export class WatchManager {
@@ -241,12 +310,27 @@ export class WatchManager {
   private counter = 0;
   /** Waits in flight, so closing the session ends them at once (m2-24). */
   private readonly waits = new Set<(reason: string) => void>();
+  private readonly stamps = new Map<string, Stamp>();
 
   constructor(private readonly host: WatchHost) {
     this.off = host.journal.subscribe((ev) => {
       if (ev.type === 'watch.fired') return;
+      if (ev.type === 'output') {
+        const stamp = { seq: ev.seq, at: clocks.monotonic() };
+        this.stamps.set('*', stamp);
+        if (ev.runId !== undefined) this.stamps.set(ev.runId, stamp);
+      } else if (ev.type === 'run.end') this.stamps.delete(ev.runId);
       for (const w of [...this.watches.values()]) w.predicate.feed(ev);
     });
+  }
+
+  /** How long ago an output event arrived: exact when it was stamped on arrival, else the journal's wall-clock age, clamped at zero. */
+  private ageOf(ev: JournalEvent): number {
+    const s = this.stamps.get(ev.type === 'output' && ev.runId !== undefined ? ev.runId : '*');
+    if (s?.seq === ev.seq) return Math.max(0, clocks.monotonic() - s.at);
+    const any = this.stamps.get('*');
+    if (any?.seq === ev.seq) return Math.max(0, clocks.monotonic() - any.at);
+    return Math.max(0, Date.now() - ev.ts);
   }
 
   add(spec: WatchSpec, owner: Principal): WatchInfo {
@@ -263,7 +347,10 @@ export class WatchManager {
       else {
         // Quiet is measured from the Run's last output; a Run that has printed nothing yet arms on its first (m2-12).
         const last = this.lastRunOutput(run.runId);
-        if (last) rec.predicate.armSilence(spec.silenceMs! - (Date.now() - last.ts), last.ts);
+        if (last) {
+          const age = this.ageOf(last);
+          rec.predicate.armSilence(spec.silenceMs! - age, clocks.monotonic() - age);
+        }
       }
     }
     return this.publicInfo(rec);
@@ -288,7 +375,7 @@ export class WatchManager {
   }
 
   private publicInfo(w: WatchRecord): WatchInfo {
-    const { predicate: _p, pending: _t, held: _h, heldCount: _c, ...info } = w;
+    const { predicate: _p, pending: _t, held: _h, heldCount: _c, lastFiredMono: _m, ...info } = w;
     return { ...info, spec: { ...info.spec } };
   }
 
@@ -309,8 +396,8 @@ export class WatchManager {
 
   private onHit(w: WatchRecord, hit: Hit): void {
     if (!this.watches.has(w.watchId)) return;
-    const now = Date.now();
-    if (w.kind === 'pattern' && w.lastFiredAt !== undefined && now - w.lastFiredAt < PATTERN_SPACING_MS) {
+    const now = clocks.monotonic();
+    if (w.kind === 'pattern' && w.lastFiredMono !== undefined && now - w.lastFiredMono < PATTERN_SPACING_MS) {
       // Coalesce a burst: one trailing firing carries the latest match; "+N more" counts the others held (m2-20).
       w.held = hit;
       w.heldCount++;
@@ -322,8 +409,19 @@ export class WatchManager {
           w.held = undefined;
           w.heldCount = 0;
           if (latest) this.emit(w, latest, others);
-        }, PATTERN_SPACING_MS - (now - w.lastFiredAt));
+        }, timerMs(PATTERN_SPACING_MS - (now - w.lastFiredMono)));
       }
+      return;
+    }
+    if (w.pending) {
+      // The spacing has passed with hits still held: this hit is the latest of them and goes out
+      // now with their count, instead of before them (the house's read of 3eade8a, #22).
+      clearTimeout(w.pending);
+      w.pending = undefined;
+      const others = w.heldCount;
+      w.held = undefined;
+      w.heldCount = 0;
+      this.emit(w, hit, others);
       return;
     }
     this.emit(w, hit, 0);
@@ -333,6 +431,7 @@ export class WatchManager {
     if (!this.watches.has(w.watchId)) return;
     w.fired++;
     w.lastFiredAt = Date.now();
+    w.lastFiredMono = clocks.monotonic();
     if (hit.match !== undefined) w.lastMatch = hit.match;
     const ev: Parameters<Journal['append']>[0] = { type: 'watch.fired', watchId: w.watchId, label: w.label, kind: w.kind, principal: w.owner, at: hit.seq };
     if (hit.match !== undefined) ev.match = hit.match;
@@ -351,15 +450,15 @@ export class WatchManager {
   waitFor(spec: WatchSpec, ms: number, since?: Seq): Promise<WaitResult> {
     const kind = kindOf(spec);
     const run = spec.runId !== undefined && kind !== 'idle' ? this.requireRun(spec.runId) : undefined;
-    const started = Date.now();
-    const result = (r: Omit<WaitResult, 'elapsedMs' | 'kind'>): WaitResult => ({ ...r, kind, elapsedMs: Date.now() - started });
+    const started = clocks.monotonic();
+    const result = (r: Omit<WaitResult, 'elapsedMs' | 'kind'>): WaitResult => ({ ...r, kind, elapsedMs: Math.max(0, Math.round(clocks.monotonic() - started)) });
     const exited = () => (this.host.exit !== undefined ? exitText(this.host.exit) : undefined);
 
     if (kind === 'idle') {
       if (this.host.shellAvailable().ok) return Promise.resolve(result({ matched: true, match: 'shell available', seq: this.host.journal.lastSeq }));
       const gone = exited();
       if (gone) return Promise.resolve(result({ matched: false, reason: gone }));
-      return this.host.waitAvailable(ms).then((ok) => {
+      return this.host.waitAvailable(timerMs(ms)).then((ok) => {
         if (ok) return result({ matched: true, match: 'shell available', seq: this.host.journal.lastSeq });
         const why = exited();
         return result(why ? { matched: false, reason: why } : { matched: false });
@@ -395,8 +494,24 @@ export class WatchManager {
       this.waits.add(abort);
       if (kind === 'pattern') {
         if (since !== undefined) {
-          for (const ev of this.host.journal.since(since).events) {
-            predicate.feed(ev);
+          // Page by page to the end: a read that stops at a hole left by a cold-store failure says
+          // `more`, and what follows the hole is still to be checked (the house's read of 3eade8a, #22).
+          const lastBy = new Map<string, JournalEvent>();
+          let cursor = since;
+          for (;;) {
+            const page = this.host.journal.since(cursor);
+            for (const ev of page.events) {
+              predicate.feed(ev);
+              if (done) return;
+              if (ev.type === 'output') lastBy.set(streamKey(ev), ev);
+            }
+            if (!page.more || !page.events.length) break;
+            cursor = page.nextCursor;
+          }
+          // A stream whose replayed last line has no newline and has been quiet for the partial
+          // delay already (a prompt sitting there) is matched now, not after the delay restarts.
+          for (const [key, ev] of lastBy) {
+            if (this.ageOf(ev) >= PARTIAL_QUIET_MS) predicate.flushStream(key);
             if (done) return;
           }
         }
@@ -413,24 +528,24 @@ export class WatchManager {
         }
       } else {
         // silence: how long has it already been quiet? Never "forever" (m2-12).
-        const t = Date.now();
         const gone = run ? undefined : exited();
         if (gone) return abort(gone);
         const cur = run && (this.host.journal.runs.get(run.runId) ?? run);
         const last = run ? this.lastRunOutput(run.runId) : lastOutput(this.host.journal);
         if (cur && isTerminal(cur.state)) {
-          const quiet = t - (last?.ts ?? cur.endedAt ?? t);
+          const quiet = last ? this.ageOf(last) : Math.max(0, Date.now() - (cur.endedAt ?? Date.now()));
           return finish(result({ matched: true, match: `${endText(cur)}; no output for ${quiet}ms`, seq: cur.seq.end ?? this.host.journal.lastSeq }));
         }
-        if (last && t - last.ts >= spec.silenceMs!) return finish(result({ matched: true, match: `no output for ${t - last.ts}ms`, seq: last.seq }));
+        const age = last ? this.ageOf(last) : 0;
+        if (last && age >= spec.silenceMs!) return finish(result({ matched: true, match: `no output for ${age}ms`, seq: last.seq }));
         // A Run that has printed nothing yet starts the clock at its first output (or its end answers).
-        if (last || !run) predicate.armSilence(spec.silenceMs! - (last ? t - last.ts : 0), last?.ts ?? t);
+        if (last || !run) predicate.armSilence(spec.silenceMs! - age, clocks.monotonic() - age);
       }
       off = this.host.journal.subscribe((ev) => {
         predicate.feed(ev);
         if (!done && ev.type === 'session.exit') abort(exitText({ exitCode: ev.code, ...(ev.signal ? { signal: ev.signal } : {}) }));
       });
-      timer = setTimeout(() => finish(result({ matched: false })), Math.max(0, ms));
+      timer = setTimeout(() => finish(result({ matched: false })), timerMs(ms));
     });
   }
 

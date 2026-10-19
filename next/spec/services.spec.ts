@@ -166,6 +166,79 @@ test('a readiness timeout is cleared by readiness itself; a prompt-like ready li
   m.dispose();
 });
 
+// ───────────── the house's read of 3eade8a (#22): services ─────────────
+
+test('health checks start after a fail-pattern recovery too, when the fail line came before readiness', async () => {
+  const f = fake();
+  let accepting = false;
+  let connects = 0;
+  const connect: Connect = async () => {
+    connects++;
+    return accepting;
+  };
+  const m = f.monitor({ ready: { pattern: '^READY', tcp: { port: 1001 } }, fail: { pattern: '^ERROR' }, health: { tcp: { port: 1002 }, intervalMs: 20 } }, { connect });
+  f.start();
+  f.out('READY\n');
+  f.out('ERROR boom\n');
+  assert.equal(m.status, 'unhealthy');
+  accepting = true;
+  await until(() => f.statuses().length === 2 && m.info().cause === 'fail-pattern' && m.status === 'unhealthy', 1000, 'tcp met while the fail verdict stands');
+  await sleep(300);
+  assert.equal(m.status, 'unhealthy', 'the port coming up does not clear a fail line');
+  f.out('READY\n');
+  assert.equal(m.status, 'ready');
+  assert.match(String(m.info().evidence), /ready pattern matched again/);
+  connects = 0;
+  await sleep(150);
+  assert.ok(connects >= 3, `health checks run after the recovery: ${connects} connects in 150 ms`);
+  accepting = false;
+  await until(() => m.status === 'unhealthy', 1000, 'a health failure after recovery');
+  assert.equal(m.info().cause, 'health');
+  m.dispose();
+});
+
+test('a cause that changes within an unhealthy period is journaled: a fail line after a readiness timeout', async () => {
+  const f = fake('shell');
+  const m = f.monitor({ ready: { pattern: 'ready', timeoutMs: 30 }, fail: { pattern: 'ERROR' } });
+  f.start();
+  await until(() => m.status === 'unhealthy', 1000, 'timeout');
+  assert.equal(m.info().cause, 'timeout');
+  f.out('ERROR disk full\r\n');
+  assert.deepEqual(f.statuses(), ['starting', 'unhealthy', 'unhealthy']);
+  const events = f.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'service' }> => e.type === 'service');
+  assert.equal(events.at(-1)!.evidence, 'ERROR disk full');
+  assert.equal(m.info().cause, 'fail-pattern');
+  assert.equal(m.info().seq, events.at(-1)!.seq);
+  f.out('ERROR again\r\n');
+  assert.equal(f.statuses().length, 3, 'a repeat of the same cause is counted, not journaled (m2-16)');
+  assert.equal(m.info().repeats, 1);
+  m.dispose();
+});
+
+test('service durations past what a timer can hold are refused', () => {
+  const bad = (spec: ServiceSpec) => assert.throws(() => validateServiceSpec(spec), (e: unknown) => e instanceof TermError && e.code === 'invalid_argument' && /2147483647/.test(e.message));
+  bad({ ready: { pattern: 'x', timeoutMs: 3e9 } });
+  bad({ ready: { exitWithinMs: 2 ** 31 } });
+  bad({ health: { tcp: { port: 1 }, intervalMs: 3e9 } });
+  assert.doesNotThrow(() => validateServiceSpec({ ready: { pattern: 'x', timeoutMs: 2 ** 31 - 1 } }));
+});
+
+test('output from before the monitor existed is read page by page to the end when a read stops short', () => {
+  const f = fake();
+  f.start();
+  for (let i = 1; i <= 4; i++) f.out(`warming up ${i}\n`);
+  f.out('listening on 8080\n');
+  const since = f.journal.since.bind(f.journal);
+  f.journal.since = (cursor: number) => since(cursor, 2);
+  try {
+    const m = f.monitor({ ready: { pattern: 'listening on \\d+' } });
+    assert.equal(m.status, 'ready', 'the ready line is behind the first page');
+    m.dispose();
+  } finally {
+    f.journal.since = since;
+  }
+});
+
 // ───────────── end to end: real bash, real processes ─────────────
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-svc-'));

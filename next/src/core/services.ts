@@ -14,12 +14,14 @@
  * readiness itself.
  *
  * Every status *change* is a journal event, which is how hosts hear about it
- * (§10.2). Further fail-pattern lines while already unhealthy update the
+ * (§10.2), and so is a change of what makes the service unhealthy (a readiness
+ * timeout, then a fail line), since what clears the verdict changes with it.
+ * Further fail-pattern lines while already unhealthy for that reason update the
  * evidence and a repeat count on the monitor, not the journal (m2-16).
  */
 import { compileLinePattern, LineSplitter } from './ansi.js';
 import type { Journal } from './journal.js';
-import { describeSpec, hasReadinessProbe, LIVENESS_MS, tcpConnect, type Connect, type ServiceSpec, type TcpTarget } from './probes.js';
+import { describeSpec, hasReadinessProbe, LIVENESS_MS, MAX_TIMER_MS, tcpConnect, type Connect, type ServiceSpec, type TcpTarget } from './probes.js';
 import type { JournalEvent, OutputStream, Principal, RunInfo, Seq, ServiceStatus } from './types.js';
 
 export type { ServiceStatus } from './types.js';
@@ -121,9 +123,17 @@ export class ServiceMonitor {
     this.off = host.journal.subscribe((ev) => this.onEvent(ev));
     this.statusSeq = this.journal('starting');
 
-    // Output that arrived before the monitor existed (a process Run starts at admission).
+    // Output that arrived before the monitor existed (a process Run starts at admission), read
+    // page by page to the end: a read that stops at a hole left by a cold-store failure says
+    // `more` (the house's read of 3eade8a, #22).
     const run = host.run(runId);
-    for (const ev of host.journal.since(run.seq.admit - 1).events) this.onEvent(ev);
+    let cursor = run.seq.admit - 1;
+    for (;;) {
+      const page = host.journal.since(cursor);
+      for (const ev of page.events) this.onEvent(ev);
+      if (!page.more || !page.events.length) break;
+      cursor = page.nextCursor;
+    }
     if (this.disposed || ended(this.statusValue)) return;
     if (run.state === 'running') this.onStarted();
 
@@ -161,7 +171,7 @@ export class ServiceMonitor {
         this.waiters.delete(done);
         resolve(this.info());
       };
-      const timer = setTimeout(done, ms);
+      const timer = setTimeout(done, Math.min(MAX_TIMER_MS, ms));
       this.waiters.add(done);
     });
   }
@@ -232,10 +242,13 @@ export class ServiceMonitor {
       return;
     }
     if (this.statusValue === 'unhealthy') {
-      // Already unhealthy for another cause: the fail pattern now holds the verdict.
+      // Already unhealthy for another cause: the fail pattern now holds the verdict, and the
+      // journal says so, since a timeout readiness would have cleared now needs a ready line
+      // (the house's read of 3eade8a, #22).
       this.cause = 'fail-pattern';
       this.evidenceText = evidence;
       this.repeats = 0;
+      this.statusSeq = this.journal('unhealthy', evidence);
       return;
     }
     this.setStatus('unhealthy', evidence, 'fail-pattern');
@@ -248,9 +261,11 @@ export class ServiceMonitor {
       this.condition('pattern', evidence);
       return;
     }
-    // A ready line after a fail line: the service says it recovered (m2-15).
+    // A ready line after a fail line: the service says it recovered (m2-15), and its health
+    // checks start if the fail line came before readiness did (the house's read of 3eade8a, #22).
     if (recovering && this.allMet() && this.statusValue === 'unhealthy' && this.cause === 'fail-pattern') {
       this.setStatus(this.healthyStatus(), `${evidence} (ready pattern matched again after the fail line)`);
+      this.startHealth();
     }
   }
 
@@ -328,7 +343,7 @@ export class ServiceMonitor {
     const t = setTimeout(() => {
       this.timers.delete(t);
       fn();
-    }, ms);
+    }, Math.min(MAX_TIMER_MS, ms));
     this.timers.add(t);
   }
 

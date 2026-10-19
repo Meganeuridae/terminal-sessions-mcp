@@ -62,13 +62,17 @@ export const tcpConnect: Connect = (target, timeoutMs) =>
 /** Without a readiness probe, how long a service must stay alive to be reported `running` (1.x waited the same). */
 export const LIVENESS_MS = 2000;
 
+/** The longest delay Node's timers honour (2^31-1 ms, about 24.8 days): a longer one fires at once. Durations are validated against it (the house's read of 3eade8a, #22). */
+export const MAX_TIMER_MS = 2 ** 31 - 1;
+
 /** Does the spec give any readiness condition? */
 export const hasReadinessProbe = (spec: ServiceSpec): boolean => spec.ready?.pattern !== undefined || spec.ready?.tcp !== undefined || spec.ready?.exitWithinMs !== undefined;
 
 /**
  * Check a spec before anything starts: patterns compile on the linear-time engine
- * and match at least one character, ports are ports, durations are positive.
- * Throws invalid_argument, so a bad spec never leaves a Run behind.
+ * and match at least one character, ports are ports, durations are positive and no
+ * longer than a timer can hold. Throws invalid_argument, so a bad spec never leaves
+ * a Run behind.
  */
 export function validateServiceSpec(spec: ServiceSpec): void {
   for (const [what, p] of [['ready.pattern', spec.ready?.pattern], ['fail.pattern', spec.fail?.pattern]] as const) {
@@ -84,7 +88,7 @@ export function validateServiceSpec(spec: ServiceSpec): void {
     if (t && (!Number.isInteger(t.port) || t.port < 1 || t.port > 65535)) throw err('invalid_argument', `${what}: invalid port ${String(t.port)}`);
   }
   for (const [what, ms] of [['ready.exitWithinMs', spec.ready?.exitWithinMs], ['ready.timeoutMs', spec.ready?.timeoutMs], ['health.intervalMs', spec.health?.intervalMs]] as const) {
-    if (ms !== undefined && !(Number.isFinite(ms) && ms > 0)) throw err('invalid_argument', `${what} must be a positive number of ms`);
+    if (ms !== undefined && !(Number.isFinite(ms) && ms > 0 && ms <= MAX_TIMER_MS)) throw err('invalid_argument', `${what} must be a positive number of ms, at most ${MAX_TIMER_MS}`);
   }
 }
 
