@@ -320,7 +320,7 @@ test('a gone marker from the declared shell ends the Run lost: line-not-whole, n
     assert.ok(one.admitted && two.admitted);
     await until(() => typed.some((t) => t.includes("__tsm_b='echo one'")), 3000, "the first Run's line");
     const line = typed.find((t) => t.includes("__tsm_b='echo one'"))!;
-    assert.ok(line.startsWith('\x15'), 'the line is preceded by ^U, which clears a pending line');
+    assert.ok(line.startsWith('\x05\x15'), 'the line is preceded by ^E ^U, which clears a pending line wherever its cursor is');
     assert.match(line, /if \[ "\$\{__tsm_b\+set\}" = set \] && \[ "\$\{#__tsm_b\}" = "8" \]; then printf '<<<STAR''T:/);
     const nonce = /<<<GON''E:([0-9a-f]+)>>>/.exec(line)![1]!;
     const before = typed.length;
@@ -438,5 +438,104 @@ test('a declared shell that ends without its caller asking refuses the next shel
     assert.equal((await h.session.awaitRun(local.run.runId, 3000)).exit, 0);
   } finally {
     await h.session.close();
+  }
+});
+
+test('a Run queued for the session’s own shell before a declaration runs when the declared shell ends unexpectedly; only the next new Run is refused once', async () => {
+  const h = await scriptedSession();
+  try {
+    const front = h.session.admit({ target: 'shell', line: 'sleep 100', principal: AGENT });
+    assert.ok(front.admitted);
+    await until(() => h.session.run(front.run.runId).state === 'running');
+    // Admitted while the opener ran, before any declaration: this Run is for the session's own shell.
+    const own = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+    assert.ok(own.admitted && own.run.state === 'queued');
+    h.session.declareShell({ principal: AGENT });
+    h.shell.finishHung(255);
+    const ran = await h.session.awaitRun(own.run.runId, 3000);
+    assert.deepEqual([ran.state, ran.exit], ['exited', 0], 'the fail-closed hold has nothing to protect in a Run admitted before the declaration');
+    const refused = h.session.admit({ target: 'shell', line: 'echo next', principal: AGENT });
+    assert.ok(!refused.admitted && refused.reason === 'declared-shell-ended');
+  } finally {
+    await h.session.close();
+  }
+});
+
+test('a line submitted at a declared prompt holds the next Run as human-submitted (not human-editing); a ^U does not end that hold; going stale does', async () => {
+  const h = await scriptedSession({ editingStaleMs: 400 });
+  try {
+    const front = h.session.admit({ target: 'shell', line: 'sleep 100', principal: AGENT });
+    assert.ok(front.admitted);
+    await until(() => h.session.run(front.run.runId).state === 'running');
+    h.session.declareShell({ principal: AGENT });
+    h.session.input('make deploy\n', { principal: AGENT });
+    const held = h.session.admit({ target: 'shell', line: 'echo agent', principal: AGENT });
+    assert.ok(!held.admitted && held.reason === 'human-submitted', JSON.stringify(held));
+    h.session.input('\x15', { principal: AGENT });
+    const still = h.session.admit({ target: 'shell', line: 'echo agent', principal: AGENT });
+    assert.ok(!still.admitted && still.reason === 'human-submitted', 'a ^U says nothing about a command already submitted');
+    await new Promise((r) => setTimeout(r, 450));
+    const after = h.session.admit({ target: 'shell', line: 'echo agent', principal: AGENT });
+    assert.ok(after.admitted, `stale, with no evidence either way: ${JSON.stringify(after)}`);
+  } finally {
+    await h.session.close();
+  }
+});
+
+test('a stale partial line is cleared whole, wherever its cursor was left', { skip: !hasShell('/bin/bash') }, async () => {
+  const x = await realSession('/bin/bash', { editingStaleMs: 300 });
+  try {
+    const enclosing = await open(x.session, 'bash --norc --noprofile');
+    declare(x.session, 'bash');
+    // Typed, then the cursor moved four places back; left to go stale. ^U alone would keep "+3))".
+    x.session.input('echo partial $((1+3))', { principal: AGENT });
+    await until(() => x.journal.since(0).events.filter((e) => e.type === 'output' && e.runId === enclosing).map((e) => (e as { data: string }).data).join('').includes('echo partial'), 8000, 'the typed text echoed');
+    x.session.input('\x1b[D\x1b[D\x1b[D\x1b[D', { principal: AGENT, kind: 'keys' });
+    await new Promise((r) => setTimeout(r, 350));
+    const r = await x.run(`printf '%s\\n' CLEAN; (exit 3)`, 8000);
+    assert.deepEqual([r.state, r.exit, r.text.trim()], ['exited', 3, 'CLEAN']);
+    assert.ok(notes(x).some((t) => /stale partial line/.test(t)));
+  } finally {
+    await x.close();
+  }
+});
+
+test('where the declared shell runs on this terminal, a submitted line’s hold ends when the person’s command ends, and lasts while their program is in front', { skip: !hasShell('/bin/bash') }, async () => {
+  // The default stale period (30 s) stands: the evidence must be what ends the hold.
+  const x = await realSession('/bin/bash');
+  try {
+    await open(x.session, 'bash --norc --noprofile');
+    declare(x.session, 'bash');
+    assert.equal((await x.run('echo ready')).text.trim(), 'ready');
+    const t0 = Date.now();
+    x.session.input('sleep 1.2\n', { principal: AGENT });
+    await new Promise((r) => setTimeout(r, 100));
+    const held = x.session.admit({ target: 'shell', line: `printf '%s\\n' CLEAN; (exit 3)`, principal: AGENT });
+    assert.ok(!held.admitted && held.reason === 'human-submitted', JSON.stringify(held));
+    const queued = x.session.admit({ target: 'shell', line: `printf '%s\\n' CLEAN; (exit 3)`, principal: AGENT, queue: true });
+    assert.ok(queued.admitted);
+    const r = await x.session.awaitRun(queued.run.runId, 8000);
+    assert.deepEqual([r.state, r.exit, (await x.session.runTranscript(r.runId)).text.trim()], ['exited', 3, 'CLEAN']);
+    assert.ok(Date.now() - t0 < 5000, `the hold ended with the sleep, not after 30 s: ${Date.now() - t0} ms`);
+  } finally {
+    await x.close();
+  }
+  const y = await realSession('/bin/bash', { editingStaleMs: 600 });
+  try {
+    await open(y.session, 'bash --norc --noprofile');
+    declare(y.session, 'bash');
+    assert.equal((await y.run('echo ready')).text.trim(), 'ready');
+    // A program that reads the terminal, in front past the stale period: the Run waits for it.
+    y.session.input('cat\n', { principal: AGENT });
+    await new Promise((r) => setTimeout(r, 100));
+    const queued = y.session.admit({ target: 'shell', line: `printf '%s\\n' CLEAN; (exit 3)`, principal: AGENT, queue: true });
+    assert.ok(queued.admitted);
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(y.session.run(queued.run.runId).state, 'queued', 'not typed into cat, stale or not');
+    y.session.input('\x03', { principal: AGENT, kind: 'keys' });
+    const r = await y.session.awaitRun(queued.run.runId, 8000);
+    assert.deepEqual([r.state, r.exit, (await y.session.runTranscript(r.runId)).text.trim()], ['exited', 3, 'CLEAN']);
+  } finally {
+    await y.close();
   }
 });

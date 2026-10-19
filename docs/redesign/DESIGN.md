@@ -591,7 +591,13 @@ once (`declared-shell-ended`, naming the enclosing Run), since a line meant for 
 would otherwise run in the one underneath; the Run after it goes there (settled with the
 reviewers of #11, 2026-10-18). One Run at a time per declared shell; a second hop is declared
 again (the innermost running Run is its program); `none` takes a declaration back. Results of
-declared Runs carry `shell` and `within` and report the cwd as unknown.
+declared Runs carry `shell` and `within` and report the cwd as unknown. G4 holds at a declared
+prompt too: a partial line someone typed there makes a declared Run busy (`human-editing`) or
+queued, a submitted one holds it (`human-submitted`) until the person's command is seen to end —
+by the terminal's foreground process group where the declared shell runs on this terminal (a
+nested shell, `sudo -i`: the shell's own group in front again means done, another group in front
+means not yet, however long), or, where a client such as `ssh` holds the foreground throughout
+and nothing can be seen, after the stale period (30 s) of quiet.
 
 ### 8.2 Process target
 

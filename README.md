@@ -119,7 +119,10 @@ at. The same works for `sudo -i`, `docker exec -it … bash`, a nested `bash`, a
 that replaced the session's own (`exec sh`, reported as `shell-unavailable`): declare it and
 go on. A second hop (`ssh` from the remote) is declared again; `tsm declare work none`
 takes a declaration back. A partial line someone is typing at its prompt makes a new Run
-busy (`human-editing`), or queued until the line is cleared or goes stale. Cancel inside a
+busy (`human-editing`), or queued until the line is cleared or goes stale; a line they
+submitted holds the next Run (`human-submitted`) until their command is seen to end — from the
+terminal's foreground where the declared shell runs on this machine (a nested shell, `sudo -i`),
+or after 30 s of quiet where nothing can be seen (`ssh`). Cancel inside a
 declared shell types `^C`, the end marker and then `^\\`: the daemon cannot signal a job
 on another machine, and says so.
 

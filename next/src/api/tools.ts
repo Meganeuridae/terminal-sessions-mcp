@@ -87,6 +87,9 @@ const BUSY_NEXT: Record<string, string> = {
     'the declared shell (ssh, sudo -i, a nested shell) ended without your asking — the connection dropped, or that shell died — so this command would have run in the shell underneath, not where you meant it: ' +
     'run it again if the session’s own shell is what you mean, or run the opener and declare again',
   'human-editing': 'a partial command line sits at the prompt: clear it with input keys:["C-u"] (needs the seat), or pass queue:true',
+  'human-submitted':
+    'a command someone typed at this prompt by hand was submitted and may still be running (no end mark comes for a hand-typed command): read `screen` to see; ' +
+    'pass queue:true to run once the prompt is back — seen from the terminal where the shell runs on this machine, otherwise assumed after 30 s of quiet',
   starting: 'the shell is still starting: pass queue:true to run once it is ready',
   exited: 'the shell has exited: run again to start a new one',
 };

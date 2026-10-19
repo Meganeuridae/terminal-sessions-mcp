@@ -133,7 +133,7 @@ export interface SeatOptions {
   asOwner?: boolean;
 }
 
-export type BusyReason = 'running' | 'prompt-pending' | 'human-editing' | 'starting' | 'shell-unavailable' | 'exited' | 'declared-shell-ended';
+export type BusyReason = 'running' | 'prompt-pending' | 'human-editing' | 'human-submitted' | 'starting' | 'shell-unavailable' | 'exited' | 'declared-shell-ended';
 export type AdmitResult = { admitted: true; run: RunInfo } | { admitted: false; busy: RunInfo | null; reason: BusyReason };
 
 export interface CancelResult {
@@ -244,6 +244,16 @@ const MAX_ENDED_RUNS = 1000;
  * drains (see onPromptStart): the line editor shows them in the same breath as the prompt.
  */
 const TYPEAHEAD_GRACE_MS = 150;
+/**
+ * Keys that empty a line editor without our integration's bindings: ^E (end of line in the emacs
+ * keymaps of readline, zsh and fish; a plain character to a canonical-mode reader) then ^U (kill
+ * to the beginning; the tty's line kill in canonical mode, which takes the ^E with the rest).
+ */
+const CLEAR_WHOLE_LINE = '\x05\x15';
+/** After a line submitted at a declared prompt, how long the shell's own group in front must stand before it means the command ended (the shell may not have forked it yet). */
+const FOREGROUND_SETTLE_MS = 200;
+/** How often a declared Run held behind a submitted line looks again (no event ends such a hold). */
+const DECLARED_RECHECK_MS = 250;
 
 function inlineTokens(body: string): string[] {
   const out: string[] = [];
@@ -474,6 +484,10 @@ export class Session {
   private readonly layers: DeclaredShell[] = [];
   /** A declared shell ended without its caller's word (§8.1, fail closed): the next shell Run is refused once, so a line meant for it does not run in the shell underneath. */
   private declaredEnded: { shell: string; within: string; how: string } | undefined;
+  /** Per declared layer (by `within`): the terminal's foreground group when that shell is at its prompt, where the backend can see it (see declaredForeground). */
+  private readonly declaredFg = new Map<string | null, number>();
+  private fgRead: { at: number; pgid: number | undefined } | undefined;
+  private declaredRecheck: NodeJS.Timeout | undefined;
   /** The end of the terminal output so far (64 chars): a declared shell's marker may straddle two reads. */
   private inlineTail = '';
   private controller: Principal | null = null;
@@ -1375,11 +1389,17 @@ export class Session {
     if (this.shellState === 'busy') return { ok: false, reason: 'prompt-pending' };
     // The prompt is here, and keys typed during the last Run may be in its editor (see onPromptStart).
     if (this.typeaheadWatch !== undefined && this.typeaheadTimer !== undefined) return { ok: false, reason: 'prompt-pending' };
-    if (this.editingBlocks()) return { ok: false, reason: 'human-editing' };
+    if (this.editingBlocks()) return { ok: false, reason: this.editingReason() };
     return { ok: true };
   }
 
-  /** A partial line (or a just-submitted one) blocks shell Runs, until it goes stale. */
+  /**
+   * A partial line (or a just-submitted one) blocks shell Runs, until it goes stale. At a declared
+   * prompt a submitted line's hold ends on evidence where there is some (declaredForeground): at
+   * once when the person's command is seen to have ended, and not at all, stale or not, while a
+   * program other than the declared shell holds the terminal (the house's read of 236301b: the
+   * hold's end sent the queued Run into the person's `cat`).
+   */
   private editingBlocks(): boolean {
     const now = this.now();
     const stale = this.opts.editingStaleMs ?? 30_000;
@@ -1387,8 +1407,51 @@ export class Session {
       this.humanEditing = false;
       this.staleLine = true;
     }
-    if (this.submittedAt !== undefined && now - this.submittedAt >= stale) this.submittedAt = undefined;
+    if (this.submittedAt !== undefined) {
+      const fg = this.declaredForeground();
+      if (fg === 'busy') return true;
+      if (fg === 'free' && now - this.submittedAt >= FOREGROUND_SETTLE_MS) this.submittedAt = undefined;
+      else if (fg !== 'free' && now - this.submittedAt >= stale) this.submittedAt = undefined;
+    }
     return this.humanEditing || this.submittedAt !== undefined;
+  }
+
+  /** What stands in the way: a line being typed, or one submitted whose command may still be running. */
+  private editingReason(): BusyReason {
+    return this.humanEditing ? 'human-editing' : 'human-submitted';
+  }
+
+  /**
+   * §8.1: at a declared prompt the terminal's foreground process group is evidence where the
+   * declared shell runs on this terminal (a nested shell, `sudo -i`): a group other than the one
+   * the shell holds at its prompt is a program the person started; the shell's own means their
+   * command has ended. Through a client such as `ssh` the client's group holds the foreground
+   * throughout, so nothing is known and the hold ends only when stale.
+   */
+  private declaredForeground(): 'busy' | 'free' | 'unknown' {
+    const layer = this.layers.at(-1);
+    if (!layer || this.inFront.has(layer.within)) return 'unknown';
+    const own = this.declaredFg.get(layer.within);
+    if (own === undefined) return 'unknown';
+    const fg = this.foregroundNow();
+    if (fg === undefined) return 'unknown';
+    return fg === own ? 'free' : 'busy';
+  }
+
+  /** The terminal's foreground group, read at most every 100 ms (it is a `ps` on macOS). */
+  private foregroundNow(): number | undefined {
+    const now = this.now();
+    if (this.fgRead && now - this.fgRead.at < 100) return this.fgRead.pgid;
+    const pgid = this.pty.foreground?.()?.foregroundPgid;
+    this.fgRead = { at: now, pgid };
+    return pgid;
+  }
+
+  /** Where the declared shell runs on this terminal, learn the group it holds at its prompt: at the declaration, and again at each of its Runs' end markers. */
+  private learnDeclaredForeground(within: string | null): void {
+    const fg = this.pty.foreground?.();
+    if (fg) this.declaredFg.set(within, fg.foregroundPgid);
+    this.fgRead = undefined;
   }
 
   private armEditingTimer(): void {
@@ -1478,7 +1541,9 @@ export class Session {
   }
 
   private drainQueue(): void {
-    if (this.declaredEnded) return;
+    // (Not held by `declaredEnded`: this queue holds Runs admitted for the session's own shell,
+    // before any declaration, which the fail-closed refusal has nothing to protect — the house's
+    // read of 236301b.)
     while (this.queue.length && this.shellAvailable().ok) {
       const next = this.queue.shift()!;
       if (isTerminal(next.state)) continue;
@@ -1528,6 +1593,7 @@ export class Session {
       this.note(`declared: ${program} is a ${shell} shell; shell Runs go to it${within === null ? '' : ` until ${within} ends`}`);
     }
     this.layers.push(layer);
+    this.learnDeclaredForeground(within);
     return { shell, within, depth: this.layers.length };
   }
 
@@ -1555,9 +1621,11 @@ export class Session {
     const occupying = this.inFront.get(within);
     const running = occupying !== undefined && !isTerminal(occupying.state);
     if (running || this.editingBlocks()) {
-      if (!opts.queue) return { admitted: false, busy: running ? publicRun(occupying!) : null, reason: running ? 'running' : 'human-editing' };
+      if (!opts.queue) return { admitted: false, busy: running ? publicRun(occupying!) : null, reason: running ? 'running' : this.editingReason() };
       const run = this.newRun({ ...init, queued: true });
       this.declaredQueue.push(run);
+      // A hold with no event to end it (a submitted line) is looked at again from the drain.
+      queueMicrotask(() => this.drainDeclared(within));
       return { admitted: true, run: publicRun(run) };
     }
     const run = this.newRun({ ...init, queued: false });
@@ -1575,11 +1643,13 @@ export class Session {
     this.humanEditing = false;
     this.submittedAt = undefined;
     this.staleLine = false;
-    // Typed, not started: the start marker says when the shell took it (no mark will). The ^U
-    // clears a stale or unobserved prefix; known active edits block admission above.
+    // Typed, not started: the start marker says when the shell took it (no mark will). ^E then ^U
+    // clears a stale or unobserved line wherever its cursor was left: ^U alone kills only what
+    // precedes the cursor, and a remainder joined the Run's first line and hung it (the house's
+    // read of 236301b); known active edits block admission above.
     run.state = 'starting';
     this.inFront.set(run.within ?? null, run);
-    this.pty.write(`\x15${run.inlineLines.shift()!}\n`);
+    this.pty.write(`${CLEAR_WHOLE_LINE}${run.inlineLines.shift()!}\n`);
     for (const w of run.changeWaiters?.splice(0) ?? []) w();
   }
 
@@ -1634,8 +1704,11 @@ export class Session {
       this.startRun(run, { cwd: '' }); // that shell's cwd is not tracked (no cwd mark)
     } else if (run.probed) {
       // The probe's status is its own line's; the start marker precedes `eval`, so without it the text never ran (G3).
+      this.learnDeclaredForeground(run.within ?? null);
       this.endRun(run, { state: run.cancelRequested ? 'cancelled' : 'lost', reason: run.state === 'starting' ? 'cancelled-before-start' : 'exit-unobserved' });
     } else {
+      // The shell printed the end marker: it is in front again, whatever ran before it.
+      this.learnDeclaredForeground(run.within ?? null);
       this.endRun(run, { state: run.cancelRequested ? 'cancelled' : 'exited', exit: hit.exit! });
     }
   }
@@ -1666,7 +1739,19 @@ export class Session {
   }
 
   private drainDeclared(within: string | null): void {
-    if (this.declaredEnded || this.editingBlocks()) return;
+    if (this.declaredEnded || this.closed) return;
+    if (this.editingBlocks()) {
+      // A submitted line's hold has no event to end it: a Run waiting behind it looks again shortly.
+      if (!this.declaredRecheck && this.declaredQueue.some((r) => (r.within ?? null) === within && !isTerminal(r.state))) {
+        this.declaredRecheck = setTimeout(() => {
+          this.declaredRecheck = undefined;
+          this.drainDeclared(within);
+          this.notifyAvailable();
+        }, DECLARED_RECHECK_MS);
+        this.declaredRecheck.unref();
+      }
+      return;
+    }
     if (this.inFront.has(within)) return;
     const i = this.declaredQueue.findIndex((r) => (r.within ?? null) === within && !isTerminal(r.state));
     if (i === -1) return;
@@ -1772,7 +1857,7 @@ export class Session {
     // clear keys to "empty the editor" in every keymap and mode; without it (the marker
     // strategy: dash, sh, a shell that never integrated) a stale partial line gets the tty's
     // line kill (^U), which a canonical-mode shell honours for the whole line.
-    const clear = marker ? (this.staleLine ? '\x15' : '') : CLEAR_LINE_KEYS;
+    const clear = marker ? (this.staleLine ? CLEAR_WHOLE_LINE : '') : CLEAR_LINE_KEYS;
     this.staleLine = false;
     this.typeaheadWatch = undefined;
     if (marker) {
@@ -2322,7 +2407,10 @@ export class Session {
       const hadLine = this.humanEditing || this.staleLine || data.length > 1;
       this.humanEditing = false;
       this.staleLine = false;
-      this.submittedAt = last === '\x03' && hadLine ? now : undefined;
+      // At a declared prompt a ^U says nothing about a command already submitted: that hold stands
+      // (following the old hint's ^U ended it and typed the Run into the person's program).
+      if (last === '\x03' && hadLine) this.submittedAt = now;
+      else if (!declaredPrompt) this.submittedAt = undefined;
     } else {
       this.humanEditing = true;
       this.editedAt = now;
