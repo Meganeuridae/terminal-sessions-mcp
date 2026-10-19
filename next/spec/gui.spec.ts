@@ -627,3 +627,31 @@ test('2f357bd: ^C interrupts the foreground job; Close asks twice; the activity 
     a.close();
   }
 });
+
+test('78c4d6e 20: the output pane trims on a code-point boundary and counts bytes, not UTF-16 units', async (t) => {
+  if (skip || !browser) return t.skip(skip || 'no browser');
+  const a = await agent();
+  await a.call('session_open', { session: 'emoji', visibility: 'shared' });
+  const problems: string[] = [];
+  const page = await openGui(`http://127.0.0.1:${port}/?token=tg`, problems);
+  try {
+    await pick(page, 'emoji');
+    await page.waitForFunction(`document.getElementById('title').textContent === 'emoji'`, { timeout: 8000 });
+    await new Promise((r) => setTimeout(r, 300));
+    // ~200 KB of 😀 (four UTF-8 bytes, two UTF-16 units each), streamed live so the pane trims it: the
+    // 64 KiB cap is counted in bytes, and the cut falls on a code point, never between a surrogate pair.
+    const ran = await a.call('run', { session: 'emoji', target: 'process', command: `sleep 0.3; awk 'BEGIN { for (i = 0; i < 1000; i++) s = s "\\360\\237\\230\\200"; for (i = 0; i < 50; i++) printf "%s", s; printf "\\nEMOJI-END\\n" }'` });
+    assert.equal(ran.state, 'exited');
+    await page.waitForFunction(`[...document.querySelectorAll('.run-out')].some((d) => d.textContent.includes('EMOJI-END') && d.querySelector('summary').textContent.includes('not shown'))`, { timeout: 10_000 });
+    const pane = await page.evaluate<{ text: string; summary: string }>(`(() => { const d = [...document.querySelectorAll('.run-out')].find((d) => d.textContent.includes('EMOJI-END')); return { text: d.querySelector('pre').textContent, summary: d.querySelector('summary').textContent }; })()`);
+    // No lone surrogate anywhere: the front cut did not split a pair.
+    assert.doesNotMatch(pane.text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, 'the trimmed pane holds no lone surrogate');
+    // The dropped count is in bytes: about 130 KB of the 200 KB, far more than the ~33 KB a UTF-16-unit count would report.
+    const kb = Number(/first (\d+) KB not shown/.exec(pane.summary)?.[1]);
+    assert.ok(kb > 100, `the summary counts bytes: ${pane.summary}`);
+    assert.deepEqual(problems, []);
+  } finally {
+    await page.close();
+    a.close();
+  }
+});

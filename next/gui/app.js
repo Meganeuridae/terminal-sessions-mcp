@@ -745,6 +745,23 @@
   const outSpan = (stream, data) => el('span', stream === 'stderr' ? 'stderr' : null, data);
   const cutMark = (text) => el('span', 'cut', `(${text})\n`);
   const kb = (n) => `${Math.max(1, Math.round(n / 1024))} KB`;
+  /** UTF-8 bytes of a text, as the daemon counts output: the pane's cap and its "not shown" count are in bytes, not UTF-16 units. */
+  const utf8 = (text) => new TextEncoder().encode(text).length;
+
+  /**
+   * `text` without its first `bytes` UTF-8 bytes, cut at a code point, never between the halves of a
+   * surrogate pair (the house's read of 78c4d6e, #22); `cut` is what was taken, in bytes.
+   */
+  function cutFront(text, bytes) {
+    let i = 0;
+    let cut = 0;
+    while (i < text.length && cut < bytes) {
+      const cp = text.codePointAt(i);
+      cut += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+      i += cp >= 0x10000 ? 2 : 1;
+    }
+    return { text: text.slice(i), cut };
+  }
 
   /** The journal's part of a Run's output goes before the streamed part, with any hole or cut marked. */
   function earlierOut(rec, r) {
@@ -754,7 +771,7 @@
       if (e.type === 'gap') frag.append(cutMark(`output ${e.from}–${e.to} not retained`));
       if (e.type !== 'output') continue;
       frag.append(outSpan(e.stream, e.data));
-      out.bytes += e.data.length;
+      out.bytes += utf8(e.data);
       if (e.stream === 'stderr') out.stderr = true;
     }
     if (r.more) frag.append(cutMark(`cut: the pane reads at most ${kb(OUT_MAX)} of the earlier output; the read tool pages all of it`));
@@ -765,15 +782,16 @@
   function appendOut(rec, { stream, data }) {
     const out = rec.out;
     out.pre.append(outSpan(stream, data));
-    out.bytes += data.length;
+    out.bytes += utf8(data);
     if (stream === 'stderr') out.stderr = true;
     trimOut(out);
   }
 
   /**
-   * The pane holds the last OUT_MAX; what the front loses is counted and said in the summary, never passed
-   * off as whole. The span that straddles the cap is shortened rather than dropped: a pipe hands the page
-   * chunks of up to 64 KiB, and dropping one whole could leave the pane nearly empty.
+   * The pane holds the last OUT_MAX bytes of UTF-8, as the daemon counts output; what the front loses
+   * is counted in bytes and said in the summary, never passed off as whole. The span that straddles
+   * the cap is shortened rather than dropped — a pipe hands the page chunks of up to 64 KiB, and
+   * dropping one whole could leave the pane nearly empty — and the cut falls on a code point (cutFront).
    */
   function trimOut(out) {
     while (out.bytes > OUT_MAX && out.pre.firstChild) {
@@ -783,15 +801,16 @@
         continue;
       }
       const excess = out.bytes - OUT_MAX;
-      const n = first.textContent.length;
+      const n = utf8(first.textContent);
       if (n <= excess) {
         out.bytes -= n;
         out.cut += n;
         first.remove();
       } else {
-        first.textContent = first.textContent.slice(excess);
-        out.bytes -= excess;
-        out.cut += excess;
+        const { text, cut } = cutFront(first.textContent, excess);
+        first.textContent = text;
+        out.bytes -= cut;
+        out.cut += cut;
       }
     }
     const parts = [`output (${out.stderr ? 'stdout + stderr' : 'stdout'})`];

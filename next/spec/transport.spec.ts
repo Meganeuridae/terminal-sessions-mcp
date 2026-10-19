@@ -15,7 +15,7 @@ import WebSocket from 'ws';
 import xterm from '@xterm/headless';
 import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
-import { SessionRegistry } from '../src/api/registry.js';
+import { isSessionId, SessionRegistry } from '../src/api/registry.js';
 import type { ScriptedBackend, ScriptedPty } from '../src/backends/scripted.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { Journal } from '../src/core/journal.js';
@@ -1385,12 +1385,16 @@ test('2f357bd-4: closing a session does not cut a paused subscriber off: it gets
     viewer.ws.pause();
     const conn = [...conns(h.server)].find((x) => x !== ownerConn)!;
     const chunk = 'z'.repeat(8 * 1024);
-    for (let i = 0; i < 400; i++) {
+    // Write until the follower pauses, not a fixed count: a host whose loopback socket buffers hold
+    // megabytes stays `live` well past 400 chunks (3.2 MB on Linux), so the test's volume must follow
+    // the backpressure, with a bound so a stream that never pauses fails rather than hangs (the house's
+    // read of 78c4d6e, #22).
+    const follower = conn.followers.get('slowview')!;
+    for (let i = 0; i < 20_000 && follower.state !== 'paused'; i++) {
       s.journal.append({ type: 'note', text: `${i}:${chunk}`, principal: 'agent:a@test' });
       if (i % 100 === 0) await sleep(1);
     }
-    const follower = conn.followers.get('slowview')!;
-    assert.equal(follower.state, 'paused');
+    assert.equal(follower.state, 'paused', 'the follower pauses once the socket and the high-water mark fill');
     const closed = await owner.call('session_close', { session: 'slowview' });
     assert.equal(closed.isError, undefined, closed.text);
     const hist = h.registry.get('slowview')!;
@@ -1695,6 +1699,65 @@ test('2f357bd paths: a journal that fails to read ends the subscription visibly 
     c4.close();
     c2.close();
     c.close();
+  } finally {
+    await h.close();
+  }
+});
+
+// ───────────── the house's read of 78c4d6e (#22): names, removal, the deferred history attach ─────────────
+
+test('78c4d6e: isSessionId’s alphabet is checked, not only the length, and the endpoint refuses a bad name', async () => {
+  // The alphabet: a letter or digit first, then letters, digits, dot, underscore or dash, 1–64 in all.
+  assert.equal(isSessionId('a'), true);
+  assert.equal(isSessionId('A0.b_c-d'), true);
+  assert.equal(isSessionId('x'.repeat(64)), true);
+  assert.equal(isSessionId('x'.repeat(65)), false, 'over 64');
+  assert.equal(isSessionId(''), false, 'empty');
+  assert.equal(isSessionId('.hidden'), false, 'a leading dot is not alphanumeric');
+  assert.equal(isSessionId('-lead'), false, 'a leading dash is not alphanumeric');
+  assert.equal(isSessionId('has space'), false);
+  assert.equal(isSessionId('has/slash'), false);
+  assert.equal(isSessionId('bell\u0007'), false);
+  const h = await start();
+  try {
+    const c = await Client.open(h.port);
+    await assert.rejects(c.request('terminal/detach', { session: 'has/slash' }), /letters, digits/);
+    await assert.rejects(c.request('terminal/subscribe', { session: '.hidden' }), /letters, digits/);
+    c.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('78c4d6e: a subscribed history session that is forgotten drives terminal/closed with reason session-removed (the GUI keys on it)', async () => {
+  const h = await start({ prepare: (dataDir) => historyDir(dataDir, 'rmhist', 'shared', [1, 2, 3].map((i) => ({ type: 'note', text: `h${i}`, principal: 'agent:a@test' }))) });
+  try {
+    const c = await Client.open(h.port);
+    await c.request('terminal/subscribe', { session: 'rmhist', since: 0 });
+    assert.equal(h.registry.get('rmhist')?.kind, 'history');
+    await h.registry.remove('rmhist');
+    const note = await c.next((m) => m.method === 'terminal/closed', 3000);
+    assert.deepEqual(note.params, { session: 'rmhist', reason: 'session-removed' });
+    c.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('78c4d6e 5: a history attach advances the read cursor on the write, not before — a reply that never reaches the client moves nothing', async () => {
+  const h = await start({ prepare: (dataDir) => historyDir(dataDir, 'hcursor', 'shared', [1, 2, 3, 4, 5].map((i) => ({ type: 'output', data: `line ${i}\r\n`, stream: 'pty' }))) });
+  try {
+    const hist = h.registry.get('hcursor');
+    assert.ok(hist?.kind === 'history');
+    const read = () => hist.cursorsOf('agent:b@test').read;
+    assert.equal(read(), 0, 'tb has read nothing of this history yet');
+    const viewer = await Client.open(h.port, { token: 'tb' });
+    const r = (await viewer.request('terminal/attach', { session: 'hcursor' })) as { transcript: string };
+    assert.match(r.transcript, /line 5/);
+    // The response reached the client: its write ran the deferred commit, so the cursor is now advanced.
+    await until(() => read() > 0, 3000, 'the cursor advances once the attach response is written');
+    assert.ok(read() >= 5);
+    viewer.close();
   } finally {
     await h.close();
   }
