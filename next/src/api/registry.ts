@@ -53,7 +53,7 @@ export interface RegistryOptions {
    * Absent or 0: no floor.
    */
   diskFloorBytes?: number;
-  /** The daemon's log, for what a session's journal has to say about its disk (writes refused, writing resumed). */
+  /** The daemon's log, for what recovery did and what a session's journal has to say about its disk (writes refused, writing resumed). */
   log?: (level: 'warn' | 'info', text: string, fields?: Record<string, unknown>) => void;
   /**
    * Take the data dir's lock (default true). Tests only: `false` lets a registry recover a
@@ -387,6 +387,9 @@ export class SessionRegistry {
   private ensureLock(): void {
     if (this.opts.lock === false || this.dirLock) return;
     this.dirLock = acquireDataDirLock(this.opts.dataDir);
+    // A lock whose holder is gone means the previous daemon did not drain: said in the log, not only by what recovery does next (the house's read of 59f660b, #22).
+    const stale = this.dirLock.tookOver;
+    if (stale) this.opts.log?.('warn', 'took over the data dir lock of a daemon that is gone (it did not drain)', { pid: stale.pid, startedAt: stale.startedAt !== undefined ? new Date(stale.startedAt).toISOString() : undefined, hostname: stale.hostname });
   }
 
   /** Flush every session's cursors and give up the data dir's lock. Sessions are not closed: see `closeAll`. */
@@ -464,10 +467,14 @@ export class SessionRegistry {
     // Every Run in flight when the daemon died — running, starting, queued, or named only by a
     // rotation header because its admission rotated out — is `lost`, never `running` (G3, G20).
     const now = Date.now();
+    const lost: string[] = [];
     for (const run of journal.runs.open()) {
       const what = ended.get(`${id}\0${run.runId}`);
       journal.append({ type: 'run.end', runId: run.runId, state: 'lost', reason: what ? `daemon-restart; ${what}` : 'daemon-restart', durationMs: Math.max(0, now - (run.startedAt ?? run.admittedAt)) });
+      lost.push(run.runId);
     }
+    // In the daemon's log too, not only in the journal (the house's read of 59f660b, #22).
+    if (lost.length) this.opts.log?.('info', 'recovery ended Runs a previous daemon left in flight', { session: id, runs: lost });
     // A Run that had ended, leaving children in its group (`leftovers`), says in the journal what became of them.
     for (const run of journal.runs.list()) {
       const what = run.endedAt !== undefined ? ended.get(`${id}\0${run.runId}`) : undefined;
@@ -528,6 +535,12 @@ export class SessionRegistry {
       const what = survivors.has(g) ? `process group ${g} survived SIGKILL` : `process group ${g} terminated`;
       for (const k of keys) out.set(k, what);
     }
+    // The drain logs its kills; so does recovery (the house's read of 59f660b, #22).
+    this.opts.log?.('warn', 'recovery ended process groups a previous daemon left running', {
+      groups: all.filter((g) => !survivors.has(g)),
+      survivedSigkill: survivors.size ? [...survivors] : undefined,
+      sessions: [...new Set([...groups.values()].flat().map((k) => k.slice(0, k.indexOf('\0'))))],
+    });
     return out;
   }
 

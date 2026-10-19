@@ -33,6 +33,8 @@ export interface LockHolder {
 
 export interface DataDirLock {
   readonly file: string;
+  /** Set when the lock was taken from a holder that is gone: what its file said (empty when it was torn). The daemon logs it (the house's read of 59f660b, #22). */
+  readonly tookOver?: Partial<LockHolder>;
   /** Give the lock up (idempotent). The file is removed only by the handle that took it, while it holds it. */
   release(): void;
 }
@@ -235,10 +237,11 @@ export function acquireDataDirLock(dataDir: string): DataDirLock {
   const dir = path.resolve(dataDir);
   const file = path.join(dir, LOCK_FILE);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const take = (raw: string): DataDirLock => {
+  const take = (raw: string, tookOver?: Partial<LockHolder>): DataDirLock => {
     taken.set(file, raw);
     return {
       file,
+      ...(tookOver ? { tookOver } : {}),
       release() {
         // A handle from before the file was lost and taken again must not release the new take.
         if (taken.get(file) === raw) taken.delete(file);
@@ -275,7 +278,7 @@ export function acquireDataDirLock(dataDir: string): DataDirLock {
       if (state === 'self') return { file, release: () => undefined }; // another registry in this process took it; its taker releases it
       if (state === 'live') throw lockedError(dataDir, file, holder, `termd pid ${holder.pid}${holder.hostname !== os.hostname() ? ` (written on host ${holder.hostname})` : ''}`);
     }
-    if (takeOver(file, current, raw)) return take(raw);
+    if (takeOver(file, current, raw)) return take(raw, holder ?? {});
     sleepSync(10);
   }
   throw lockedError(dataDir, file, parseHolder(readRaw(file) ?? ''), 'another termd starting at the same time');
