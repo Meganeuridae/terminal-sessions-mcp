@@ -124,6 +124,9 @@ test('tsm gui prints the GUI URL, with the token when one is configured, as JSON
   assert.equal(withToken.stdout.trim(), 'https://term.example:8443/?token=a+b%26c');
   const inUrl = await tsm(['gui'], { TSM_URL: 'ws://localhost:3175/?token=t1', TSM_TOKEN: '' });
   assert.equal(inUrl.stdout.trim(), 'http://localhost:3175/?token=t1');
+  // An empty TSM_URL is unset: the default address (the house's read, #22 comment 6269721389).
+  const empty = await tsm(['gui'], { TSM_URL: '' });
+  assert.equal(empty.stdout.trim(), 'http://127.0.0.1:3101/');
   const json = await tsm(['gui', '--json'], { TSM_URL: 'ws://127.0.0.1:3101' });
   assert.deepEqual(JSON.parse(json.stdout), { url: 'http://127.0.0.1:3101/' });
 });
@@ -265,6 +268,16 @@ test('ux-18: after --, each word is one argument of the command under sh, bash, 
     assert.equal(d.calls[2]!.arguments.command, 'echo a | cat; echo "b c"');
     await tsm(['run', 'q', 'env', '--', 'FOO=a b', 'cmd'], env);
     assert.equal(d.calls[3]!.arguments.command, "env 'FOO=a b' cmd");
+    // `--json` after `--` is the command's word, not tsm's flag: the result renders as transcript
+    // text; before `--` it is tsm's and the result is JSON (the house's read, #22 comment 6269721389).
+    const after = await tsm(['run', 'q', '--', 'echo', '--json'], env);
+    assert.equal(d.calls[4]!.arguments.command, 'echo --json');
+    assert.equal(after.stdout, '[canned]\n', 'transcript text, not JSON');
+    assert.match(d.urls[4]!, /resultText=transcript/);
+    const before = await tsm(['run', 'q', '--json', '--', 'echo', 'hi'], env);
+    assert.equal(d.calls[5]!.arguments.command, 'echo hi');
+    assert.deepEqual(JSON.parse(before.stdout), { runId: 'r1', state: 'exited', exit: 0 });
+    assert.match(d.urls[5]!, /resultText=json/);
   } finally {
     await d.close();
   }
@@ -298,6 +311,10 @@ test('a flag’s value takes the type of the tool’s parameter: text stays text
       [['start', '--session', 's', '--command', 'x', '--ready', '{"pattern":"ok"}', '--wait=5s', '--name', '42'], 'start', { session: 's', command: 'x', ready: { pattern: 'ok' }, wait: 5000, name: '42' }],
       [['read', 'q', '--since', '0', '--tail=3', '--run-id', 'r7', '--as', 'events'], 'read', { session: 'q', since: 0, tail: 3, runId: 'r7', as: 'events' }],
       [['open', 's', '--cwd', '123', '--shell', '/bin/sh'], 'session_open', { session: 's', cwd: '123', shell: '/bin/sh' }],
+      // A text parameter's value that looks like JSON is text: nothing is parsed before the schema
+      // says what the parameter is (the house's read, #22 comment 6269721389).
+      [['open', 's', '--cwd', '{work}'], 'session_open', { session: 's', cwd: '{work}' }],
+      [['run', 'q', '--command', '{"a":1}'], 'run', { session: 'q', command: '{"a":1}' }],
       [['close', 's', '--force'], 'session_close', { session: 's', force: true }],
       [['await', 'r1', '--wait', '250'], 'await', { runId: 'r1', wait: 250 }],
     ];
@@ -326,6 +343,20 @@ test('a flag’s value takes the type of the tool’s parameter: text stays text
     assert.equal(none.code, 1);
     assert.match(none.stderr, /session_list takes no arguments \(unexpected word foo\)/);
     assert.doesNotMatch(none.stderr, /--session/);
+    // The hint shows each flag as the parser takes it: a yes/no flag alone, never `--force <value>`,
+    // which the parser then refused (the house's read, #22 comment 6269721389).
+    const typedHint = await tsm(['session_close', 'foo'], env);
+    assert.equal(typedHint.code, 1);
+    assert.match(typedHint.stderr, /tsm session_close --session <value> --force --forget --idempotency-key <value>/);
+    assert.doesNotMatch(typedHint.stderr, /--force <value>/);
+    // A misspelt name is an unknown command, with the nearest names, not a hint about a tool that
+    // does not exist; with or without a stray word (the house's read, #22 comment 6269721389).
+    for (const argv of [['sesions', 'foo'], ['sesions']]) {
+      const typo = await tsm(argv, env);
+      assert.equal(typo.code, 1, argv.join(' '));
+      assert.match(typo.stderr, /^sesions is not a command or a tool the daemon lists \(did you mean sessions\?\); tsm --help lists the commands/m, argv.join(' '));
+      assert.doesNotMatch(typo.stderr, /takes --flags only/, argv.join(' '));
+    }
     assert.equal(d.calls.length, expected.length, 'none of the errors reached the daemon');
   } finally {
     await d.close();
@@ -482,11 +513,48 @@ test('tsm usage: the report and --since; a date that does not parse or a log tha
   assert.match(unknown.stderr, /unknown argument --bogus/);
 });
 
-test('a stray word on a flags-only tool is a usage error even when no daemon answers: the generic hint, not a connection error', async () => {
-  // The schema-built hint needs the daemon; without one the stray word is still said first (the
-  // reviewer's read of the r16 commits, #22).
-  const r = await tsm(['session_list', 'foo'], { TSM_URL: `ws://127.0.0.1:${await unusedPort()}` });
+test('without a daemon, only what the syntax alone can tell is said: a stray word is; a flag’s missing value is not', async () => {
+  const env = { TSM_URL: `ws://127.0.0.1:${await unusedPort()}` };
+  // The schema-built hint needs the daemon; without one the stray word is still said first (a
+  // reviewer's read of a088780, #22), and the hint says no daemon listed the flags.
+  const r = await tsm(['session_list', 'foo'], env);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /session_list takes --flags only \(unexpected word foo\)/);
+  assert.match(r.stderr, /session_list takes --flags only \(unexpected word foo\); no daemon answered to list them/);
   assert.doesNotMatch(r.stderr, /cannot reach|--session/);
+  // A flag of unknown type with no value may be a yes/no flag, so before the schema nothing can call
+  // its value missing: the connection error is the truth (the house's read, #22 comment 6269721389).
+  for (const argv of [['run', 'q', '--wait'], ['open', 's', '--cwd']]) {
+    const missing = await tsm(argv, env);
+    assert.equal(missing.code, 1, argv.join(' '));
+    assert.match(missing.stderr, /cannot reach the daemon/, argv.join(' '));
+    assert.doesNotMatch(missing.stderr, /needs a value/, argv.join(' '));
+  }
+  // A text value that looks like JSON is not refused before the schema either.
+  const json = await tsm(['open', 's', '--cwd', '{work}'], env);
+  assert.match(json.stderr, /cannot reach the daemon/);
+  assert.doesNotMatch(json.stderr, /not valid JSON/);
+});
+
+test('an empty TSM_URL or TSM_DATA_DIR is unset: the default daemon address is dialled, and tsm usage reads ~/.tsm', async (t) => {
+  // The empty value is unset, as the shell leaves a variable it exported and then cleared (the house's
+  // read, #22 comment 6269721389).
+  const dialled = await tsm(['sessions'], { TSM_URL: '', TSM_TOKEN: 'not-a-token' });
+  // A daemon of this machine's own on 3101 that admits anyone would answer instead of refusing.
+  if (dialled.code === 0) return t.skip('a daemon on this machine answers on 3101 without a token');
+  assert.equal(dialled.code, 1, dialled.stdout);
+  assert.match(dialled.stderr, /the daemon at ws:\/\/127\.0\.0\.1:3101/, dialled.stderr);
+  const home = path.join(tmp, 'home');
+  fs.mkdirSync(path.join(home, '.tsm'), { recursive: true });
+  const record = (ts: number, tool: string): UsageRecord => ({ ts, principal: 'agent:a@x', connection: 'c1', host: 'mcp', profile: 'full', tool, ok: true, ms: 5, args: [] });
+  fs.writeFileSync(path.join(home, '.tsm', 'usage.jsonl'), [record(1, 'run'), record(2, 'read')].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const other = path.join(tmp, 'other-data');
+  fs.mkdirSync(other, { recursive: true });
+  fs.writeFileSync(path.join(other, 'usage.jsonl'), JSON.stringify(record(3, 'await')) + '\n');
+  const calls = async (env: NodeJS.ProcessEnv) => {
+    const r = await tsm(['usage', '--json'], { HOME: home, ...env });
+    assert.equal(r.code, 0, r.stderr);
+    return (JSON.parse(r.stdout) as { calls: number }).calls;
+  };
+  assert.equal(await calls({ TSM_DATA_DIR: '' }), 2, 'an empty TSM_DATA_DIR reads ~/.tsm');
+  assert.equal(await calls({ TSM_DATA_DIR: other }), 1, 'a set one is read');
 });

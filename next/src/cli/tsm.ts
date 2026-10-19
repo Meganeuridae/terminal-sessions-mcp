@@ -183,17 +183,54 @@ const kebab = (k: string) => k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
 /**
  * The hint for a stray word on a tool called by its full name (no positional shorthand). Built from
  * the tool's own schema, so it names the tool's real parameters, or says it takes none — never a
- * fixed `--session` the tool may not have (the house's read, #22 comment 6264958172).
+ * fixed `--session` the tool may not have (the house's read, #22 comment 6264958172). Each flag is
+ * shown as the parser takes it: a yes/no flag stands alone, since `--force true` was refused as a
+ * stray word after the hint suggested it (the house's read, #22 comment 6269721389).
  */
 function strayHint(cmd: string, stray: string, schema: Schema | undefined): string {
-  const names = schema?.properties ? Object.keys(schema.properties) : undefined;
-  if (names && names.length) return `${cmd} takes --flags only (unexpected word ${stray}): tsm ${cmd} ${names.slice(0, 4).map((p) => `--${kebab(p)} <value>`).join(' ')}${names.length > 4 ? ' …' : ''}`;
+  const props = schema?.properties;
+  const names = props ? Object.keys(props) : undefined;
+  const flag = (p: string) => (typeOf(props![p]) === 'boolean' ? `--${kebab(p)}` : `--${kebab(p)} <value>`);
+  if (names && names.length) return `${cmd} takes --flags only (unexpected word ${stray}): tsm ${cmd} ${names.slice(0, 4).map(flag).join(' ')}${names.length > 4 ? ' …' : ''}`;
   if (schema) return `${cmd} takes no arguments (unexpected word ${stray})`;
-  return `${cmd} takes --flags only (unexpected word ${stray})`;
+  return `${cmd} takes --flags only (unexpected word ${stray}); no daemon answered to list them`;
 }
 
-/** The arguments of a tool call; `--json` and `--until-done` are tsm's own. */
-function parse(argv: string[], schema: Schema | undefined): Parsed {
+/** Edit distance, for the names nearest a misspelt one. */
+function distance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length]!;
+}
+
+/**
+ * A name that is neither a shorthand nor a tool the daemon lists. `tsm sesions foo` was told that
+ * `sesions` takes --flags only, a hint about a tool that does not exist (the house's read, #22
+ * comment 6269721389); the nearest names are offered when any is within two edits.
+ */
+function unknownTool(cmd: string, listed: string[]): string {
+  const short = SHORT[cmd];
+  if (short) return `${short.tool}, the tool behind ${cmd}, is not one the daemon lists for this connection`;
+  const near = [...Object.keys(SHORT), ...listed]
+    .map((n) => [n, distance(cmd, n)] as const)
+    .filter(([, d]) => d <= 2)
+    .sort((x, y) => x[1] - y[1])
+    .slice(0, 3)
+    .map(([n]) => n);
+  return `${cmd} is not a command or a tool the daemon lists${near.length ? ` (did you mean ${near.join(', ')}?)` : ''}; tsm --help lists the commands`;
+}
+
+/**
+ * The arguments of a tool call; `--json` and `--until-done` are tsm's own. Before the daemon is
+ * asked (`typed` false) only the syntax is read and every value stays the text it was typed as:
+ * the schema's type for a parameter decides what a value is, and `--cwd '{work}'` was refused as
+ * "not valid JSON" before the schema could say cwd is text (the house's read, #22 comment 6269721389).
+ */
+function parse(argv: string[], schema: Schema | undefined, typed = true): Parsed {
   const [cmd = '', ...rest] = argv;
   const short = SHORT[cmd];
   const tool = short?.tool ?? cmd;
@@ -230,10 +267,12 @@ function parse(argv: string[], schema: Schema | undefined): Parsed {
       // A yes/no flag stands alone: `--queue echo hi` leaves `echo` to the command (the house's read of 4e37a11, #22).
       else if (type === 'boolean') raw = 'true';
       else if (next === undefined || next.startsWith('--')) {
+        // Of unknown type, a flag with no value may be a yes/no flag: its missing value is told once
+        // the schema is known, and never before (the house's read, #22 comment 6269721389).
         if (type !== undefined) throw new Error(`${a} needs a value`);
         raw = 'true';
       } else raw = rest[++i]!;
-      args[key] = coerce(key, raw, type);
+      args[key] = typed ? coerce(key, raw, type) : raw;
       continue;
     }
     positional.push(a);
@@ -363,14 +402,16 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   if (!cmd || cmd === '--help' || cmd === '-h') return end(0, USAGE);
-  if (cmd === 'gui') return end(0, parse(argv, undefined).json ? JSON.stringify({ url: guiUrl() }, null, 2) : guiUrl());
+  if (cmd === 'gui') return end(0, parse(argv, undefined, false).json ? JSON.stringify({ url: guiUrl() }, null, 2) : guiUrl());
   if (cmd === 'usage') return usageReport(argv.slice(1));
-  // The syntax is checked before any daemon is asked: a shorthand's extra word or a flag without its
-  // value is a usage error whether or not termd runs, and `--json` means tsm's own flag only before
-  // `--`. A flags-only tool's stray word waits for the daemon's schema, so its hint can name the
-  // tool's parameters; when no daemon answers, the generic hint is given instead (the reviewer's
-  // read of the r16 commits, #22).
-  const syntax = parse(argv, undefined);
+  // Before any daemon is asked, the syntax alone is checked, and only what it can tell: a
+  // shorthand's extra word is a usage error whether or not termd runs, and `--json` means tsm's own
+  // flag only before `--`. What needs the schema waits for it: a flag's missing value (a flag of
+  // unknown type with no value may be a yes/no flag), a value's type, and a flags-only tool's stray
+  // word, whose hint names the tool's parameters; when no daemon answers, the stray word gets the
+  // generic hint and a missing value is a connection error (a reviewer's read of a088780
+  // and the house's read, #22 comment 6269721389).
+  const syntax = parse(argv, undefined, false);
   const url = new URL(setting('TSM_URL') ?? 'ws://127.0.0.1:3101');
   const token = setting('TSM_TOKEN');
   if (token) url.searchParams.set('token', token);
@@ -423,6 +464,8 @@ async function main(): Promise<void> {
   const toolName = SHORT[cmd]?.tool ?? cmd;
   const listed = (await request('tools/list').catch(() => undefined)) as { tools?: Array<{ name: string; inputSchema?: Schema }> } | undefined;
   const { json, untilDone } = syntax;
+  // A name the daemon's list does not have is reported as such, before any hint that presumes a tool.
+  if (listed?.tools && !listed.tools.some((t) => t.name === toolName)) throw new Error(unknownTool(cmd, listed.tools.map((t) => t.name)));
   const schema = listed?.tools?.find((t) => t.name === toolName)?.inputSchema;
   const { tool, args, stray } = parse(argv, schema);
   // A flags-only tool given a positional word: report it now the schema is known, named for this tool.
