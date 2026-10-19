@@ -253,7 +253,7 @@ test('the reinit is not typed while a program the rc started is reading, even no
   await tick(600);
   assert.ok(!h.pty.written.includes('reinit typed'), 'nothing was typed into the child');
   assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
-  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /a program it started is reading its input/.test(e.text)), 'the note names the reading program');
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /has a child process in its own process group, so something its rc started may be reading its input/.test(e.text)), 'the note says what the check knows, no more');
   await h.session.close();
 });
 

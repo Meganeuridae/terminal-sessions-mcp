@@ -94,14 +94,17 @@ function canonicalInput(ptsName: string | undefined): boolean | undefined {
 }
 
 /**
- * Does `pid` have a child process right now? `pgrep -P <pid>` (on macOS and Linux) exits 0 when it
- * finds one, 1 when it finds none; any other failure (no pgrep) is unknown. A child is an external
- * program the shell started (a pager, an editor, a password tool), not a builtin `read` (the
- * house's read, #22 comment 6269901528).
+ * Does `pid` have a child process in its own process group right now? `pgrep -P <pid> -g <pid>` (on
+ * macOS and Linux) exits 0 when it finds one, 1 when it finds none; any other failure (no pgrep) is
+ * unknown. While an rc runs, job control is off, so a program the rc started (a pager, an editor, a
+ * password tool) shares the shell's group; a job started at a prompt (`sleep 600 &`) gets its own
+ * group, survives an `exec bash` as the shell's child, and must not count — any child at all kept the
+ * reinit from being typed (a reviewer's read of the fixes for #22 comment 6269901528). A builtin
+ * `read` has no child and is not caught either way.
  */
 function hasChild(pid: number): boolean | undefined {
   try {
-    const out = execFileSync('pgrep', ['-P', String(pid)], { encoding: 'utf8', timeout: 2000 });
+    const out = execFileSync('pgrep', ['-P', String(pid), '-g', String(pid)], { encoding: 'utf8', timeout: 2000 });
     return out.trim().length > 0;
   } catch (e) {
     // pgrep exits 1 with no match: that is a definite "no child". Anything else (ENOENT: no pgrep)

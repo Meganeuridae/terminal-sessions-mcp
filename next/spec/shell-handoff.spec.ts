@@ -189,6 +189,36 @@ for (const [how, rc] of [
   });
 }
 
+test('/bin/bash: a background job started at the prompt before `exec bash` does not hold the reinit back', { skip: !hasShell('/bin/bash') }, async () => {
+  // A job started at a prompt keeps its own process group and stays the shell's child across the exec.
+  // Counting any child, the gate never typed the reinit and the session ended unavailable with a note
+  // blaming a program the rc started; the check now asks for a child in the shell's own group, which
+  // only an rc's program is (a reviewer's read of the fixes for #22 comment 6269901528).
+  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': "PROMPT_COMMAND='history -a'\n" }, startupCapMs: 1500 });
+  let bg: number | undefined;
+  try {
+    const started = await x.run('sleep 600 & echo BGPID=$!', 20_000);
+    bg = Number(/BGPID=(\d+)/.exec(started.text)?.[1]);
+    assert.ok(bg! > 0, `a background job started: ${started.text}`);
+    const handoff = await x.run('exec /bin/bash', 20_000);
+    assert.deepEqual([handoff.state, handoff.reason], ['lost', 'shell-replaced']);
+    const back = await x.run('echo back', 20_000);
+    assert.deepEqual([back.state, back.exit, back.text.trim()], ['exited', 0, 'back'], 'the reinit was typed despite the background job');
+    assert.equal(x.session.integration, 'rich');
+    assert.ok(handoffNotes(x).some((t) => /did not load the shell integration/.test(t)), `the daemon reloaded it: ${JSON.stringify(handoffNotes(x))}`);
+    assert.ok(!handoffNotes(x).some((t) => /child process/.test(t)), 'no note blamed the background job');
+  } finally {
+    await x.close();
+    if (bg) {
+      try {
+        process.kill(bg, 'SIGKILL');
+      } catch {
+        // already gone
+      }
+    }
+  }
+});
+
 const handoffOutput = (x: Awaited<ReturnType<typeof realSession>>): string =>
   x.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output').map((e) => e.data).join('');
 
@@ -266,7 +296,7 @@ test('/bin/bash: the reinit is not typed while a program the rc started is readi
     const out = handoffOutput(x);
     assert.ok(!out.includes('reinit typed'), 'nothing was typed into the child reader');
     assert.doesNotMatch(out, /PYGOT:/, 'the child reader received nothing from the daemon');
-    assert.ok(handoffNotes(x).some((t) => /a program it started is reading its input/.test(t)), `the note names the reading program: ${JSON.stringify(handoffNotes(x))}`);
+    assert.ok(handoffNotes(x).some((t) => /has a child process in its own process group, so something its rc started may be reading its input/.test(t)), `the note says what the check knows: ${JSON.stringify(handoffNotes(x))}`);
   } finally {
     await x.close();
   }

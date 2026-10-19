@@ -965,8 +965,13 @@ export class Session {
             //   - canonical with no child: a `read -p` and a `bash --noediting` prompt cannot be told
             //     apart, so do not type; say so, and that --noediting is unsupported for the handoff.
             //   - the mode unreadable (stty failed): do not type; say that cause.
-            const child = this.pty.hasChild?.();
+            // The mode first, and the child check only when the mode would let the reinit be typed:
+            // one process spawned per tick, not two for the whole cap (a reviewer's read of the fixes
+            // for #22 comment 6269901528). The child check asks for a child in the shell's own process
+            // group — what an rc starts, with job control off — not a job started at a prompt before
+            // the exec, which keeps its own group and must not hold the reinit back.
             const canon = this.pty.canonicalInput?.();
+            const child = canon === false ? this.pty.hasChild?.() : undefined;
             if (child !== true && canon === false) {
               reinitTyped = true;
               changedAt = clocks.monotonic();
@@ -978,7 +983,7 @@ export class Session {
                 const manual = 'recover by typing ` . "$TSM_BASH_RC" reinit typed` at the prompt, or send that line with input';
                 const why =
                   child === true
-                    ? 'a program it started is reading its input: the shell integration was not loaded, and typing into that program is unsafe'
+                    ? 'it has a child process in its own process group, so something its rc started may be reading its input: the shell integration was not loaded, and the reinit was not typed into that program'
                     : canon === true
                       ? `its terminal is in canonical mode, where a \`read -p\` prompt and a \`bash --noediting\` prompt cannot be told apart, so the reinit was not typed (--noediting is unsupported for the handoff): the shell integration was not loaded — ${manual}`
                       : `its terminal mode could not be read (stty failed), so whether a program is reading its input is unknown and the reinit was not typed: the shell integration was not loaded — ${manual}`;

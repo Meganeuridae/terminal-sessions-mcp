@@ -56,10 +56,13 @@ export interface PtyHandle {
   /** The shell process's current command line (it changes when the process execs); undefined if unknown. */
   command?(): string | undefined;
   /**
-   * Does the shell have a child process right now (the house's read, #22 comment 6269901528)? A
-   * pager, an editor, tmux or a password tool the rc started is one, and the daemon never types a
-   * reinit while a child is reading. A builtin `read` has no child, so this does not catch it.
-   * Undefined when it cannot be read; the caller then falls back to the terminal mode.
+   * Does the shell have a child process in its own process group right now (the house's read, #22
+   * comment 6269901528, narrowed by a reviewer's read of its fixes)? A pager, an editor, tmux or a
+   * password tool the rc started is one — job control is off while the rc runs, so it shares the
+   * shell's group — and the daemon never types a reinit while one may be reading. A job started at a
+   * prompt (`sleep 600 &`) has its own group and does not count, though it stays the shell's child
+   * across an `exec`. A builtin `read` has no child, so this does not catch it. Undefined when it
+   * cannot be read; the caller then falls back to the terminal mode alone.
    */
   hasChild?(): boolean | undefined;
   /**
