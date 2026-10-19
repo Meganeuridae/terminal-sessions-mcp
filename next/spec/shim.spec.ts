@@ -1,12 +1,15 @@
 /**
  * The stdio shim as a process (tg-19): piped use gets every answer, a dropped
  * socket fails the requests in flight (never silently) and reconnects with the
- * host's state replayed, requests that cannot reach a daemon fail after a bound,
- * and on loopback with nothing listening it starts termd itself, unless a
- * supervisor manages one for that port, and again when it dies.
+ * host's state replayed — the state the daemon accepted, with the daemon's own
+ * request ids kept apart per connection — requests that cannot reach a daemon
+ * fail after a bound, and on loopback with nothing listening it starts termd
+ * itself, unless a supervisor manages one for that port, and again when it dies.
  *
- * The shim's supervisor question (launchctl, systemctl) is answered by stubs
- * first on its PATH, so no unit of the host's decides a test.
+ * Two peers stand in for termd: the real server in-process (`daemon`), and a
+ * scripted WebSocket peer (`peer`) that records every frame per connection, for
+ * what only the wire shows. The shim's supervisor question (launchctl, systemctl)
+ * is answered by stubs first on its PATH, so no unit of the host's decides a test.
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,7 +19,7 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type WebSocket from 'ws';
+import { WebSocketServer, type WebSocket } from 'ws';
 import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
@@ -30,7 +33,7 @@ const COMPAT = path.resolve(here, '../src/shim/compat.js');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-shim-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-type Msg = { jsonrpc: '2.0'; id?: number | string; method?: string; result?: unknown; error?: { code: number; message: string; data?: unknown } };
+type Msg = { jsonrpc: '2.0'; id?: number | string; method?: string; params?: Record<string, unknown>; result?: unknown; error?: { code: number; message: string; data?: unknown } };
 
 interface Daemon {
   server: TermServer;
@@ -67,7 +70,52 @@ async function daemon(port = 0, registry?: SessionRegistry, tokens?: Record<stri
   };
 }
 
-const conns = (s: TermServer) => (s as unknown as { conns: Set<{ ws: WebSocket; initialized: boolean; label: string | undefined }> }).conns;
+type Lane = { open: Set<string>; has(cap: string): boolean; grant: { disabledFeatureSets: string[] } };
+const conns = (s: TermServer) => (s as unknown as { conns: Set<{ ws: WebSocket; initialized: boolean; label: string | undefined; inFlight: number; lane: Lane | null }> }).conns;
+/** The MCPL lane of the daemon's one connection, or null. */
+const laneOf = (d: Daemon): Lane | null => [...conns(d.server)][0]?.lane ?? null;
+
+interface PeerConn {
+  index: number;
+  ws: WebSocket;
+  frames: Msg[];
+}
+type Answer = { result: unknown } | { error: { code: number; message: string } } | undefined;
+interface Peer {
+  port: number;
+  conns: PeerConn[];
+  close(): Promise<void>;
+}
+
+/**
+ * A scripted peer in termd's place: it records every frame per connection and answers each request
+ * as `answer` says (undefined: never). The default answers every request with an empty result.
+ */
+async function peer(answer: (c: PeerConn, m: Msg) => Answer = () => ({ result: {} })): Promise<Peer> {
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>((r) => wss.once('listening', r));
+  const peerConns: PeerConn[] = [];
+  wss.on('connection', (ws) => {
+    const c: PeerConn = { index: peerConns.length, ws, frames: [] };
+    peerConns.push(c);
+    ws.on('message', (d) => {
+      const m = JSON.parse(d.toString()) as Msg;
+      c.frames.push(m);
+      if (m.method === undefined || m.id === undefined) return;
+      const a = answer(c, m);
+      if (a) ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, ...a }));
+    });
+  });
+  return {
+    port: (wss.address() as net.AddressInfo).port,
+    conns: peerConns,
+    close: () =>
+      new Promise((r) => {
+        for (const c of peerConns) c.ws.terminate();
+        wss.close(() => r());
+      }),
+  };
+}
 
 interface Shim {
   child: ChildProcess;
@@ -144,11 +192,14 @@ async function until(pred: () => boolean, ms: number, what: string): Promise<voi
 }
 
 const init = (id: number | string) => ({ jsonrpc: '2.0', id, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'spec', version: '0' } } });
+const initMcpl = (id: number | string) => ({ jsonrpc: '2.0', id, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: { experimental: { mcpl: {} } }, clientInfo: { name: 'spec', version: '0' } } });
 const byId = (id: number | string) => (m: Msg) => m.id === id && m.method === undefined;
 /** The shim's exit code, or an error when it is still running after `ms`: a shim that should have exited must not hang the run. */
 const exitWithin = (s: Shim, ms = 5000) => Promise.race([s.exited, new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`the shim did not exit within ${ms} ms; stderr=${s.err.join('')}`)), ms).unref())]);
 const call = (id: number, name: string, args: Record<string, unknown>) => ({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } });
 const structured = (m: Msg) => (m.result as { structuredContent: Record<string, unknown> }).structuredContent;
+/** No answer to a replayed request (id `tsm-shim:replay:N`) may reach the host. */
+const noReplayedAnswer = (s: Shim) => s.out.every((m) => !String(m.id).startsWith('tsm-shim:replay:'));
 
 test('tg-19: piped stdin that ends before the socket opens still gets every answer, then exit 0', async () => {
   const d = await daemon();
@@ -192,8 +243,9 @@ test('tg-19: a dropped socket fails the requests in flight with -32000, then the
     s.send(init(1));
     await s.next(byId(1));
     s.send(call(2, 'run', { session: 'r1', command: 'sleep 30', wait: 10_000 }));
-    await new Promise((r) => setTimeout(r, 200));
-    for (const c of conns(d.server)) c.ws.terminate(); // the daemon side drops the connection mid-call
+    // The daemon has the call (it is in flight on the connection) when the connection drops under it.
+    await until(() => [...conns(d.server)].some((c) => c.inFlight > 0), 5000, 'the call to be in flight at the daemon');
+    for (const c of conns(d.server)) c.ws.terminate();
     const failed = await s.next(byId(2));
     assert.equal(failed.error?.code, -32000);
     assert.match(failed.error?.message ?? '', /outcome is unknown/);
@@ -205,6 +257,7 @@ test('tg-19: a dropped socket fails the requests in flight with -32000, then the
     assert.equal(now.length, 1);
     assert.equal(now[0]!.initialized, true, 'initialize was replayed on the new connection');
     assert.equal(s.out.filter((m) => m.id === 1).length, 1, 'the replayed initialize answer is swallowed');
+    assert.ok(noReplayedAnswer(s), 'no replayed answer reached the host under its replay id');
     s.end();
     assert.equal(await s.exited, 0);
   } finally {
@@ -216,7 +269,7 @@ test('tg-19: after a reconnect an MCPL host keeps its grant and its open channel
   const d = await daemon();
   try {
     const s = shim({ TSM_URL: `ws://127.0.0.1:${d.port}` });
-    s.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: { experimental: { mcpl: {} } }, clientInfo: { name: 'spec', version: '0' } } });
+    s.send(initMcpl(1));
     await s.next(byId(1));
     s.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     s.send({ jsonrpc: '2.0', id: 2, method: 'featureSets/update', params: { effectiveCapabilities: ['tools', 'pushEvents', 'channels.register', 'channels.lifecycle', 'channels.incoming', 'channels.publish'] } });
@@ -231,22 +284,219 @@ test('tg-19: after a reconnect an MCPL host keeps its grant and its open channel
     const kb = (await s.next(byId(6))).result as { channel: { id: string } };
     s.send({ jsonrpc: '2.0', id: 7, method: 'channels/close', params: { channelId: kb.channel.id } });
     await s.next(byId(7));
-    type Lane = { open: Set<string>; has(path: string): boolean };
-    const lane = () => ([...conns(d.server)][0] as unknown as { lane: Lane | null } | undefined)?.lane ?? null;
-    const first = lane();
+    const first = laneOf(d);
     assert.deepEqual([...first!.open], [ka.channel.id]);
     for (const c of conns(d.server)) c.ws.terminate();
     await until(() => {
-      const l = lane();
+      const l = laneOf(d);
       return l !== null && l !== first && l.open.size > 0;
     }, 5000, 'the channel to be reopened on the new connection');
-    assert.deepEqual([...lane()!.open], [ka.channel.id], 'the open channel is back; the closed one is not');
-    assert.equal(lane()!.has('channels.lifecycle'), true, 'the grant was replayed');
+    assert.deepEqual([...laneOf(d)!.open], [ka.channel.id], 'the open channel is back; the closed one is not');
+    assert.equal(laneOf(d)!.has('channels.lifecycle'), true, 'the grant was replayed');
     assert.equal(s.out.filter((m) => m.method === undefined && (m.id === 1 || m.id === 2 || m.id === 5)).length, 3, 'replayed answers are swallowed');
+    assert.ok(noReplayedAnswer(s), 'no replayed answer reached the host under its replay id');
     s.end();
     assert.equal(await s.exited, 0);
   } finally {
     await d.close();
+  }
+});
+
+test("tg-19: the replay follows what the daemon accepted — not a refused grant, not a channel closed before its open was answered, not one closed or a reduction made while the daemon was down, and every reduction past 255 (the house's read of 4e37a11, #22)", async () => {
+  const first = await daemon();
+  const { port, registry } = first;
+  const s = shim({ TSM_URL: `ws://127.0.0.1:${port}`, TSM_CONNECT_TIMEOUT_MS: '300' });
+  let second: Daemon | undefined;
+  try {
+    s.send(initMcpl(1));
+    await s.next(byId(1));
+    s.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    const caps = ['tools', 'pushEvents', 'channels.register', 'channels.lifecycle', 'channels.incoming', 'channels.publish'];
+    s.send({ jsonrpc: '2.0', id: 2, method: 'featureSets/update', params: { effectiveCapabilities: caps } });
+    assert.ok((await s.next(byId(2))).result, 'the grant is accepted');
+    for (const [n, id] of [[3, 'ka'], [4, 'kb'], [5, 'kc']] as const) {
+      s.send(call(n, 'session_open', { session: id }));
+      await s.next(byId(n));
+    }
+    // ka stays open. kb is closed by a notification sent right behind its open, before the open is
+    // answered (a host can: the channel's id is its session's). kc is closed while the daemon is down.
+    s.send({ jsonrpc: '2.0', id: 6, method: 'channels/open', params: { address: { session: 'ka' } } });
+    s.send({ jsonrpc: '2.0', id: 7, method: 'channels/open', params: { address: { session: 'kb' } } });
+    s.send({ jsonrpc: '2.0', method: 'channels/close', params: { channelId: 'terminal:kb' } });
+    s.send({ jsonrpc: '2.0', id: 8, method: 'channels/open', params: { address: { session: 'kc' } } });
+    const ka = (await s.next(byId(6))).result as { channel: { id: string } };
+    const kb = (await s.next(byId(7))).result as { channel: { id: string } };
+    const kc = (await s.next(byId(8))).result as { channel: { id: string } };
+    assert.equal(kb.channel.id, 'terminal:kb');
+    // A second grant whose lists overlap is refused (§5.4) and fails the lane closed; a close of ka is refused under it.
+    s.send({ jsonrpc: '2.0', id: 9, method: 'featureSets/update', params: { effectiveCapabilities: caps, deniedCapabilities: ['tools'] } });
+    assert.ok((await s.next(byId(9))).error, 'the overlapping grant is refused');
+    s.send({ jsonrpc: '2.0', id: 10, method: 'channels/close', params: { channelId: ka.channel.id } });
+    assert.ok((await s.next(byId(10))).error, 'the close is refused under the failed-closed grant');
+    // 300 reductions, each naming a feature set of its own, in bursts under the daemon's in-flight bound.
+    for (let i = 1; i <= 300; i++) {
+      s.send({ jsonrpc: '2.0', method: 'featureSets/update', params: { disabled: [`x${i}`] } });
+      if (i % 100 === 0) {
+        s.send({ jsonrpc: '2.0', id: 100 + i, method: 'ping' });
+        await s.next(byId(100 + i));
+      }
+    }
+    const lane1 = laneOf(first)!;
+    assert.deepEqual([...lane1.open].sort(), [ka.channel.id, kc.channel.id].sort(), 'the daemon has ka and kc open');
+    assert.equal(lane1.has('channels.lifecycle'), false, 'the daemon failed closed');
+    // The daemon goes away. The host closes kc and disables terminal.annotate, both as notifications,
+    // and both wait out the queue; so does the ping behind them, which says so.
+    await first.server.close();
+    await until(() => s.err.join('').includes('ECONNREFUSED'), 5000, 'the shim to find the port refused');
+    s.send({ jsonrpc: '2.0', method: 'channels/close', params: { channelId: kc.channel.id } });
+    s.send({ jsonrpc: '2.0', method: 'featureSets/update', params: { disabled: ['terminal.annotate'] } });
+    s.send({ jsonrpc: '2.0', id: 11, method: 'ping' });
+    assert.equal((await s.next(byId(11))).error?.code, -32000, 'the queue expired');
+    second = await daemon(port, registry);
+    await until(() => {
+      const l = laneOf(second!);
+      return l !== null && l.open.size > 0;
+    }, 8000, 'a channel to be reopened on the new connection');
+    const lane2 = laneOf(second)!;
+    assert.deepEqual([...lane2.open], [ka.channel.id], 'ka is back; kb (closed before its open was answered) and kc (closed while the daemon was down) are not');
+    assert.equal(lane2.has('channels.lifecycle'), true, 'the accepted grant was replayed, not the refused one');
+    const disabled = lane2.grant.disabledFeatureSets;
+    assert.equal(disabled.filter((n) => /^x\d+$/.test(n)).length, 300, 'every reduction since the grant is replayed');
+    assert.ok(disabled.includes('terminal.annotate'), 'the reduction that expired unsent is replayed');
+    assert.ok(noReplayedAnswer(s), 'no replayed answer reached the host');
+    assert.doesNotMatch(s.err.join(''), /refused/, 'nothing replayed was refused');
+    s.end();
+    assert.equal(await s.exited, 0);
+  } finally {
+    s.child.kill();
+    if (second) await second.close();
+    else {
+      await first.server.close().catch(() => undefined);
+      await registry.closeAll();
+    }
+  }
+});
+
+test("tg-19: the host's answer to a request from a connection that is gone is dropped, never passed on as the answer to the new connection's request with the same id (the house's read of 4e37a11, #22)", async () => {
+  // The peer asks the host something (its id 1, as the daemon's ids restart per connection) on each connection, once initialize is answered.
+  const p = await peer((c, m) => {
+    if (m.method === 'initialize') setImmediate(() => c.ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'push/event', params: { conn: c.index + 1 } })));
+    return { result: {} };
+  });
+  const s = shim({ TSM_URL: `ws://127.0.0.1:${p.port}` });
+  try {
+    s.send(init(1));
+    const askedFirst = await s.next((m) => m.method === 'push/event' && m.params?.conn === 1);
+    p.conns[0]!.ws.terminate();
+    const askedSecond = await s.next((m) => m.method === 'push/event' && m.params?.conn === 2);
+    assert.notEqual(askedFirst.id, askedSecond.id, 'the two requests reach the host under ids of their own');
+    // The host answers the old one first, then the new one.
+    s.send({ jsonrpc: '2.0', id: askedFirst.id, result: { stale: true } });
+    s.send({ jsonrpc: '2.0', id: askedSecond.id, result: { fresh: true } });
+    const answers = () => p.conns[1]!.frames.filter((f) => f.method === undefined && f.id === 1);
+    await until(() => answers().length > 0, 5000, 'an answer on the new connection');
+    await new Promise((r) => setTimeout(r, 100)); // room for a second answer to arrive, were one passed on
+    assert.deepEqual(answers().map((a) => a.result), [{ fresh: true }], "only the answer to the new connection's own request, under the daemon's id");
+    assert.match(s.err.join(''), /dropped the host's answer to request/);
+    s.end();
+    await s.exited;
+  } finally {
+    s.child.kill();
+    await p.close();
+  }
+});
+
+test("tg-19: after a drop, the request in flight is failed and not resent, the replay goes before the queue, a reopened channel asks for no history, and a refused replay is said (the house's read of 4e37a11, #22)", async () => {
+  const p = await peer((c, m) => {
+    if (m.method === 'channels/open') return c.index === 0 ? { result: { channel: { id: 'terminal:k1' } } } : { error: { code: -32017, message: 'unknown channel terminal:k1' } };
+    if (m.method === 'tools/call') return undefined; // never answered: in flight when the connection drops
+    return { result: {} };
+  });
+  const s = shim({ TSM_URL: `ws://127.0.0.1:${p.port}` });
+  try {
+    s.send(init(1));
+    await s.next(byId(1));
+    s.send({ jsonrpc: '2.0', id: 2, method: 'channels/open', params: { address: { session: 'k1' }, history: { limit: 50 } } });
+    await s.next(byId(2));
+    s.send(call(3, 'run', { session: 'k1', command: 'sleep 9' }));
+    await until(() => p.conns[0]!.frames.some((f) => f.id === 3), 5000, 'the call to reach the peer');
+    p.conns[0]!.ws.terminate();
+    const failed = await s.next(byId(3));
+    assert.equal(failed.error?.code, -32000);
+    s.send({ jsonrpc: '2.0', id: 4, method: 'ping' }); // queued until the new connection is in the host's state
+    assert.deepEqual((await s.next(byId(4))).result, {});
+    const frames = p.conns[1]!.frames;
+    assert.deepEqual(frames.map((f) => f.method), ['initialize', 'channels/open', 'ping'], 'the replay, then the queue; the failed call is not resent');
+    const reopen = frames[1]!;
+    assert.match(String(reopen.id), /^tsm-shim:replay:/);
+    assert.equal(reopen.params?.channelId, 'terminal:k1');
+    assert.equal(reopen.params?.history, undefined, 'catch-up resumes from the delivered cursor, not from history');
+    assert.match(s.err.join(''), /replay of channels\/open for terminal:k1 refused \(-32017 unknown channel terminal:k1\)/);
+    assert.ok(noReplayedAnswer(s));
+    s.end();
+    await s.exited;
+  } finally {
+    s.child.kill();
+    await p.close();
+  }
+});
+
+/** A TCP server that accepts, reads and never answers: a stalled handshake. */
+function silentServer(): Promise<{ port: number; accepted(): number; close(): void }> {
+  const socks = new Set<net.Socket>();
+  let accepted = 0;
+  const srv = net.createServer((sock) => {
+    accepted++;
+    socks.add(sock);
+    sock.on('data', () => undefined);
+    sock.on('error', () => undefined);
+    sock.on('close', () => socks.delete(sock));
+  });
+  return new Promise((resolve) =>
+    srv.listen(0, '127.0.0.1', () =>
+      resolve({
+        port: (srv.address() as net.AddressInfo).port,
+        accepted: () => accepted,
+        close: () => {
+          for (const s of socks) s.destroy();
+          srv.close();
+        },
+      }),
+    ),
+  );
+}
+
+test("tg-19: a handshake the peer accepts but never answers is given up and tried again (the house's read of 4e37a11, #22)", async () => {
+  const srv = await silentServer();
+  const s = shim({ TSM_URL: `ws://127.0.0.1:${srv.port}`, TSM_CONNECT_TIMEOUT_MS: '1200' });
+  try {
+    s.send(init(1));
+    const failed = await s.next(byId(1), 5000);
+    assert.equal(failed.error?.code, -32000);
+    await until(() => srv.accepted() >= 2, 6000, 'a second handshake');
+    assert.match(s.err.join(''), /handshake has timed out/i);
+  } finally {
+    s.child.kill();
+    srv.close();
+  }
+});
+
+test("tg-19: reconnects back off (the house's read of 4e37a11, #22)", async () => {
+  let accepted = 0;
+  const srv = net.createServer((sock) => {
+    accepted++;
+    sock.destroy();
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+  const s = shim({ TSM_URL: `ws://127.0.0.1:${(srv.address() as net.AddressInfo).port}`, TSM_CONNECT_TIMEOUT_MS: '5000' });
+  try {
+    s.send(init(1));
+    await new Promise((r) => setTimeout(r, 1500));
+    // Attempts 100, 200, 400 and 800 ms apart: a handful in the first 1.5 s, not hundreds.
+    assert.ok(accepted >= 2 && accepted <= 6, `${accepted} connection attempts in 1.5 s`);
+  } finally {
+    s.child.kill();
+    srv.close();
   }
 });
 
@@ -259,9 +509,10 @@ test('tg-19: when the daemon goes away and comes back on the same port, queued r
     s.send(init(1));
     await s.next(byId(1));
     await first.close();
-    await new Promise((r) => setTimeout(r, 300));
-    s.send({ jsonrpc: '2.0', id: 2, method: 'ping' }); // queued while nothing listens
-    await new Promise((r) => setTimeout(r, 300));
+    // Once the shim has found the port refused, nothing it reads can go anywhere but its queue until a
+    // reconnect succeeds, and the next attempt is a backoff away.
+    await until(() => s.err.join('').includes('ECONNREFUSED'), 5000, 'the shim to find the port refused');
+    s.send({ jsonrpc: '2.0', id: 2, method: 'ping' });
     second = await daemon(port);
     const pong = await s.next(byId(2), 8000);
     assert.deepEqual(pong.result, {});
@@ -273,23 +524,43 @@ test('tg-19: when the daemon goes away and comes back on the same port, queued r
   }
 });
 
-test('tg-19: a request that cannot reach any daemon fails after TSM_CONNECT_TIMEOUT_MS instead of hanging', async () => {
+test('tg-19: a request that cannot reach any daemon fails after TSM_CONNECT_TIMEOUT_MS instead of hanging, with stdin still open', async () => {
   const port = await unusedPort();
   const s = shim({ TSM_URL: `ws://127.0.0.1:${port}`, TSM_CONNECT_TIMEOUT_MS: '400' });
   s.send(init(7));
-  s.end();
-  const failed = await s.next(byId(7), 5000);
+  // stdin stays open: the bound is the setting's, not stdin's end (the house's read of 4e37a11, #22).
+  const failed = await s.next(byId(7), 2000);
   assert.equal(failed.error?.code, -32000);
   assert.match(failed.error?.message ?? '', /cannot reach/);
-  assert.equal(await s.exited, 1);
+  s.end();
+  await s.exited;
 });
 
-test("tg-19: a profile that is none of core, full, compat is a mistake: said, exit 2 (the house's read of 4e37a11, #22)", async () => {
+test("tg-19: the wait for a connection is on a monotonic clock: a wall-clock step does not stretch it (the house's read of 4e37a11, #22)", async () => {
+  const preload = path.join(tmp, 'clock-step.cjs');
+  fs.writeFileSync(preload, 'const real = Date.now; let shift = 0; setTimeout(() => { shift = 3600_000; }, 150).unref(); Date.now = () => real() - shift;\n');
+  const port = await unusedPort();
+  const s = shim({ TSM_URL: `ws://127.0.0.1:${port}`, TSM_CONNECT_TIMEOUT_MS: '600' }, ['--require', preload, SHIM]);
+  try {
+    s.send(init(1));
+    const failed = await s.next(byId(1), 3000);
+    assert.equal(failed.error?.code, -32000);
+  } finally {
+    s.child.kill();
+  }
+});
+
+test("tg-19: a profile that is none of core, full, compat and a connect timeout that is not a count of milliseconds are mistakes: said, exit 2 (the house's read of 4e37a11, #22)", async () => {
   const typo = shim({ TSM_PROFILE: 'comapt' });
   assert.equal(await exitWithin(typo), 2);
   assert.match(typo.err.join(''), /profile must be one of core, full, compat, not "comapt"/);
   const flag = shim({}, [SHIM, '--profile=comapt']);
   assert.equal(await exitWithin(flag), 2);
+  for (const bad of ['abc', 'Infinity', '-1', '1e3']) {
+    const s = shim({ TSM_CONNECT_TIMEOUT_MS: bad });
+    assert.equal(await exitWithin(s), 2, bad);
+    assert.match(s.err.join(''), /TSM_CONNECT_TIMEOUT_MS must be a whole number of milliseconds/);
+  }
 });
 
 test("tg-19: --help (and -h) prints the settings and exits 0 before anything is read or started (the house's read of 4e37a11, #22)", async () => {

@@ -413,10 +413,14 @@ test('--until-done keeps awaiting past the per-call wait until the Run has ended
   const env = { TSM_URL: `ws://127.0.0.1:${port}`, TSM_TOKEN: 'tk' };
   try {
     const pending = tsm(['run', 'u', '--wait', '0', '--until-done', '--json', '--', 'sleep', '9'], env);
-    // A zero initial wait becomes one long poll, rather than thousands of immediate calls.
-    await new Promise((r) => setTimeout(r, 700));
+    // A zero initial wait becomes one long poll, rather than thousands of immediate calls: the first
+    // call's wait is the long poll's, and no second call follows it (the house's read of 4e37a11, #22).
+    const end = Date.now() + 5000;
+    while (!waits.length && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
     assert.ok(sh, 'the shell started');
     assert.deepEqual(waits, [55_000]);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(waits, [55_000], 'one long poll, not a loop of short ones');
     sh.finishHung(3, 'took a while\r\n');
     const r = await pending;
     assert.equal(r.code, 3, `exit code: ${r.stderr}`);

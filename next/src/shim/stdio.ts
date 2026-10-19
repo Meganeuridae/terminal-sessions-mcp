@@ -5,14 +5,25 @@
  * adds no protocol logic, only what keeps the pipe honest:
  *
  *  - Lines read before the socket opens are queued and sent in order once it
- *    does, so `printf '…' | tsm-shim` gets its answers.
+ *    does, so `printf '…' | tsm-shim` gets its answers. A request that waits
+ *    longer than TSM_CONNECT_TIMEOUT_MS for a connection is answered with a
+ *    JSON-RPC error (-32000) saying why none came; a notification that waits
+ *    that long is dropped. The wait is measured on a monotonic clock.
  *  - At stdin EOF it waits for the answer to every request it forwarded, then
  *    closes the socket and exits 0.
- *  - When the socket drops, every request in flight is answered with a JSON-RPC
- *    error (-32000): its outcome is unknown, and the host must not blindly resend
- *    it (G16). The shim reconnects with backoff and replays the host's
- *    `initialize`, its MCPL policy and its open channels, so the new connection
- *    is in the state the host believes it is in; replayed answers are swallowed.
+ *  - When the socket drops, every request in flight is answered with -32000:
+ *    its outcome is unknown, and the host must not blindly resend it (G16); it
+ *    is not resent here either. The daemon numbers the requests it makes of the
+ *    host per connection, so the shim gives them ids of its own and maps the
+ *    host's answers back; an answer to a request from a connection that is gone
+ *    is dropped, never passed on as the answer to a new one. The shim reconnects
+ *    with backoff (a handshake the peer accepts but never answers is given up
+ *    and tried again) and replays the host's `initialize`, its MCPL grant with
+ *    the reductions since, and its open channels, so the new connection is in
+ *    the state the host believes it is in. The replay follows what the daemon
+ *    accepted — a request counts when its answer says so, a notification when it
+ *    arrives — goes in bounded windows, its answers are swallowed, and a refusal
+ *    is logged.
  *  - When the URL is a plain ws:// loopback address and nothing listens, it
  *    starts termd — detached, same port, logging to <data-dir>/termd.log
  *    (rotated), its stderr kept in <data-dir>/termd.stderr.log — unless
@@ -45,7 +56,7 @@
  * Env (an empty value is unset, as for termd): TSM_RESULT_TEXT (json|transcript),
  * TSM_NO_SPAWN, TSM_DATA_DIR (for a spawned termd; a relative path is taken from
  * this process's working directory), TSM_CONNECT_TIMEOUT_MS (how long a request
- * may wait for a connection, default 15000).
+ * may wait for a connection, default 15000; a whole number of milliseconds, empty = default).
  */
 import { execFile, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
@@ -66,6 +77,9 @@ interface Parsed {
 
 const CONNECTION_CLOSED = -32000;
 const log = (m: string) => process.stderr.write(`[tsm-shim] ${m}\n`);
+/** Milliseconds on a clock that never steps: a wall-clock step would make a wait never end, or end at once (the house's read of 4e37a11, #22). */
+const mono = () => performance.now();
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /** `tsm-shim --help`: the settings and what the shim does, before anything is read or started. */
 const HELP = `tsm-shim: stdio MCP server for hosts without a WebSocket client; relays to termd (2.0).
@@ -136,6 +150,17 @@ function chooseProfile(argv: string[]): string | undefined {
   return names.some((n) => COMPAT_BINS.has(n)) ? 'compat' : undefined;
 }
 
+/** A setting in milliseconds: a whole number up to what a timer takes; anything else is a mistake, not a value (the house's read of 4e37a11, #22). */
+function msSetting(name: string, fallback: number): number {
+  const raw = setting(name);
+  if (raw === undefined) return fallback;
+  if (!/^\d+$/.test(raw.trim()) || Number(raw) > MAX_TIMER_MS) {
+    log(`${name} must be a whole number of milliseconds (0 to ${MAX_TIMER_MS}), not ${JSON.stringify(raw)}`);
+    process.exit(2);
+  }
+  return Number(raw);
+}
+
 const chosen = target1x();
 if (chosen.from) log(`using ${chosen.from} (a 1.x setting) for the daemon address; TSM_URL is the 2.0 name`);
 if (!setting('TSM_TOKEN') && setting('SESSION_SERVER_TOKEN')) log('using SESSION_SERVER_TOKEN (a 1.x setting); TSM_TOKEN is the 2.0 name');
@@ -165,7 +190,10 @@ url.searchParams.set('connection', `shim-${process.pid}`);
 // same port — the one dialled, never a default of its own (the house's read of 4e37a11, #22).
 const port = url.port || (url.protocol === 'wss:' ? '443' : '80');
 const target = `${url.protocol}//${url.hostname}:${port}`;
-const connectTimeoutMs = Number(setting('TSM_CONNECT_TIMEOUT_MS') ?? 15_000);
+const connectTimeoutMs = msSetting('TSM_CONNECT_TIMEOUT_MS', 15_000);
+// A handshake the peer accepts but never answers would otherwise wait forever, and no later attempt
+// could find a daemon that answers (the house's read of 4e37a11, #22).
+const handshakeTimeoutMs = Math.max(1000, Math.min(connectTimeoutMs, 10_000));
 const loopback = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(url.hostname);
 // Resolved here, so the shim's crash file and termd's own files are in one directory whatever either
 // process's working directory is (the house's read of 4e37a11, #22).
@@ -218,7 +246,7 @@ function unitPort(text: string): string {
  * that is due, at most once per SUPERVISOR_CACHE_MS.
  */
 async function supervisedTermd(): Promise<Supervisor> {
-  const now = Date.now();
+  const now = mono();
   if (supervisorCache && now - supervisorCache.at < SUPERVISOR_CACHE_MS) return supervisorCache.result;
   const result = await checkSupervisor();
   supervisorCache = { at: now, result };
@@ -251,6 +279,7 @@ async function checkSupervisor(): Promise<Supervisor> {
 const out = (m: unknown) => process.stdout.write(JSON.stringify(m) + '\n');
 const key = (id: Id) => `${typeof id}:${String(id)}`;
 const isId = (v: unknown): v is Id => typeof v === 'string' || typeof v === 'number';
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
 function parse(line: string): Parsed | undefined {
   try {
@@ -267,31 +296,70 @@ let stdinClosed = false;
 let finishing = false;
 let everOpened = false;
 let attempt = 0;
+/** One per connection attempt: the daemon's request ids are scoped to it. */
+let generation = 0;
 let reconnectTimer: NodeJS.Timeout | undefined;
 /** The last connection error, logged once per change and quoted when a request gives up. */
 let lastError = '';
-/** Lines waiting for an open socket, with when they arrived. */
-const queue: Array<{ line: string; at: number; id?: Id }> = [];
-/** Requests forwarded and not yet answered: key → the host's id. */
-const inflight = new Map<string, Id>();
+/** Lines from the host, numbered in arrival order: what came after what decides the replay (see `closed`). */
+let seq = 0;
+interface Line {
+  line: string;
+  seq: number;
+  /** When it arrived (monotonic), for the wait bound. */
+  at: number;
+  m?: Parsed;
+  method?: string;
+  id?: Id;
+}
+/** Lines waiting for an open socket. */
+const queue: Line[] = [];
+/** Requests forwarded and not yet answered: key → the request, for the host's id and what its answer changes. */
+interface Pending {
+  id: Id;
+  method: string;
+  seq: number;
+  m: Parsed;
+}
+const inflight = new Map<string, Pending>();
 /**
- * What to replay on a new connection so it is in the host's state: its
- * `initialize`, the MCPL policy (the last request-form `featureSets/update`
- * replaces the grant; notification-form ones after it only add reductions, so
- * all of those are kept, in order), and the channels it has open (reopened
- * without `history`: catch-up resumes from the principal's `delivered` cursor,
- * G22).
+ * Requests the daemon made of the host on the current connection, by the id the shim gave them: the
+ * daemon numbers its requests per connection from 1, so the host's answer to one from a connection
+ * that is gone would settle a different request on the new one (the house's read of 4e37a11, #22).
+ * Cleared at each close; capped, since a host need not answer.
  */
-const replay: { initialize?: Parsed; initialized?: string; policy: Array<{ m: Parsed; request: boolean }>; channels: Map<string, Parsed> } = {
-  policy: [],
+const asked = new Map<string, { generation: number; id: Id }>();
+const ASKED_MAX = 4096;
+/**
+ * What to replay on a new connection so it is in the host's state: its `initialize`; the MCPL grant
+ * (the last request-form `featureSets/update` the daemon accepted) with every reduction since —
+ * notification-form updates only ever add `disabled` feature sets (MCPL §6.7), so all of them since
+ * the grant fold into one set, however many there were (the house's read of 4e37a11, #22); and the
+ * channels the host has open (reopened without `history`: catch-up resumes from the principal's
+ * `delivered` cursor, G22). A request's effect is recorded when its answer says it took, a
+ * notification's when it arrives (it is never answered, and one that waits out the queue is never
+ * forwarded), so what the daemon refused and what expired are both reflected (the house's read of
+ * 4e37a11, #22).
+ */
+const replay: { initialize?: Parsed; initialized?: Parsed; grant?: Parsed; reduced: Map<string, number>; channels: Map<string, Parsed> } = {
+  reduced: new Map(),
   channels: new Map(),
 };
-/** channels/open requests awaiting their answer: request key → the host's params. */
-const opening = new Map<string, Record<string, unknown>>();
-const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
-/** Ids of replayed requests whose answers the host must not see. */
-const swallow = new Set<string>();
+const REDUCED_MAX = 10_000;
+/** Channels closed while an open was pending, with the close's seq: a later answer to an earlier open does not reopen them. */
+const closedAt = new Map<string, number>();
+/** Ids of replayed requests whose answers the host must not see, with what was replayed, for the log. */
+const swallow = new Map<string, { method: string; channel?: string }>();
 let replayCounter = 0;
+/** A replay in progress: sent in windows below the daemon's bound on requests in flight per connection (128), which refuses requests and drops notifications past it. */
+interface Replaying {
+  items: Array<{ m: Parsed; request: boolean; channel?: string }>;
+  next: number;
+  outstanding: number;
+  sock: WebSocket;
+}
+let replaying: Replaying | undefined;
+const REPLAY_WINDOW = 32;
 
 function exit(code: number): void {
   process.exitCode = code;
@@ -304,30 +372,80 @@ function failRequest(id: Id, message: string): void {
   out({ jsonrpc: '2.0', id, error: { code: CONNECTION_CLOSED, message, data: { daemon: target } } });
 }
 
-function forward(line: string): void {
-  const m = parse(line);
-  if (m && typeof m.method === 'string') {
-    if (isId(m.id)) inflight.set(key(m.id), m.id);
-    if (m.method === 'initialize') replay.initialize = m;
-    else if (m.method === 'notifications/initialized') replay.initialized = line;
-    else if (m.method === 'featureSets/update') {
-      if (isId(m.id)) replay.policy = [{ m, request: true }];
-      else if (replay.policy.length < 256) replay.policy.push({ m, request: false });
-    } else if (m.method === 'channels/open' && isId(m.id) && isObj(m.params)) opening.set(key(m.id), m.params);
-    else if (m.method === 'channels/close' && isObj(m.params) && typeof m.params.channelId === 'string') replay.channels.delete(m.params.channelId);
-  }
-  ws!.send(line);
+/** What a notification changes in the host's picture, recorded as it arrives (see `replay`). */
+function noteNotification(m: Parsed, seq: number): void {
+  if (m.method === 'notifications/initialized') replay.initialized = m;
+  else if (m.method === 'featureSets/update' && isObj(m.params) && Array.isArray(m.params.disabled)) {
+    for (const n of m.params.disabled) {
+      if (typeof n !== 'string') continue;
+      if (replay.reduced.size >= REDUCED_MAX && !replay.reduced.has(n)) {
+        log(`more than ${REDUCED_MAX} distinct feature sets disabled since the grant; ${n} will not be replayed after a reconnect`);
+        continue;
+      }
+      replay.reduced.set(n, seq);
+    }
+  } else if (m.method === 'channels/close' && isObj(m.params) && typeof m.params.channelId === 'string') closed(m.params.channelId, seq);
 }
 
-/** A host channels/open was answered: remember the channel (by the id the daemon gave it) until the host closes it. */
-function opened(id: Id, m: Parsed): void {
-  const params = opening.get(key(id));
-  if (!params) return;
-  opening.delete(key(id));
+/** The daemon accepted a host request: what that changes in the host's picture (see `replay`). */
+function answered(p: Pending, m: Parsed): void {
+  if (m.error !== undefined) return; // the host saw the refusal; its picture is as before
+  if (p.method === 'initialize') replay.initialize = p.m;
+  else if (p.method === 'featureSets/update') {
+    replay.grant = p.m;
+    // Reductions before this grant are its to carry (or not); those sent after it still bind.
+    for (const [n, at] of replay.reduced) if (at < p.seq) replay.reduced.delete(n);
+  } else if (p.method === 'channels/open') opened(p, m);
+  else if (p.method === 'channels/close' && isObj(p.m.params) && typeof p.m.params.channelId === 'string') closed(p.m.params.channelId, p.seq);
+}
+
+/** A channels/open the daemon accepted: remember the channel (by the id the daemon gave it) until the host closes it. */
+function opened(p: Pending, m: Parsed): void {
   const channel = isObj(m.result) && isObj(m.result.channel) ? m.result.channel.id : undefined;
-  if (typeof channel !== 'string') return;
-  const { history: _history, historyLimit: _limit, ...again } = params;
+  if (typeof channel !== 'string' || !isObj(p.m.params)) return;
+  // A close the host sent after this open stands — it can, since it can predict the channel's id —
+  // and the open's late answer does not undo it (the house's read of 4e37a11, #22).
+  if ((closedAt.get(channel) ?? -1) > p.seq) return;
+  closedAt.delete(channel);
+  const { history: _history, historyLimit: _limit, ...again } = p.m.params;
   replay.channels.set(channel, { jsonrpc: '2.0', method: 'channels/open', params: { ...again, channelId: channel } } as Parsed);
+}
+
+function closed(channel: string, at: number): void {
+  replay.channels.delete(channel);
+  closedAt.set(channel, at);
+}
+
+/** `closedAt` matters only while an open is pending; once none is, nothing can arrive late. */
+function pruneClosed(): void {
+  if (closedAt.size === 0) return;
+  const pendingOpen = (p: { method?: string; id?: Id }) => p.method === 'channels/open' && p.id !== undefined;
+  if (![...inflight.values()].some(pendingOpen) && !queue.some(pendingOpen)) closedAt.clear();
+}
+
+function forward(q: Line): void {
+  const m = q.m;
+  if (m && q.method !== undefined) {
+    if (q.id !== undefined) inflight.set(key(q.id), { id: q.id, method: q.method, seq: q.seq, m });
+  } else if (m && isId(m.id)) {
+    // The host's answer to a request the daemon made (see `asked`): back under the daemon's own id,
+    // and only to the connection that asked.
+    const a = typeof m.id === 'string' ? asked.get(m.id) : undefined;
+    if (!a || a.generation !== generation) {
+      log(`dropped the host's answer to request ${JSON.stringify(m.id)}: the connection it was asked on is gone`);
+      return;
+    }
+    asked.delete(m.id as string);
+    ws!.send(JSON.stringify({ ...m, id: a.id }));
+    return;
+  }
+  ws!.send(q.line);
+}
+
+function flushQueue(): void {
+  if (!open || !ws || replaying) return;
+  for (const q of queue.splice(0)) forward(q);
+  maybeFinish();
 }
 
 function maybeFinish(): void {
@@ -342,12 +460,13 @@ function maybeFinish(): void {
 
 /** Requests that waited too long for a connection get an error; notifications are dropped. The queue is in arrival order. */
 function expireQueue(): void {
-  const now = Date.now();
+  const now = mono();
   if (!queue.length || now - queue[0]!.at < connectTimeoutMs) return;
   while (queue.length && now - queue[0]!.at >= connectTimeoutMs) {
     const q = queue.shift()!;
     if (q.id !== undefined) failRequest(q.id, `cannot reach the terminal daemon at ${target}${lastError ? ` (${lastError})` : ''}${unreachableHint()}`);
   }
+  pruneClosed();
   if (stdinClosed && !queue.length && !inflight.size) {
     finishing = true;
     exit(1);
@@ -368,7 +487,7 @@ function unreachableHint(): string {
   return '';
 }
 
-const seconds = (since: number) => (Math.round((Date.now() - since) / 100) / 10).toFixed(1);
+const seconds = (since: number) => (Math.round((mono() - since) / 100) / 10).toFixed(1);
 
 /** Say what a refused upgrade means (the ws library reports only the status). */
 function explain(message: string): string {
@@ -411,7 +530,7 @@ const RETRY_START_MS = 30_000;
 function roomToStart(): boolean {
   if (!spawned) return true;
   if (spawned.exit === undefined) return false;
-  return Date.now() - spawned.at >= (spawned.reached ? RESTART_AFTER_MS : RETRY_START_MS);
+  return mono() - spawned.at >= (spawned.reached ? RESTART_AFTER_MS : RETRY_START_MS);
 }
 
 function noteNotStarted(why: string): void {
@@ -492,7 +611,7 @@ function spawnDaemon(): void {
       env: Object.fromEntries(Object.entries(process.env).filter(([k]) => SPAWN_ENV.test(k))),
       cwd: os.homedir(),
     });
-    const me: Spawned = { pid: child.pid ?? 0, at: Date.now(), reached: false };
+    const me: Spawned = { pid: child.pid ?? 0, at: mono(), reached: false };
     spawned = me;
     child.on('error', (e) => {
       me.exit = `could not be started: ${e.message}`;
@@ -523,22 +642,48 @@ function scheduleReconnect(): void {
 }
 
 function replayState(sock: WebSocket): void {
-  const send = (m: Parsed) => {
-    const id = `tsm-shim:replay:${++replayCounter}`;
-    swallow.add(key(id));
-    sock.send(JSON.stringify({ ...m, id }));
-  };
-  if (replay.initialize) send(replay.initialize);
-  if (replay.initialized) sock.send(replay.initialized);
-  for (const p of replay.policy) {
-    if (p.request) send(p.m);
-    else sock.send(JSON.stringify(p.m));
+  const items: Replaying['items'] = [];
+  if (replay.initialize) items.push({ m: replay.initialize, request: true });
+  if (replay.initialized) items.push({ m: replay.initialized, request: false });
+  if (replay.grant) items.push({ m: replay.grant, request: true });
+  if (replay.reduced.size) items.push({ m: { jsonrpc: '2.0', method: 'featureSets/update', params: { disabled: [...replay.reduced.keys()] } } as Parsed, request: false });
+  for (const [channel, m] of replay.channels) items.push({ m, request: true, channel });
+  replaying = { items, next: 0, outstanding: 0, sock };
+  pumpReplay();
+}
+
+/** Send the next window of the replay; when all of it is answered, the queue follows. */
+function pumpReplay(): void {
+  const r = replaying;
+  if (!r || r.sock !== ws) return;
+  while (r.next < r.items.length && r.outstanding < REPLAY_WINDOW) {
+    const it = r.items[r.next++]!;
+    if (it.request) {
+      const id = `tsm-shim:replay:${++replayCounter}`;
+      swallow.set(key(id), { method: String(it.m.method), ...(it.channel !== undefined ? { channel: it.channel } : {}) });
+      r.outstanding++;
+      r.sock.send(JSON.stringify({ ...it.m, id }));
+    } else r.sock.send(JSON.stringify(it.m));
   }
-  for (const c of replay.channels.values()) send(c);
+  if (r.next >= r.items.length && r.outstanding === 0) {
+    replaying = undefined;
+    flushQueue();
+  }
+}
+
+/** A replayed request was answered: a refusal is said, since the host is not told (the house's read of 4e37a11, #22). */
+function replayed(what: { method: string; channel?: string }, m: Parsed): void {
+  if (replaying) replaying.outstanding--;
+  if (m.error !== undefined) {
+    const e = isObj(m.error) ? `${String(m.error.code)} ${String(m.error.message)}` : JSON.stringify(m.error);
+    log(`replay of ${what.method}${what.channel ? ` for ${what.channel}` : ''} refused (${e}): the host believes otherwise and was not told`);
+  }
+  pumpReplay();
 }
 
 function connect(): void {
-  const sock = new WebSocket(url.toString());
+  generation++;
+  const sock = new WebSocket(url.toString(), { handshakeTimeout: handshakeTimeoutMs });
   ws = sock;
   sock.on('open', () => {
     if (ws !== sock) return;
@@ -549,18 +694,34 @@ function connect(): void {
     if (everOpened) {
       log(`reconnected to ${target}`);
       replayState(sock);
-    }
+    } else flushQueue();
     everOpened = true;
-    for (const q of queue.splice(0)) forward(q.line);
-    maybeFinish();
   });
   sock.on('message', (data) => {
     const text = data.toString();
     const m = parse(text);
-    if (m && m.method === undefined && isId(m.id)) {
-      if (swallow.delete(key(m.id))) return;
-      inflight.delete(key(m.id));
-      opened(m.id, m);
+    if (m && isId(m.id)) {
+      if (typeof m.method === 'string') {
+        // A request of the daemon's: under an id of this connection's, so its answer can be told from
+        // another connection's (see `asked`).
+        const mine = `tsm-shim:${generation}:${typeof m.id === 'number' ? 'n' : 's'}:${String(m.id)}`;
+        if (asked.size >= ASKED_MAX) asked.delete(asked.keys().next().value!);
+        asked.set(mine, { generation, id: m.id });
+        process.stdout.write(JSON.stringify({ ...m, id: mine }) + '\n');
+        return;
+      }
+      const replayedWhat = swallow.get(key(m.id));
+      if (replayedWhat) {
+        swallow.delete(key(m.id));
+        replayed(replayedWhat, m);
+        return;
+      }
+      const p = inflight.get(key(m.id));
+      if (p) {
+        inflight.delete(key(m.id));
+        answered(p, m);
+        pruneClosed();
+      }
     }
     process.stdout.write(text + '\n');
     maybeFinish();
@@ -585,10 +746,12 @@ function connect(): void {
     }
     if (wasOpen) log(`daemon connection closed (${code}${reason.length ? ` ${reason.toString()}` : ''})`);
     // Their outcome is unknown: say so, never leave the host waiting forever (G16).
-    for (const id of inflight.values()) failRequest(id, 'the terminal daemon connection closed before a response; the outcome is unknown');
+    for (const p of inflight.values()) failRequest(p.id, 'the terminal daemon connection closed before a response; the outcome is unknown');
     inflight.clear();
-    opening.clear();
+    asked.clear();
     swallow.clear();
+    replaying = undefined;
+    pruneClosed();
     if (stdinClosed && !queue.length) {
       finishing = true;
       exit(1);
@@ -601,13 +764,18 @@ function connect(): void {
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on('line', (line) => {
   if (!line.trim()) return;
-  if (open && ws) forward(line);
-  else {
-    const m = parse(line);
-    const entry: { line: string; at: number; id?: Id } = { line, at: Date.now() };
-    if (m && typeof m.method === 'string' && isId(m.id)) entry.id = m.id;
-    queue.push(entry);
+  const m = parse(line);
+  const entry: Line = { line, seq: ++seq, at: mono() };
+  if (m) {
+    entry.m = m;
+    if (typeof m.method === 'string') {
+      entry.method = m.method;
+      if (isId(m.id)) entry.id = m.id;
+      else noteNotification(m, entry.seq);
+    }
   }
+  if (open && ws && !replaying) forward(entry);
+  else queue.push(entry);
 });
 rl.on('close', () => {
   stdinClosed = true;
