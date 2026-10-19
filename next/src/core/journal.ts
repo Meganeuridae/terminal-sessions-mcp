@@ -140,10 +140,13 @@ export class Journal {
     if (hw?.failed && this.coldError === null) this.cold!.setHighWater?.(0, false);
   }
 
-  /** One streaming pass over what the stores retain: Run lifecycle events only (jr-14). */
+  /**
+   * One streaming pass over what the stores retain (jr-14): Run lifecycle events, and the gaps the
+   * journal recorded, so a Run's reads know of a hole recorded after its end (see RunIndex.gapsWithin).
+   */
   private index(): void {
     if (this.cold?.scan) {
-      this.cold.scan('"type":"run.', (ev) => this.runs.feed(ev), (h) => this.runs.absorbHeader(h));
+      this.cold.scan(['"type":"run.', '"type":"gap"'], (ev) => this.runs.feed(ev), (h) => this.runs.absorbHeader(h));
       return;
     }
     for (const ev of (this.cold ?? this.hot).read()) this.runs.feed(ev);
@@ -414,11 +417,15 @@ export class Journal {
   }
 
   /**
-   * Does [from, to] touch the hole between the stores — the seqs the disk refused and the ring has
-   * since dropped — wherever in the range it lies? `gapAt` answers for the range's start; a Run's
-   * output that lost a middle stretch is `truncated` by this (the house's read of b047b92).
+   * Does [from, to] touch a hole — the seqs the disk refused and the ring has since dropped, whether
+   * still open between the stores or recorded since as a gap event, wherever that event sits — anywhere
+   * in the range? `gapAt` answers for the range's start; a Run's output that lost a middle stretch is
+   * `truncated` by this (the house's read of b047b92), including one whose gap the catch-up recorded
+   * after the Run ended, which only the range's own events said nothing of (the house's read of
+   * cc8c909..39787b3, #22).
    */
   holeWithin(from: Seq, to: Seq): boolean {
+    if (this.runs.gapsWithin(from, to).length) return true;
     const hotOldest = this.hot.oldestSeq();
     if (hotOldest === undefined || this.cold === undefined) return false;
     const last = this.cold.lastSeq() ?? 0;

@@ -332,6 +332,27 @@ test('jr2-11: a torn write or store failure inside the range is a gap in the res
   assert.equal(run.text, 'run a\n[… 1 journal event missing (seq 99–99: a torn write) …]\nrun b');
 });
 
+test('a hole recorded after a Run ended, for seqs inside it, is a line in the Run\'s text where the hole is (the house\'s read of cc8c909..39787b3)', async () => {
+  const src = source();
+  startRun(src.journal, 'r1');
+  out(src.journal, 'run a\n', 'stdout', 'r1');
+  const n1 = src.journal.append({ type: 'note', text: 'n', principal: 'agent:a@test' }).seq;
+  src.journal.append({ type: 'note', text: 'n', principal: 'agent:a@test' });
+  const n3 = src.journal.append({ type: 'note', text: 'n', principal: 'agent:a@test' }).seq;
+  out(src.journal, 'run b\n', 'stdout', 'r1');
+  endRun(src.journal, 'r1');
+  assert.equal((await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 })).text, 'run a\nrun b');
+  // The catch-up records, after the Run ended, that the seqs between its two outputs are gone.
+  src.journal.append({ type: 'gap', from: n1, to: n3, reason: 'store-error' });
+  const line = `[… 3 journal events missing (seq ${n1}–${n3}: the journal store failed) …]`;
+  const r = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
+  assert.equal(r.text, `run a\n${line}\nrun b`);
+  assert.deepEqual(r.gap, { from: n1, to: n3, reason: 'store-error' });
+  const tail = await readJournal(src, { runId: 'r1', tail: 5 }, { resultBytes: 16384 });
+  assert.equal(tail.text, `run a\n${line}\nrun b`);
+  assert.deepEqual(tail.gap, { from: n1, to: n3, reason: 'store-error' });
+});
+
 test('jr2-11 / G11: a cursor older than retention starts the text with the hole it cannot show', async () => {
   const j = new Journal({ sessionId: 's' });
   const src = source({ journal: j });

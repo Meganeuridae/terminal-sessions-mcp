@@ -31,9 +31,9 @@ const B = 'agent:b@test';
 
 const aboutRun = (runId: unknown) => (d: Delivery) => d.metadata.runId === runId && d.tags.some((t) => t === 'terminal:run-finished' || t === 'terminal:run-lost');
 
-async function daemon(o: { dataDir?: string; segmenter?: SegmenterOptions } = {}) {
+async function daemon(o: { dataDir?: string; segmenter?: SegmenterOptions; retention?: { maxBytes?: number; maxAgeMs?: number } } = {}) {
   const dataDir = o.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-lane-'));
-  const registry = new SessionRegistry({ dataDir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
+  const registry = new SessionRegistry({ dataDir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true, ...(o.retention && { retention: o.retention }) });
   const app = new App({ registry, defaultWaitMs: 5000, segmenter: o.segmenter ?? { runSettleMs: 30, cadenceMs: 400, needsInputMs: 700 } });
   const logs: string[] = [];
   const server = new TermServer({ app, resolver: new TokenMapResolver({ tokens: { ta: A, tb: B, th: 'human:test:9' } }), host: '127.0.0.1', port: 0, version: 'lane-spec', log: (line) => logs.push(line) });
@@ -722,6 +722,38 @@ test('ux-25: a first connection after plain-MCP use gets the completion it is ow
     const a3 = await d.host('ta', 'ux-a3');
     await a3.noDelivery(() => true, 800, 'the summary settled what it covered');
     await a3.close();
+  } finally {
+    await d.stop();
+  }
+});
+
+test('a catch-up that begins inside a retention gap tells the host the range it will never see (the segmenter\'s read, comment 6265082050)', { timeout: 30_000 }, async () => {
+  // The scan reported the range as `lost`, but the catch-up built its work from the picked and omitted
+  // messages alone: a host whose cursor lay inside the gap heard nothing of what was gone.
+  const d = await daemon({ retention: { maxBytes: 16 * 1024 } });
+  try {
+    const m = await d.host('ta', 'rg-m', { mcpl: false });
+    await m.call('session_open', { session: 'rg' });
+    for (let i = 0; i < 4; i++) await m.call('run', { session: 'rg', command: 'seq 1 2000' });
+    const bg = await m.call('run', { session: 'rg', command: 'sleep 0.3; echo done-rg', wait: 20 });
+    const s = live(d.registry, 'rg');
+    await until(() => s.run(bg.structured?.runId as string).state === 'exited', 8000, 'the run to end');
+    await m.close();
+    const oldest = s.journal.oldestSeq ?? 1;
+    assert.ok(oldest > 1, `retention took the start of the journal (oldest seq ${oldest})`);
+    const a = await d.host('ta', 'rg-a');
+    const missed = await a.delivery((x) => x.tags.includes('terminal:missed'), 6000);
+    assert.match(missed.text, /^\[terminal\] rg: seq 1–\d+ gone past retention, with whatever happened then · read session=rg since=\d+ as=events$/);
+    const { lostFrom, lostTo } = missed.metadata as { lostFrom: number; lostTo: number };
+    assert.equal(lostFrom, 1);
+    assert.ok(lostTo >= 1 && lostTo < oldest, JSON.stringify(missed.metadata));
+    assert.equal(missed.metadata.count, 0, 'nothing was omitted: the summary is about the gap alone');
+    await a.delivery(aboutRun(bg.structured?.runId), 6000);
+    await a.close();
+    // Accepted, the summary settles: the next connection is not told again.
+    const a2 = await d.host('ta', 'rg-a2');
+    await a2.noDelivery((x) => x.tags.includes('terminal:missed'), 800, 'the summary was accepted');
+    await a2.close();
   } finally {
     await d.stop();
   }

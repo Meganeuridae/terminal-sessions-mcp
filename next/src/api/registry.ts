@@ -483,27 +483,35 @@ export class SessionRegistry {
     // Every Run in flight when the daemon died — running, starting, queued, or named only by a
     // rotation header because its admission rotated out — is `lost`, never `running` (G3, G20).
     const now = Date.now();
-    const lost: string[] = [];
+    const lost = new Set<string>();
     for (const run of journal.runs.open()) {
       const what = ended.get(`${id}\0${run.runId}`);
       journal.append({ type: 'run.end', runId: run.runId, state: 'lost', reason: what ? `daemon-restart; ${what}` : 'daemon-restart', durationMs: Math.max(0, now - (run.startedAt ?? run.admittedAt)) });
-      lost.push(run.runId);
+      lost.add(run.runId);
     }
     // In the daemon's log too, not only in the journal (the house's read of 59f660b, #22).
-    if (lost.length) this.opts.log?.('info', 'recovery ended Runs a previous daemon left in flight', { session: id, runs: lost });
-    // A Run that had ended, leaving children in its group (`leftovers`), says in the journal what became of them.
+    if (lost.size) this.opts.log?.('info', 'recovery ended Runs a previous daemon left in flight', { session: id, runs: [...lost] });
+    // What became of each group, in the journal: a Run that had ended before the daemon died left it
+    // behind (`leftovers`), and it outlived the Run; a Run recovery itself ended `lost` just now went
+    // with its group — not "outlived …, which had ended", which the first wording said of both (the
+    // house's read of cc8c909..39787b3, #22).
     for (const run of journal.runs.list()) {
       const what = run.endedAt !== undefined ? ended.get(`${id}\0${run.runId}`) : undefined;
-      if (what) journal.append({ type: 'note', text: `recovery: ${what}; it outlived ${run.runId}, which had ended`, principal: SYSTEM });
+      if (!what) continue;
+      const text = lost.has(run.runId) ? `recovery: ${what} with ${run.runId}, which recovery ended lost` : `recovery: ${what}; it outlived ${run.runId}, which had ended`;
+      journal.append({ type: 'note', text, principal: SYSTEM });
     }
     // Mark the restart once: a session closed on purpose, or history since an earlier restart, gains nothing.
     if (meta.closedAt === undefined && last?.type !== 'recovered') journal.append({ type: 'recovered', class: 'history-only' });
     journal.seal();
-    // A record that cannot be read names no owner. The name is nobody's to reopen until the record
-    // is repaired or the session removed — not the system principal's by default, which let anyone
-    // acting as the system start a new life on it (the house's read of 2c35df8, #22).
-    if (meta.damaged !== undefined) this.opts.log?.('warn', `session record cannot be read; nobody may reopen the session until it is repaired or removed: ${meta.damaged}`, { session: id });
-    const owner = meta.damaged !== undefined ? UNOWNED : meta.owner ?? SYSTEM;
+    // A record that cannot be read, or that is not there, names no owner. The name is nobody's to
+    // reopen until the record is repaired or written or the session removed — not the system
+    // principal's by default, which let anyone acting as the system start a new life on it (the
+    // house's read of 2c35df8, #22), and with no record made its owner a stranger to it (the house's
+    // read of cc8c909..39787b3, #22).
+    const refusal = recordRefusal(id, meta);
+    if (refusal) this.opts.log?.('warn', refusal.message, { session: id });
+    const owner = refusal ? UNOWNED : meta.owner ?? SYSTEM;
     const cursors = new CursorBook(path.join(dir, 'cursors.json'));
     const view = new HistoryEntry(id, journal, owner, meta.visibility ?? 'private', meta.closedAt !== undefined, retention, recordedOptions(meta, retention), cursors);
     this.slots.set(id, { id, dir, store, meta, cursors, view });
@@ -604,10 +612,15 @@ export class SessionRegistry {
     if (!SAFE_ID.test(id)) throw err('invalid_argument', 'session id must be 1–64 chars of [A-Za-z0-9._-], starting alphanumeric', { id });
   }
 
-  /** Refuse a name that folds onto another one, whose record cannot be read, or whose history is someone else's (G18). */
+  /** Refuse a name that folds onto another one, whose record names no owner, or whose history is someone else's (G18). */
   private checkName(o: CreateOptions, slot: Slot | undefined): void {
     if (slot) {
-      if (slot.meta.damaged !== undefined) throw damagedRecord(o.id, slot.meta.damaged);
+      // A record that named no owner is read again at every attempt: repaired, or written where there
+      // was none, it names the owner without a restart of the daemon, as the refusal says (the house's
+      // read of cc8c909..39787b3, #22).
+      if (recordRefusal(o.id, slot.meta)) this.rereadRecord(slot);
+      const refusal = recordRefusal(o.id, slot.meta);
+      if (refusal) throw refusal;
       if (!this.mayReuse(slot, o.owner)) {
         throw err('forbidden', `session ${o.id} belongs to another principal; only its owner may open it again`, { id: o.id });
       }
@@ -625,6 +638,16 @@ export class SessionRegistry {
     return principal === SYSTEM || principal === ownerOf(slot);
   }
 
+  /** Read a history entry's record again; one that reads now gives the entry its owner, visibility and options. */
+  private rereadRecord(slot: Slot): void {
+    const meta = readMeta(slot.dir);
+    slot.meta = meta;
+    if (recordRefusal(slot.id, meta) || slot.view.kind !== 'history') return;
+    const v = slot.view;
+    slot.view = new HistoryEntry(slot.id, v.journal, meta.owner ?? SYSTEM, meta.visibility ?? 'private', meta.closedAt !== undefined, v.retention, recordedOptions(meta, v.retention), slot.cursors);
+    this.opts.log?.('info', 'session record reads again; its owner may start a new life for the session', { session: slot.id, owner: slot.view.owner });
+  }
+
   private async newLife(o: CreateOptions, prev: Slot | undefined): Promise<Session> {
     this.ensureLock();
     if (prev?.view.kind === 'live') {
@@ -638,6 +661,11 @@ export class SessionRegistry {
     const jo: JournalOptions = { hot: this.hotStore(retention), sessionId: id, log: this.journalLog(id) };
     let store: FileStore;
     let recorded: Meta;
+    // The retention the history is kept under until this life has started: the store takes the one
+    // asked for only then. Applied before the start, a reopen asking for less pruned files the
+    // record still kept when its start failed, and the entry reported the retention it never got
+    // (the house's read of cc8c909..39787b3, #22).
+    let before: SessionRetention;
     if (prev) {
       // A new life for an old name: the same journal, numbering and run index continue (G10).
       const old = journalOf(prev);
@@ -645,22 +673,26 @@ export class SessionRegistry {
       // disk still refuses, the new journal numbers past it and records the hole.
       old.retryCold();
       store = prev.store;
-      store.setRetention(retention);
+      before = prev.view.retention;
       jo.runs = old.runs;
       jo.startSeq = old.lastSeq;
       recorded = prev.meta;
     } else {
-      store = new FileStore(dir, this.storeOptions(retention));
       recorded = readMeta(dir);
+      before = this.retentionFor(undefined, recorded.retention);
+      store = new FileStore(dir, this.storeOptions(before));
       // A journal this registry did not surface (recovery could not read it): its owner stands (G18),
-      // and a record that cannot be read names none.
-      if (store.lastSeq() !== undefined && recorded.damaged !== undefined) {
-        store.close();
-        throw damagedRecord(id, recorded.damaged);
-      }
-      if (store.lastSeq() !== undefined && o.owner !== SYSTEM && (recorded.owner ?? SYSTEM) !== o.owner) {
-        store.close();
-        throw err('forbidden', `session ${id} belongs to another principal; only its owner may open it again`, { id });
+      // and a record that cannot be read, or is not there, names none.
+      if (store.lastSeq() !== undefined) {
+        const refusal = recordRefusal(id, recorded);
+        if (refusal) {
+          store.close();
+          throw refusal;
+        }
+        if (o.owner !== SYSTEM && (recorded.owner ?? SYSTEM) !== o.owner) {
+          store.close();
+          throw err('forbidden', `session ${id} belongs to another principal; only its owner may open it again`, { id });
+        }
       }
     }
     jo.cold = store;
@@ -726,16 +758,19 @@ export class SessionRegistry {
           // the record in memory stands; the disk has the attempt's until the next write
         }
       }
-      // The name keeps its history (and whatever the failed start journaled), readable and owned (G19).
+      // The name keeps its history (and whatever the failed start journaled), readable and owned (G19),
+      // under the retention it had.
       journal.seal();
       if (prev || journal.lastSeq > 0) {
-        const view = new HistoryEntry(id, journal, kept.owner ?? o.owner, kept.visibility ?? options.visibility, kept.closedAt !== undefined, retention, recordedOptions(kept, retention), cursors);
+        const view = new HistoryEntry(id, journal, kept.owner ?? o.owner, kept.visibility ?? options.visibility, kept.closedAt !== undefined, before, recordedOptions(kept, before), cursors);
         this.slots.set(id, { id, dir, store, meta: kept, cursors, view });
       } else {
         store.close();
       }
       throw e;
     }
+    // Started: the history is kept under this life's retention from here on.
+    store.setRetention(retention);
     this.slots.set(id, { id, dir, store, meta, cursors, view: new LiveEntry(session, () => integ?.cleanup(), retention, options) });
     this.emit({ type: 'created', id });
     return session;
@@ -979,9 +1014,11 @@ export interface OrphanCandidate {
  * reused, and `ps` start times are truncated to the second — and the Run has not ended: its own
  * process was reaped before its end was written, so a leader now holds the freed pid. With the
  * leader gone, the kernel keeps a group's id while a member lives, so the members are descendants
- * of whoever led it: the Run's, when none predates the Run and none started after the Run ended;
- * for a Run still in flight, when one predates the dead daemon's last event by a second, so the
- * group is not one formed after the daemon died.
+ * of whoever led it: the Run's, when none predates the Run and one started before the Run ended —
+ * a member that started later descends from one that was there, as a loop's newest child does, so
+ * the whole group goes; asking every member to predate the end left such a loop running (the
+ * house's read of cc8c909..39787b3, #22). For a Run still in flight, when one predates the dead
+ * daemon's last event by a second, so the group is not one formed after the daemon died.
  */
 export function orphanGroups(candidates: OrphanCandidate[], procs: ProcessRow[], self: { pid: number; pgid: number | undefined }): Map<number, string[]> {
   const groups = new Map<number, string[]>();
@@ -997,7 +1034,7 @@ export function orphanGroups(candidates: OrphanCandidate[], procs: ProcessRow[],
     const ours = leader
       ? ended === undefined && sinceStart(leader) && leader.startMs <= started + 1000
       : ended !== undefined
-        ? members.every((p) => sinceStart(p) && p.startMs <= ended)
+        ? members.every(sinceStart) && members.some((p) => p.startMs <= ended)
         : members.every(sinceStart) && members.some((p) => p.startMs + 1000 <= (lastTs ?? 0));
     if (ours) groups.set(g, [...(groups.get(g) ?? []), key]);
   }
@@ -1030,10 +1067,26 @@ interface Meta {
   options?: Omit<SessionCreationOptions, 'retention'>;
   /** In memory only: session.json is there but cannot be read (why). Nothing of the name is reopened until it is repaired or removed. */
   damaged?: string;
+  /** In memory only: there is no session.json. Beside a journal, nothing of the name is reopened until one naming the owner is written or the session is removed. */
+  missing?: true;
 }
 
 const damagedRecord = (id: string, why: string): TermError =>
   err('forbidden', `session ${id}'s record (session.json) cannot be read: ${why}; nobody may start a new life for it until the file is repaired or the session is removed`, { id });
+
+const missingRecord = (id: string): TermError =>
+  err('forbidden', `session ${id} has history but no record (session.json is missing beside its journal), so its owner is not known; nobody may start a new life for it until a record naming the owner is written there ({"owner":"<principal>","visibility":"private"}) or the session is removed`, { id });
+
+/**
+ * The refusal a record that names no owner earns a name with history: the file cannot be read, or
+ * there is none (the house's read of cc8c909..39787b3, #22). Undefined when the record reads. A
+ * name with no history and no record is simply new.
+ */
+function recordRefusal(id: string, meta: Meta): TermError | undefined {
+  if (meta.damaged !== undefined) return damagedRecord(id, meta.damaged);
+  if (meta.missing) return missingRecord(id);
+  return undefined;
+}
 
 /** The recorded options, validated (a damaged or foreign session.json falls back field by field). */
 function recordedOptions(meta: Meta, retention: SessionRetention): SessionCreationOptions {
@@ -1059,8 +1112,8 @@ function recordedOptions(meta: Meta, retention: SessionRetention): SessionCreati
 }
 
 /**
- * The record beside a journal: `{}` when there is none (a directory an older build made), `damaged`
- * when there is one that cannot be read — never a guess at its owner (the house's read of 2c35df8, #22).
+ * The record beside a journal: `missing` when there is none, `damaged` when there is one that cannot
+ * be read — never a guess at its owner (the house's read of 2c35df8, #22).
  */
 function readMeta(dir: string): Meta {
   const file = path.join(dir, 'session.json');
@@ -1073,7 +1126,7 @@ function readMeta(dir: string): Meta {
   try {
     raw = fs.readFileSync(file, 'utf8');
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { missing: true };
     return { damaged: (e as Error).message };
   }
   try {
@@ -1087,7 +1140,7 @@ function readMeta(dir: string): Meta {
 
 /** Durably, and private to the daemon's user: a crash mid-write never loses the owner (G18, G26); `env` may hold secrets. */
 function writeMeta(dir: string, meta: Meta): void {
-  const { damaged: _d, ...record } = meta;
+  const { damaged: _d, missing: _m, ...record } = meta;
   writeDurably(path.join(dir, 'session.json'), JSON.stringify(record, null, 2));
 }
 

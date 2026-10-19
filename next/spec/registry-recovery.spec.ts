@@ -178,6 +178,10 @@ test('jr2-4/G19c/G20/G29: recovery terminates the process groups a dead daemon l
     assert.deepEqual([h.run('r5-leftover').state, h.run('r5-leftover').exit], ['exited', 0], 'the Run\'s own end stands');
     const notes = h.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'note' }> => e.type === 'note').map((e) => e.text);
     assert.ok(notes.some((t) => t.includes(`process group ${leftover} terminated`) && t.includes('r5-leftover')), `the journal says so: ${JSON.stringify(notes)}`);
+    // A Run recovery ended `lost` just now did not have its group outlive it: the note says the group
+    // went with the Run (the house's read of cc8c909..39787b3, #22).
+    assert.ok(notes.includes(`recovery: process group ${polite} terminated with r1-polite, which recovery ended lost`), JSON.stringify(notes));
+    assert.ok(!notes.some((t) => /outlived r1-(polite|stubborn)/.test(t)), `no note says a group recovery ended outlived its Run: ${JSON.stringify(notes)}`);
     assert.ok(groupAlive(strangers), 'a leaderless group whose members started after the Run ended is a stranger\'s');
     assert.ok(groupAlive(clean), 'a Run that exited with its group empty vouches for nothing now in it');
     assert.ok(!notes.some((t) => t.includes(`${strangers}`) || t.includes(`${clean}`)), JSON.stringify(notes));
@@ -244,10 +248,14 @@ test('jr2-4: which groups recovery signals — never its own, never 1, a leader 
   assert.deepEqual(select([run('e', self.pid, T), run('f', self.pgid, T), run('g', 1, T), run('h', 0, T)], own), []);
   // A Run that ended: a leader now holds the freed pid (its process was reaped before its end was written), a stranger.
   assert.deepEqual(select([run('i', 1001, T, { endedAt: T + 500, state: 'exited', leftovers: true })], leaders), []);
-  // Leaderless members: the Run's descendants when none predates the Run and none started after it ended.
+  // Leaderless members: the Run's descendants when none predates the Run and one started before it ended.
   const ended = { endedAt: T + 5000, state: 'exited' as const, leftovers: true as const };
   assert.deepEqual(select([run('j', 2001, T, ended)], [row(2101, 2001, T), row(2102, 2001, T + 5000)]), [2001], 'a child forked as the Run exited is within its life');
-  assert.deepEqual(select([run('k', 2001, T, ended)], [row(2101, 2001, T), row(2102, 2001, T + 6000)]), [], 'one member started after the Run ended: a reused group id');
+  // A member that started after the Run ended descends from one that was there — a loop's newest
+  // child; asking every member to predate the end left such a loop running (the house's read of
+  // cc8c909..39787b3, #22). When every member started after the Run ended, the group id is a reused one.
+  assert.deepEqual(select([run('k', 2001, T, ended)], [row(2101, 2001, T), row(2102, 2001, T + 6000)]), [2001], 'a member started within the Run: the later one is its descendant');
+  assert.deepEqual(select([run('k2', 2001, T, ended)], [row(2101, 2001, T + 6000), row(2102, 2001, T + 7000)]), [], 'every member started after the Run ended: a reused group id');
   assert.deepEqual(select([run('l', 2001, T, ended)], [row(2101, 2001, T - 3000), row(2102, 2001, T)]), [], 'one member predates the Run');
   assert.deepEqual(select([run('m', 2001, T, { endedAt: T + 5000, state: 'cancelled' })], [row(2101, 2001, T + 1000)]), [2001], 'a cancelled Run\'s group too');
   assert.deepEqual(select([run('n', 2001, T, { endedAt: T + 5000, state: 'lost' })], [row(2101, 2001, T + 1000)]), [2001], 'and a lost one\'s');

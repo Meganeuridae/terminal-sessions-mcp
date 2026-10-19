@@ -212,3 +212,38 @@ test('a Run\'s output carries the gap events of the part it covers, as narrowOut
     assert.deepEqual(j.runs.output(j, runId, range), narrowOutput(whole, range), JSON.stringify(range));
   }
 });
+
+test('a gap recorded after a Run ended, for seqs inside its range, cuts its output and goes with the result where its hole ends (the house\'s read of cc8c909..39787b3)', () => {
+  // The catch-up writes the gap for what the ring dropped at the seq current then, past the Run's end:
+  // the Run's own range held no gap event, and its output read as complete.
+  const j = new Journal({ sessionId: 's' });
+  const runId = 'r1-late000';
+  j.append({ type: 'run.admit', runId, target: 'process', principal: 'agent:a@test', origin: 'self', queued: false });
+  j.append({ type: 'run.start', runId, cwd: '/' });
+  const o = (data: string) => j.append({ type: 'output', data, stream: 'stdout', runId }).seq;
+  const note = () => j.append({ type: 'note', text: 'n', principal: 'agent:a@test' }).seq;
+  const a = o('a\n');
+  const n1 = note();
+  note();
+  const n3 = note();
+  const b = o('b\n');
+  const end = j.append({ type: 'run.end', runId, state: 'exited', exit: 0, durationMs: 1 }).seq;
+  assert.equal(j.runs.output(j, runId).truncated, false);
+  const late = j.append({ type: 'gap', from: n1, to: n3, reason: 'store-error' });
+  assert.ok(late.seq > end);
+  const whole = j.runs.output(j, runId);
+  assert.equal(whole.truncated, true, 'the hole cuts the Run');
+  assert.deepEqual(whole.events.map((e) => e.seq), [a, b]);
+  assert.deepEqual(whole.gaps?.map((g) => [g.seq, g.from, g.to, g.reason]), [[n3, n1, n3, 'store-error']], 'the gap goes with the result, seated where its hole ends');
+  assert.equal(j.holeWithin(a, b), true);
+  assert.equal(j.holeWithin(b, end), false);
+  // Narrowed as every gap is: a range of the Run the hole does not touch has none.
+  assert.deepEqual([j.runs.output(j, runId, { until: a }).gaps, j.runs.output(j, runId, { until: a }).truncated], [undefined, false]);
+  assert.deepEqual(j.runs.output(j, runId, { since: a }).gaps?.map((g) => g.seq), [n3]);
+  for (const range of [{}, { limit: 1 }, { maxBytes: 2 }, { since: a }, { until: n1 }] as RunOutputRange[]) {
+    assert.deepEqual(j.runs.output(j, runId, range), narrowOutput(whole, range), JSON.stringify(range));
+  }
+  // A gap for seqs past the Run says nothing of it.
+  j.append({ type: 'gap', from: late.seq + 1, to: late.seq + 1, reason: 'torn-write' });
+  assert.equal(j.runs.output(j, runId).gaps?.length, 1);
+});

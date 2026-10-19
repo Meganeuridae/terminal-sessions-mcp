@@ -558,6 +558,21 @@ export class McplLane {
     const id = channelId(sid);
     const s = this.app.registry.get(sid);
     if (!s || !this.app.can(this.me, s, 'observe')) throw new RpcError(UNKNOWN_CHANNEL, `unknown channel ${id}`, { channelId: id });
+    // Every parameter is checked before the open takes effect: checked after, a refused open had
+    // opened the channel, and the next completion reached the host on it (the house's read of
+    // cc8c909..39787b3, #22).
+    const raw = params.history?.limit;
+    if (raw !== undefined && (typeof raw !== 'number' || Number.isNaN(raw))) throw new RpcError(INVALID_PARAMS, 'history.limit must be a number', { limit: raw });
+    // A whole number, never past the cap: a fraction was kept, compared equal to no count, and got everything (the house's read of 2f357bd, #22).
+    const limit = raw === undefined ? 0 : Math.min(HISTORY_MAX, Math.max(0, Math.floor(raw)));
+    const boundary = limit > 0 ? params.history?.beforeMessageId : undefined;
+    const before = boundary !== undefined ? seqOfMessageId(String(boundary)) : undefined;
+    // A boundary that is not one of our ids is refused, not ignored: ignored, it answered with the
+    // newest page as if none had been given, and a host paging back got the same page again (the
+    // house's read of 07ab3dd, #22).
+    if (boundary !== undefined && before === undefined) {
+      throw new RpcError(INVALID_PARAMS, 'history.beforeMessageId is not a message id of this server; ids look like <node>/<session>~<epoch>:<kind>:<seq>, as channels/incoming and channels/open history give them', { beforeMessageId: String(boundary).slice(0, 200) });
+    }
     this.registered.add(id);
     if (s.kind === 'live') {
       // §9: the owner's connection takes a free seat; everyone else observes. Opening never starts a
@@ -569,19 +584,7 @@ export class McplLane {
     this.open.add(id);
     if (!wasOpen) this.carryNow(targetOf(s));
     const res: { channel: ChannelDescriptor; history?: IncomingMessage[]; historyTruncated?: boolean } = { channel: this.descriptorFor(s) };
-    const raw = params.history?.limit;
-    if (raw !== undefined && (typeof raw !== 'number' || Number.isNaN(raw))) throw new RpcError(INVALID_PARAMS, 'history.limit must be a number', { limit: raw });
-    // A whole number, never past the cap: a fraction was kept, compared equal to no count, and got everything (the house's read of 2f357bd, #22).
-    const limit = raw === undefined ? 0 : Math.min(HISTORY_MAX, Math.max(0, Math.floor(raw)));
     if (limit > 0) {
-      const boundary = params.history?.beforeMessageId;
-      const before = boundary !== undefined ? seqOfMessageId(String(boundary)) : undefined;
-      // A boundary that is not one of our ids is refused, not ignored: ignored, it answered with the
-      // newest page as if none had been given, and a host paging back got the same page again (the
-      // house's read of 07ab3dd, #22).
-      if (boundary !== undefined && before === undefined) {
-        throw new RpcError(INVALID_PARAMS, 'history.beforeMessageId is not a message id of this server; ids look like <node>/<session>~<epoch>:<kind>:<seq>, as channels/incoming and channels/open history give them', { beforeMessageId: String(boundary).slice(0, 200) });
-      }
       const r = await replayNewest(this.sourceOf(s), before !== undefined ? { limit, before } : { limit });
       const t = targetOf(s);
       res.history = r.segments.map((seg) => this.message(t, seg));
@@ -1130,10 +1133,15 @@ export class McplLane {
         p.covered.delete(pk.ev.seq);
       }
       const w: (typeof work)[number] = { t: p.t, src: p.src, picked };
-      if (omitted) {
-        this.owe(p.st, omitted.to);
-        w.summary = this.summary(p.t, omitted);
-        p.st.summaries.set(qualify(w.summary.messageId), { from: omitted.from, covered: p.covered });
+      // One summary for what the host will not see replayed: the messages past the cap, and the
+      // range retention took before the scan began, which the scan reports and nothing can replay
+      // (the segmenter's read, comment 6265082050 on #22: the catch-up never told the host of it).
+      if (omitted || scan.lost) {
+        const from = omitted?.from ?? scan.lost!.from;
+        const to = omitted?.to ?? scan.lost!.to;
+        this.owe(p.st, to);
+        w.summary = this.summary(p.t, omitted, scan.lost);
+        p.st.summaries.set(qualify(w.summary.messageId), { from, covered: p.covered });
       }
       if (scan.end > p.st.clearTo) p.st.clearTo = scan.end;
       p.st.scanningFrom = undefined;
@@ -1160,20 +1168,31 @@ export class McplLane {
     return this.owed(t, ev, open, src, lost?.principals);
   }
 
-  /** One message for what a catch-up did not replay (ux-25): how many of each, and where to read them. */
-  private summary(t: Target, o: Omitted): Segment {
+  /**
+   * One message for what a catch-up did not replay (ux-25): how many of each and where to read them,
+   * and the range the scan began inside of, gone past retention with whatever it held, which no
+   * read brings back (the segmenter's read, comment 6265082050 on #22). One of the two is given.
+   */
+  private summary(t: Target, o: Omitted | undefined, lost: LifecycleScan['lost']): Segment {
     const names: Record<string, string> = { run: 'completions', service: 'service changes', watch: 'watch firings', 'session-exit': 'shell exits', recovered: 'restarts', 'needs-input': 'input prompts' };
-    const parts = Object.entries(o.kinds).map(([k, n]) => `${n} ${names[k] ?? k}`);
+    const parts: string[] = [];
+    if (o) parts.push(`${o.count} earlier message${o.count > 1 ? 's' : ''} while you were away not replayed (${Object.entries(o.kinds).map(([k, n]) => `${n} ${names[k] ?? k}`).join(', ')}) · seq ${o.from}–${o.to}`);
+    if (lost) parts.push(`seq ${lost.from}–${lost.to} gone past retention, with whatever happened then`);
+    const to = o?.to ?? lost!.to;
+    const since = o ? Math.max(0, o.from - 1) : lost!.to;
+    const metadata: Record<string, unknown> = { session: t.id, state: liveOf(t)?.state ?? 'exited', count: o?.count ?? 0, from: o?.from ?? lost!.from, to, kinds: o?.kinds ?? {} };
+    // Two scalars, not a range object: a push event's origin carries scalar metadata only.
+    if (lost) Object.assign(metadata, { lostFrom: lost.from, lostTo: lost.to });
     return {
       kind: 'summary',
       lifecycle: true,
-      seq: o.to,
+      seq: to,
       ts: Date.now(),
-      messageId: segmentId(t.id, t.journal, 'summary', o.to),
+      messageId: segmentId(t.id, t.journal, 'summary', to),
       tags: ['terminal:missed'],
       // `as=events`: a plain read projects text, which has no exit statuses or service changes in it (the house's read of 2f357bd, #22).
-      head: `[terminal] ${t.id}: ${o.count} earlier message${o.count > 1 ? 's' : ''} while you were away not replayed (${parts.join(', ')}) · seq ${o.from}–${o.to} · read session=${t.id} since=${Math.max(0, o.from - 1)} as=events`,
-      metadata: { session: t.id, state: liveOf(t)?.state ?? 'exited', count: o.count, from: o.from, to: o.to, kinds: o.kinds },
+      head: `[terminal] ${t.id}: ${parts.join(' · ')} · read session=${t.id} since=${since} as=events`,
+      metadata,
       interested: [this.me],
     };
   }

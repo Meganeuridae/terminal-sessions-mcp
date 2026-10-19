@@ -31,10 +31,10 @@ export interface JournalStore {
   bytes?(): number;
   retention?(): Retention;
   /**
-   * Stream every retained event whose serialized line contains `needle`, oldest
+   * Stream every retained event whose serialized line contains one of the `needles`, oldest
    * first, without holding the journal in memory; rotation headers go to `onHeader`.
    */
-  scan?(needle: string, visit: (ev: JournalEvent) => void, onHeader?: (h: RotationHeader) => void): void;
+  scan?(needles: string | string[], visit: (ev: JournalEvent) => void, onHeader?: (h: RotationHeader) => void): void;
   /** What to write at the head of each file this store rotates into, within the byte budget the provider is given. */
   setRotationHeader?(provider: ((maxBytes?: number) => RotationHeader | undefined) | undefined): void;
   /** True once if opening the store cut a torn final event (a crash mid-write); see Journal. */
@@ -965,8 +965,8 @@ export class FileStore implements JournalStore {
     return out.reverse();
   }
 
-  scan(needle: string, visit: (ev: JournalEvent) => void, onHeader?: (h: RotationHeader) => void): void {
-    const nb = Buffer.from(needle);
+  scan(needles: string | string[], visit: (ev: JournalEvent) => void, onHeader?: (h: RotationHeader) => void): void {
+    const nbs = (Array.isArray(needles) ? needles : [needles]).map((n) => Buffer.from(n));
     const hb = Buffer.from(HEADER_PREFIX);
     for (const seg of this.segments) {
       let first = true;
@@ -983,15 +983,27 @@ export class FileStore implements JournalStore {
             }
           }
         }
-        // Only lines holding the needle are decoded and parsed; the rest is a memchr.
-        let p = chunk.indexOf(nb);
-        while (p !== -1) {
-          const ls = chunk.lastIndexOf(10, p) + 1;
-          let le = chunk.indexOf(10, p);
+        // Only lines holding a needle are decoded and parsed; the rest is a memchr per needle over the
+        // one read of the file, and the lines found go to the visitor in their order.
+        const starts: number[] = [];
+        for (const nb of nbs) {
+          let p = chunk.indexOf(nb);
+          while (p !== -1) {
+            const ls = chunk.lastIndexOf(10, p) + 1;
+            starts.push(ls);
+            const le = chunk.indexOf(10, p);
+            p = le !== -1 && le < chunk.length ? chunk.indexOf(nb, le + 1) : -1;
+          }
+        }
+        if (nbs.length > 1) starts.sort((a, b) => a - b);
+        let seen = -1;
+        for (const ls of starts) {
+          if (ls === seen) continue; // one line holding two needles
+          seen = ls;
+          let le = chunk.indexOf(10, ls);
           if (le === -1) le = chunk.length;
           const ev = parseEvent(chunk.toString('utf8', ls, le));
           if (ev) visit(ev);
-          p = le < chunk.length ? chunk.indexOf(nb, le + 1) : -1;
         }
       }
     }

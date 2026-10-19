@@ -154,6 +154,15 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
     gaps.push(e);
     if (e.to >= lo && e.from <= hi) holed = true;
   };
+  // A gap for seqs of the range recorded past it — the catch-up writes the gap when the disk takes
+  // writes again, which may be long after the Run ended — is not among the range's events: it goes
+  // with the result all the same, seated where its hole ends (within the Run's whole range, so that
+  // `narrowOutput` places it the same for every `range`), and the reader shows the hole where it is
+  // instead of a complete Run (the house's read of cc8c909..39787b3, #22).
+  for (const g of journal.runs.gapsWithin(lo, hi)) {
+    if (g.seq <= hi) continue;
+    gaps.push({ ...g, seq: Math.min(g.to, to) });
+  }
   if (range.maxBytes !== undefined && range.limit === undefined) {
     let bytes = 0;
     walk: for (let cursor = hi; cursor >= lo; ) {
@@ -202,10 +211,14 @@ const copy = (r: RunInfo): RunInfo => ({ ...r, seq: { ...r.seq } });
  * 07ab3dd, #22: this comment gave retention as the reason).
  */
 const MAX_RUNS = 100_000;
+/** Gap events remembered at most: one per episode of a refusing disk or a torn write, so rarely many; the oldest go first. */
+const MAX_GAPS = 10_000;
 
 export class RunIndex {
   private readonly runs = new Map<string, RunInfo>();
   private readonly openIds = new Set<string>();
+  /** The journal's gap events, in seq order: a Run's reads ask for those over its range, wherever each sits (see `gapsWithin`). */
+  private readonly gaps: GapEvent[] = [];
 
   /** `sessionId` is stamped on every RunInfo. */
   constructor(readonly sessionId: string) {}
@@ -264,9 +277,24 @@ export class RunIndex {
         this.openIds.delete(ev.runId);
         return;
       }
+      case 'gap': {
+        // Kept here, with the lineage every life of the name shares, so a Run's reads see a hole
+        // recorded after the Run ended, by this life or an earlier one (the house's read of
+        // cc8c909..39787b3, #22). A gap describes seqs issued before it; a line claiming later
+        // ones is not the journal's, and is left out.
+        if (ev.to >= ev.seq) return;
+        this.gaps.push(ev);
+        if (this.gaps.length > MAX_GAPS) this.gaps.splice(0, this.gaps.length - MAX_GAPS);
+        return;
+      }
       default:
         return;
     }
+  }
+
+  /** The gap events whose range `from..to` overlaps [from, to], wherever each was recorded, in seq order. */
+  gapsWithin(from: Seq, to: Seq): GapEvent[] {
+    return this.gaps.filter((g) => g.to >= from && g.from <= to);
   }
 
   /** Take the Runs a rotation header names that this index has not seen admitted. */

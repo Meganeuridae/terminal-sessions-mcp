@@ -434,20 +434,95 @@ test('G18: a session whose record cannot be read is nobody\'s to reopen — not 
   const h = hist(reg.get('dmg'));
   assert.equal(h.owner, 'unknown');
   assert.match(text(h.journal.since(0).events), /keep-me/);
-  assert.ok(warnings.some((w) => /record cannot be read/.test(w) && /"session":"dmg"/.test(w)), JSON.stringify(warnings));
+  assert.ok(warnings.some((w) => /record \(session\.json\) cannot be read/.test(w) && /"session":"dmg"/.test(w)), JSON.stringify(warnings));
   for (const owner of [A, B, 'system']) {
     await rejectsWith(reg.ensure({ id: 'dmg', owner }), 'forbidden');
     await rejectsWith(reg.create({ id: 'dmg', owner }), 'forbidden');
   }
   assert.equal(fs.readFileSync(file, 'utf8'), '{', 'the file is left for repair');
-  // Repaired: the recorded owner reopens it, nobody else.
+  await assert.rejects(reg.ensure({ id: 'dmg', owner: A }), /cannot be read/);
+  // Repaired: the same daemon reads the record again at the next attempt, as the refusal promised — the
+  // recorded owner reopens it, nobody else, with no restart (the house's read of cc8c909..39787b3, #22).
   fs.writeFileSync(file, JSON.stringify({ owner: A, visibility: 'private' }));
+  await assert.rejects(reg.ensure({ id: 'dmg', owner: B }), /belongs to another principal/);
+  assert.equal(hist(reg.get('dmg')).owner, A);
+  assert.equal((await reg.ensure({ id: 'dmg', owner: A })).created, true);
+  await reg.close('dmg');
   await reg.closeAll();
   const r3 = restart(r2);
   assert.equal(hist(r3.reg.get('dmg')).owner, A);
   await rejectsWith(r3.reg.ensure({ id: 'dmg', owner: B }), 'forbidden');
   assert.equal((await r3.reg.ensure({ id: 'dmg', owner: A })).created, true);
   await cleanup(r3, r2, r);
+});
+
+test('G18: a session whose record is missing beside its history is nobody\'s to reopen, and the refusal says the record is missing — not that the name is someone else\'s', async () => {
+  // With session.json gone, recovery made the system principal the owner: the owner and everyone
+  // else were refused as if the name belonged to another principal, and a caller acting as the
+  // system could take it (the house's read of cc8c909..39787b3, #22).
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'norec', owner: A })).session;
+  await run(s, A, 'echo keep-me');
+  await r.reg.close('norec');
+  await r.reg.closeAll();
+  const file = path.join(r.dir, 'sessions', 'norec', 'session.json');
+  fs.rmSync(file);
+  const warnings: string[] = [];
+  const { backend, shells } = scripted();
+  const reg = new SessionRegistry({ dataDir: r.dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), log: (level, msg, fields) => void (level === 'warn' && warnings.push(`${msg} ${JSON.stringify(fields)}`)) });
+  const r2: Rig = { dir: r.dir, backend, shells, reg, changes: [] };
+  const h = hist(reg.get('norec'));
+  assert.equal(h.owner, 'unknown');
+  assert.match(text(h.journal.since(0).events), /keep-me/);
+  assert.ok(warnings.some((w) => /session\.json is missing/.test(w) && /"session":"norec"/.test(w)), JSON.stringify(warnings));
+  const missing = (e: unknown) => e instanceof TermError && e.code === 'forbidden' && /session\.json is missing/.test(e.message) && !/another principal/.test(e.message);
+  for (const owner of [A, B, 'system']) {
+    await assert.rejects(reg.ensure({ id: 'norec', owner }), missing);
+    await assert.rejects(reg.create({ id: 'norec', owner }), missing);
+  }
+  assert.equal(fs.existsSync(file), false, 'nothing is written in its place');
+  // A record written there names the owner again: it reopens the session on the same daemon, nobody else.
+  fs.writeFileSync(file, JSON.stringify({ owner: A, visibility: 'private' }));
+  await assert.rejects(reg.ensure({ id: 'norec', owner: B }), /belongs to another principal/);
+  assert.equal((await reg.ensure({ id: 'norec', owner: A })).created, true);
+  await cleanup(r2, r);
+});
+
+test('G21: a reopen that fails to start prunes nothing — the history keeps the retention it had, on disk and in memory', async () => {
+  // The store took the requested retention, and pruned to it, before the shell was spawned: a failed
+  // reopen asking for less deleted rotated files the record still kept, and the entry reported the
+  // retention it never got (the house's read of cc8c909..39787b3, #22).
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'keep', owner: A, retention: { maxBytes: 256 * 1024 } })).session;
+  for (let i = 0; i < 20; i++) await run(s, A, 'big 16000');
+  await r.reg.close('keep');
+  const none = (await r.reg.ensure({ id: 'none', owner: A })).session;
+  await run(none, A, 'echo kept');
+  await r.reg.close('none');
+  const sdir = path.join(r.dir, 'sessions', 'keep');
+  const rotated = () => fs.readdirSync(sdir).filter((n) => /^journal\.\d+\.jsonl$/.test(n)).sort();
+  const recorded = (id: string) => (JSON.parse(fs.readFileSync(path.join(r.dir, 'sessions', id, 'session.json'), 'utf8')) as { retention: unknown }).retention;
+  const files = rotated();
+  assert.ok(files.length >= 3, `rotated files under 256 KiB: ${JSON.stringify(files)}`);
+  const spawn = r.backend.spawnShell.bind(r.backend);
+  r.backend.spawnShell = () => {
+    throw new Error('spawn failed');
+  };
+  await rejectsWith(r.reg.ensure({ id: 'keep', owner: A, retention: { maxBytes: 64 * 1024 } }), 'Error: spawn failed');
+  assert.deepEqual(rotated(), files, 'the history is still there');
+  assert.deepEqual(hist(r.reg.get('keep')).retention, { maxBytes: 262144 });
+  assert.deepEqual(recorded('keep'), { maxBytes: 262144 });
+  // A session with no limit, asked to take one: the same.
+  await rejectsWith(r.reg.ensure({ id: 'none', owner: A, retention: { maxBytes: 1024 * 1024 } }), 'Error: spawn failed');
+  assert.deepEqual(hist(r.reg.get('none')).retention, {});
+  assert.deepEqual(recorded('none'), {});
+  r.backend.spawnShell = spawn;
+  // Started, the new life's retention applies.
+  const again = (await r.reg.ensure({ id: 'keep', owner: A, retention: { maxBytes: 64 * 1024 } })).session;
+  assert.ok(rotated().length < files.length, `pruned to 64 KiB: ${JSON.stringify(rotated())}`);
+  assert.equal(again.journal.stats().retention.maxBytes, 65536);
+  assert.deepEqual(recorded('keep'), { maxBytes: 65536 });
+  await cleanup(r);
 });
 
 test('the integration preserves the environment the shell starts with — the session\'s over the daemon\'s — not the daemon\'s own', async () => {

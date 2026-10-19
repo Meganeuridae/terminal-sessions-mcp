@@ -252,6 +252,54 @@ test('jr-2/G11: when the ring dropped part of what the disk refused, a store-err
   assert.ok(gap && gap.type === 'gap' && gap.from === 4 && gap.to === hotOldest - 1 && (gap.reason as string) === 'store-error', JSON.stringify(gap));
 });
 
+test('a Run whose output the ring dropped while the disk refused still reads as truncated once the catch-up has recorded the gap, past the Run\'s end', () => {
+  // The catch-up writes the gap at the seq current then, after the Run ended: the Run's range held no
+  // gap event, the hole between the stores had closed, and the output read as complete (the house's
+  // read of cc8c909..39787b3, #22).
+  const cold = new FlakyStore();
+  cold.broken = false;
+  const j = new Journal({ hot: new MemoryStore(600), cold, sessionId: 's' });
+  j.append({ type: 'run.admit', runId: 'r1', target: 'process', principal: 'agent:a@test', origin: 'self', queued: false });
+  const start = j.append({ type: 'run.start', runId: 'r1', cwd: '/' }).seq;
+  cold.broken = true;
+  for (let i = 0; i < 20; i++) j.append({ type: 'output', data: `lost-or-kept-${i}-${'z'.repeat(40)}`, stream: 'stdout', runId: 'r1' });
+  const end = j.append({ type: 'run.end', runId: 'r1', state: 'exited', exit: 0, durationMs: 1 }).seq;
+  assert.equal(j.runs.output(j, 'r1').truncated, true, 'while the hole is open between the stores');
+  cold.broken = false;
+  assert.equal(j.retryCold(), true);
+  const gap = j.since(end).events.find((e) => e.type === 'gap');
+  assert.ok(gap && gap.type === 'gap' && gap.reason === 'store-error', JSON.stringify(gap));
+  const o = j.runs.output(j, 'r1');
+  assert.equal(o.truncated, true, 'the hole is recorded past the Run, and still cuts it');
+  assert.deepEqual(o.gaps?.map((g) => [g.from, g.to, g.reason]), [[gap.from, gap.to, 'store-error']]);
+  assert.equal(j.holeWithin(start, end), true);
+});
+
+test('a journal reopened over its files knows the gaps they hold: after a restart a Run is cut by a hole recorded after its end', () => {
+  const dir = tmpDir();
+  try {
+    const j = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+    j.append({ type: 'run.admit', runId: 'r1', target: 'process', principal: 'agent:a@test', origin: 'self', queued: false });
+    j.append({ type: 'run.start', runId: 'r1', cwd: '/' });
+    const a = j.append({ type: 'output', data: 'a', stream: 'stdout', runId: 'r1' }).seq;
+    const n1 = j.append({ type: 'note', text: 'n', principal: 'agent:a@test' }).seq;
+    const n2 = j.append({ type: 'note', text: 'n', principal: 'agent:a@test' }).seq;
+    const b = j.append({ type: 'output', data: 'b', stream: 'stdout', runId: 'r1' }).seq;
+    j.append({ type: 'run.end', runId: 'r1', state: 'exited', exit: 0, durationMs: 1 });
+    j.append({ type: 'gap', from: n1, to: n2, reason: 'store-error' });
+    j.close();
+    const j2 = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+    assert.equal(j2.holeWithin(a, b), true, 'the one pass over the files took the gap in');
+    const o = j2.runs.output(j2, 'r1');
+    assert.equal(o.truncated, true);
+    assert.deepEqual(o.gaps?.map((g) => [g.seq, g.from, g.to]), [[n2, n1, n2]]);
+    assert.deepEqual([j2.runs.run('r1').state, j2.runs.run('r1').exit], ['exited', 0], 'the Runs are indexed as before');
+    j2.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('jr-2: a real disk refusal (read-only journal, then a refused rotation) keeps the journal alive and loses nothing once it heals', () => {
   if (process.getuid?.() === 0) return; // root ignores modes
   const dir = tmpDir();

@@ -13,6 +13,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { SessionRegistry, type HistorySession } from '../src/api/registry.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
+import { groupAlive } from '../src/core/lock.js';
 import type { JournalEvent } from '../src/core/types.js';
 
 const A = 'agent:a@test';
@@ -50,7 +51,13 @@ const queued = session.admit({ target: 'shell', line: 'echo never-ran', principa
 const proc = session.admit({ target: 'process', line: 'sleep 2', principal: P });
 const orphan = session.admit({ target: 'process', line: 'sleep 30.75', principal: P });
 for (let i = 0; i < 100 && session.run(orphan.run.runId).state !== 'running'; i++) await new Promise((r) => setTimeout(r, 20));
-process.stdout.write(JSON.stringify({ one, two, slow, slowState: session.run(slow).state, queued: queued.run.runId, proc: proc.run.runId, orphan: orphan.run.runId }) + '\\n');
+// A Run that ends at once, leaving background work that keeps starting processes in its group. The
+// daemon dies more than a second after the Run ended, so the loop's newest child — whose start ps
+// truncates to the second — started after the end by any reading: the case the house ran.
+const loop = session.admit({ target: 'process', line: '(while true; do sleep 0.3; done) & exit 0', principal: P });
+await session.awaitRun(loop.run.runId, 5000);
+await new Promise((r) => setTimeout(r, 1500));
+process.stdout.write(JSON.stringify({ one, two, slow, slowState: session.run(slow).state, queued: queued.run.runId, proc: proc.run.runId, orphan: orphan.run.runId, loop: loop.run.runId, loopPgid: String(session.run(loop.run.runId).pgid ?? '') }) + '\\n');
 setInterval(() => {}, 1000);
 `;
 
@@ -62,6 +69,7 @@ test('tg-11/G20: after a SIGKILLed daemon, every admitted Run is terminal and ea
   const proc = spawn(process.execPath, ['--input-type=module', '-e', child(dataDir)], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, TMPDIR: childTmp } });
   let stderr = '';
   proc.stderr.on('data', (d) => (stderr += d));
+  let loopPgid = 0;
   try {
     const ids = await new Promise<Record<string, string>>((resolve, reject) => {
       let buf = '';
@@ -74,6 +82,7 @@ test('tg-11/G20: after a SIGKILLed daemon, every admitted Run is terminal and ea
       setTimeout(() => reject(new Error(`child timed out: ${stderr}`)), 20_000).unref();
     });
     assert.equal(ids.slowState, 'running');
+    loopPgid = Number(ids.loopPgid) || 0;
     const exited = new Promise((r) => proc.once('exit', r));
     proc.kill('SIGKILL');
     await exited;
@@ -85,20 +94,32 @@ test('tg-11/G20: after a SIGKILLed daemon, every admitted Run is terminal and ea
     assert.ok(h && h.kind === 'history' && h.recovered === 'history-only' && !h.closed);
     for (const l of fs.readFileSync(path.join(dataDir, 'sessions/k/journal.jsonl'), 'utf8').split('\n').filter(Boolean)) JSON.parse(l);
     const runs = h.listRuns();
-    assert.deepEqual(runs.map((r) => r.runId), [ids.one, ids.two, ids.slow, ids.queued, ids.proc, ids.orphan]);
+    assert.deepEqual(runs.map((r) => r.runId), [ids.one, ids.two, ids.slow, ids.queued, ids.proc, ids.orphan, ids.loop]);
     for (const r of runs) assert.ok(['exited', 'cancelled', 'lost'].includes(r.state), `${r.line}: ${r.state}`);
     assert.deepEqual([h.run(ids.one!).state, h.run(ids.one!).exit], ['exited', 0]);
     for (const id of [ids.slow!, ids.queued!, ids.proc!, ids.orphan!]) {
       assert.equal(h.run(id).state, 'lost');
       assert.match(h.run(id).reason ?? '', /^daemon-restart(; process group \d+ (terminated|survived SIGKILL))?$/);
     }
+    const notes = h.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'note' }> => e.type === 'note').map((e) => e.text);
     // jr2-4: a process Run whose group the journal names is not left running as an orphan.
     const orphan = h.run(ids.orphan!);
     if (orphan.pgid !== undefined) {
       assert.equal(orphan.reason, `daemon-restart; process group ${orphan.pgid} terminated`);
       assert.equal(alive('sleep 30.75'), false, 'the orphan was terminated at recovery');
+      // Its note says the group went with the Run recovery ended, not that it outlived a Run that had ended (the house's read of cc8c909..39787b3, #22).
+      assert.ok(notes.includes(`recovery: process group ${orphan.pgid} terminated with ${ids.orphan}, which recovery ended lost`), JSON.stringify(notes));
+      assert.ok(!notes.some((t) => t.includes(`outlived ${ids.orphan}`)), JSON.stringify(notes));
     } else {
       console.log('# run.start carries no pgid in this build: the orphan check is skipped (the session workstream records it)');
+    }
+    // A Run that had ended leaving a loop in its group, whose newest child started after the Run ended:
+    // the whole group is the Run's, and goes (the house's read of cc8c909..39787b3, #22).
+    const loop = h.run(ids.loop!);
+    assert.deepEqual([loop.state, loop.exit, loop.leftovers], ['exited', 0, true]);
+    if (loop.pgid !== undefined) {
+      assert.equal(groupAlive(loop.pgid), false, 'the loop and its newest child were terminated at recovery');
+      assert.ok(notes.includes(`recovery: process group ${loop.pgid} terminated; it outlived ${ids.loop}, which had ended`), JSON.stringify(notes));
     }
     const textOf = (runId: string) =>
       h
@@ -114,6 +135,14 @@ test('tg-11/G20: after a SIGKILLed daemon, every admitted Run is terminal and ea
     await reg.closeAll();
   } finally {
     if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+    // The loop's group outlives everything unless recovery ended it; a failure must not leave it running.
+    if (loopPgid > 1) {
+      try {
+        process.kill(-loopPgid, 'SIGKILL');
+      } catch {
+        // ended at recovery, as expected
+      }
+    }
     // The shell's foreground job dies with the PTY; clean up anyway so a failure leaves nothing behind.
     for (const leftover of ['sleep 31.25', 'sleep 30.75']) {
       try {

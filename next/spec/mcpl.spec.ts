@@ -217,6 +217,13 @@ test('channels/open returns history only when asked, bounded by the limit, stamp
   assert.equal(frac.historyTruncated, true);
   await a.request('channels/close', { channelId: 'terminal:hist' });
   await assert.rejects(a.request('channels/open', { channelId: 'terminal:hist', history: { limit: 'all' } }), (e: { code: number }) => e.code === -32602);
+  await assert.rejects(a.request('channels/open', { channelId: 'terminal:hist', history: { limit: null } }), (e: { code: number }) => e.code === -32602);
+  await assert.rejects(a.request('channels/open', { channelId: 'terminal:hist', history: { limit: 5, beforeMessageId: 'not-one-of-ours' } }), (e: { code: number }) => e.code === -32602);
+  // A refused open did not open the channel: the next completion reaches this host by its interest,
+  // as a push, not as a channel message (the house's read of cc8c909..39787b3, #22).
+  const bg = await a.call('run', { session: 'hist', command: 'sleep 0.3; echo after-refusal', wait: 20 });
+  const d = await a.delivery(aboutRun(bg.structured?.runId), 6000);
+  assert.equal(d.via, 'push');
   await a.close();
 });
 
