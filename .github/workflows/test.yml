@@ -48,9 +48,12 @@ jobs:
       # interactive-shell tests waiting behind an unread startup prompt.
       - name: Check shell startup
         run: npm run build:next && node --test --test-name-pattern='G5 rich integration is observed' next/dist/spec/pty.spec.js
-      # 1.x's suite (src/, cli/, gui/, test/) and 2.0's (next/): both ship in this package.
+      # 1.x's suite (src/, cli/, gui/, test/) and 2.0's (next/): both ship in this package. The GUI spec
+      # needs the browser puppeteer installs; a runner without one fails instead of skipping it.
       - run: npm test
       - run: npm run test:next
+        env:
+          GUI_REQUIRED: '1'
 
   # The two checks against real MCPL hosts (next/acceptance), which `npm test` does not run: the
   # agent-framework host with a mock model, and mcpl-cc-bridge's own host classes under bun. Each

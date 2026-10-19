@@ -152,10 +152,13 @@
     role: 'observer',
     controller: null,
     lastSeq: 0,
+    attachedAt: 0, // the cursor the attach's snapshot (or transcript) reflects: everything after it streams
     exited: false,
     history: false,
-    streamEnded: false, // the daemon ended this session's stream (closed, removed, or a read error)
+    streamEnded: false, // the daemon ended this session's stream (closed, removed, a read error, or a failed attach)
+    behind: false, // output outran the emulator: it is not fed until a fresh snapshot replaces the screen
     liveState: null, // the shell's state as the journal tells it (run.start/run.end/screen.mode), newer than the list's
+    running: new Set(), // shell Runs that started and have not ended: the shell is busy while any remains
     runs: new Map(), // runId → {line, principal, target, item, out}
     typing: null, // {principal, text, code}: the line another principal is typing, shown as it grows
   };
@@ -262,6 +265,8 @@
     term.open($('term'));
     term.onData(send);
     term.onBinary(send);
+    pendingBytes = 0;
+    state.behind = false;
   }
 
   // ───────────── typing: never queued, secret when asked or when it looks like a password prompt ─────────────
@@ -293,6 +298,7 @@
   };
 
   let typedAhead = '';
+  let typedFor = null; // the session the text was typed into: it goes there even if another is selected before it is sent
   let typedSecret = false;
   let sendTimer = null;
   function send(data) {
@@ -301,9 +307,16 @@
       notice('You are observing. Take the seat to type.');
       return;
     }
-    // tsg-7: typed while disconnected or while (re)attaching, it goes nowhere — and says so.
-    if (!rpc.open || state.attaching) {
-      notice(rpc.open ? 'Attaching: that input was not sent. Type again once the terminal is back.' : 'Not connected: that input was not sent.');
+    // tsg-7: typed while disconnected or while (re)attaching, it goes nowhere — and says so. Nor after the
+    // stream ended: the page no longer shows what the input would land on (the house's read of 2f357bd, #22).
+    if (!rpc.open || state.attaching || state.streamEnded) {
+      notice(
+        !rpc.open
+          ? 'Not connected: that input was not sent.'
+          : state.attaching
+            ? 'Attaching: that input was not sent. Type again once the terminal is back.'
+            : 'The live stream ended: that input was not sent. Click the session to reattach.',
+      );
       return;
     }
     // G26: a password prompt on the cursor line makes this input secret until the line is entered.
@@ -315,6 +328,7 @@
     const sensitive = secret.manual || secret.auto;
     if (typedAhead && sensitive !== typedSecret) flush();
     typedSecret = sensitive;
+    if (!typedAhead) typedFor = state.current;
     typedAhead += data;
     if (sensitive && secret.auto && /[\r\n]/.test(data)) {
       secret.auto = false;
@@ -330,7 +344,9 @@
     const text = typedAhead;
     typedAhead = '';
     if (!text) return;
-    const args = { session: state.current, text };
+    // The session it was typed into, not the one selected now: a paste followed at once by a click on
+    // another session went to that session, and took its free seat (the house's read of 2f357bd, #22).
+    const args = { session: typedFor, text };
     if (typedSecret) args.sensitive = true;
     tool('input', args).catch((e) =>
       notice(
@@ -352,16 +368,22 @@
   });
 
   /** The controller sizes the PTY to its view — columns and rows (tsg-11); observers keep the controller's size (G17). */
+  const canResize = () => term && state.role === 'controller' && !state.history && !state.exited && !state.streamEnded;
   function maybeResize() {
-    if (!term || state.role !== 'controller' || state.history || state.exited) return;
+    if (!canResize()) return;
     clearTimeout(resizeTimer);
+    const id = state.current;
     resizeTimer = setTimeout(() => {
+      resizeTimer = null;
+      // Checked again when the timer fires: the daemon gives a free seat to whoever acts first, so a resize
+      // sent after Release seat took the seat back (the house's read of 2f357bd, #22).
+      if (!canResize() || state.current !== id) return;
       const d = fit.proposeDimensions();
       if (!d || !d.cols || !d.rows) return;
       const cols = Math.max(20, Math.min(500, d.cols));
       const rows = Math.max(5, Math.min(200, d.rows));
       if (cols === term.cols && rows === term.rows) return;
-      tool('resize', { session: state.current, cols, rows }).catch(() => undefined);
+      tool('resize', { session: id, cols, rows }).catch(() => undefined);
     }, 150);
   }
   window.addEventListener('resize', maybeResize);
@@ -372,12 +394,19 @@
   async function select(id) {
     // Clicking the current session again reattaches when its stream ended (closed, exited, history; tsg-9).
     if (state.current === id && !(state.exited || state.history || state.streamEnded)) return;
+    // Text still coalescing was typed into the session being left: it goes there, now.
+    flush();
     if (state.current && state.current !== id) rpc.request('terminal/detach', { session: state.current }).catch(() => undefined);
     state.current = id;
     state.runs.clear();
+    state.running.clear();
     state.typing = null;
     state.lastSeq = 0;
     state.liveState = null;
+    // The bar's cwd, title and mode belong to the session that produced them (the house's read of 2f357bd, #22).
+    cwd = '';
+    title = '';
+    alt = false;
     secret.auto = false;
     updateSecret();
     $('activity').replaceChildren();
@@ -397,7 +426,7 @@
     try {
       r = await rpc.request('terminal/attach', { session: id, role: 'auto' });
     } catch (e) {
-      if (state.current === id && state.attachSeq === mine) notice(e.message);
+      if (state.current === id && state.attachSeq === mine) attachFailed(e);
       return;
     } finally {
       if (state.attachSeq === mine) state.attaching = false;
@@ -413,11 +442,12 @@
     state.liveState = r.info?.state ?? null;
     if (r.snapshot) {
       makeTerminal(r.snapshot.cols, r.snapshot.rows);
-      term.write(r.snapshot.data);
+      writeTerm(r.snapshot.data);
       state.lastSeq = r.snapshot.seq;
+      alt = Boolean(r.snapshot.alt);
     } else {
       makeTerminal(120, 30);
-      term.write((r.transcript ?? '').replace(/\r?\n/g, '\r\n'));
+      writeTerm((r.transcript ?? '').replace(/\r?\n/g, '\r\n'));
       state.lastSeq = r.lastSeq ?? 0;
       notice(
         r.info?.closed
@@ -427,10 +457,33 @@
             : 'History only.',
       );
     }
-    for (const run of r.runs ?? []) showRun(run);
+    state.attachedAt = state.lastSeq;
+    for (const run of r.runs ?? []) {
+      showRun(run);
+      if (run.target !== 'process' && (run.state === 'running' || run.state === 'starting')) state.running.add(run.runId);
+    }
     updateBar();
     maybeResize();
     term.focus();
+  }
+
+  /**
+   * Nothing of the session is attached: the previous session's screen and seat must not stand in for it,
+   * and a click on it tries again (the house's read of 2f357bd, #22).
+   */
+  function attachFailed(e) {
+    if (term) term.dispose();
+    term = null;
+    $('term').replaceChildren();
+    $('empty').style.display = '';
+    state.role = 'observer';
+    state.controller = null;
+    state.history = false;
+    state.exited = false;
+    state.streamEnded = true;
+    state.behind = false;
+    updateBar();
+    notice(`Could not attach: ${e.message} Click the session to try again.`);
   }
 
   /**
@@ -497,11 +550,13 @@
     state.lastSeq = event.seq;
     switch (event.type) {
       case 'output':
-        if (event.stream === 'pty') term.write(event.data);
+        if (event.stream === 'pty') writeTerm(event.data);
         else runOutput(event); // a process Run's stdout/stderr: its own pane, never the shell's screen (G14, tsg-23)
         return;
       case 'resize':
-        term.resize(event.cols, event.rows);
+        // Behind the output written before it, so those bytes are laid out at the size they were produced
+        // for; applied at once, it overtook output still queued (the house's read of 2f357bd, #22).
+        writeTerm('', () => term.resize(event.cols, event.rows));
         return;
       case 'control':
         state.controller = event.controller;
@@ -518,12 +573,17 @@
         const r = runRec(event.runId);
         if (event.line && !r.line) r.line = event.line;
         showRun({ runId: event.runId, state: 'running' });
-        if (r.target !== 'process') setLiveState('busy');
+        if (r.target !== 'process') {
+          state.running.add(event.runId);
+          setLiveState('busy');
+        }
         return;
       }
       case 'run.end': {
         showRun({ runId: event.runId, state: event.state, exit: event.exit, signal: event.signal, reason: event.reason, durationMs: event.durationMs });
-        if (state.runs.get(event.runId)?.target !== 'process') setLiveState('idle');
+        // Only the end of a Run that held the shell frees it: a Run cancelled while queued behind a running
+        // one never did, and the bar said idle too soon (the house's read of 2f357bd, #22).
+        if (state.running.delete(event.runId) && state.running.size === 0) setLiveState('idle');
         return;
       }
       case 'input':
@@ -564,6 +624,37 @@
     updateBar();
   }
 
+  /**
+   * Output goes through xterm's write queue, which parses it later; `pendingBytes` is what it has not drawn
+   * yet. Past PENDING_MAX the page has fallen behind: it stops feeding the queue and rebuilds the screen
+   * from a fresh snapshot, instead of letting xterm throw the output away at 50 MB while the page counted
+   * it as shown (the house's read of 2f357bd, #22). `then` runs once the data before it is drawn.
+   */
+  const PENDING_MAX = 16 * 1024 * 1024;
+  let pendingBytes = 0;
+  function writeTerm(data, then) {
+    if (state.behind) return;
+    if (pendingBytes + data.length > PENDING_MAX) return fellBehind();
+    const t = term;
+    pendingBytes += data.length;
+    try {
+      t.write(data, () => {
+        if (term !== t) return;
+        pendingBytes -= data.length;
+        if (then) then();
+      });
+    } catch {
+      pendingBytes -= data.length;
+      fellBehind();
+    }
+  }
+
+  function fellBehind() {
+    state.behind = true;
+    notice('Output arrived faster than this page could draw it: the screen is being rebuilt from a snapshot.');
+    reattach();
+  }
+
   // ───────────── activity panel ─────────────
 
   function activity(text, who, cls) {
@@ -573,7 +664,12 @@
     body.append(text instanceof Node ? text : document.createTextNode(text));
     item.append(body);
     $('activity').prepend(item);
-    while ($('activity').childElementCount > 200) $('activity').lastElementChild.remove();
+    while ($('activity').childElementCount > 200) {
+      const gone = $('activity').lastElementChild;
+      // A Run's record, and the output its pane held, go with its item (the house's read of 2f357bd, #22).
+      if (gone.dataset.run) state.runs.delete(gone.dataset.run);
+      gone.remove();
+    }
     return item;
   }
 
@@ -610,6 +706,7 @@
       rec.item.replaceChildren(el('div', 'who', `${rec.principal} · ${run.runId}`), frag);
     } else {
       rec.item = activity(frag, `${rec.principal} · ${run.runId}`);
+      rec.item.dataset.run = run.runId;
     }
     state.typing = null;
   }
@@ -618,38 +715,72 @@
 
   const OUT_MAX = 64 * 1024;
 
-  /** An expandable pane under the Run's activity item: its stdout and stderr, stderr marked apart. */
+  /**
+   * An expandable pane under the Run's activity item: its stdout and stderr, stderr marked apart. Output
+   * from before this page attached is in the journal: read on demand when the pane is opened, as events
+   * so stderr stays marked, up to the attach cursor (what came after it streamed to the page), and put
+   * before what streamed. Every cut is marked where it is (the house's read of 2f357bd, #22).
+   */
   function outputPane(runId, rec) {
     if (!rec.out) {
       const details = el('details', 'run-out');
       const summary = el('summary', null, 'output');
       const pre = el('pre');
       details.append(summary, pre);
-      rec.out = { details, pre, bytes: 0, loaded: false, streamed: false };
-      // Output from before this page attached comes from the journal, on demand.
+      rec.out = { details, pre, bytes: 0, cut: 0, stderr: false, loaded: false };
       details.addEventListener('toggle', () => {
-        if (!details.open || rec.out.loaded || rec.out.streamed) return;
+        if (!details.open || rec.out.loaded) return;
         rec.out.loaded = true;
-        tool('read', { session: state.current, runId, maxBytes: OUT_MAX })
-          .then((r) => {
-            if (!rec.out.streamed) appendOut(rec, { stream: 'stdout', data: r.text ?? '' });
-          })
+        const args = { session: state.current, runId, as: 'events', maxBytes: OUT_MAX / 4, limit: 2000 };
+        if (state.attachedAt > 0) args.until = state.attachedAt;
+        tool('read', args)
+          .then((r) => earlierOut(rec, r))
           .catch((e) => appendOut(rec, { stream: 'stderr', data: `(could not read the output: ${e.message})` }));
       });
     }
     return rec.out.details;
   }
 
+  const outSpan = (stream, data) => el('span', stream === 'stderr' ? 'stderr' : null, data);
+  const cutMark = (text) => el('span', 'cut', `(${text})\n`);
+  const kb = (n) => `${Math.max(1, Math.round(n / 1024))} KB`;
+
+  /** The journal's part of a Run's output goes before the streamed part, with any hole or cut marked. */
+  function earlierOut(rec, r) {
+    const out = rec.out;
+    const frag = document.createDocumentFragment();
+    for (const e of r.events ?? []) {
+      if (e.type === 'gap') frag.append(cutMark(`output ${e.from}–${e.to} not retained`));
+      if (e.type !== 'output') continue;
+      frag.append(outSpan(e.stream, e.data));
+      out.bytes += e.data.length;
+      if (e.stream === 'stderr') out.stderr = true;
+    }
+    if (r.more) frag.append(cutMark(`cut: the pane reads at most ${kb(OUT_MAX)} of the earlier output; the read tool pages all of it`));
+    out.pre.prepend(frag);
+    trimOut(out);
+  }
+
   function appendOut(rec, { stream, data }) {
     const out = rec.out;
-    const span = el('span', stream === 'stderr' ? 'stderr' : null, data);
-    out.pre.append(span);
+    out.pre.append(outSpan(stream, data));
     out.bytes += data.length;
+    if (stream === 'stderr') out.stderr = true;
+    trimOut(out);
+  }
+
+  /** The pane holds OUT_MAX; what the front loses is counted and said in the summary, never passed off as whole. */
+  function trimOut(out) {
     while (out.bytes > OUT_MAX && out.pre.firstChild) {
-      out.bytes -= out.pre.firstChild.textContent.length;
-      out.pre.firstChild.remove();
+      const first = out.pre.firstChild;
+      const n = first.classList.contains('cut') ? 0 : first.textContent.length;
+      out.bytes -= n;
+      out.cut += n;
+      first.remove();
     }
-    out.details.querySelector('summary').textContent = `output (${stream === 'stderr' || out.pre.querySelector('.stderr') ? 'stdout + stderr' : 'stdout'})`;
+    const parts = [`output (${out.stderr ? 'stdout + stderr' : 'stdout'})`];
+    if (out.cut) parts.push(`first ${kb(out.cut)} not shown`);
+    out.details.querySelector('summary').textContent = parts.join(' · ');
   }
 
   function runOutput(event) {
@@ -657,7 +788,6 @@
     const rec = runRec(event.runId, 'process');
     if (!rec.item) showRun({ runId: event.runId, state: rec.state ?? 'running' });
     outputPane(event.runId, rec);
-    rec.out.streamed = true;
     appendOut(rec, event);
   }
 
@@ -708,24 +838,34 @@
   }
 
   $('seat-btn').onclick = async () => {
+    if (!state.current) return;
     const mine = state.controller === state.me;
+    if (mine) {
+      // Releasing: no resize of ours may follow and take the seat back (the house's read of 2f357bd, #22).
+      clearTimeout(resizeTimer);
+      resizeTimer = null;
+      state.role = 'observer';
+    }
     try {
       const r = await tool('control', { session: state.current, action: mine ? 'release' : 'take' });
       state.controller = r.controller;
-      state.role = r.controller === state.me ? 'controller' : 'observer';
       notice('');
-      updateBar();
-      maybeResize();
-      term?.focus();
     } catch (e) {
       notice(e.message);
     }
+    state.role = state.controller && state.controller === state.me ? 'controller' : 'observer';
+    updateBar();
+    maybeResize();
+    term?.focus();
   };
 
-  $('ctrlc').onclick = () => tool('signal', { session: state.current, signal: 'SIGINT' }).catch((e) => notice(e.message));
+  $('ctrlc').onclick = () => {
+    if (state.current) tool('signal', { session: state.current, signal: 'SIGINT' }).catch((e) => notice(e.message));
+  };
 
   let closeArmed = null;
   $('close').onclick = async () => {
+    if (!state.current) return;
     if (!closeArmed) {
       $('close').textContent = 'Confirm close';
       closeArmed = setTimeout(() => {
@@ -761,10 +901,13 @@
     const name = $('new-name').value.trim();
     if (!name) return;
     try {
-      await tool('session_open', { session: name, visibility: $('new-vis').value });
+      const r = await tool('session_open', { session: name, visibility: $('new-vis').value });
       $('new-name').value = '';
       await refreshSessions();
-      select(name);
+      await select(name);
+      // The session existed, so the form's choices did not apply: say so, as the tool's result does
+      // (the house's read of 2f357bd, #22).
+      if (r.ignored?.length) notice(`${name} already exists${r.info?.visibility ? ` (${r.info.visibility})` : ''}: ${r.ignored.join(', ')} not changed.`);
     } catch (err) {
       notice(err.message);
     }

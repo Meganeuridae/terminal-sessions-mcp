@@ -33,7 +33,8 @@ async function stop(child: ChildProcess | undefined): Promise<void> {
   });
 }
 
-describe('SSH workflows', { skip: ![SSH, SSHD, KEYGEN].every(fs.existsSync) }, () => {
+// A machine without sshd skips; with SSH_REQUIRED=1 (CI) the missing sshd fails the suite instead (the house's read of 2f357bd, #22).
+describe('SSH workflows', { skip: process.env.SSH_REQUIRED !== '1' && ![SSH, SSHD, KEYGEN].every(fs.existsSync) }, () => {
   let dir: string, remote: string, args: string[], dest: string;
   let sshd: ChildProcess | undefined;
   before(async () => {

@@ -27,7 +27,7 @@ interface Page {
   evaluate<T>(expr: string): Promise<T>;
   waitForFunction(expr: string, o?: { timeout?: number; polling?: number }): Promise<unknown>;
   click(selector: string): Promise<void>;
-  keyboard: { type(text: string, o?: { delay?: number }): Promise<void>; press(key: string): Promise<void> };
+  keyboard: { type(text: string, o?: { delay?: number }): Promise<void>; press(key: string): Promise<void>; down(key: string): Promise<void>; up(key: string): Promise<void> };
   setViewport(v: { width: number; height: number }): Promise<void>;
   select(selector: string, ...values: string[]): Promise<string[]>;
   close(): Promise<void>;
@@ -55,6 +55,8 @@ before(async () => {
     browser = await mod.default.launch({ headless: true });
   } catch (e) {
     skip = `no headless browser: ${(e as Error).message.split('\n')[0]}`;
+    // A machine without a browser skips; CI must not pass with the page never run (the house's read of 2f357bd, #22).
+    if (process.env.GUI_REQUIRED === '1') throw new Error(`GUI_REQUIRED=1 but ${skip}`);
   }
 });
 
@@ -90,6 +92,12 @@ async function agent(): Promise<{ call(name: string, args: Record<string, unknow
 
 const HUMAN = 'human:gui:agent:g@test';
 const rows = `(document.querySelector('.xterm-rows')?.innerText ?? '')`;
+const info = `document.getElementById('info').textContent`;
+const noticeText = `document.getElementById('notice').textContent`;
+/** A paste into the terminal, as the browser delivers one (xterm reads the event's clipboard data). */
+const paste = (text: string) =>
+  `(() => { const dt = new DataTransfer(); dt.setData('text/plain', ${JSON.stringify(text)}); document.querySelector('.xterm-helper-textarea').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })); })()`;
+const clickSession = (name: string) => `[...document.querySelectorAll('.session')].find((e) => e.querySelector('.name').textContent === ${JSON.stringify(name)}).click()`;
 
 test('GUI: snapshot on attach, observers cannot type, the seat holder types, and a DSR query gets exactly one reply (G13, G17, G25)', async (t) => {
   if (skip || !browser) return t.skip(skip || 'no browser');
@@ -160,6 +168,25 @@ test('GUI: snapshot on attach, observers cannot type, the seat holder types, and
   assert.ok(replies[0]!.type === 'input' && cpr.test(replies[0]!.data), 'the reply is a cursor position report');
   const echoedByGui = after.filter((e) => e.type === 'input' && e.principal === HUMAN && cpr.test(e.data));
   assert.deepEqual(echoedByGui, [], "the GUI's emulator did not answer");
+
+  // The other query kinds the page swallows: DA1, a colour query (OSC 11) and DECRQSS. Each gets the daemon's one
+  // reply and nothing from the page; its xterm would answer all three on its own.
+  const before2 = journal.lastSeq;
+  // The CPR reply above landed in the tty's input after its command ended; readline holds its tail: clear the line first.
+  await page.keyboard.down('Control');
+  await page.keyboard.press('u');
+  await page.keyboard.up('Control');
+  await page.keyboard.type(`printf '\\033[c\\033]11;?\\033\\\\\\033P$qm\\033\\\\'; sleep 0.5; echo QRY-$((2*2))`);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(`${rows}.includes('QRY-4')`, { timeout: 8000 });
+  await new Promise((r) => setTimeout(r, 300));
+  const after2 = journal.since(before2).events.filter((e): e is Extract<JournalEvent, { type: 'input' }> => e.type === 'input');
+  const daemonReplies = after2.filter((e) => e.kind === 'protocol-reply').map((e) => e.data);
+  assert.equal(daemonReplies.filter((d) => /^\x1b\[\?\d+(;\d+)*c$/.test(d)).length, 1, `one DA1 reply: ${JSON.stringify(daemonReplies)}`);
+  assert.equal(daemonReplies.filter((d) => d.startsWith('\x1bP1$r')).length, 1, `one DECRQSS reply: ${JSON.stringify(daemonReplies)}`);
+  assert.ok(daemonReplies.length <= 3, `nothing else (the daemon's emulator answers no colour query today): ${JSON.stringify(daemonReplies)}`);
+  const looksLikeReply = (d: string) => /\x1b\[\?\d/.test(d) || d.includes('\x1b]11;') || d.includes('\x1bP');
+  assert.deepEqual(after2.filter((e) => e.principal === HUMAN && looksLikeReply(e.data)), [], "the GUI's emulator answered none of them");
 
   assert.deepEqual(problems, [], 'no page errors and no CSP violations');
   a.close();
@@ -245,9 +272,12 @@ test('tsg-7: keystrokes typed while the connection is down are dropped with a no
     await page.keyboard.type('echo QUEUED-$((2+3))');
     await page.keyboard.press('Enter');
     await page.waitForFunction(`document.getElementById('notice').textContent.includes('Not connected')`, { timeout: 5000 });
+    // Output produced during the outage: shown after the reconnect only by the reattach's fresh snapshot.
+    await a.call('run', { session: 'outage', command: 'echo DURING-$((5+5))' });
     proxy.resume();
     await page.waitForFunction(`document.getElementById('conn-text').textContent === 'connected'`, { timeout: 15_000 });
-    await new Promise((r) => setTimeout(r, 1500));
+    await page.waitForFunction(`${rows}.includes('DURING-10')`, { timeout: 10_000 });
+    await new Promise((r) => setTimeout(r, 1000));
     assert.deepEqual(inputsOf('outage').filter((e) => e.data.includes('QUEUED')), [], 'nothing typed during the outage reached the terminal');
     assert.ok(!(await page.evaluate<string>(rows)).includes('QUEUED-5'));
   } finally {
@@ -294,6 +324,15 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
     // The shell echoes what is typed at its prompt (G26 makes no promise about output); the input events are redacted.
     assert.deepEqual(inputsOf('secret').filter((e) => e.data.includes('locked') || e.data.includes('hunter2')), [], 'no input event carries the text');
     assert.ok(inputsOf('secret').filter((e) => e.sensitive).length > secretInputs.length, 'the locked input was sensitive');
+    // Plain and secret text never share one input call: a paste, the lock, and another paste in one task (inside the
+    // coalescing window) give a plain event with the first and a redacted one for the second.
+    await page.evaluate(`${paste('PLAIN-BIT')}; document.getElementById('secret').click(); ${paste('HIDDEN-BIT')}`);
+    await new Promise((r) => setTimeout(r, 300));
+    await page.click('#secret');
+    const plain = inputsOf('secret').filter((e) => e.data.includes('PLAIN-BIT'));
+    assert.equal(plain.length, 1, 'the plain part was sent on its own');
+    assert.ok(!plain[0]!.sensitive, 'and not as sensitive');
+    assert.deepEqual(inputsOf('secret').filter((e) => e.data.includes('HIDDEN-BIT')), [], 'the locked part is redacted');
     assert.deepEqual(problems, []);
   } finally {
     await page.close();
@@ -342,17 +381,30 @@ test('tsg-11: the controller fits rows as well as columns to the window', async 
     assert.ok(s && s.kind === 'live');
     return { cols: s.session.screen.cols, rows: s.session.screen.rows };
   };
+  const grow = async (dim: 'cols' | 'rows', over: number) => {
+    const end = Date.now() + 5000;
+    while (size()[dim] <= over && Date.now() < end) await new Promise((r) => setTimeout(r, 100));
+    return size();
+  };
   try {
-    await page.setViewport({ width: 1100, height: 500 });
+    // An observer's window never sizes the PTY (G17).
+    await page.setViewport({ width: 1500, height: 500 });
     await pick(page, 'fit');
+    await page.waitForFunction(`${rows}.includes('$')`, { timeout: 10_000 });
+    await new Promise((r) => setTimeout(r, 600));
+    const observed = size();
+    await page.setViewport({ width: 1100, height: 500 });
+    await new Promise((r) => setTimeout(r, 600));
+    assert.deepEqual(size(), observed, 'an observer resizes nothing');
     await takeSeat(page, a, 'fit');
     await new Promise((r) => setTimeout(r, 600));
     const short = size();
-    await page.setViewport({ width: 1100, height: 1000 });
-    const end = Date.now() + 5000;
-    while (size().rows <= short.rows && Date.now() < end) await new Promise((r) => setTimeout(r, 100));
-    const tall = size();
-    assert.ok(tall.rows > short.rows + 10, `rows follow the window height: ${JSON.stringify(short)} → ${JSON.stringify(tall)}`);
+    await page.setViewport({ width: 1500, height: 500 });
+    const wide = await grow('cols', short.cols);
+    assert.ok(wide.cols > short.cols + 20, `columns follow the window width: ${JSON.stringify(short)} → ${JSON.stringify(wide)}`);
+    await page.setViewport({ width: 1500, height: 1000 });
+    const tall = await grow('rows', wide.rows);
+    assert.ok(tall.rows > wide.rows + 10, `rows follow the window height: ${JSON.stringify(wide)} → ${JSON.stringify(tall)}`);
   } finally {
     await page.close();
     a.close();
@@ -396,6 +448,13 @@ test('tsg-22/tsg-23/mcpl-14/tsg-16: open private or shared; a process Run shows 
     await page.waitForFunction(`[...document.querySelectorAll('.run-out pre')].some((p) => p.textContent.includes('OUT-1') && p.textContent.includes('ERR-2'))`, { timeout: 8000 });
     assert.ok(await page.evaluate<boolean>(`[...document.querySelectorAll('.run-out .stderr')].some((e) => e.textContent.includes('ERR-2'))`), 'stderr is marked apart');
     assert.ok(!(await page.evaluate<string>(rows)).includes('OUT-1'), 'never drawn into the shell screen');
+    // A pane holds 64 KB of streamed output; what it drops from the front is said in its summary.
+    const bulk = await a.call('run', { session: 'procs', target: 'process', command: `sleep 0.5; head -c 100000 /dev/zero | tr '\\0' x; echo; echo BULK-END-$((4+4))` });
+    assert.equal(bulk.state, 'exited');
+    await page.waitForFunction(`[...document.querySelectorAll('.run-out')].some((d) => d.textContent.includes('BULK-END-8') && d.querySelector('summary').textContent.includes('not shown'))`, { timeout: 8000 });
+    const bulkPane = await page.evaluate<{ summary: string; bytes: number }>(`(() => { const d = [...document.querySelectorAll('.run-out')].find((d) => d.textContent.includes('BULK-END-8')); return { summary: d.querySelector('summary').textContent, bytes: d.querySelector('pre').textContent.length }; })()`);
+    assert.ok(bulkPane.bytes <= 64 * 1024 && bulkPane.bytes > 32 * 1024, `the pane keeps the last 64 KB: ${bulkPane.bytes}`);
+    assert.match(bulkPane.summary, /first \d+ KB not shown/);
 
     // mcpl-14: a note on the session's channel is shown to the human.
     const s = registry.get('procs');
@@ -407,6 +466,159 @@ test('tsg-22/tsg-23/mcpl-14/tsg-16: open private or shared; a process Run shows 
     await a.call('session_open', { session: 'pushed-in', visibility: 'shared' });
     await page.waitForFunction(`[...document.querySelectorAll('.session .name')].some((e) => e.textContent === 'pushed-in')`, { timeout: 3000 });
     assert.equal(logs.filter((l) => l.msg === 'tool call' && l.tool === 'session_list').length, 0, 'no session_list polling');
+    assert.deepEqual(problems, []);
+  } finally {
+    await page.close();
+    a.close();
+  }
+});
+
+// ───────────────────────────── the house's read of 2f357bd (#22) ─────────────────────────────
+
+const controllerOf = (id: string) => {
+  const s = registry.get(id);
+  assert.ok(s && s.kind === 'live');
+  return s.session.currentController;
+};
+
+test('r9b: no bar before a selection; a paste goes to the session it was typed into, not the one clicked next; Release seat is not undone by a pending resize', async (t) => {
+  if (skip || !browser) return t.skip(skip || 'no browser');
+  const a = await agent();
+  await a.call('session_open', { session: 'pa', visibility: 'shared' });
+  await a.call('session_open', { session: 'pb', visibility: 'shared' });
+  await a.call('control', { session: 'pb', action: 'release' }); // a stray input to pb would take its free seat
+  const problems: string[] = [];
+  const page = await openGui(`http://127.0.0.1:${port}/?token=tg`, problems);
+  try {
+    assert.equal(await page.evaluate<string>(`getComputedStyle(document.getElementById('bar')).display`), 'none', 'the action bar waits for a selection');
+    await pick(page, 'pa');
+    await page.waitForFunction(`${rows}.includes('$')`, { timeout: 10_000 });
+    await takeSeat(page, a, 'pa');
+    await page.click('#term');
+    // The paste and the click on pb in one task: the page's coalescing timer has not fired between them.
+    await page.evaluate(`${paste('echo PASTE-TO-PA')}; ${clickSession('pb')}`);
+    await page.waitForFunction(`document.getElementById('title').textContent === 'pb' && ${rows}.includes('$')`, { timeout: 10_000 });
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(inputsOf('pa').filter((e) => e.data.includes('PASTE-TO-PA')).length, 1, 'the paste reached pa');
+    assert.deepEqual(inputsOf('pb'), [], 'nothing reached pb');
+    assert.equal(controllerOf('pb'), null, "pb's seat is still free");
+    // Take pb's seat, then release it right after a window change: the resize that change scheduled must not take it back.
+    await page.click('#seat-btn');
+    await page.waitForFunction(`document.getElementById('seat').textContent === 'you hold the seat'`, { timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 500));
+    await page.setViewport({ width: 1100, height: 700 });
+    await page.click('#seat-btn');
+    await page.waitForFunction(`document.getElementById('seat').textContent === 'seat free'`, { timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 800));
+    assert.equal(controllerOf('pb'), null, 'the release stands');
+    assert.equal(await page.evaluate<string>(`document.getElementById('seat').textContent`), 'seat free');
+    assert.deepEqual(problems, []);
+  } finally {
+    await page.close();
+    a.close();
+  }
+});
+
+test('r9b: a process Run’s output from before the attach shows with stderr marked and in order; a cut pane says so; the title and the idle state belong to one session; the Open form says what was ignored', async (t) => {
+  if (skip || !browser) return t.skip(skip || 'no browser');
+  const a = await agent();
+  await a.call('session_open', { session: 'pe', visibility: 'shared' });
+  await a.call('session_open', { session: 'pf', visibility: 'shared' });
+  // Early output, then a shell line so the early output lies before the snapshot's cursor, then late output after the attach.
+  const spanning = await a.call('run', { session: 'pe', target: 'process', command: `printf 'EARLY-OUT\\n'; printf 'EARLY-ERR\\n' >&2; sleep 2.5; printf 'LATE-OUT\\n'`, wait: 500 });
+  assert.equal(spanning.state, 'running');
+  const big = await a.call('run', { session: 'pe', target: 'process', command: 'seq 1 30000' });
+  assert.equal(big.state, 'exited');
+  await a.call('run', { session: 'pe', command: 'echo MARK-$((1+1))' });
+  const problems: string[] = [];
+  const page = await openGui(`http://127.0.0.1:${port}/?token=tg`, problems);
+  const panes = `[...document.querySelectorAll('.run-out')]`;
+  try {
+    await pick(page, 'pe');
+    await page.waitForFunction(`${rows}.includes('MARK-2')`, { timeout: 10_000 });
+    await page.waitForFunction(`${panes}.some((d) => d.textContent.includes('LATE-OUT'))`, { timeout: 10_000 });
+    await page.evaluate(`${panes}.forEach((d) => { d.open = true; })`);
+    await page.waitForFunction(`${panes}.some((d) => d.textContent.includes('EARLY-OUT') && d.textContent.includes('LATE-OUT'))`, { timeout: 8000 });
+    const spanningPane = await page.evaluate<{ text: string; stderr: string[] }>(`(() => { const d = ${panes}.find((d) => d.textContent.includes('LATE-OUT')); return { text: d.querySelector('pre').textContent, stderr: [...d.querySelectorAll('.stderr')].map((e) => e.textContent) }; })()`);
+    assert.ok(spanningPane.text.indexOf('EARLY-OUT') < spanningPane.text.indexOf('LATE-OUT'), `the early output comes first: ${JSON.stringify(spanningPane.text)}`);
+    assert.deepEqual(spanningPane.stderr, ['EARLY-ERR\n'], 'stderr read from the journal is marked apart');
+    await page.waitForFunction(`${panes}.some((d) => d.textContent.includes('(cut:'))`, { timeout: 8000 });
+    const bigPane = await page.evaluate<string>(`${panes}.find((d) => d.textContent.includes('(cut:')).querySelector('pre').textContent`);
+    assert.ok(bigPane.startsWith('1\n2\n3\n'), 'the first lines are there');
+    assert.ok(!bigPane.includes('\n30000\n'), 'the last are not');
+    assert.match(bigPane, /\(cut: the pane reads at most 64 KB/);
+
+    // The title set while pe is shown does not follow to pf.
+    await a.call('run', { session: 'pe', command: `printf '\\033]0;TITLE-OF-PE\\007'; echo TITLED-$((1+1))` });
+    await page.waitForFunction(`${info}.includes('TITLE-OF-PE')`, { timeout: 8000 });
+    await pick(page, 'pf');
+    await page.waitForFunction(`document.getElementById('title').textContent === 'pf' && ${rows}.includes('$')`, { timeout: 10_000 });
+    assert.ok(!(await page.evaluate<string>(info)).includes('TITLE-OF-PE'), `pf does not wear pe's title: ${await page.evaluate<string>(info)}`);
+
+    // Cancelling a Run queued behind a running one does not make the bar say idle.
+    const slow = await a.call('run', { session: 'pf', command: 'sleep 2; echo SLOW-DONE', wait: 300 });
+    assert.equal(slow.state, 'running');
+    const queued = await a.call('run', { session: 'pf', command: 'echo QUEUED-BEHIND', queue: true, wait: 0 });
+    assert.equal(queued.state, 'queued');
+    await a.call('cancel', { session: 'pf', runId: queued.runId as string });
+    await page.waitForFunction(`document.getElementById('activity').textContent.includes('cancelled')`, { timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.match(await page.evaluate<string>(info), /busy/, 'the shell is still busy');
+    await page.waitForFunction(`${rows}.includes('SLOW-DONE')`, { timeout: 8000 });
+    await page.waitForFunction(`${info}.includes('idle')`, { timeout: 5000 });
+
+    // Opening an existing shared session as private: the form says the choice did not apply.
+    await page.select('#new-vis', 'private');
+    await page.evaluate(`document.getElementById('new-name').value = 'pe'`);
+    await page.click('#new-form button[type=submit]');
+    await page.waitForFunction(`${noticeText}.includes('pe already exists (shared): visibility not changed')`, { timeout: 8000 });
+    const pe = registry.get('pe');
+    assert.ok(pe && pe.kind === 'live' && pe.session.visibility === 'shared');
+    assert.deepEqual(problems, []);
+  } finally {
+    await page.close();
+    a.close();
+  }
+});
+
+test('r9b: ^C interrupts the foreground job; Close asks twice; the activity list keeps 200 items', async (t) => {
+  if (skip || !browser) return t.skip(skip || 'no browser');
+  const a = await agent();
+  await a.call('session_open', { session: 'pc', visibility: 'shared' });
+  const s = registry.get('pc');
+  assert.ok(s && s.kind === 'live');
+  const problems: string[] = [];
+  const page = await openGui(`http://127.0.0.1:${port}/?token=tg`, problems);
+  const runOf = (line: string) => s.session.listRuns().find((r) => r.line === line);
+  const until = async (ok: () => boolean, ms: number) => {
+    const end = Date.now() + ms;
+    while (!ok() && Date.now() < end) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(ok(), 'waited in vain');
+  };
+  try {
+    await pick(page, 'pc');
+    await page.waitForFunction(`${rows}.includes('$')`, { timeout: 10_000 });
+    await takeSeat(page, a, 'pc');
+    await page.click('#term');
+    await page.keyboard.type('sleep 30');
+    await page.keyboard.press('Enter');
+    await until(() => runOf('sleep 30')?.state === 'running', 8000);
+    await page.click('#ctrlc');
+    await until(() => runOf('sleep 30')?.state !== 'running', 8000);
+    const interrupted = runOf('sleep 30')!;
+    assert.ok(interrupted.state === 'cancelled' || interrupted.exit === 130, `ended by ^C: ${JSON.stringify(interrupted)}`);
+    // Notes beyond 200: the list is trimmed from the end.
+    for (let i = 0; i < 230; i++) s.session.journal.append({ type: 'note', text: `note-${i}`, principal: 'agent:g@test' });
+    await page.waitForFunction(`document.getElementById('activity').textContent.includes('note-229')`, { timeout: 8000 });
+    assert.ok((await page.evaluate<number>(`document.getElementById('activity').childElementCount`)) <= 200);
+    // Close: the first click arms, the second closes.
+    await page.click('#close');
+    assert.equal(await page.evaluate<string>(`document.getElementById('close').textContent`), 'Confirm close');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(registry.get('pc')?.kind, 'live', 'one click closes nothing');
+    await page.click('#close');
+    await page.waitForFunction(`${noticeText}.includes('closed')`, { timeout: 8000 });
+    assert.equal(registry.get('pc')?.kind, 'history');
     assert.deepEqual(problems, []);
   } finally {
     await page.close();
