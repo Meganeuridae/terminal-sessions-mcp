@@ -18,9 +18,16 @@ import { AGENT, hasShell, until } from './fake-shell.js';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-pty-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 let n = 0;
-// Python's independent close_fds control excludes even descriptors inherited from
-// the CI runner before this Node process started. node-gyp already requires Python.
-const cleanChildFds = execFileSync('python3', ['-c', "import subprocess; print(subprocess.check_output(['ls', '/dev/fd'], close_fds=True, text=True), end='')"], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\s+/).sort();
+// Python's independent close_fds control excludes even descriptors inherited from the CI runner
+// before this Node process started. Without python3 (the house's read: the whole file failed to
+// load there), a plain child's listing stands in, and inherited handles would show in it.
+const cleanChildFds = (() => {
+  try {
+    return execFileSync('python3', ['-c', "import subprocess; print(subprocess.check_output(['ls', '/dev/fd'], close_fds=True, text=True), end='')"], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\s+/).sort();
+  } catch {
+    return execFileSync('ls', ['/dev/fd'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\s+/).sort();
+  }
+})();
 
 test('process output is streaming UTF-8 text with separate stderr, including invalid-byte replacement', async () => {
   const backend = new NodePtyBackend();
@@ -290,7 +297,7 @@ test('/bin/bash: a process Run inherits no terminal master, and its line is not 
       assert.equal(exit.exitCode, 0);
       assert.deepEqual(text.trim().split(/\s+/).sort(), cleanChildFds, JSON.stringify(command));
     }
-    // The line's text is in a file, not in the shell's argv: a pkill -f for a word of the line
+    // The line's text arrives on a descriptor, not in the shell's argv: a pkill -f for a word of the line
     // finds nothing but pkill itself, which it skips, and the line goes on.
     const own = a.session.admit({ target: 'process', line: "pkill -f 'qz7-relaunch' >/dev/null 2>&1; echo after-the-pkill qz7-relaunch", principal: AGENT });
     assert.ok(own.admitted);
@@ -345,10 +352,20 @@ test('/bin/bash: a process Run that leaves a child in the background says so (le
     assert.deepEqual([r.state, r.exit, r.leftovers], ['exited', 0, true], 'the sleep is still in the group');
     const end = journal.since(0).events.find((e) => e.type === 'run.end' && e.runId === r.runId) as Extract<JournalEvent, { type: 'run.end' }>;
     assert.equal(end.leftovers, true, 'journaled, so a reader of the history sees it too');
-    // The group is still the Run's: cancel on the ended Run reaches it (ss-10).
+    // The group is still the Run's: cancel on the ended Run reaches it (ss-10). (A live Run's
+    // RunInfo carries no pgid; run.start does.)
+    const start = journal.since(0).events.find((e) => e.type === 'run.start' && e.runId === r.runId) as Extract<JournalEvent, { type: 'run.start' }>;
+    assert.ok(start.pgid !== undefined && groupLives(start.pgid), 'the child keeps the group alive after the Run ended');
     const c = await session.cancel(r.runId, AGENT);
     assert.ok(c.steps.length > 0, JSON.stringify(c));
-    await until(() => !session.run(r.runId).pgid || !groupLives(session.run(r.runId).pgid!), 3000, 'the group to end');
+    await until(() => !groupLives(start.pgid!), 3000, 'the group to end');
+    // A cancelled Run never carries the flag: its cancel keeps signalling the group after the leader's exit.
+    const stubborn = session.admit({ target: 'process', argv: ['/bin/sh', '-c', "(trap '' INT; exec sleep 30) & exec sleep 30"], principal: AGENT });
+    assert.ok(stubborn.admitted);
+    await until(() => session.run(stubborn.run.runId).state === 'running', 3000);
+    const cancelled = await session.cancel(stubborn.run.runId, AGENT);
+    assert.equal(cancelled.state, 'cancelled');
+    assert.equal(session.run(stubborn.run.runId).leftovers, undefined, 'the cancel\'s own result says what it reached');
   } finally {
     await session.close();
   }

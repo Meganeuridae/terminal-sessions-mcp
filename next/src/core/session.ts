@@ -16,6 +16,7 @@ import type { ExecutionBackend, ProcessHandle, PtyExit, PtyHandle } from '../bac
 import { configuredEnv, historyIsolationEnv, parseEnvNul, redactSnapshot, type EnvSnapshot } from './env.js';
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
+import { livingGroups } from './lock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
@@ -2031,9 +2032,13 @@ export class Session {
       if (e.exitCode !== null) outcome.exit = e.exitCode;
       if (e.signal) outcome.signal = e.signal;
       // The leader is reaped by now (Node waits for it before this callback): a group that still
-      // answers is a child the Run left behind, and the result says so rather than reading as a
-      // clean end (the house's review of #11, shell tools 5). Its output, if any, is noted above.
-      if (proc.groupAlive?.()) outcome.leftovers = true;
+      // has a living member is a child the Run left behind, and the result says so rather than
+      // reading as a clean end (the house's review of #11, shell tools 5). Living: a group that
+      // answers a signal may hold only zombies where no init reaps orphans (a container's PID 1),
+      // which no cancel could end, so the listing that leaves zombies out decides — only when the
+      // group answers at all. Not for a cancelled Run: its cancel goes on signalling the group after
+      // the leader's exit, and its own result says what happened (the house's read of ec34e1e).
+      if (!run.cancelRequested && proc.groupAlive?.() && livingGroups([proc.pgid ?? proc.pid]).length > 0) outcome.leftovers = true;
       this.endRun(run, outcome);
     });
   }
