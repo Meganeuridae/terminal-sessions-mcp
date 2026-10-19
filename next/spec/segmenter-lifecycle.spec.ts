@@ -11,6 +11,8 @@ import assert from 'node:assert/strict';
 import { Journal } from '../src/core/journal.js';
 import { MemoryStore } from '../src/core/stores.js';
 import {
+  cleanLine,
+  columnIndex,
   journalSource,
   liveSource,
   promptLine,
@@ -20,6 +22,7 @@ import {
   segmentId,
   Segmenter,
   seqOfMessageId,
+  tailBytes,
   type Segment,
   type SegmentSource,
 } from '../src/core/segmenter.js';
@@ -261,27 +264,44 @@ test('mcpl-14/mcpl-15: a note is an ambient segment authored by its publisher; h
   seg.dispose();
 });
 
-test('m2-22: human input is the edited line: erasures, ^U, ^W, ^C and cursor keys applied, not raw keystrokes', async () => {
+test('m2-22: human input is the edited line: erasures, ^U, ^W and ^C applied, not raw keystrokes; a line that met a cursor or history key is not shown', async () => {
   const src = fakeSource();
   const seg = new Segmenter(src);
   const out = collect(seg);
-  src.screen.lines = ['>>> ', '', '', '', ''];
-  src.screen.cursor = { x: 4, y: 0 };
-  for (const k of ['s', 'e', 'c', 'r', 't', 'e', '\x7f', '\x7f', 'e', 't', '\x1bOA', '\x1b[D']) src.journal.append({ type: 'input', data: k, principal: H, kind: 'keys' });
-  // The REPL echoed the edited line.
-  src.screen.lines = ['>>> secret', '', '', '', ''];
-  src.screen.cursor = { x: 10, y: 0 };
-  src.journal.append({ type: 'input', data: '\r', principal: H, kind: 'keys' });
-  await sleep(400);
-  assert.equal(out.length, 1);
-  assert.match(out[0]!.head, /typed: secret$/);
-  out.length = 0;
-  src.screen.lines = ['>>> keep this', '>>> ', '', '', ''];
-  src.screen.cursor = { x: 4, y: 1 };
-  src.journal.append({ type: 'input', data: 'rm -rf \x15drop this\x03keep that\x17this\r', principal: H, kind: 'text' });
-  await sleep(400);
-  assert.equal(out.length, 1);
-  assert.match(out[0]!.head, /typed: keep this$/);
+  const typed = async (keys: string[], echoed: string, kind: 'keys' | 'text' = 'keys') => {
+    out.length = 0;
+    for (const k of keys) src.journal.append({ type: 'input', data: k, principal: H, kind });
+    // The REPL echoed the edited line.
+    src.screen.lines = [echoed, '', '', '', ''];
+    src.screen.cursor = { x: echoed.length, y: 0 };
+    src.journal.append({ type: 'input', data: '\r', principal: H, kind });
+    await sleep(400);
+    assert.equal(out.length, 1);
+    return out[0]!.head;
+  };
+  const at = (prompt: string) => {
+    src.screen.lines = [prompt, '', '', '', ''];
+    src.screen.cursor = { x: prompt.length, y: 0 };
+  };
+  at('>>> ');
+  assert.match(await typed(['s', 'e', 'c', 'r', 't', 'e', '\x7f', '\x7f', 'e', 't'], '>>> secret'), /typed: secret$/, 'erasures applied');
+  at('>>> ');
+  assert.match(await typed(['rm -rf \x15keep this'], '>>> keep this', 'text'), /typed: keep this$/, '^U alone clears the line');
+  at('>>> ');
+  assert.match(await typed(['drop this\x03keep that\x17this'], '>>> keep this', 'text'), /typed: keep this$/, '^C abandons, ^W erases a word');
+  // Up recalled `x = 1`, then `0` was typed: the screen shows `x = 10`, the keystrokes alone say `0`
+  // (the house's read of 3eade8a, #22: it was reported as `typed: 0`).
+  at('>>> ');
+  assert.match(await typed(['\x1b[A', '0'], '>>> x = 10'), /typed: \[input edited with cursor, history or completion keys — not shown\]$/);
+  assert.doesNotMatch(JSON.stringify(out[0]), /typed: 0/);
+  // Tab completion changed the line too; Left then typing likewise.
+  at('$ ');
+  assert.match(await typed(['ls /tm', '\t'], '$ ls /tmp/', 'text'), /not shown\]$/);
+  at('$ ');
+  assert.match(await typed(['ab', '\x1bOD', 'X'], '$ aXb'), /not shown\]$/);
+  // ^U after such keys starts a clean line: what follows is known again.
+  at('$ ');
+  assert.match(await typed(['\x1b[A', '\x15', 'echo hi'], '$ echo hi', 'text'), /typed: echo hi$/);
   seg.dispose();
 });
 
@@ -394,5 +414,297 @@ test('m2-19: a segmenter created while a full-screen program is up sends its scr
     ['screen'],
   );
   assert.match(out[0]!.body ?? '', /htop/);
+  seg.dispose();
+});
+
+// ───────────── the house's read of 3eade8a (#22): the segmenter ─────────────
+
+test('an output chunk that starts with a bare newline is split like any other (it hung the journal append)', async () => {
+  const src = fakeSource();
+  startRun(src, 'nl');
+  const seg = new Segmenter(src, { cadenceMs: 40 });
+  const out = collect(seg);
+  src.journal.append({ type: 'output', data: 'abc\n', stream: 'pty', runId: 'nl' });
+  src.journal.append({ type: 'output', data: '\nhello\n', stream: 'pty', runId: 'nl' });
+  src.journal.append({ type: 'output', data: '\n', stream: 'pty', runId: 'nl' });
+  src.journal.append({ type: 'output', data: '\n\n\nend', stream: 'pty', runId: 'nl' });
+  await sleep(100);
+  const digest = out.filter((s) => s.kind === 'output').at(-1);
+  assert.deepEqual(digest?.body?.split('\n'), ['abc', 'hello', 'end']);
+  seg.dispose();
+});
+
+test('a long output cut to its tail keeps a torn line that is most of the budget, marked; a short truncated transcript still says so', async () => {
+  const noteish = `${'x'.repeat(5000)}\nEND`;
+  const t1 = tailBytes(noteish, 4096);
+  assert.ok(t1.startsWith('…xxx') && t1.endsWith('\nEND') && t1.length > 4000, `kept the torn line: ${t1.length} chars`);
+  const oneLine = `${JSON.stringify({ k: 'v'.repeat(10_000) })}\n`;
+  const t2 = tailBytes(oneLine, 4096);
+  assert.ok(t2.startsWith('…') && t2.endsWith('"}\n') && t2.length > 4000, 'a single long line is not kept as nothing');
+  const lines = Array.from({ length: 2000 }, (_, i) => `line ${i}`).join('\n');
+  const t3 = tailBytes(lines, 4096);
+  assert.ok(t3.startsWith('line ') && !t3.includes('…'), 'whole lines when they fill the budget');
+  // The Run's message: a transcript the session already cut gets the omission line and says so in its metadata.
+  const src = fakeSource();
+  src.runTranscript = async () => ({ text: 'tail only', truncated: true, seq: [1, 2], nextCursor: 2 });
+  const seg = new Segmenter(src, { runSettleMs: 5 });
+  const out = collect(seg);
+  startRun(src, 'cut');
+  endRun(src, 'cut');
+  await sleep(60);
+  assert.equal(out.length, 1);
+  assert.match(out[0]!.body ?? '', /^\[… earlier output omitted · read runId=cut for all of it\]\ntail only$/);
+  assert.equal(out[0]!.metadata.truncated, true);
+  // One 10 KB line ending in a newline: its tail is shown under the omission line, not nothing.
+  src.runTranscript = async () => ({ text: oneLine, truncated: false, seq: [1, 2], nextCursor: 2 });
+  out.length = 0;
+  startRun(src, 'json');
+  endRun(src, 'json');
+  await sleep(60);
+  assert.match(out[0]!.body ?? '', /omitted[^\n]*\n…v+"}\n$/);
+  seg.dispose();
+});
+
+test('segments go out in seq order: a note journaled while a completion settles waits for it', async () => {
+  const src = fakeSource();
+  const seg = new Segmenter(src, { runSettleMs: 60 });
+  const out = collect(seg);
+  startRun(src, 'r1');
+  const end = endRun(src, 'r1');
+  const note = src.journal.append({ type: 'note', text: 'meanwhile', principal: B });
+  assert.equal(out.length, 0, 'the note waits');
+  await sleep(150);
+  assert.deepEqual(
+    out.map((s) => [s.kind, s.seq]),
+    [
+      ['run', end.seq],
+      ['note', note.seq],
+    ],
+  );
+  // Two completions settling: the one whose text is slow still goes first.
+  out.length = 0;
+  let slow = true;
+  src.runTranscript = async (runId) => {
+    if (runId === 'slow') while (slow) await sleep(5);
+    return { text: `output of ${runId}`, truncated: false, seq: [1, 2], nextCursor: 2 };
+  };
+  startRun(src, 'slow');
+  startRun(src, 'fast');
+  endRun(src, 'slow');
+  endRun(src, 'fast');
+  await sleep(150);
+  assert.equal(out.length, 0, 'the fast one waits behind the slow one');
+  slow = false;
+  await seg.drained();
+  assert.deepEqual(
+    out.map((s) => s.runId),
+    ['slow', 'fast'],
+  );
+  seg.dispose();
+});
+
+test('typed text is shown only when the screen shows it after its prompt: a number already on the screen is not the echo of a number typed with echo off', async () => {
+  const src = fakeSource();
+  const seg = new Segmenter(src);
+  const out = collect(seg);
+  src.screen.lines = ['Listening on 4821', 'Port to use: ', '', '', ''];
+  src.screen.cursor = { x: 13, y: 1 };
+  src.journal.append({ type: 'input', data: '4821\r', principal: H, kind: 'text' });
+  await sleep(400);
+  assert.equal(out.length, 1);
+  assert.match(out[0]!.head, /typed: \[input not echoed — not shown\]$/);
+  assert.doesNotMatch(out[0]!.head, /4821/);
+  // The same number echoed after the prompt is shown.
+  out.length = 0;
+  src.screen.lines = ['Listening on 4821', 'Port to use: ', 'Port to use: ', '', ''];
+  src.screen.cursor = { x: 13, y: 2 };
+  src.journal.append({ type: 'input', data: '4821', principal: H, kind: 'text' });
+  src.screen.lines[2] = 'Port to use: 4821';
+  src.screen.cursor = { x: 17, y: 2 };
+  src.journal.append({ type: 'input', data: '\r', principal: H, kind: 'text' });
+  await sleep(400);
+  assert.match(out[0]!.head, /typed: 4821$/);
+  seg.dispose();
+});
+
+test('a failed transcript read, an end without a status and leftovers are each said in the completion', async () => {
+  const src = fakeSource();
+  const seg = new Segmenter(src, { runSettleMs: 5 });
+  const out = collect(seg);
+  src.runTranscript = async () => {
+    throw new Error('store unavailable');
+  };
+  const run = startRun(src, 'bad');
+  src.journal.append({ type: 'output', data: 'some output\r\n', stream: 'pty', runId: 'bad' });
+  endRun(src, 'bad');
+  await sleep(60);
+  assert.equal(out.length, 1);
+  assert.match(out[0]!.body ?? '', /could not be read: store unavailable/);
+  assert.match(out[0]!.head, new RegExp(`read since=${run.seq.start! - 1}$`), 'the read cursor starts at the Run, not past its output');
+  assert.equal(out[0]!.metadata.outputError, 'store unavailable');
+  src.runTranscript = async (runId) => ({ text: `output of ${runId}`, truncated: false, seq: [1, 2], nextCursor: 2 });
+  out.length = 0;
+  startRun(src, 'nostatus');
+  src.journal.append({ type: 'run.end', runId: 'nostatus', state: 'exited', durationMs: 1 });
+  src.runs.get('nostatus')!.state = 'exited';
+  startRun(src, 'left');
+  src.journal.append({ type: 'run.end', runId: 'left', state: 'exited', exit: 0, durationMs: 1, leftovers: true });
+  src.runs.get('left')!.state = 'exited';
+  await sleep(80);
+  assert.equal(out.length, 2);
+  assert.match(out[0]!.head, /→ exit \? in/);
+  assert.ok(!out[0]!.tags.some((t) => t.startsWith('terminal:exit=')), `no exit tag for an unknown status: ${out[0]!.tags.join(' ')}`);
+  assert.match(out[1]!.head, /→ exit 0 in [^·]+ · left processes running \(cancel the Run to end them\) · run left/);
+  assert.equal(out[1]!.metadata.leftovers, true);
+  seg.dispose();
+});
+
+test('a Run already in flight when the segmenter starts: its bytes so far are counted and a prompt it waits at is noticed', async () => {
+  const src = fakeSource();
+  startRun(src, 'ask', A, 'read name');
+  src.screen.lines = ['Name? ', '', '', '', ''];
+  src.screen.cursor = { x: 6, y: 0 };
+  src.screen.seq = src.journal.append({ type: 'output', data: 'Name? ', stream: 'pty', runId: 'ask' }).seq;
+  const seg = new Segmenter(src, { needsInputMs: 40, cadenceMs: 30 });
+  const out = collect(seg);
+  assert.equal(seg.unreadBytes('ask', 0), 6);
+  await sleep(120);
+  assert.equal(src.journal.since(0).events.filter((e) => e.type === 'run.waiting').length, 1, 'needs-input armed for a Run already waiting');
+  assert.ok(out.some((s) => s.kind === 'needs-input'));
+  seg.dispose();
+});
+
+test('digests render carriage returns and backspaces as the transcript does, see a process Run through a full-screen program, and join its pipes', async () => {
+  assert.equal(cleanLine('spin |\b/\b-\b\\'), 'spin \\');
+  assert.equal(cleanLine('ABCDE\rXY'), 'XYCDE');
+  assert.equal(cleanLine('progress 10%\rprogress 90%'), 'progress 90%');
+  const src = fakeSource();
+  const admit = src.journal.append({ type: 'run.admit', runId: 'p', target: 'process', argv: ['node', 'x.js'], principal: A, origin: 'self', queued: false });
+  const start = src.journal.append({ type: 'run.start', runId: 'p', cwd: '/w', envBasis: 'configured' });
+  src.runs.set('p', { runId: 'p', sessionId: 's1', target: 'process', origin: 'self', principal: A, state: 'running', admittedAt: admit.ts, startedAt: start.ts, seq: { admit: admit.seq, start: start.seq }, attribution: 'exact', argv: ['node', 'x.js'] });
+  const seg = new Segmenter(src, { cadenceMs: 40 });
+  const out = collect(seg);
+  src.screen.alt = true;
+  src.journal.append({ type: 'screen.mode', alt: true });
+  src.journal.append({ type: 'output', data: 'abc', stream: 'stdout', runId: 'p' });
+  src.journal.append({ type: 'output', data: 'def\n', stream: 'stderr', runId: 'p' });
+  await sleep(100);
+  const digest = out.filter((s) => s.kind === 'output').at(-1);
+  assert.deepEqual(digest?.body?.split('\n'), ['abcdef'], 'one line from two pipes, while the terminal shows a full-screen program');
+  src.screen.alt = false;
+  src.journal.append({ type: 'screen.mode', alt: false });
+  src.journal.append({ type: 'output', data: 'more\n', stream: 'stdout', runId: 'p' });
+  await sleep(100);
+  assert.deepEqual(out.filter((s) => s.kind === 'output').at(-1)?.body?.split('\n'), ['abcdef', 'more'], 'leaving the alternate screen keeps a process Run’s lines');
+  seg.dispose();
+});
+
+test('unread bytes are never short of what arrived after the read, even once marks were thinned', async () => {
+  const src = fakeSource();
+  startRun(src, 'many');
+  const seg = new Segmenter(src, { cadenceMs: 60_000 });
+  const first = src.journal.append({ type: 'output', data: 'x', stream: 'pty', runId: 'many' });
+  for (let i = 1; i < 1100; i++) src.journal.append({ type: 'output', data: 'x', stream: 'pty', runId: 'many' });
+  assert.equal(seg.unreadBytes('many', first.seq), 1099);
+  assert.equal(seg.unreadBytes('many', src.journal.lastSeq), 0);
+  assert.equal(seg.unreadBytes('many', 0), 1100);
+  seg.dispose();
+});
+
+test("a Run rendered from the journal loses the typed wrapper's echo and the end marker, and is projected at the width it started at", async () => {
+  const src = fakeSource();
+  src.journal.append({ type: 'run.admit', runId: 'old', target: 'shell', line: 'echo hello', principal: A, origin: 'self', queued: false });
+  src.journal.append({ type: 'run.start', runId: 'old', cwd: '/w', cols: 20 });
+  src.journal.append({ type: 'output', data: `. '/tmp/cmd-old'; echo "<<<EXI""T:abc123:$?>>>"\r\n`, stream: 'pty', runId: 'old' });
+  src.journal.append({ type: 'output', data: `${'0123456789'.repeat(3)}\r\n<<<EXIT:abc123:0>>>\r\n$ `, stream: 'pty', runId: 'old' });
+  src.journal.append({ type: 'run.end', runId: 'old', state: 'exited', exit: 0, durationMs: 3 });
+  const r = await replay(src);
+  assert.equal(r.length, 1);
+  assert.doesNotMatch(r[0]!.body ?? '', /<<<EXI|cmd-old/);
+  // The projection rejoins soft-wrapped rows, so the 20 columns the Run started with (now passed to it) leave a plain line whole.
+  assert.equal(r[0]!.body, '0123456789'.repeat(3));
+  // A declared shell's Run: start marker and the printf wrapper go too.
+  src.journal.append({ type: 'run.admit', runId: 'inl', target: 'shell', line: 'uname', principal: A, origin: 'self', queued: false, shell: 'sh', within: 'ssh1' });
+  src.journal.append({ type: 'run.start', runId: 'inl', cwd: '/w' });
+  src.journal.append({ type: 'output', data: `printf '<<<STAR''T:n1>>>\\n'; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:n1:%s>>>\\n' "$?"\r\n<<<START:n1>>>\r\nLinux\r\n<<<EXIT:n1:0>>>\r\n`, stream: 'pty', runId: 'inl' });
+  src.journal.append({ type: 'run.end', runId: 'inl', state: 'exited', exit: 0, durationMs: 3 });
+  const r2 = await replay(src);
+  assert.equal(r2.at(-1)?.body, 'Linux');
+});
+
+test('screens: a blank first frame is a screen, dropped output is said, and a wall-clock step moves no schedule', async (t) => {
+  const src = fakeSource();
+  const seg = new Segmenter(src, { screenQuietMs: 30, cadenceMs: 100 });
+  const out = collect(seg);
+  src.screen.alt = true;
+  src.screen.lines = ['', '', '', '', ''];
+  src.journal.append({ type: 'screen.mode', alt: true });
+  await sleep(80);
+  assert.equal(out.filter((s) => s.kind === 'screen').length, 1, 'a blank first frame is still the program’s first screen');
+  const wall = Date.now();
+  t.mock.method(Date, 'now', () => wall - 60_000);
+  src.screen.lines = ['frame 2', '', '', '', ''];
+  src.screen.droppedUnits = 7;
+  src.journal.append({ type: 'output', data: 'frame 2', stream: 'pty' });
+  await sleep(200);
+  const screens = out.filter((s) => s.kind === 'screen');
+  assert.equal(screens.length, 2, 'the next screen came within the cadence despite the step');
+  assert.match(screens[1]!.head, /7 output units were dropped under pressure/);
+  assert.equal(screens[1]!.metadata.droppedUnits, 7);
+  seg.dispose();
+});
+
+test('a catch-up scan that starts inside a retention gap says what range is gone', async () => {
+  const src = fakeSource(new Journal({ hot: new MemoryStore(4096) }));
+  for (let i = 0; i < 40; i++) {
+    startRun(src, `r${i}`);
+    src.journal.append({ type: 'output', data: 'x'.repeat(100), stream: 'pty', runId: `r${i}` });
+    endRun(src, `r${i}`);
+  }
+  const scan = await scanLifecycle(liveSource(src), 0);
+  assert.ok(scan.picked.length < 40, `the ring kept only some: ${scan.picked.length}`);
+  assert.ok(scan.lost && scan.lost.from === 1 && scan.lost.to >= 1, `the gap is reported: ${JSON.stringify(scan.lost)}`);
+  assert.equal(scan.lost.to, (src.journal.oldestSeq ?? 1) - 1);
+});
+
+test("a human's line is a command only when a Run of their own follows it; lines pasted together each take a Run", async () => {
+  const src = fakeSource();
+  const seg = new Segmenter(src);
+  const out = collect(seg);
+  src.screen.lines = ['>>> exit()', '', '', '', ''];
+  src.screen.cursor = { x: 4, y: 0 };
+  src.journal.append({ type: 'input', data: 'exit()', principal: H, kind: 'text' });
+  src.screen.cursor = { x: 10, y: 0 };
+  src.journal.append({ type: 'input', data: '\r', principal: H, kind: 'text' });
+  // Another principal's queued Run starts right after: not the human's command.
+  startRun(src, 'agent-run', A, 'ls');
+  await sleep(400);
+  assert.equal(out.length, 1, 'the REPL line is reported');
+  assert.match(out[0]!.head, /typed: exit\(\)$/);
+  out.length = 0;
+  src.screen.lines = ['$ echo a', 'a', '$ echo b', 'b', '$ '];
+  src.screen.cursor = { x: 2, y: 4 };
+  src.journal.append({ type: 'input', data: 'echo a\recho b\r', principal: H, kind: 'paste' });
+  startRun(src, 'h1', H, 'echo a');
+  startRun(src, 'h2', H, 'echo b');
+  await sleep(400);
+  assert.equal(out.length, 0, 'both pasted lines became Runs');
+  seg.dispose();
+});
+
+test('a prompt with a combining mark is found at the cursor; needs-input does not fire on a progress bar at the producer', async () => {
+  const decomposed = 'Café?';
+  assert.equal(columnIndex(decomposed, 5), decomposed.length);
+  assert.equal(promptLine(snap([decomposed, ''], 5, 0)), decomposed);
+  assert.equal(promptLine(snap(['Café crème? ', ''], 13, 0)), 'Café crème?');
+  assert.equal(columnIndex('日本語?', 7), 4, 'wide characters take two cells');
+  const src = fakeSource();
+  const seg = new Segmenter(src, { needsInputMs: 30 });
+  startRun(src, 'bar');
+  src.screen.lines = ['[#####     ]', '', '', '', ''];
+  src.screen.cursor = { x: 12, y: 0 };
+  src.screen.seq = src.journal.append({ type: 'output', data: '[#####     ]', stream: 'pty', runId: 'bar' }).seq;
+  await sleep(100);
+  assert.equal(src.journal.since(0).events.filter((e) => e.type === 'run.waiting').length, 0);
   seg.dispose();
 });

@@ -4,22 +4,25 @@
  * per principal what to deliver (suppression G28, explicit interest, open or
  * closed channel) and personalizes the few fields that depend on the reader.
  *
- * Every segment's text opens with one self-describing line — session, what
- * happened, and the cursor that fetches more — because in some hosts the text is
- * all a model sees and a held rendering keeps only its first few hundred
- * characters (§10.6). Ambient segments (digests, screens, control, notes, human
- * input) reach open channels only; digests and screens carry `supersedes`,
- * never deltas: at most one per cadence per subject.
+ * Every segment's text opens with one self-describing line — the session and what
+ * happened, and for a completion, a watch or a recovery the cursor that fetches
+ * more — because in some hosts the text is all a model sees and a held rendering
+ * keeps only its first few hundred characters (§10.6). Ambient segments (digests,
+ * screens, control, notes, human input) reach open channels only; digests and
+ * screens carry `supersedes`, never deltas: at most one per cadence per subject.
  *
  * Lifecycle segments are rebuilt from the journal alone for catch-up and channel
  * history (`scanLifecycle`, `replayNewest`), for any life of a name and for a
  * history-only session, so a completion is never lost because nobody was
- * following the session when it happened (G22, G28).
+ * following the session when it happened (G22, G28). Channel history is bounded
+ * (HISTORY_MAX_EVENTS) and says when it stopped short; a catch-up that starts
+ * inside a retention gap says what range is gone.
  */
+import { performance } from 'node:perf_hooks';
 import { stripAnsi } from './ansi.js';
 import type { Journal } from './journal.js';
 import type { RunOutput } from './runindex.js';
-import { looksLikeSecretPrompt } from './session.js';
+import { looksLikeSecretPrompt, stripEscapes } from './session.js';
 import { project } from './transcript.js';
 import type { JournalEvent, OutputStream, Principal, RunInfo, ScreenSnapshot, Seq } from './types.js';
 
@@ -44,9 +47,9 @@ export interface Segment {
   lifecycle: boolean;
   /** The journal event this segment reports (the delivered cursor advances to it). */
   seq: Seq;
-  /** When it happened (the journal event's time). */
+  /** When it happened: the journal event's time for a lifecycle segment, a note or a seat change; when it was built for a digest, a screen or human input. */
   ts: number;
-  /** `<session>~<epoch>:<kind>:<seq>`; the lane qualifies it with the node (§10.2). */
+  /** `<session>~<epoch>:<kind>:<seq>`, a digest's with `~<runId>` after the kind; the lane qualifies it with the node (§10.2, see segmentId). */
   messageId: string;
   supersedes?: string;
   tags: string[];
@@ -82,7 +85,7 @@ export interface SegmenterOptions {
   runSettleMs?: number;
   /** Quiet period before a full-screen program's screen is sent. */
   screenQuietMs?: number;
-  /** A screen that keeps changing is sent at most this long after its first unsent change (never starved, m2-13). */
+  /** A screen that keeps changing is sent at most this long after its first unsent change (never starved, m2-13), though never more often than the cadence after the first. */
   screenMaxWaitMs?: number;
   /** Silence before needs-input is considered (G15). */
   needsInputMs?: number;
@@ -116,14 +119,13 @@ export interface ReplaySource {
 // ───────────── ids (§10.2, mcpl-4) ─────────────
 
 /**
- * `<session>~<epoch>:<kind>:<seq>` — the lane qualifies it with the node. The journal's
- * epoch is kept across lives and restarts, so replayed messages keep their ids (G22), and
- * is new when a forgotten name starts `seq` over, so an id never names two events (mcpl-4).
- */
-/**
- * A message's stable id. A Run's progress digest carries the Run's id too: two Runs in one
- * session, each printing a line and going quiet, had digests at the same journal seq and so the
- * same id, and the lane's sent-set dropped the second as a repeat (the house's review of #11).
+ * A message's stable id: `<session>~<epoch>:<kind>:<seq>`, which the lane qualifies with the
+ * node. The journal's epoch is kept across lives and restarts, so replayed messages keep their
+ * ids (G22), and is new when a forgotten name starts `seq` over, so an id never names two
+ * events (mcpl-4). A Run's progress digest carries the Run's id too, `<kind>~<runId>`: two Runs
+ * in one session, each printing a line and going quiet, had digests at the same journal seq
+ * and so the same id, and the lane's sent-set dropped the second as a repeat (the house's
+ * review of #11).
  */
 export function segmentId(session: string, journal: Journal, kind: SegmentKind, seq: Seq, runId?: string): string {
   return `${session}~${journal.epoch}:${kind}${runId !== undefined ? `~${runId}` : ''}:${seq}`;
@@ -154,12 +156,39 @@ const looksLikePrompt = (t: string) => ASKS.test(t) || LABEL_ASK.test(t) || REPL
  */
 export function promptLine(snap: ScreenSnapshot): string | undefined {
   const row = snap.lines[snap.cursor.y] ?? '';
-  if (row.slice(snap.cursor.x).trim()) return undefined; // the cursor is not at the end of what is written
-  const before = row.slice(0, snap.cursor.x).trim();
+  const at = columnIndex(row, snap.cursor.x);
+  if (row.slice(at).trim()) return undefined; // the cursor is not at the end of what is written
+  const before = row.slice(0, at).trim();
   if (before) return looksLikePrompt(before) ? before : undefined;
   const prev = snap.cursor.y > 0 ? (snap.lines[snap.cursor.y - 1] ?? '').trim() : '';
   return prev && ASKS.test(prev) ? prev : undefined;
 }
+
+/** Zero-width marks and joiners; wide (two-cell) East Asian and emoji ranges, as the emulator lays them out. */
+const ZERO_WIDTH = /^[\p{M}​-‍️]$/u;
+const WIDE = /^[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦\u{1f300}-\u{1f64f}\u{1f900}-\u{1f9ff}\u{20000}-\u{3fffd}]$/u;
+
+/**
+ * The index in a screen row's text of the cell column `x`. A combining mark takes no cell and a
+ * wide character two, so a column is not a string index: `Café?` written decomposed, with the
+ * cursor after it, was sliced one character short and read as no prompt (the house's read of 3eade8a, #22).
+ */
+export function columnIndex(row: string, x: number): number {
+  let col = 0;
+  let i = 0;
+  for (const ch of row) {
+    if (col >= x && !ZERO_WIDTH.test(ch)) break;
+    col += ZERO_WIDTH.test(ch) ? 0 : WIDE.test(ch) ? 2 : 1;
+    i += ch.length;
+  }
+  return i;
+}
+
+/** A row's text up to the cursor's cell column. */
+const beforeCursor = (snap: ScreenSnapshot) => {
+  const row = snap.lines[snap.cursor.y] ?? '';
+  return row.slice(0, columnIndex(row, snap.cursor.x));
+};
 
 const fmtDuration = (ms: number) => (ms >= 60_000 ? `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s` : `${(ms / 1000).toFixed(1)}s`);
 export const fmtBytes = (n: number) => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MiB` : n >= 1024 ? `${(n / 1024).toFixed(1)} KiB` : `${n} B`);
@@ -175,11 +204,26 @@ const yieldTurn = (): Promise<void> => new Promise((r) => setImmediate(r));
 const howEnded = (x: SessionExit) =>
   x.reason === 'daemon-shutdown' ? ' by daemon shutdown' : x.reason === 'daemon-restart' ? ' by a daemon restart' : x.reason !== undefined ? ` (${x.reason})` : x.code !== null ? ` with code ${x.code}` : x.signal ? ` by ${x.signal}` : '';
 
-/** One line of output as a reader sees it: control sequences gone, a carriage return's overwrite applied. */
-function cleanLine(raw: string): string {
-  const s = stripAnsi(raw);
-  const cr = s.lastIndexOf('\r', s.length - 2);
-  return (cr === -1 ? s : s.slice(cr + 1)).replace(/\r/g, '').trimEnd();
+/** Stands in for a backspace through `stripAnsi`, which drops C0 controls (a private-use character). */
+const BS_MARK = '';
+
+/**
+ * One line of output as a reader sees it: control sequences gone, carriage returns and backspaces
+ * applied as overwrites, the way the transcript renders them. A line was cut at its last carriage
+ * return, so `ABCDE\rXY` read `XY` for the transcript's `XYCDE`, and a spinner's `|\b/\b-\b\`
+ * read `|/-\` for its `\` (the house's read of 3eade8a, #22).
+ */
+export function cleanLine(raw: string): string {
+  const s = stripAnsi(raw.replace(/\x08/g, BS_MARK));
+  if (!s.includes('\r') && !s.includes(BS_MARK)) return s.trimEnd();
+  const cells: string[] = [];
+  let col = 0;
+  for (const ch of s) {
+    if (ch === '\r') col = 0;
+    else if (ch === BS_MARK) col = Math.max(0, col - 1);
+    else cells[col++] = ch;
+  }
+  return cells.join('').trimEnd();
 }
 
 /** The Run, or undefined when the source does not know it. */
@@ -191,14 +235,21 @@ export function runOf(src: { run(runId: string): RunInfo }, runId: string): RunI
   }
 }
 
-function tailBytes(text: string, max: number): string {
+/**
+ * The last `max` bytes of a text, whole lines where that keeps most of the budget. A torn first
+ * line used to be dropped whatever it left: a 10 KB JSON line ending in a newline came out as
+ * nothing, and a note whose long first line was followed by `END` as `END` (the house's read of
+ * 3eade8a, #22). Now a torn line that is most of what there is stays, marked with a leading `…`.
+ */
+export function tailBytes(text: string, max: number): string {
   const buf = Buffer.from(text);
   if (buf.length <= max) return text;
   let start = buf.length - max;
   while (start < buf.length && (buf[start]! & 0xc0) === 0x80) start++; // never cut a UTF-8 sequence
   const kept = buf.subarray(start).toString();
   const nl = kept.indexOf('\n');
-  return nl === -1 ? kept : kept.slice(nl + 1);
+  if (nl !== -1 && Buffer.byteLength(kept) - Buffer.byteLength(kept.slice(0, nl + 1)) >= max / 2) return kept.slice(nl + 1);
+  return `…${kept}`;
 }
 
 // ───────────── sources ─────────────
@@ -211,13 +262,45 @@ type SessionExit = Extract<JournalEvent, { type: 'session.exit' }>;
 /** Input read to render a Run of an earlier life or of history: its newest part (runOutput walks backwards). */
 const HISTORY_RUN_INPUT_BYTES = 64 * 1024;
 
-/** A Run's text from the journal alone: the newest part of its attributed output, projected (§6). */
-export async function journalRunText(o: RunOutput, cols = 120): Promise<RunText> {
+/** The shell integration's end marker as the shell prints it; the typed wrapper echoes it split (`<<<EXI""T:`), so this never matches the echo. */
+const END_MARKER = /<<<EXIT:[^:>\s]+:-?\d+>>>/g;
+/** A declared shell's Run opens with its start marker; what precedes its line is the typed wrapper. */
+const START_MARKER = /<<<START:[^:>\s]+>>>[^\n]*\n/;
+/** The echo of a typed wrapper line, in any of the shells' spellings. */
+const WRAPPER_ECHO = /<<<EXI(?:""|'')T:/g;
+
+/**
+ * A shell Run's plumbing cut from its journaled output, as the live transcript cuts it (the
+ * session knows the nonce; here the markers' shape is enough): the typed wrapper's echo, the
+ * start marker and everything from the end marker on. A Run rendered from the journal kept both
+ * (the house's read of 3eade8a, #22).
+ */
+function cutPlumbing(raw: string): string {
+  const { text, map } = stripEscapes(raw);
+  let from = 0;
+  let to = text.length;
+  let lastEcho = -1;
+  for (const m of text.matchAll(WRAPPER_ECHO)) lastEcho = m.index!;
+  if (lastEcho !== -1) {
+    const nl = text.indexOf('\n', lastEcho);
+    if (nl === -1) return '';
+    from = nl + 1;
+  }
+  const start = START_MARKER.exec(text.slice(from));
+  if (start?.index === 0) from += start[0].length;
+  for (const m of text.matchAll(END_MARKER)) to = m.index!;
+  if (from >= to) return '';
+  return raw.slice(map[from]!, map[to] ?? raw.length);
+}
+
+/**
+ * A Run's text from the journal alone: the newest part of its attributed output, projected (§6)
+ * at the width the Run started at when the journal recorded one (the live transcript's width).
+ */
+export async function journalRunText(o: RunOutput, cols = 120, run?: RunInfo): Promise<RunText> {
   const events = o.events.filter((e): e is Output => e.type === 'output');
-  const p = await project(
-    events.map((e) => ({ data: e.data, stream: e.stream })),
-    { cols, maxInputBytes: HISTORY_RUN_INPUT_BYTES, keep: 'tail' },
-  );
+  const chunks = run?.target === 'shell' && events.every((e) => e.stream === 'pty') ? [{ data: cutPlumbing(events.map((e) => e.data).join('')), stream: 'pty' as const }] : events.map((e) => ({ data: e.data, stream: e.stream }));
+  const p = await project(chunks, { cols: run?.cols ?? cols, maxInputBytes: HISTORY_RUN_INPUT_BYTES, keep: 'tail' });
   return { text: p.text, truncated: o.truncated || p.truncated, seq: [o.from, o.to], nextCursor: o.to };
 }
 
@@ -252,7 +335,7 @@ export function journalSource(o: {
       return o.controller?.() ?? null;
     },
     run: (runId) => (o.run ? o.run(runId) : o.journal.runs.run(runId)),
-    runText: (runId) => o.transcript?.(runId) ?? journalRunText(o.journal.runs.output(o.journal, runId, { maxBytes: HISTORY_RUN_INPUT_BYTES }), o.cols),
+    runText: (runId) => o.transcript?.(runId) ?? journalRunText(o.journal.runs.output(o.journal, runId, { maxBytes: HISTORY_RUN_INPUT_BYTES }), o.cols, runOf({ run: (id) => (o.run ? o.run(id) : o.journal.runs.run(id)) }, runId)),
   };
 }
 
@@ -287,11 +370,20 @@ class Render {
   async run(ev: RunEnd): Promise<Segment | undefined> {
     const run = runOf(this.src, ev.runId);
     if (!run) return undefined;
-    const t = await this.src.runText(ev.runId).catch((): RunText => ({ text: '', seq: [ev.seq, ev.seq], nextCursor: ev.seq, truncated: false }));
+    // A read that fails still reports the Run's own range, and the body says the output is missing
+    // rather than looking like a Run that printed nothing (the house's read of 3eade8a, #22).
+    let unreadable: string | undefined;
+    const from = run.seq.start ?? run.seq.admit;
+    const t = await this.src.runText(ev.runId).catch((e: unknown): RunText => {
+      unreadable = e instanceof Error ? e.message : String(e);
+      return { text: '', seq: [from, ev.seq], nextCursor: ev.seq, truncated: false };
+    });
     let body = t.text;
-    if (Buffer.byteLength(body) > RUN_BODY_BYTES) {
-      body = `[… earlier output omitted · read runId=${ev.runId} for all of it]\n` + tailBytes(body, RUN_BODY_BYTES);
-    }
+    const cut = Buffer.byteLength(body) > RUN_BODY_BYTES;
+    if (cut) body = tailBytes(body, RUN_BODY_BYTES);
+    // The transcript may already be the newest part of a longer output: the omission is said either way.
+    if (cut || t.truncated) body = `[… earlier output omitted · read runId=${ev.runId} for all of it]\n${body}`;
+    if (unreadable !== undefined) body = `[the Run's output could not be read: ${oneLine(unreadable, 160)} · read runId=${ev.runId} to try again]`;
     const status =
       ev.state === 'exited'
         ? ev.signal
@@ -301,15 +393,21 @@ class Render {
           ? `→ cancelled${ev.signal ? ` by ${ev.signal}` : ev.exit !== undefined ? ` (exit ${ev.exit})` : ''}`
           : `→ outcome unknown (${ev.reason ?? 'lost'})`;
     const who = run.origin === 'self' || run.origin === 'system' ? '' : ` · by ${run.principal}`;
-    const head = `[terminal] ${this.src.id}: \`${describeRun(run)}\` ${status} in ${fmtDuration(ev.durationMs)}${who} · run ${ev.runId} · read since=${Math.max(0, t.seq[0] - 1)}`;
+    // A process Run that left its group behind says so (shell tools 5 of the house's review of #11).
+    const left = ev.leftovers ? ' · left processes running (cancel the Run to end them)' : '';
+    const head = `[terminal] ${this.src.id}: \`${describeRun(run)}\` ${status} in ${fmtDuration(ev.durationMs)}${who}${left} · run ${ev.runId} · read since=${Math.max(0, t.seq[0] - 1)}`;
     // The origin facet and the chat:from-* sender tag are relative to the reader; the lane adds them.
     const tags = [ev.state === 'lost' ? 'terminal:run-lost' : 'terminal:run-finished', `terminal:target=${run.target}`];
     if (ev.signal) tags.push('terminal:exit=signal');
-    else if (ev.state === 'exited') tags.push(`terminal:exit=${ev.exit === 0 ? 'ok' : 'nonzero'}`);
+    // An end mark without a status (`→ exit ?`) is neither ok nor nonzero: no exit tag.
+    else if (ev.state === 'exited' && ev.exit !== undefined) tags.push(`terminal:exit=${ev.exit === 0 ? 'ok' : 'nonzero'}`);
     const meta: Record<string, unknown> = { runId: ev.runId, runState: ev.state, target: run.target, principal: run.principal, durationMs: ev.durationMs, outputFrom: t.seq[0], outputTo: t.seq[1], nextCursor: t.nextCursor };
     if (ev.exit !== undefined) meta.exit = ev.exit;
     if (ev.signal) meta.signal = ev.signal;
     if (ev.reason) meta.reason = ev.reason;
+    if (ev.leftovers) meta.leftovers = true;
+    if (cut || t.truncated) meta.truncated = true;
+    if (unreadable !== undefined) meta.outputError = unreadable;
     if (run.line !== undefined) meta.line = run.line;
     const seg: Segment = { ...this.base('run', ev.seq, meta, ev.ts), lifecycle: true, tags, head, interested: [run.principal], runId: ev.runId, author: run.principal };
     if (body) seg.body = body;
@@ -434,6 +532,12 @@ export interface LifecycleScan {
   omitted?: Omitted;
   /** The last seq the scan covered. */
   end: Seq;
+  /**
+   * The scan began inside a retention gap: these seqs are gone, and how many lifecycle events
+   * they held is unknown. A catch-up from an old cursor over a small memory ring returned a
+   * handful of completions as if they were all (the house's read of 3eade8a, #22).
+   */
+  lost?: { from: Seq; to: Seq };
 }
 
 /** Events only a running shell journals: after an exit or recovery they mean a new life began, which supersedes it (a viewer attaching to an ended shell is not one). */
@@ -488,8 +592,10 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
     if (kept.length > Math.max(64, keep * 4)) trim();
   };
 
+  let gone: LifecycleScan['lost'];
   for (let cursor = since; cursor < end; ) {
     const page = src.journal.since(cursor, SCAN_PAGE);
+    if (cursor === since && page.gap) gone = { from: page.gap.from, to: page.gap.to };
     const events = page.events;
     if (!events.length) break;
     for (const ev of events) {
@@ -525,6 +631,7 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
   trim();
   const out: LifecycleScan = { picked: kept, end };
   if (omitted) out.omitted = omitted;
+  if (gone) out.lost = gone;
   return out;
 }
 
@@ -609,7 +716,11 @@ export async function replayNewest(src: ReplaySource, opts: { limit: number; bef
 
 interface RunWatch {
   runId: string;
+  /** A process Run's output is its pipes, which the terminal never shows; a shell Run's is the pty. */
+  pipes: boolean;
   bytes: number;
+  /** The count began when the segmenter did, after some output it could only read bounded (a Run already in flight). */
+  bytesAtLeast: boolean;
   bytesAtLastDigest: number;
   lastDigestId?: string;
   timer?: NodeJS.Timeout | undefined;
@@ -619,8 +730,12 @@ interface RunWatch {
   lines: string[];
   /** Raw text after the last newline, capped. */
   carry: string;
-  carryStream?: OutputStream;
-  /** (seq, bytes before it) checkpoints, for "new since your last read" without reading the journal. */
+  /**
+   * (seq, bytes through it) checkpoints, for "new since your last read" without reading the
+   * journal. Bytes *through* an event, and the newest mark always kept: with "bytes before" and
+   * every other mark dropped, a read whose mark was gone counted from a later one and came up
+   * short, to zero when the newest had gone (the house's read of 3eade8a, #22).
+   */
   marks: Array<[Seq, number]>;
 }
 
@@ -628,10 +743,14 @@ interface Submitted {
   text: string;
   seq: Seq;
   sensitive: boolean;
-  /** The text was on the screen when Enter was pressed (the program echoed it). */
+  /** The text was on the screen after its prompt when Enter was pressed (the program echoed it). */
   echoed: boolean;
   /** The line it answered asked for a secret. */
   secretPrompt: boolean;
+  /** What the screen showed before the line's first keystroke: the program's prompt. */
+  prompt: string;
+  /** The line met a cursor, history or completion key, so what was typed is not what was submitted. */
+  unknown: boolean;
 }
 
 interface HumanLine {
@@ -640,11 +759,18 @@ interface HumanLine {
   buf: string;
   bufSensitive: boolean;
   bufSeq: Seq;
+  /**
+   * A cursor, history or completion key was pressed since the line was last empty: readline
+   * applied it to text this reconstruction does not have (a recalled line, a completed path), so
+   * the text is not shown (the house's read of 3eade8a, #22).
+   */
+  bufUnknown: boolean;
   /** What the screen showed before the line's first keystroke: the program's prompt. */
   prompt: string;
   /** An escape sequence being skipped, across input events (arrows, SS3 keys). */
   esc: '' | 'esc' | 'csi' | 'ss3' | 'osc' | 'osc-esc';
   lines: Submitted[];
+  /** When the first line of the burst was submitted, on the monotonic clock. */
   firstAt?: number | undefined;
   timer?: NodeJS.Timeout | undefined;
 }
@@ -662,6 +788,11 @@ const CARRY_MAX = 4096;
 const MARKS_MAX = 1024;
 const SENSITIVE = '[sensitive input]';
 const NOT_ECHOED = '[input not echoed — not shown]';
+const NOT_RECONSTRUCTED = '[input edited with cursor, history or completion keys — not shown]';
+/** Output of a Run already in flight when the segmenter starts is counted from a bounded read. */
+const INFLIGHT_COUNT_BYTES = 1024 * 1024;
+/** Timers and cadences run on the monotonic clock: a wall-clock step scheduled a screen a minute out and showed a Run's age as negative (the house's read of 3eade8a, #22). */
+const mono = (): number => performance.now();
 
 export class Segmenter {
   private readonly listeners = new Set<(s: Segment) => void>();
@@ -669,17 +800,26 @@ export class Segmenter {
   private readonly running = new Map<string, RunWatch>();
   /** Completions waiting out the settle, by run.end seq; emitted, never dropped, on dispose (mcpl-6). */
   private readonly settling = new Map<Seq, Settling>();
+  /**
+   * Segments built while an earlier completion settles, waiting for it: segments go out in seq
+   * order, so a cursor a reader advances to a later message never passes a completion that is
+   * still being built. A note journaled after a Run's end went out first, and a lane that then
+   * died would have lost the completion to its catch-up (the house's read of 3eade8a, #22).
+   */
+  private readonly deferred: Segment[] = [];
   private readonly o: Required<SegmenterOptions>;
   private readonly render: Render;
   private screenTimer: NodeJS.Timeout | undefined;
   private screenAt: number | undefined;
-  /** When the screen first changed since the last one sent (a max-wait, m2-13). */
+  /** When the screen first changed since the last one sent (a max-wait, m2-13); monotonic. */
   private screenDirtySince: number | undefined;
   /** The first screen of a full-screen program is not held to the cadence. */
   private firstScreenPending = false;
-  private lastScreenAt = 0;
+  /** Monotonic; negative infinity until a screen was sent, so the first is never held to a cadence from zero. */
+  private lastScreenAt = Number.NEGATIVE_INFINITY;
   private lastScreenId: string | undefined;
-  private lastScreenText = '';
+  /** The last screen's text; undefined when none was sent for this program, so a blank first frame is still a screen. */
+  private lastScreenText: string | undefined;
   private alt = false;
   private readonly human = new Map<Principal, HumanLine>();
   /** Recent run.start events: a human line followed by one was a command, and the Run is its message. */
@@ -700,8 +840,10 @@ export class Segmenter {
       needsInputMs: opts.needsInputMs ?? 5_000,
     };
     this.render = new Render(liveSource(s));
-    // Runs already in flight when the segmenter starts get digests too.
-    for (const r of s.listRuns()) if (r.state === 'running') this.track(r.runId);
+    // Runs already in flight when the segmenter starts get digests too, counting what they
+    // printed before it, and a shell Run already sitting at a prompt gets its needs-input check
+    // (the house's read of 3eade8a, #22: one waiting at `Name? ` got none, and counted from 0).
+    for (const r of s.listRuns()) if (r.state === 'running') this.trackInflight(r);
     this.off = s.journal.subscribe((ev) => this.onEvent(ev));
     // Created while a full-screen program is up (the first lane arrived late): its screens flow (m2-19).
     try {
@@ -742,16 +884,45 @@ export class Segmenter {
     return this.disposing;
   }
 
-  /** Output bytes of a running Run after `read` (for "new since your last read"), or undefined when it is not tracked. */
+  /**
+   * Output bytes of a running Run after `read` (for "new since your last read"), or undefined when
+   * it is not tracked. Exact while the mark for `read` is kept; when it was dropped, the count runs
+   * from the last kept mark before it, so it is never short.
+   */
   unreadBytes(runId: string, read: Seq): number | undefined {
     const w = this.running.get(runId);
     if (!w) return undefined;
-    const first = w.marks.find(([seq]) => seq > read);
-    return first ? w.bytes - first[1] : 0;
+    let through = 0;
+    for (const [seq, bytes] of w.marks) {
+      if (seq > read) break;
+      through = bytes;
+    }
+    return w.bytes - through;
   }
 
   private emit(seg: Segment | undefined): void {
     if (!seg || this.disposed) return;
+    if (this.behindSettling(seg)) {
+      this.deferred.push(seg);
+      return;
+    }
+    this.send(seg);
+  }
+
+  /** Is a completion with an earlier seq (or this one, for another kind at the same seq) still settling? */
+  private behindSettling(seg: Segment): boolean {
+    for (const seq of this.settling.keys()) if (seg.seq > seq || (seg.seq === seq && seg.kind !== 'run')) return true;
+    return false;
+  }
+
+  /** A completion went out: what waited behind it follows, in seq order, up to the next one settling. */
+  private release(): void {
+    this.deferred.sort((a, b) => a.seq - b.seq);
+    while (this.deferred.length && !this.behindSettling(this.deferred[0]!)) this.send(this.deferred.shift()!);
+  }
+
+  private send(seg: Segment): void {
+    if (this.disposed) return;
     for (const l of this.listeners) {
       try {
         l(seg);
@@ -828,6 +999,7 @@ export class Segmenter {
           .catch(() => undefined)
           .finally(() => {
             this.settling.delete(ev.seq);
+            this.release();
             resolve();
           });
       },
@@ -836,11 +1008,32 @@ export class Segmenter {
     this.settling.set(ev.seq, e);
   }
 
-  private track(runId: string): void {
-    if (this.running.has(runId) || this.disposing) return;
-    const w: RunWatch = { runId, bytes: 0, bytesAtLastDigest: 0, lines: [], carry: '', marks: [] };
+  private track(runId: string): RunWatch | undefined {
+    if (this.running.has(runId) || this.disposing) return undefined;
+    const w: RunWatch = { runId, pipes: runOf(this.s, runId)?.target === 'process', bytes: 0, bytesAtLeast: false, bytesAtLastDigest: 0, lines: [], carry: '', marks: [] };
     this.running.set(runId, w);
     w.timer = setInterval(() => this.digest(w), this.o.cadenceMs);
+    return w;
+  }
+
+  /** Track a Run that was already running: count its output so far (bounded), feed its last lines, arm needs-input. */
+  private trackInflight(run: RunInfo): void {
+    const w = this.track(run.runId);
+    if (!w) return;
+    let out: RunOutput | undefined;
+    try {
+      out = this.s.journal.runs.output(this.s.journal, run.runId, { maxBytes: INFLIGHT_COUNT_BYTES });
+    } catch {
+      return; // nothing journaled for it yet
+    }
+    for (const ev of out.events) {
+      if (ev.type !== 'output') continue;
+      w.bytes += Buffer.byteLength(ev.data);
+      if (!this.alt || w.pipes) this.feedLines(w, ev.data, ev.stream);
+    }
+    w.bytesAtLeast = out.truncated;
+    if (out.events.length) w.marks.push([out.events[out.events.length - 1]!.seq, w.bytes]);
+    if (!w.pipes) w.silenceTimer = setTimeout(() => this.checkNeedsInput(w), this.o.needsInputMs);
   }
 
   private untrack(runId: string): void {
@@ -856,12 +1049,12 @@ export class Segmenter {
     if (!ev.runId) return;
     const w = this.running.get(ev.runId);
     if (!w) return;
-    const n = Buffer.byteLength(ev.data);
+    w.bytes += Buffer.byteLength(ev.data);
     w.marks.push([ev.seq, w.bytes]);
-    if (w.marks.length > MARKS_MAX) w.marks = w.marks.filter((_, i) => i % 2 === 0);
-    w.bytes += n;
-    // A full-screen program's redraws are not lines; its screens are the message.
-    if (!this.alt) this.feedLines(w, ev.data, ev.stream);
+    if (w.marks.length > MARKS_MAX) w.marks = w.marks.filter((_, i) => i % 2 === 0 || i === w.marks.length - 1);
+    // A full-screen program's redraws are not lines; its screens are the message. A process Run's
+    // pipes are not drawn on the terminal at all, so a full-screen program hides nothing of theirs.
+    if (!this.alt || w.pipes) this.feedLines(w, ev.data, ev.stream);
     // Needs-input: a shell Run that goes silent with a prompt-like last line (G15).
     if (ev.stream === 'pty') {
       if (w.silenceTimer) clearTimeout(w.silenceTimer);
@@ -869,22 +1062,22 @@ export class Segmenter {
     }
   }
 
-  /** Keep the Run's last lines as output arrives, so a digest costs what it shows (er-3, mcpl-11, m2-17). */
-  private feedLines(w: RunWatch, data: string, stream: OutputStream): void {
-    if (w.carry && w.carryStream !== undefined && w.carryStream !== stream) {
-      // A change of source starts on a fresh line (§6 rule 6).
-      this.pushLines(w, [cleanLine(w.carry)]);
-      w.carry = '';
-    }
-    w.carryStream = stream;
+  /**
+   * Keep the Run's last lines as output arrives, so a digest costs what it shows (er-3, mcpl-11,
+   * m2-17). A process Run's stdout and stderr are one source, as the transcript reads them (§6
+   * rule 6): `abc` on stdout then `def\n` on stderr is the line `abcdef`, not two lines.
+   */
+  private feedLines(w: RunWatch, data: string, _stream: OutputStream): void {
     let buf = w.carry + data;
     const nl = buf.lastIndexOf('\n');
     if (nl !== -1) {
       const fresh: string[] = [];
       let end = nl;
-      // Only the newest lines can survive, so read back from the end until there are enough.
+      // Only the newest lines can survive, so read back from the end until there are enough. A
+      // newline at index 0 ends an empty first line: searching before it must find nothing, where
+      // `lastIndexOf('\n', -1)` searches from 0 and found it again, forever (the house's read of 3eade8a, #22).
       while (end >= 0 && fresh.length < DIGEST_LINES) {
-        const start = buf.lastIndexOf('\n', end - 1);
+        const start = end > 0 ? buf.lastIndexOf('\n', end - 1) : -1;
         const line = cleanLine(buf.slice(start + 1, end));
         if (line) fresh.push(line);
         if (start < 0) break;
@@ -908,16 +1101,17 @@ export class Segmenter {
 
   private digest(w: RunWatch): void {
     const run = runOf(this.s, w.runId);
-    if (!run || w.bytes === w.bytesAtLastDigest || this.alt || this.disposing) return;
+    if (!run || w.bytes === w.bytesAtLastDigest || (this.alt && !w.pipes) || this.disposing) return;
     const partial = cleanLine(w.carry);
     const tail = (partial ? [...w.lines, partial] : w.lines).slice(-DIGEST_LINES).join('\n');
     const seq = this.s.journal.lastSeq;
-    const elapsed = Date.now() - (run.startedAt ?? run.admittedAt);
+    // The Run's start is a wall-clock stamp; a step back since then is not a negative age.
+    const elapsed = Math.max(0, Date.now() - (run.startedAt ?? run.admittedAt));
     const seg: Segment = {
-      ...this.render.base('output', seq, { runId: w.runId, bytes: w.bytes, elapsedMs: elapsed, nextCursor: seq }),
+      ...this.render.base('output', seq, { runId: w.runId, bytes: w.bytes, ...(w.bytesAtLeast ? { bytesAtLeast: true } : {}), elapsedMs: elapsed, nextCursor: seq }),
       lifecycle: false,
       tags: ['terminal:output', 'terminal:running'],
-      head: `[terminal] ${this.s.id}: running \`${describeRun(run)}\` ${fmtDuration(elapsed)} · ${fmtBytes(w.bytes)} so far · run ${w.runId}`,
+      head: `[terminal] ${this.s.id}: running \`${describeRun(run)}\` ${fmtDuration(elapsed)} · ${w.bytesAtLeast ? 'at least ' : ''}${fmtBytes(w.bytes)} so far · run ${w.runId}`,
       interested: [run.principal],
       runId: w.runId,
     };
@@ -949,6 +1143,8 @@ export class Segmenter {
     this.alt = alt;
     if (alt) {
       this.firstScreenPending = true;
+      // A new program's first frame is news even when blank (the house's read of 3eade8a, #22).
+      this.lastScreenText = undefined;
       this.scheduleScreen();
       return;
     }
@@ -956,8 +1152,9 @@ export class Segmenter {
     this.screenTimer = undefined;
     this.screenAt = undefined;
     this.screenDirtySince = undefined;
-    // What a full-screen program drew is not lines of output.
+    // What a full-screen program drew is not lines of output; a process Run's pipes it never touched.
     for (const w of this.running.values()) {
+      if (w.pipes) continue;
       w.lines = [];
       w.carry = '';
     }
@@ -970,7 +1167,7 @@ export class Segmenter {
    */
   private scheduleScreen(): void {
     if (this.disposing) return;
-    const now = Date.now();
+    const now = mono();
     if (this.screenDirtySince === undefined) this.screenDirtySince = now;
     const quietAt = now + this.o.screenQuietMs;
     const latestAt = this.screenDirtySince + this.o.screenMaxWaitMs;
@@ -995,13 +1192,15 @@ export class Segmenter {
     const text = snap.lines.join('\n').replace(/\n+$/, '');
     if (text === this.lastScreenText) return;
     this.lastScreenText = text;
-    this.lastScreenAt = Date.now();
+    this.lastScreenAt = mono();
     this.firstScreenPending = false;
+    // Output the emulator dropped under pressure is part of what the screen does not show (§6).
+    const dropped = snap.droppedUnits ? ` · ${snap.droppedUnits} output units were dropped under pressure, so the screen may be incomplete` : '';
     const seg: Segment = {
-      ...this.render.base('screen', snap.seq, { cols: snap.cols, rows: snap.rows }),
+      ...this.render.base('screen', snap.seq, { cols: snap.cols, rows: snap.rows, ...(snap.droppedUnits ? { droppedUnits: snap.droppedUnits } : {}) }),
       lifecycle: false,
       tags: ['terminal:screen'],
-      head: `[terminal] ${this.s.id}: full-screen program${snap.title ? ` "${oneLine(snap.title, 60)}"` : ''} · screen at seq ${snap.seq} (screen session=${this.s.id} for the current one)`,
+      head: `[terminal] ${this.s.id}: full-screen program${snap.title ? ` "${oneLine(snap.title, 60)}"` : ''} · screen at seq ${snap.seq}${dropped} (screen session=${this.s.id} for the current one)`,
       body: text,
       interested: [],
     };
@@ -1024,12 +1223,12 @@ export class Segmenter {
     if (ev.kind === 'protocol-reply' || !ev.principal.startsWith('human:') || this.alt || this.disposing) return;
     let h = this.human.get(ev.principal);
     if (!h) {
-      h = { principal: ev.principal, buf: '', bufSensitive: false, bufSeq: ev.seq, prompt: '', esc: '', lines: [] };
+      h = { principal: ev.principal, buf: '', bufSensitive: false, bufUnknown: false, bufSeq: ev.seq, prompt: '', esc: '', lines: [] };
       this.human.set(ev.principal, h);
     }
     h.bufSeq = ev.seq;
     // A line's first keystroke is journaled before the program sees it: the cursor row is its prompt.
-    if (!h.buf) h.prompt = this.cursorRow();
+    if (!h.buf && !h.bufUnknown) h.prompt = this.cursorRow();
     if (ev.sensitive) {
       // Journaled as a placeholder (G26); whatever it was, it is a sensitive answer.
       h.bufSensitive = true;
@@ -1037,7 +1236,7 @@ export class Segmenter {
     } else this.edit(h, ev.data, ev.seq);
     if (h.timer) clearTimeout(h.timer);
     h.timer = undefined;
-    const now = Date.now();
+    const now = mono();
     if (h.lines.length) {
       // On Enter wait briefly (does a Run start?), coalescing a burst of lines, never past 2 s.
       h.firstAt ??= now;
@@ -1065,33 +1264,42 @@ export class Segmenter {
         default:
           break;
       }
-      if (ch === '\x1b') h.esc = 'esc';
-      else if (ch === '\r' || ch === '\n') this.submit(h, seq);
+      // Arrows, Home/End, Up for history: the editor applied them to text not reconstructed here.
+      if (ch === '\x1b') {
+        h.esc = 'esc';
+        h.bufUnknown = true;
+      } else if (ch === '\r' || ch === '\n') this.submit(h, seq);
       else if (ch === '\x7f' || ch === '\b') h.buf = [...h.buf].slice(0, -1).join('');
-      else if (ch === '\x15') h.buf = ''; // ^U
-      else if (ch === '\x17') h.buf = h.buf.replace(/\S*\s*$/, ''); // ^W
+      else if (ch === '\x15') {
+        h.buf = ''; // ^U: the line is empty again, whatever it held
+        h.bufUnknown = false;
+      } else if (ch === '\x17') h.buf = h.buf.replace(/\S*\s*$/, ''); // ^W
       else if (ch === '\x03') {
         h.buf = ''; // ^C abandons the line
         h.bufSensitive = false;
+        h.bufUnknown = false;
       } else if (ch >= ' ') h.buf += ch;
+      // Tab completion, ^A/^E/^B/^F, ^P/^N/^R history, ^K/^Y, ^T: the line changed in ways not seen here.
+      else h.bufUnknown = true;
     }
   }
 
   private submit(h: HumanLine, seq: Seq): void {
     const text = h.buf;
     const sensitive = h.bufSensitive;
+    const unknown = h.bufUnknown;
     h.buf = '';
     h.bufSensitive = false;
+    h.bufUnknown = false;
     if (!text.trim() && !sensitive) return;
     const snap = this.s.snapshot();
-    h.lines.push({ text, seq, sensitive, echoed: !sensitive && echoedOn(snap, text, 0), secretPrompt: looksLikeSecretPrompt(h.prompt) });
+    h.lines.push({ text, seq, sensitive, echoed: !sensitive && !unknown && echoedOn(snap, h.prompt, text, 0), secretPrompt: looksLikeSecretPrompt(h.prompt), prompt: h.prompt, unknown });
     h.prompt = this.cursorRow();
   }
 
   private cursorRow(): string {
     try {
-      const snap = this.s.snapshot();
-      return (snap.lines[snap.cursor.y] ?? '').slice(0, snap.cursor.x);
+      return beforeCursor(this.s.snapshot());
     } catch {
       return '';
     }
@@ -1105,11 +1313,13 @@ export class Segmenter {
     h.firstAt = undefined;
     if (!h.buf && !h.esc) this.human.delete(h.principal);
     const snap = this.s.snapshot();
+    const ran = this.executedLines(h.principal, lines);
     const shown: string[] = [];
     lines.forEach((l, i) => {
-      if (this.executed(l.seq, lines[i + 1]?.seq)) return;
+      if (ran.has(i)) return;
       if (l.sensitive || l.secretPrompt) shown.push(SENSITIVE);
-      else if (l.echoed || echoedOn(snap, l.text, 3)) shown.push(oneLine(l.text, 200));
+      else if (l.unknown) shown.push(NOT_RECONSTRUCTED);
+      else if (l.echoed || echoedOn(snap, l.prompt, l.text, 3)) shown.push(oneLine(l.text, 200));
       else shown.push(NOT_ECHOED);
     });
     if (!shown.length) return;
@@ -1130,17 +1340,45 @@ export class Segmenter {
     this.emit(seg);
   }
 
-  /** Did a Run admitted after this line start before the next one (the line was a command)? */
-  private executed(seq: Seq, next: Seq | undefined): boolean {
-    return this.recentStarts.some((st) => st.seq > seq && (next === undefined || st.seq < next) && (runOf(this.s, st.runId)?.seq.admit ?? 0) > seq);
+  /**
+   * Which of the lines became this human's commands (the Run's end is their message): the Runs
+   * of their own that were admitted after a line and started before the next one. Lines pasted
+   * in one input event share a seq, so a group of n such lines takes the first n Runs started
+   * after it. Only the typer's Runs count: another principal's Run admitted after an `exit()`
+   * typed into a REPL hid the line (the house's read of 3eade8a, #22).
+   */
+  private executedLines(principal: Principal, lines: Submitted[]): Set<number> {
+    const ran = new Set<number>();
+    for (let i = 0; i < lines.length; ) {
+      const seq = lines[i]!.seq;
+      let j = i;
+      while (j < lines.length && lines[j]!.seq === seq) j++;
+      const next = lines[j]?.seq;
+      const starts = this.recentStarts.filter((st) => {
+        if (!(st.seq > seq && (next === undefined || st.seq < next))) return false;
+        const run = runOf(this.s, st.runId);
+        return run !== undefined && run.seq.admit > seq && run.principal === principal;
+      });
+      for (let k = i; k < Math.min(j, i + starts.length); k++) ran.add(k);
+      i = j;
+    }
+    return ran;
   }
 }
 
-/** Is `text` on the screen near the cursor (the program echoed it)? `extra` rows above the ones it would span. */
-function echoedOn(snap: ScreenSnapshot, text: string, extra: number): boolean {
+/**
+ * Did the program echo `text` after `prompt`: does a row near the cursor end with the prompt
+ * followed by the text (wrapped rows joined)? Any substring near the cursor used to do, so a
+ * number already on the screen a row above passed for the echo of the same number typed with
+ * echo off (the house's read of 3eade8a, #22). `extra` rows above the ones the line would span,
+ * for a check made after the program moved on.
+ */
+function echoedOn(snap: ScreenSnapshot, prompt: string, text: string, extra: number): boolean {
   const t = text.trim();
   if (!t) return false;
-  const span = Math.ceil(t.length / Math.max(1, snap.cols)) + 1 + extra;
+  const want = `${prompt}${text}`.trim();
+  const span = Math.ceil(want.length / Math.max(1, snap.cols)) + 1 + extra;
   const rows = snap.lines.slice(Math.max(0, snap.cursor.y - span), snap.cursor.y + 1);
-  return rows.join('').includes(t) || rows.some((r) => r.includes(t));
+  if (extra === 0) rows[rows.length - 1] = beforeCursor(snap);
+  return rows.some((r) => r.trimEnd().endsWith(want)) || rows.join('').trimEnd().endsWith(want);
 }

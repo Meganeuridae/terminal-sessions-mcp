@@ -404,7 +404,7 @@ export const looksLikeSecretPrompt = (textBeforeCursor: string): boolean => SECR
 const ESCAPES = /\x1b\[[^@-~]*[@-~]?|\x1b\][^]*?(?:\x07|\x1b\\|$)|\x1b[^]?|[\x00-\x08\x0b-\x1f]/g;
 
 /** Output with escape sequences removed, and where each kept character came from (for cuts in raw output). */
-function stripEscapes(s: string): { text: string; map: number[] } {
+export function stripEscapes(s: string): { text: string; map: number[] } {
   const map: number[] = [];
   let at = 0;
   const keep = (to: number) => {
