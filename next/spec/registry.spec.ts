@@ -525,6 +525,36 @@ test('G21: a reopen that fails to start prunes nothing — the history keeps the
   await cleanup(r);
 });
 
+test('G21: a damaged record is recovered with retention off, so a repair brings back what the daemon default would have pruned, and the reread applies the record\'s retention (the house\'s read of the 36 commits, #22)', async () => {
+  const r = rig();
+  // 256 KiB cap forces rotation into several files; the record keeps that retention.
+  const s = (await r.reg.ensure({ id: 'dr', owner: A, retention: { maxBytes: 256 * 1024 } })).session;
+  for (let i = 0; i < 20; i++) await run(s, A, 'big 16000');
+  await r.reg.close('dr');
+  await r.reg.closeAll();
+  const sdir = path.join(r.dir, 'sessions', 'dr');
+  const rotated = () => fs.readdirSync(sdir).filter((n) => /^journal\.\d+\.jsonl$/.test(n)).sort();
+  const before = rotated();
+  assert.ok(before.length >= 3, `rotated files to prune: ${JSON.stringify(before)}`);
+  // The record is damaged, and the daemon it restarts into carries a small default retention that would
+  // prune at open. A damaged record must not be pruned by a default it did not ask for: the repair the
+  // refusal invites could not then bring the history back.
+  fs.writeFileSync(path.join(sdir, 'session.json'), '{');
+  const { backend, shells } = scripted();
+  const reg = new SessionRegistry({ dataDir: r.dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), retention: { maxBytes: 64 * 1024 } });
+  const r2: Rig = { dir: r.dir, backend, shells, reg, changes: [] };
+  assert.equal(hist(reg.get('dr')).owner, 'unknown');
+  assert.deepEqual(rotated(), before, 'nothing pruned while the record is unreadable');
+  // Repaired without a per-session retention: the reread applies the daemon default — to the store too,
+  // not only to what the entry reports — so the history is pruned to it now that the record reads.
+  fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }));
+  await rejectsWith(reg.ensure({ id: 'dr', owner: B }), 'forbidden'); // triggers the reread; B is refused
+  assert.equal(hist(reg.get('dr')).owner, A);
+  assert.deepEqual(hist(reg.get('dr')).retention, { maxBytes: 65536 }, 'the record read applies the retention');
+  assert.ok(rotated().length < before.length, `and the store is pruned to it now: ${JSON.stringify(rotated())}`);
+  await cleanup(r2, r);
+});
+
 test('the integration preserves the environment the shell starts with — the session\'s over the daemon\'s — not the daemon\'s own', async () => {
   // zsh's ZDOTDIR and fish's XDG_DATA_DIRS were read from the daemon's environment, so a session's
   // own value appeared nowhere in its shell (the house's read of 2c35df8, #22).

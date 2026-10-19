@@ -268,3 +268,32 @@ test('Measure: the usage report finds the confusion signatures', () => {
   assert.equal(r.signatures['cancel-after-busy']!.count, 1);
   assert.equal(r.byTool.cancel!.errors, 1);
 });
+
+test('item 11/G18: the App rereads a repaired record before judging a new life\'s owner, so the owner reopens without a restart (the house\'s read of the 36 commits, #22)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-app-repair-'));
+  try {
+    const r1 = new SessionRegistry({ dataDir: dir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
+    const a1 = new App({ registry: r1, defaultWaitMs: 5000 });
+    await a1.sessionOpen(A, { id: 'rp' });
+    await a1.sessionClose(A, { session: 'rp' });
+    await r1.closeAll();
+    // The record is damaged: a fresh daemon surfaces the session with an unknown owner.
+    const file = path.join(dir, 'sessions', 'rp', 'session.json');
+    fs.writeFileSync(file, '{');
+    const r2 = new SessionRegistry({ dataDir: dir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
+    const a2 = new App({ registry: r2, defaultWaitMs: 5000 });
+    try {
+      assert.equal(r2.get('rp')?.kind, 'history');
+      // The operator repairs the record on disk, naming the real owner. The owner's own call must
+      // reread it before judging — not refuse from the cached unknown owner, as it did before the fix.
+      fs.writeFileSync(file, JSON.stringify({ owner: A.principal, visibility: 'private' }));
+      const r = await a2.sessionOpen(A, { id: 'rp' });
+      assert.ok(r, 'the owner reopens the repaired session with no restart');
+      assert.equal(r2.get('rp')?.kind, 'live');
+    } finally {
+      await r2.closeAll();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

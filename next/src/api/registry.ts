@@ -461,7 +461,11 @@ export class SessionRegistry {
     const dir = path.join(this.root, id);
     if (!fs.statSync(dir).isDirectory()) return undefined;
     const meta = readMeta(dir);
-    const retention = this.retentionFor(undefined, meta.retention);
+    // A record that cannot be read names no retention to trust: open with retention off, so a FileStore
+    // does not prune at open what a repair (which the refusal invites) could bring back; the real
+    // retention is applied once a valid record reads (rereadRecord / newLife). The house's read of the
+    // 36 commits, #22 (comment 6269992150): the default pruned before finishRecovery refused the name.
+    const retention = recordRefusal(id, meta) ? {} : this.retentionFor(undefined, meta.retention);
     const store = new FileStore(dir, this.storeOptions(retention));
     const gone = expired(store, retention, Date.now());
     // The journal is opened before the store is judged empty: a file holding only a rotation header
@@ -699,14 +703,29 @@ export class SessionRegistry {
     return principal === SYSTEM || principal === ownerOf(slot);
   }
 
+  /**
+   * Re-read a name's record from disk when it is refused (damaged or missing), and return its current
+   * view. The App calls this before judging a new life's owner, so a repaired record names the owner
+   * without a restart for every caller, not only the system (the house's read of the 36 commits, #22,
+   * comment 6269992150). A no-op when the record already reads, or the name is live or unknown.
+   */
+  rereadIfRefused(id: string): AnySession | undefined {
+    const slot = this.slots.get(id);
+    if (slot && recordRefusal(slot.id, slot.meta)) this.rereadRecord(slot);
+    return slot?.view;
+  }
+
   /** Read a history entry's record again; one that reads now gives the entry its owner, visibility and options. */
   private rereadRecord(slot: Slot): void {
     const meta = readMeta(slot.dir);
     slot.meta = meta;
     if (recordRefusal(slot.id, meta) || slot.view.kind !== 'history') return;
     const v = slot.view;
-    // The retention is the record's now, not the default chosen while the record was unreadable.
+    // The retention is the record's now, not the default (nor the retention-off) chosen while the
+    // record was unreadable, and it is applied to the store too — not only reported — so the history is
+    // kept under what the record says (the house's read of the 36 commits, #22, comment 6269992150).
     const retention = this.retentionFor(undefined, meta.retention);
+    slot.store.setRetention(retention);
     slot.view = new HistoryEntry(slot.id, v.journal, meta.owner ?? SYSTEM, meta.visibility ?? 'private', meta.closedAt !== undefined, retention, recordedOptions(meta, retention), slot.cursors);
     this.opts.log?.('info', 'session record reads again; its owner may start a new life for the session', { session: slot.id, owner: slot.view.owner });
   }
@@ -769,7 +788,6 @@ export class SessionRegistry {
     let integ: ReturnType<typeof prepareIntegration> | undefined;
     let session: Session;
     try {
-      writeMeta(dir, meta);
       // The integration files live in the session's own directory: a daemon that dies leaves them for
       // the next life to overwrite, not in the system's temp dir. The user's environment the
       // integration preserves (zsh's ZDOTDIR, fish's XDG variables) is the one the shell starts
@@ -810,21 +828,21 @@ export class SessionRegistry {
       session = await Session.start(so);
     } catch (e) {
       integ?.cleanup();
-      // A start that failed is not a life: the record keeps what the last life was created with,
-      // and its closedAt, so a plain reopen starts the shell the name had and the history still
-      // reads as closed (the house's read of 2c35df8, #22). A name with no record keeps the attempt's.
+      // A start that failed is not a life: the record is written only once the start succeeds, so a
+      // reopen whose start failed never overwrote the old record — the history keeps the retention and
+      // the closedAt it had, on disk and in memory (the house's read of the 36 commits, #22, comment
+      // 6269992150). A name that had no record but journaled something keeps the attempt's, so its
+      // history stays owned and reopenable; a failed write is logged, not swallowed.
       const kept = recorded.owner !== undefined ? recorded : meta;
-      if (kept !== meta) {
-        try {
-          writeMeta(dir, kept);
-        } catch {
-          // the record in memory stands; the disk has the attempt's until the next write
-        }
-      }
-      // The name keeps its history (and whatever the failed start journaled), readable and owned (G19),
-      // under the retention it had.
       journal.seal();
       if (prev || journal.lastSeq > 0) {
+        if (recorded.owner === undefined) {
+          try {
+            writeMeta(dir, meta);
+          } catch (we) {
+            this.opts.log?.('warn', `could not record a failed new session's owner: ${we instanceof Error ? we.message : String(we)}`, { session: id });
+          }
+        }
         const view = new HistoryEntry(id, journal, kept.owner ?? o.owner, kept.visibility ?? options.visibility, kept.closedAt !== undefined, before, recordedOptions(kept, before), cursors);
         this.slots.set(id, { id, dir, store, meta: kept, cursors, view });
       } else {
@@ -832,7 +850,14 @@ export class SessionRegistry {
       }
       throw e;
     }
-    // Started: the history is kept under this life's retention from here on.
+    // Started: the record is written now (with this life's retention), and the history is kept under it
+    // from here on. A failed record write is logged, not swallowed; the session is live and the record
+    // is retried at its next change.
+    try {
+      writeMeta(dir, meta);
+    } catch (we) {
+      this.opts.log?.('warn', `history is live but its record could not be written: ${we instanceof Error ? we.message : String(we)}`, { session: id });
+    }
     store.setRetention(retention);
     this.slots.set(id, { id, dir, store, meta, cursors, view: new LiveEntry(session, () => integ?.cleanup(), retention, options) });
     this.emit({ type: 'created', id });
@@ -1208,7 +1233,13 @@ function readMeta(dir: string): Meta {
   try {
     const parsed: unknown = JSON.parse(raw);
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return { damaged: 'not a JSON object' };
-    return parsed as Meta;
+    const rec = parsed as Meta;
+    // A valid JSON object that names no owner (or a non-string one) names nobody: treat it as damaged,
+    // so the name is nobody's to reopen until it is repaired — not handed to the system, which `{}`
+    // and an owner that is not a string both were (the house's read of the 36 commits, #22, comment
+    // 6269992150). recordRefusal's own doc says a record naming no owner earns the refusal.
+    if (typeof rec.owner !== 'string' || rec.owner.length === 0) return { damaged: 'the record (session.json) names no owner' };
+    return rec;
   } catch (e) {
     return { damaged: (e as Error).message };
   }

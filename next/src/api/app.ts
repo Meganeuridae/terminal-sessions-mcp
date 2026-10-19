@@ -600,10 +600,15 @@ export class App {
    */
   private newLifeOwner(caller: Caller, existing: AnySession | undefined, id: string): Principal {
     if (!existing || caller.principal === SYSTEM) return caller.principal;
-    const owner = existing.kind === 'live' ? existing.session.owner : existing.owner;
+    // A recovered session whose record was repaired names its owner once re-read. Ask the registry to
+    // re-read a refused (damaged or missing) record before judging, so the refusal's promise — it names
+    // the owner without a restart — holds for every caller, not only the system, which reached the
+    // registry's own re-read first (the house's read of the 36 commits, #22, comment 6269992150).
+    const current = existing.kind === 'history' ? this.registry.rereadIfRefused(id) ?? existing : existing;
+    const owner = current.kind === 'live' ? current.session.owner : current.owner;
     if (caller.principal === owner || guiActsFor(caller.principal, owner)) return owner;
-    if (!this.can(caller.principal, existing, 'observe')) throw err('session_exists', `the name ${id} belongs to another principal; choose another name`, { session: id });
-    throw err('forbidden', endedMessage(existing, false), { session: id, owner });
+    if (!this.can(caller.principal, current, 'observe')) throw err('session_exists', `the name ${id} belongs to another principal; choose another name`, { session: id });
+    throw err('forbidden', endedMessage(current, false), { session: id, owner });
   }
 
   private busyResult(session: Session, target: RunTarget, reason: string, occupant: RunInfo | null | undefined, created: boolean): RunResult {
