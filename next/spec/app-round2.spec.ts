@@ -1,8 +1,8 @@
 /**
  * The application layer's round-2 fixes against real bash: authorization of a name
  * another call is creating (jr2-1), idempotency bounds, argument checks and restart
- * survival (G16), earlier lives (G30), results that tell agents what to do next, and
- * the compat pack's 1.x fidelity.
+ * survival (G16), earlier lives (G30), and results that tell agents what to do next
+ * (the compat pack's 1.x fidelity: compat.spec).
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,7 +11,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { App, type Caller } from '../src/api/app.js';
 import { SessionRegistry } from '../src/api/registry.js';
-import { callTool, TOOLS, toolsFor, type ResultText, type ToolResult } from '../src/api/tools.js';
+import { callTool, TOOLS, type ResultText, type ToolResult } from '../src/api/tools.js';
 import { validate } from '../src/api/validate.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { sleep, until } from './testhost.js';
@@ -222,26 +222,4 @@ test('results name what to do next: queued, waiting for input, ignored cwd, inte
   assert.ok(m, found.text);
   const page = await tool('read', { session: 'ux1', since: Number(m[1]), ...(m[2] ? { offset: Number(m[2]) } : {}) });
   assert.match(page.text, /NEEDLE here/, 'reading from the cursor includes the match');
-});
-
-test('compat: literal ready patterns, case-insensitive searchLogs, complete raw output, await for runIds', async () => {
-  const compat = toolsFor('compat');
-  assert.ok(compat.some((t) => t.name === 'await') && compat.some((t) => t.name === 'read'));
-  const call = async (name: string, args: Record<string, unknown>) => JSON.parse((await callTool(name, args, { app, caller: A, resultText: 'json' }, compat)).text) as Record<string, unknown> & unknown[];
-  const launched = await call('launch', { name: 'cpt-svc', command: 'echo "[server] ready (port 3000)?"; sleep 30', readyPatterns: ['[server] ready (port 3000)?'] });
-  assert.equal(launched.status, 'ready', JSON.stringify(launched));
-  await call('killSession', { session: 'cpt-svc', graceful: false });
-
-  await call('runCommand', { session: 'cpt', command: 'echo "Some ERROR happened"' });
-  const found = await call('searchLogs', { session: 'cpt', pattern: 'error happened' });
-  assert.equal((found as unknown as unknown[]).length, 1);
-
-  const raw = await call('runCommand', { session: 'cpt', command: 'for i in $(seq 1 600); do echo "line $i"; sleep 0.001; done', raw: true });
-  assert.match(String(raw.output), /line 1\r?\n/);
-  assert.match(String(raw.output), /line 600/);
-
-  const slow = await call('runCommand', { session: 'cpt', command: '(sleep 0.5; exit 4)', timeout: -1 });
-  assert.match(String(slow.note), /await \{"runId": "r/);
-  const done = JSON.parse((await callTool('await', { runId: slow.runId, wait: 3000 }, { app, caller: A, resultText: 'json' }, compat)).text);
-  assert.equal(done.exit, 4);
 });

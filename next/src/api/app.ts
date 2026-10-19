@@ -98,7 +98,12 @@ export interface SessionSummary {
   closed?: boolean;
   createdAt?: number;
   lastActivity?: number;
-  services?: Array<{ runId: string; name?: string; status: ServiceStatus }>;
+  /** The innermost declared shell (§8.1), where shell Runs go now; absent when they go to the session's own shell. */
+  declared?: { shell: string; within: string | null };
+  /** The terminal's geometry (live sessions). */
+  cols?: number;
+  rows?: number;
+  services?: Array<{ runId: string; name?: string; status: ServiceStatus; evidence?: string }>;
   watches?: number;
   /** Runs that have not ended (shell and process), newest last, so a lost runId can be found again. */
   runs?: Array<{ runId: string; target: RunTarget; state: RunInfo['state']; principal: Principal; line?: string; admittedAt: number }>;
@@ -377,13 +382,16 @@ export class App {
         lastSeq: i.lastSeq,
         createdAt: i.createdAt,
         lastActivity: i.lastActivity,
+        cols: i.cols,
+        rows: i.rows,
       };
+      if (i.declared) out.declared = i.declared;
       const oldest = s.session.journal.oldestSeq;
       if (oldest !== undefined) out.oldestSeq = oldest;
       out.retention = { ...s.retention };
       const x = this.extrasBySession.get(s.session);
       if (x) {
-        const services = x.services.list().map((v) => ({ runId: v.runId, status: v.status, ...(v.name !== undefined ? { name: v.name } : {}) }));
+        const services = x.services.list().map((v) => ({ runId: v.runId, status: v.status, ...(v.name !== undefined ? { name: v.name } : {}), ...(v.evidence !== undefined ? { evidence: v.evidence } : {}) }));
         if (services.length) out.services = services;
         const w = x.watches.list().length;
         if (w) out.watches = w;

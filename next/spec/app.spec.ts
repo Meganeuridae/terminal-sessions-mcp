@@ -1,7 +1,7 @@
 /**
  * The application API and the tool table against real bash: idempotency (G16),
  * verbs (G17/G18), every result envelope against its outputSchema (G27), read
- * paging (G11), search, services (G9), watches, and the compat pack.
+ * paging (G11), search, services (G9), and watches (the compat pack: compat.spec).
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,11 +11,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { App, type Caller } from '../src/api/app.js';
 import { SessionRegistry } from '../src/api/registry.js';
-import { callTool, TOOLS, toolsFor, type ResultText, type ToolResult } from '../src/api/tools.js';
+import { callTool, TOOLS, type ResultText, type ToolResult } from '../src/api/tools.js';
 import { analyze, type UsageRecord } from '../src/api/usage.js';
 import { validate } from '../src/api/validate.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
-import { sleep, until } from './testhost.js';
+import { until } from './testhost.js';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-app-'));
 let registry: SessionRegistry;
@@ -232,39 +232,6 @@ test('watches: a pattern watch fires as a journal event; wait_for sees a line pr
   const rm = await tool('unwatch', { session: 'wat', watchId: w.structured?.watchId }, B);
   assert.equal(rm.isError, true, 'only the watch owner or session owner removes it');
   await tool('unwatch', { session: 'wat', watchId: w.structured?.watchId });
-});
-
-test('compat pack: the 1.x names keep their shapes and tell the truth about running commands', async () => {
-  const compat = toolsFor('compat');
-  const call = async (name: string, args: Record<string, unknown>) => JSON.parse((await callTool(name, args, { app, caller: A, resultText: 'json' }, compat)).text) as Record<string, unknown> & unknown[];
-  const r = await call('runCommand', { session: 'legacy', command: 'echo legacy-ok' });
-  assert.equal(r.exitCode, 0);
-  assert.match(String(r.output), /legacy-ok/);
-  const running = await call('runCommand', { session: 'legacy', command: 'sleep 1; echo later', timeout: -1 });
-  assert.equal(running.exitCode, -1);
-  assert.ok(running.state === 'running' || running.state === 'starting', String(running.state));
-  // 1.x queued overlapping calls to one session (atc-10): this one runs after the sleep.
-  const queued = await call('runCommand', { session: 'legacy', command: 'echo queued-ran', timeout: 50 });
-  assert.equal(queued.state, 'queued');
-  await sleep(1300);
-  const tail = await call('tailLogs', { session: 'legacy', lines: 20 });
-  assert.ok((tail as unknown as string[]).some((l) => l.includes('later')), JSON.stringify(tail));
-  assert.ok((tail as unknown as string[]).some((l) => l.includes('queued-ran')), JSON.stringify(tail));
-  const found = await call('searchLogs', { session: 'legacy', pattern: 'legacy-ok' });
-  assert.ok((found as unknown as unknown[]).length >= 1);
-  await call('runCommand', { session: 'legacy', command: 'read -p "name? " n; echo "hello $n"', timeout: -1 });
-  await sleep(300);
-  const sent = await call('sendInput', { session: 'legacy', input: 'claude' });
-  assert.equal(sent.success, true);
-  await sleep(500);
-  const after2 = await call('tailLogs', { session: 'legacy', lines: 5 });
-  assert.ok((after2 as unknown as string[]).some((l) => l.includes('hello claude')), JSON.stringify(after2));
-  const launched = await call('launch', { name: 'legacy-svc', command: 'echo ready-now; sleep 30', readyPatterns: ['ready-now'] });
-  assert.equal(launched.status, 'ready');
-  const list = await call('listSessions', {});
-  assert.ok((list as unknown as Array<{ id: string; isAlive: boolean }>).some((s) => s.id === 'legacy-svc' && s.isAlive));
-  const killed = await call('killSession', { session: 'legacy-svc', graceful: false });
-  assert.equal(killed.success, true);
 });
 
 test('Measure: the usage report finds the confusion signatures', () => {

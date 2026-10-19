@@ -9,7 +9,10 @@
 import { TermError } from '../core/errors.js';
 import type { App, Caller, ReadResult, RunResult, SearchResult, SessionSummary } from './app.js';
 import { COMPAT_TOOLS } from './compat.js';
+import { looksLikeErrexit, looksLikeShellOpener, oneShotSshWithoutTty } from './hints.js';
 import { validate, ValidationError, type Schema } from './validate.js';
+
+export { looksLikeErrexit, looksLikeShellOpener, oneShotSshWithoutTty } from './hints.js';
 
 export type Tier = 'core' | 'control' | 'services' | 'watch' | 'search' | 'compat';
 export type Profile = 'core' | 'full' | 'compat';
@@ -93,48 +96,6 @@ const BUSY_NEXT: Record<string, string> = {
   starting: 'the shell is still starting: pass queue:true to run once it is ready',
   exited: 'the shell has exited: run again to start a new one',
 };
-
-/**
- * Does the command line read like one that opens another shell (ssh, sudo -i, docker exec, a
- * nested shell, …)? Only ever a hint in a result's text; what is in front is the caller's to say (§8.1).
- */
-const SHELL_OPENER = /^(?:(?:sudo|doas|env|command|exec|time)\s+(?:(?:-\S+|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*)*(?:ssh|mosh|sudo\s+-[is]\b|su\b|docker\s+(?:exec|run)\b|podman\s+(?:exec|run)\b|kubectl\s+exec\b|nix-shell\b|nix\s+develop\b|poetry\s+shell\b|pipenv\s+shell\b|limactl\s+shell\b|lima\s+shell\b|vagrant\s+ssh\b|(?:\S*\/)?(?:sh|bash|zsh|dash|ksh|mksh|fish)(?:\s|$))/;
-export const looksLikeShellOpener = (line: string | undefined): boolean => line !== undefined && SHELL_OPENER.test(line.trim());
-
-/**
- * Does the line, at a command position, turn on errexit in the shell it runs in (`set -e`,
- * `set -euo pipefail`, `set -o errexit`)? In a session shell that stays on: the next
- * failing command ends the whole shell, and the Run in it ends `lost`. A hint only.
- */
-const ERREXIT = /(?:^|[;&|\n]\s*|\b(?:then|do|else)\s+)set\s+(?:-[A-Za-df-z]*e[A-Za-z]*\b|-o\s+errexit\b)/;
-export const looksLikeErrexit = (line: string | undefined): boolean => line !== undefined && ERREXIT.test(line);
-
-/**
- * Is the line a one-shot `ssh [options] host command` without `-t`/`-tt`? Such a remote
- * command has no terminal: a cancel here ends ssh and nothing reaches the command, and a
- * dropped connection does not hang it up, so it runs on until it writes to the closed
- * connection. Returns the host for the hint, or undefined. A hint only.
- */
-const SSH_OPT_WITH_ARG = new Set(['-b', '-B', '-c', '-D', '-e', '-E', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-P', '-Q', '-R', '-S', '-W', '-w']);
-export function oneShotSshWithoutTty(line: string | undefined): string | undefined {
-  if (line === undefined) return undefined;
-  const words = line.trim().split(/\s+/);
-  let i = 0;
-  // Prefixes the shell-opener pattern allows too: sudo/env/command/exec/time and assignments.
-  while (i < words.length && (/^(?:sudo|doas|env|command|exec|time)$/.test(words[i]!) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!) || (i > 0 && /^-/.test(words[i]!) && /^(?:sudo|doas|env)$/.test(words[i - 1]!)))) i++;
-  if (words[i] !== 'ssh') return undefined;
-  i++;
-  let tty = false;
-  for (; i < words.length && words[i]!.startsWith('-'); i++) {
-    const w = words[i]!;
-    if (w === '--') { i++; break; }
-    if (/^-t+$/.test(w) || /^-[A-Za-z]*t/.test(w)) tty = true;
-    if (SSH_OPT_WITH_ARG.has(w)) i++;
-  }
-  if (tty || i >= words.length) return undefined;
-  const host = words[i]!;
-  return i + 1 < words.length ? host : undefined; // a host alone opens a shell: that is the other hint
-}
 
 const SET_E_NOTE = 'set -e belongs inside scripts and subshells, not in a session shell, where it makes every later failing command end the whole shell';
 
@@ -892,10 +853,12 @@ export const TOOLS: ToolDef[] = [
 
 export const CORE_TOOLS = TOOLS.filter((t) => t.tier === 'core').map((t) => t.name);
 
-/** Plain MCP profiles: `core` (the default), `full` (every tier), `compat` (the 1.x names plus await and read, one release). */
+/** Plain MCP profiles: `core` (the default), `full` (every tier), `compat` (the 1.x names plus await, read and session_declare_shell, one release). */
 export function toolsFor(profile: Profile): ToolDef[] {
   // compat also serves `await` and `read`: its results hand out runIds, and these are how to follow them (ux-14).
-  if (profile === 'compat') return TOOLS.filter((t) => t.tier === 'compat' || t.name === 'await' || t.name === 'read');
+  // compat also serves session_declare_shell: 1.x typed commands into whatever shell was in front (ssh, sudo -i, a nested
+  // shell), and runCommand can only send them there once the caller has declared it (the house's read of 1cabc6a, #22).
+  if (profile === 'compat') return TOOLS.filter((t) => t.tier === 'compat' || t.name === 'await' || t.name === 'read' || t.name === 'session_declare_shell');
   if (profile === 'full') return TOOLS.filter((t) => t.tier !== 'compat');
   return TOOLS.filter((t) => t.tier === 'core');
 }
