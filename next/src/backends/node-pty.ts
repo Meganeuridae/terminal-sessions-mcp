@@ -72,6 +72,26 @@ function pidExists(pid: number): boolean | undefined {
   }
 }
 
+/**
+ * Whether the terminal slave's input is in canonical mode: `stty -a` names `icanon` when on,
+ * `-icanon` when off (readline at a prompt turns it off). true: a `read`/password prompt is
+ * reading a line; false: readline is editing; undefined: the slave's termios cannot be read.
+ * The daemon owns the slave name, so this reads it without disturbing the shell (the house's
+ * read, #22 comment 6264958172: a typed reinit landed in an rc's `read -p`).
+ */
+function canonicalInput(ptsName: string | undefined): boolean | undefined {
+  if (!ptsName) return undefined;
+  try {
+    const flag = process.platform === 'linux' ? '-F' : '-f';
+    const out = execFileSync('stty', ['-a', flag, ptsName], { encoding: 'utf8', timeout: 2000 });
+    if (/-icanon\b/.test(out)) return false;
+    if (/\bicanon\b/.test(out)) return true;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** A process's current command line: `/proc/<pid>/cmdline` on Linux, `ps` elsewhere. */
 function readCommand(pid: number): string | undefined {
   try {
@@ -120,6 +140,9 @@ class NodePty implements PtyHandle {
   }
   command(): string | undefined {
     return readCommand(this.p.pid);
+  }
+  canonicalInput(): boolean | undefined {
+    return canonicalInput((this.p as { ptsName?: string }).ptsName);
   }
   signalGroup(pgid: number, signal: NodeJS.Signals): boolean {
     if (!(pgid > 1)) return false;

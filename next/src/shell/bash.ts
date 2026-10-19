@@ -92,7 +92,10 @@ if [ "$\{1-}" = reinit ]; then
     case $__tsm_e in *[![:space:]\\;]*) __tsm_pcs+=("$__tsm_e") ;; esac
   done
   unset PROMPT_COMMAND
-  if [ "$\{#__tsm_pcs[@]}" -gt 0 ]; then PROMPT_COMMAND=("$\{__tsm_pcs[@]}"); fi
+  # Solo when nothing of the inherited value runs after our hook at this prompt: then precmd may
+  # clear __tsm_reinit_pending (promptvars off never lets PS1 do it); with an appended part still to
+  # run, PS1 clears it after that part, so the DEBUG trap stands down for it (#22 comment 6264958172).
+  if [ "$\{#__tsm_pcs[@]}" -gt 0 ]; then PROMPT_COMMAND=("$\{__tsm_pcs[@]}"); __tsm_reinit_solo=; else __tsm_reinit_solo=1; fi
   unset __tsm_pcs __tsm_e
   __tsm_reinit_pending=1
   if [ -z "$__tsm_key" ]; then return 0; fi
@@ -230,6 +233,13 @@ __tsm_preexec() {
   __tsm_osc "633;E;$__tsm_ret"
   __tsm_osc '133;C'
   __tsm_in_cmd=1
+  # A typed line's Run has started: later DEBUG firings in it are the line's own, even one that
+  # matches a PROMPT_COMMAND the line itself just set (the house's read, #22 comment 6264958172: a
+  # typed \`PROMPT_COMMAND="history -a"; history -a; sleep 3\` read as idle, its heal mistaking the
+  # line's own \`history -a\` for the prompt's). The heal stands down until the next precmd (ss-9).
+  # A daemon line (sourced through \`.\`) suspends the DEBUG trap, so it has no later firings of its
+  # own; leaving the flag clear for it keeps the heal working at the prompt that follows it.
+  case $__line in ". '"*tsm-cmd-*"'") ;; *) __tsm_line_started=1 ;; esac
   __tsm_opened=
   __tsm_text "$__line"
   # A command that may set a DEBUG trap — one that names trap, or sources a file or evals text that
@@ -243,6 +253,7 @@ __tsm_precmd() {
   set +eu
   # (An empty line ran no command since the last prompt armed pre-execution detection.)
   __tsm_prompt_active=
+  __tsm_line_started=
   __tsm_top=
   if [ -n "$__tsm_exec_armed" ]; then __tsm_exec_disarm; fi
   # Our DEBUG trap did not fire for the last command, or the command may have set a
@@ -276,7 +287,11 @@ __tsm_precmd() {
   # elements of an array PROMPT_COMMAND on bash >= 5.1) still run after this function:
   # fold them into the user's part for next time, and leave arming to the PS1 expansion
   # that follows them — armed, they would look like a command (ss-9).
-  if __tsm_pc_intact; then __tsm_top="$\{__tsm_top:+$__tsm_top; }__tsm_prompt_active=1"; else __tsm_fold_pc; fi
+  # Clearing __tsm_reinit_pending is PS1's job (the B mark), except with promptvars off, where
+  # PS1 expands no command/arith substitution: when the hook stands alone (nothing of the inherited
+  # value runs after it — __tsm_reinit_solo), clear it here too, so the DEBUG trap does not stand
+  # down for good on the next Run after \`exec bash\` (the house's read, #22 comment 6264958172).
+  if __tsm_pc_intact; then __tsm_top="$\{__tsm_top:+$__tsm_top; }$\{__tsm_reinit_solo:+__tsm_reinit_pending=0; }__tsm_prompt_active=1"; else __tsm_fold_pc; fi
   __tsm_restore "$__o"
   # Leave $? as the command left it (PS1 may show it); never under errexit, where
   # returning a failure would end the shell.
@@ -297,8 +312,16 @@ __tsm_debug() {
     eval "$__tsm_prev_debug"
   fi
   if [ "$BASH_COMMAND" != __tsm_precmd ] && [ -z "$__tsm_exec_armed" ] && ! __tsm_pc_intact; then
-    # A command of the prompt's own (it stands in PROMPT_COMMAND) is never a Run.
-    if __tsm_heal_pc "$__st"; then __tsm_prompt_active=; fi
+    if [ -n "$__tsm_line_started" ]; then
+      # A typed line's Run is running: a later command of the line that reassigned PROMPT_COMMAND is
+      # the line's own, not the prompt's (so no close here). Still fold the reassignment back behind
+      # our hook, so the next prompt's precmd runs and closes the Run — without it the Run read as
+      # idle while \`sleep 3\` ran on (the house's read, #22 comment 6264958172).
+      __tsm_fold_pc
+    else
+      # A command of the prompt's own (it stands in PROMPT_COMMAND) is never a Run.
+      if __tsm_heal_pc "$__st"; then __tsm_prompt_active=; fi
+    fi
   fi
   if [ -n "$__tsm_prompt_active" ] && [ -z "$\{COMP_LINE-}" ] && [ -z "$\{READLINE_LINE+x}" ] && [ "$BASH_COMMAND" != __tsm_precmd ]; then
     __tsm_prompt_active=
@@ -465,6 +488,7 @@ __tsm_own_history_keys() {
 
 __tsm_in_cmd=
 __tsm_prompt_active=
+__tsm_line_started=
 __tsm_opened=
 __tsm_dbg_tick=
 __tsm_hist_n=

@@ -17,6 +17,7 @@ import { configuredEnv, historyIsolationEnv, parseEnvNul, redactSnapshot, type E
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
 import { livingGroups } from './lock.js';
+import { clocks } from './clock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
@@ -447,7 +448,14 @@ function normalizeSignal(signal: unknown): NodeJS.Signals {
  */
 type ShellFlavor = 'posix' | 'zsh' | 'fish';
 
-/** The flavor of a shell path or command line (`-zsh` for a login shell, `/bin/bash --rcfile …`). */
+/**
+ * The flavor of a shell path or command line (`-zsh` for a login shell, `/bin/bash --rcfile …`).
+ * An unrecognised shell is POSIX here, on purpose, and not refused the way `declaredFlavor` refuses
+ * an unknown declared name (the house's read, #22 comment 6264958172): this is the session's own
+ * shell, chosen when the session was opened, and all it decides is how a daemon line is sourced — by
+ * `.`, which every POSIX shell has — whereas a declared name decides inline syntax typed into a
+ * foreign shell, where a wrong guess is worse than a clear refusal.
+ */
 function flavorOf(command: string | undefined): ShellFlavor {
   const first = (command ?? '').trim().split(/\s+/)[0] ?? '';
   const base = path.basename(first).replace(/^-/, '');
@@ -912,26 +920,41 @@ export class Session {
     // Told from the command line the shell had when it announced itself: by the time this mark is
     // read, the exec has usually happened.
     const before = this.helloCommand ?? this.pty.command();
-    const startedAt = Date.now();
+    const startedAt = clocks.monotonic();
     let changedAt: number | undefined;
     let reinitTyped = false;
+    let reinitWaitStart: number | undefined;
     const tick = (): void => {
       if (isTerminal(run.state) || this.closed || this.shellState === 'exited') return this.stopExecWatch();
       const now = this.pty.command?.();
       if (now !== undefined && before !== undefined && now !== before) {
-        changedAt ??= Date.now();
+        changedAt ??= clocks.monotonic();
         // bash, zsh and fish re-announce themselves after an exec: their hello gets the startup cap.
         const kind = path.basename(now.trim().split(/\s+/)[0] ?? '').replace(/^-/, '');
-        const wait = ['bash', 'zsh', 'fish'].includes(kind) ? (this.opts.startupCapMs ?? 15_000) : (this.opts.integrationGraceMs ?? 3000);
-        if (Date.now() - changedAt >= wait) {
+        const cap = this.opts.startupCapMs ?? 15_000;
+        const wait = ['bash', 'zsh', 'fish'].includes(kind) ? cap : (this.opts.integrationGraceMs ?? 3000);
+        if (clocks.monotonic() - changedAt >= wait) {
           if (kind === 'bash' && !reinitTyped) {
             // A new bash whose rc replaced the PROMPT_COMMAND the handoff left it never loaded the
             // integration (the house's read of 1d83ffa). The rc's path is still in its environment:
-            // load it from here, once, and wait for its hello again.
-            reinitTyped = true;
-            changedAt = Date.now();
-            this.note('the new bash did not load the shell integration (its rc replaced PROMPT_COMMAND): loading it once more');
-            this.pty.write(' . "$TSM_BASH_RC" reinit typed\n');
+            // load it from here, once, and wait for its hello again. But type it only when bash's
+            // line editor holds the terminal (ICANON off): an rc that reads a line before its first
+            // prompt (`read -p`, a password prompt) leaves it canonical, and the reinit would land in
+            // that read (the house's read, #22 comment 6264958172). While it stays canonical, or its
+            // mode cannot be read, wait a bounded time, then give up as a replacement, as before.
+            const canon = this.pty.canonicalInput?.();
+            if (canon === false) {
+              reinitTyped = true;
+              changedAt = clocks.monotonic();
+              this.note('the new bash did not load the shell integration (its rc replaced PROMPT_COMMAND): loading it once more');
+              this.pty.write(' . "$TSM_BASH_RC" reinit typed\n');
+            } else {
+              reinitWaitStart ??= clocks.monotonic();
+              if (clocks.monotonic() - reinitWaitStart >= cap) {
+                this.stopExecWatch();
+                return this.onShellReplaced(now);
+              }
+            }
           } else {
             this.stopExecWatch();
             return this.onShellReplaced(now);
@@ -940,7 +963,7 @@ export class Session {
       }
       // An exec replaces the process at once, but it may come at the end of a long line: poll
       // briskly at first, then slowly.
-      if (this.execWatch) this.execWatch.timer = setTimeout(tick, Date.now() - startedAt < 3000 ? 100 : 1000);
+      if (this.execWatch) this.execWatch.timer = setTimeout(tick, clocks.monotonic() - startedAt < 3000 ? 100 : 1000);
     };
     this.execWatch = { run, timer: setTimeout(tick, 50) };
   }
@@ -1731,6 +1754,11 @@ export class Session {
       this.note(`declared: ${program} is a ${shell} shell; shell Runs go to it${within === null ? '' : ` until ${within} ends`}`);
     }
     this.layers.push(layer);
+    // A fresh declaration starts with nothing proven: the shell proven to run here before (a local
+    // `sh`) is not the one declared now (`exec ssh host`, declared at the same layer), and a carried
+    // `proven` would read the remote shell as free whenever its client is in front (the house's read,
+    // #22 comment 6264958172). learnDeclaredForeground keeps `proven` only at an end marker.
+    this.declaredFg.delete(within);
     this.learnDeclaredForeground(within);
     return { shell, within, depth: this.layers.length };
   }

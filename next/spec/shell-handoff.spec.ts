@@ -7,6 +7,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { processLaunch } from '../src/core/launch.js';
+import type { JournalEvent } from '../src/core/types.js';
 import { prepareIntegration } from '../src/shell/integration.js';
 import { AGENT, hasShell, realSession, until } from './fake-shell.js';
 
@@ -187,3 +188,49 @@ for (const [how, rc] of [
     }
   });
 }
+
+const handoffOutput = (x: Awaited<ReturnType<typeof realSession>>): string =>
+  x.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output').map((e) => e.data).join('');
+
+test('/bin/bash: the reinit is never typed into an rc that reads a line before its first prompt', { skip: !hasShell('/bin/bash') }, async () => {
+  // The post-exec bash replaces PROMPT_COMMAND (no hello) and reads a line before any prompt. The
+  // daemon must not type its reinit into that read — the terminal is canonical then, not readline
+  // (the house's read, #22 comment 6264958172). It waits, then gives up as a replacement.
+  const x = await realSession('/bin/bash', {
+    login: false,
+    rc: { '.bashrc': 'PROMPT_COMMAND=:\nif [ -n "${SECOND-}" ]; then IFS= read -r -p "rc-read> " __x; printf "RC-GOT:[%s]\\n" "$__x"; fi\n' },
+    startupCapMs: 400,
+    integrationGraceMs: 300,
+  });
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'first shell ready');
+    const handoff = await x.run('export SECOND=1; exec /bin/bash', 20_000);
+    assert.deepEqual([handoff.state, handoff.reason], ['lost', 'shell-replaced']);
+    await until(() => x.session.info().state === 'unavailable', 8000, 'unavailable');
+    // Complete the still-blocked read and read back what it captured: nothing, not the reinit line.
+    x.session.input('\n', { principal: AGENT });
+    await until(() => /RC-GOT:\[[^\]]*\]/.test(handoffOutput(x)), 3000, 'the rc read completed');
+    const out = handoffOutput(x);
+    assert.ok(!out.includes('reinit typed'), `the reinit leaked into the read: ${out.match(/RC-GOT:\[[^\]]*\]/)?.[0]}`);
+    assert.match(out, /RC-GOT:\[\]/);
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: with promptvars off, exec bash integrates and the next Runs exit 0', { skip: !hasShell('/bin/bash') }, async () => {
+  // __tsm_reinit_pending is cleared by PS1's arithmetic, which promptvars off never expands; the
+  // hook now clears it at the end of PROMPT_COMMAND when it stands alone, so the DEBUG trap does not
+  // stand down for good after exec bash (the house's read, #22 comment 6264958172).
+  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': 'shopt -u promptvars\n' }, startupCapMs: 1500 });
+  try {
+    const handoff = await x.run('exec /bin/bash', 20_000);
+    assert.deepEqual([handoff.state, handoff.reason], ['lost', 'shell-replaced']);
+    const a = await x.run('echo one', 20_000);
+    const b = await x.run('echo two', 20_000);
+    assert.deepEqual([a.state, a.exit, a.text.trim()], ['exited', 0, 'one']);
+    assert.deepEqual([b.state, b.exit, b.text.trim()], ['exited', 0, 'two']);
+  } finally {
+    await x.close();
+  }
+});

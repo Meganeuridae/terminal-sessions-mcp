@@ -55,6 +55,12 @@ export interface PtyHandle {
   groupAlive?(pgid: number): boolean;
   /** The shell process's current command line (it changes when the process execs); undefined if unknown. */
   command?(): string | undefined;
+  /**
+   * Is the terminal's input line discipline canonical right now? readline at a prompt turns ICANON
+   * off (`false`); a `read` builtin or a password prompt leaves it on (`true`). Undefined when it
+   * cannot be read. Used to keep a typed reinit out of a program that is reading a line (#22).
+   */
+  canonicalInput?(): boolean | undefined;
   /** Stop reading the PTY (the writer blocks once the kernel buffer fills) — flow control for the daemon's own emulator (§6). */
   pause?(): void;
   resume?(): void;

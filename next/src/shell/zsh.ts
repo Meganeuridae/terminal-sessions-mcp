@@ -264,6 +264,9 @@ export const ZSH_ZLOGIN = `# --- tsm shell integration (zsh .zlogin shim) --- ge
 if [[ -z $__tsm_no_user_rc ]]; then
   __tsm_zdot_user
   if [[ -f $\{ZDOTDIR:-$HOME}/.zlogin ]]; then builtin source $\{ZDOTDIR:-$HOME}/.zlogin; fi
+  # A ZDOTDIR .zlogin set is the user's from here on, as in the .zprofile and .zshrc shims (the
+  # house's read, #22 comment 6264958172: .zlogin's was undone).
+  __tsm_zdot_keep
 fi
 __tsm_finish
 `;

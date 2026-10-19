@@ -295,3 +295,21 @@ test('/bin/zsh: a plugin that replaces the line-init widget after startup does n
     await x.close();
   }
 });
+
+test('/bin/bash: a typed line that sets PROMPT_COMMAND and runs one of its commands stays busy while it runs', { skip: !hasShell('/bin/bash') }, async () => {
+  // The line's own `history -a` matches the PROMPT_COMMAND it just set; the heal must not mistake it
+  // for the prompt's own and close the Run, leaving the session idle while `sleep 3` runs on (the
+  // house's read, #22 comment 6264958172). A daemon `.`-sourced Run is unaffected (DEBUG suspended).
+  const x = await realSession('/bin/bash', { login: false });
+  try {
+    x.session.input('PROMPT_COMMAND="history -a"; history -a; sleep 3\n', { principal: AGENT });
+    await until(() => x.session.listRuns().some((r) => r.origin === 'agent'), 3000, 'run started');
+    await new Promise((r) => setTimeout(r, 1200));
+    assert.equal(x.session.info().state, 'busy', 'busy while the typed command sleeps');
+    await until(() => x.session.listRuns().every((r) => r.state === 'exited' || r.state === 'lost'), 6000, 'ended');
+    assert.ok(x.session.listRuns().some((r) => r.origin === 'agent' && r.state === 'exited'), 'the typed Run ended exited');
+    assert.equal((await x.run('echo back')).text.trim(), 'back');
+  } finally {
+    await x.close();
+  }
+});
