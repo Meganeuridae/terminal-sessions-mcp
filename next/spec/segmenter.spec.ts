@@ -63,6 +63,32 @@ test('a human typing into a program is a message; a human typing a command that 
   seg.dispose();
 });
 
+test('a line recalled from history or completed with Tab, then Enter, is a human-input message shown as a placeholder', async () => {
+  const src = fakeSource();
+  const seg = new Segmenter(src, { runSettleMs: 5 });
+  const out = collect(seg);
+  src.screen.lines = ['>>> ', '', '', '', ''];
+  src.screen.cursor = { x: 4, y: 0 };
+  // Up recalls a line this reconstruction never saw; Enter submits it from an empty buffer.
+  src.journal.append({ type: 'input', data: '\x1b[A', principal: 'human:gui:aster', kind: 'keys' });
+  src.journal.append({ type: 'input', data: '\r', principal: 'human:gui:aster', kind: 'text' });
+  await sleep(400);
+  assert.equal(out.filter((s) => s.kind === 'human-input').length, 1, 'the recalled line is reported');
+  assert.match(out[0]!.head, /typed: \[input edited with cursor, history or completion keys — not shown\]$/);
+  out.length = 0;
+  // Tab alone completes something, then Enter.
+  src.journal.append({ type: 'input', data: '\t', principal: 'human:gui:aster', kind: 'text' });
+  src.journal.append({ type: 'input', data: '\r', principal: 'human:gui:aster', kind: 'text' });
+  await sleep(400);
+  assert.equal(out.filter((s) => s.kind === 'human-input').length, 1, 'the completed line is reported');
+  out.length = 0;
+  // A bare Enter with nothing recalled is still nothing.
+  src.journal.append({ type: 'input', data: '\r', principal: 'human:gui:aster', kind: 'text' });
+  await sleep(400);
+  assert.equal(out.length, 0);
+  seg.dispose();
+});
+
 test('protocol replies and agent input are never messages; sensitive input is a placeholder', async () => {
   const src = fakeSource();
   const seg = new Segmenter(src);

@@ -20,7 +20,7 @@ import { livingGroups } from './lock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
-import { exitMark, firstMark, probeMark, startMark } from './plumbing.js';
+import { cutPlumbing, exitMark, probeMark, startMark } from './plumbing.js';
 import { stripEscapes } from './text.js';
 import { project, type ProjectChunk } from './transcript.js';
 import { type AttachmentRole, type ControlPolicy, type Cursors, DEFAULT_GEOMETRY, type EnvBasis, type EventOf, type IntegrationLevel, type JournalEvent, type Principal, type RunInfo, type RunOrigin, type RunState, type RunTarget, type ScreenSnapshot, type Seq, type ShellState, SYSTEM, type Visibility } from './types.js';
@@ -205,7 +205,7 @@ const MAX_ORPHAN_LINES = 32;
  */
 const probeLine = (nonce: string) => ` echo "<<<PRO""BE:${nonce}>>>"`;
 const publicRun = (r: RunRecord): RunInfo => {
-  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, strategy: _s, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, shellPid: _sh, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, ...info } = r;
+  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, shellPid: _sh, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, ...info } = r;
   return { ...info, seq: { ...info.seq } };
 };
 
@@ -344,9 +344,11 @@ export function inlineLines(body: string, nonce: string, fish: boolean): string[
     ? (len: number, then: string) => `if set -q __tsm_b; and test (string length -- "$__tsm_b") = ${len}; ${then}; else; ${gone}; end`
     : (len: number, then: string) => `if [ "\${__tsm_b+set}" = set ] && [ "\${#__tsm_b}" = "${len}" ]; then ${then}; else ${gone}; fi`;
   const ack = (k: number) => `printf '<<<AC''K:${nonce}:${k}>>>\\n'`;
+  // The shell that prints the start marker first sets the token the cancel probe prints (see
+  // inlineProbe): an unexported variable, so a nested shell has none of it.
   const finish = fish
-    ? `printf '<<<STAR''T:${nonce}:%s>>>\\n' $fish_pid; eval (printf '%b' "$__tsm_b" | string collect); printf '<<<EXI''T:${nonce}:%s>>>\\n' $status`
-    : `printf '<<<STAR''T:${nonce}:%s>>>\\n' "$$"; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:${nonce}:%s>>>\\n' "$?"`;
+    ? `set -g __tsm_r ${nonce}; printf '<<<STAR''T:${nonce}:%s>>>\\n' $fish_pid; eval (printf '%b' "$__tsm_b" | string collect); printf '<<<EXI''T:${nonce}:%s>>>\\n' $status`
+    : `__tsm_r=${nonce}; printf '<<<STAR''T:${nonce}:%s>>>\\n' "$$"; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:${nonce}:%s>>>\\n' "$?"`;
   const forget = fish ? 'set -e __tsm_b' : 'unset __tsm_b';
   const all = toks.join('');
   const single = `${set(all)}; ${whole(all.length, finish)}; ${forget}`;
@@ -371,9 +373,23 @@ export function inlineLines(body: string, nonce: string, fish: boolean): string[
 }
 
 type InlineMarkerKind = 'ack' | 'start' | 'exit' | 'gone' | 'probe';
+/** A declared shell's marker found in the output: which Run's, which kind, where the piece carrying it ends, and what it printed. */
+interface InlineHit {
+  run: RunRecord;
+  kind: InlineMarkerKind;
+  end: number;
+  value?: number;
+  token?: string;
+}
 
-/** The probe typed after a ^C (which may have cut the line before its end marker): a marker of its own, with the Run's nonce and the pid of the shell that runs it. */
-const inlineProbe = (nonce: string, fish: boolean) => ` printf '<<<PRO''BE:${nonce}:%s>>>\\n' ${fish ? '$fish_pid' : '"$$"'}`;
+/**
+ * The probe typed after a ^C (which may have cut the line before its end marker): a marker of its
+ * own, with the Run's nonce, the pid of the shell that runs it, and the token the Run's own line
+ * set in that shell (its nonce again). A nested shell the Run started prints its own pid and an
+ * empty token: pids alone repeat across PID namespaces (`docker run -it … sh` is pid 1), the
+ * variable does not travel (the house's read of 39787b3, #22).
+ */
+export const inlineProbe = (nonce: string, fish: boolean): string => ` printf '<<<PRO''BE:${nonce}:%s:%s>>>\\n' ${fish ? '$fish_pid "$__tsm_r"' : '"$$" "$\{__tsm_r-}"'}`;
 
 /** The caller's name for the shell in front → the syntax the inline strategy types. */
 function declaredFlavor(name: string): 'posix' | 'fish' {
@@ -1329,6 +1345,14 @@ export class Session {
     // jr2-4: a process Run's pid and process group, so a recovery can find what outlived a crash.
     if (info.pid !== undefined && info.pid > 0) ev.pid = info.pid;
     if (info.pgid !== undefined && info.pgid > 0) ev.pgid = info.pgid;
+    if (run.target === 'shell') {
+      // What the output holds besides the command's own, so history cuts it as the live transcript
+      // does (core/plumbing.ts; the house's read of 39787b3, #22). A line typed at the prompt is
+      // bounded by the integration's marks like a daemon line under the rich strategy.
+      run.strategy ??= 'rich';
+      ev.strategy = run.strategy;
+      if (run.markerNonce !== undefined) ev.nonce = run.nonce = run.markerNonce;
+    }
     const started = this.append(ev);
     run.state = 'running';
     run.startedAt = started?.ts ?? this.now();
@@ -1772,18 +1796,19 @@ export class Session {
    * the end marker with the status. The earliest one that ends inside `rest` (what precedes `rest`
    * was `seen` already) says where to cut the piece and what it means.
    */
-  private nextInlineMarker(seen: string, rest: string): { run: RunRecord; kind: InlineMarkerKind; end: number; value?: number } | undefined {
+  private nextInlineMarker(seen: string, rest: string): InlineHit | undefined {
     const window = seen + rest;
-    let best: { run: RunRecord; kind: InlineMarkerKind; end: number; value?: number } | undefined;
-    // `value`: the exit status of an end marker; the pid of the shell that printed a start marker or a probe's answer.
-    const consider = (run: RunRecord, kind: InlineMarkerKind, idx: number, len: number, value?: number) => {
+    let best: InlineHit | undefined;
+    // `value`: the exit status of an end marker; the pid of the shell that printed a start marker or
+    // a probe's answer. `token`: what a probe's answer printed from the Run's variable (inlineProbe).
+    const consider = (run: RunRecord, kind: InlineMarkerKind, idx: number, len: number, value?: number, token?: string) => {
       if (idx === -1 || idx + len <= seen.length) return;
       const end = idx + len - seen.length;
-      if (!best || end < best.end) best = { run, kind, end, ...(value !== undefined && { value }) };
+      if (!best || end < best.end) best = { run, kind, end, ...(value !== undefined && { value }), ...(token !== undefined && { token }) };
     };
     const numbered = (run: RunRecord, kind: InlineMarkerKind, re: RegExp) => {
       const m = re.exec(window);
-      if (m) consider(run, kind, m.index, m[0].length, Number(m[1]));
+      if (m) consider(run, kind, m.index, m[0].length, Number(m[1]), m[2]);
     };
     for (const run of this.inFront.values()) {
       if (isTerminal(run.state)) continue;
@@ -1803,7 +1828,7 @@ export class Session {
     return best;
   }
 
-  private applyInlineMarker(hit: { run: RunRecord; kind: InlineMarkerKind; value?: number }): void {
+  private applyInlineMarker(hit: InlineHit): void {
     const { run } = hit;
     if (hit.kind === 'ack') {
       run.inlineAck = (run.inlineAck ?? 0) + 1;
@@ -1822,13 +1847,15 @@ export class Session {
       this.startRun(run, { cwd: '' }); // that shell's cwd is not tracked (no cwd mark)
     } else if (hit.kind === 'probe') {
       // Only the shell the Run was typed into answers for the Run: the one whose pid the start
-      // marker named (kept across an `exec` into another shell). A nested shell the Run started,
-      // or a second ssh hop, prints its own pid: the Run's program is still in front and the Run
-      // goes on (the house's read of a6d0c35, #22: the Run ended `cancelled` and the next Run,
-      // meant for the declared shell, ran in the nested bash). The start marker precedes `eval`,
-      // so a Run answered before it never ran (G3).
-      if (run.shellPid !== undefined && hit.value !== run.shellPid) {
-        this.note(`the end-marker probe for ${run.runId} was answered by another shell (pid ${hit.value}; the declared shell's is ${run.shellPid}): what ${run.runId} started is still in front`);
+      // marker named, printing the token the Run's line set in it. A nested shell the Run started,
+      // or a second ssh hop, prints its own pid and no token: the Run's program is still in front
+      // and the Run goes on (the house's read of a6d0c35, #22: the Run ended `cancelled` and the
+      // next Run, meant for the declared shell, ran in the nested bash). The same pid without the
+      // token is a shell in another PID namespace (the house's read of 39787b3, #22). The start
+      // marker precedes `eval`, so a Run answered before it never ran (G3).
+      if (run.shellPid !== undefined && (hit.value !== run.shellPid || hit.token !== run.markerNonce)) {
+        const who = hit.value !== run.shellPid ? `pid ${hit.value}; the declared shell's is ${run.shellPid}` : `pid ${hit.value} like the declared shell's, but without the variable the Run's line set: a shell in another PID namespace`;
+        this.note(`the end-marker probe for ${run.runId} was answered by another shell (${who}): what ${run.runId} started is still in front`);
         return;
       }
       this.learnDeclaredForeground(run.within ?? null);
@@ -2399,7 +2426,7 @@ export class Session {
     return pageOutput(this.journal, runId, from, to, range);
   }
 
-  /** Transcript of a Run's output (§6), projected at the width the Run started at (er-4); marker-strategy plumbing is cut out. */
+  /** Transcript of a Run's output (§6), projected at the width the Run started at (er-4); the daemon's plumbing is cut out. */
   async runTranscript(runId: string): Promise<{ text: string; truncated: boolean; seq: [Seq, Seq]; nextCursor: Seq }> {
     const run = this.getRun(runId);
     // Results show the tail: only the newest part is read and projected, so a flood renders
@@ -2407,49 +2434,10 @@ export class Session {
     const out = this.runOutput(runId, { maxBytes: TRANSCRIPT_INPUT_CHARS });
     const events = out.events as OutputEvent[];
     let chunks = events.map((e) => e.data);
-    if (run.strategy === 'marker' && run.markerNonce) {
-      // The typed line is echoed (sometimes twice, when it was typed ahead of the
-      // prompt, wrapped at the terminal's width, and coloured by fish); real output begins
-      // after the newline that follows the last echo of the wrapper's tail, and ends at the
-      // resolved marker. A probe line (typed after an aborting ^C) is removed first. The
-      // echo is found on the text without escape sequences (ss-12), then cut in the raw.
-      const joined = chunks.join('');
-      const marker = firstMark(joined, run.markerNonce);
-      let body = marker === -1 ? joined : joined.slice(0, marker);
-      let plain = stripEscapes(body);
-      const probe = plain.text.lastIndexOf(probeLine(run.markerNonce).slice(0, -4).trim());
-      if (probe !== -1) {
-        const nl = plain.text.lastIndexOf('\n', probe);
-        body = nl === -1 ? '' : body.slice(0, plain.map[nl]! + 1);
-        plain = stripEscapes(body);
-      }
-      const tail = plain.text.lastIndexOf(`${this.statusVar()}>>>"`);
-      if (tail !== -1) {
-        const nl = plain.text.indexOf('\n', tail);
-        body = nl === -1 ? '' : body.slice(plain.map[nl]! + 1);
-      }
-      chunks = [body];
-    } else if (run.strategy === 'inline' && run.markerNonce) {
-      // A declared shell's Run: its output begins right after its start marker (the newline that
-      // ends the marker's line is the shell's) and ends at its end marker; a probe line typed after
-      // a ^C is cut too.
-      let body = chunks.join('');
-      const marker = firstMark(body, run.markerNonce);
-      if (marker !== -1) body = body.slice(0, marker);
-      const plain = stripEscapes(body);
-      const probe = plain.text.lastIndexOf(`printf '<<<PRO''BE:${run.markerNonce}`);
-      if (probe !== -1) {
-        const nl = plain.text.lastIndexOf('\n', probe);
-        body = nl === -1 ? '' : body.slice(0, plain.map[nl]! + 1);
-      }
-      chunks = [body.replace(/^\r?\n/, '')];
-    } else if (run.strategy === 'basic' && !out.truncated) {
-      // The Run started at the write, so the first line is the echo of what was typed (a read
-      // that starts later has none).
-      const joined = chunks.join('');
-      const nl = joined.indexOf('\n');
-      chunks = [nl === -1 ? '' : joined.slice(nl + 1)];
-    }
+    // The plumbing the launch strategy left in the output — the typed line's echo, the markers,
+    // the probes a cancel typed — goes, by the Run's nonce, by the one rule history uses too
+    // (core/plumbing.ts; the house's reads of 39787b3, #22).
+    if (run.target === 'shell' && run.strategy !== undefined) chunks = [cutPlumbing(chunks.join(''), { strategy: run.strategy, nonce: run.markerNonce, truncated: out.truncated })];
     // Process output comes from pipes (LF → CRLF, rule 6).
     const input: ProjectChunk[] = run.target === 'process' ? events.map((e) => ({ data: e.data, stream: e.stream })) : chunks;
     const p = await project(input, { cols: run.cols ?? this.screen.cols, rows: run.rows ?? this.screen.rows, maxInputBytes: TRANSCRIPT_INPUT_CHARS, keep: 'tail' });

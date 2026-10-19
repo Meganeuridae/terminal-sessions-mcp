@@ -655,6 +655,48 @@ test('screens: a blank first frame is a screen, dropped output is said, and a wa
   seg.dispose();
 });
 
+test('a compaction that leaves the visible text unchanged is a new screen: the last one no longer stands as exact (G11)', async () => {
+  const src = fakeSource();
+  const seg = new Segmenter(src, { screenQuietMs: 20, cadenceMs: 50 });
+  const out = collect(seg);
+  src.screen.alt = true;
+  src.screen.lines = ['frame', '', '', '', ''];
+  src.journal.append({ type: 'screen.mode', alt: true });
+  await sleep(120);
+  assert.equal(out.filter((s) => s.kind === 'screen').length, 1);
+  // Output arrives and is dropped under pressure; what the screen shows did not change.
+  src.screen.droppedUnits = 3;
+  src.journal.append({ type: 'output', data: 'dropped', stream: 'pty' });
+  await sleep(150);
+  const screens = out.filter((s) => s.kind === 'screen');
+  assert.equal(screens.length, 2, 'the unchanged frame is sent again, now saying what it misses');
+  assert.equal(screens[1]!.metadata.droppedUnits, 3);
+  assert.equal(screens[1]!.supersedes, screens[0]!.messageId);
+  // Nothing else changed: no third screen.
+  src.journal.append({ type: 'output', data: 'same', stream: 'pty' });
+  await sleep(150);
+  assert.equal(out.filter((s) => s.kind === 'screen').length, 2);
+  seg.dispose();
+});
+
+test('a Run whose start recorded its strategy and nonce is cut by them from history: a program line in the wrapper’s shape is output', async () => {
+  const src = fakeSource();
+  src.journal.append({ type: 'run.admit', runId: 'nonced', target: 'shell', line: 'history', principal: A, origin: 'self', queued: false });
+  src.journal.append({ type: 'run.start', runId: 'nonced', cwd: '/w', strategy: 'marker', nonce: 'abc123' });
+  src.journal.append({ type: 'output', data: `. '/tmp/cmd-1'; echo "<<<EXI""T:abc123:$?>>>"\r\n`, stream: 'pty', runId: 'nonced' });
+  src.journal.append({ type: 'output', data: `line1\r\n  2  . '/tmp/cmd-0'; echo "<<<EXI""T:0badf00d:$?>>>"\r\nline3\r\n<<<EXIT:abc123:0>>>\r\n$ `, stream: 'pty', runId: 'nonced' });
+  src.journal.append({ type: 'run.end', runId: 'nonced', state: 'exited', exit: 0, durationMs: 3 });
+  assert.deepEqual([src.journal.runs.run('nonced').strategy, src.journal.runs.run('nonced').nonce], ['marker', 'abc123'], 'the run index carries both');
+  const r = await replay(src);
+  assert.equal(r.at(-1)?.body, `line1\n  2  . '/tmp/cmd-0'; echo "<<<EXI""T:0badf00d:$?>>>"\nline3`);
+  // A rich Run's output is never cut, whatever shape it holds.
+  src.journal.append({ type: 'run.admit', runId: 'rich', target: 'shell', line: 'cat log', principal: A, origin: 'self', queued: false });
+  src.journal.append({ type: 'run.start', runId: 'rich', cwd: '/w', strategy: 'rich' });
+  src.journal.append({ type: 'output', data: `<<<EXIT:abc123:0>>>\r\nkept\r\n`, stream: 'pty', runId: 'rich' });
+  src.journal.append({ type: 'run.end', runId: 'rich', state: 'exited', exit: 0, durationMs: 3 });
+  assert.equal((await replay(src)).at(-1)?.body, '<<<EXIT:abc123:0>>>\nkept');
+});
+
 test('a catch-up scan that starts inside a retention gap says what range is gone', async () => {
   const src = fakeSource(new Journal({ hot: new MemoryStore(4096) }));
   for (let i = 0; i < 40; i++) {

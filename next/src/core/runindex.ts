@@ -262,6 +262,9 @@ export class RunIndex {
         if (ev.rows !== undefined) r.rows = ev.rows;
         if (ev.pid !== undefined) r.pid = ev.pid;
         if (ev.pgid !== undefined) r.pgid = ev.pgid;
+        // How the Run was launched and the nonce in its marks: what history cuts its plumbing by.
+        if (ev.strategy !== undefined) r.strategy = ev.strategy;
+        if (ev.nonce !== undefined) r.nonce = ev.nonce;
         return;
       }
       case 'run.end': {

@@ -248,12 +248,17 @@ export interface HistoryRender {
 
 /**
  * A Run's text from the journal alone (the one renderer of history, for completions and for
- * results): the newest part of its attributed output, a shell Run's plumbing cut by shape, projected
- * (§6) at the size the Run started at when the journal recorded one, else the caller's.
+ * results): the newest part of its attributed output, a shell Run's plumbing cut as the live
+ * transcript cuts it — by the strategy and nonce its run.start recorded, by shape for a Run
+ * journaled before those were (the house's read of 39787b3, #22) — projected (§6) at the size the
+ * Run started at when the journal recorded one, else the caller's.
  */
 export async function journalRunText(o: RunOutput, how: HistoryRender = {}, run?: RunInfo): Promise<RunText> {
   const events = o.events.filter((e): e is Output => e.type === 'output');
-  const chunks = run?.target === 'shell' && events.every((e) => e.stream === 'pty') ? [{ data: cutPlumbing(events.map((e) => e.data).join('')), stream: 'pty' as const }] : events.map((e) => ({ data: e.data, stream: e.stream }));
+  const chunks =
+    run?.target === 'shell' && events.every((e) => e.stream === 'pty')
+      ? [{ data: cutPlumbing(events.map((e) => e.data).join(''), { strategy: run.strategy, nonce: run.nonce, truncated: o.truncated }), stream: 'pty' as const }]
+      : events.map((e) => ({ data: e.data, stream: e.stream }));
   const p = await project(chunks, { cols: run?.cols ?? how.cols ?? DEFAULT_GEOMETRY.cols, rows: run?.rows ?? how.rows ?? DEFAULT_GEOMETRY.rows, maxInputBytes: how.maxInputBytes ?? HISTORY_RUN_INPUT_BYTES, keep: 'tail' });
   return { text: p.text, truncated: o.truncated || p.truncated, seq: [o.from, o.to], nextCursor: o.to };
 }
@@ -774,6 +779,8 @@ export class Segmenter {
   private lastScreenId: string | undefined;
   /** The last screen's text; undefined when none was sent for this program, so a blank first frame is still a screen. */
   private lastScreenText: string | undefined;
+  /** The emulator's dropped-unit count the last screen reported. */
+  private lastScreenDropped = 0;
   private alt = false;
   private readonly human = new Map<Principal, HumanLine>();
   /** Recent run.start events: a human line followed by one was a command, and the Run is its message. */
@@ -1144,8 +1151,11 @@ export class Segmenter {
     this.screenDirtySince = undefined;
     const snap = this.s.snapshot();
     const text = snap.lines.join('\n').replace(/\n+$/, '');
-    if (text === this.lastScreenText) return;
+    // Dropped output is part of what a screen says (G11): a compaction that left the visible text
+    // as it was still ends the last screen's claim to be exact (the house's read of 39787b3, #22).
+    if (text === this.lastScreenText && (snap.droppedUnits ?? 0) === this.lastScreenDropped) return;
     this.lastScreenText = text;
+    this.lastScreenDropped = snap.droppedUnits ?? 0;
     this.lastScreenAt = clocks.monotonic();
     this.firstScreenPending = false;
     // Output the emulator dropped under pressure is part of what the screen does not show (§6).
@@ -1245,7 +1255,9 @@ export class Segmenter {
     h.buf = '';
     h.bufSensitive = false;
     h.bufUnknown = false;
-    if (!text.trim() && !sensitive) return;
+    // An empty buffer under a history or completion key is a line this reconstruction never saw
+    // (Up then Enter recalls one): reported as not shown (the house's read of 39787b3, #22).
+    if (!text.trim() && !sensitive && !unknown) return;
     const snap = this.s.snapshot();
     h.lines.push({ text, seq, sensitive, echoed: !sensitive && !unknown && echoedOn(snap, h.prompt, text, 0), secretPrompt: looksLikeSecretPrompt(h.prompt), prompt: h.prompt, unknown });
     h.prompt = this.cursorRow();
@@ -1265,7 +1277,7 @@ export class Segmenter {
     if (h.buf.trim()) this.submit(h, h.bufSeq); // 2 s quiet ends a line too (§10.2)
     const lines = h.lines.splice(0);
     h.firstAt = undefined;
-    if (!h.buf && !h.esc) this.human.delete(h.principal);
+    if (!h.buf && !h.esc && !h.bufUnknown) this.human.delete(h.principal);
     const snap = this.s.snapshot();
     const ran = this.executedLines(h.principal, lines);
     const shown: string[] = [];

@@ -586,8 +586,9 @@ test('marks split at every offset, including byte by byte, still end Runs (emu-1
   await h.session.close();
 });
 
-test('G27: a public RunInfo carries only its declared fields (no launch strategy, nonce, temp file or waiters)', async () => {
-  const allowed = new Set(['runId', 'sessionId', 'target', 'origin', 'principal', 'state', 'line', 'argv', 'cwd', 'envBasis', 'admittedAt', 'startedAt', 'endedAt', 'exit', 'signal', 'reason', 'seq', 'attribution', 'cols', 'rows', 'idem']);
+test('G27: a public RunInfo carries only its declared fields (no temp file, typed lines, marker tail or waiters)', async () => {
+  // The strategy and the nonce are declared fields since the house's read of 39787b3 (#22): history cuts a Run's plumbing by them.
+  const allowed = new Set(['runId', 'sessionId', 'target', 'origin', 'principal', 'state', 'line', 'argv', 'cwd', 'envBasis', 'admittedAt', 'startedAt', 'endedAt', 'exit', 'signal', 'reason', 'seq', 'attribution', 'cols', 'rows', 'idem', 'strategy', 'nonce']);
   for (const marks of ['rich', 'basic', 'none'] as const) {
     const h = await harness({ marks });
     const a = await h.session.admitWhenAvailable({ target: 'shell', line: 'echo hello', principal: AGENT });

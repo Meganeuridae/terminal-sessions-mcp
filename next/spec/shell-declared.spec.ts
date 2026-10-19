@@ -12,8 +12,10 @@ import { looksLikeShellOpener } from '../src/api/hints.js';
 import { renderRun } from '../src/api/tools.js';
 import type { RunResult } from '../src/api/app.js';
 import { execFileSync } from 'node:child_process';
-import { inlineLines } from '../src/core/session.js';
+import { inlineLines, inlineProbe } from '../src/core/session.js';
+import { journalRunText } from '../src/core/segmenter.js';
 import { AGENT, hasShell, realSession, scriptedSession, until, type Real } from './fake-shell.js';
+import { sleep } from './testhost.js';
 
 test('the result of a command that looks like it opened a shell points at the declaration; others do not', () => {
   const running = (line: string): RunResult => ({ runId: 'r1', session: 's', target: 'shell', state: 'running', cwd: '/', attribution: 'temporal', line, durationMs: 1500, output: { text: '', truncated: false, seq: [1, 2], nextCursor: 2 } });
@@ -288,6 +290,62 @@ test('a typed line prints its marker only where the shell holds exactly the text
   }
 });
 
+test('the cancel probe answers with the token the Run’s line set: a shell that ran the line prints it, one that did not prints none', () => {
+  const n = 'abcd1234';
+  const shells = [...['/bin/sh', '/bin/bash', '/bin/zsh', '/bin/dash'].filter(hasShell).map((s) => ({ shell: s, fish: false })), ...(FISH ? [{ shell: FISH, fish: true }] : [])];
+  for (const { shell, fish } of shells) {
+    const line = inlineLines(`true`, n, fish)[0]!;
+    const own = runScript(shell, `${line}\n${inlineProbe(n, fish)}\n`);
+    assert.match(own, new RegExp(`<<<EXIT:${n}:0>>>\n<<<PROBE:${n}:\\d+:${n}>>>\n$`), `${shell}: the shell the line ran in: ${JSON.stringify(own)}`);
+    // A fresh shell that never ran the line has no such variable: an empty token, and (POSIX) nounset-safe.
+    const other = runScript(shell, `${fish ? '' : 'set -u; '}${inlineProbe(n, fish).trimStart()}\n`);
+    assert.match(other, new RegExp(`^<<<PROBE:${n}:\\d+:>>>\n$`), `${shell}: a shell that never saw the line: ${JSON.stringify(other)}`);
+    // The variable is not exported: a shell the line's shell starts has none of it.
+    const nested = runScript(shell, `${line}\n${shell} -c '${inlineProbe(n, fish).trimStart().replace(/'/g, `'\\''`)}'\n`);
+    assert.match(nested, new RegExp(`<<<PROBE:${n}:\\d+:>>>\n$`), `${shell}: a nested shell: ${JSON.stringify(nested)}`);
+  }
+});
+
+test('a cancel answered by a nested shell leaves the Run running; its result, live and from history, keeps what followed and none of the probes', { skip: !hasShell('/bin/sh') }, async () => {
+  const x = await realSession('/bin/bash');
+  try {
+    const enclosing = await open(x.session, 'sh');
+    declare(x.session, 'sh');
+    const nested = x.session.admit({ target: 'shell', line: 'sh', principal: AGENT });
+    assert.ok(nested.admitted);
+    const runId = nested.run.runId;
+    await until(() => x.session.run(runId).state === 'running', 5000, 'the nested sh to start');
+    await sleep(300); // its prompt
+    // ^C and ^\ reach the nested shell's prompt; both probes are answered by it, with its pid and no token.
+    const c = await x.session.cancel(runId, AGENT, { graceMs: 400 });
+    assert.equal(c.state, 'running', JSON.stringify(c));
+    assert.ok(c.steps.includes('end-marker probe') && c.steps.includes('end-marker probe after ^\\'), c.steps.join(', '));
+    assert.equal(c.escalation, `cancel ${enclosing}`);
+    assert.ok(notes(x).some((t) => /answered by another shell/.test(t)));
+    const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' && e.runId === runId ? [e.data] : [])).join('');
+    assert.match(output(), new RegExp(`<<<PROBE:[0-9a-f]+:\\d+:>>>`), 'the journal holds the nested shell’s answers');
+    // The Run goes on in the nested shell: a typed line runs there, then it exits and the declared shell prints the end marker.
+    x.session.input('echo after-probe-$((7*6))\n', { principal: AGENT });
+    await until(() => output().includes('after-probe-42'), 5000, 'the typed line to run');
+    x.session.input('exit\n', { principal: AGENT });
+    const r = await x.session.awaitRun(runId, 5000);
+    assert.deepEqual([r.state, r.exit], ['exited', 0]);
+    const live = await x.session.runTranscript(runId);
+    assert.match(live.text, /after-probe-42/);
+    assert.doesNotMatch(live.text, /PROBE|printf/, `no probe plumbing in the live result: ${JSON.stringify(live.text)}`);
+    assert.equal(live.truncated, false);
+    const info = x.journal.runs.run(runId);
+    assert.equal(info.strategy, 'inline');
+    assert.ok(info.nonce, 'the nonce is journaled');
+    const history = await journalRunText(x.journal.runs.output(x.journal, runId), {}, info);
+    assert.match(history.text, /after-probe-42/);
+    assert.doesNotMatch(history.text, /PROBE|printf/, `no probe plumbing from history: ${JSON.stringify(history.text)}`);
+    assert.equal(x.session.run(enclosing).state, 'running', 'the declared shell is still there');
+  } finally {
+    await x.close();
+  }
+});
+
 test('a declared shell preserves a half-typed prompt, refusing or queueing until it is cleared', { skip: !hasShell('/bin/bash') }, async () => {
   const x = await realSession('/bin/bash');
   try {
@@ -324,7 +382,7 @@ test('a gone marker from the declared shell ends the Run lost: line-not-whole, n
     await until(() => typed.some((t) => t.includes("__tsm_b='echo one'")), 3000, "the first Run's line");
     const line = typed.find((t) => t.includes("__tsm_b='echo one'"))!;
     assert.ok(line.startsWith('\x05\x15'), 'the line is preceded by ^E ^U, which clears a pending line wherever its cursor is');
-    assert.match(line, /if \[ "\$\{__tsm_b\+set\}" = set \] && \[ "\$\{#__tsm_b\}" = "8" \]; then printf '<<<STAR''T:/);
+    assert.match(line, /if \[ "\$\{__tsm_b\+set\}" = set \] && \[ "\$\{#__tsm_b\}" = "8" \]; then __tsm_r=[0-9a-f]+; printf '<<<STAR''T:/);
     const nonce = /<<<GON''E:([0-9a-f]+)>>>/.exec(line)![1]!;
     const before = typed.length;
     // The shell answers with the gone marker: the line reached it changed.
@@ -354,8 +412,8 @@ test('declared cancellation probes again after quit flushes an earlier probe', a
       if (data === '\x03') return; // this job ignores interrupt
       if (data === '\x1c') { quit = true; return; }
       if (data.includes(`<<<PRO''BE:${nonce}`)) {
-        // Its first probe was flushed by quit; only one typed afterwards can answer, from the declared shell itself (pid 900).
-        if (quit) h.pty.emit(`<<<PROBE:${nonce}:900>>>\r\n`);
+        // Its first probe was flushed by quit; only one typed afterwards can answer, from the declared shell itself (pid 900, with the Run's token).
+        if (quit) h.pty.emit(`<<<PROBE:${nonce}:900:${nonce}>>>\r\n`);
         return;
       }
       write(data);
@@ -537,7 +595,11 @@ test('a cancel is answered only by the shell the Run was typed into: a nested sh
       if (data === '\x03' || data === '\x1c') return; // the nested bash at its own prompt ignores them
       if (data.includes(`<<<PRO''BE:${nonce}`)) {
         probes++;
-        h.pty.emit(`<<<PROBE:${nonce}:2000>>>\r\n`); // answered by the nested bash (pid 2000), not the declared shell
+        // The first probe is answered by the nested bash with the declared shell's own pid but no
+        // token: pid alone would have accepted it (the old bug), the missing variable the Run's
+        // line set rejects it (a shell in another PID namespace). A later probe (after ^\) goes
+        // unanswered, as the nested bash at its own prompt would leave it.
+        if (probes === 1) h.pty.emit(`<<<PROBE:${nonce}:1000:>>>\r\n`);
         return;
       }
       write(data);
@@ -546,7 +608,9 @@ test('a cancel is answered only by the shell the Run was typed into: a nested sh
     assert.equal(result.state, 'running', 'the nested shell’s probe answer did not end the Run');
     assert.ok(probes >= 1, 'a probe was typed');
     assert.equal(result.escalation, `cancel ${opener}`, 'cancel names the enclosing Run as the next thing to cancel');
-    assert.match(notes(h).at(-1) ?? '', /answered by another shell/);
+    const rejected = notes(h).filter((n) => /answered by another shell/.test(n));
+    assert.equal(rejected.length, 1, 'the answered probe was rejected');
+    assert.match(rejected[0]!, /pid 1000 like the declared shell's, but without the variable the Run's line set: a shell in another PID namespace/);
     // The nested bash exits and the declared shell prints the Run's own end marker: reported as itself (core-14).
     h.pty.write = write;
     h.pty.emit(`<<<EXIT:${nonce}:42>>>\r\n`);

@@ -20,6 +20,13 @@ export type ShellState = 'starting' | 'idle' | 'busy' | 'unavailable' | 'exited'
 export type IntegrationLevel = 'unknown' | 'rich' | 'basic' | 'none';
 
 export type Attribution = 'exact' | 'temporal';
+/**
+ * How a shell Run's boundaries are observed, and so what the daemon's plumbing in its output is
+ * (core/plumbing.ts cuts it): `rich` — the integration's marks, nothing in the output; `basic` —
+ * end marks only, the typed line's echo opens the output; `marker` — an end marker with a nonce
+ * chained on the typed line (§8.1 fallback); `inline` — a declared shell's markers (§8.1).
+ */
+export type RunStrategy = 'rich' | 'basic' | 'marker' | 'inline';
 export type OutputStream = 'pty' | 'stdout' | 'stderr';
 export type EnvBasis = 'configured' | 'snapshot';
 
@@ -33,7 +40,7 @@ export type EventInput =
   | { type: 'input'; data: string; principal: Principal; kind: 'text' | 'keys' | 'paste' | 'protocol-reply'; sensitive?: true; runId?: string; key?: string }
   /** `shell`/`within`: a Run declared for the shell in front of the terminal (§8.1): the kind of shell, and the Run whose program it is (null: what replaced the session's shell). */
   | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string; shell?: string; within?: string | null }
-  | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number }
+  | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number; strategy?: RunStrategy; nonce?: string }
   | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number; leftovers?: true; pipeStatus?: number[] }
   | { type: 'prompt'; cwd: string; phase: 'start' | 'end' }
   | { type: 'cwd'; path: string }
@@ -111,6 +118,14 @@ export interface RunInfo {
   rows?: number;
   /** The admitting call's idempotency identity (G16): opaque, set by the application layer, journaled so it survives a restart. */
   idem?: string;
+  /**
+   * How the Run's boundaries were observed, from its run.start: history cuts the plumbing the
+   * output holds exactly as the live transcript does. Absent for a Run journaled before this was
+   * recorded: its history is cut by shape (the house's read of 39787b3, #22).
+   */
+  strategy?: RunStrategy;
+  /** The nonce in a `marker` or `inline` Run's marks, from its run.start: what its plumbing is cut by. */
+  nonce?: string;
   /** A declared shell Run (§8.1): the caller's name for the shell in front (`bash`, `sh`, `fish`…). */
   shell?: string;
   /** With `shell`: the Run whose program is that shell (`ssh host`, `sudo -i`…), or null for the program that replaced the session's shell. */
