@@ -581,7 +581,14 @@ export class McplLane {
     // A whole number, never past the cap: a fraction was kept, compared equal to no count, and got everything (the house's read of 2f357bd, #22).
     const limit = raw === undefined ? 0 : Math.min(HISTORY_MAX, Math.max(0, Math.floor(raw)));
     if (limit > 0) {
-      const before = params.history?.beforeMessageId !== undefined ? seqOfMessageId(params.history.beforeMessageId) : undefined;
+      const boundary = params.history?.beforeMessageId;
+      const before = boundary !== undefined ? seqOfMessageId(String(boundary)) : undefined;
+      // A boundary that is not one of our ids is refused, not ignored: ignored, it answered with the
+      // newest page as if none had been given, and a host paging back got the same page again (the
+      // house's read of 07ab3dd, #22).
+      if (boundary !== undefined && before === undefined) {
+        throw new RpcError(INVALID_PARAMS, 'history.beforeMessageId is not a message id of this server; ids look like <node>/<session>~<epoch>:<kind>:<seq>, as channels/incoming and channels/open history give them', { beforeMessageId: String(boundary).slice(0, 200) });
+      }
       const r = await replayNewest(this.sourceOf(s), before !== undefined ? { limit, before } : { limit });
       const t = targetOf(s);
       res.history = r.segments.map((seg) => this.message(t, seg));

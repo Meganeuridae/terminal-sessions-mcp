@@ -639,6 +639,14 @@ test("mcpl-18: a closed session's channel has history, pages before a message, a
     const before = (await a.request('channels/open', { channelId: 'terminal:hs', history: { limit: 10, beforeMessageId: second.messageId } })) as Opened;
     const t3 = texts(before);
     assert.ok(t3.some((t) => /echo first-life/.test(t)) && !t3.some((t) => /echo second-life/.test(t)), JSON.stringify(t3));
+    // The ids carry the journal's epoch (<node>/<session>~<epoch>:<kind>:<seq>); a boundary that is not one of
+    // ours is refused, not read as no boundary (the house's read of 07ab3dd, #22: it answered with the newest page).
+    assert.match(second.messageId, new RegExp(`^${NODE_NAME}/hs~[^:/]+:run:\\d+$`), second.messageId);
+    await a.request('channels/close', { channelId: 'terminal:hs' });
+    await assert.rejects(
+      a.request('channels/open', { channelId: 'terminal:hs', history: { limit: 10, beforeMessageId: `${NODE_NAME}/hs:run:5` } }),
+      (e: Error & { code?: number }) => e.code === -32602 && /beforeMessageId/.test(e.message),
+    );
     await a.close();
   } finally {
     await d.stop();

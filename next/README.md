@@ -63,7 +63,8 @@ Every result has two renderings: a readable transcript closed by one status line
 `[run r4-1a2b exited 1 in 8.2s · shell · cwd /w/app · next=4990]` — and a structured
 envelope (`structuredContent`) whose `state` is the only authority on whether a command
 finished. The exit is the shell's own; for a pipeline (the last one of a multi-line command) the
-result also carries each command's status (`pipeStatus`), and the status line says when one before
+result also carries each command's status (`pipeStatus`, not in a declared shell, whose end marker
+carries `$?` alone), and the status line says when one before
 the last failed, since `make | tee log` exits as `tee` did; a producer that `head` stopped reading
 (status 141, SIGPIPE) is not called a failure. The text block is the transcript when the connection asks for it
 (`TSM_RESULT_TEXT=transcript` for the shim, `?resultText=transcript` on the URL; the
@@ -199,7 +200,9 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
 - **Persistence.** Sessions outlive connections; journals (`~/.tsm/sessions/<id>/`) outlive
   the daemon, and after a restart each old session is readable as `history-only` with its
   in-flight Runs reported `lost` (reason `daemon-restart`). Live processes surviving a restart
-  needs the keeper backend (milestone 3).
+  needs the keeper backend (milestone 3): a stopping daemon hangs up each shell as a closing
+  terminal does, so its foreground job ends with it, while a job the shell detached on purpose
+  (`nohup`, `setsid`, `disown`) lives on; process Runs' groups are ended.
 - **Supervision.** `next/config/com.animalabs.termd.plist` (launchd), `next/config/termd.service`
   (systemd). SIGTERM ends sessions cleanly.
 - **History on disk.** Kept whole by default; `--retention-bytes` and `--retention-days` cap it

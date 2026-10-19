@@ -488,6 +488,37 @@ test('at a shell declared through a client that holds the foreground (ssh), a su
   }
 });
 
+test('at a shell declared through ssh, a submitted line holds the next Run while its program prints: the stale period is one of quiet, counted from the last output', async () => {
+  // The person's line printed a tick every second and read stdin; counted from the submission,
+  // the hold ended at +31 s and a Run's wrapper was typed into that program (the house's read of
+  // 07ab3dd, #22). §8.1 and the README say the hold ends after the stale period of quiet.
+  const h = await scriptedSession({ editingStaleMs: 500 });
+  try {
+    const front = h.session.admit({ target: 'shell', line: 'sleep 100', principal: AGENT });
+    assert.ok(front.admitted);
+    await until(() => h.session.run(front.run.runId).state === 'running');
+    h.session.declareShell({ principal: AGENT });
+    h.session.input('./ticker\n', { principal: AGENT });
+    const held = h.session.admit({ target: 'shell', line: 'echo agent', principal: AGENT });
+    assert.ok(!held.admitted && held.reason === 'human-submitted', JSON.stringify(held));
+    const queued = h.session.admit({ target: 'shell', line: 'echo queued', principal: AGENT, queue: true });
+    assert.ok(queued.admitted && queued.run.state === 'queued', JSON.stringify(queued));
+    // The program prints for 900 ms: well past a 500 ms stale period counted from the submission.
+    const ticker = setInterval(() => h.pty.emit('tick\r\n'), 150);
+    await new Promise((r) => setTimeout(r, 900));
+    clearInterval(ticker);
+    const still = h.session.admit({ target: 'shell', line: 'echo agent', principal: AGENT });
+    assert.ok(!still.admitted && still.reason === 'human-submitted', `held while the program prints: ${JSON.stringify(still)}`);
+    assert.equal(h.session.run(queued.run.runId).state, 'queued', 'the queued Run waited too');
+    await new Promise((r) => setTimeout(r, 750)); // a stale period of quiet, with no call to look again: the re-armed timer drains
+    assert.notEqual(h.session.run(queued.run.runId).state, 'queued', 'the queued Run got its turn once the quiet ran out');
+    const after = h.session.admit({ target: 'shell', line: 'echo agent', principal: AGENT });
+    assert.ok(!after.admitted && after.reason === 'running', `the hold is over; the queued Run has the declared shell now: ${JSON.stringify(after)}`);
+  } finally {
+    await h.session.close();
+  }
+});
+
 test('a cancel is answered only by the shell the Run was typed into: a nested shell’s probe answer does not end it, and a later natural end reads as itself', async () => {
   const h = await scriptedSession();
   const write = h.pty.write.bind(h.pty);

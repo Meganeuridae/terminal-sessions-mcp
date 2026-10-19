@@ -191,7 +191,14 @@ const terminal = (s: RunInfo['state']) => s === 'exited' || s === 'cancelled' ||
 /** Events per page when a Run's output is read in pieces. */
 const OUTPUT_PAGE = 512;
 const copy = (r: RunInfo): RunInfo => ({ ...r, seq: { ...r.seq } });
-/** Runs remembered at most; beyond it the oldest terminal Runs are forgotten (their output is long gone from retention by then). */
+/**
+ * Runs remembered at most, a bound on the index's memory (10,000 Runs cost about 450 MiB
+ * unbounded, core 3 of the house's review of #11); beyond it the oldest ended Runs are
+ * forgotten. Their output is not: retention is opt-in and unlimited by default (G21), so a
+ * Run the index forgot is no longer reachable by its id, while its output stays readable by
+ * cursor (`read since`) and in channel history. G30 states the bound (the house's read of
+ * 07ab3dd, #22: this comment gave retention as the reason).
+ */
 const MAX_RUNS = 100_000;
 
 export class RunIndex {

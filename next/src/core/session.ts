@@ -1504,9 +1504,20 @@ export class Session {
       const fg = this.declaredForeground();
       if (fg === 'busy') return true;
       if (fg === 'free' && now - this.submittedAt >= FOREGROUND_SETTLE_MS) this.submittedAt = undefined;
-      else if (fg !== 'free' && now - this.submittedAt >= stale) this.submittedAt = undefined;
+      else if (fg !== 'free' && now - this.submittedQuietSince() >= stale) this.submittedAt = undefined;
     }
     return this.humanEditing || this.submittedAt !== undefined;
+  }
+
+  /**
+   * Where nothing shows what is in front (ssh), a submitted line's hold ends after the stale period
+   * of quiet, as §8.1 says: output or input since the submission means the person's command is still
+   * going, so the period counts from the last of it, not from the submission (the house's read of
+   * 07ab3dd, #22: counted from the submission, the hold ended while the program printed and read, and
+   * a Run's wrapper was typed into it).
+   */
+  private submittedQuietSince(): number {
+    return Math.max(this.submittedAt ?? 0, this.lastActivity);
   }
 
   /** What stands in the way: a line being typed, or one submitted whose command may still be running. */
@@ -1554,15 +1565,23 @@ export class Session {
     this.fgRead = undefined;
   }
 
-  private armEditingTimer(): void {
+  private armEditingTimer(ms = (this.opts.editingStaleMs ?? 30_000) + 5): void {
     if (this.editingTimer) clearTimeout(this.editingTimer);
     this.editingTimer = setTimeout(() => {
       this.editingTimer = undefined;
+      // A submitted line's hold counts its quiet from the last activity (submittedQuietSince): still
+      // held, come back when that period would end; held by a program in front, after another period.
+      if (this.editingBlocks() && this.submittedAt !== undefined) {
+        const stale = this.opts.editingStaleMs ?? 30_000;
+        const left = this.submittedQuietSince() + stale - this.now();
+        this.armEditingTimer((left > 0 ? left : stale) + 5);
+        return;
+      }
       this.drainQueue();
       const layer = this.layers.at(-1);
       if (layer) this.drainDeclared(layer.within);
       this.notifyAvailable();
-    }, (this.opts.editingStaleMs ?? 30_000) + 5);
+    }, Math.min(ms, 2 ** 31 - 1));
     this.editingTimer.unref();
   }
 

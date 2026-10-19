@@ -241,7 +241,7 @@ notifications silently. SPEC §9.4 asks hosts to deduplicate by `eventId`; it do
 across servers.
 
 **Change.** Key the set by `serverId + '\0' + eventId`. termd already node-qualifies its ids
-(`<node>/<session>:<kind>:<seq>`), so this is defence in depth.
+(`<node>/<session>~<epoch>:<kind>:<seq>`), so this is defence in depth.
 
 **Tests.** Two fake servers push the same `eventId`; both are accepted.
 

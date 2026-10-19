@@ -270,7 +270,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   keystrokes through the line editor, so history expansion, completion, comments, syntax
   errors and continuation prompts can neither change it nor wedge the session; a line the
   shell never starts ends `lost` (`no-pre-execution-mark`). The plumbing stays out of every
-  history, which is the session's own, never the user's.
+  history, which is the session's own, never the user's. A declared shell (§8.1) is the
+  exception to both: its Runs travel inline, so their wrappers appear in that shell's history —
+  over `ssh` or `sudo -i`, the user's own — and its end marker carries `$?` alone, so its
+  results have no `pipeStatus`.
 - **G7.** Process Runs are spawned by the daemon with an **explicit environment basis**: the
   session's configured environment (creation-time env over the daemon's, which never includes
   the daemon's own credentials and configuration or the identity variables of the terminal
@@ -305,7 +308,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   `seq`, timestamped, typed (Appendix A). Three products derive from it and each states
   what it is. **Raw output** is retained decoded UTF-8 text with provenance, a pure function of a
   range. **Transcript** is a documented line-oriented projection of a range, a pure
-  function of that range, for reading and search — not a claim about what anyone saw.
+  function of that range and the width it is projected at, for reading and search — not a
+  claim about what anyone saw. A Run's page projects at the geometry its `run.start`
+  recorded, so it reads the same after a resize; a `since` page projects at the terminal's
+  current width, so a resize changes how a later `since` read of earlier output wraps.
   **Screen** is emulator state at a position, a function of the whole history up to it.
   Channel messages and search results are built from raw and transcript.
 - **G11.** Cursors are `seq` values. `since(seq)` returns exactly the retained events after
@@ -352,7 +358,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 
 - **G19.** Three promises, reported separately: (a) sessions and Runs outlive any client
   connection; (b) journals and metadata survive a daemon restart; (c) live processes
-  survive a daemon restart only under the keeper backend. A live session's state names its
+  survive a daemon restart only under the keeper backend: without it, a stopping daemon
+  hangs up each shell as a closing terminal does, so the shell and its foreground job end
+  while a job the shell detached on purpose (`nohup`, `setsid`, `disown`) lives on, and
+  process Runs' groups are ended. A live session's state names its
   backend; a session whose shell ended reports `closed` or `recovered` in its place.
   A disk that refuses writes never takes the daemon or a session down: the ring carries
   on, the failure is reported (`/health`, journal stats), and the file store catches up
@@ -372,7 +381,8 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 - **G30.** A session name belongs to its owner. After its shell ends — closed, or
   recovered after a restart — only the owner (or the daemon) may start a new life under
   the name, which continues the same journal and `seq` numbering, so earlier Runs stay
-  reachable by id; anyone else is refused, so no principal can take over a name to read
+  reachable by id (the newest 100,000 Runs of a name: the run index is bounded in memory, and
+  output of a Run it forgot stays readable by cursor); anyone else is refused, so no principal can take over a name to read
   another's history. The owner's GUI (`human:gui:<owner>`, §12) acts for the owner here.
   Names are unique regardless of case, and concurrent opens of one name make one shell;
   a caller that raced another principal's creation is authorized against the session that
@@ -699,11 +709,17 @@ Descriptor:
 { "id": "terminal:build", "type": "terminal", "label": "build (node: mbp)",
   "direction": "bidirectional",
   "address": { "node": "mbp", "session": "build" },
-  "metadata": { "owner": "agent:linn@animalabs.ai", "controller": "agent:linn@animalabs.ai",
-                "state": "running", "cwd": "/w/app", "integration": "full" },
+  "metadata": { "node": "mbp", "speech": "none",
+                "owner": "agent:linn@animalabs.ai", "controller": "agent:linn@animalabs.ai",
+                "state": "idle", "cwd": "/w/app", "integration": "rich" },
   "initiallyOpen": false,
   "capabilities": { "history": { "maxMessages": 500, "supportsBeforeMessage": true } } }
 ```
+
+`state` is the session's (`starting | idle | busy | unavailable | exited`, or `tui` while a
+full-screen program holds the terminal) and `integration` its level (`rich | basic | none`,
+G5); a session whose shell ended carries `state: exited` and its recovery class instead of
+a cwd.
 
 `channels/open` returns history only when the host asks (`history.limit`, ≤ 500),
 rebuilt by the same segmenter as live messages and stamped with event times, and attaches
@@ -725,8 +741,8 @@ A `Segmenter` turns journal events into messages. One default policy, replaceabl
 |---|---|---|---|
 | run | `run.end` | ``[terminal] <s>: `<line>` → exit N in 1.2s · run <id> · read since=<seq>`` + the output's tail (4 KiB) | `terminal:run-finished` or `terminal:run-lost`, `terminal:exit=ok\|nonzero\|signal` (at most one: a lost Run, a cancellation without a signal and an end mark without a status carry none), `terminal:target=shell\|process`, and per recipient `terminal:origin=self\|human\|agent\|system` with the matching `chat:from-*` |
 | service | a Service's status changes (`starting` is journaled, not a message) | status line with the probe's evidence | `terminal:service-<status>`: `-ready`, `-running`, `-unhealthy`, `-exited`, `-lost` |
-| output | while running, at most once per cadence (default 10 s) | digest: elapsed, bytes since the agent last read, the tail; `metadata.supersedes` names the previous digest | `terminal:output`, `terminal:running` |
-| screen | in alt-screen, 500 ms after last change | full screen text | `terminal:screen` |
+| output | while a Run runs, at most once per cadence (default 10 s) per Run — two Runs running at once give two digests per cadence | digest: elapsed, bytes since the agent last read, the tail; `metadata.supersedes` names the previous digest | `terminal:output`, `terminal:running` |
+| screen | in alt-screen: the first 500 ms after the last change (at most 1 s after the first), then at most once per cadence (default 10 s) when the screen changed | full screen text; `metadata.supersedes` names the previous screen | `terminal:screen` |
 | needs-input | running, silent ≥ 5 s, last line unterminated and prompt-like | last lines + evidence | `terminal:needs-input` |
 | watch | a watch fires | matched line / notice, burst-coalesced (≥ 1 s apart, `+N more`) | `terminal:watch=<label>`, `terminal:watch`, and `terminal:pattern`, `terminal:silence` or `terminal:idle` |
 | control | controller changes | one line | `terminal:control` |
@@ -739,8 +755,11 @@ a held or summarized rendering keeps only its first few hundred characters. Ever
 message's `metadata` is structured: `{node, session, state, cwd, controller, kind, seq,
 runId?, exit?, outputFrom?, outputTo?, nextCursor?, supersedes?}`, where `seq` is the journal
 event the message reports — what the `delivered` cursor advances to — and message and event
-ids are node-qualified (`<node>/<session>:<kind>:<seq>`), so two daemons never collide in a
-host's dedup window. The idle segment of draft 3 is dropped: a prompt without a Run is not
+ids are node-qualified (`<node>/<session>~<epoch>:<kind>:<seq>`, a digest's with `~<runId>`
+after the kind; the epoch is the journal's, so a forgotten name's new journal never reuses an
+id), so two daemons never collide in a host's dedup window. A history boundary
+(`beforeMessageId`) must be one of these ids; any other form is refused, not read as no
+boundary. The idle segment of draft 3 is dropped: a prompt without a Run is not
 news, and presence already says a session is idle. Digests exist because a delta
 stream is wrong for every host: deferred events still enter context in agent-framework,
 so a 1 s cadence would land about 180 messages during a three-minute build. Hosts that
@@ -859,10 +878,10 @@ this server:
   rules, which agent-framework's gate already has — not doubled tags on the wire. Until it
   lands, the server can emit the bare class (`terminal:watch`) beside the faceted tag as a
   documented interim.
-- **Ambient-class messages are digests, not deltas.** While a run is in progress the
-  session sends at most one progress message per cadence (default 10 s) — elapsed, bytes
+- **Ambient-class messages are digests, not deltas.** While a run is in progress it
+  sends at most one progress message per cadence (default 10 s) — elapsed, bytes
   since the agent last read, the tail — carrying `metadata.supersedes` naming the previous
-  one. This is not bridge-specific: draft 2's 1 s delta stream would have landed roughly
+  one; two Runs in progress in one session are two digest chains. This is not bridge-specific: draft 2's 1 s delta stream would have landed roughly
   180 messages in any host's context during a three-minute build, since deferred events
   still enter context in agent-framework. The bridge merely made it visible. Hosts that
   honour `supersedes` can collapse the digests to one line; hosts that do not still see a
