@@ -178,3 +178,37 @@ test('maxBytes counts UTF-8 bytes, as every cap does: box-drawing output is narr
   assert.equal(narrowed.truncated, true);
   assert.equal(narrowOutput({ events, from: 1, to: 5, truncated: false }, { maxBytes: 240 }).events.length, 4);
 });
+
+test('a Run\'s output carries the gap events of the part it covers, as narrowOutput narrows them (the house\'s read of 1cabc6a)', () => {
+  const j = new Journal({ sessionId: 's' });
+  const runId = 'r1-gaps00';
+  j.append({ type: 'run.admit', runId, target: 'process', principal: 'agent:a@test', origin: 'self', queued: false });
+  j.append({ type: 'run.start', runId, cwd: '/' });
+  const o = (data: string) => j.append({ type: 'output', data, stream: 'stdout', runId }).seq;
+  const gap = () => {
+    const g = j.lastSeq + 1;
+    return j.append({ type: 'gap', from: g, to: g, reason: 'torn-write' }).seq;
+  };
+  const g0 = gap(); // before the first output
+  o('a\n');
+  o('b\n');
+  const g1 = gap(); // between outputs, behind other events
+  for (let i = 0; i < 30; i++) j.append({ type: 'note', text: 'n', principal: 'agent:a@test' });
+  o('c\n');
+  o('d\n');
+  const g2 = gap(); // after the last output
+  j.append({ type: 'run.end', runId, state: 'exited', exit: 0, durationMs: 1 });
+  const whole = j.runs.output(j, runId);
+  assert.deepEqual(whole.gaps!.map((g) => g.seq), [g0, g1, g2]);
+  assert.equal(whole.truncated, true, 'a hole inside the Run cuts its output');
+  // `limit` keeps the holes before the first output it drops; `maxBytes` those after the first output it keeps; `since`/`until` bound both.
+  const seqs = (range: RunOutputRange) => j.runs.output(j, runId, range).gaps?.map((g) => g.seq);
+  assert.deepEqual(seqs({ limit: 2 }), [g0, g1]);
+  assert.deepEqual(seqs({ limit: 3 }), [g0, g1]);
+  assert.deepEqual(seqs({ maxBytes: 3 }), [g2]);
+  assert.deepEqual(seqs({ since: g0 }), [g1, g2]);
+  assert.deepEqual(seqs({ until: g1 }), [g0, g1]);
+  for (const range of [{}, { limit: 2 }, { limit: 3 }, { maxBytes: 3 }, { since: g0 }, { until: g1 }, { since: g1, maxBytes: 2 }] as RunOutputRange[]) {
+    assert.deepEqual(j.runs.output(j, runId, range), narrowOutput(whole, range), JSON.stringify(range));
+  }
+});

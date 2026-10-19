@@ -62,6 +62,8 @@ export function boundHeader(h: RotationHeader, maxBytes = Number.POSITIVE_INFINI
   return { v: 1, openRuns: runs.slice(k) };
 }
 
+type GapEvent = Extract<JournalEvent, { type: 'gap' }>;
+
 /** A Run's attributed output, the same shape as `Session.runOutput` (G12). */
 export interface RunOutput {
   events: JournalEvent[];
@@ -70,6 +72,13 @@ export interface RunOutput {
   truncated: boolean;
   /** With `limit`: output events of the range remain after the last one returned. */
   more?: boolean;
+  /**
+   * The journal's gap events within the part of the range this result covers (before the first
+   * output dropped by `limit`, after the first one kept by `maxBytes`), when there are any: a
+   * reader shows a Run's holes where they are, however many other events lie between its outputs
+   * (the house's read of 1cabc6a, #22).
+   */
+  gaps?: GapEvent[];
 }
 
 /** Which part of a Run's output to return. Readers page with these instead of loading the whole Run. */
@@ -87,9 +96,14 @@ export interface RunOutputRange {
 /** Apply a range to a Run's whole output (the reference semantics; stores may do it without loading everything). */
 export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
   if (range.since === undefined && range.until === undefined && range.limit === undefined && range.maxBytes === undefined) return o;
-  let events = o.events.filter((e) => (range.since === undefined || e.seq > range.since) && (range.until === undefined || e.seq <= range.until));
+  const within = (e: JournalEvent) => (range.since === undefined || e.seq > range.since) && (range.until === undefined || e.seq <= range.until);
+  let events = o.events.filter(within);
+  let gaps = o.gaps?.filter(within);
   let more = false;
   if (range.limit !== undefined && events.length > range.limit) {
+    // The holes kept are those before the first output dropped.
+    const cutAt = events[Math.max(0, range.limit)]!.seq;
+    gaps = gaps?.filter((g) => g.seq < cutAt);
     events = events.slice(0, Math.max(0, range.limit));
     more = true;
   }
@@ -104,12 +118,15 @@ export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
       k--;
     }
     if (k > 0) {
+      const dropped = events[k - 1]!.seq;
+      gaps = gaps?.filter((g) => g.seq > dropped);
       events = events.slice(k);
       truncated = true;
     }
   }
   const out: RunOutput = { events, from: o.from, to: range.until !== undefined ? Math.min(o.to, range.until) : o.to, truncated };
   if (range.limit !== undefined) out.more = more;
+  if (gaps?.length) out.gaps = gaps;
   return out;
 }
 
@@ -126,10 +143,14 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
   const mine = (e: JournalEvent): e is OutputEvent => e.type === 'output' && e.runId === runId;
   const events: OutputEvent[] = [];
   // A gap recorded inside the Run's range (the ring dropped what the disk refused) cuts its output
-  // as retention does: `truncated` says so (the house's read of b047b92).
+  // as retention does: `truncated` says so (the house's read of b047b92), and the gap events passed
+  // on the way go with the result, so a reader can place them.
   let holed = journal.holeWithin(lo, hi);
+  const gaps: GapEvent[] = [];
   const seeGap = (e: JournalEvent): void => {
-    if (e.type === 'gap' && e.to >= lo && e.from <= hi) holed = true;
+    if (e.type !== 'gap') return;
+    gaps.push(e);
+    if (e.to >= lo && e.from <= hi) holed = true;
   };
   if (range.maxBytes !== undefined && range.limit === undefined) {
     let bytes = 0;
@@ -161,7 +182,9 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
       cursor = last.seq + 1;
     }
   }
-  return narrowOutput({ events, from, to: hi, truncated: journal.gapAt(from, to) || holed }, range);
+  const whole: RunOutput = { events, from, to: hi, truncated: journal.gapAt(from, to) || holed };
+  if (gaps.length) whole.gaps = gaps.sort((a, b) => a.seq - b.seq);
+  return narrowOutput(whole, range);
 }
 
 const terminal = (s: RunInfo['state']) => s === 'exited' || s === 'cancelled' || s === 'lost';

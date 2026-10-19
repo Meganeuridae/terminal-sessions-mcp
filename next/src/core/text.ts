@@ -73,7 +73,12 @@ export function cutTail(text: string, maxBytes: number): { text: string; cut: bo
   return { text: text.slice(start), cut: true };
 }
 
-/** How far back `safeCut` looks for the start of a control sequence (an OSC string can be long). */
+/**
+ * How far back `safeCut` and `unfinishedSequence` look for the start of a control sequence by
+ * default. A control string can be longer than this (an OSC 52 carries a clipboard): a caller
+ * that holds the whole of a source's output passes a wider lookback, since a cut inside a string
+ * it did not see the start of puts the string's payload into text (the house's read of 1cabc6a, #22).
+ */
 const SEQUENCE_LOOKBACK = 4096;
 
 /**
@@ -125,11 +130,11 @@ export function sequenceEnd(data: string, e: number): number | undefined {
  * control sequence, a surrogate pair, or a CR from the LF after it, so each part
  * projects as the whole would (§6). 0 when there is no such point.
  */
-export function safeCut(data: string, index: number): number {
+export function safeCut(data: string, index: number, lookback = SEQUENCE_LOOKBACK): number {
   let c = Math.max(0, Math.min(index, data.length));
   if (c === 0 || c === data.length) return c;
   // Inside a control sequence: cut before it.
-  const from = Math.max(0, c - SEQUENCE_LOOKBACK);
+  const from = Math.max(0, c - lookback);
   for (let e = c - 1; e >= from; e--) {
     const ch = data.charCodeAt(e);
     if (ch !== 0x1b && ch !== 0x9b) continue;
@@ -151,15 +156,15 @@ export function safeCut(data: string, index: number): number {
  * Where a control sequence left unfinished at the end of `data` starts (a PTY
  * read can end inside one), or `data.length` when every sequence in it is complete.
  */
-export function unfinishedSequence(data: string): number {
-  const from = Math.max(0, data.length - SEQUENCE_LOOKBACK);
+export function unfinishedSequence(data: string, lookback = SEQUENCE_LOOKBACK): number {
+  const from = Math.max(0, data.length - lookback);
   for (let e = data.length - 1; e >= from; e--) {
     const ch = data.charCodeAt(e);
     if (ch !== 0x1b && ch !== 0x9b) continue;
     if (ch === 0x1b && data[e + 1] === '\\') continue; // an ST: the string it ends is judged at its start
     if (ch === 0x1b && e === data.length - 1) {
       // A lone ESC at the end may be the first half of an ST: then the string before it is what is open.
-      const earlier = unfinishedSequence(data.slice(0, e));
+      const earlier = unfinishedSequence(data.slice(0, e), lookback);
       return earlier < e && /[\]PX^_]/.test(data[earlier + 1] ?? '') ? earlier : e;
     }
     return sequenceEnd(data, e) === undefined ? e : data.length;

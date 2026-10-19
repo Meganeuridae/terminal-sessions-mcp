@@ -13,7 +13,9 @@ import { App, type Caller } from '../src/api/app.js';
 import { readJournal, searchJournal, type SearchOptions, type SearchResult } from '../src/api/reader.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
+import { Journal } from '../src/core/journal.js';
 import { cleanLine } from '../src/core/search.js';
+import { MemoryStore } from '../src/core/stores.js';
 import { endRun, out, source, startRun } from './reader-fixture.spec.js';
 
 const lines = (r: SearchResult) => r.matches.map((m) => m.line);
@@ -71,7 +73,8 @@ test('er-5: a real PTY `cat` of 5000 lines: every line is found, whatever the re
     const s = await app.search(A, { session: 'cat', pattern: '^row-\\d+-p*-end$', runId: r.runId!, limit: 500 });
     let n = s.matches.length;
     let next = s;
-    while (next.more) {
+    for (let guard = 0; next.more; guard++) {
+      assert.ok(guard < 100, 'the scan makes progress');
       next = await app.search(A, { session: 'cat', pattern: '^row-\\d+-p*-end$', runId: r.runId!, limit: 500, since: next.nextCursor!, ...(next.nextOffset ? { offset: next.nextOffset } : {}) });
       n += next.matches.length;
     }
@@ -117,6 +120,7 @@ test('jr2-10 / m2-25: a scan that hits its budget says more, and continuing from
   let found = 0;
   let calls = 1;
   while (r.more) {
+    assert.ok(calls < 100, 'the scan makes progress');
     r = await searchJournal(src, { pattern: 'NEEDLE', since: r.nextCursor!, ...(r.nextOffset ? { offset: r.nextOffset } : {}) }, { events: 1000 });
     found += r.matches.length;
     calls++;
@@ -138,7 +142,8 @@ test('jr2-10: the match limit stops the scan where the next match starts: contin
   const seen: string[] = [];
   let r = await search(src, { pattern: '^hit', runId: 'r1', limit: 7, context: 0 });
   seen.push(...lines(r));
-  while (r.more) {
+  for (let guard = 0; r.more; guard++) {
+    assert.ok(guard < 100, 'the scan makes progress');
     assert.equal(r.stoppedBy, 'limit');
     r = await search(src, { pattern: '^hit', runId: 'r1', limit: 7, context: 0, since: r.nextCursor!, ...(r.nextOffset ? { offset: r.nextOffset } : {}) });
     seen.push(...lines(r));
@@ -179,6 +184,126 @@ test('a context line cut by the raw bound is marked clipped on the match it belo
   out(h.journal, `${'\x1b[31m'.repeat(60_000)}\r\nneedle\r\n`);
   const r2 = await search(h, { pattern: '^needle', since: 0, context: 1 });
   assert.deepEqual(r2.matches[0]!.before, ['']);
+});
+
+// ───────────── the house's read of 1cabc6a (#22): where a scan stops ─────────────
+
+const follow = async (src: ReturnType<typeof source>, o: Omit<SearchOptions, 'pattern'> & { pattern: string }, limits?: Parameters<typeof searchJournal>[2]) => {
+  const all: SearchResult[] = [];
+  let r = await searchJournal(src, o, limits);
+  all.push(r);
+  for (let guard = 0; r.more; guard++) {
+    assert.ok(guard < 100, 'the scan makes progress');
+    r = await searchJournal(src, { ...o, since: r.nextCursor!, ...(r.nextOffset ? { offset: r.nextOffset } : {}) }, limits);
+    all.push(r);
+  }
+  return all;
+};
+
+test('1cabc6a 1: a scan at its limit whose unfinished last line is the next match says more, and continuing finds it', async () => {
+  const src = source();
+  for (let i = 0; i < 50; i++) out(src.journal, `hit ${i}\r\n`);
+  out(src.journal, 'hit unfinished');
+  const [first, next, ...rest] = await follow(src, { pattern: '^hit', since: 0, limit: 50 });
+  assert.equal(first!.matches.length, 50);
+  assert.equal(first!.stoppedBy, 'limit', 'the 51st match is in the unfinished last line');
+  assert.deepEqual(lines(next!), ['hit unfinished']);
+  assert.equal(rest.length, 0);
+});
+
+test('1cabc6a 2: a prompt without its newline before a Run\'s output neither hides the matches past the limit nor repeats any', async () => {
+  // Open since the scan began (the cursor lies right before it), or begun after other events: either way it is
+  // matched on what there is of it, and the scan continues at the match past the limit.
+  for (const atCursor of [true, false]) {
+    const src = source();
+    startRun(src.journal, 'r1');
+    const since = atCursor ? src.journal.lastSeq : 0;
+    out(src.journal, 'prompt$ ');
+    for (let k = 0; k < 3; k++) out(src.journal, Array.from({ length: 20 }, (_, i) => `hit ${k * 20 + i}\n`).join(''), 'stdout', 'r1');
+    endRun(src.journal, 'r1');
+    const calls = await follow(src, { pattern: 'hit|prompt', since, limit: 50, context: 0 });
+    const seen = calls.flatMap(lines);
+    const where = new Set(calls.flatMap((r) => r.matches.map((m) => `${m.cursor}:${m.offset ?? 0}`)));
+    assert.equal(seen.length, 61, `${atCursor ? 'at the cursor' : 'after other events'}: ${seen.length} matches in ${calls.length} calls`);
+    assert.equal(where.size, 61, 'no match reported twice');
+    assert.equal(calls.length, 2);
+    assert.ok(seen.includes('prompt$ '), 'the prompt line is matched on what there is of it');
+  }
+});
+
+test('1cabc6a 2: a line longer than a whole scan is matched on each part scanned, and the scan still gets further', async () => {
+  const src = source();
+  // 1 KiB events, 100 per scan: the third scan's part of the line begins with NEEDLE (parts are matched on their head, rule 5).
+  const line = `${'x'.repeat(204_800)}NEEDLE${'y'.repeat(100_000)}\r\n`;
+  for (let i = 0; i < line.length; i += 1024) out(src.journal, line.slice(i, i + 1024));
+  out(src.journal, 'after\r\n');
+  const calls = await follow(src, { pattern: 'NEEDLE|after', since: 0, context: 0 }, { events: 100 });
+  assert.equal(calls.length, 3, 'every scan gets further: 299 events, 100 a scan');
+  assert.deepEqual(calls.flatMap(lines).map((l) => l.slice(0, 6)), ['NEEDLE', 'after'], 'the part beginning with NEEDLE once, and `after`');
+  assert.equal(calls.at(-1)!.more, false);
+});
+
+test('1cabc6a 3: events lost while the scan ran are a hole: no line is joined across it, and the hole is reported', async () => {
+  const j = new Journal({ sessionId: 's', hot: new MemoryStore(256 * 1024) });
+  // `LEFT-` is the last event of the first batch of 2,048; the line it begins goes on in the next.
+  for (let i = 0; i < 2047; i++) out(j, `filler ${i}\r\n`);
+  out(j, 'LEFT-');
+  for (let i = 0; i < 1000; i++) out(j, `rest ${i}\r\n`);
+  // The journal as the scan sees it: by its second fetch, a flood has evicted everything fetched so far and the rest.
+  let fetches = 0;
+  const seen = new Proxy(j, {
+    get(target, prop) {
+      if (prop === 'range') {
+        return (...args: Parameters<Journal['range']>) => {
+          if (++fetches === 2) for (let i = 0; i < 3000; i++) out(j, `${'x'.repeat(100)} new ${i}\r\n`);
+          return target.range(...args);
+        };
+      }
+      const v = Reflect.get(target, prop, target);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+  const r = await searchJournal(source({ journal: seen }), { pattern: 'LEFT-\\S+', since: 0 }, { ms: 60_000 });
+  assert.ok(fetches >= 2);
+  assert.deepEqual(lines(r), [], 'LEFT- was never joined with a line after the hole');
+  assert.equal(r.gap?.reason, 'retention');
+  assert.equal(r.gap?.from, 2049, 'the hole begins where the second fetch did');
+});
+
+test('1cabc6a: the size budget counts UTF-8 bytes and stops with where to continue; a line past the match window is clipped and says so', async () => {
+  const ascii = source();
+  const euro = source();
+  for (let i = 0; i < 100; i++) {
+    out(ascii.journal, `${'a'.repeat(1200)}\r\n`);
+    out(euro.journal, `${'€'.repeat(400)}\r\n`); // 1,200 bytes too
+  }
+  const a = await searchJournal(ascii, { pattern: 'zzz', since: 0 }, { bytes: 6000 });
+  const e = await searchJournal(euro, { pattern: 'zzz', since: 0 }, { bytes: 6000 });
+  assert.equal(a.stoppedBy, 'size');
+  assert.equal(e.stoppedBy, 'size');
+  assert.equal(e.scanned[1] - e.scanned[0], a.scanned[1] - a.scanned[0], 'the same bytes scanned whatever the characters');
+  assert.ok(a.more && a.nextCursor !== undefined && a.nextCursor >= a.scanned[1]);
+  const long = source();
+  out(long.journal, `${'a'.repeat(300_000)}END\r\n`);
+  out(long.journal, 'short aaa\r\n');
+  const r = await search(long, { pattern: 'aaa', since: 0, context: 0 });
+  assert.equal(r.matches.length, 2);
+  assert.equal(r.clippedLines, 1);
+  assert.equal(r.matches[0]!.clipped, true);
+});
+
+test('1cabc6a: without a cursor the recent window is scanned; a cursor older than retention names the hole at its start', async () => {
+  const src = source();
+  for (let i = 0; i < 100; i++) out(src.journal, `line ${i}\r\n`);
+  const r = await search(src, { pattern: '^line 50$' });
+  assert.equal(r.matches.length, 1);
+  assert.equal(r.bounded, false);
+  const j = new Journal({ sessionId: 's', hot: new MemoryStore(64 * 1024) });
+  for (let i = 0; i < 2000; i++) out(j, `${'x'.repeat(100)} ${i}\r\n`);
+  const oldest = j.oldestSeq!;
+  assert.ok(oldest > 1);
+  const g = await search(source({ journal: j }), { pattern: 'zzz', since: 0 });
+  assert.deepEqual(g.gap, { from: 1, to: oldest - 1, reason: 'retention' });
 });
 
 test('jr2-10 / jr2-11: a scan reports the holes it spans: past retention at its start, and gap events inside', async () => {

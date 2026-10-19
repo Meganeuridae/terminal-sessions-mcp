@@ -126,6 +126,34 @@ test('m2-8: presence names the newest ended Runs after the cursor, counts the re
   assert.match(P(B, ['busy']), /≥ [\d.]+ \S+ new since your last read \(read since=0\)/);
 });
 
+test('1cabc6a 8: a later Run\'s result does not move the read cursor past an earlier Run\'s unread output', async () => {
+  await app.sessionOpen(A, { id: 'rc' });
+  await app.run(A, { session: 'rc', command: 'echo first' });
+  assert.match(P(A, ['rc']), /idle, nothing new: rc/);
+  // Y: started with wait 0, its outcome and output never fetched.
+  const y = await app.run(A, { session: 'rc', command: "echo unread; sh -c 'exit 3'", wait: 0 });
+  await until(() => live('rc').run(y.runId!).state === 'exited', 5000, 'Y to end');
+  const before = P(A, ['rc']);
+  assert.match(before, /new since your last read/);
+  assert.match(before, /→ 3/);
+  // X: a later Run whose result the caller got. Its result shows X's output, not Y's.
+  const x = await app.run(A, { session: 'rc', command: 'echo later' });
+  assert.equal(x.exit, 0);
+  const after = P(A, ['rc']);
+  assert.doesNotMatch(after, /idle, nothing new/, "X's result must not hide Y");
+  assert.match(after, /new since your last read/);
+  assert.match(after, /→ 3/);
+  assert.ok(live('rc').cursorsOf(A.principal).read < live('rc').runOutput(y.runId!).events[0]!.seq, "the cursor stays before Y's output");
+  // A page of X alone leaves Y unread too; a read of the session clears it; results seen move the cursor as before.
+  await app.read(A, { session: 'rc', runId: x.runId! });
+  assert.match(P(A, ['rc']), /→ 3/);
+  await app.read(A, { session: 'rc', since: 0 });
+  assert.match(P(A, ['rc']), /idle, nothing new: rc/);
+  await app.run(A, { session: 'rc', command: 'echo one' });
+  await app.run(A, { session: 'rc', command: 'echo two' });
+  assert.match(P(A, ['rc']), /idle, nothing new: rc/);
+});
+
 test('mcpl-2: after a daemon restart, a history-only session reports the Runs the restart lost', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-pres-restart-'));
   const reg1 = new SessionRegistry({ dataDir: dir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });

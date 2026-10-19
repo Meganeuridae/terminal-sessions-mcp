@@ -167,6 +167,18 @@ test('G11: read pages forward head-first — every output line exactly once, wit
   assert.equal((rr.structured?.text as string).trim(), '1\n2\n3\n4\n5');
 });
 
+test('a Run result cut to the result size carries the omission line, is truncated, and leaves the read cursor at the Run\'s end (the house\'s read of 1cabc6a)', async () => {
+  const r = await app.run(A, { session: 'omit', command: 'seq 1 5000', wait: 20_000 });
+  assert.equal(r.state, 'exited');
+  assert.equal(r.output.truncated, true);
+  assert.match(r.output.text, new RegExp(`^\\[… earlier output omitted · read runId=${r.runId} pages through all of it\\]\\n`));
+  assert.ok(Buffer.byteLength(r.output.text) <= 16 * 1024 + 200, `${Buffer.byteLength(r.output.text)} bytes`);
+  assert.match(r.output.text, /\n5000\s*$/);
+  const s = registry.get('omit');
+  assert.ok(s?.kind === 'live');
+  assert.equal(s.session.cursorsOf(A.principal).read, r.output.nextCursor, 'nothing else unread: the cursor is at the Run\'s end');
+});
+
 test('search: regex matches with seq anchors and context', async () => {
   await tool('run', { session: 'srch', command: 'printf "alpha\\nbeta ERROR one\\ngamma\\ndelta\\nERROR two\\nomega\\n"' });
   const r = await tool('search', { session: 'srch', pattern: 'ERROR', context: 1 });

@@ -864,7 +864,7 @@ export const TOOLS: ToolDef[] = [
         offset: { type: 'integer', minimum: 0, description: 'With since: continue inside the event after since (a result’s nextOffset).' },
         until: { type: 'integer', minimum: 0 },
         runId: { type: 'string' },
-        limit: { type: 'integer', minimum: 1, maximum: 500 },
+        limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Matches per call (default 50); a matching line open since the scan started is reported even past it.' },
       },
       required: ['session', 'pattern'],
       additionalProperties: false,

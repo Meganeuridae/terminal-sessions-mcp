@@ -769,7 +769,7 @@ export class App {
       res.integration = session.integration;
       const waiting = this.waitingEvidence(session, run);
       if (waiting) res.waiting = waiting;
-      session.markRead(caller.principal, out.nextCursor);
+      session.markRead(caller.principal, this.readCursorAfterRun(s, caller.principal, run.runId, out.nextCursor));
       // The outcome counts as delivered (G28) only once the transport wrote it: see outcomeSent.
     } else {
       // This result returned the history to the caller: the cursor moves as it does for `read` (G22),
@@ -778,6 +778,24 @@ export class App {
       else s.markRead(caller.principal, out.nextCursor);
     }
     return res;
+  }
+
+  /**
+   * Where a result that showed one Run's output leaves the caller's `read` cursor: at `to`, unless
+   * output of another Run lies unread between the cursor and `to` (its result not returned to the
+   * caller, its output not read since): then just before that output, so presence keeps reporting
+   * it (the house's read of 1cabc6a, #22: a later Run's result hid an earlier Run's unread output).
+   */
+  private readCursorAfterRun(s: AnySession, principal: Principal, runId: string, to: Seq): Seq {
+    const read = (s.kind === 'live' ? s.session : s).cursorsOf(principal).read;
+    let at = to;
+    for (const r of s.listRuns()) {
+      if (r.runId === runId || (r.seq.end !== undefined && r.seq.end <= read) || (r.seq.start ?? r.seq.admit) > at) continue;
+      if (s.kind === 'live' && s.session.outcomeDeliveredTo(r.runId, principal)) continue;
+      const first = s.runOutput(r.runId, { since: read, until: at, limit: 1 }).events[0];
+      if (first) at = first.seq - 1;
+    }
+    return at;
   }
 
   /**
@@ -1112,8 +1130,10 @@ export class App {
     const { session: _, ...opts } = o;
     if (o.runId !== undefined) opts.runId = this.findRun(caller, o.runId, sessionId(s)).run.runId;
     const r = await readJournal(readSource(s), opts, { resultBytes: this.resultBytes });
-    if (s.kind === 'live' && r.nextCursor <= s.session.journal.lastSeq) s.session.markRead(caller.principal, r.nextCursor);
-    else if (s.kind === 'history') s.markRead(caller.principal, r.nextCursor);
+    // A page of one Run leaves other Runs' unread output unread (see readCursorAfterRun).
+    const at = opts.runId !== undefined ? this.readCursorAfterRun(s, caller.principal, opts.runId, r.nextCursor) : r.nextCursor;
+    if (s.kind === 'live' && at <= s.session.journal.lastSeq) s.session.markRead(caller.principal, at);
+    else if (s.kind === 'history') s.markRead(caller.principal, at);
     return r;
   }
 

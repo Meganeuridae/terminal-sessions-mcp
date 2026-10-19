@@ -25,11 +25,20 @@
  *    `clippedLines` (G11: the cut is visible). Displayed lines and context are
  *    cut at MAX_SHOWN characters, marked `clipped`; a context line cut either
  *    way marks the match it belongs to.
- * 6. The limit. Once `limit` matches are found, the first line that matches
- *    beyond them ends the matching, and the scan goes on only as far as the
- *    after-context of the last matches needs (`full` says when nothing more is
- *    wanted); `stop` is where that further match began, so a continuation finds
- *    it first.
+ * 6. The limit, and stopping. Once `limit` matches are found, the first line
+ *    that matches beyond them ends the matching, and the scan goes on only as
+ *    far as the after-context of the last matches needs (`full` says when
+ *    nothing more is wanted); `stop` is where that further match began, so a
+ *    continuation finds it first. Unless that line began where the scan began:
+ *    a continuation could never start it again from a later point, so it is
+ *    matched now, beyond the limit. Where a scan stops, at the limit or a
+ *    budget, a line still open that began where the scan began, or before other
+ *    lines completed (a prompt without its newline, another source's line among
+ *    this one's), is matched now on what there is of it (`settle`): a
+ *    continuation never scans completed lines again. Its rest, if any, is a line
+ *    of its own to the continuation. A line cut at the very end stays pending,
+ *    and the continuation starts at its start, so no match straddling the cut is
+ *    missed (the house's reads of ed4ecac and 1cabc6a, #22).
  *
  * The scanner is incremental: feed events in order, in as many calls as the
  * caller likes (searchJournal pages, yields and stops on a budget), and ask
@@ -77,6 +86,8 @@ interface Carry {
   /** The line's raw bytes passed MAX_LINE_RAW: only its head is kept. */
   cut: boolean;
   start: Resume;
+  /** Lines completed when this one began (rule 6: more since means other lines came between). */
+  linesAt: number;
 }
 
 const shown = (s: string): { text: string; cut: boolean } => (s.length > MAX_SHOWN ? { text: `${s.slice(0, MAX_SHOWN)}…`, cut: true } : { text: s, cut: false });
@@ -106,6 +117,8 @@ export class LineScanner {
   private readonly recent: Array<{ text: string; cut: boolean }> = [];
   private readonly waiting: SearchMatch[] = [];
   private readonly carries = new Map<string, Carry>();
+  /** Where the scan began: the point before the first event fed, as a continuation names it (rule 6). */
+  private start: Resume | undefined;
 
   constructor(
     private readonly re: RegExp,
@@ -132,6 +145,7 @@ export class LineScanner {
    */
   feed(ev: JournalEvent, offset = 0): void {
     if (this.full) return;
+    this.start ??= { cursor: ev.seq - 1, offset };
     if (ev.type === 'gap') {
       this.flush(ev.seq);
       return;
@@ -142,13 +156,37 @@ export class LineScanner {
     this.take(key, ev.data.slice(i), ev.seq, utf8Length(ev.data.slice(0, i)));
   }
 
-  /** End of the range: unfinished lines are lines (anchored at `last`). */
+  /**
+   * End of the range: unfinished lines are lines (anchored at `last`). One of them can be
+   * the match past the limit: the scan stops there (`stop`), and the lines still unfinished
+   * stay for `pending()`.
+   */
   flush(last: Seq): void {
-    for (const c of this.carries.values()) {
+    for (const [key, c] of this.carries) {
       if (this.full) break;
       if (c.raw) this.complete(c, last);
+      this.carries.delete(key);
     }
-    this.carries.clear();
+  }
+
+  /**
+   * Where a stopped scan leaves its open lines (rule 6): one open since the scan began, or begun
+   * before other lines completed, is matched now on what there is of it, anchored at `last`; the
+   * lines cut at the very end stay pending.
+   */
+  settle(last: Seq): void {
+    const lines = this.lines;
+    for (const [key, c] of this.carries) {
+      if (this.progressed(c.start) && c.linesAt === lines) continue;
+      if (c.raw) this.complete(c, last, true);
+      this.carries.delete(key);
+    }
+  }
+
+  /** True when a continuation from `at` gets further than this scan's start. */
+  private progressed(at: Resume): boolean {
+    const s = this.start;
+    return s === undefined || at.cursor > s.cursor || (at.cursor === s.cursor && at.offset > s.offset);
   }
 
   /** The earliest start of an unfinished line: resuming there loses nothing (it may repeat lines of other streams). */
@@ -168,7 +206,7 @@ export class LineScanner {
     while (pos <= data.length && !this.full) {
       if (!carry) {
         if (pos === data.length) break;
-        carry = { raw: '', cut: false, start: { cursor: seq - 1, offset: bytes } };
+        carry = { raw: '', cut: false, start: { cursor: seq - 1, offset: bytes }, linesAt: this.lines };
         this.carries.set(key, carry);
       }
       const nl = data.indexOf('\n', pos);
@@ -191,7 +229,8 @@ export class LineScanner {
     }
   }
 
-  private complete(c: Carry, seq: Seq): void {
+  /** A line is complete; `settled` ones are matched whatever the limit (rule 6). */
+  private complete(c: Carry, seq: Seq, settled = false): void {
     const line = cleanLine(c.raw);
     this.lines++;
     // A line shown shorter than it was, by MAX_SHOWN or by the raw cut, is clipped wherever it appears.
@@ -204,11 +243,13 @@ export class LineScanner {
       }
     }
     while (this.waiting.length && this.waiting[0]!.after.length >= this.context) this.waiting.shift();
-    if (this.limited) return; // only the after-context was wanted of this line
+    if (this.limited && !settled) return; // only the after-context was wanted of this line (a settled one is still matched, rule 6)
     const t = testBounded(this.re, line);
     if (t.clipped || c.cut) this.clippedLines++;
     if (t.matched) {
-      if (this.matches.length >= this.limit) {
+      // The match past the limit stops the scan where its line starts, unless that is where the
+      // scan started: then the line is matched now, beyond the limit (rule 6).
+      if (!settled && this.matches.length >= this.limit && this.progressed(c.start)) {
         this.limited = true;
         this.stop = c.start;
         return;

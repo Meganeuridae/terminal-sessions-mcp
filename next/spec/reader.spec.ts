@@ -6,8 +6,9 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readJournal, type ReadResult, type ReadSource } from '../src/api/reader.js';
+import { readJournal, searchJournal, type ReadResult } from '../src/api/reader.js';
 import { Journal } from '../src/core/journal.js';
+import { MemoryStore } from '../src/core/stores.js';
 import { project } from '../src/core/transcript.js';
 import { endRun, out, readAll, source, startRun } from './reader-fixture.spec.js';
 
@@ -294,14 +295,14 @@ test('er-10: pages project at the session\'s rows, and a Run\'s at the geometry 
   out(tall.journal, frame);
   const r = await readJournal(tall, { since: 0 }, { resultBytes: 16384 });
   assert.equal(r.text!.split('\n').filter((l) => l.startsWith('row-')).length, 50);
-  // A Run started at 100x50 in a session now 80x24 projects at 100x50.
+  // A Run started at 100x50 in a session now 80x24 projects at 100x50: the geometry its journal record keeps (run.start).
   const resized = source({ cols: 80, rows: 24 });
   startRun(resized.journal, 'r1', 'shell', { cols: 100, rows: 50 });
   out(resized.journal, frame, 'pty', 'r1');
-  const src: ReadSource = { ...resized, run: () => ({ ...resized.journal.runs.get('r1')!, cols: 100, rows: 50 }) };
-  const byRun = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
+  assert.deepEqual([resized.run!('r1')!.cols, resized.run!('r1')!.rows], [100, 50]);
+  const byRun = await readJournal(resized, { runId: 'r1' }, { resultBytes: 16384 });
   assert.equal(byRun.text!.split('\n').filter((l) => l.startsWith('row-')).length, 50);
-  const tail = await readJournal(src, { runId: 'r1', tail: 60 }, { resultBytes: 16384 });
+  const tail = await readJournal(resized, { runId: 'r1', tail: 60 }, { resultBytes: 16384 });
   assert.equal(tail.text!.split('\n').filter((l) => l.startsWith('row-')).length, 50);
 });
 
@@ -381,7 +382,188 @@ test('er-2: the tail of apt-style output reads as the terminal shows it, though 
   }
 });
 
-// ───────────── the house's read of ed4ecac (#22): a hole ends an open sequence ─────────────
+// ───────────── the house's read of 1cabc6a (#22): holes, tails, long control strings, bounds ─────────────
+
+const gapAt = (j: Journal) => {
+  const g = j.lastSeq + 1;
+  return j.append({ type: 'gap', from: g, to: g, reason: 'torn-write' }).seq;
+};
+
+test('1cabc6a 4: a Run\'s read and search show a hole wherever it lies: at a batch edge, after the last output, before the first, and 20,500 other events in', async () => {
+  // Between the 2,048th and 2,049th outputs: where a walk's batch ends.
+  const edge = source();
+  startRun(edge.journal, 'r1');
+  for (let i = 0; i < 2048; i++) out(edge.journal, `l${i}\n`, 'stdout', 'r1');
+  const ge = gapAt(edge.journal);
+  for (let i = 0; i < 10; i++) out(edge.journal, `m${i}\n`, 'stdout', 'r1');
+  endRun(edge.journal, 'r1');
+  const { text, pages } = await readAll(edge, { runId: 'r1', maxBytes: 1024 * 1024 });
+  assert.match(text, /l2047\n\[… 1 journal event missing \(seq \d+–\d+: a torn write\) …\]\nm0\n/);
+  assert.deepEqual(pages.flatMap((p) => (p.gaps ?? (p.gap ? [p.gap] : [])).map((g) => g.from)), [ge]);
+  assert.equal((await searchJournal(edge, { pattern: 'zzz', runId: 'r1' })).gap?.from, ge);
+  // After the last output, and before the first.
+  for (const where of ['after', 'before'] as const) {
+    const src = source();
+    startRun(src.journal, 'r1');
+    if (where === 'before') gapAt(src.journal);
+    out(src.journal, 'only\n', 'stdout', 'r1');
+    if (where === 'after') gapAt(src.journal);
+    endRun(src.journal, 'r1');
+    const r = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
+    assert.equal(r.gap?.reason, 'torn-write', where);
+    assert.equal(r.text, where === 'before' ? '[… 1 journal event missing (seq 3–3: a torn write) …]\nonly' : 'only\n[… 1 journal event missing (seq 4–4: a torn write) …]', where);
+    assert.equal(r.more, false, where);
+    assert.equal((await searchJournal(src, { pattern: 'zzz', runId: 'r1' })).gap?.reason, 'torn-write', where);
+  }
+  // 20,500 other events after the first output: beyond any bounded scan of the range.
+  const far = source();
+  startRun(far.journal, 'r1');
+  out(far.journal, 'a\n', 'stdout', 'r1');
+  for (let i = 0; i < 20_500; i++) far.journal.append({ type: 'note', text: 'n', principal: 'agent:x@test' });
+  const gf = gapAt(far.journal);
+  out(far.journal, 'b\n', 'stdout', 'r1');
+  endRun(far.journal, 'r1');
+  const r = await readJournal(far, { runId: 'r1' }, { resultBytes: 16384 });
+  assert.equal(r.gap?.from, gf);
+  assert.equal(r.text, `a\n[… 1 journal event missing (seq ${gf}–${gf}: a torn write) …]\nb`);
+  assert.equal((await searchJournal(far, { pattern: 'zzz', runId: 'r1' })).gap?.from, gf);
+});
+
+test('1cabc6a 5: a tail of one line longer than the old input cap keeps the whole line within maxBytes, and says truncated when it cannot', async () => {
+  const line = `${'y'.repeat(307_201)}\n`;
+  const src = source();
+  startRun(src.journal, 'r1');
+  for (let i = 0; i < line.length; i += 65536) out(src.journal, line.slice(i, i + 65536), 'stdout', 'r1');
+  endRun(src.journal, 'r1');
+  const whole = await readJournal(src, { runId: 'r1', tail: 1, maxBytes: 1024 * 1024 }, { resultBytes: 16384 });
+  assert.equal(whole.text!.length, 307_201, 'the input cap is never below maxBytes');
+  assert.equal(whole.truncated, false);
+  const session = source();
+  for (let i = 0; i < line.length; i += 1024) out(session.journal, line.slice(i, i + 1024));
+  const s = await readJournal(session, { tail: 1, maxBytes: 1024 * 1024 }, { resultBytes: 16384 });
+  assert.equal(s.text!.length, 307_201);
+  assert.equal(s.truncated, false);
+  // A line longer than the cap itself: its head is gone, and the result says so.
+  const huge = source();
+  startRun(huge.journal, 'r1');
+  const big = `${'z'.repeat(1_300_000)}\n`;
+  for (let i = 0; i < big.length; i += 65536) out(huge.journal, big.slice(i, i + 65536), 'stdout', 'r1');
+  endRun(huge.journal, 'r1');
+  const cut = await readJournal(huge, { runId: 'r1', tail: 1, maxBytes: 1024 * 1024 }, { resultBytes: 16384 });
+  assert.ok(cut.text!.length > 0 && cut.text!.length < 1_300_000);
+  assert.equal(cut.truncated, true, 'the line came back without its head');
+  assert.deepEqual(cut.lines, { requested: 1, returned: 1 });
+});
+
+test('1cabc6a 6: a control string longer than any lookback (an OSC 52 clipboard) never leaks its payload into a page, whatever the page size', async () => {
+  const osc = (n: number) => `\x1b]52;c;${'Q'.repeat(n)}\x07`;
+  for (const [payload, maxBytes, chunk] of [
+    [20_000, 16384, 1024],
+    [3000, 1024, 1024],
+    [40_000, 4096, 100],
+  ] as const) {
+    const src = source();
+    const data = `before\r\n${osc(payload)}after\r\nlast\r\n`;
+    for (let i = 0; i < data.length; i += chunk) out(src.journal, data.slice(i, i + chunk));
+    // A page that would begin inside the string takes it whole, even when it is longer than the page (readAll checks that every page makes progress).
+    const { text, pages } = await readAll(src, { since: 0, maxBytes });
+    assert.equal(text, 'before\nafter\nlast', `payload ${payload} in pages of ${maxBytes}`);
+    assert.ok(pages.every((p) => !p.truncated));
+  }
+});
+
+test('1cabc6a 7: an events tail and an events page keep to maxBytes, say when a cap cut them, and page every event once', async () => {
+  const src = source();
+  const seqs = Array.from({ length: 2500 }, (_, i) => out(src.journal, `${'z'.repeat(10_000)} ${i}\r\n`));
+  const tail = await readJournal(src, { tail: 2000, as: 'events', maxBytes: 1024 }, { resultBytes: 16384 });
+  assert.equal(tail.events!.length, 1, 'one event is over the budget by itself: it alone');
+  assert.equal(tail.events![0]!.seq, seqs.at(-1));
+  assert.equal(tail.truncated, true);
+  const wide = await readJournal(src, { tail: 2400, as: 'events', maxBytes: 1024 * 1024 }, { resultBytes: 16384 });
+  assert.ok(wide.events!.length < 2400 && wide.events!.reduce((a, e) => a + JSON.stringify(e).length, 0) <= 1024 * 1024);
+  assert.equal(wide.truncated, true, 'fewer than asked, by the budget: a cut');
+  assert.deepEqual(wide.lines, { requested: 2400, returned: wide.events!.length });
+  // Head-first events pages: at least one event, else within maxBytes; the cursor is the last event returned.
+  const small = source();
+  for (let i = 0; i < 30; i++) out(small.journal, `${'z'.repeat(700)} ${i}\r\n`);
+  const got: number[] = [];
+  let since = 0;
+  for (let guard = 0; guard < 100; guard++) {
+    const p = await readJournal(small, { since, as: 'events', maxBytes: 2048 }, { resultBytes: 16384 });
+    assert.ok(p.events!.length >= 1 && (p.events!.length === 1 || p.events!.reduce((a, e) => a + JSON.stringify(e).length, 0) <= 2048));
+    assert.equal(p.nextCursor, p.events!.at(-1)!.seq);
+    got.push(...p.events!.map((e) => e.seq));
+    since = p.nextCursor;
+    if (!p.more) break;
+  }
+  assert.deepEqual(got, Array.from({ length: 30 }, (_, i) => i + 1));
+});
+
+test('1cabc6a: with every event of a range aged out, a Run\'s read and the session\'s tail say so', async () => {
+  const j = new Journal({ sessionId: 's', hot: new MemoryStore(64 * 1024) });
+  const src = source({ journal: j });
+  startRun(j, 'r1');
+  for (let i = 0; i < 2000; i++) out(j, `${'x'.repeat(200)} ${i}\n`, 'stdout', 'r1');
+  endRun(j, 'r1');
+  const runEnd = j.lastSeq;
+  for (let i = 0; i < 2000; i++) j.append({ type: 'note', text: 'n'.repeat(200), principal: 'agent:x@test' });
+  assert.ok(j.oldestSeq! > runEnd, 'the Run is gone entirely');
+  const r = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
+  assert.deepEqual(r.gap, { from: 2, to: runEnd, reason: 'retention' });
+  assert.equal(r.text, `[… ${runEnd - 1} journal events missing (seq 2–${runEnd}: past retention) …]`);
+  assert.equal(r.more, false);
+  const t = await readJournal(src, { tail: 5, until: runEnd }, { resultBytes: 16384 });
+  assert.deepEqual(t.gap, { from: 1, to: runEnd, reason: 'retention' });
+  assert.equal(t.truncated, true);
+  assert.deepEqual(t.lines, { requested: 5, returned: 1 });
+});
+
+test('1cabc6a: lasting state set by a sequence split across two events still applies to pages deep in the output (er-2)', async () => {
+  const src = source({ cols: 120, rows: 30 });
+  const data = apt(400, 30);
+  // The scroll region ESC[0;29r is cut after its `0;`: the first event ends inside it.
+  const split = data.indexOf('\x1b[0;') + 4;
+  assert.equal(data.slice(split, split + 3), '29r');
+  out(src.journal, data.slice(0, split));
+  for (let i = split; i < data.length; i += 1024) out(src.journal, data.slice(i, i + 1024));
+  for (const maxBytes of [16384, 65536]) {
+    const { text } = await readAll(src, { since: 0, maxBytes });
+    const lines = text.split('\n');
+    assert.deepEqual(lines.filter((l) => /Progress|#####|\.\.\.\.\.\]/.test(l) && !l.startsWith('Progress')), [], `maxBytes ${maxBytes}`);
+    assert.equal(lines.filter((l) => l.startsWith('Setting up pkg-')).length, 400, `maxBytes ${maxBytes}`);
+  }
+});
+
+test('1cabc6a: `until` bounds head-first pages, and a sealed journal\'s final unterminated line is final', async () => {
+  const src = source();
+  const seqs = Array.from({ length: 200 }, (_, i) => out(src.journal, `line ${String(i).padStart(3, '0')} ${'p'.repeat(40)}\r\n`));
+  const { text, pages } = await readAll(src, { since: 0, until: seqs[99]!, maxBytes: 1024 });
+  assert.equal(text.split('\n').length, 100);
+  assert.ok(pages.length > 3);
+  assert.ok(pages.every((p) => p.nextCursor <= seqs[99]!));
+  assert.equal(pages.at(-1)!.nextCursor, seqs[99]);
+  out(src.journal, 'no newline at the end');
+  assert.equal((await readJournal(src, { since: seqs[199]! }, { resultBytes: 16384 })).splitLine, true, 'live: the line may go on');
+  src.journal.seal();
+  const sealed = await readJournal(src, { since: seqs[199]! }, { resultBytes: 16384 });
+  assert.equal(sealed.text, 'no newline at the end');
+  assert.equal(sealed.splitLine, undefined, 'sealed: nothing can continue it');
+});
+
+test('1cabc6a: every change of source in a page is headed, not only the first two', async () => {
+  const src = source();
+  startRun(src.journal, 'rA');
+  startRun(src.journal, 'rB');
+  for (let n = 1; n <= 4; n++) {
+    out(src.journal, `A${n}\n`, 'stdout', 'rA');
+    out(src.journal, `B${n}\n`, 'stdout', 'rB');
+    out(src.journal, `T${n}\r\n`);
+  }
+  const r = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
+  const lines = r.text!.split('\n');
+  assert.equal(lines.filter((l) => l.startsWith('[')).length, 12, r.text);
+  assert.deepEqual(lines.slice(0, 6), ['[run rA]', 'A1', '[run rB]', 'B1', '[terminal]', 'T1']);
+});
 
 test('ed4ecac 3: output that ends inside a control sequence before a hole hides neither the hole nor what follows it', async () => {
   for (const open of ['\x1b]0;my tit', '\x1b[', '\x1bPq1', '\x1b_x']) {
@@ -446,11 +628,17 @@ test('G11 / er-1 / er-8 / er-12 through the App and a real shell: pages by since
     const proc = await app.run(A, { session: 'pg', target: 'process', command: `seq -f 'L%05g some text here' 1 20000`, wait: 20_000 });
     const got = (await follow({ session: 'pg', runId: proc.runId! })).split('\n');
     assert.deepEqual(got, Array.from({ length: 20_000 }, (_, i) => `L${String(i + 1).padStart(5, '0')} some text here`));
-    // Two concurrent process Runs: every line whole, labelled by Run.
+    // Two concurrent process Runs: every line whole, labelled by Run. The verdict means something only
+    // when their output did interleave in the journal, so that is checked too.
     const start = (await app.read(A, { session: 'pg', tail: 1 })).nextCursor;
-    const a = app.run(A, { session: 'pg', target: 'process', command: "for n in 1 2 3; do printf 'A%s-start ' $n; sleep 0.05; printf 'A%s-end\\n' $n; done", wait: 10_000 });
-    const b = app.run(A, { session: 'pg', target: 'process', command: "for n in 1 2 3; do printf 'B%s-start ' $n; sleep 0.05; printf 'B%s-end\\n' $n; done", wait: 10_000 });
+    const a = app.run(A, { session: 'pg', target: 'process', command: "for n in 1 2 3; do printf 'A%s-start ' $n; sleep 0.15; printf 'A%s-end\\n' $n; done", wait: 10_000 });
+    const b = app.run(A, { session: 'pg', target: 'process', command: "for n in 1 2 3; do printf 'B%s-start ' $n; sleep 0.15; printf 'B%s-end\\n' $n; done", wait: 10_000 });
     await Promise.all([a, b]);
+    const order: string[] = [];
+    for (const e of (await app.read(A, { session: 'pg', since: start, as: 'events', limit: 2000, maxBytes: 1024 * 1024 })).events!) {
+      if (e.type === 'output' && e.stream !== 'pty' && e.runId !== undefined) order.push(e.runId);
+    }
+    assert.ok(order.some((id, i) => i > 0 && id !== order[i - 1] && order.slice(i + 1).includes(order[i - 1]!)), `the Runs' output events interleaved: ${order.join(',')}`);
     const mixed = (await app.read(A, { session: 'pg', since: start })).text!.split('\n').filter((l) => /[AB]\d-/.test(l));
     assert.equal(mixed.length, 6);
     for (const l of mixed) assert.match(l, /^(A\d)-start \1-end$|^(B\d)-start \2-end$/, l);

@@ -17,14 +17,18 @@
  *   stays a seq), else inside an event (`nextOffset`); else, for a line longer
  *   than the rest of the page, at the budget (mid-line: `splitLine`); else at
  *   an earlier line end. A cut is never inside a character, a control sequence
- *   or a CRLF: a sequence longer than a page is taken whole, and a live page
- *   that ends inside one stops before it. A hole ends any sequence open before
- *   it: nothing continues across lost events. The budget holds for the projected
- *   text: a page whose projection grows past `maxBytes` (tabs, cursor-addressed
- *   output) is taken again from less input, so the head of a page is never cut
- *   away. A page the next one continues keeps its trailing blank lines and an
- *   unfinished line's trailing spaces (§6 rule 3, `open`), so pages joined read
- *   as the whole range does.
+ *   or a CRLF: a sequence longer than a page is taken whole (a control string
+ *   longer than OPEN_SEQUENCE_BYTES past the page is the one exception), and a
+ *   live page that ends inside one stops before it. A hole ends any sequence
+ *   open before it: nothing continues across lost events. The budget holds for
+ *   the projected text: a page whose projection grows past `maxBytes` (tabs,
+ *   cursor-addressed output) is taken again from less input, so the head of a
+ *   page is never cut away. A page the next one continues keeps its trailing
+ *   blank lines and an unfinished line's trailing spaces (§6 rule 3, `open`), so
+ *   pages joined read as the whole range does, with one exception: a line longer
+ *   than the rest of its page is cut mid-line, and its rest begins the next page
+ *   at column 0, so a tab or cursor motion in that rest lands on a different
+ *   column than it would unsplit.
  * - `splitLine` is set whenever the page ends mid-line and the line may go on:
  *   more follows, or the range is still open (a running Run, a live session).
  * - `more` is true whenever retained events of the range remain after the page.
@@ -43,8 +47,10 @@
  * - `tail: N` gives the last N lines of the range (the session, a Run with
  *   `runId`, bounded by `since` and `until`), up to `maxBytes`. `lines` says
  *   how many were asked for and returned: fewer returned without `truncated`
- *   means the range holds no more; `truncated` means `maxBytes` (or retention)
- *   cut lines that were asked for.
+ *   means the range holds no more; `truncated` means `maxBytes`, retention, the
+ *   scan bound or the projection's input cap cut lines (or a line's head) that
+ *   were asked for. As events, the tail is the newest N events whose JSON fits
+ *   `maxBytes`.
  */
 import type { Journal } from '../core/journal.js';
 import { compileUserRegex } from '../core/regex.js';
@@ -91,6 +97,7 @@ export interface ReadResult {
 
 export interface SearchResult {
   session: string;
+  /** At most `limit`, plus the matching lines the stop settled (search.ts rule 6). */
   matches: SearchMatch[];
   /** The journal range scanned. */
   scanned: [Seq, Seq];
@@ -98,7 +105,11 @@ export interface SearchResult {
   more: boolean;
   /** The scan started after the oldest retained event because of the scan bound; `since` reaches further back. */
   bounded: boolean;
-  /** With `more`: where to continue (a continued search may repeat a match interleaved with the line it resumes at). */
+  /**
+   * With `more`: where to continue. A continuation scans no completed line again; a line still
+   * open here that other lines completed after was matched on the part scanned, and its rest goes
+   * on as a line of its own (search.ts rule 6).
+   */
   nextCursor?: Seq;
   nextOffset?: number;
   /** `limit`: more matches exist; `time` or `size`: the scan's budget ran out. */
@@ -131,6 +142,7 @@ export interface SearchOptions {
   offset?: number;
   until?: Seq;
   runId?: string;
+  /** Matches per call (default 50); see SearchResult.matches for the one way past it. */
   limit?: number;
 }
 
@@ -144,8 +156,6 @@ export interface ReadSource {
   runOutput(runId: string, range?: RunOutputRange): RunOutput;
   /** The Run's record: its recorded geometry (RunInfo.cols/rows) and whether it has ended. */
   run?(runId: string): RunInfo | undefined;
-  /** Gap events with seq in [from, to]; without it the reader scans the journal (bounded) for them. */
-  gaps?(from: Seq, to: Seq): Array<Extract<JournalEvent, { type: 'gap' }>>;
 }
 
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
@@ -191,13 +201,23 @@ type Piece = OutPiece | { kind: 'gap'; seq: Seq; gap: GapInfo; atStart?: true };
 
 /** The range a read or search walks: events after a cursor, in batches, up to an end. */
 interface Walk {
-  /** The next batch, or an empty array at the end of the range. */
+  /** The next batch, or an empty array at the end of the range. Every hole in the range comes as a gap event, once. */
   next(): JournalEvent[];
   /** A retention hole at the start of the range. */
   gap: GapInfo | undefined;
   /** The last seq of the range (as far as it is known now). */
   end: Seq;
 }
+
+/** The hole retention leaves at the start of [from, to], by the journal's oldest retained seq (all of it when nothing is retained); undefined when none. */
+function retentionGap(journal: Journal, from: Seq, to: Seq): GapInfo | undefined {
+  const oldest = journal.oldestSeq;
+  const hole = oldest === undefined ? to : Math.min(to, oldest - 1);
+  return from <= hole ? { from, to: hole, reason: 'retention' } : undefined;
+}
+
+/** A gap event standing for a hole the journal holds no event for (a Run's range cut, or events lost since the walk began). */
+const gapEvent = (g: GapInfo): Gap => ({ type: 'gap', seq: g.to, ts: Date.now(), from: g.from, to: g.to, reason: 'retention' });
 
 function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | undefined; until?: Seq | undefined }): Walk {
   const journal = src.journal;
@@ -207,14 +227,17 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
   let pending: typeof first | undefined = first;
   let gap: GapInfo | undefined;
   let end = journal.lastSeq;
+  // The range's first seq: after `since`, and not before a Run's first.
+  let from = (o.since ?? 0) + 1;
   if ('truncated' in first) {
-    // A Run's output: a hole at its start when its first retained output comes after what was asked for.
-    const oldest = journal.oldestSeq;
-    const wanted = o.since !== undefined ? Math.max(o.since + 1, first.from) : first.from;
-    if (first.truncated && oldest !== undefined && wanted < oldest) gap = { from: wanted, to: oldest - 1, reason: 'retention' };
+    // A Run's output: a hole at its start when retention took the range's first events, or all of them.
+    from = Math.max(from, first.from);
     end = first.to;
+    if (first.truncated) gap = retentionGap(journal, from, end);
   } else if (first.gap) gap = { ...first.gap };
   if (o.until !== undefined) end = Math.min(end, o.until);
+  /** Holes have been reported through this seq. */
+  let reported = gap?.to ?? from - 1;
   let done = false;
   return {
     gap,
@@ -222,10 +245,24 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
     next() {
       if (done) return [];
       const r = pending ?? fetch();
+      const resumed = pending === undefined;
       pending = undefined;
       if (!r.more || r.events.length === 0) done = true;
+      const events: JournalEvent[] = [...r.events];
+      // Events gone since the walk began (retention while a search yielded) are a hole, not a seam
+      // to join lines across: a gap event stands where they were (the house's read of 1cabc6a, #22).
+      const lost = !resumed ? undefined : 'truncated' in r ? retentionGap(journal, (cursor ?? 0) + 1, Math.min(end, events[0] ? events[0].seq - 1 : end)) : r.gap;
+      if (lost && lost.to > reported) events.unshift(gapEvent({ from: Math.max(lost.from, reported + 1), to: lost.to, reason: 'retention' }));
+      if ('gaps' in r && r.gaps) {
+        // A Run's output is filtered to its own events: its holes come apart and are placed among
+        // them, each once; after its last output they reach to the range's end.
+        const upTo = done ? end : (events[events.length - 1]?.seq ?? reported);
+        for (const g of r.gaps) if (g.seq > reported && g.seq <= upTo) events.push(g);
+        events.sort((a, b) => a.seq - b.seq);
+      }
+      if (events.length) reported = Math.max(reported, done ? end : events[events.length - 1]!.seq);
       if (r.events.length) cursor = r.events[r.events.length - 1]!.seq;
-      return o.runId !== undefined ? withGaps(src, r.events) : r.events;
+      return events;
     },
   };
 }
@@ -235,16 +272,6 @@ const rangeOf = (since: Seq | undefined, until: Seq | undefined, r: RunOutputRan
   if (until !== undefined) r.until = until;
   return r;
 };
-
-/** A Run's output events with the gap events among them (a Run's output is filtered to its own events). */
-function withGaps(src: ReadSource, events: JournalEvent[]): JournalEvent[] {
-  if (events.length === 0) return events;
-  const lo = events[0]!.seq;
-  const hi = events[events.length - 1]!.seq;
-  const gaps = src.gaps ? src.gaps(lo, hi) : src.journal.range(lo, hi, MAX_SCAN).events.filter(isGap);
-  if (gaps.length === 0) return events;
-  return [...events, ...gaps.filter((g) => g.seq > lo && g.seq <= hi)].sort((a, b) => a.seq - b.seq);
-}
 
 /**
  * Read by cursor (G11). `since` pages forward, head first: each result says where
@@ -288,9 +315,27 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   let examined = 0;
   let lastExamined = start;
   let exhausted = false;
-  // A control sequence left open where collecting would stop is collected to its end
-  // (within OPEN_SEQUENCE_BYTES), so no page has to end inside it.
-  const full = () => bytes > maxBytes && (bytes > maxBytes + OPEN_SEQUENCE_BYTES || openSequence(pieces) === undefined);
+  // A control sequence left open where collecting would stop is collected to its end (within
+  // OPEN_SEQUENCE_BYTES), so no page has to end inside it. A control string (an OSC carrying a
+  // clipboard) can be long: once one is found open, only an event that could end it (BEL, ST,
+  // ESC) or a hole makes the check run again (the house's read of 1cabc6a, #22).
+  let openString: number | undefined; // pieces checked so far, while a control string is open
+  const closer = /[\x07\x1b\x9c]/;
+  const full = () => {
+    if (bytes <= maxBytes) return false;
+    if (bytes > maxBytes + OPEN_SEQUENCE_BYTES) return true;
+    if (openString !== undefined) {
+      if (!pieces.slice(openString).some((q) => q.kind === 'gap' || closer.test(q.data))) {
+        openString = pieces.length;
+        return false;
+      }
+      openString = undefined;
+    }
+    const at = openSequence(pieces);
+    if (at === undefined) return true;
+    if (isControlString(pieces, at)) openString = pieces.length;
+    return false;
+  };
   outer: for (;;) {
     const batch = w.next();
     if (batch.length === 0) {
@@ -427,20 +472,18 @@ function joined(segs: Array<{ j: number; data: string }>, end: Pos): { text: str
 }
 
 /**
- * The data of piece `j`'s source up to `at`, with as much of that source's earlier
- * pieces as control sequences can reach back (SEQUENCE_LOOKBACK), and the rest of piece `j`.
+ * The data of piece `j`'s source up to `at`, with all of that source's earlier pieces back to
+ * the page's start or the last hole (nothing continues across lost events; a control string can
+ * be longer than any fixed lookback), and the rest of piece `j`.
  */
 function sourceContext(pieces: Piece[], pos: Pos): { text: string; rest: string; locate(i: number): Pos } {
   const pc = pieces[pos.j] as OutPiece;
   const key = sourceKey(pc.ev);
   const segs: Array<{ j: number; data: string }> = [{ j: pos.j, data: pc.data.slice(0, pos.at) }];
-  let len = pos.at;
-  for (let i = pos.j - 1; i >= 0 && len < 4096; i--) {
+  for (let i = pos.j - 1; i >= 0; i--) {
     const q = pieces[i]!;
-    if (q.kind === 'gap') break; // nothing continues across a hole (the house's read of ed4ecac, #22)
-    if (sourceKey(q.ev) !== key) continue;
-    segs.unshift({ j: i, data: q.data });
-    len += q.data.length;
+    if (q.kind === 'gap') break;
+    if (sourceKey(q.ev) === key) segs.unshift({ j: i, data: q.data });
   }
   return { ...joined(segs, pos), rest: pc.data.slice(pos.at) };
 }
@@ -456,6 +499,12 @@ function sourceForward(pieces: Piece[], j: number): { text: string; locate(i: nu
   }
   const last = segs[segs.length - 1]!;
   return joined(segs, { j: last.j, at: last.data.length });
+}
+
+/** Whether the sequence starting at `at` is a control string (OSC, DCS, SOS, PM, APC), judged by its second byte when it is at hand. */
+function isControlString(pieces: Piece[], at: Pos): boolean {
+  const d = (pieces[at.j] as OutPiece).data;
+  return d.charCodeAt(at.at) === 0x1b && /[\]PX^_]/.test(d[at.at + 1] ?? '');
 }
 
 /**
@@ -482,22 +531,32 @@ function throughLineEnd(pieces: Piece[], pos: Pos): Pos {
 }
 
 /**
- * Where a control sequence left open at the end of the pieces (in the last output's source) starts;
- * undefined when none is. A hole at the end ends it: its end was lost with the events the hole stands
- * for, and what follows is no continuation (the house's read of ed4ecac, #22).
+ * Where a control sequence left open at the end of the pieces starts, in whichever source left
+ * it open (the earliest when several did); undefined when none is. A hole at the end ends them
+ * all (the house's read of ed4ecac, #22).
  */
 function openSequence(pieces: Piece[]): Pos | undefined {
-  const last = pieces.length - 1;
-  if (last < 0 || pieces[last]!.kind !== 'out') return undefined;
-  const ctx = sourceContext(pieces, { j: last, at: (pieces[last] as OutPiece).data.length });
-  const e = unfinishedSequence(ctx.text);
-  return e < ctx.text.length ? ctx.locate(e) : undefined;
+  let found: Pos | undefined;
+  const seen = new Set<string>();
+  for (let j = pieces.length - 1; j >= 0; j--) {
+    const q = pieces[j]!;
+    if (q.kind === 'gap') break;
+    const key = sourceKey(q.ev);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const ctx = sourceContext(pieces, { j, at: q.data.length });
+    const e = unfinishedSequence(ctx.text, Number.POSITIVE_INFINITY);
+    if (e >= ctx.text.length) continue;
+    const at = ctx.locate(e);
+    if (!found || at.j < found.j || (at.j === found.j && at.at < found.at)) found = at;
+  }
+  return found;
 }
 
 /** The nearest point at or before `pos` where the page can end without splitting a control sequence, a character or a CRLF (§6). */
 function safeBefore(pieces: Piece[], pos: Pos): Pos {
   const ctx = sourceContext(pieces, pos);
-  return ctx.locate(safeCut(ctx.text + ctx.rest, ctx.text.length));
+  return ctx.locate(safeCut(ctx.text + ctx.rest, ctx.text.length, Number.POSITIVE_INFINITY));
 }
 
 /**
@@ -572,8 +631,10 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
       }
     }
   } else if (hold) {
+    // Only the sequence waits when it is in the last output; an earlier source's open sequence defers
+    // visible output after it too, which is `more`.
     cut = openSequence(pieces);
-    held = cut !== undefined;
+    held = cut !== undefined && !pieces.some((q, i) => i > cut!.j && q.kind === 'out');
   }
   if (cut && cut.at >= (out(cut.j)?.data.length ?? 0)) {
     // A cut at the end of a piece is the end of that piece.
@@ -678,9 +739,12 @@ function stateBefore(src: ReadSource, o: ReadOptions, first: Output, start = 0):
     }
   } else {
     let cursor = first.seq - 1;
-    while (bytes < STATE_LOOKBACK && cursor > 0) {
+    let examined = 0;
+    // Bounded in events as well as bytes: a stretch of marks and notes with no output ends the look-back.
+    while (bytes < STATE_LOOKBACK && cursor > 0 && examined < MAX_SCAN) {
       const batch = src.journal.tail(512, cursor);
       if (batch.length === 0) break;
+      examined += batch.length;
       for (let i = batch.length - 1; i >= 0 && bytes < STATE_LOOKBACK; i--) {
         const e = batch[i]!;
         if (!isOutput(e)) continue;
@@ -690,8 +754,9 @@ function stateBefore(src: ReadSource, o: ReadOptions, first: Output, start = 0):
       cursor = batch[0]!.seq - 1;
     }
   }
-  // Oldest first; each part reduced on its own, then the whole (a reset makes what precedes it moot).
-  return persistentState(parts.reverse().map(persistentState).join(''));
+  // Oldest first, reduced as one text: a sequence split across two events (apt's scroll region) is
+  // whole again (the house's read of 1cabc6a, #22); a reset makes what precedes it moot.
+  return persistentState(parts.reverse().join(''));
 }
 
 // ───────────── events pages ─────────────
@@ -708,8 +773,9 @@ function eventsPage(src: ReadSource, o: ReadOptions, maxBytes: number): Omit<Rea
     const batch = w.next();
     if (batch.length === 0) break;
     for (const e of batch) {
+      // `maxBytes` is the page size: JSON of the events, at least one of them.
       const b = JSON.stringify(e).length;
-      if (page.length >= limit || (page.length > 0 && bytes + b > maxBytes * 4)) {
+      if (page.length >= limit || (page.length > 0 && bytes + b > maxBytes)) {
         more = true;
         break outer;
       }
@@ -730,47 +796,59 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const n = clamp(o.tail!, 1, 10_000);
   // Input with enough line ends for the last n lines, and room for a screenful of redraw (§6 rule 7).
   const need = n + 2 * geometry.rows + 1;
-  const cap = Math.max(256 * 1024, n * 400);
+  // Input projected at most: never less than the result may hold, so a page of long lines is whole.
+  const cap = Math.max(256 * 1024, n * 400, maxBytes);
   let events: JournalEvent[];
   let end: Seq;
   /** Output of the range older than what was fetched exists, or existed and is gone. */
   let older: boolean;
+  /** The holes the window spans: retention's at the range's start when the window reaches it, then the gap events among the window's events. */
+  const gaps: GapInfo[] = [];
   if (o.runId !== undefined) {
     let want = Math.min(cap, 64 * 1024);
+    let ro: RunOutput;
     for (;;) {
-      const ro = src.runOutput(o.runId, rangeOf(o.since, o.until, { maxBytes: want }));
-      events = ro.events;
-      end = o.until !== undefined ? Math.min(ro.to, o.until) : ro.to;
-      older = ro.truncated;
-      const lineEnds = events.reduce((a, e) => a + (isOutput(e) ? count(e.data) : 0), 0);
+      ro = src.runOutput(o.runId, rangeOf(o.since, o.until, { maxBytes: want }));
+      const lineEnds = ro.events.reduce((a, e) => a + (isOutput(e) ? count(e.data) : 0), 0);
       if (lineEnds >= need || !ro.truncated || want >= cap) break;
       want = Math.min(cap, want * 4);
     }
-    events = withGaps(src, events);
+    end = o.until !== undefined ? Math.min(ro.to, o.until) : ro.to;
+    older = ro.truncated;
+    events = [...ro.events, ...(ro.gaps ?? [])].sort((a, b) => a.seq - b.seq);
+    // Nothing of the range retained: the hole is the range (the house's read of 1cabc6a, #22).
+    const lost = ro.truncated && ro.events.length === 0 ? retentionGap(journal, Math.max(ro.from, (o.since ?? 0) + 1), end) : undefined;
+    if (lost) events.unshift(gapEvent(lost));
   } else {
-    // Walk back from the end until the lines, the byte cap, `since` or retention stops it.
+    // Walk back from the end until the lines, the byte cap, the event bound, `since` or retention stops it.
     end = o.until !== undefined ? Math.min(o.until, journal.lastSeq) : journal.lastSeq;
     let cursor = end;
     let lineEnds = 0;
     let bytes = 0;
+    let examined = 0;
     const parts: JournalEvent[][] = [];
     older = false;
     for (;;) {
       if (o.since !== undefined && cursor <= o.since) break;
       const batch = journal.tail(512, cursor).filter((e) => o.since === undefined || e.seq > o.since);
       if (batch.length === 0) {
-        const oldest = journal.oldestSeq;
-        older = oldest !== undefined && oldest > (o.since ?? 0) + 1;
+        // The range's start: what retention took of it is a hole, all of it when nothing is retained.
+        const lost = retentionGap(journal, (o.since ?? 0) + 1, cursor);
+        if (lost) {
+          older = true;
+          parts.push([gapEvent(lost)]);
+        }
         break;
       }
       parts.push(batch);
+      examined += batch.length;
       for (const e of batch) {
         if (!isOutput(e)) continue;
         lineEnds += count(e.data);
         bytes += e.data.length;
       }
       cursor = batch[0]!.seq - 1;
-      if (lineEnds >= need || bytes >= cap) {
+      if (lineEnds >= need || bytes >= cap || examined >= MAX_SCAN) {
         older = cursor > (o.since ?? 0);
         break;
       }
@@ -778,12 +856,21 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     events = parts.reverse().flat();
   }
   if (o.as === 'events') {
-    const ev = events.slice(-Math.min(n, 2000));
-    return { events: ev, seq: [ev[0]?.seq ?? end, end], nextCursor: end, more: false, truncated: ev.length < n && older, lines: { requested: n, returned: ev.length } };
+    // The newest events whose JSON fits `maxBytes` (at least one), at most n and 2,000; fewer than
+    // asked is a cut unless the range holds no more (the house's read of 1cabc6a, #22).
+    const ev: JournalEvent[] = [];
+    let bytes = 0;
+    for (let i = events.length - 1; i >= 0 && ev.length < Math.min(n, 2000); i--) {
+      const b = JSON.stringify(events[i]).length;
+      if (ev.length > 0 && bytes + b > maxBytes) break;
+      ev.push(events[i]!);
+      bytes += b;
+    }
+    ev.reverse();
+    return { events: ev, seq: [ev[0]?.seq ?? end, end], nextCursor: end, more: false, truncated: ev.length < n && (older || ev.length < events.length), lines: { requested: n, returned: ev.length } };
   }
   const chunks: ProjectChunk[] = [];
   const sources = new Set<string>();
-  const gaps: GapInfo[] = [];
   const outs: Output[] = [];
   // The lasting state set before the window (a scroll region, the alternate screen) applies to it.
   const firstOut = events.find(isOutput);
@@ -812,8 +899,14 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   while (lines.length - drop > 1 && bytes > maxBytes) bytes -= utf8Length(lines[drop++]!) + 1;
   const kept = lines.slice(drop);
   const text = cutTail(kept.join('\n'), maxBytes).text;
-  // Fewer lines than asked is truncation only when older output was cut (by the walk's cap, or retention).
-  const truncated = cutByBytes || (kept.length < n && older);
+  // Fewer lines than asked is truncation only when older output was cut (by the walk's bounds, or
+  // retention). So is the head of a line asked for that lies past what was projected: past the input
+  // cap, or past the start of a window that older output precedes. A tail of one line longer than the
+  // cap came back without its head and said nothing (the house's read of 1cabc6a, #22).
+  const inputBytes = outs.reduce((a, e) => a + utf8Length(e.data), 0);
+  const reach = lastLinesBytes(outs, n);
+  const headCut = reach > cap || (older && reach >= inputBytes);
+  const truncated = cutByBytes || (kept.length < n && older) || headCut;
   return withGapInfo<Omit<ReadResult, 'session'>>({ text, seq: [firstEventOf(outs, kept.length) ?? end, end], nextCursor: end, more: false, truncated, lines: { requested: n, returned: kept.length } }, gaps);
 }
 
@@ -822,6 +915,26 @@ const count = (s: string): number => {
   for (let i = s.indexOf('\n'); i !== -1; i = s.indexOf('\n', i + 1)) c++;
   return c;
 };
+
+/** UTF-8 bytes from the end of the output back to where its last `n` lines begin (by raw line ends); all of it when it holds no more lines. */
+function lastLinesBytes(outs: Output[], n: number): number {
+  let bytes = 0;
+  let seen = 0;
+  for (let k = outs.length - 1; k >= 0; k--) {
+    const d = outs[k]!.data;
+    // The LF that ends the last line begins no line.
+    let i = d.length;
+    if (k === outs.length - 1 && d.endsWith('\n')) i--;
+    for (;;) {
+      const nl = d.lastIndexOf('\n', i - 1);
+      if (nl === -1) break;
+      if (++seen >= n) return bytes + utf8Length(d.slice(nl + 1));
+      i = nl;
+    }
+    bytes += utf8Length(d);
+  }
+  return bytes;
+}
 
 /**
  * The seq of the first output event whose bytes reach the last `lines` lines, by
@@ -915,7 +1028,7 @@ export async function searchJournal(src: ReadSource, o: SearchOptions, limits: P
       firstSeq ??= e.seq;
       lastSeq = e.seq;
       events++;
-      if (isOutput(e)) bytes += e.data.length;
+      if (isOutput(e)) bytes += utf8Length(e.data);
       if (scanner.full) {
         stoppedBy = 'limit';
         break outer;
@@ -927,17 +1040,21 @@ export async function searchJournal(src: ReadSource, o: SearchOptions, limits: P
     }
   }
   let resume: Resume | undefined;
-  if (stoppedBy === undefined) scanner.flush(lastSeq ?? w.end);
-  else {
-    // Continue where nothing is lost: the earliest unfinished line, or the match past the limit.
+  if (stoppedBy === undefined) {
+    scanner.flush(lastSeq ?? w.end);
+    // The flush can find the match past the limit in an unfinished last line: the scan stops
+    // there, with more (the house's read of 1cabc6a, #22).
+    if (scanner.full) stoppedBy = 'limit';
+  }
+  if (stoppedBy !== undefined) {
+    // Lines open since the scan began, or with other lines completed after them, are matched now
+    // (search.ts rule 6); then the scan continues at the earliest point where nothing is lost or
+    // scanned twice: a line cut at the very end, or the match past the limit. Both lie past the
+    // start, so continuing always gets further.
+    const last = lastSeq ?? since ?? 0;
+    scanner.settle(last);
     const candidates = [scanner.pending(), scanner.stop].filter((x): x is Resume => x !== undefined);
-    resume = candidates.sort((a, b) => a.cursor - b.cursor || a.offset - b.offset)[0] ?? { cursor: lastSeq ?? since ?? 0, offset: 0 };
-    const startCursor = since ?? (firstSeq ?? 1) - 1;
-    if (resume.cursor < startCursor || (resume.cursor === startCursor && resume.offset <= (o.offset ?? 0))) {
-      // A line longer than a whole scan: match what there is of it, and go on after it.
-      scanner.flush(lastSeq ?? startCursor);
-      resume = { cursor: lastSeq ?? startCursor, offset: 0 };
-    }
+    resume = candidates.sort((a, b) => a.cursor - b.cursor || a.offset - b.offset)[0] ?? { cursor: last, offset: 0 };
   }
   const from = firstSeq ?? (since ?? 0) + 1;
   const to = stoppedBy === undefined ? Math.max(lastSeq ?? w.end, w.end) : (lastSeq ?? from);
