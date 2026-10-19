@@ -58,6 +58,7 @@
  * this process's working directory), TSM_CONNECT_TIMEOUT_MS (how long a request
  * may wait for a connection, default 15000; a whole number of milliseconds, empty = default).
  */
+import { setting } from '../core/env.js';
 import { execFile, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -107,8 +108,6 @@ if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) {
   process.stdout.write(HELP);
   process.exit(0);
 }
-/** A setting from the environment; empty is unset, as termd reads them (so TSM_DATA_DIR="" never becomes --data-dir ''). */
-const setting = (name: string): string | undefined => process.env[name] || undefined;
 
 /** The 1.x names of this bin; invoked under one of them, the shim serves the 1.x tools. */
 const COMPAT_BINS: ReadonlySet<string> = new Set(['terminal-sessions-mcp']);
