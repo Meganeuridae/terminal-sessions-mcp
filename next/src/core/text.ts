@@ -66,11 +66,58 @@ export function tailIndex(text: string, maxBytes: number): number {
  * starts just after a newline when the first newline in it lies in its first half.
  */
 export function cutTail(text: string, maxBytes: number): { text: string; cut: boolean } {
-  if (utf8Length(text) <= maxBytes) return { text, cut: false };
-  let start = tailIndex(text, Math.max(0, maxBytes));
+  const start = tailStart(text, maxBytes);
+  return start === 0 ? { text, cut: false } : { text: text.slice(start), cut: true };
+}
+
+/**
+ * Where the last `maxBytes` UTF-8 bytes of `text` start (0 when it all fits), moved to the line
+ * boundary after a newline that lies in the first half of them, so a torn first line is dropped
+ * only when it costs at most half the budget; a newline that is the text's last character begins
+ * no line and never moves the start. The one rule for every tail cut: results, pages, the
+ * segmenter's bodies and the transcript's input.
+ */
+export function tailStart(text: string, maxBytes: number): number {
+  if (utf8Length(text) <= maxBytes) return 0;
+  const start = tailIndex(text, Math.max(0, maxBytes));
   const nl = text.indexOf('\n', start);
-  if (nl !== -1 && nl + 1 < text.length && utf8Length(text.slice(start, nl + 1)) <= maxBytes / 2) start = nl + 1;
-  return { text: text.slice(start), cut: true };
+  return nl !== -1 && nl + 1 < text.length && utf8Length(text.slice(start, nl + 1)) <= maxBytes / 2 ? nl + 1 : start;
+}
+
+/** How many newlines `s` holds. */
+export function countLines(s: string): number {
+  let c = 0;
+  for (let i = s.indexOf('\n'); i !== -1; i = s.indexOf('\n', i + 1)) c++;
+  return c;
+}
+
+/**
+ * Output with its control sequences and control characters (other than tab and newline) removed,
+ * and where each kept character came from, for cuts in the raw text. The sequences are read by
+ * `sequenceEnd`, one grammar with `safeCut` and `unfinishedSequence`: a charset designation such as
+ * `ESC ( B` goes whole (the house's read of ed4ecac, #22: a two-byte rule left its `B`). An
+ * unfinished sequence takes the rest of the text with it.
+ */
+export function stripEscapes(s: string): { text: string; map: number[] } {
+  const map: number[] = [];
+  let text = '';
+  for (let i = 0; i < s.length; ) {
+    const c = s.charCodeAt(i);
+    if (c === 0x1b || c === 0x9b) {
+      const end = sequenceEnd(s, i);
+      if (end === undefined) break;
+      i = end;
+      continue;
+    }
+    if (c < 0x20 && c !== 0x09 && c !== 0x0a) {
+      i++;
+      continue;
+    }
+    map.push(i);
+    text += s[i];
+    i++;
+  }
+  return { text, map };
 }
 
 /**

@@ -14,7 +14,7 @@ import { readJournal, searchJournal, type SearchOptions, type SearchResult } fro
 import { SessionRegistry } from '../src/api/registry.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { Journal } from '../src/core/journal.js';
-import { cleanLine } from '../src/core/search.js';
+import { cleanLine } from '../src/core/ansi.js';
 import { MemoryStore } from '../src/core/stores.js';
 import { endRun, out, source, startRun } from './reader-fixture.spec.js';
 

@@ -83,7 +83,7 @@
 import xterm from '@xterm/headless';
 import type { IBuffer, Terminal as TerminalType } from '@xterm/headless';
 import { persistentState } from './screen.js';
-import { headIndex, sequenceEnd, tailIndex, utf8Length } from './text.js';
+import { headIndex, sequenceEnd, tailStart, utf8Length } from './text.js';
 
 const { Terminal } = xterm;
 
@@ -551,13 +551,6 @@ function dropHead(segs: Segment[], k: number, at: number, dropped: string[]): vo
   segs[k]!.bytes = utf8Length(segs[k]!.data);
   segs.splice(0, k);
   if (!segs[0]!.data) segs.shift();
-}
-
-/** Where the last `max` UTF-8 bytes of `data` start, moved to a line boundary when one lies in the first half of them (rule 7). */
-function tailStart(data: string, max: number): number {
-  const start = tailIndex(data, max);
-  const nl = data.indexOf('\n', start);
-  return nl !== -1 && utf8Length(data.slice(start, nl + 1)) <= max / 2 ? nl + 1 : start;
 }
 
 /**

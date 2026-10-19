@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { processLaunch } from '../src/backends/node-pty.js';
+import { processLaunch } from '../src/core/launch.js';
 import { prepareIntegration } from '../src/shell/integration.js';
 import { AGENT, hasShell, realSession, until } from './fake-shell.js';
 

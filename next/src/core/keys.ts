@@ -33,6 +33,10 @@
 
 import { err, type TermError } from './errors.js';
 
+/** A table's own entry for `key`, never one inherited from Object.prototype (`constructor` is no key name; the house's read of ed4ecac, #22). */
+export const own = <T>(o: Record<string, T> | undefined, key: string): T | undefined => (o !== undefined && Object.hasOwn(o, key) ? o[key] : undefined);
+
+
 /** The normal-mode byte sequence for each named key. */
 export const NAMED_KEYS: Record<string, string> = {
   enter: '\r',
@@ -184,7 +188,7 @@ function canonical(name: string, hyphens = false): string | undefined {
   let squeezed = k.replace(/[\s_]/g, '');
   if (hyphens) squeezed = squeezed.replace(/-/g, '');
   if (Object.hasOwn(NAMED_KEYS, squeezed)) return squeezed;
-  return Object.hasOwn(KEY_ALIASES, squeezed) ? KEY_ALIASES[squeezed] : undefined;
+  return own(KEY_ALIASES, squeezed);
 }
 
 /** Split `Ctrl+Shift+Up`, `C-M-a`, `Alt-x` into prefixes (`c`, `m`, `s`) and the base key; undefined when it has no modifier. */
@@ -194,7 +198,7 @@ function splitModifiers(name: string): { prefixes: Set<'c' | 'm' | 's'>; base: s
   for (;;) {
     const m = /^([a-z]+)[-+]/i.exec(rest);
     const word = m?.[1]!.toLowerCase();
-    const mod = word !== undefined && Object.hasOwn(MODIFIERS, word) ? MODIFIERS[word] : undefined;
+    const mod = word !== undefined ? own(MODIFIERS, word) : undefined;
     if (!m || mod === undefined || rest.length === m[0].length) break;
     prefixes.add(mod);
     rest = rest.slice(m[0].length);
@@ -207,7 +211,7 @@ function splitModifiers(name: string): { prefixes: Set<'c' | 'm' | 's'>; base: s
 function ctrlChar(ch: string): string | undefined {
   const c = ch.charCodeAt(0);
   if (ch.length === 1 && ((c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a))) return String.fromCharCode(c & 0x1f);
-  const p = Object.hasOwn(CTRL_PUNCT, ch) ? CTRL_PUNCT[ch] : undefined;
+  const p = own(CTRL_PUNCT, ch);
   return p === undefined ? undefined : String.fromCharCode(p);
 }
 
@@ -255,7 +259,7 @@ export function decodeKey(name: string, opts: KeyOptions = {}): string {
     return esc + (shift ? '\x1b[Z' : '\t');
   }
   const mod = 1 + (shift ? 1 : 0) + (meta ? 2 : 0) + (ctrl ? 4 : 0);
-  const bytes = Object.hasOwn(NAMED_KEYS, b) ? NAMED_KEYS[b]! : '';
+  const bytes = own(NAMED_KEYS, b) ?? '';
   const final = FINAL.exec(bytes)?.[1];
   if (final !== undefined) return `\x1b[1;${mod}${final}`;
   const code = TILDE.exec(bytes)?.[1];

@@ -59,7 +59,8 @@ export type EventInput =
   /** A Service's status changed (§8.3); `principal` started it. */
   | { type: 'service'; runId: string; status: ServiceStatus; probe: string; principal: Principal; name?: string; evidence?: string; exit?: number }
   /** A Watch fired (§4); `principal` set it; `at` is the event that satisfied it. */
-  | { type: 'watch.fired'; watchId: string; label: string; kind: 'pattern' | 'silence' | 'idle'; principal: Principal; at: Seq; match?: string; line?: string; suppressed?: number }
+  /** `clipped`: the line was longer than the pattern's match window and matched on its head. */
+  | { type: 'watch.fired'; watchId: string; label: string; kind: 'pattern' | 'silence' | 'idle'; principal: Principal; at: Seq; match?: string; line?: string; clipped?: boolean; suppressed?: number }
   /**
    * A running Run may be waiting for input (G15: a heuristic, journaled with its evidence) —
    * the last line, how long output has been silent, the session state — so catch-up and

@@ -85,9 +85,8 @@ const PERSISTENT_STATE =
  * (DECSTR) in its place among them, since it resets the shift and the
  * designations before it, the last title and the last icon name (OSC 0 sets
  * both), and a full reset (RIS), which makes everything before it moot. Also
- * used by the transcript and the reader for output they omit. (The house's read
- * of ed4ecac, #22: every cursor toggle was kept, OSC 2 then OSC 1 kept only the
- * icon, and SO moved past a soft reset.)
+ * used by the transcript and the reader for output they omit (the house's read
+ * of ed4ecac, #22).
  */
 export function persistentState(data: string): string {
   // Key → position in `kept`; a setting seen again moves to its latest place.

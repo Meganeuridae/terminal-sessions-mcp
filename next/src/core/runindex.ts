@@ -64,7 +64,7 @@ export function boundHeader(h: RotationHeader, maxBytes = Number.POSITIVE_INFINI
 
 type GapEvent = Extract<JournalEvent, { type: 'gap' }>;
 
-/** A Run's attributed output, the same shape as `Session.runOutput` (G12). */
+/** A Run's attributed output, the same shape as `Session.runOutput` (G12), holes included: `gaps` is part of what the reader relies on. */
 export interface RunOutput {
   events: JournalEvent[];
   from: Seq;

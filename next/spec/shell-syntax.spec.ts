@@ -10,7 +10,7 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { processLaunch, shellLaunch } from '../src/backends/node-pty.js';
+import { processLaunch, shellLaunch } from '../src/core/launch.js';
 import { inlineLines } from '../src/core/session.js';
 import { prepareIntegration } from '../src/shell/integration.js';
 import { hasShell } from './fake-shell.js';

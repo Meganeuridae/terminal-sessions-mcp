@@ -20,6 +20,7 @@ import { livingGroups } from './lock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
+import { stripEscapes } from './text.js';
 import { project, type ProjectChunk } from './transcript.js';
 import {
   SYSTEM,
@@ -467,24 +468,6 @@ const SECRET_PROMPT =
 
 export const looksLikeSecretPrompt = (textBeforeCursor: string): boolean => SECRET_PROMPT.test(textBeforeCursor);
 
-/** Escape sequences (CSI, OSC, two-character) and control characters other than newline and tab. */
-const ESCAPES = /\x1b\[[^@-~]*[@-~]?|\x1b\][^]*?(?:\x07|\x1b\\|$)|\x1b[^]?|[\x00-\x08\x0b-\x1f]/g;
-
-/** Output with escape sequences removed, and where each kept character came from (for cuts in raw output). */
-export function stripEscapes(s: string): { text: string; map: number[] } {
-  const map: number[] = [];
-  let at = 0;
-  const keep = (to: number) => {
-    while (at < to) map.push(at++);
-  };
-  const text = s.replace(ESCAPES, (seq: string, offset: number) => {
-    keep(offset);
-    at += seq.length;
-    return '';
-  });
-  keep(s.length);
-  return { text, map };
-}
 
 export class Session {
   readonly id: string;
@@ -1712,8 +1695,7 @@ export class Session {
     const layer: DeclaredShell = { shell, within, by: opts.principal, at: this.now() };
     // Declaring the same program again corrects the kind; anything declared inside it is gone with the
     // old word: the layers above it end with their Runs, in flight and queued (the house's read of
-    // a6d0c35, #22: one splice took them all and the loop over a second found none, so an inner
-    // shell's Runs ran on, and its queued one later ran in it).
+    // a6d0c35, #22).
     if (same !== -1) {
       const [old, ...inner] = this.layers.splice(same);
       for (const l of inner) {

@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as pty from 'node-pty';
 import { err } from '../core/errors.js';
+import { processLaunch, shellLaunch, viaBash } from '../core/launch.js';
 import type { ExecutionBackend, ForegroundInfo, ProcessHandle, PtyExit, PtyHandle, SpawnProcessOptions, SpawnShellOptions } from './types.js';
 
 const signalName = (n: number | undefined): string | undefined => {
@@ -204,64 +205,6 @@ function failedSpawn(error: string): ProcessHandle {
 }
 
 /**
- * What every process Run starts through: `/bin/bash -p -c PROCESS_LAUNCH termd-process <argv…>`.
- * It closes every descriptor above stderr before the command runs. node-pty opens each
- * session's terminal master without close-on-exec, and Node passes a child every descriptor
- * that isn't, so a process Run held the master of every session open when it started: it
- * could have written into those terminals, another principal's included, and it kept a
- * shell alive after the daemon died, since the terminal never hung up (the house's review
- * of #11, and issue #18). The descriptors are listed through /dev/fd (Linux links it to
- * /proc/self/fd); the glob is expanded, and its directory closed, before the loop runs. On
- * Linux the Run is also made a likelier victim of the out-of-memory killer than the daemon,
- * as the shells are (see oomLine). Only the daemon's constant text is on this command line: a Run given a
- * line gets its text on descriptor 3, which `/bin/sh`, exec'd by the launcher, reads whole, closes,
- * and runs with `eval` (see Session.admit; argv is then `/bin/sh`): the line is in no argv and in no file a
- * crash and a fast restart could remove, and the command's own children never see the descriptor.
- * Bash is needed only for closing arbitrary descriptor numbers (dash parses `exec 12>&-`
- * as a command named 12). Its privileged mode skips BASH_ENV and imported shell functions
- * before cleanup; the Run's line still executes in /bin/sh, with the environment it was given plus
- * what bash exports on its way (`PWD`, `SHLVL`) and without `_` (the house measured it).
- *
- * The launcher's text; with `readsLine`, descriptor 3 carries the Run's own text: the launcher
- * keeps it through the close loop and execs `/bin/sh`, which reads it, closes it and runs the text
- * (see spawnProcess).
- */
-export function processLaunch(readsLine: boolean, oomScoreAdj = 0): string {
-  const readLine = [
-    '__tsm_line=; while IFS= read -r __tsm_l; do __tsm_line="$__tsm_line$__tsm_l',
-    '"; done <&3; __tsm_line="$__tsm_line$__tsm_l"',
-    'exec 3<&-',
-    'eval "unset __tsm_l __tsm_line; $__tsm_line"',
-  ].join('\n');
-  return [
-    `if [ -d /dev/fd ]; then for __tsm_fd in /dev/fd/*; do case "\${__tsm_fd##*/}" in ${readsLine ? '0|1|2|3' : '0|1|2'}) ;; *) eval "exec \${__tsm_fd##*/}>&-" 2>/dev/null || :;; esac; done; unset __tsm_fd; fi`,
-    ...oomLine(oomScoreAdj),
-    ...(readsLine
-      // Read the descriptor itself: Linux cannot reopen Node's socket as /dev/fd/3.
-      // Only this constant reader is in argv; its eval removes both temporary variables.
-      ? [`exec /bin/sh -c '${readLine.replaceAll("'", "'\\''")}' termd-process`]
-      : ['exec "$@"']),
-  ].join('\n');
-}
-
-/** The text that starts a shell without an integration launcher: its oom_score_adj raised (see oomLine), then `exec` of the shell and its arguments. */
-export function shellLaunch(oomScoreAdj: number): string {
-  return [...oomLine(oomScoreAdj), 'exec "$@"'].join('\n');
-}
-
-/**
- * The line that raises a session process's oom_score_adj on Linux (no /proc elsewhere): the
- * kernel then takes it before the daemon, whose death would lose every session. The preference
- * is machine-wide, not relative to the daemon alone — a raised build is taken before other
- * users' processes too — so the amount is the daemon's `--session-oom-score-adj` (default 200),
- * and 0 writes nothing.
- */
-export function oomLine(oomScoreAdj: number): string[] {
-  const n = Math.max(0, Math.min(1000, Math.floor(oomScoreAdj)));
-  return n > 0 ? [`if [ -w /proc/self/oom_score_adj ]; then echo ${n} > /proc/self/oom_score_adj 2>/dev/null || :; fi`] : [];
-}
-
-/**
  * Where process Runs find bash (see processLaunch): `/bin/bash`, else the first `bash` on the
  * daemon's PATH (NixOS has one there and none in /bin). Alpine's base has neither: `apk add bash`.
  */
@@ -310,20 +253,17 @@ export class NodePtyBackend implements ExecutionBackend {
     // The launcher runs under bash where there is one (`-p`: no BASH_ENV, no imported functions), so
     // its loop can close the terminal masters of the sessions opened before this one, which node-pty
     // leaves open to every child (the house's read of d5873f0). Without bash it runs under /bin/sh
-    // and skips the loop. A shell without integration has no launcher to raise its oom_score_adj
-    // (the house's read of 2c35df8, #22): on Linux the constant text of shellLaunch does, and
-    // execs the shell, which keeps its pid.
-    const oom = !launcher && process.platform === 'linux' && opts.oomScoreAdj !== undefined && opts.oomScoreAdj > 0 ? shellLaunch(opts.oomScoreAdj) : undefined;
-    const through = launcher
+    // and skips the loop. A shell without integration has no launcher: under bash the constant text
+    // of shellLaunch closes the same descriptors and raises its oom_score_adj (the house's read of
+    // 2c35df8, #22), then execs the shell, which keeps its pid; without bash it starts bare.
+    const through: [string, string[]] = launcher
       ? this.bash
         ? [this.bash, ['-p', launcher, opts.shell, ...opts.args]]
         : ['/bin/sh', [launcher, opts.shell, ...opts.args]]
-      : oom !== undefined
-        ? this.bash
-          ? [this.bash, ['--noprofile', '--norc', '-p', '-c', oom, 'termd-shell', opts.shell, ...opts.args]]
-          : ['/bin/sh', ['-c', oom, 'termd-shell', opts.shell, ...opts.args]]
+      : this.bash
+        ? viaBash(this.bash, shellLaunch(opts.oomScoreAdj ?? 0), 'termd-shell', [opts.shell, ...opts.args])
         : [opts.shell, opts.args];
-    const p = pty.spawn(through[0] as string, through[1] as string[], {
+    const p = pty.spawn(through[0], through[1], {
       name: 'xterm-256color',
       cwd: opts.cwd,
       env: opts.env,
@@ -355,11 +295,8 @@ export class NodePtyBackend implements ExecutionBackend {
       const can = executable(cmd, opts.env.PATH, opts.cwd);
       if (!can.ok) return failedSpawn(can.error);
     }
-    const launched =
-      script !== undefined
-        ? ([bash, ['--noprofile', '--norc', '-p', '-c', processLaunch(true, opts.oomScoreAdj ?? 0), 'termd-process']] as const)
-        : ([bash, ['--noprofile', '--norc', '-p', '-c', processLaunch(false, opts.oomScoreAdj ?? 0), 'termd-process', cmd, ...args]] as const);
-    const child = spawnChild(launched[0], [...launched[1]], { cwd: opts.cwd, env: opts.env, stdio: script !== undefined ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'], detached: true });
+    const launched = script !== undefined ? viaBash(bash, processLaunch(true, opts.oomScoreAdj ?? 0), 'termd-process', []) : viaBash(bash, processLaunch(false, opts.oomScoreAdj ?? 0), 'termd-process', [cmd, ...args]);
+    const child = spawnChild(launched[0], launched[1], { cwd: opts.cwd, env: opts.env, stdio: script !== undefined ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'], detached: true });
     const outL = new Set<(d: string) => void>();
     const errL = new Set<(d: string) => void>();
     const exitL = new Set<(e: PtyExit) => void>();

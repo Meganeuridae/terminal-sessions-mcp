@@ -5,8 +5,9 @@
  * block up to a deadline for the same predicates, without leaving a watch behind.
  *
  * Patterns match whole lines, as `search` does (see StreamMatcher): each line of
- * each stream is tested once, `^` and `$` are the line's ends (a line over 64 KiB
- * is matched in pieces of that size), and a line with no newline yet (a prompt)
+ * each stream is tested once, `^` and `$` are the line's ends (a line longer than
+ * the pattern's match window is matched on its head, and the hit says `clipped`),
+ * and a line with no newline yet (a prompt)
  * is tested once its stream has been quiet for a moment. Every pattern compiles
  * on the linear-time engine, and a bad one is refused with invalid_argument when
  * the watch or wait is created.
@@ -18,11 +19,10 @@
  * 3eade8a, #22: a forward step of 10 s certified 5 s of silence in 1 ms).
  */
 import { randomBytes } from 'node:crypto';
-import { performance } from 'node:perf_hooks';
 import { compileLinePattern, PARTIAL_QUIET_MS, StreamMatcher } from './ansi.js';
+import { clocks, MAX_TIMER_MS, timerMs } from './clock.js';
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
-import { MAX_TIMER_MS } from './probes.js';
 import type { IntegrationLevel, JournalEvent, Principal, RunInfo, Seq } from './types.js';
 
 export type WatchKind = 'pattern' | 'silence' | 'idle';
@@ -101,6 +101,9 @@ export function kindOf(spec: WatchSpec): WatchKind {
 /** Which matcher stream an output event belongs to: the PTY is one stream; each process pipe is its own. */
 const streamKey = (ev: Extract<JournalEvent, { type: 'output' }>) => (ev.stream === 'pty' ? 'pty' : `${ev.stream}:${ev.runId ?? ''}`);
 
+/** A matcher's hit as the predicate fires it; `clipped` travels only when set (the house's read of ed4ecac, #22: the flag was produced and dropped). */
+const hitOf = (hit: { match: string; line: string; clipped?: boolean }, seq: Seq): Hit => (hit.clipped ? { match: hit.match, line: hit.line.trim(), seq, clipped: true } : { match: hit.match, line: hit.line.trim(), seq });
+
 const isTerminal = (s: RunInfo['state']) => s === 'exited' || s === 'cancelled' || s === 'lost';
 
 const exitText = (x: { exitCode: number | null; signal?: string }) => `session exited (${x.signal ? `signal ${x.signal}` : `code ${x.exitCode ?? '?'}`})`;
@@ -108,13 +111,8 @@ const exitText = (x: { exitCode: number | null; signal?: string }) => `session e
 const endText = (r: { runId: string; state: string; exit?: number; signal?: string }) =>
   `run ${r.runId} ended (${r.state}${r.signal ? ` ${r.signal}` : r.exit !== undefined ? ` ${r.exit}` : ''})`;
 
-type Hit = { match?: string; line?: string; seq: Seq };
-
-/** The clock the quiet interval is measured on; a test may replace it. */
-export const clocks = { monotonic: (): number => performance.now() };
-
-/** A timer delay Node honours: never past 2^31-1 ms, never negative. */
-const timerMs = (ms: number) => Math.min(MAX_TIMER_MS, Math.max(0, ms));
+/** What a predicate fires with: the match and its line, where in the journal, and whether the line was matched on its head only (longer than the pattern's match window). */
+type Hit = { match?: string; line?: string; seq: Seq; clipped?: boolean };
 
 /** Evaluates one predicate against journal events; shared by watches and waits. */
 class Predicate {
@@ -177,7 +175,7 @@ class Predicate {
           if (this.spec.runId !== undefined && ev.runId !== this.spec.runId) return;
           const s = this.matcher(streamKey(ev));
           s.seq = ev.seq;
-          for (const hit of s.m.feed(ev.data)) this.fire({ match: hit.match, line: hit.line.trim(), seq: ev.seq });
+          for (const hit of s.m.feed(ev.data)) this.fire(hitOf(hit, ev.seq));
         } else if (ev.type === 'run.end') {
           if (ev.runId === this.spec.runId) {
             // The Run's streams are over: its unterminated last line is complete.
@@ -256,13 +254,13 @@ class Predicate {
 
   /** Complete every stream's unterminated line now (its stream ended). */
   flush(): void {
-    for (const s of this.matchers.values()) for (const hit of s.m.flush()) this.fire({ match: hit.match, line: hit.line.trim(), seq: s.seq });
+    for (const s of this.matchers.values()) for (const hit of s.m.flush()) this.fire(hitOf(hit, s.seq));
   }
 
   /** Complete one stream's unterminated line now, if it has one waiting (the stream has been quiet long enough). */
   flushStream(key: string): void {
     const s = this.matchers.get(key);
-    if (s) for (const hit of s.m.flush()) this.fire({ match: hit.match, line: hit.line.trim(), seq: s.seq });
+    if (s) for (const hit of s.m.flush()) this.fire(hitOf(hit, s.seq));
   }
 
   /** These streams are over: complete their last lines and forget their matchers. */
@@ -282,7 +280,7 @@ class Predicate {
       const entry: { m: StreamMatcher; seq: Seq } = { m: undefined as never, seq: 0 };
       entry.m = new StreamMatcher(this.re!, {
         onPartial: (hit) => {
-          if (!this.disposed) this.fire({ match: hit.match, line: hit.line.trim(), seq: entry.seq });
+          if (!this.disposed) this.fire(hitOf(hit, entry.seq));
         },
       });
       this.matchers.set(key, (s = entry));
@@ -448,6 +446,7 @@ export class WatchManager {
     const ev: Parameters<Journal['append']>[0] = { type: 'watch.fired', watchId: w.watchId, label: w.label, kind: w.kind, principal: w.owner, at: hit.seq };
     if (hit.match !== undefined) ev.match = hit.match;
     if (hit.line !== undefined) ev.line = hit.line;
+    if (hit.clipped) ev.clipped = true;
     if (more > 0) ev.suppressed = more;
     this.host.journal.append(ev);
     if (w.spec.once) this.remove(w.watchId);

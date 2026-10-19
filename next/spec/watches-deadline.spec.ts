@@ -6,7 +6,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { TermError } from '../src/core/errors.js';
 import { Journal } from '../src/core/journal.js';
 import type { JournalEvent } from '../src/core/types.js';
-import { clocks, WatchManager, type WatchHost } from '../src/core/watches.js';
+import { clocks } from '../src/core/clock.js';
+import { WatchManager, type WatchHost } from '../src/core/watches.js';
 
 test('silence rechecks its deadline when the timer wakes before the quiet duration has passed, and a wall-clock step neither delays nor hastens it', async (t) => {
   // After arming, the monotonic clock falls 40 ms behind the timer: the first wake, at 100 ms, sees
@@ -260,6 +261,27 @@ test('an idle watch stands down once the shell has exited: no recheck loop again
     await sleep(20);
     assert.ok(asked <= 1, `the host was asked ${asked} times after the exit`);
     assert.equal(x.firings(w.watchId).length, 0);
+  } finally {
+    x.close();
+  }
+});
+
+test('a pattern watch says when it matched a line on its head only', async () => {
+  // The line is longer than the pattern's match window: the hit is reported and marked clipped,
+  // as StreamMatcher reports it (the house's read of ed4ecac, #22); a short line is not marked.
+  const x = bare();
+  try {
+    const w = x.manager.add({ pattern: `${'.'.repeat(999)}0` }, A);
+    x.out(`${'x'.repeat(999)}0${'y'.repeat(20_000)}\n`);
+    await sleep(10);
+    const hits = x.firings(w.watchId);
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0]!.clipped, true);
+    await sleep(1100); // past the pattern spacing
+    x.out(`${'x'.repeat(999)}0\n`);
+    await sleep(10);
+    assert.equal(x.firings(w.watchId).length, 2);
+    assert.equal(x.firings(w.watchId)[1]!.clipped, undefined);
   } finally {
     x.close();
   }

@@ -29,7 +29,7 @@ import { Journal, type JournalOptions } from '../core/journal.js';
 import { acquireDataDirLock, listProcesses, livingGroups, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { Session, trustedDir, type SessionOptions } from '../core/session.js';
-import { FileStore, FreeSpaceFloor, MemoryStore, type DiskFloor, type FileStoreOptions, type Retention } from '../core/stores.js';
+import { FileStore, FreeSpaceFloor, MemoryStore, type DiskFloor, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
 import { SYSTEM, type ControlPolicy, type Cursors, type JournalEvent, type Principal, type RunInfo, type Seq, type Visibility } from '../core/types.js';
 import { prepareIntegration } from '../shell/integration.js';
 
@@ -121,6 +121,8 @@ export interface CreateOptions {
 }
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+/** The one rule for a session name: 1 to 64 characters of [A-Za-z0-9._-], starting alphanumeric; the endpoint checks it too. */
+export const isSessionId = (id: string): boolean => SAFE_ID.test(id);
 const fold = (id: string) => id.toLowerCase();
 const DEFAULT_MEMORY_BYTES = 8 * 1024 * 1024;
 const MIN_DISK_BYTES = 16 * 1024;
@@ -1078,33 +1080,6 @@ function writeMeta(dir: string, meta: Meta): void {
   writeDurably(path.join(dir, 'session.json'), JSON.stringify(record, null, 2));
 }
 
-/**
- * Write `text` through a temp file beside `file`, synced to disk, then renamed over it, with the
- * directory synced too: after a crash of the process or the machine the file is the old one or the
- * new one, never torn or missing (the house's read of 2c35df8, #22). Owner-only (G26).
- */
-function writeDurably(file: string, text: string): void {
-  const tmp = `${file}.${process.pid}.tmp`;
-  const data = Buffer.from(text);
-  const fd = fs.openSync(tmp, 'w', 0o600);
-  try {
-    for (let off = 0; off < data.length; ) off += fs.writeSync(fd, data, off);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  fs.chmodSync(tmp, 0o600);
-  fs.renameSync(tmp, file);
-  let dir: number | undefined;
-  try {
-    dir = fs.openSync(path.dirname(file), 'r');
-    fs.fsyncSync(dir);
-  } catch {
-    // a filesystem that cannot sync a directory: the rename is still atomic
-  } finally {
-    if (dir !== undefined) fs.closeSync(dir);
-  }
-}
 
 /** A session's shell-side files: command files and the shell's own history (0700). */
 function shellDir(dir: string): string {

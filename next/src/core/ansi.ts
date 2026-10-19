@@ -19,6 +19,29 @@ export function stripAnsi(s: string): string {
   return s.replace(SEQ, '').replace(CTRL, '');
 }
 
+/** A backspace stands in for itself through stripAnsi, which drops C0 controls. */
+const BS_MARK = '\uE000';
+
+/**
+ * One line of output as a reader sees it: control sequences gone, carriage returns and backspaces
+ * applied as overwrites, the way the transcript renders them, so `ABCDE\rXY` reads `XYCDE` and a
+ * spinner's `|\b/\b-\b\\` reads its last frame. Trailing blanks stay (a pattern may anchor on them);
+ * a display trims them. Search and the segmenter read lines through this one function (the house's
+ * read of 3eade8a, #22).
+ */
+export function cleanLine(raw: string): string {
+  const s = stripAnsi(raw.replace(/\x08/g, BS_MARK));
+  if (!s.includes('\r') && !s.includes(BS_MARK)) return s;
+  const cells: string[] = [];
+  let col = 0;
+  for (const ch of s) {
+    if (ch === '\r') col = 0;
+    else if (ch === BS_MARK) col = Math.max(0, col - 1);
+    else cells[col++] = ch;
+  }
+  return cells.join('');
+}
+
 /** The longest line a StreamMatcher holds: a longer one is matched in pieces of this size. */
 export const MAX_LINE = 64 * 1024;
 

@@ -18,6 +18,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { err } from './errors.js';
+import { writeDurably } from './stores.js';
 
 export const LOCK_FILE = 'termd.lock';
 
@@ -219,9 +220,7 @@ function takeOver(file: string, staleRaw: string, raw: string): boolean {
   }
   try {
     if (readRaw(file) !== staleRaw) return false;
-    const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-    fs.writeFileSync(tmp, raw, { mode: 0o600 });
-    fs.renameSync(tmp, file);
+    writeDurably(file, raw);
     return readRaw(file) === raw;
   } finally {
     fs.rmSync(guard, { recursive: true, force: true });

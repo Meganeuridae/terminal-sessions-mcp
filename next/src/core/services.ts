@@ -22,7 +22,8 @@
 import { compileLinePattern, LineSplitter } from './ansi.js';
 import { testBounded } from './regex.js';
 import type { Journal } from './journal.js';
-import { describeSpec, hasReadinessProbe, LIVENESS_MS, MAX_TIMER_MS, tcpConnect, type Connect, type ServiceSpec, type TcpTarget } from './probes.js';
+import { timerMs } from './clock.js';
+import { describeSpec, hasReadinessProbe, LIVENESS_MS, tcpConnect, type Connect, type ServiceSpec, type TcpTarget } from './probes.js';
 import type { JournalEvent, OutputStream, Principal, RunInfo, Seq, ServiceStatus } from './types.js';
 
 export type { ServiceStatus } from './types.js';
@@ -172,7 +173,7 @@ export class ServiceMonitor {
         this.waiters.delete(done);
         resolve(this.info());
       };
-      const timer = setTimeout(done, Math.min(MAX_TIMER_MS, ms));
+      const timer = setTimeout(done, timerMs(ms));
       this.waiters.add(done);
     });
   }
@@ -222,15 +223,18 @@ export class ServiceMonitor {
   /** One line of the Run's output; true when a pattern matched it. A fail match wins over a ready match on the same line. */
   private onLine(line: string): boolean {
     if (this.disposed || ended(this.statusValue)) return false;
-    const evidence = line.trim();
     // Matched on the line's head within the pattern's match window, as watches and search are
-    // (the house's read of ed4ecac, #22: a long pattern on a 64 KiB line held the thread for seconds).
-    if (this.failRe && testBounded(this.failRe, line).matched) {
-      this.onFail(evidence);
+    // (the house's read of ed4ecac, #22: a long pattern on a 64 KiB line held the thread for seconds);
+    // the evidence says when only the head was looked at.
+    const evidenceOf = (clipped: boolean) => (clipped ? `${line.trim()} (matched on the line's head)` : line.trim());
+    const fail = this.failRe ? testBounded(this.failRe, line) : undefined;
+    if (fail?.matched) {
+      this.onFail(evidenceOf(fail.clipped));
       return true;
     }
-    if (this.readyRe && testBounded(this.readyRe, line).matched) {
-      this.onReadyLine(evidence);
+    const ready = this.readyRe ? testBounded(this.readyRe, line) : undefined;
+    if (ready?.matched) {
+      this.onReadyLine(evidenceOf(ready.clipped));
       return true;
     }
     return false;
@@ -346,7 +350,7 @@ export class ServiceMonitor {
     const t = setTimeout(() => {
       this.timers.delete(t);
       fn();
-    }, Math.min(MAX_TIMER_MS, ms));
+    }, timerMs(ms));
     this.timers.add(t);
   }
 

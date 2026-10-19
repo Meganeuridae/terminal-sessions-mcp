@@ -6,12 +6,12 @@
  * never a secret, needs-input is journaled and does not fire on progress bars, and
  * screens flow for programs that never stop redrawing.
  */
+import { cleanLine } from '../src/core/ansi.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Journal } from '../src/core/journal.js';
 import { MemoryStore } from '../src/core/stores.js';
 import {
-  cleanLine,
   columnIndex,
   journalSource,
   liveSource,

@@ -44,7 +44,7 @@
  * caller likes (searchJournal pages, yields and stops on a budget), and ask
  * where to continue.
  */
-import { stripAnsi } from './ansi.js';
+import { cleanLine } from './ansi.js';
 import { testBounded } from './regex.js';
 import { indexAtByte, unfinishedSequence, utf8Length } from './text.js';
 import type { JournalEvent, Seq } from './types.js';
@@ -93,13 +93,6 @@ interface Carry {
 const before = (a: Resume, b: Resume): boolean => a.cursor < b.cursor || (a.cursor === b.cursor && a.offset < b.offset);
 
 const shown = (s: string): { text: string; cut: boolean } => (s.length > MAX_SHOWN ? { text: `${s.slice(0, MAX_SHOWN)}…`, cut: true } : { text: s, cut: false });
-
-/** Rule 3: control sequences out, trailing CRs dropped, the last carriage return starts the line over. */
-export function cleanLine(raw: string): string {
-  const text = stripAnsi(raw).replace(/\r+$/, '');
-  const cr = text.lastIndexOf('\r');
-  return cr === -1 ? text : text.slice(cr + 1);
-}
 
 /** UTF-8 byte length of a string that may be all ASCII (the common case costs nothing). */
 const bytesOf = (s: string, ascii: boolean): number => (ascii ? s.length : Buffer.byteLength(s));

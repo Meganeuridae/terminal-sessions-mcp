@@ -16,6 +16,7 @@ import { randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { closeFdsLine, oomLine } from '../core/launch.js';
 import { BASH_RC } from './bash.js';
 import { FISH_CONF } from './fish.js';
 import { ZSH_ZLOGIN, ZSH_ZPROFILE, ZSH_ZSHENV, ZSH_ZSHRC } from './zsh.js';
@@ -68,17 +69,13 @@ export function prepareIntegration(shellPath: string, opts: PrepareOptions = {})
   // killer than the daemon (a build's peak then costs that Run, not every session); raising
   // one's own oom_score_adj needs no privilege, and /proc is Linux's. The amount is the
   // daemon's setting: the preference is machine-wide, so a shared host may want none.
-  const oom = opts.oomScoreAdj !== undefined && opts.oomScoreAdj > 0 ? `if [ -w /proc/self/oom_score_adj ]; then echo ${Math.min(1000, Math.floor(opts.oomScoreAdj))} > /proc/self/oom_score_adj 2>/dev/null || :; fi\n` : '';
-  // The shell inherits every descriptor the daemon holds without close-on-exec — node-pty's
-  // terminal masters of the sessions opened before it (the house's read of d5873f0, #22): a command
-  // in it could write into another session's terminal, which also never hangs up while it is held.
-  // Under bash (the backend runs the launcher with bash where there is one) the loop closes them;
-  // dash cannot name a two-digit descriptor, so without bash the loop is skipped.
-  const closeFds = `if [ -n "\${BASH_VERSION-}" ] && [ -d /dev/fd ]; then for __tsm_fd in /dev/fd/*; do case "\${__tsm_fd##*/}" in 0|1|2) ;; *) eval "exec \${__tsm_fd##*/}>&-" 2>/dev/null || :;; esac; done; unset __tsm_fd; fi\n`;
+  // The descriptors the shell would inherit are closed and its oom_score_adj raised with the same
+  // lines every child of the daemon starts through (backends/launch.ts); the key file is written
+  // between them, owner-only, and the shell starts with the mask it inherited.
   fs.writeFileSync(launcher,
-    closeFds +
+    `${closeFdsLine('0|1|2')}\n` +
     `__tsm_umask=$(umask); umask 077\ncommand printf '%s\\n' '${key}' > "\${0%/*}/key-$$" || exit 1\numask "$__tsm_umask"; unset __tsm_umask\n` +
-    oom +
+    oomLine(opts.oomScoreAdj ?? 0).map((l) => `${l}\n`).join('') +
     `exec "$@"\n`, { mode: 0o600 });
   if (opts.noUserRc) env.TSM_NO_USER_RC = '1';
   const files = { 'bash-rc.sh': BASH_RC, '.zshenv': ZSH_ZSHENV, '.zprofile': ZSH_ZPROFILE, '.zshrc': ZSH_ZSHRC, '.zlogin': ZSH_ZLOGIN, 'fish/vendor_conf.d/tsm-integration.fish': FISH_CONF };

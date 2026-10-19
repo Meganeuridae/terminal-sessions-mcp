@@ -3,6 +3,7 @@
  * modules, each answering one question from observation. None of them looks at
  * the enclosing shell's liveness (G9).
  */
+import { MAX_TIMER_MS } from './clock.js';
 import * as net from 'node:net';
 import { compileLinePattern } from './ansi.js';
 import { err } from './errors.js';
@@ -62,8 +63,6 @@ export const tcpConnect: Connect = (target, timeoutMs) =>
 /** Without a readiness probe, how long a service must stay alive to be reported `running` (1.x waited the same). */
 export const LIVENESS_MS = 2000;
 
-/** The longest delay Node's timers honour (2^31-1 ms, about 24.8 days): a longer one fires at once. Durations are validated against it (the house's read of 3eade8a, #22). */
-export const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /** Does the spec give any readiness condition? */
 export const hasReadinessProbe = (spec: ServiceSpec): boolean => spec.ready?.pattern !== undefined || spec.ready?.tcp !== undefined || spec.ready?.exitWithinMs !== undefined;

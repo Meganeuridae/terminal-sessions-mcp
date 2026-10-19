@@ -18,11 +18,12 @@
  * (HISTORY_MAX_EVENTS) and says when it stopped short; a catch-up that starts
  * inside a retention gap says what range is gone.
  */
-import { performance } from 'node:perf_hooks';
-import { stripAnsi } from './ansi.js';
+import { cleanLine } from './ansi.js';
+import { clocks } from './clock.js';
 import type { Journal } from './journal.js';
 import type { RunOutput } from './runindex.js';
-import { looksLikeSecretPrompt, stripEscapes } from './session.js';
+import { looksLikeSecretPrompt } from './session.js';
+import { stripEscapes, tailStart } from './text.js';
 import { project } from './transcript.js';
 import type { JournalEvent, OutputStream, Principal, RunInfo, ScreenSnapshot, Seq } from './types.js';
 
@@ -204,27 +205,7 @@ const yieldTurn = (): Promise<void> => new Promise((r) => setImmediate(r));
 const howEnded = (x: SessionExit) =>
   x.reason === 'daemon-shutdown' ? ' by daemon shutdown' : x.reason === 'daemon-restart' ? ' by a daemon restart' : x.reason !== undefined ? ` (${x.reason})` : x.code !== null ? ` with code ${x.code}` : x.signal ? ` by ${x.signal}` : '';
 
-/** Stands in for a backspace through `stripAnsi`, which drops C0 controls (a private-use character). */
-const BS_MARK = '';
 
-/**
- * One line of output as a reader sees it: control sequences gone, carriage returns and backspaces
- * applied as overwrites, the way the transcript renders them. A line was cut at its last carriage
- * return, so `ABCDE\rXY` read `XY` for the transcript's `XYCDE`, and a spinner's `|\b/\b-\b\`
- * read `|/-\` for its `\` (the house's read of 3eade8a, #22).
- */
-export function cleanLine(raw: string): string {
-  const s = stripAnsi(raw.replace(/\x08/g, BS_MARK));
-  if (!s.includes('\r') && !s.includes(BS_MARK)) return s.trimEnd();
-  const cells: string[] = [];
-  let col = 0;
-  for (const ch of s) {
-    if (ch === '\r') col = 0;
-    else if (ch === BS_MARK) col = Math.max(0, col - 1);
-    else cells[col++] = ch;
-  }
-  return cells.join('').trimEnd();
-}
 
 /** The Run, or undefined when the source does not know it. */
 export function runOf(src: { run(runId: string): RunInfo }, runId: string): RunInfo | undefined {
@@ -236,20 +217,15 @@ export function runOf(src: { run(runId: string): RunInfo }, runId: string): RunI
 }
 
 /**
- * The last `max` bytes of a text, whole lines where that keeps most of the budget. A torn first
- * line used to be dropped whatever it left: a 10 KB JSON line ending in a newline came out as
- * nothing, and a note whose long first line was followed by `END` as `END` (the house's read of
- * 3eade8a, #22). Now a torn line that is most of what there is stays, marked with a leading `…`.
+ * The last `max` bytes of a text, from a line boundary when one lies in the first half of them
+ * (text.ts's rule for every tail cut); a torn first line that is most of what there is stays, with a
+ * leading `…` saying it is partial (the house's read of 3eade8a, #22: a torn line was dropped whatever
+ * it left).
  */
 export function tailBytes(text: string, max: number): string {
-  const buf = Buffer.from(text);
-  if (buf.length <= max) return text;
-  let start = buf.length - max;
-  while (start < buf.length && (buf[start]! & 0xc0) === 0x80) start++; // never cut a UTF-8 sequence
-  const kept = buf.subarray(start).toString();
-  const nl = kept.indexOf('\n');
-  if (nl !== -1 && Buffer.byteLength(kept) - Buffer.byteLength(kept.slice(0, nl + 1)) >= max / 2) return kept.slice(nl + 1);
-  return `…${kept}`;
+  const start = tailStart(text, max);
+  if (start === 0) return text;
+  return text[start - 1] === '\n' ? text.slice(start) : `…${text.slice(start)}`;
 }
 
 // ───────────── sources ─────────────
@@ -792,7 +768,6 @@ const NOT_RECONSTRUCTED = '[input edited with cursor, history or completion keys
 /** Output of a Run already in flight when the segmenter starts is counted from a bounded read. */
 const INFLIGHT_COUNT_BYTES = 1024 * 1024;
 /** Timers and cadences run on the monotonic clock: a wall-clock step scheduled a screen a minute out and showed a Run's age as negative (the house's read of 3eade8a, #22). */
-const mono = (): number => performance.now();
 
 export class Segmenter {
   private readonly listeners = new Set<(s: Segment) => void>();
@@ -1075,10 +1050,10 @@ export class Segmenter {
       let end = nl;
       // Only the newest lines can survive, so read back from the end until there are enough. A
       // newline at index 0 ends an empty first line: searching before it must find nothing, where
-      // `lastIndexOf('\n', -1)` searches from 0 and found it again, forever (the house's read of 3eade8a, #22).
+      // A search before index 0 finds nothing: `lastIndexOf('\n', -1)` would search from 0 (the house's read of 3eade8a, #22).
       while (end >= 0 && fresh.length < DIGEST_LINES) {
         const start = end > 0 ? buf.lastIndexOf('\n', end - 1) : -1;
-        const line = cleanLine(buf.slice(start + 1, end));
+        const line = cleanLine(buf.slice(start + 1, end)).trimEnd();
         if (line) fresh.push(line);
         if (start < 0) break;
         end = start;
@@ -1102,7 +1077,7 @@ export class Segmenter {
   private digest(w: RunWatch): void {
     const run = runOf(this.s, w.runId);
     if (!run || w.bytes === w.bytesAtLastDigest || (this.alt && !w.pipes) || this.disposing) return;
-    const partial = cleanLine(w.carry);
+    const partial = cleanLine(w.carry).trimEnd();
     const tail = (partial ? [...w.lines, partial] : w.lines).slice(-DIGEST_LINES).join('\n');
     const seq = this.s.journal.lastSeq;
     // The Run's start is a wall-clock stamp; a step back since then is not a negative age.
@@ -1167,7 +1142,7 @@ export class Segmenter {
    */
   private scheduleScreen(): void {
     if (this.disposing) return;
-    const now = mono();
+    const now = clocks.monotonic();
     if (this.screenDirtySince === undefined) this.screenDirtySince = now;
     const quietAt = now + this.o.screenQuietMs;
     const latestAt = this.screenDirtySince + this.o.screenMaxWaitMs;
@@ -1192,7 +1167,7 @@ export class Segmenter {
     const text = snap.lines.join('\n').replace(/\n+$/, '');
     if (text === this.lastScreenText) return;
     this.lastScreenText = text;
-    this.lastScreenAt = mono();
+    this.lastScreenAt = clocks.monotonic();
     this.firstScreenPending = false;
     // Output the emulator dropped under pressure is part of what the screen does not show (§6).
     const dropped = snap.droppedUnits ? ` · ${snap.droppedUnits} output units were dropped under pressure, so the screen may be incomplete` : '';
@@ -1236,7 +1211,7 @@ export class Segmenter {
     } else this.edit(h, ev.data, ev.seq);
     if (h.timer) clearTimeout(h.timer);
     h.timer = undefined;
-    const now = mono();
+    const now = clocks.monotonic();
     if (h.lines.length) {
       // On Enter wait briefly (does a Run start?), coalescing a burst of lines, never past 2 s.
       h.firstAt ??= now;
@@ -1368,9 +1343,7 @@ export class Segmenter {
 
 /**
  * Did the program echo `text` after `prompt`: does a row near the cursor end with the prompt
- * followed by the text (wrapped rows joined)? Any substring near the cursor used to do, so a
- * number already on the screen a row above passed for the echo of the same number typed with
- * echo off (the house's read of 3eade8a, #22). `extra` rows above the ones the line would span,
+ * followed by the text (wrapped rows joined)? (The house's read of 3eade8a, #22.) `extra` rows above the ones the line would span,
  * for a check made after the program moved on.
  */
 function echoedOn(snap: ScreenSnapshot, prompt: string, text: string, extra: number): boolean {

@@ -89,6 +89,40 @@ export interface MemoryStoreOptions {
  * The hot ring. Bounded by approximate bytes over every event; eviction moves a
  * head index and compacts occasionally, so appends are O(1) amortized.
  */
+/**
+ * Write `text` through a temp file beside `file`, synced to disk, then renamed over it, with the
+ * directory synced too: after a crash of the process or the machine the file is the old one or the
+ * new one, never torn or missing (the house's read of 2c35df8, #22). Owner-only (G26). The session records, the store's own
+ * metadata and the lock file are all written this way.
+ */
+export function writeDurably(file: string, text: string): void {
+  const tmp = `${file}.${process.pid}.tmp`;
+  const data = Buffer.from(text);
+  try {
+    const fd = fs.openSync(tmp, 'w', 0o600);
+    try {
+      for (let off = 0; off < data.length; ) off += fs.writeSync(fd, data, off);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    fs.rmSync(tmp, { force: true }); // a failed write leaves no stray beside the file
+    throw e;
+  }
+  let dir: number | undefined;
+  try {
+    dir = fs.openSync(path.dirname(file), 'r');
+    fs.fsyncSync(dir);
+  } catch {
+    // a filesystem that cannot sync a directory: the rename is still atomic
+  } finally {
+    if (dir !== undefined) fs.closeSync(dir);
+  }
+}
+
 export class MemoryStore implements JournalStore {
   readonly kind = 'memory';
   private events: Array<JournalEvent | undefined> = [];
@@ -412,18 +446,10 @@ export class FileStore implements JournalStore {
 
   /** Atomically and privately (G26); false when the disk refuses. */
   private writeMeta(meta: StoreMeta): boolean {
-    const file = path.join(this.dir, META);
-    const tmp = `${file}.${process.pid}.tmp`;
     try {
-      fs.writeFileSync(tmp, JSON.stringify(meta) + '\n', { mode: FILE_MODE });
-      fs.renameSync(tmp, file);
+      writeDurably(path.join(this.dir, META), JSON.stringify(meta) + '\n');
       return true;
     } catch {
-      try {
-        fs.rmSync(tmp, { force: true });
-      } catch {
-        // nothing to clean
-      }
       return false;
     }
   }
