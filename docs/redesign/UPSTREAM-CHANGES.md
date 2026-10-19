@@ -92,12 +92,14 @@ it every new server needs a hand-written rule set or a preset baked into the bri
 2. In the handle, after feature sets are known, when `cfg.wake === "suggested"`: collect
    `suggestedTreatment` rules from every declared feature set in declaration order and
    compile to a `WakePolicy`: a rule whose behavior is `immediate` becomes a `wake` entry;
-   any other behavior becomes a `hold` entry. `tagsAll` → one AND-set; `tagsAny` → one
-   AND-set per tag; a rule with both `tagsAll` and `tagsAny` cannot be compiled to AND-sets
-   without weakening it (a `tagsAny` tag would then match alone, against mcpl-core 0.3.0's
-   "only if ALL"), so skip such a rule and log it, as for `tagsNone`; termd's own rules use
-   `tagsAny` only. `tagsNone` is not expressible in the bridge's rule form — skip the rule
-   and log it. Precedence approximation: the bridge checks all `wake` rules before all
+   any other behavior becomes a `hold` entry. `tagsAll` alone → one AND-set holding every
+   tag; `tagsAny` alone → one AND-set per tag; both → one AND-set per `tagsAny` tag, each
+   holding every `tagsAll` tag (`tagsAll: [a, b]` with `tagsAny: [c, d]` compiles to
+   `{a, b, c}` and `{a, b, d}`). That is the rule's exact meaning under mcpl-core 0.3.0 —
+   all of `tagsAll` and at least one of `tagsAny` — not a weakening: a `tagsAny` tag never
+   matches alone. termd's own rules use `tagsAny` only. `tagsNone` is not expressible in the
+   bridge's rule form — skip the rule and log it. Precedence approximation: the bridge
+   checks all `wake` rules before all
    `hold` rules, not first-match over the producer's order; document this.
 3. **Acceptance is pinned to a manifest revision and is invalidated by change** — SPEC
    §17.5 and §16.5: a changed `tagOntology` invalidates prior acceptance rather than

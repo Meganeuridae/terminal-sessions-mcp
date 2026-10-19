@@ -37,7 +37,7 @@ export type AttachmentRole = 'observer' | 'controller';
 /** Journal events without the fields the journal assigns (`seq`, `ts`). Appendix A. */
 export type EventInput =
   | { type: 'output'; data: string; runId?: string; stream: OutputStream; attribution?: Attribution }
-  | { type: 'input'; data: string; principal: Principal; kind: 'text' | 'keys' | 'paste' | 'protocol-reply'; sensitive?: true; runId?: string; key?: string }
+  | { type: 'input'; data: string; principal: Principal; kind: 'text' | 'keys' | 'paste' | 'protocol-reply'; sensitive?: true; runId?: string }
   /** `shell`/`within`: a Run declared for the shell in front of the terminal (§8.1): the kind of shell, and the Run whose program it is (null: what replaced the session's shell). */
   | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string; shell?: string; within?: string | null }
   | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number; strategy?: RunStrategy; nonce?: string }
@@ -54,7 +54,7 @@ export type EventInput =
   | { type: 'detach'; attachmentId: string; principal: Principal }
   | { type: 'integration'; level: IntegrationLevel }
   /**
-   * A range of seqs that is gone (G11). Beyond Appendix A's `retention | keeper-overflow`: `torn-write` (a crash cut
+   * A range of seqs that is gone (G11, Appendix A): `retention`, `keeper-overflow`, `torn-write` (a crash cut
    * the last line), `store-error` (the ring dropped events the disk had refused), `store-failed` (the disk still
    * refused them when the journal sealed, or the daemon died first); their seqs are never reissued (G10).
    */

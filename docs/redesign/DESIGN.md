@@ -390,7 +390,9 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   Names are unique regardless of case, and concurrent opens of one name make one shell;
   a caller that raced another principal's creation is authorized against the session that
   resulted, and a name the caller cannot observe is reported as taken, not as a verb
-  refused. A new life keeps the name's watches.
+  refused. A new life started while the daemon that set them runs keeps the name's watches:
+  they live in the daemon's memory, not in the journal, so a life recovered after a restart
+  starts with none, until watch persistence exists.
 
 ### Delivery to hosts
 
@@ -1093,8 +1095,11 @@ release so existing recipes keep working, and is removed in the release after.
 
 ## 13. Internal architecture and seams
 
-One npm package, four bins, hard internal layering enforced by directory and by a test that
-fails on cross-layer imports (`next/spec/layering.spec.ts`, type-only imports included):
+One npm package; 2.0's three bins (`termd`, `tsm`, `tsm-shim`) beside 1.x's four until the
+swap (§16); hard internal layering enforced by directory and by a test that fails on
+cross-layer imports (`next/spec/layering.spec.ts`, type-only imports included: a top-level
+module — `daemon.ts`, `index.ts` — wires the layers and is above them all, so nothing below
+may import it, and `core/` takes `backends/types` alone from `backends/`, never a backend):
 
 ```
 src/core/        Session, Run, Service, Journal, JournalStore, views, Screen, Marks,
@@ -1123,9 +1128,11 @@ implementation with a second use:
 | `Renderer` | text | svg, png |
 | `ProtocolAdapter` | mcp/mcpl over ws; native ws; stdio shim | compat pack at swap-in (§16) |
 
-`core/` imports nothing from `api/` or `transport/`. Dependencies: `node-pty` (native,
-unavoidable), `@xterm/headless` (pure JS, 6.x), `@animalabs/mcpl-core` (zero-dep), `ws`,
-and one small schema validator. Nothing else.
+`core/` imports nothing from `api/` or `transport/`. Dependencies — the packages `next/src`
+imports: `node-pty` (native, unavoidable), `@xterm/headless` (pure JS, 6.x) with
+`@xterm/addon-serialize` (the screen's serializer, `core/screen.ts`), `@animalabs/mcpl-core`
+(zero-dep) and `ws`. Nothing else: the validation of §15 is hand-written (`api/validate.ts`),
+not a schema package.
 
 ---
 
@@ -1142,7 +1149,9 @@ addition; nothing about them touches the live PTY.
 
 ## 15. Quality bar
 
-- TypeScript strict, ESM, Node ≥ 20. No `any` at boundaries. Every operation validated
+- TypeScript strict, ESM, Node ≥ 20.19 (`engines` says `>=20.19.0 <25.0.0`: 20.19 is the
+  earliest Node 20 that loads the package's dependencies, and Node 18 has reached its end of
+  life). No `any` at boundaries. Every operation validated
   against its schema before dispatch. Errors are typed with codes. A tool's failure reaches
   hosts as MCP carries one: an `isError` result whose text opens with the code
   (`session_not_found: …`) and carries no envelope; a protocol failure is a JSON-RPC error.
@@ -1154,8 +1163,12 @@ addition; nothing about them touches the live PTY.
   length-limited and JSON-encoded, tokens never appear. `/health` reports per-session
   state, backend, integration, controller, the current Run, journal stats (bytes, retention,
   a failed store) and the emulator's backlog, plus connections by kind. Graceful drain on
-  shutdown ends in-flight Runs `lost` with reason `daemon-shutdown` and leaves no process
-  group behind; none needed under the keeper.
+  shutdown ends in-flight Runs `lost` with reason `daemon-shutdown`, ends every process
+  group a process Run started, and hangs up each shell as a closing terminal does: the shell
+  and its foreground job end, while a job the shell detached on purpose (`nohup`, `setsid`,
+  `disown`) lives on, as G19(c) says — which is why the systemd unit stops termd with
+  `KillMode=process` rather than killing its whole cgroup. None of this is needed under the
+  keeper.
 - Tests in three layers, and the guarantees are the test plan:
   1. **Core against the scripted backend** — fast, deterministic, replaying recorded PTY
      transcripts including TUI sessions and floods. G1–G30 each have at least one test
@@ -1178,10 +1191,15 @@ milestone lands as one bundle rather than a drawn-out series. Something is defer
 when it would add complexity the first milestone does not need, or when a decision should
 be made on evidence the first milestone will produce. Each deferral below says which.
 
-**Implementation status (2026-09-24).** Milestones 1 and 2 are built in `next/` on branch
-`redesign/m1` and replace the 1.x code in the package (the old binary names keep working:
-`terminal-sessions-mcp` is the stdio shim serving the compat pack, `session-server` starts
-`termd`). Milestone 1's exit criterion passes: the acceptance sentence runs against
+**Implementation status (2026-09-24; landing shape 2026-10-19).** Milestones 1 and 2 are
+built in `next/`, and the package ships them beside the 1.x code rather than in its place
+(PR #22): `package.json` points the 1.x names (`terminal-sessions-mcp`, `session-server`,
+`session-gui`, `session-cli`) at the 1.x code, unchanged, and adds `termd`, `tsm` and
+`tsm-shim` for 2.0; the 1.x server keeps ports 3100 and 3200, `termd` listens on 3101.
+Making 2.0 the default — `terminal-sessions-mcp` becoming the stdio shim serving the compat
+pack, `session-server` starting `termd`, the 1.x code retired — is a later release, antra's
+call as the maintainer; until then the shim serves the 1.x tool names with
+`--profile compat`. Milestone 1's exit criterion passes: the acceptance sentence runs against
 agent-framework's real host code and against mcpl-cc-bridge's host classes
 (`next/acceptance/`), and the suite (285 tests then; 717 at #22's `dbf3efc`: scripted, real
 bash 3.2 / zsh / sh / dash / fish, end to end over the endpoint, a headless browser for the
@@ -1339,29 +1357,38 @@ protocol tests; the application API schema is the shared artifact both build to.
 
 ## Appendix A: journal event schema
 
+The schema of record is `EventInput` in `next/src/core/types.ts`; this appendix mirrors it,
+field for field, with the comments that say what each field is for.
+
 ```ts
 type JournalEvent =
   | { seq; ts; type: 'output';      data: string; runId?; stream: 'pty'|'stdout'|'stderr'; attribution?: 'exact'|'temporal' }
-  | { seq; ts; type: 'input';       data: string; principal; kind: 'text'|'keys'|'paste'|'protocol-reply'; sensitive?: true; runId? }
-  | { seq; ts; type: 'run.admit';   runId; target: 'shell'|'process'; line?|argv?; principal; queued: boolean; idem?; shell?; within? }  // idem: key identity (G16); shell/within: a declared shell's Run (§8.1)
-  | { seq; ts; type: 'run.start';   runId; cwd; line?; envBasis?: 'configured'|'snapshot' }   // C mark, or spawn
-  | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs }
-  | { seq; ts; type: 'service';     runId; status: 'starting'|'ready'|'running'|'unhealthy'|'exited'|'lost'; probe; evidence?; name?; principal? }
+  | { seq; ts; type: 'input';       data: string; principal; kind: 'text'|'keys'|'paste'|'protocol-reply'; sensitive?: true; runId? }  // sensitive: data is '[redacted]'
+  | { seq; ts; type: 'run.admit';   runId; target: 'shell'|'process'; line?|argv?; principal; origin: 'self'|'human'|'agent'|'system'; queued: boolean; idem?; shell?; within?: string|null }  // idem: key identity (G16); shell/within: a declared shell's Run (§8.1)
+  | { seq; ts; type: 'run.start';   runId; cwd; line?; envBasis?: 'configured'|'snapshot'; cols?; rows?; pid?; pgid?; strategy?: 'rich'|'basic'|'marker'|'inline'; nonce? }
+                                    // C mark, or spawn. cols/rows: the geometry the transcript is projected at (§6); pid/pgid: a process Run's group, ended by recovery (G19c);
+                                    // strategy/nonce: how the Run's boundaries were observed and the nonce in its marks, so history cuts its plumbing as the live transcript did (§8.1)
+  | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs; leftovers?: true; pipeStatus?: number[] }
+                                    // leftovers: a process Run's group had members when its process exited; pipeStatus: a pipeline's statuses, one per command (§8.1)
+  | { seq; ts; type: 'run.waiting'; runId; lastLine; silentMs; state }                        // G15's input-wanted heuristic, journaled with its evidence
+  | { seq; ts; type: 'service';     runId; status: 'starting'|'ready'|'running'|'unhealthy'|'exited'|'lost'; probe; principal; name?; evidence?; exit? }  // §8.3; principal started it
   | { seq; ts; type: 'prompt';      cwd; phase: 'start'|'end' }                              // A and B marks
   | { seq; ts; type: 'cwd';         path }                                                    // OSC 7
-  | { seq; ts; type: 'env.snapshot';vars: Record<string,string> }                             // session_env_capture
+  | { seq; ts; type: 'env.snapshot';count: number; vars?: Record<string,string> }             // session_env_capture journals the count; vars only in journals written before that
   | { seq; ts; type: 'screen.mode'; alt: boolean }
   | { seq; ts; type: 'title';       text }
   | { seq; ts; type: 'resize';      cols; rows; principal }
   | { seq; ts; type: 'signal';      signal; principal; runId? }
   | { seq; ts; type: 'control';     controller: principal|null; by: principal; how: 'take'|'release'|'override'|'auto' }
-  | { seq; ts; type: 'attach';      attachmentId; principal; role }                           // and 'detach'
-  | { seq; ts; type: 'watch.fired'; watchId; label; kind; principal; at; match?; line?; clipped?; suppressed? }
-  | { seq; ts; type: 'gap';         from: seq; to: seq; reason: 'retention'|'keeper-overflow' }
-  | { seq; ts; type: 'checkpoint';  screen: serialized }                                      // milestone 3
+  | { seq; ts; type: 'attach';      attachmentId; principal; role: 'observer'|'controller' }
+  | { seq; ts; type: 'detach';      attachmentId; principal }
+  | { seq; ts; type: 'integration'; level: 'unknown'|'rich'|'basic'|'none' }                  // G5
+  | { seq; ts; type: 'watch.fired'; watchId; label; kind: 'pattern'|'silence'|'idle'; principal; at: seq; match?; line?; clipped?: boolean; suppressed?: number }
+  | { seq; ts; type: 'gap';         from: seq; to: seq; reason: 'retention'|'keeper-overflow'|'torn-write'|'store-error'|'store-failed' }  // G11; the last three are G19's disk path
+  | { seq; ts; type: 'checkpoint';  screen: serialized }                                      // milestone 3; not in types.ts yet
   | { seq; ts; type: 'recovered';   class: 'continuous'|'reattached'|'history-only' }
-  | { seq; ts; type: 'session.exit';code: number|null; signal? }
-  | { seq; ts; type: 'note';        text; principal };
+  | { seq; ts; type: 'session.exit';code: number|null; signal?; reason? }                     // reason: why the daemon ended the shell (daemon-shutdown); absent when it ended on its own
+  | { seq; ts; type: 'note';        text; principal; channel? };                              // channel: the MCPL channel an annotation came through
 ```
 
 ## Appendix B: five flows
