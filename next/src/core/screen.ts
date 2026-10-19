@@ -30,6 +30,7 @@
 import xterm from '@xterm/headless';
 import type { Terminal as TerminalType } from '@xterm/headless';
 import serializeAddon from '@xterm/addon-serialize';
+import { sequenceEnd, unfinishedSequence } from './text.js';
 import type { ScreenSnapshot, Seq } from './types.js';
 
 const { Terminal } = xterm;
@@ -72,24 +73,101 @@ function deferred(): Deferred {
 const PERSISTENT_STATE =
   /\x1bc|\x1b\[!p|\x1b\[\??[0-9;:]*[hl]|\x1b[=>]|\x1b\[[0-9;]*r|\x1b[()*+][0-9A-Za-z<>=%"&'`]|\x1b\][012];[^\x07\x1b]*(?:\x07|\x1b\\)|[\x0e\x0f]/g;
 
-/** The sequences in `data` that change lasting terminal state, in order (see PERSISTENT_STATE); also used by the transcript for input it omits. */
+/**
+ * The sequences in `data` that change lasting terminal state (see
+ * PERSISTENT_STATE), reduced to the last setting of each thing set and kept in
+ * their order, so the result is bounded by the number of things a terminal can
+ * have set, not by the output's length, and a replay reaches the same state: a
+ * mode's last set and last reset, each in its place (a sequence setting several
+ * modes is split into one per mode; a program's visit to the alternate screen
+ * is still a visit when replayed), the last scroll region, keypad mode and
+ * designation of each character set, the last shift (SO or SI), a soft reset
+ * (DECSTR) in its place among them, since it resets the shift and the
+ * designations before it, the last title and the last icon name (OSC 0 sets
+ * both), and a full reset (RIS), which makes everything before it moot. Also
+ * used by the transcript and the reader for output they omit. (The house's read
+ * of ed4ecac, #22: every cursor toggle was kept, OSC 2 then OSC 1 kept only the
+ * icon, and SO moved past a soft reset.)
+ */
 export function persistentState(data: string): string {
-  let out: string[] = [];
-  let title: string | undefined;
-  let shift: string | undefined;
+  // Key → position in `kept`; a setting seen again moves to its latest place.
+  const at = new Map<string, number>();
+  let kept: Array<{ key: string; s: string } | undefined> = [];
+  let live = 0;
+  const put = (key: string, s: string) => {
+    const old = at.get(key);
+    if (old !== undefined) {
+      kept[old] = undefined;
+      live--;
+    }
+    at.set(key, kept.length);
+    kept.push({ key, s });
+    live++;
+    if (kept.length > 4 * live + 64) {
+      // Sparse: close the holes so the array stays proportional to the state.
+      kept = kept.filter((x) => x !== undefined);
+      kept.forEach((e, i) => at.set(e!.key, i));
+    }
+  };
   for (const m of data.matchAll(PERSISTENT_STATE)) {
     const s = m[0];
     if (s === '\x1bc') {
-      out = [s]; // a full reset makes everything before it moot
-      title = undefined;
-      shift = undefined;
-    } else if (s.startsWith('\x1b]')) title = s;
-    else if (s === '\x0e' || s === '\x0f') shift = s;
-    else out.push(s);
+      at.clear();
+      kept = [];
+      live = 0;
+      put('ris', s);
+    } else if (s.startsWith('\x1b]')) {
+      // OSC 0 sets the title and the icon name (one entry, `both`, which replaces either); 1 the icon
+      // name; 2 the title. A `both` that a later title and a later icon name both supersede is dropped.
+      const n = s[2];
+      if (n === '0') {
+        for (const k of ['title', 'icon']) {
+          const old = at.get(k);
+          if (old !== undefined) {
+            kept[old] = undefined;
+            live--;
+            at.delete(k);
+          }
+        }
+        put('both', s);
+      } else {
+        put(n === '1' ? 'icon' : 'title', s);
+        const both = at.get('both');
+        if (both !== undefined && at.has('title') && at.has('icon')) {
+          kept[both] = undefined;
+          live--;
+          at.delete('both');
+        }
+      }
+    } else if (s === '\x0e' || s === '\x0f') put('shift', s);
+    else if (s === '\x1b[!p') put('decstr', s);
+    else if (s === '\x1b=' || s === '\x1b>') put('keypad', s);
+    else if (s[1] === '(' || s[1] === ')' || s[1] === '*' || s[1] === '+') put(`charset${s[1]}`, s);
+    else if (s.endsWith('r')) put('region', s);
+    else {
+      // Modes: the last set and the last reset of each mode number (with its private marker).
+      const priv = s[2] === '?' ? '?' : '';
+      const params = s.slice(2 + priv.length, -1);
+      const final = s[s.length - 1]!;
+      for (const p of params.split(';')) put(`mode${priv}${p}${final}`, `\x1b[${priv}${p}${final}`);
+    }
   }
-  if (title) out.push(title);
-  if (shift) out.push(shift);
-  return out.join('');
+  return kept.filter((x): x is { key: string; s: string } => x !== undefined).map((e) => e.s).join('');
+}
+
+/** How far a sequence left open at a compaction cut is followed into the next data for its end. */
+const COMPLETION_LOOKAHEAD = 4096;
+
+/**
+ * Where the control sequence left open at the end of `before` ends inside `after`
+ * (an index into `after`), or undefined when none is open or it does not end
+ * within COMPLETION_LOOKAHEAD.
+ */
+function completionLength(before: string, after: string): number | undefined {
+  const open = unfinishedSequence(before);
+  if (open === before.length) return undefined;
+  const e = sequenceEnd(before.slice(open) + after.slice(0, COMPLETION_LOOKAHEAD), 0);
+  return e === undefined ? undefined : e - (before.length - open);
 }
 
 export class Screen {
@@ -106,6 +184,8 @@ export class Screen {
   private readonly queue: Op[] = [];
   private queuedUnits = 0;
   private inflightUnits = 0;
+  /** The end of the last batch written to xterm, as far back as a sequence it left open can start. */
+  private lastBatchTail = '';
   private inflight = false;
   private scheduled = false;
   /** Resolves when everything queued so far (and not yet sent) is parsed. */
@@ -268,18 +348,20 @@ export class Screen {
 
   /**
    * The emulator state as an escape-sequence stream that reproduces it in another
-   * emulator of the same size: both buffers, cursor, modes. `seq` is `appliedSeq`,
-   * so a client attaching with this snapshot continues from events after `seq`
-   * (G13). Call after `settled()` to include every write issued so far.
+   * emulator of the same size: both buffers, cursor, modes, and the active
+   * buffer's scroll region (the serialize addon leaves that out; the house's read
+   * of ed4ecac, #22). `seq` is `appliedSeq`, so a client attaching with this
+   * snapshot continues from events after `seq` (G13). Call after `settled()` to
+   * include every write issued so far.
    */
   serialize(opts: { scrollback?: number } = {}): { data: string; cols: number; rows: number; alt: boolean; seq: Seq } {
-    return {
-      data: this.serializer.serialize({ scrollback: opts.scrollback ?? 1000 }),
-      cols: this.term.cols,
-      rows: this.term.rows,
-      alt: this.altState,
-      seq: this.applied,
-    };
+    let data = this.serializer.serialize({ scrollback: opts.scrollback ?? 1000 });
+    // DECSTBM homes the cursor, so it goes between a save and a restore of it (xterm internals; skipped if they change).
+    const buf = (this.term as unknown as { _core?: { buffers?: { active?: { scrollTop?: unknown; scrollBottom?: unknown } } } })._core?.buffers?.active;
+    if (buf && typeof buf.scrollTop === 'number' && typeof buf.scrollBottom === 'number' && (buf.scrollTop > 0 || buf.scrollBottom < this.term.rows - 1)) {
+      data += `\x1b7\x1b[${buf.scrollTop + 1};${buf.scrollBottom + 1}r\x1b8`;
+    }
+    return { data, cols: this.term.cols, rows: this.term.rows, alt: this.altState, seq: this.applied };
   }
 
   dispose(): void {
@@ -348,7 +430,9 @@ export class Screen {
       this.inflightUnits = units;
       this.inflight = true;
       this.sent = batch;
-      this.term.write(parts.join(''), () => {
+      const text = parts.join('');
+      this.lastBatchTail = text.slice(-COMPLETION_LOOKAHEAD);
+      this.term.write(text, () => {
         this.inflight = false;
         this.inflightUnits = 0;
         if (this.disposed) return;
@@ -372,37 +456,65 @@ export class Screen {
   /**
    * The backlog passed maxBacklog: replace the oldest queued output (not the
    * batch inside xterm) with its persistent-state sequences until half the cap
-   * remains. A leading CAN (0x18) aborts any sequence the batch inside xterm
-   * left unfinished; the first kept chunk is advanced to its first newline or
-   * ESC (within 256 units) so the tail of a sequence cut in two is not printed.
+   * remains. A queued resize stays where it is, and the output on each side of it
+   * is compacted on its own, so the cap holds behind a resize too (the house's
+   * read of ed4ecac, #22: the backlog had reached twelve times the cap). A
+   * sequence the discarded output cuts in two is kept whole: the last batch
+   * written may have ended inside one, whose end is taken from the discarded
+   * output (CAN, 0x18, aborts it only when its end is not within reach), and the
+   * discarded output may end inside one, whose beginning stays in the queue for
+   * the output after it to finish (a mode set across the cut is still set, and a
+   * long OSC goes on as the payload it is). Otherwise the first kept chunk is
+   * advanced to its first newline or ESC (within 256 units) so the tail of a line
+   * cut in two is not printed.
    */
   private compact(): void {
     const target = this.maxBacklog / 2;
-    const droppedParts: string[] = [];
-    let seq: Seq | undefined;
-    let removed = 0;
     let i = 0;
-    while (i < this.queue.length && this.queuedUnits - removed > target) {
-      const op = this.queue[i]!;
-      if (op.kind === 'resize') break; // compaction stops at a resize, which must stay in order
-      droppedParts.push(op.data);
-      removed += op.data.length;
-      if (op.seq !== undefined) seq = op.seq;
-      i++;
-    }
-    if (i === 0) return;
-    const next = this.queue[i];
-    if (next?.kind === 'data') {
-      const cut = next.data.slice(0, 256).search(/[\n\x1b]/);
-      if (cut > 0) {
-        droppedParts.push(next.data.slice(0, cut));
-        removed += cut;
-        next.data = next.data.slice(cut);
+    while (i < this.queue.length && this.queuedUnits > target) {
+      if (this.queue[i]!.kind === 'resize') {
+        i++;
+        continue;
       }
+      const start = i;
+      const parts: string[] = [];
+      let seq: Seq | undefined;
+      let removed = 0;
+      while (i < this.queue.length && this.queue[i]!.kind === 'data' && this.queuedUnits - removed > target) {
+        const op = this.queue[i] as Extract<Op, { kind: 'data' }>;
+        parts.push(op.data);
+        removed += op.data.length;
+        if (op.seq !== undefined) seq = op.seq;
+        i++;
+      }
+      let dropped = parts.join('');
+      // A sequence left open at the end of the discarded output stays, for what follows to finish.
+      const open = unfinishedSequence(dropped);
+      const tail = dropped.slice(open);
+      dropped = dropped.slice(0, open);
+      const next = this.queue[i];
+      if (!tail && next?.kind === 'data') {
+        const cut = next.data.slice(0, 256).search(/[\n\x1b]/);
+        if (cut > 0) {
+          dropped += next.data.slice(0, cut);
+          removed += cut;
+          next.data = next.data.slice(cut);
+        }
+      }
+      // At the head: the last batch written may have ended inside a sequence that this output finishes.
+      let head = '';
+      if (start === 0) {
+        const c = completionLength(this.lastBatchTail, dropped);
+        if (c !== undefined) {
+          head = dropped.slice(0, c);
+          dropped = dropped.slice(c);
+        } else head = '\x18';
+      }
+      const kept = head + persistentState(dropped) + tail;
+      this.queue.splice(start, i - start, { kind: 'data', data: kept, seq });
+      this.queuedUnits += kept.length - removed;
+      this.dropped += dropped.length;
+      i = start + 1;
     }
-    const kept = `\x18${persistentState(droppedParts.join(''))}`;
-    this.queue.splice(0, i, { kind: 'data', data: kept, seq });
-    this.queuedUnits += kept.length - removed;
-    this.dropped += removed;
   }
 }

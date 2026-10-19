@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import xterm from '@xterm/headless';
 import type { Terminal as TerminalType } from '@xterm/headless';
-import { Screen } from '../src/core/screen.js';
+import { persistentState, Screen } from '../src/core/screen.js';
 import { transcript } from '../src/core/transcript.js';
 
 test('G14: the screen is emulator state; snapshot reads it without side effects', async () => {
@@ -155,6 +155,57 @@ test('emu-7: applicationCursorKeys follows DECCKM as parsed', async () => {
   s.dispose();
 });
 
+// ───────────── persistentState: the lasting state of discarded output ─────────────
+
+test('persistentState keeps the last setting of each thing, in order, so its size is bounded by the state, not the output', () => {
+  const frame = `\x1b[?25l${'z'.repeat(100)}\x1b[?25h`;
+  // A mode keeps its last set and its last reset, in their order: the final state is the later one, and a
+  // visit (set, then reset) is still a visit when replayed.
+  assert.equal(persistentState(frame.repeat(400)), '\x1b[?25l\x1b[?25h');
+  assert.equal(persistentState(`${frame.repeat(3)}\x1b[?25l`), '\x1b[?25h\x1b[?25l');
+  assert.equal(persistentState('\x1b[?1h\x1b[?2004h\x1b[?1l\x1b[?1h'), '\x1b[?2004h\x1b[?1l\x1b[?1h');
+  // Several modes in one sequence are split.
+  assert.equal(persistentState('\x1b[?1;2004h\x1b[?1l'), '\x1b[?1h\x1b[?2004h\x1b[?1l');
+  assert.equal(persistentState('\x1b[4h\x1b[?4h\x1b[4h'), '\x1b[?4h\x1b[4h', 'an ANSI mode and the private mode of the same number are different modes');
+  // Keypad mode, the scroll region and each character set's designation keep their last value.
+  assert.equal(persistentState('\x1b=\x1b>\x1b='), '\x1b=');
+  assert.equal(persistentState('\x1b[1;5r\x1b[2;8r'), '\x1b[2;8r');
+  assert.equal(persistentState('\x1b(0\x1b)0\x1b(B'), '\x1b)0\x1b(B');
+  assert.equal(persistentState('\x0e\x0f\x0e'), '\x0e');
+  // A full reset discards what came before it, and only that.
+  assert.equal(persistentState('\x1b[?1h\x1b[1;5r\x1bc\x1b[?2004h'), '\x1bc\x1b[?2004h');
+  // Idempotent: the state of a state is itself.
+  const once = persistentState(`${frame.repeat(5)}\x1b[?1h\x1b=\x1b[2;8r\x1b)0\x0e\x1b]2;t\x07`);
+  assert.equal(persistentState(once), once);
+});
+
+test('persistentState: a soft reset stays where it was, so the shift and designations before it are reset as a terminal resets them', async () => {
+  // SO, DECSTR, then G1 = DEC graphics: a terminal shows `lqqk` as text (DECSTR shifted back in).
+  assert.equal(persistentState('\x0e\x1b[!p\x1b)0'), '\x0e\x1b[!p\x1b)0');
+  assert.equal(persistentState('\x1b[!p\x0e\x1b)0'), '\x1b[!p\x0e\x1b)0');
+  // The terminal agrees: the kept state replayed, then `lqqk`.
+  const check = async (data: string) => {
+    const t = new xterm.Terminal({ cols: 20, rows: 3, allowProposedApi: true });
+    await new Promise<void>((r) => t.write(`${data}lqqk`, r));
+    const text = t.buffer.active.getLine(0)!.translateToString(true);
+    t.dispose();
+    return text;
+  };
+  assert.equal(await check('\x0e\x1b[!p\x1b)0'), 'lqqk');
+  assert.equal(await check(persistentState('\x0e\x1b[!p\x1b)0')), 'lqqk');
+  assert.equal(await check(persistentState('\x1b[!p\x1b)0\x0e')), '┌──┐', 'a shift after the soft reset holds');
+});
+
+test('persistentState: a title and an icon name are both kept; OSC 0 sets both', () => {
+  assert.equal(persistentState('\x1b]2;title\x07\x1b]1;icon\x07'), '\x1b]2;title\x07\x1b]1;icon\x07');
+  assert.equal(persistentState('\x1b]1;icon\x07\x1b]2;title\x07'), '\x1b]1;icon\x07\x1b]2;title\x07');
+  assert.equal(persistentState('\x1b]0;both\x07'), '\x1b]0;both\x07');
+  assert.equal(persistentState('\x1b]2;old\x07\x1b]0;both\x07'), '\x1b]0;both\x07');
+  // OSC 0 then OSC 2: the title is the later one, the icon still OSC 0's, which therefore goes first.
+  assert.equal(persistentState('\x1b]0;both\x07\x1b]2;title\x07'), '\x1b]0;both\x07\x1b]2;title\x07');
+  assert.equal(persistentState('\x1b]2;title\x07\x1b]0;both\x07\x1b]1;icon\x1b\\'), '\x1b]0;both\x07\x1b]1;icon\x1b\\');
+});
+
 // ───────────── G13: serialize reproduces the screen ─────────────
 
 function cells(t: TerminalType, which: 'normal' | 'alternate') {
@@ -195,6 +246,29 @@ test('G13: serialize → a fresh emulator reproduces cells, cursor and modes (no
   assert.equal(t.modes.bracketedPasteMode, true);
   t.dispose();
   s.dispose();
+});
+
+test('G13: serialize carries the scroll region, so a replica scrolls where the original does', async () => {
+  const s = new Screen({ cols: 20, rows: 8 });
+  await s.write('\x1b[1;5r\x1b[5;1Hone\r\n', 1);
+  const ser = s.serialize();
+  assert.match(ser.data, /\x1b\[1;5r/);
+  const t = await replay(ser.data, ser.cols, ser.rows);
+  const src = (s as unknown as { term: TerminalType }).term;
+  assert.deepEqual({ x: t.buffer.active.cursorX, y: t.buffer.active.cursorY }, { x: src.buffer.active.cursorX, y: src.buffer.active.cursorY }, 'DECSTBM homed nothing');
+  await new Promise<void>((r) => t.write('two\r\nthree\r\nfour\r\n', r));
+  await s.write('two\r\nthree\r\nfour\r\n', 2);
+  const rows = (term: TerminalType) => Array.from({ length: term.rows }, (_, y) => term.buffer.active.getLine(term.buffer.active.baseY + y)!.translateToString(true));
+  assert.deepEqual(rows(t), rows(src));
+  assert.deepEqual(rows(t).slice(0, 5), ['one', 'two', 'three', 'four', ''], 'the lines scrolled within rows 1–5, the cursor on row 5');
+  assert.equal(rows(t)[5], '', 'nothing below the region');
+  t.dispose();
+  s.dispose();
+  // A full-screen region is not emitted.
+  const plain = new Screen({ cols: 20, rows: 8 });
+  await plain.write('x', 1);
+  assert.doesNotMatch(plain.serialize().data, /\d*;\d*r/);
+  plain.dispose();
 });
 
 test('G13: serialize reproduces the alternate screen, the normal screen under it, and the cursor', async () => {

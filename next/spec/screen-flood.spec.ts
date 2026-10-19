@@ -118,7 +118,9 @@ test('emu-2: settled() after 25 000 small chunks takes parser time, not a timer 
   for (let k = 0; k < 25_000; k++) s.write(`${'y'.repeat(158)}\r\n`, k + 1);
   await s.settled();
   const elapsed = Date.now() - started;
-  assert.ok(elapsed < 2000, `settled after ${elapsed} ms`);
+  // Parsing 4 MB takes a few hundred ms; a timer per chunk would take 25 s or more. A runner under a
+  // CPU quota was seen at 3 s (the house's read of ed4ecac), so the bound leaves room without blurring the point.
+  assert.ok(elapsed < 5000, `settled after ${elapsed} ms`);
   assert.equal(s.appliedSeq, 25_000);
   s.dispose();
 });
@@ -196,6 +198,84 @@ test('emu-2 / G25: compaction keeps the title and modes, drops stale queries una
   assert.equal(s.snapshot().lines.filter(Boolean).at(-1)?.endsWith('tail line'), true);
   const t = (s as unknown as { term: { modes: { bracketedPasteMode: boolean } } }).term;
   assert.equal(t.modes.bracketedPasteMode, true);
+  s.dispose();
+});
+
+test('the backlog cap holds behind a queued resize: output on each side of it is compacted on its own', async () => {
+  const cap = 512 * 1024;
+  const s = new Screen({ cols: 80, rows: 10, maxBacklog: cap });
+  s.write('x'.repeat(1000), 1);
+  s.resize(100, 10);
+  let seq = 1;
+  let peak = 0;
+  for (let k = 0; k < 100; k++) {
+    s.write('y'.repeat(64 * 1024), ++seq);
+    peak = Math.max(peak, s.backlog);
+  }
+  assert.ok(peak <= cap, `backlog peaked at ${peak} against a cap of ${cap}`);
+  await s.settled();
+  assert.ok(s.droppedUnits > 0);
+  assert.equal(s.snapshot().cols, 100);
+  assert.ok(s.snapshot().lines.some((l) => l.length === 100), 'the output after the resize was parsed at the new width');
+  s.dispose();
+});
+
+test('compaction keeps a mode whose sequence the cut splits, at either end of the discarded output', async () => {
+  const cap = 512 * 1024;
+  const chunk = 64 * 1024;
+  // Inside the queue: the cut between the fifth and sixth chunk (half the cap is four chunks) splits ESC [ ? 1 | h.
+  {
+    const s = new Screen({ cols: 80, rows: 10, maxBacklog: cap });
+    let seq = 0;
+    for (let k = 1; k <= 20; k++) {
+      let data = 'q'.repeat(chunk - 4);
+      if (k === 5) data += '\x1b[?1';
+      if (k === 6) data = `h${data}`;
+      s.write(data, ++seq);
+    }
+    await s.settled();
+    assert.ok(s.droppedUnits > 0);
+    assert.equal(s.applicationCursorKeys, true, 'DECCKM set across the cut inside the queue');
+    s.dispose();
+  }
+  // At the head: the last batch written ended inside the sequence, the discarded output finished it.
+  {
+    const s = new Screen({ cols: 80, rows: 10, maxBacklog: cap });
+    await s.write(`${'a'.repeat(1000)}\x1b[?1`, 1);
+    let seq = 1;
+    for (let k = 0; k < 12; k++) s.write(`${k === 0 ? 'h' : ''}${'b'.repeat(chunk)}`, ++seq);
+    await s.settled();
+    assert.ok(s.droppedUnits > 0);
+    assert.equal(s.applicationCursorKeys, true, 'DECCKM set across the cut at the parsed batch');
+    s.dispose();
+  }
+  // At the tail: the discarded output ends inside the sequence, and what finishes it has not arrived yet.
+  {
+    const s = new Screen({ cols: 80, rows: 10, maxBacklog: cap });
+    s.write('a'.repeat(300_000), 1);
+    s.write(`${'b'.repeat(300_000)}\x1b[?1`, 2);
+    assert.ok(s.droppedUnits > 0, 'compacted before the rest arrived');
+    s.write(`h${'c'.repeat(1000)}`, 3);
+    await s.settled();
+    assert.equal(s.applicationCursorKeys, true, 'DECCKM set across the cut at the end of the discarded output');
+    assert.equal(s.snapshot().lines.filter(Boolean).at(-1)?.includes('h'), false, 'the h was the sequence\'s, not text');
+    s.dispose();
+  }
+});
+
+test('the kept head of discarded output is bounded by the state it holds, not by the output', async () => {
+  const cap = 512 * 1024;
+  const s = new Screen({ cols: 80, rows: 10, maxBacklog: cap });
+  const frame = `\x1b[?25l${'f'.repeat(67_000)}\x1b[?25h`;
+  let seq = 0;
+  let peak = 0;
+  for (let k = 0; k < 400; k++) {
+    s.write(frame, ++seq);
+    peak = Math.max(peak, s.backlog);
+  }
+  assert.ok(peak <= cap, `backlog peaked at ${peak} units against a cap of ${cap}`);
+  await s.settled();
+  assert.ok(s.droppedUnits > 0);
   s.dispose();
 });
 
