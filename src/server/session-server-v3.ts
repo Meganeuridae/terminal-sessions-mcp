@@ -106,6 +106,18 @@ interface SessionInfo {
   // When the server last typed a line for a command (see typeLine) or acted
   // on a marker (see actOnMarker). Input written by sendInput doesn't count.
   typingProgressAt: number;
+  // Whether the shell in front is back at its prompt, so that the next line
+  // the terminal gives it goes to its line editor. True after any marker but
+  // a start marker: each is printed as a line the server typed finishes (a
+  // probe line, a body's line, or a command's wrapper once its command has
+  // ended), and the shell then reads its next line. False after a start
+  // marker, which the wrapper prints as its command starts, since the command
+  // reads the terminal from then on, and after input written by sendInput
+  // other than a lone ^C, which may start a command too. A shell that exits
+  // without a marker, as when an ssh connection drops, goes unseen. A lone ^C
+  // that gives up a body partway typed in has ^U and Enter follow it only
+  // while this holds (see CLEAR_HELD_LINE).
+  shellAtPrompt: boolean;
   // Commands that hadn't started when a ^C was written, and that it didn't
   // give up (see interruptTyping). A mark acts only at a no-file marker, which
   // then gives the command up rather than typing its body (see
@@ -198,6 +210,11 @@ type SessionEventMap = {
     output: string;
     finishedAt: Date;
   };
+  /**
+   * The call as made. A lone ^C that gives up a body the shell is partway
+   * through reading is followed by ^U and Enter (see CLEAR_HELD_LINE), which
+   * `input` doesn't show.
+   */
   'session:input': {
     sessionId: string;
     input: string;
@@ -354,6 +371,34 @@ const HELD_PROBE_MAX_MS = 2000;
  * (see interruptTyping).
  */
 const INTERRUPTED_BODY = '[command not run: interrupted before its body was all typed in]';
+/**
+ * What follows a lone ^C that gives up a body the shell in front is partway
+ * through reading (see interruptTyping): ^U, then Enter. That is a body with
+ * lines left while the shell is at its prompt (see shellAtPrompt). A line of
+ * the body runs nothing, so it is the shell's line editor that reads the body's
+ * line, and the ^U and Enter after it. After a start marker a command reads the
+ * terminal, and it may have read a first line of the body typed as it started,
+ * so a ^C then goes alone, as it does after input sent with sendInput, which
+ * may have started a command. A shell that exits without a marker, as when an
+ * ssh connection drops, goes unseen: ^U and Enter then go to whatever reads the
+ * terminal next, which is the shell behind it at its prompt unless something
+ * run after ssh on the same command line reads them. The ^C can reach bash
+ * while readline is still reading one of the body's lines; readline then keeps
+ * the part it had read and waits for more, so the next line typed joins it. And
+ * bash can act on the interrupt only once it has read its next line, which then
+ * fails with a syntax error. The ^U drops the kept part, and the empty line
+ * takes the interrupt, so the next command goes in whole. In runs of the
+ * over-a-link test, whose writes reach the shell 50 ms late (bash 5.2),
+ * `echo NEXT` typed right after such a ^C failed in 10 of 30 with nothing
+ * between, in 2 of 230 with an Enter alone, and in none of 230 with ^U and
+ * Enter between. A ^U that readline doesn't take as discarding the line leaves
+ * the kept part, which the Enter then accepts. While ^U is the terminal's kill
+ * character, as it is by default, readline binds it to discarding the line in
+ * place of any function an inputrc binds to it, unless bind-tty-special-chars
+ * is off (set_special_char in readline's rltty.c). A macro bound to it stands,
+ * and the Enter then accepts the kept part with the macro's text after it.
+ */
+const CLEAR_HELD_LINE = '\x15\r';
 
 export class PersistentSessionServer extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
@@ -451,6 +496,7 @@ export class PersistentSessionServer extends EventEmitter {
       scanCarry: '',
       awaitingMarkers: [],
       typingProgressAt: 0,
+      shellAtPrompt: false,
       interruptedProbes: new Set()
     };
 
@@ -780,26 +826,31 @@ export class PersistentSessionServer extends EventEmitter {
 
   /**
    * Before a ^C is written (sendSignal's SIGINT, or input holding a ^C sent
-   * with sendInput: the C-c key, or a ^C in its text), give up the commands
-   * on their way in that can't have started: a body going in with lines left
-   * and the bodies waiting their turn (inlineQueue), since a body's last line
-   * is what runs it, and a held probe line, which is then never typed. Over a
+   * with sendInput: the C-c key, or a ^C in its text), give up the commands on
+   * their way in that can't have started: a body going in with lines left and
+   * the bodies waiting their turn (inlineQueue), since a body's last line is
+   * what runs it, and a held probe line, which is then never typed. Over a
    * link, a ^C typed while a body goes in mostly reaches the shell at its
    * prompt between two lines and takes nothing with it, and the server would
    * type the rest and run it. These are the inline form of the typeahead a ^C
    * discards. Every other command whose line is typed and that hasn't started
    * is marked (interruptedProbes). A mark acts only at a no-file marker: it
-   * gives up a command whose shell then asks for its body, and does nothing
-   * for one whose body is typed in whole already. A body whose lines are all
-   * typed may be running, and is left to the ^C. Commands still in the
-   * server's queue have no line typed and aren't touched: each goes in after
-   * the ^C in its turn (processCommandQueue). Returns the reason the current
-   * command is to be answered with, if it was given up.
+   * gives up a command whose shell then asks for its body, and does nothing for
+   * one whose body is typed in whole already. A body whose lines are all typed
+   * may be running, and is left to the ^C. Commands still in the server's queue
+   * have no line typed and aren't touched: each goes in after the ^C in its
+   * turn (processCommandQueue). Returns the reason the current command is to be
+   * answered with, if it was given up, and whether a lone ^C is to have ^U and
+   * Enter follow it (see CLEAR_HELD_LINE): whether it gave up a body partway
+   * typed in while the shell in front is at its prompt (see shellAtPrompt). A
+   * body whose lines are all typed may be running, and gets the ^C alone.
    */
-  private interruptTyping(session: SessionInfo): string | undefined {
+  private interruptTyping(session: SessionInfo): { reason?: string; clearHeldLine: boolean } {
     const given: GivenUp = {};
+    let partway = false;
     for (const nonce of [...session.inlineQueue]) {
       if (session.typedInline.has(nonce) && !session.inlinePieces.has(nonce)) continue; // all its lines typed
+      if (session.typedInline.has(nonce)) partway = true; // some of its lines typed, some not
       this.dropUntyped(session, nonce, given, INTERRUPTED_BODY);
     }
     const current = session.currentCommand;
@@ -812,7 +863,7 @@ export class PersistentSessionServer extends EventEmitter {
     for (const [nonce, started] of session.unfinished) {
       if (!started) session.interruptedProbes.add(nonce);
     }
-    return given.current;
+    return { reason: given.current, clearHeldLine: partway && session.shellAtPrompt };
   }
 
   /**
@@ -1124,6 +1175,7 @@ export class PersistentSessionServer extends EventEmitter {
   private actOnMarker(session: SessionInfo, marker: Marker): void {
     const given: GivenUp = {};
     session.typingProgressAt = Date.now();
+    session.shellAtPrompt = marker.kind !== 'start';
     this.handleMarker(session, marker, given);
     this.advanceInline(session);
     this.typeHeldProbe(session);
@@ -1600,10 +1652,16 @@ export class PersistentSessionServer extends EventEmitter {
    * and reads input sent before then itself. The caller sends it again in a
    * moment. A lone ^C, as the C-c key or a terminal's Ctrl+C keystroke writes
    * it, isn't refused: like sendSignal's SIGINT, it first gives up the
-   * commands still being typed in (see interruptTyping). Input holding a ^C
-   * among other characters does that too, once it's accepted.
+   * commands still being typed in (see interruptTyping), and when that gives
+   * up a body the shell in front is partway through reading, ^U and Enter
+   * follow it (see CLEAR_HELD_LINE). Input holding a ^C among other
+   * characters gives them up too, once it's accepted, and goes in as given.
+   * Input other than a lone ^C that writes anything may start a command, so
+   * a ^C after it goes alone until a marker other than a start marker comes
+   * (see shellAtPrompt). Returns whether ^U and Enter followed the ^C, so the
+   * caller's result can say so.
    */
-  sendInput(sessionId: string, input: string, appendNewline?: boolean, keys?: string[]): void {
+  sendInput(sessionId: string, input: string, appendNewline?: boolean, keys?: string[]): { clearedHeldLine: boolean } {
     const session = this.sessions.get(sessionId);
     if (!session || !session.isAlive) {
       throw new Error(`Session ${sessionId} not available`);
@@ -1622,11 +1680,18 @@ export class PersistentSessionServer extends EventEmitter {
         `(empty text, keys ['C-c']), neither of which is refused.`);
     }
 
-    // A ^C is the same event whichever call writes it (see sendSignal).
-    const givenUp = dataToSend.includes('\x03') ? this.interruptTyping(session) : undefined;
-    session.shell.write(dataToSend);
+    // A ^C is the same event whichever call writes it (see sendSignal). A lone
+    // one that gives up a body the shell in front is partway through reading
+    // is followed by ^U and Enter (see CLEAR_HELD_LINE). Other input, a ^C
+    // among other characters included, goes in as given, and if it writes
+    // anything it may start a command, so the shell is no longer known to be
+    // at its prompt.
+    const interrupt = dataToSend.includes('\x03') ? this.interruptTyping(session) : undefined;
+    const clearedHeldLine = dataToSend === '\x03' && interrupt?.clearHeldLine === true;
+    session.shell.write(clearedHeldLine ? dataToSend + CLEAR_HELD_LINE : dataToSend);
+    if (dataToSend !== '' && dataToSend !== '\x03') session.shellAtPrompt = false;
     session.lastActivity = new Date();
-    if (givenUp !== undefined) this.resolveCommand(session, -1, { reason: givenUp });
+    if (interrupt?.reason !== undefined) this.resolveCommand(session, -1, { reason: interrupt.reason });
 
     const hasKeys = !!(keys && keys.length > 0);
     this.notify('session:input', {
@@ -1636,25 +1701,32 @@ export class PersistentSessionServer extends EventEmitter {
       keys,
       timestamp: new Date()
     });
+    return { clearedHeldLine };
   }
 
   /**
    * Send a signal to a session. SIGINT is sent as Ctrl-C, after the commands
    * still being typed in are given up and the others whose line is typed and
-   * that haven't started are marked (see interruptTyping).
+   * that haven't started are marked (see interruptTyping). Returns whether ^U
+   * and Enter followed the Ctrl-C (see CLEAR_HELD_LINE), so the caller's
+   * result can say so.
    */
-  sendSignal(sessionId: string, signal: string = 'SIGINT'): void {
+  sendSignal(sessionId: string, signal: string = 'SIGINT'): { clearedHeldLine: boolean } {
     const session = this.sessions.get(sessionId);
     if (!session || !session.isAlive) {
       throw new Error(`Session ${sessionId} not available`);
     }
 
     // For SIGINT, send Ctrl+C, once the commands it must stop that are still
-    // on their way in are given up (see interruptTyping)
+    // on their way in are given up (see interruptTyping), with ^U and Enter
+    // behind it when it gives up a body the shell in front is partway through
+    // reading (see CLEAR_HELD_LINE)
+    let clearedHeldLine = false;
     if (signal === 'SIGINT') {
-      const givenUp = this.interruptTyping(session);
-      session.shell.write('\x03');
-      if (givenUp !== undefined) this.resolveCommand(session, -1, { reason: givenUp });
+      const { reason, clearHeldLine } = this.interruptTyping(session);
+      clearedHeldLine = clearHeldLine;
+      session.shell.write(clearHeldLine ? '\x03' + CLEAR_HELD_LINE : '\x03');
+      if (reason !== undefined) this.resolveCommand(session, -1, { reason });
     } else if (signal === 'SIGTERM') {
       session.shell.kill('SIGTERM');
     } else {
@@ -1666,6 +1738,7 @@ export class PersistentSessionServer extends EventEmitter {
       signal,
       timestamp: new Date()
     });
+    return { clearedHeldLine };
   }
 
   /**

@@ -52,6 +52,42 @@ while `termd` listens on 3101. Making 2.0 the default — the 1.x names pointing
   xterm from a CDN, and 1.x's `ws` stays within 8.x. New dependencies: `@animalabs/mcpl-core`,
   `@xterm/headless`, `@xterm/addon-serialize`.
 
+## v1.7.1 - 2026-10-19
+
+### Fixed
+
+- **A command sent right after a lone Ctrl-C that gave up a body the shell
+  was partway through reading goes in whole.** The Ctrl-C can reach bash
+  while readline is still reading one of the body's lines. readline then
+  keeps the part it had read and waits for more, so the next command typed
+  joined it; an open quote put bash at its continuation prompt and the
+  command never ran. bash can also act on the Ctrl-C only once it has read
+  its next line, which then failed with a syntax error. When a lone Ctrl-C
+  (`sendSignal`'s SIGINT, the `C-c` key alone, or a terminal's Ctrl+C
+  keystroke) gives up a body the shell is partway through reading, the
+  server now sends Ctrl-U and Enter behind it: the Ctrl-U drops what
+  readline kept, and the empty line takes the interrupt. A Ctrl-C still goes
+  alone when it finds a body's lines all typed, since that body may be
+  running, and after a command's start marker or other input sent with
+  `sendInput`, until a marker other than a start marker comes, since a
+  command started either way may have read the body's line. In the test of a
+  SIGINT over a link, on Linux with bash 5.2, `echo NEXT` sent right after
+  such a Ctrl-C failed in 10 of 30 runs with nothing written between, in 2
+  of 230 with an Enter, and in none of 230 with Ctrl-U and Enter. That was
+  the test's occasional failure. A Ctrl-U that readline doesn't take as
+  discarding the line leaves the kept part, which the Enter then accepts.
+  While Ctrl-U is the terminal's kill character, as it is by default,
+  readline binds it to discarding the line in place of any function an
+  inputrc binds to it, unless `bind-tty-special-chars` is off. A macro bound
+  to it stands, and the Enter then accepts the kept part with the macro's
+  text after it. `sendInput`'s and `sendSignal`'s results say when Ctrl-U and
+  Enter followed: the MCP tools' results carry a `note`, and the session
+  server's answer `clearedHeldLine: true`. The MCP tools report the answer to
+  their last attempt: if the connection is lost after a call went in, they
+  send it again, and the result doesn't report a Ctrl-U and Enter that the
+  first attempt wrote. The tools' descriptions are unchanged, so the tool list
+  a host has cached stays as it was.
+
 ## v1.7.0 - 2026-10-18
 
 ### Fixed

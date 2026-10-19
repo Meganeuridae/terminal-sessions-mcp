@@ -48,13 +48,15 @@ export function decodeKey(name: string): string {
 }
 
 /**
- * Build the exact byte string to write to the PTY for a sendInput call.
+ * Build the byte string a sendInput call writes to the PTY. (sendInput adds
+ * ^U and Enter after a lone ^C that gives up a body the shell is partway
+ * through reading; see CLEAR_HELD_LINE in the session server.)
  *
  * - `input` is passed through verbatim, followed by decoded `keys`.
  * - Enter (\r — what a real Enter key sends; correct for canonical-mode
  *   shells and raw-mode TUIs alike) is appended by default when no keys
- *   are given. When `keys` are given the caller controls the exact bytes,
- *   so Enter is only appended if `appendNewline` is explicitly true.
+ *   are given. When `keys` are given the caller controls the bytes, so
+ *   Enter is only appended if `appendNewline` is explicitly true.
  */
 export function buildInputData(input: string, appendNewline?: boolean, keys?: string[]): string {
   const hasKeys = !!(keys && keys.length > 0);

@@ -312,7 +312,22 @@ the server has typed no line and read no marker, as when a program rather than
 a shell took the command's line, or a busy shell hasn't read it yet; that
 doesn't mean the command has started. Send refused input again in a moment. To
 interrupt a command, use `sendSignal` with SIGINT, its default, or send the
-`C-c` key alone (empty text, `keys: ["C-c"]`); neither is refused.
+`C-c` key alone (empty text, `keys: ["C-c"]`); neither is refused. When either
+gives up a body that a shell which can't read the temp file is partway through
+reading, the server follows the Ctrl-C with Ctrl-U and Enter, which drop what
+the shell had read of the body's line. The server takes the shell to be reading
+while the latest marker it printed isn't a command's start marker and no other
+input has been sent since. A body whose lines are all typed may be running, and
+gets the Ctrl-C alone. So does a body partway typed in after a command's start
+marker, since that command reads the terminal and may have read the body's
+first line, and after other input sent with `sendInput`, which may have started
+a command, until a marker other than a start marker comes. This is the one case
+in which `sendInput` writes more than its `input`, `keys` and `appendNewline`
+ask for. When it happens, the call's result says so: the MCP tools' results
+carry a `note`, and the session server's answer `clearedHeldLine: true`. The MCP
+tools report the answer to their last attempt: if the connection is lost after
+a call went in, they send it again, and the result doesn't report a Ctrl-U and
+Enter that the first attempt wrote.
 
 ### Log Operations
 - **tailLogs** - Get recent logs from a session

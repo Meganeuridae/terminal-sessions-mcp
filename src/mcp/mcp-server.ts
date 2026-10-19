@@ -33,6 +33,18 @@ interface LogMatch {
   context: string[];
 }
 
+/**
+ * What sendInput's and sendSignal's results say when the session server
+ * followed their Ctrl+C with Ctrl+U and Enter (see CLEAR_HELD_LINE in the
+ * session server). The result says it, not the tools' descriptions, since it
+ * matters only once it has happened: a caller sending a Ctrl+C has nothing to
+ * choose differently. A call withConnectionRetry sends again after a lost
+ * connection reports the second attempt's answer alone, so a Ctrl+U and Enter
+ * the first attempt wrote go unreported.
+ */
+const CLEARED_HELD_LINE_NOTE =
+  'Ctrl+U and Enter followed the Ctrl+C, to clear what the shell had read of the command it gave up.';
+
 export class ConnectomeTestingMCP {
   private client: RobustSessionClient | null = null;
   private apiUrl: string;
@@ -295,13 +307,13 @@ export class ConnectomeTestingMCP {
     input: string;
     appendNewline?: boolean;
     keys?: string[];
-  }): Promise<{ success: boolean; error?: string }> {
+  }): Promise<{ success: boolean; error?: string; note?: string }> {
     try {
       const sessionId = this.serviceMap.get(params.session) || params.session;
-      await this.withConnectionRetry(() =>
+      const sent = await this.withConnectionRetry(() =>
         this.getClient().sendInput(sessionId, params.input, params.appendNewline, params.keys)
       );
-      return { success: true };
+      return sent?.clearedHeldLine === true ? { success: true, note: CLEARED_HELD_LINE_NOTE } : { success: true };
     } catch (error: any) {
       return { success: false, error: error?.message || String(error) };
     }
@@ -314,13 +326,13 @@ export class ConnectomeTestingMCP {
   async sendSignal(params: {
     session: string;
     signal?: string;
-  }): Promise<{ success: boolean }> {
+  }): Promise<{ success: boolean; note?: string }> {
     try {
       const sessionId = this.serviceMap.get(params.session) || params.session;
-      await this.withConnectionRetry(() =>
+      const sent = await this.withConnectionRetry(() =>
         this.getClient().sendSignal(sessionId, params.signal || 'SIGINT')
       );
-      return { success: true };
+      return sent?.clearedHeldLine === true ? { success: true, note: CLEARED_HELD_LINE_NOTE } : { success: true };
     } catch (error) {
       return { success: false };
     }
