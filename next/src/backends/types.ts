@@ -89,4 +89,6 @@ export interface ExecutionBackend {
   readonly kind: string;
   spawnShell(opts: SpawnShellOptions): PtyHandle;
   spawnProcess(opts: SpawnProcessOptions): ProcessHandle;
+  /** Can this host run process Runs at all? (node-pty: bash and /dev/fd must exist, see processLaunch.) Absent: yes. */
+  processSupport?(): { ok: true } | { ok: false; reason: string };
 }

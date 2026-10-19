@@ -224,6 +224,10 @@ class OwnedProcessGroups implements ExecutionBackend {
     return this.inner.spawnShell(opts);
   }
 
+  processSupport(): { ok: true } | { ok: false; reason: string } {
+    return this.inner.processSupport?.() ?? { ok: true };
+  }
+
   spawnProcess(opts: SpawnProcessOptions): ProcessHandle {
     const h = this.inner.spawnProcess(opts);
     const pgid = h.pid;
@@ -452,6 +456,9 @@ async function main(): Promise<void> {
   }
 
   const groups = new OwnedProcessGroups(new NodePtyBackend());
+  // A documented requirement, said once here rather than Run by Run (the house's review of #11).
+  const support = groups.processSupport();
+  if (!support.ok) log('warn', 'process Runs are unavailable on this host; they will be refused', { reason: support.reason });
   // Sessions opened without a cwd start in the home directory, never wherever the daemon
   // happened to be started (launchd: `/`; a shim: its host's project directory) (ux-16, tsg-3).
   const registryOpts: ConstructorParameters<typeof SessionRegistry>[0] = { dataDir, backend: groups, defaultCwd: os.homedir() };

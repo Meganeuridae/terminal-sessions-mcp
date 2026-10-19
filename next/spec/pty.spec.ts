@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { groupStillOurs, NodePtyBackend } from '../src/backends/node-pty.js';
+import { findBash, groupStillOurs, NodePtyBackend } from '../src/backends/node-pty.js';
 import { Journal } from '../src/core/journal.js';
 import { Session } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
@@ -43,7 +43,7 @@ test('process output is streaming UTF-8 text with separate stderr, including inv
   assert.equal(stderr, 'separate');
 });
 
-async function real(shell: string): Promise<{ session: Session; journal: Journal }> {
+async function real(shell: string, backend: NodePtyBackend = new NodePtyBackend()): Promise<{ session: Session; journal: Journal }> {
   const id = `real-${++n}`;
   const integ = prepareIntegration(shell, { noUserRc: true, dir: path.join(tmp, `integration-${id}`) });
   const journal = new Journal();
@@ -52,7 +52,7 @@ async function real(shell: string): Promise<{ session: Session; journal: Journal
     owner: AGENT,
     shell,
     cwd: tmp,
-    backend: new NodePtyBackend(),
+    backend,
     journal,
     integrationGraceMs: 4000,
     tempDir: tmp,
@@ -379,3 +379,27 @@ function groupLives(pgid: number): boolean {
     return false;
   }
 }
+
+test('bash is a checked requirement for process Runs: found at /bin/bash or on PATH; without it termd refuses process Runs with the reason, and shell Runs go on', async () => {
+  // The finder: the standard path first, then PATH; nothing found is undefined.
+  const bin = path.join(tmp, 'nix-bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'bash'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  assert.equal(findBash(`/nonexistent:${bin}`, path.join(tmp, 'no-such-bash')), path.join(bin, 'bash'));
+  assert.equal(findBash('/nonexistent', path.join(tmp, 'no-such-bash')), undefined);
+  assert.equal(findBash(process.env.PATH, '/bin/bash'), '/bin/bash', 'this host has it where the launcher looks first');
+  // A host without bash: the backend says so once, the daemon logs it at startup, and a process Run is refused, not lost.
+  const without = new NodePtyBackend({ bash: null });
+  const support = without.processSupport();
+  assert.ok(!support.ok && /need bash/.test(support.reason), JSON.stringify(support));
+  assert.throws(() => without.spawnProcess({ argv: ['/bin/true'], cwd: tmp, env: {} }), (e: { code?: string }) => e.code === 'unsupported');
+  const { session } = await real('/bin/bash', without);
+  try {
+    assert.throws(() => session.admit({ target: 'process', argv: ['/bin/true'], principal: AGENT }), (e: { code?: string; message: string }) => e.code === 'unsupported' && /need bash/.test(e.message));
+    assert.equal(session.listRuns().filter((r) => r.target === 'process').length, 0, 'nothing was admitted to end lost');
+    const r = await runWait(session, 'echo shell-still-works');
+    assert.deepEqual([r.state, r.exit], ['exited', 0]);
+  } finally {
+    await session.close();
+  }
+});

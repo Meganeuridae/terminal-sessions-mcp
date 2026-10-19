@@ -1532,6 +1532,9 @@ export class Session {
     const origin = opts.origin ?? (opts.principal === SYSTEM ? 'system' : 'self');
     if (opts.target === 'process') {
       this.assertAlive();
+      // A host without bash or /dev/fd cannot run process Runs (ExecutionBackend.processSupport): refused with the reason, never admitted to end lost.
+      const support = this.backend.processSupport?.();
+      if (support && !support.ok) throw err('unsupported', support.reason);
       // A line's text reaches the shell on descriptor 3 (see SpawnProcessOptions.line): on
       // `/bin/sh -c LINE` it was in the shell's argv, where a `pkill -f` in the line itself found
       // and killed it (the house's review of #11), and a file could be removed under a shell

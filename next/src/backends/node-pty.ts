@@ -3,6 +3,7 @@ import { execFileSync, spawn as spawnChild } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as pty from 'node-pty';
+import { err } from '../core/errors.js';
 import type { ExecutionBackend, ForegroundInfo, ProcessHandle, PtyExit, PtyHandle, SpawnProcessOptions, SpawnShellOptions } from './types.js';
 
 const signalName = (n: number | undefined): string | undefined => {
@@ -202,8 +203,43 @@ export function oomLine(oomScoreAdj: number): string[] {
   return n > 0 ? [`if [ -w /proc/self/oom_score_adj ]; then echo ${n} > /proc/self/oom_score_adj 2>/dev/null || :; fi`] : [];
 }
 
+/**
+ * Where process Runs find bash (see processLaunch): `/bin/bash`, else the first `bash` on the
+ * daemon's PATH (NixOS has one there and none in /bin). Alpine's base has neither: `apk add bash`.
+ */
+export function findBash(PATH: string | undefined = process.env.PATH, standard = '/bin/bash'): string | undefined {
+  const ok = (p: string): boolean => {
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+      return fs.statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (ok(standard)) return standard;
+  for (const d of (PATH ?? '').split(':')) if (d !== '' && ok(path.join(d, 'bash'))) return path.join(d, 'bash');
+  return undefined;
+}
+
 export class NodePtyBackend implements ExecutionBackend {
   readonly kind = 'node-pty';
+  /** The bash process Runs launch through; undefined where this host has none (process Runs are then refused, not lost). */
+  private readonly bash: string | undefined;
+
+  constructor(opts: { bash?: string | null } = {}) {
+    this.bash = opts.bash === undefined ? findBash() : (opts.bash ?? undefined);
+  }
+
+  /**
+   * A documented requirement, checked once (the house's review of #11): without bash, or without
+   * /dev/fd to list descriptors by, the launcher could not close what a Run would inherit, so
+   * process Runs are refused with this reason rather than ending `lost` one by one.
+   */
+  processSupport(): { ok: true } | { ok: false; reason: string } {
+    if (!this.bash) return { ok: false, reason: 'process Runs need bash (/bin/bash, or a bash on the daemon’s PATH) to close inherited descriptors before the command runs, and this host has none: install it (Alpine: apk add bash)' };
+    if (!fs.existsSync('/dev/fd')) return { ok: false, reason: 'process Runs need /dev/fd to list the descriptors to close before the command runs, and this host has none' };
+    return { ok: true };
+  }
 
   spawnShell(opts: SpawnShellOptions): PtyHandle {
     const launcher = opts.bootstrap?.launcher;
@@ -228,12 +264,15 @@ export class NodePtyBackend implements ExecutionBackend {
     // not the launcher's exit 127 (core-15: nothing ran, no signal was observed).
     // A line's text goes to the child on descriptor 3, which the launcher shell keeps, reads
     // whole and closes before running the text (see processLaunch).
+    const support = this.processSupport();
+    if (!support.ok) throw err('unsupported', support.reason);
+    const bash = this.bash!;
     const script = opts.line !== undefined && cmd === '/bin/sh' && args.length === 0 ? `${opts.line}\n` : undefined;
     const launched =
       script !== undefined
-        ? (['/bin/bash', ['--noprofile', '--norc', '-p', '-c', processLaunch(true, opts.oomScoreAdj ?? 0), 'termd-process']] as const)
+        ? ([bash, ['--noprofile', '--norc', '-p', '-c', processLaunch(true, opts.oomScoreAdj ?? 0), 'termd-process']] as const)
         : executable(cmd, opts.env.PATH, opts.cwd)
-          ? (['/bin/bash', ['--noprofile', '--norc', '-p', '-c', processLaunch(false, opts.oomScoreAdj ?? 0), 'termd-process', cmd, ...args]] as const)
+          ? ([bash, ['--noprofile', '--norc', '-p', '-c', processLaunch(false, opts.oomScoreAdj ?? 0), 'termd-process', cmd, ...args]] as const)
           : ([cmd, args] as const);
     const child = spawnChild(launched[0], [...launched[1]], { cwd: opts.cwd, env: opts.env, stdio: script !== undefined ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'], detached: true });
     if (script !== undefined) {

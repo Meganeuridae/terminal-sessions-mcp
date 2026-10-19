@@ -20,8 +20,10 @@ termd                                 # ws://127.0.0.1:3101 · GUI at http://127
 tsm run demo 'echo hello; pwd'        # exit code = the command's; 2 while still running
 ```
 
-On macOS and Linux, process Runs use `/bin/bash` to close inherited descriptors before
-executing the command. Command text itself runs in `/bin/sh`.
+Process Runs need bash: `/bin/bash`, or a `bash` on the daemon's PATH (NixOS). It closes the
+descriptors a Run would otherwise inherit before the command runs; the command text itself runs in
+`/bin/sh`. Without bash (Alpine's base: `apk add bash`), termd says so when it starts and refuses
+process Runs with that message; shell Runs are unaffected.
 
 Then connect a host (configurations in [`next/config/`](next/config/)):
 
