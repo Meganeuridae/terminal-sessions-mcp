@@ -65,6 +65,9 @@ A value takes the type of the tool's parameter (the daemon's schema decides): te
 commas (--keys Enter,C-c) or is JSON; an object is JSON (start --ready '{"pattern":"listening"}');
 --key=value works everywhere. Durations (--wait and any --*-ms flag): 500ms, 20s, 2m, or plain
 milliseconds.
+--json prints the result as JSON on stdout, and a daemon's error as {"error": "..."} on stdout with
+exit 1; tsm's own refusals (a usage error, an unknown command, a connection it cannot make) are text
+on stderr with exit 1, --json or not.
 Env: TSM_URL (ws://127.0.0.1:3101), TSM_TOKEN.
 Exit code: a run's exit code; 128+N when it died on signal N; ${EXIT_UNFINISHED} while it is still running
 (await it); ${EXIT_BUSY} when the shell is busy (another Run, or a person editing a line at the prompt); 1 on
@@ -214,7 +217,9 @@ function distance(a: string, b: string): number {
  */
 function unknownTool(cmd: string, listed: string[]): string {
   const short = SHORT[cmd];
-  if (short) return `${short.tool}, the tool behind ${cmd}, is not one the daemon lists for this connection`;
+  // tsm asks for the full profile, which lists every tool of its own version: a shorthand whose tool
+  // is missing met a daemon of another version (the house's read, #22 comment 6274806357).
+  if (short) return `${short.tool}, the tool behind ${cmd}, is not one the daemon lists: this tsm and that termd are of different versions; update one to match, or call a tool the daemon lists by its name`;
   const near = [...Object.keys(SHORT), ...listed]
     .map((n) => [n, distance(cmd, n)] as const)
     .filter(([, d]) => d <= 2)

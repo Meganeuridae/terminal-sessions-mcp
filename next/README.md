@@ -260,8 +260,10 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
 `tsm screen build`, `tsm input build --keys C-c`, `tsm sessions`, `tsm gui`, `tsm usage`.
 After `--`, each word is one argument of the command, quoted for the session's shell, so its own
 flags and odd characters arrive whole: `tsm run build -- git log --oneline -5`. Flag values take
-the type of the tool's parameter; a yes/no flag stands alone (`--queue`, `--force`).
-`TSM_URL` and `TSM_TOKEN` point it at a daemon.
+the type of the tool's parameter; a yes/no flag stands alone (`--queue`, `--force`). Under
+`--json` the result is JSON on stdout and a daemon's error is `{"error": …}` on stdout with exit 1;
+`tsm`'s own refusals (a usage error, an unknown command, a connection it cannot make) are text on
+stderr with exit 1, `--json` or not. `TSM_URL` and `TSM_TOKEN` point it at a daemon.
 
 ## Upgrading from 1.x
 

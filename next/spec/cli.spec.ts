@@ -188,19 +188,21 @@ interface Canned {
  * with a canned envelope — the next of a list when a tool is asked more than once, the last
  * one repeating.
  */
-async function cannedDaemon(answers: Record<string, Record<string, unknown> | Array<Record<string, unknown>>>): Promise<Canned> {
+async function cannedDaemon(answers: Record<string, Record<string, unknown> | Array<Record<string, unknown>>>, opts: { without?: string[] } = {}): Promise<Canned> {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise<void>((r) => wss.once('listening', () => r()));
   const calls: Canned['calls'] = [];
   const urls: string[] = [];
   const left = Object.fromEntries(Object.entries(answers).map(([k, v]) => [k, Array.isArray(v) ? [...v] : [v]]));
+  // `without`: tools this stand-in does not list, as a daemon of another version would not.
+  const tools = TOOLS.filter((t) => !opts.without?.includes(t.name));
   wss.on('connection', (ws, req) => {
     urls.push(req.url ?? '');
     ws.on('message', (d) => {
       const m = JSON.parse(d.toString()) as { id: number; method: string; params?: { name: string; arguments: Record<string, unknown> } };
       const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }));
       if (m.method === 'initialize') return reply({ protocolVersion: '2025-06-18', capabilities: {} });
-      if (m.method === 'tools/list') return reply({ tools: TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
+      if (m.method === 'tools/list') return reply({ tools: tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
       const call = m.params!;
       calls.push({ name: call.name, arguments: call.arguments });
       const queue = left[call.name] ?? [];
@@ -351,13 +353,30 @@ test('a flag’s value takes the type of the tool’s parameter: text stays text
     assert.doesNotMatch(typedHint.stderr, /--force <value>/);
     // A misspelt name is an unknown command, with the nearest names, not a hint about a tool that
     // does not exist; with or without a stray word (the house's read, #22 comment 6269721389).
-    for (const argv of [['sesions', 'foo'], ['sesions']]) {
+    for (const argv of [['sesions', 'foo'], ['sesions'], ['sesions', '--json']]) {
       const typo = await tsm(argv, env);
       assert.equal(typo.code, 1, argv.join(' '));
       assert.match(typo.stderr, /^sesions is not a command or a tool the daemon lists \(did you mean sessions\?\); tsm --help lists the commands/m, argv.join(' '));
       assert.doesNotMatch(typo.stderr, /takes --flags only/, argv.join(' '));
+      // tsm's own refusal is text on stderr, --json or not; only a daemon's error is {"error": …} on stdout.
+      assert.equal(typo.stdout, '', argv.join(' '));
     }
     assert.equal(d.calls.length, expected.length, 'none of the errors reached the daemon');
+  } finally {
+    await d.close();
+  }
+});
+
+test('a shorthand whose tool the daemon does not list is told the versions differ, with the remedy', async () => {
+  // tsm asks for the full profile, which lists every tool of the daemon's version, so this branch is
+  // met only across versions (the house's read, #22 comment 6274806357).
+  const d = await cannedDaemon({}, { without: ['session_env_capture'] });
+  try {
+    const r = await tsm(['env-capture', 's'], { TSM_URL: `ws://127.0.0.1:${d.port}` });
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /^session_env_capture, the tool behind env-capture, is not one the daemon lists: this tsm and that termd are of different versions; update one to match, or call a tool the daemon lists by its name/m);
+    assert.equal(r.stdout, '', 'a refusal of tsm’s own is text on stderr');
+    assert.equal(d.calls.length, 0, 'nothing reached the daemon');
   } finally {
     await d.close();
   }
@@ -535,14 +554,18 @@ test('without a daemon, only what the syntax alone can tell is said: a stray wor
   assert.doesNotMatch(json.stderr, /not valid JSON/);
 });
 
-test('an empty TSM_URL or TSM_DATA_DIR is unset: the default daemon address is dialled, and tsm usage reads ~/.tsm', async (t) => {
+test('an empty TSM_URL is unset: the default daemon address is dialled', async (t) => {
   // The empty value is unset, as the shell leaves a variable it exported and then cleared (the house's
   // read, #22 comment 6269721389).
   const dialled = await tsm(['sessions'], { TSM_URL: '', TSM_TOKEN: 'not-a-token' });
-  // A daemon of this machine's own on 3101 that admits anyone would answer instead of refusing.
+  // A daemon of this machine's own on 3101 that admits anyone would answer instead of refusing. The
+  // TSM_DATA_DIR half is its own test, so this skip costs nothing else (the house's read, #22 comment 6274806357).
   if (dialled.code === 0) return t.skip('a daemon on this machine answers on 3101 without a token');
   assert.equal(dialled.code, 1, dialled.stdout);
   assert.match(dialled.stderr, /the daemon at ws:\/\/127\.0\.0\.1:3101/, dialled.stderr);
+});
+
+test('an empty TSM_DATA_DIR is unset: tsm usage reads ~/.tsm', async () => {
   const home = path.join(tmp, 'home');
   fs.mkdirSync(path.join(home, '.tsm'), { recursive: true });
   const record = (ts: number, tool: string): UsageRecord => ({ ts, principal: 'agent:a@x', connection: 'c1', host: 'mcp', profile: 'full', tool, ok: true, ms: 5, args: [] });

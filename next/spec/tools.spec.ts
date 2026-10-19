@@ -29,6 +29,18 @@ test('search: the status line names the gap the scan spanned and the lines it se
   assert.equal((JSON.parse((await search(r, 'json')).text) as SearchResult).clippedLines, 1, 'json mode is the envelope');
 });
 
+test('wait_for: a match on a clipped line is said in the text, as search’s status says it, and the schema declares clipped', async () => {
+  // Only `--json` showed `clipped` (the house's read of the 38 commits, #22 comment 6274806357).
+  const wait = async (r: Record<string, unknown>, mode: ResultText = 'transcript') => callTool('wait_for', { session: 's', pattern: 'head' }, ctx(stub({ waitFor: async () => r }), mode), TOOLS);
+  const clipped = { session: 's', matched: true, kind: 'pattern', line: 'head of a long line', seq: 7, elapsedMs: 12, nextCursor: 8, clipped: true };
+  const out = await wait(clipped);
+  assert.equal(out.text, '[pattern matched after 12ms: head of a long line · seq 7 · the line is longer than the match window: matched on its head only]');
+  validate(out.structured, TOOLS.find((t) => t.name === 'wait_for')!.outputSchema!);
+  const whole = await wait({ session: 's', matched: true, kind: 'pattern', line: 'a short line', seq: 7, elapsedMs: 12, nextCursor: 8 });
+  assert.equal(whole.text, '[pattern matched after 12ms: a short line · seq 7]');
+  assert.equal((JSON.parse((await wait(clipped, 'json')).text) as { clipped?: boolean }).clipped, true, 'json mode is the envelope');
+});
+
 test('a hole is worded once: read’s status line says of it what the text’s gap line says, for every reason the journal records', async () => {
   const reasons: GapReason[] = ['retention', 'keeper-overflow', 'torn-write', 'store-error', 'store-failed'];
   for (const reason of reasons) {

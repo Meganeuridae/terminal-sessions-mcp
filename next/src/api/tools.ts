@@ -355,6 +355,7 @@ const WAIT_OUTPUT: Schema = {
     kind: { type: 'string', enum: ['pattern', 'silence', 'idle'] },
     match: { type: 'string' },
     line: { type: 'string' },
+    clipped: { type: 'boolean', description: 'The line was longer than the match window and matched on its head only; `line` is that head.' },
     seq: { type: 'integer' },
     elapsedMs: { type: 'number' },
     nextCursor: { type: 'integer' },
@@ -857,7 +858,9 @@ export const TOOLS: ToolDef[] = [
     outputSchema: WAIT_OUTPUT,
     async run(ctx, a) {
       const r = await ctx.app.waitFor(ctx.caller, pick(a, ['session', 'pattern', 'silenceMs', 'idle', 'runId', 'since', 'wait']));
-      const text = r.matched ? `[${r.kind} matched after ${fmt(r.elapsedMs)}${r.line ? `: ${r.line}` : r.match ? `: ${r.match}` : ''} · seq ${r.seq ?? '?'}]` : `[no ${r.kind} match${r.reason ? ` · ${r.reason}` : ` within ${fmt(r.elapsedMs)}`} · next=${r.nextCursor}]`;
+      // A match on a clipped line is said in the text as search's status says it; only `--json` showed `clipped` (the house's read of the 38 commits, #22 comment 6274806357).
+      const clipped = r.clipped ? ' · the line is longer than the match window: matched on its head only' : '';
+      const text = r.matched ? `[${r.kind} matched after ${fmt(r.elapsedMs)}${r.line ? `: ${r.line}` : r.match ? `: ${r.match}` : ''} · seq ${r.seq ?? '?'}${clipped}]` : `[no ${r.kind} match${r.reason ? ` · ${r.reason}` : ` within ${fmt(r.elapsedMs)}`} · next=${r.nextCursor}]`;
       return render(ctx, text, env(r));
     },
   },
