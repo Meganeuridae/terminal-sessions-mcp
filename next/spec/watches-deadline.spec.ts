@@ -237,3 +237,30 @@ test("an unscoped pattern watch completes a process Run's last line at its end a
     f.close();
   }
 });
+
+test('an idle watch stands down once the shell has exited: no recheck loop against a host that answers at once', async () => {
+  // A Run that exits the shell ends with the watch armed and the shell gone for good. The host answers
+  // every wait at once with false; the watch must not ask again on each answer (that chain of
+  // microtasks starved the event loop). (The consolidation of the house's reads of 3eade8a and a6d0c35, #22.)
+  const x = bare();
+  const host = x.host as typeof x.host & { exit?: { exitCode: number | null } };
+  let asked = 0;
+  host.waitAvailable = async () => {
+    asked++;
+    return false;
+  };
+  try {
+    const w = x.manager.add({ idle: true }, A);
+    x.startRun('r1');
+    host.exit = { exitCode: 0 };
+    x.journal.append({ type: 'run.end', runId: 'r1', state: 'exited', exit: 0, durationMs: 1 });
+    await sleep(20);
+    assert.ok(asked <= 1, `the host was asked ${asked} times`);
+    x.journal.append({ type: 'session.exit', code: 0 });
+    await sleep(20);
+    assert.ok(asked <= 1, `the host was asked ${asked} times after the exit`);
+    assert.equal(x.firings(w.watchId).length, 0);
+  } finally {
+    x.close();
+  }
+});

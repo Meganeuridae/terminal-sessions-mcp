@@ -205,6 +205,12 @@ class Predicate {
         }
         return;
       case 'idle':
+        // An exited shell is never available again: the watch stands down (a wait on the host
+        // answered at once, and a recheck on each answer spun the event loop).
+        if (ev.type === 'session.exit') {
+          this.idleArmed = false;
+          return;
+        }
         // Only the shell's own Runs make it busy or idle (m2-11): a process Run's end says
         // nothing about the shell. Under basic/none an unknown outcome never establishes
         // availability (G4); under rich the prompt after it does.
@@ -228,6 +234,10 @@ class Predicate {
       if (this.host.shellAvailable().ok) {
         this.idleArmed = false;
         this.fire({ seq: this.host.journal.lastSeq, match: 'shell available' });
+        return;
+      }
+      if (this.host.exit !== undefined) {
+        this.idleArmed = false;
         return;
       }
       if (this.idleWaiting) return;
