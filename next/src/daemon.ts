@@ -272,12 +272,10 @@ function fail(message: string, code = 2): never {
 }
 
 /**
- * Hold the port before anything reads the data dir (jr2-2, tsg-1): a second termd for the
- * same port stops here, at EADDRINUSE, instead of running recovery over a live daemon's
- * journals first. Clients that connect meanwhile are hung up on (not refused), so a shim
- * retries rather than starting yet another daemon. Port 0 has nothing to hold.
+ * The port, held from before anything reads the data dir (jr2-2, tsg-1: a second termd for the
+ * same port stops at EADDRINUSE instead of running recovery over a live daemon's journals) until
+ * the endpoint takes the socket over (see the header). Port 0 has nothing to hold.
  */
-/** The port, held from before the data dir is read until the endpoint takes the socket over (see the header). */
 interface HeldPort {
   server: net.Server;
   /** Connections accepted during the hold, paused with their first bytes unread, for the endpoint to serve once it listens. */

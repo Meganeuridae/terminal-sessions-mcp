@@ -108,9 +108,11 @@ test('API 3: clients that connected while the port was held are answered once th
   );
 });
 
-test('API 3: a hold that takes more waiting connections than it keeps closes the rest, never the ones it kept', async () => {
-  // The cap in daemon.ts (MAX_PARKED) is a guard against a flood during a long recovery;
-  // this pins the shape it relies on: a paused socket keeps its bytes until it is resumed.
+test('API 3: a paused socket keeps its bytes until it is resumed, which is what serving a parked connection later relies on', async () => {
+  // Parking (daemon.ts) relies on this shape. Note that today recovery runs synchronously in the
+  // registry's constructor, so nothing is parked in practice: connections wait in the kernel's
+  // accept queue until the endpoint owns the socket (the house's read of 59605dd); the parking
+  // would matter if recovery ever yielded to the event loop.
   const held = await hold();
   try {
     const c = net.connect(held.port, '127.0.0.1');

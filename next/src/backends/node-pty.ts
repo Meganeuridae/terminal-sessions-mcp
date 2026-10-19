@@ -144,12 +144,13 @@ class NodePty implements PtyHandle {
  * /proc/self/fd); the glob is expanded, and its directory closed, before the loop runs. On
  * Linux the Run is also made a likelier victim of the out-of-memory killer than the daemon,
  * as the shells are (see oomLine). Only the daemon's constant text is on this command line: a Run given a
- * line gets its text on descriptor 3, which the launcher shell reads whole, closes, and runs with
- * `eval` (see Session.admit; argv is then `/bin/sh`): the line is in no argv and in no file a
+ * line gets its text on descriptor 3, which `/bin/sh`, exec'd by the launcher, reads whole, closes,
+ * and runs with `eval` (see Session.admit; argv is then `/bin/sh`): the line is in no argv and in no file a
  * crash and a fast restart could remove, and the command's own children never see the descriptor.
  * Bash is needed only for closing arbitrary descriptor numbers (dash parses `exec 12>&-`
  * as a command named 12). Its privileged mode skips BASH_ENV and imported shell functions
- * before cleanup; the Run's line still executes in /bin/sh, with its original environment.
+ * before cleanup; the Run's line still executes in /bin/sh, with the environment it was given plus
+ * what bash exports on its way (`PWD`, `SHLVL`) and without `_` (the house measured it).
  */
 /** Is `cmd` a file that may be executed, by path or on `PATH`? */
 function executable(cmd: string, PATH: string | undefined, cwd: string): boolean {
@@ -168,7 +169,8 @@ function executable(cmd: string, PATH: string | undefined, cwd: string): boolean
 
 /**
  * The launcher's text; with `readsLine`, descriptor 3 carries the Run's own text: the launcher
- * keeps it through the close loop, reads it, closes it and runs the text (see spawnProcess).
+ * keeps it through the close loop and execs `/bin/sh`, which reads it, closes it and runs the text
+ * (see spawnProcess).
  */
 export function processLaunch(readsLine: boolean, oomScoreAdj = 0): string {
   const readLine = [

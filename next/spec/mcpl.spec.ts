@@ -94,7 +94,10 @@ test('G28: a run whose outcome its call returned is not delivered to its caller 
   assert.equal(r.structured?.state, 'exited');
   const big = await a.call('run', { session: 'g28', command: 'seq 1 40000', wait: 30000 });
   assert.equal(big.structured?.state, 'exited');
-  await a.noDelivery((d) => d.metadata.runId === r.structured?.runId || d.metadata.runId === big.structured?.runId, 1200, 'for runs whose outcome the call returned');
+  // Only the completion is withheld (G28): a progress digest of a Run that outlasts the cadence on a
+  // loaded machine is delivered to an open channel as designed (the house's read).
+  const completion = (d: Delivery) => d.tags.includes('terminal:run-finished') || d.tags.includes('terminal:run-lost');
+  await a.noDelivery((d) => completion(d) && (d.metadata.runId === r.structured?.runId || d.metadata.runId === big.structured?.runId), 1200, 'for runs whose outcome the call returned');
   await a.close();
 });
 

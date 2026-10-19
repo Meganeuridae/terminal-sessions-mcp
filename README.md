@@ -33,8 +33,8 @@ Then connect a host (configurations in [`next/config/`](next/config/)):
   the gate policies from `next/config/agent-framework.gate.json`.
 - **Any MCP host** (Cursor, Claude Desktop, Claude Code without the bridge):
   `next/config/mcp.json` — the stdio shim starts `termd` if nothing is listening, unless a
-  termd launchd job or systemd user unit exists (then it is the supervisor's to start, and the
-  shim waits for it) or `TSM_NO_SPAWN=1` says never to. With a supervisor unit of your own
+  termd systemd user unit is enabled or a launchd job is loaded (then it is the supervisor's to
+  start, and the shim waits for it) or `TSM_NO_SPAWN=1` says never to. With a supervisor unit of your own
   name, set `TSM_NO_SPAWN=1` in the shim's configuration.
 
 ## What an agent gets
@@ -124,14 +124,15 @@ busy (`human-editing`), or queued until the line is cleared or goes stale; a lin
 submitted holds the next Run (`human-submitted`) until their command is seen to end — from the
 terminal's foreground where the declared shell runs on this machine (a nested shell, `sudo -i`),
 or after 30 s of quiet where nothing can be seen (`ssh`). Cancel inside a
-declared shell types `^C`, the end marker and then `^\\`: the daemon cannot signal a job
+declared shell types `^C`, the end marker and then `^\`: the daemon cannot signal a job
 on another machine, and says so.
 
 For an unattended remote command, run `ssh -t host 'cmd'`, or `ssh -tt host 'cmd'` with
 `--target process`. A cancel here ends the local ssh client; that is all the daemon can see,
 and all `cancelled` means. With `ssh -t` in the shell, terminal cancellation sends an interrupt,
-then quit (`^\\`); with `ssh -tt` as a process Run, ending ssh hangs the remote command up.
-A command that traps or ignores those signals can run on, and nothing here knows.
+then quit (`^\`); with `ssh -tt` as a process Run, ending ssh hangs the remote command up.
+A command that traps or ignores those signals — and the hangup, if the cancel goes on to end
+ssh — can run on, and nothing here knows.
 Without a terminal (`ssh host 'cmd'`,
 or `-T`), the remote command gets neither and runs until it writes to the closed
 connection; the result of such a Run says so. The process target keeps stdout and stderr
