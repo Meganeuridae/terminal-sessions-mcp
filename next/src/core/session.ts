@@ -1083,24 +1083,7 @@ export class Session {
       // ss-8). Its command file goes before the outcome is declared, so a late read of the line
       // sources a missing file (a harmless error) and never runs the command as a Run nobody
       // awaits. Never invent an exit (G3); the prompt confirms availability (G4).
-      this.pendingShellRun = undefined;
-      if (pending.tempFile) {
-        try {
-          fs.rmSync(pending.tempFile, { force: true });
-        } catch {
-          // already gone
-        }
-        delete pending.tempFile;
-      }
-      if (pending.execLine) {
-        this.orphanLines.set(pending.execLine, pending);
-        // Most were discarded (a ^C flushed them): keep only the recent ones.
-        for (const k of this.orphanLines.keys()) {
-          if (this.orphanLines.size <= MAX_ORPHAN_LINES) break;
-          this.orphanLines.delete(k);
-        }
-      }
-      this.endRun(pending, pending.cancelRequested ? { state: 'cancelled', reason: 'cancelled-before-start' } : { state: 'lost', reason: 'no-pre-execution-mark' });
+      this.discardPending(pending, pending.cancelRequested ? { state: 'cancelled', reason: 'cancelled-before-start' } : { state: 'lost', reason: 'no-pre-execution-mark' });
     }
     if (this.currentShellRun && isTerminal(this.currentShellRun.state)) this.currentShellRun = undefined;
     if (this.shellState !== 'exited') this.shellState = this.currentShellRun || this.pendingShellRun ? 'busy' : 'idle';
@@ -1134,6 +1117,33 @@ export class Session {
       this.notifyAvailable();
     }, TYPEAHEAD_GRACE_MS);
     this.typeaheadTimer.unref();
+  }
+
+  /**
+   * A pending Run whose line will not start as ours: its command file goes before the outcome is
+   * declared, so a late read of the line sources a missing file (a harmless error) and never runs the
+   * command as a Run nobody awaits; its line is remembered so a late C is still attributed to it as
+   * an orphan's. Never invents an exit (G3).
+   */
+  private discardPending(pending: RunRecord, outcome: { state: 'cancelled' | 'lost'; reason: string }): void {
+    if (this.pendingShellRun === pending) this.pendingShellRun = undefined;
+    if (pending.tempFile) {
+      try {
+        fs.rmSync(pending.tempFile, { force: true });
+      } catch {
+        // already gone
+      }
+      delete pending.tempFile;
+    }
+    if (pending.execLine) {
+      this.orphanLines.set(pending.execLine, pending);
+      // Most were discarded (a ^C flushed them): keep only the recent ones.
+      for (const k of this.orphanLines.keys()) {
+        if (this.orphanLines.size <= MAX_ORPHAN_LINES) break;
+        this.orphanLines.delete(k);
+      }
+    }
+    this.endRun(pending, outcome);
   }
 
   private onPreExec(): void {
@@ -1205,6 +1215,16 @@ export class Session {
       // One status per pipeline command (shell tools 3); a single command's is `exit` itself.
       if (pipeStatus && pipeStatus.length > 1) outcome.pipeStatus = pipeStatus;
       this.endRun(run, outcome);
+    }
+    const pending = this.pendingShellRun;
+    if (!run && pending?.cancelRequested) {
+      // An end mark with no Run running and our line still unstarted, while that line is being
+      // cancelled: the shell finished something whose start mark never came (a ^C that landed in
+      // the hook before it printed). Whatever it was, our line did not start as a Run; it ends
+      // cancelled now rather than waiting for a prompt that a ^C-quiet shell may not print (CI at
+      // cb603a8 on #22). The exit is not attributed to it (G3).
+      this.note(`${pending.runId}: an end mark arrived with no start mark for its line while it was being cancelled; the line never started as a Run`);
+      this.discardPending(pending, { state: 'cancelled', reason: 'cancelled-before-start' });
     }
     this.currentShellRun = undefined;
     // Availability waits for the prompt mark (G4); under `basic` there is none.
@@ -2361,6 +2381,23 @@ export class Session {
       this.typeSignal(run, 'SIGINT', principal);
       steps.push('^C');
       await this.awaitRun(runId, grace);
+    }
+    if (run.state === 'starting' && this.pendingShellRun === run) {
+      // Two ^Cs and no mark of any kind: the line never started. The tty flushes unread input on a
+      // SIGINT and the line editor drops a line it had read, so the line is gone either way — but
+      // a shell whose ^C at an empty line prints nothing (fish) sends no prompt mark to say so,
+      // and the Run was left `starting` for good, the cancel answering as if it had failed (CI at
+      // cb603a8 on #22: a macOS runner under load). It ends cancelled here; the shell is at the
+      // prompt it never left, so it is available again when nothing else is in flight. A late
+      // start of the line, were it ever read, is attributed as an orphan's (discardPending).
+      this.note(`${runId}: no mark followed two ^C; the line was discarded before it started`);
+      this.discardPending(run, { state: 'cancelled', reason: 'cancelled-before-start' });
+      steps.push('the line was discarded before it started');
+      if (!this.currentShellRun && this.sawPromptEnd && this.shellState === 'busy') {
+        this.shellState = 'idle';
+        this.drainQueue();
+        this.notifyAvailable();
+      }
     }
     this.replacedStep(run, steps);
     if (run.state === 'running') await this.probeMarker(run, grace, steps);

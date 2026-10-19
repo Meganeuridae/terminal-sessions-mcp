@@ -27,6 +27,8 @@ export interface FakeCommandResult {
   hang?: boolean;
   /** The line produces no pre-execution mark: output, then a new prompt (no C, no D). */
   noPreexec?: boolean;
+  /** The line runs without its E and C marks (a hook that did not print), but its D still comes. */
+  noStartMark?: boolean;
 }
 
 export type FakeHandler = (line: string, shell: FakeShell) => FakeCommandResult;
@@ -162,10 +164,12 @@ export class FakeShell {
       }
       if (this.paused) {
         if (ch === '\x03') {
-          // The tty driver flushes unread input on SIGINT; the line editor redraws.
+          // The tty driver flushes unread input on SIGINT; the line editor redraws — or, like fish
+          // at an empty line, prints nothing at all (quietEmptyInterrupt), so no prompt mark follows.
           this.held = '';
-          this.pty.emit('^C\r\n');
           this.buf = '';
+          if (this.opts.quietEmptyInterrupt) continue;
+          this.pty.emit('^C\r\n');
           this.prompt();
           continue;
         }
@@ -267,7 +271,7 @@ export class FakeShell {
       this.prompt();
       return;
     }
-    if (this.marks === 'rich') this.pty.emit(this.mark(`633;E;${encodeVscodeValue(typedLine)}`) + this.mark('133;C'));
+    if (this.marks === 'rich' && !result.noStartMark) this.pty.emit(this.mark(`633;E;${encodeVscodeValue(typedLine)}`) + this.mark('133;C'));
     const finish = (exit: number, output?: string, withPrompt = true) => {
       if (this.running === undefined) return;
       const aborted = this.running.aborted === true;

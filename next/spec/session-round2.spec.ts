@@ -310,6 +310,53 @@ test('an editing hold neither ends early on a forward wall-clock step nor stretc
   }
 });
 
+// ───────────── a cancel right after admit, before the line started (CI at cb603a8 on #22) ─────────────
+
+test('a cancel whose ^C flushed the line before the shell read it, at a shell that prints no prompt for a ^C on an empty line, ends the Run cancelled rather than leaving it starting', async () => {
+  // The tty flushes unread input on SIGINT, so the line is gone; fish prints nothing for a ^C at an
+  // empty line, so no prompt mark says so. The cancel answered `starting` with escalation
+  // session_close on a loaded macOS runner (CI at cb603a8 on #22).
+  const h = await harness({ quietEmptyInterrupt: true });
+  h.shell.pause(); // the shell has not read the line when the ^C arrives
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.equal(c.state, 'cancelled', JSON.stringify(c));
+  assert.equal(c.escalation, undefined);
+  assert.deepEqual(c.steps, ['^C', '^C', 'the line was discarded before it started']);
+  const r = h.session.run(a.run.runId);
+  assert.deepEqual([r.state, r.reason], ['cancelled', 'cancelled-before-start']);
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /discarded before it started/.test(e.text)), 'the reason is said');
+  assert.ok(h.session.shellAvailable().ok, 'the shell is at the prompt it never left');
+  await h.session.close();
+});
+
+test('an end mark that arrives for a line under cancel whose start mark never came ends the Run cancelled at that mark', async () => {
+  // The ^C landed in the hook before it printed the C mark; the command ran and its D came with no
+  // Run running. The pending Run ends cancelled there (its exit is not attributed to it), without
+  // waiting for a prompt (CI at cb603a8 on #22).
+  const h = await harness({ ignoreSignals: true, setup: (s) => s.on(/^nostart/, () => ({ hang: true, noStartMark: true })) });
+  const a = h.session.admit({ target: 'shell', line: 'nostart 1', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  await tick(20);
+  assert.equal(h.session.run(a.run.runId).state, 'starting', 'no start mark came');
+  // The first ^C (ignored by the job) marks the cancel as requested: the end mark follows it.
+  let fired = false;
+  h.pty.onWrite((d) => {
+    if (d !== '\x03' || fired) return;
+    fired = true;
+    queueMicrotask(() => h.shell.finishHung(130, undefined, { prompt: false }));
+  });
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 200 });
+  assert.equal(c.state, 'cancelled', JSON.stringify(c));
+  assert.deepEqual(c.steps, ['^C'], 'the end mark ended it before a second ^C');
+  const r = h.session.run(a.run.runId);
+  assert.deepEqual([r.state, r.reason, r.exit], ['cancelled', 'cancelled-before-start', undefined]);
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /end mark arrived with no start mark/.test(e.text)), 'the reason is said');
+  h.shell.promptNow();
+  await h.session.close();
+});
+
 // ───────────── ss-6, ss-10: nothing the session started outlives it unowned ─────────────
 
 test('ss-6: close sends SIGTERM, then SIGKILL, to a foreground job that survived its hangup, and journals it', async () => {
