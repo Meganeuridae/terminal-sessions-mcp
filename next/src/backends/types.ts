@@ -56,9 +56,20 @@ export interface PtyHandle {
   /** The shell process's current command line (it changes when the process execs); undefined if unknown. */
   command?(): string | undefined;
   /**
-   * Is the terminal's input line discipline canonical right now? readline at a prompt turns ICANON
-   * off (`false`); a `read` builtin or a password prompt leaves it on (`true`). Undefined when it
-   * cannot be read. Used to keep a typed reinit out of a program that is reading a line (#22).
+   * Does the shell have a child process right now (the house's read, #22 comment 6269901528)? A
+   * pager, an editor, tmux or a password tool the rc started is one, and the daemon never types a
+   * reinit while a child is reading. A builtin `read` has no child, so this does not catch it.
+   * Undefined when it cannot be read; the caller then falls back to the terminal mode.
+   */
+  hasChild?(): boolean | undefined;
+  /**
+   * Is the terminal's input line discipline canonical right now (the house's read, #22 comment
+   * 6269901528)? `false` is non-canonical: readline at a bash prompt, but also `read -e`, `read -n`,
+   * a pager, an editor and a raw-mode password tool — non-canonical does not mean readline. `true`
+   * is canonical: a plain `read`/`read -p`, and a `bash --noediting` prompt, which cannot be told
+   * apart from each other. Undefined when it cannot be read (no pts name, or `stty` failed). Used to
+   * decide whether a typed reinit is safe after `exec bash` (#22); the gate types only when `false`
+   * and the shell has no child.
    */
   canonicalInput?(): boolean | undefined;
   /** Stop reading the PTY (the writer blocks once the kernel buffer fills) — flow control for the daemon's own emulator (§6). */
@@ -100,6 +111,12 @@ export interface ExecutionBackend {
   readonly kind: string;
   spawnShell(opts: SpawnShellOptions): PtyHandle;
   spawnProcess(opts: SpawnProcessOptions): ProcessHandle;
-  /** Can this host run process Runs at all? (node-pty: bash and /dev/fd must exist, see processLaunch.) Absent: yes. */
+  /**
+   * Can this host run the daemon's children safely at all (the house's read of #11 and comment
+   * 6269901528)? One check, consulted for both shells and process Runs: without bash, or without
+   * /dev/fd to list descriptors by, a child could not close the terminal masters it inherits, so a
+   * shell could write into another session's terminal and a process Run could not be isolated.
+   * Absent: yes.
+   */
   processSupport?(): { ok: true } | { ok: false; reason: string };
 }

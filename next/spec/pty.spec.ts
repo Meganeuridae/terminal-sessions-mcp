@@ -396,7 +396,7 @@ function groupLives(pgid: number): boolean {
   }
 }
 
-test('bash is a checked requirement for process Runs: found at /bin/bash or on PATH; without it termd refuses process Runs with the reason, and shell Runs go on', async () => {
+test('bash is a checked requirement for sessions and process Runs: found at /bin/bash or on PATH; without it termd refuses to open a session or run a process Run', async () => {
   // The finder: the standard path first, then PATH; nothing found is undefined.
   const bin = path.join(tmp, 'nix-bin');
   fs.mkdirSync(bin, { recursive: true });
@@ -404,16 +404,18 @@ test('bash is a checked requirement for process Runs: found at /bin/bash or on P
   assert.equal(findBash(`/nonexistent:${bin}`, path.join(tmp, 'no-such-bash')), path.join(bin, 'bash'));
   assert.equal(findBash('/nonexistent', path.join(tmp, 'no-such-bash')), undefined);
   assert.equal(findBash(process.env.PATH, '/bin/bash'), '/bin/bash', 'this host has it where the launcher looks first');
-  // A host without bash: the backend says so once, the daemon logs it at startup, and a process Run is refused, not lost.
+  // A host without bash: one check (processSupport), consulted for shells and process Runs alike. A
+  // shell started under /bin/sh without the descriptor loop would inherit other sessions' terminal
+  // masters, so a session is refused, not opened unsafely (the house's read, #22 comment 6269901528).
   const without = new NodePtyBackend({ bash: null });
   const support = without.processSupport();
-  assert.ok(!support.ok && /need bash/.test(support.reason), JSON.stringify(support));
+  assert.ok(!support.ok && /needs bash/.test(support.reason), JSON.stringify(support));
   assert.throws(() => without.spawnProcess({ argv: ['/bin/true'], cwd: tmp, env: {} }), (e: { code?: string }) => e.code === 'unsupported');
-  const { session } = await real('/bin/bash', without);
+  await assert.rejects(real('/bin/bash', without), (e: { code?: string; message: string }) => e.code === 'unsupported' && /needs bash/.test(e.message), 'opening a session without bash is refused');
+  // With bash, a session opens and shell Runs work.
+  const { session } = await real('/bin/bash');
   try {
-    assert.throws(() => session.admit({ target: 'process', argv: ['/bin/true'], principal: AGENT }), (e: { code?: string; message: string }) => e.code === 'unsupported' && /need bash/.test(e.message));
-    assert.equal(session.listRuns().filter((r) => r.target === 'process').length, 0, 'nothing was admitted to end lost');
-    const r = await runWait(session, 'echo shell-still-works');
+    const r = await runWait(session, 'echo shell-works');
     assert.deepEqual([r.state, r.exit], ['exited', 0]);
   } finally {
     await session.close();

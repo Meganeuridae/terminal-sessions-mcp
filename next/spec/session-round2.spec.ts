@@ -7,9 +7,11 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { performance } from 'node:perf_hooks';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { clocks } from '../src/core/clock.js';
 import type { ScriptedProcess } from '../src/backends/scripted.js';
 import type { TermError } from '../src/core/errors.js';
 import { Journal } from '../src/core/journal.js';
@@ -213,6 +215,99 @@ test('ss-4: a new shell that announces itself mid-Run ends it lost as shell-repl
   assert.deepEqual(g.session.shellAvailable(), { ok: false, reason: 'shell-unavailable' });
   assert.equal(g.session.admit({ target: 'shell', line: 'echo never', principal: AGENT, queue: true }).admitted, false);
   await g.session.close();
+});
+
+// ───────────── the reinit gate after exec bash: honest, and as narrow as it can be (#22 comment 6269901528) ─────────────
+
+/**
+ * Arm an exec into a bash whose rc replaced PROMPT_COMMAND (no second hello), with the terminal mode
+ * and child state the test scripts, then let the gate reach its decision after the startup cap.
+ */
+async function armExecBash(h: Awaited<ReturnType<typeof harness>>, mode: boolean | undefined, child: boolean | undefined) {
+  h.shell.pause(); // the fake execs: it stops answering as a shell of ours
+  const a = h.session.admit({ target: 'shell', line: 'exec bash', principal: AGENT });
+  assert.ok(a.admitted);
+  const file = fileOf(h.pty.written);
+  const mark = (p: string) => h.shell.mark(p);
+  h.pty.emit(mark(`633;E; . '${file}'`) + mark('133;C') + mark('633;P;TsmExec=1'));
+  assert.equal(h.session.run(a.run.runId).state, 'running');
+  h.pty.commandLine = '/bin/bash -i';
+  h.pty.canonicalMode = mode;
+  h.pty.childPresent = child;
+  return a.run.runId;
+}
+
+test('the reinit is typed only with no child and a non-canonical terminal', async () => {
+  const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
+  await armExecBash(h, false, false);
+  await tick(500);
+  assert.ok(h.pty.written.includes(' . "$TSM_BASH_RC" reinit typed\n'), 'the reinit was typed at a non-canonical prompt with no child');
+  await h.session.close();
+});
+
+test('the reinit is not typed while a program the rc started is reading, even non-canonical', async () => {
+  // A pager, editor or password tool the rc started is a child; non-canonical does not prove readline.
+  // Without the child check the gate would type into that program (the house's read, #22 comment 6269901528).
+  const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
+  const runId = await armExecBash(h, false, true);
+  await tick(600);
+  assert.ok(!h.pty.written.includes('reinit typed'), 'nothing was typed into the child');
+  assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /a program it started is reading its input/.test(e.text)), 'the note names the reading program');
+  await h.session.close();
+});
+
+test('a canonical prompt gets the honest note (read -p and --noediting cannot be told apart), not a false canonical-mode give-up', async () => {
+  const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
+  const runId = await armExecBash(h, true, false);
+  await tick(600);
+  assert.ok(!h.pty.written.includes('reinit typed'), 'nothing typed into a canonical reader or prompt');
+  assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
+  const note = ofType(h.journal.since(0).events, 'note').map((e) => e.text).join(' | ');
+  assert.match(note, /canonical mode/);
+  assert.match(note, /--noediting is unsupported for the handoff/);
+  assert.match(note, /TSM_BASH_RC" reinit typed/, 'the manual recovery is given');
+  await h.session.close();
+});
+
+test('an unreadable terminal mode (stty failed) gets its own note, and nothing is typed', async () => {
+  const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
+  const runId = await armExecBash(h, undefined, false);
+  await tick(600);
+  assert.ok(!h.pty.written.includes('reinit typed'));
+  assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /terminal mode could not be read \(stty failed\)/.test(e.text)), 'the note names the stty cause');
+  await h.session.close();
+});
+
+// ───────────── holds and waits are measured on the monotonic clock, not the wall clock (#22 comment 6269901528) ─────────────
+
+test('an editing hold neither ends early on a forward wall-clock step nor stretches on a backward one', async (t) => {
+  const real = performance.now.bind(performance);
+  let mono = 0;
+  t.mock.method(clocks, 'monotonic', () => real() + mono);
+  const h = await harness({ editingStaleMs: 1000 });
+  const reason = () => {
+    const a = h.session.shellAvailable();
+    return a.ok ? 'ok' : a.reason;
+  };
+  try {
+    // A partial line is being edited at the rich idle prompt: the shell is held until it goes stale.
+    h.session.input('sle', { principal: AGENT });
+    assert.equal(reason(), 'human-editing');
+    // The wall clock jumps forward an hour; the monotonic clock has not moved: the hold stands.
+    const wall = Date.now();
+    t.mock.method(Date, 'now', () => wall + 3_600_000);
+    assert.equal(reason(), 'human-editing', 'a forward wall-clock step does not end the hold early');
+    // The wall clock jumps back; still held.
+    t.mock.method(Date, 'now', () => wall - 3_600_000);
+    assert.equal(reason(), 'human-editing', 'a backward wall-clock step does not change it');
+    // Only the monotonic clock passing the stale period ends it.
+    mono = 1500;
+    assert.equal(reason(), 'ok', 'the hold ends when the monotonic quiet period passes');
+  } finally {
+    await h.session.close();
+  }
 });
 
 // ───────────── ss-6, ss-10: nothing the session started outlives it unowned ─────────────

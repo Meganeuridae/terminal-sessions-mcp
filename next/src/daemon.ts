@@ -535,9 +535,11 @@ async function main(): Promise<void> {
   }
 
   const groups = new OwnedProcessGroups(new NodePtyBackend());
-  // A documented requirement, said once here rather than Run by Run (the house's review of #11).
+  // A documented requirement, said once here rather than session by session (the house's review of
+  // #11 and read of #22 comment 6269901528): without bash a shell would inherit other sessions'
+  // terminals, so opening a session is refused, not only a process Run.
   const support = groups.processSupport();
-  if (!support.ok) log('warn', 'process Runs are unavailable on this host; they will be refused', { reason: support.reason });
+  if (!support.ok) log('warn', 'this host cannot open sessions or run process Runs; both will be refused', { reason: support.reason });
   // Sessions opened without a cwd start in the home directory, never wherever the daemon
   // happened to be started (launchd: `/`; a shim: its host's project directory) (ux-16, tsg-3).
   const registryOpts: ConstructorParameters<typeof SessionRegistry>[0] = { dataDir, backend: groups, defaultCwd: os.homedir() };

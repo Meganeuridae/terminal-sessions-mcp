@@ -547,6 +547,44 @@ test('at a shell declared through a client that holds the foreground (ssh), a su
   }
 });
 
+test('a fresh declaration at the same context starts with nothing proven: the foreground it had proven does not carry over', async () => {
+  // A local sh proven to run here (a job came and went) reads its own group in front as `free`, so a
+  // submitted line's hold ends after the 200 ms settle. Redeclaring the same context (e.g. the program
+  // became `ssh host`) must forget that: a remote shell whose client holds the foreground throughout
+  // would otherwise read as free whenever its own group is in front, and the hold would end early,
+  // typing the queued Run into the person's program (the house's read, #22 comment 6269901528).
+  const h = await scriptedSession();
+  try {
+    const opener = await open(h.session, 'sleep 100');
+    declare(h.session, 'sh', opener);
+    const own = h.pty.foregroundPgid!; // the group in front while the declared shell is at its prompt, as the declaration recorded it
+    // Prove it: a job runs in front (a different group), then ends back to the shell's own group.
+    h.pty.foregroundPgid = own + 1000;
+    h.session.input('do-local-thing\n', { principal: AGENT });
+    const busy = h.session.admit({ target: 'shell', line: 'x', principal: AGENT });
+    assert.ok(!busy.admitted && busy.reason === 'human-submitted', `busy while the job runs: ${JSON.stringify(busy)}`);
+    h.pty.foregroundPgid = own; // the job ended
+    await new Promise((r) => setTimeout(r, 150)); // the 100 ms foreground cache expires
+    h.session.input('another-local\n', { principal: AGENT });
+    await new Promise((r) => setTimeout(r, 350)); // past the 200 ms settle: `free` ends the hold
+    const free = h.session.admit({ target: 'shell', line: 'echo f', principal: AGENT });
+    assert.ok(free.admitted, `proven + own group in front reads free, so the hold ended: ${JSON.stringify(free)}`);
+    // Finish that declared Run so it no longer occupies the shell; its end keeps `proven`.
+    const fn = /<<<STAR''T:([0-9a-f]+):/.exec(h.pty.writes.at(-1)!)![1]!;
+    h.pty.emit(`<<<START:${fn}:${own}>>>\r\n<<<EXIT:${fn}:0>>>\r\n`);
+    await until(() => h.session.run(free.run.runId).state === 'exited', 2000, 'the free Run finished');
+    // Redeclare the same context: proven is forgotten.
+    declare(h.session, 'sh', opener);
+    h.pty.foregroundPgid = own;
+    h.session.input('remote-thing\n', { principal: AGENT });
+    await new Promise((r) => setTimeout(r, 350)); // past the settle, but nothing is proven now
+    const held = h.session.admit({ target: 'shell', line: 'x', principal: AGENT });
+    assert.ok(!held.admitted && held.reason === 'human-submitted', `after redeclaration the own group is not proof of free: ${JSON.stringify(held)}`);
+  } finally {
+    await h.session.close();
+  }
+});
+
 test('at a shell declared through ssh, a submitted line holds the next Run while its program prints: the stale period is one of quiet, counted from the last output', async () => {
   // The person's line printed a tick every second and read stdin; counted from the submission,
   // the hold ended at +31 s and a Run's wrapper was typed into that program (the house's read of
@@ -574,6 +612,40 @@ test('at a shell declared through ssh, a submitted line holds the next Run while
     const after = h.session.admit({ target: 'shell', line: 'echo agent', principal: AGENT });
     assert.ok(!after.admitted && after.reason === 'running', `the hold is over; the queued Run has the declared shell now: ${JSON.stringify(after)}`);
   } finally {
+    await h.session.close();
+  }
+});
+
+test('a cancel probe answered with the declared shell’s own pid but another Run’s token is rejected by the token check', async () => {
+  // The only answer the token check alone rejects: the declared shell's pid (which the pid check
+  // accepts) carrying a token that is not this Run's. A shell in another PID namespace with the same
+  // pid, set up to print some other Run's token, must not end this Run (the house's read, #22 comment
+  // 6269901528: without the token check the pid alone accepted it).
+  const h = await scriptedSession();
+  const write = h.pty.write.bind(h.pty);
+  try {
+    const opener = await open(h.session, 'sleep 100');
+    declare(h.session, 'sh', opener);
+    const admitted = h.session.admit({ target: 'shell', line: 'echo hi', principal: AGENT });
+    assert.ok(admitted.admitted);
+    const nonce = /<<<STAR''T:([0-9a-f]+):/.exec(h.pty.writes.at(-1)!)![1]!;
+    h.pty.emit(`<<<START:${nonce}:1000>>>\r\n`);
+    await until(() => h.session.run(admitted.run.runId).state === 'running', 2000);
+    h.pty.write = (data) => {
+      if (data === '\x03' || data === '\x1c') return;
+      if (data.includes(`<<<PRO''BE:${nonce}`)) {
+        h.pty.emit(`<<<PROBE:${nonce}:1000:deadbeefdeadbeef>>>\r\n`); // the declared shell's pid, another Run's token
+        return;
+      }
+      write(data);
+    };
+    const result = await h.session.cancel(admitted.run.runId, AGENT, { graceMs: 5 });
+    assert.equal(result.state, 'running', 'the foreign-token answer did not end the Run');
+    const rejected = notes(h).filter((n) => /answered by another shell/.test(n));
+    assert.equal(rejected.length, 1, 'the answer was rejected');
+    assert.match(rejected[0]!, /pid 1000 like the declared shell's, but with another Run's token/);
+  } finally {
+    h.pty.write = write;
     await h.session.close();
   }
 });

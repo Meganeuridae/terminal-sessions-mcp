@@ -192,6 +192,11 @@ for (const [how, rc] of [
 const handoffOutput = (x: Awaited<ReturnType<typeof realSession>>): string =>
   x.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output').map((e) => e.data).join('');
 
+const handoffNotes = (x: Awaited<ReturnType<typeof realSession>>): string[] =>
+  x.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'note' }> => e.type === 'note').map((e) => e.text);
+
+const PY = ['/usr/bin/python3', '/opt/homebrew/bin/python3', '/usr/local/bin/python3'].find(hasShell);
+
 test('/bin/bash: the reinit is never typed into an rc that reads a line before its first prompt', { skip: !hasShell('/bin/bash') }, async () => {
   // The post-exec bash replaces PROMPT_COMMAND (no hello) and reads a line before any prompt. The
   // daemon must not type its reinit into that read — the terminal is canonical then, not readline
@@ -213,6 +218,55 @@ test('/bin/bash: the reinit is never typed into an rc that reads a line before i
     const out = handoffOutput(x);
     assert.ok(!out.includes('reinit typed'), `the reinit leaked into the read: ${out.match(/RC-GOT:\[[^\]]*\]/)?.[0]}`);
     assert.match(out, /RC-GOT:\[\]/);
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: exec into `bash --noediting` gets the honest note, not a false give-up, and the reinit is not typed', { skip: !hasShell('/bin/bash') }, async () => {
+  // A --noediting prompt is canonical, like a `read -p`, and the two cannot be told apart: the daemon
+  // does not type the reinit, and says exactly that (with the manual recovery and that --noediting is
+  // unsupported) instead of the old false "a program read its input" give-up (the house's read, #22
+  // comment 6269901528).
+  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': 'PROMPT_COMMAND=:\n' }, startupCapMs: 500, integrationGraceMs: 400 });
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'first shell ready');
+    const handoff = await x.run('exec /bin/bash --noediting', 20_000);
+    assert.deepEqual([handoff.state, handoff.reason], ['lost', 'shell-replaced']);
+    await until(() => x.session.info().state === 'unavailable', 10_000, 'unavailable');
+    assert.ok(!handoffOutput(x).includes('reinit typed'), 'the reinit was not typed at the canonical prompt');
+    const note = handoffNotes(x).join(' | ');
+    assert.match(note, /canonical mode/);
+    assert.match(note, /--noediting is unsupported for the handoff/);
+    assert.match(note, /TSM_BASH_RC" reinit typed/, 'the note gives the manual recovery');
+    assert.doesNotMatch(note, /while a program read its input/, 'not the old false give-up wording');
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: the reinit is not typed while a program the rc started is reading (a child), even non-canonical', { skip: !hasShell('/bin/bash') || PY === undefined }, async () => {
+  // A raw-mode reader the rc started is a child and leaves the terminal non-canonical; non-canonical
+  // does not prove readline. Without the child check the daemon would type the reinit into that
+  // program (the house's read, #22 comment 6269901528). `read -e`/`read -n` builtins have no child
+  // and stay a stated limit; this is the external-reader case the child check catches.
+  const reader = `${PY} -c 'import sys,tty; tty.setcbreak(sys.stdin.fileno()); sys.stdout.write("PYREADY\\n"); sys.stdout.flush(); d=sys.stdin.read(1); sys.stdout.write("PYGOT:["+d+"]\\n"); sys.stdout.flush()'`;
+  const x = await realSession('/bin/bash', {
+    login: false,
+    rc: { '.bashrc': `PROMPT_COMMAND=:\nif [ -n "\${SECOND-}" ]; then ${reader}; fi\n` },
+    startupCapMs: 500,
+    integrationGraceMs: 400,
+  });
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'first shell ready');
+    const handoff = await x.run('export SECOND=1; exec /bin/bash', 20_000);
+    assert.deepEqual([handoff.state, handoff.reason], ['lost', 'shell-replaced']);
+    await until(() => /PYREADY/.test(handoffOutput(x)), 8000, 'the child reader started');
+    await until(() => x.session.info().state === 'unavailable', 10_000, 'unavailable');
+    const out = handoffOutput(x);
+    assert.ok(!out.includes('reinit typed'), 'nothing was typed into the child reader');
+    assert.doesNotMatch(out, /PYGOT:/, 'the child reader received nothing from the daemon');
+    assert.ok(handoffNotes(x).some((t) => /a program it started is reading its input/.test(t)), `the note names the reading program: ${JSON.stringify(handoffNotes(x))}`);
   } finally {
     await x.close();
   }

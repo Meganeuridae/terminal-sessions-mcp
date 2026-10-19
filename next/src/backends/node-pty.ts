@@ -92,6 +92,25 @@ function canonicalInput(ptsName: string | undefined): boolean | undefined {
   }
 }
 
+/**
+ * Does `pid` have a child process right now? `pgrep -P <pid>` (on macOS and Linux) exits 0 when it
+ * finds one, 1 when it finds none; any other failure (no pgrep) is unknown. A child is an external
+ * program the shell started (a pager, an editor, a password tool), not a builtin `read` (the
+ * house's read, #22 comment 6269901528).
+ */
+function hasChild(pid: number): boolean | undefined {
+  try {
+    const out = execFileSync('pgrep', ['-P', String(pid)], { encoding: 'utf8', timeout: 2000 });
+    return out.trim().length > 0;
+  } catch (e) {
+    // pgrep exits 1 with no match: that is a definite "no child". Anything else (ENOENT: no pgrep)
+    // leaves it unknown.
+    const x = e as NodeJS.ErrnoException & { status?: number | null };
+    if (x.status === 1) return false;
+    return undefined;
+  }
+}
+
 /** A process's current command line: `/proc/<pid>/cmdline` on Linux, `ps` elsewhere. */
 function readCommand(pid: number): string | undefined {
   try {
@@ -143,6 +162,9 @@ class NodePty implements PtyHandle {
   }
   canonicalInput(): boolean | undefined {
     return canonicalInput((this.p as { ptsName?: string }).ptsName);
+  }
+  hasChild(): boolean | undefined {
+    return hasChild(this.p.pid);
   }
   signalGroup(pgid: number, signal: NodeJS.Signals): boolean {
     if (!(pgid > 1)) return false;
@@ -255,18 +277,20 @@ export class NodePtyBackend implements ExecutionBackend {
   }
 
   /**
-   * A documented requirement, checked once (the house's review of #11): without bash, or without
-   * /dev/fd to list descriptors by, the launcher could not close what a Run would inherit, so
-   * process Runs are refused with this reason rather than ending `lost` one by one.
+   * One requirement for both shells and process Runs, checked once (the house's review of #11 and
+   * read of #22 comment 6269901528): without bash, or without /dev/fd to list descriptors by, a
+   * child could not close the terminal masters node-pty leaves open to it, so a shell could write
+   * into another session's terminal and a process Run could not be isolated. Refused here, with the
+   * reason, rather than opened unsafely or ended `lost` one Run at a time.
    */
   processSupport(): { ok: true } | { ok: false; reason: string } {
-    if (!this.bash) return { ok: false, reason: 'process Runs need bash (/bin/bash, or a bash on the daemon’s PATH) to close inherited descriptors before the command runs, and this host has none: install it (Alpine: apk add bash), then restart termd — the check runs once at startup' };
+    if (!this.bash) return { ok: false, reason: 'termd needs bash (/bin/bash, or a bash on the daemon’s PATH) to open a session or run a process Run without leaking other sessions’ terminals into it, and this host has none: install it (Alpine: apk add bash), then restart termd — the check runs once at startup' };
     // /dev/fd must be a directory listing this process's own descriptors (a loop over an empty one ran `exec *>&-`).
     try {
       const names = fs.readdirSync('/dev/fd');
-      if (!['0', '1', '2'].every((n) => names.includes(n))) return { ok: false, reason: 'process Runs need /dev/fd to list the process’s descriptors so the ones a command would inherit can be closed, and this host’s /dev/fd does not' };
+      if (!['0', '1', '2'].every((n) => names.includes(n))) return { ok: false, reason: 'termd needs /dev/fd to list the process’s descriptors so the ones a child would inherit can be closed before it runs, and this host’s /dev/fd does not' };
     } catch {
-      return { ok: false, reason: 'process Runs need /dev/fd to list the descriptors to close before the command runs, and this host has none' };
+      return { ok: false, reason: 'termd needs /dev/fd to list the descriptors to close before a child runs, and this host has none' };
     }
     return { ok: true };
   }

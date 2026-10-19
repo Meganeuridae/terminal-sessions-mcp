@@ -25,10 +25,12 @@ termd                                 # ws://127.0.0.1:3101 · GUI at http://127
 tsm run demo 'echo hello; pwd'        # exit = the command's code; 124 running, 75 busy, 1 error (tsm --help lists them all)
 ```
 
-Process Runs need bash: `/bin/bash`, or a `bash` on the daemon's PATH (NixOS). It closes the
-descriptors a Run would otherwise inherit before the command runs; the command text itself runs in
-`/bin/sh`. Without bash (Alpine's base: `apk add bash`), termd says so when it starts and refuses
-process Runs with that message; shell Runs are unaffected.
+termd needs bash: `/bin/bash`, or a `bash` on the daemon's PATH (NixOS). It closes the descriptors a
+shell or a process Run would otherwise inherit — the terminal masters of other sessions among them —
+before the child runs; a process Run's command text itself then runs in `/bin/sh`. Without bash
+(Alpine's base: `apk add bash`), termd says so when it starts and refuses to open a session or run a
+process Run with that message, since a shell that could write into another session's terminal is the
+worse failure.
 
 Then connect a host (configurations in [`next/config/`](config/)):
 

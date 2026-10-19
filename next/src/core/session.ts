@@ -482,8 +482,15 @@ export class Session {
   readonly screen: Screen;
   readonly createdAt: number;
   lastActivity: number;
+  /**
+   * The monotonic-clock reading of the last activity (output or input), beside `lastActivity`'s
+   * wall-clock timestamp: the editing/submitted holds measure their quiet from this, so a wall-clock
+   * step neither ends a hold early nor stretches it (the house's read, #22 comment 6269901528).
+   */
+  private lastActivityMono: number;
 
   private readonly opts: SessionOptions;
+  /** Wall-clock `Date.now`: journal timestamps and the reported `lastActivity`/seat deadline only — never an interval (the house's read, #22 comment 6269901528). Intervals use `clocks.monotonic()`. */
   private readonly now = Date.now;
   private readonly backend: ExecutionBackend;
   private pty!: PtyHandle;
@@ -519,6 +526,7 @@ export class Session {
   /** The end of the latest terminal output (what a program waiting for input printed last). */
   private outputTail = '';
   private humanEditing = false;
+  /** When the partial line was last edited, on the monotonic clock (a wall-clock step must not move the stale period). */
   private editedAt = 0;
   /** A principal submitted a line at the prompt (Enter / ^C): the shell answers with C or A. */
   private submittedAt: number | undefined;
@@ -607,6 +615,7 @@ export class Session {
     this.cwdPath = opts.cwd;
     this.createdAt = this.now();
     this.lastActivity = this.createdAt;
+    this.lastActivityMono = clocks.monotonic();
     this.tempDir = opts.tempDir ?? os.tmpdir();
     this.commandDir = opts.commandDir ?? this.tempDir;
     this.safeId = this.id.replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -634,6 +643,12 @@ export class Session {
   // ───────────────────────────── lifecycle ─────────────────────────────
 
   private spawn(): void {
+    // One rule for shells and process Runs (the house's read, #22 comment 6269901528): without bash
+    // (or /dev/fd) a shell would inherit — and could write into — other sessions' terminal masters,
+    // the same reason process Runs are refused. So a session is not opened at all; it is refused with
+    // the same reason, said once at daemon startup too.
+    const support = this.backend.processSupport?.();
+    if (support && !support.ok) throw err('unsupported', support.reason);
     const kind = path.basename(this.opts.shell);
     const integrated = this.opts.integration !== undefined;
     const login = this.opts.login ?? true;
@@ -778,6 +793,7 @@ export class Session {
   private onPtyData(data: string): void {
     if (this.closed) return;
     this.lastActivity = this.now();
+    this.lastActivityMono = clocks.monotonic();
     let shown = data;
     try {
       shown = this.consume(data);
@@ -849,7 +865,7 @@ export class Session {
     this.typeaheadTimer = undefined;
     this.idleEcho = '';
     this.humanEditing = true;
-    this.editedAt = this.now();
+    this.editedAt = clocks.monotonic();
     this.armEditingTimer();
   }
 
@@ -937,16 +953,21 @@ export class Session {
           if (kind === 'bash' && !reinitTyped) {
             // A new bash whose rc replaced the PROMPT_COMMAND the handoff left it never loaded the
             // integration (the house's read of 1d83ffa). The rc's path is still in its environment:
-            // load it from here, once, and wait for its hello again. But type it only while the
-            // terminal is in non-canonical mode (ICANON off), as readline leaves it at a prompt: an rc
-            // that reads a line before its first prompt (`read -p`, a password prompt) leaves it
-            // canonical, and the reinit would land in that read (the house's read, #22 comment
-            // 6264958172). Only canonical readers are excluded by this: `read -e`, vim, less and a
-            // raw-mode password tool turn ICANON off too, and the reinit would still land in those.
-            // While the mode stays canonical, or cannot be read, wait a bounded time, then give up
-            // as a replacement, as before.
+            // load it from here, once, and wait for its hello again — but only when it is safe, and
+            // the gate tells no more than it can (the house's read, #22 comment 6269901528). The
+            // reinit is typed only with no child process and a non-canonical terminal: readline at a
+            // prompt leaves it non-canonical, so the line is read and run. Everything else gives up
+            // as a replacement, with the cause named honestly:
+            //   - a child process (a pager, editor, tmux or password tool the rc started) is reading:
+            //     never type into it; non-canonical does not prove readline. `read -e` and `read -n`
+            //     are builtins with no child, so they stay indistinguishable from a prompt — a stated
+            //     limit, not a case this catches.
+            //   - canonical with no child: a `read -p` and a `bash --noediting` prompt cannot be told
+            //     apart, so do not type; say so, and that --noediting is unsupported for the handoff.
+            //   - the mode unreadable (stty failed): do not type; say that cause.
+            const child = this.pty.hasChild?.();
             const canon = this.pty.canonicalInput?.();
-            if (canon === false) {
+            if (child !== true && canon === false) {
               reinitTyped = true;
               changedAt = clocks.monotonic();
               this.note('the new bash did not load the shell integration (its rc replaced PROMPT_COMMAND): loading it once more');
@@ -954,9 +975,14 @@ export class Session {
             } else {
               reinitWaitStart ??= clocks.monotonic();
               if (clocks.monotonic() - reinitWaitStart >= cap) {
-                // What holds is not "reports no marks" alone: the new bash reached no prompt within the cap
-                // while something read its input, so the integration was never loaded into it.
-                this.note(`the new bash reached no prompt within ${cap} ms while a program read its input (the terminal stayed in canonical mode): the shell integration was not loaded into it`);
+                const manual = 'recover by typing ` . "$TSM_BASH_RC" reinit typed` at the prompt, or send that line with input';
+                const why =
+                  child === true
+                    ? 'a program it started is reading its input: the shell integration was not loaded, and typing into that program is unsafe'
+                    : canon === true
+                      ? `its terminal is in canonical mode, where a \`read -p\` prompt and a \`bash --noediting\` prompt cannot be told apart, so the reinit was not typed (--noediting is unsupported for the handoff): the shell integration was not loaded — ${manual}`
+                      : `its terminal mode could not be read (stty failed), so whether a program is reading its input is unknown and the reinit was not typed: the shell integration was not loaded — ${manual}`;
+                this.note(`the new bash reached no prompt within ${cap} ms: ${why}`);
                 this.stopExecWatch();
                 return this.onShellReplaced(now);
               }
@@ -1529,7 +1555,7 @@ export class Session {
    * hold's end sent the queued Run into the person's `cat`).
    */
   private editingBlocks(): boolean {
-    const now = this.now();
+    const now = clocks.monotonic(); // an interval, not a timestamp: a wall-clock step must not end a hold early or stretch it (the house's read, #22 comment 6269901528)
     const stale = this.opts.editingStaleMs ?? 30_000;
     if (this.humanEditing && now - this.editedAt >= stale) {
       this.humanEditing = false;
@@ -1553,7 +1579,7 @@ export class Session {
    * input() for what is typed, so a keystroke counts at once, not only through its echo.
    */
   private submittedQuietSince(): number {
-    return Math.max(this.submittedAt ?? 0, this.lastActivity);
+    return Math.max(this.submittedAt ?? 0, this.lastActivityMono);
   }
 
   /** What stands in the way: a line being typed, or one submitted whose command may still be running. */
@@ -1609,7 +1635,7 @@ export class Session {
       // held, come back when that period would end; held by a program in front, after another period.
       if (this.editingBlocks() && this.submittedAt !== undefined) {
         const stale = this.opts.editingStaleMs ?? 30_000;
-        const left = this.submittedQuietSince() + stale - this.now();
+        const left = this.submittedQuietSince() + stale - clocks.monotonic();
         this.armEditingTimer((left > 0 ? left : stale) + 5);
         return;
       }
@@ -1650,11 +1676,11 @@ export class Session {
    * actually running still answers `busy` at once.
    */
   async admitWhenAvailable(opts: AdmitOptions, settleMs = 1500): Promise<AdmitResult> {
-    const deadline = Date.now() + settleMs;
+    const deadline = clocks.monotonic() + settleMs;
     for (;;) {
       const a = this.admit(opts);
       if (a.admitted || (a.reason !== 'prompt-pending' && a.reason !== 'starting')) return a;
-      const remaining = deadline - Date.now();
+      const remaining = deadline - clocks.monotonic();
       if (remaining <= 0) return a;
       await this.waitAvailable(remaining);
     }
@@ -2374,8 +2400,8 @@ export class Session {
 
   /** Poll (bounded) until the terminal's foreground group is a job, the Run ends, or the backend cannot tell. */
   private async waitForegroundJob(run: RunRecord, ms: number): Promise<void> {
-    const end = Date.now() + ms;
-    while (run.state === 'running' && Date.now() < end) {
+    const end = clocks.monotonic() + ms;
+    while (run.state === 'running' && clocks.monotonic() < end) {
       const fg = this.pty.foreground?.();
       if (!fg || fg.foregroundPgid !== fg.shellPgid) return;
       await sleep(15);
@@ -2418,9 +2444,9 @@ export class Session {
       this.append({ type: 'signal', signal: sig, principal, runId: run.runId });
       proc.kill(sig);
       steps.push(`${sig} → process group`);
-      const deadline = Date.now() + (sig === 'SIGKILL' ? grace * 4 : grace);
-      await this.awaitRun(run.runId, deadline - Date.now());
-      while (alive() && Date.now() < deadline) await sleep(20);
+      const deadline = clocks.monotonic() + (sig === 'SIGKILL' ? grace * 4 : grace);
+      await this.awaitRun(run.runId, deadline - clocks.monotonic());
+      while (alive() && clocks.monotonic() < deadline) await sleep(20);
     }
   }
 
@@ -2517,6 +2543,7 @@ export class Session {
     const layer = this.layers.at(-1);
     if (layer) queueMicrotask(() => this.drainDeclared(layer.within));
     this.lastActivity = this.now();
+    this.lastActivityMono = clocks.monotonic();
   }
 
   /**
@@ -2577,7 +2604,7 @@ export class Session {
     const declaredPrompt = layer !== undefined && !this.inFront.has(layer.within);
     if (!declaredPrompt && (this.integrationLevel !== 'rich' || this.shellState !== 'idle' || this.pendingShellRun || this.currentShellRun)) return;
     const last = data[data.length - 1];
-    const now = this.now();
+    const now = clocks.monotonic(); // the holds below are intervals: a wall-clock step must not move them (the house's read, #22 comment 6269901528)
     if (last === '\r' || last === '\n') {
       this.humanEditing = false;
       this.submittedAt = now;
@@ -2737,6 +2764,10 @@ export class Session {
       if (this.controller === principal && ![...this.attachments.values()].some((a) => a.principal === principal)) this.setController(null, principal, 'release');
     }, grace);
     timer.unref();
+    // The reservation's hold is `timer` (a setTimeout, which a wall-clock step never moves); `until`
+    // is only the wall-clock instant it is shown and reported as (reservedNote, seatReservedUntil),
+    // so it stays on `this.now()` — it is a displayed timestamp, never compared as an interval (the
+    // house's read, #22 comment 6269901528).
     this.seatReserved = { principal, until: this.now() + grace, timer };
   }
 
