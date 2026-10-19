@@ -208,7 +208,8 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   the daemon plus its shell (about 4 MB); a busy session holds up to 8 MiB of recent history
   in memory (`memoryBytes`) and the rest on disk. The daemon itself is about 170 MB. The
   shipped units raise the open-file limit to 65536 (launchd's default of 256 would end new
-  sessions near 45), and the launcher raises it where a supervisor didn't. Everything a
+  sessions near 45), and the launcher raises it where a supervisor didn't, saying so when the
+  hard limit keeps it under 65536. Everything a
   session runs is the daemon's descendant: under systemd, the unit sets `OOMPolicy=continue`
   so a build the kernel kills for memory costs that Run, not every session (the default
   stops the whole service), and on Linux the shells and process Runs start with a raised

@@ -12,6 +12,8 @@ node_modules/
 *.png
 *.gif
 *.sh
+# ...except the launcher the shipped supervisor units run (the house's read of 59f660b, #22)
+!next/config/termd-launch.sh
 *.py
 EXTRACTION_AND_ENHANCEMENT_SUMMARY.md
 CHANGELOG.md

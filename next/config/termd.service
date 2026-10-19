@@ -1,9 +1,10 @@
 # systemd user unit: cp to ~/.config/systemd/user/termd.service, replace PACKAGE with the
 # installed package ("$(npm root -g)/term-sessions-mcp"), then
 #   systemctl --user daemon-reload && systemctl --user enable --now termd
-# termd-launch.sh finds node (nvm, Volta, /usr/local, ~/.local; or Environment=TSM_NODE=…),
-# puts those directories on PATH for process Runs and starts in $HOME. Logs go to the
-# journal: journalctl --user -u termd.
+# termd-launch.sh finds node (nvm's default version, Volta, /usr/local, ~/.local; or
+# Environment=TSM_NODE_BIN=/path/to/node), puts those directories on PATH for process Runs and
+# starts in $HOME. Logs go to the journal: journalctl --user -u termd. (TSM_NODE is something
+# else: the daemon's node name in MCPL message ids and channel addresses.)
 [Unit]
 Description=terminal sessions daemon (termd)
 

@@ -22,7 +22,9 @@
           ["terminal:session-exited"],
           ["terminal:service-unhealthy"],
           ["terminal:service-exited"],
-          ["terminal:service-ready"]
+          ["terminal:service-lost"],
+          ["terminal:service-ready"],
+          ["terminal:service-running"]
         ],
         "hold": [["terminal:output"], ["terminal:screen"], ["terminal:control"], ["terminal:note"]]
       },
