@@ -22,7 +22,7 @@ presence) to hosts that support it — agent-framework (connectome) and Claude C
 ```bash
 npm install -g term-sessions-mcp     # bins: termd, tsm, tsm-shim
 termd                                 # ws://127.0.0.1:3101 · GUI at http://127.0.0.1:3101/
-tsm run demo 'echo hello; pwd'        # exit code = the command's; 124 while still running
+tsm run demo 'echo hello; pwd'        # exit = the command's code; 124 running, 75 busy, 1 error (tsm --help lists them all)
 ```
 
 Process Runs need bash: `/bin/bash`, or a `bash` on the daemon's PATH (NixOS). It closes the
@@ -207,7 +207,9 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   in-flight Runs reported `lost` (reason `daemon-restart`). Live processes surviving a restart
   needs the keeper backend (milestone 3): a stopping daemon hangs up each shell as a closing
   terminal does, so its foreground job ends with it, while a job the shell detached on purpose
-  (`nohup`, `setsid`, `disown`) lives on; process Runs' groups are ended.
+  (`nohup`, `setsid`, `disown`) lives on; process Runs' groups are ended. The systemd unit sets
+  `KillMode=process` so systemd signals termd alone on stop: those detached jobs survive, as they
+  would when a terminal closes. `KillMode=mixed` would SIGKILL the whole cgroup and take them.
 - **Supervision.** `next/config/com.animalabs.termd.plist` (launchd), `next/config/termd.service`
   (systemd). SIGTERM ends sessions cleanly.
 - **History on disk.** Kept whole by default; `--retention-bytes` and `--retention-days` cap it

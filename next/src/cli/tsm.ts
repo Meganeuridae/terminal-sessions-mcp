@@ -162,7 +162,10 @@ function coerce(key: string, raw: string, type: ParamType | undefined): unknown 
  */
 function shellWord(w: string): string {
   if (w === '') return "''";
-  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(w)) return w;
+  // A word beginning with = or ~ is never left bare: zsh's EQUALS option (on by default) expands a
+  // leading =name to a path (so `==` fails with "= not found"), and ~ is home-directory expansion in
+  // zsh and bash (the house's read, #22 comment 6264958172). = stays bare mid-word (FOO=bar).
+  if (!/^[=~]/.test(w) && /^[A-Za-z0-9_@%+=:,./-]+$/.test(w)) return w;
   return w.replace(/[^'\\]+|['\\]/g, (m) => (m === "'" || m === '\\' ? `\\${m}` : `'${m}'`));
 }
 
@@ -181,6 +184,22 @@ interface Parsed {
   args: Record<string, unknown>;
   json: boolean;
   untilDone: boolean;
+  /** A positional word a flags-only tool does not take, left for the caller to report once the tool's schema is known. */
+  stray?: string;
+}
+
+const kebab = (k: string) => k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+
+/**
+ * The hint for a stray word on a tool called by its full name (no positional shorthand). Built from
+ * the tool's own schema, so it names the tool's real parameters, or says it takes none — never a
+ * fixed `--session` the tool may not have (the house's read, #22 comment 6264958172).
+ */
+function strayHint(cmd: string, stray: string, schema: Schema | undefined): string {
+  const names = schema?.properties ? Object.keys(schema.properties) : undefined;
+  if (names && names.length) return `${cmd} takes --flags only (unexpected word ${stray}): tsm ${cmd} ${names.slice(0, 4).map((p) => `--${kebab(p)} <value>`).join(' ')}${names.length > 4 ? ' …' : ''}`;
+  if (schema) return `${cmd} takes no arguments (unexpected word ${stray})`;
+  return `${cmd} takes --flags only (unexpected word ${stray})`;
 }
 
 /** The arguments of a tool call; `--json` and `--until-done` are tsm's own. */
@@ -237,10 +256,14 @@ function parse(argv: string[], schema: Schema | undefined): Parsed {
       if (v) args[name] = v;
     } else if (positional[i] !== undefined) args[name] = positional[i];
   });
-  // A word nothing takes is a mistake to say, not to drop: a tool without a shorthand takes only flags.
+  // A word nothing takes is a mistake to say, not to drop. A shorthand tool's extra positional is a
+  // usage error now (its forms are fixed); a tool called by name is flags-only, and the stray word's
+  // hint is built from its schema by the caller, so it is left here for the schema-aware parse.
   const stray = short?.join !== undefined ? undefined : positional[names.length];
-  if (stray !== undefined) throw new Error(short ? `${cmd}: unexpected word ${stray}` : `${cmd} takes --flags only (unexpected word ${stray}): tsm ${cmd} --session <session> …`);
-  return { tool, args, json, untilDone };
+  if (stray !== undefined && short) throw new Error(`${cmd}: unexpected word ${stray}`);
+  const parsed: Parsed = { tool, args, json, untilDone };
+  if (stray !== undefined && !short) parsed.stray = stray;
+  return parsed;
 }
 
 /** The exit code for a finished call's envelope (see the header). */
@@ -406,7 +429,10 @@ async function main(): Promise<void> {
   const toolName = SHORT[cmd]?.tool ?? cmd;
   const listed = (await request('tools/list').catch(() => undefined)) as { tools?: Array<{ name: string; inputSchema?: Schema }> } | undefined;
   const { json, untilDone } = syntax;
-  const { tool, args } = parse(argv, listed?.tools?.find((t) => t.name === toolName)?.inputSchema);
+  const schema = listed?.tools?.find((t) => t.name === toolName)?.inputSchema;
+  const { tool, args, stray } = parse(argv, schema);
+  // A flags-only tool given a positional word: report it now the schema is known, named for this tool.
+  if (stray !== undefined) throw new Error(strayHint(cmd, stray, schema));
   let r = (await request('tools/call', { name: tool, arguments: args })) as { content: Array<{ text: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
   // --until-done: after the initial observation, long-poll until the Run ends. A short
   // initial wait (including zero) must not turn this into a busy polling loop.

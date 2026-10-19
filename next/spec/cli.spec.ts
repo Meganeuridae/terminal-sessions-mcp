@@ -5,6 +5,7 @@
  * forms (`await <runId>`, durations, `--`, values typed by the tool's schema),
  * its output to a slow reader, `tsm gui` and `tsm usage`.
  */
+import { until } from './testhost.js';
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
@@ -20,7 +21,7 @@ import { TOOLS } from '../src/api/tools.js';
 import type { UsageRecord } from '../src/api/usage.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermServer } from '../src/transport/server.js';
-import { fakeShellBackend, type FakeShell } from './fake-shell.js';
+import { fakeShellBackend, until, type FakeShell } from './fake-shell.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const TSM = path.resolve(here, '../src/cli/tsm.js');
@@ -245,8 +246,9 @@ test('ux-18: after --, each word is one argument of the command under sh, bash, 
   const env = { TSM_URL: `ws://127.0.0.1:${d.port}` };
   try {
     // Every kind of word a shell would split, expand or read as syntax.
-    const words = ['a;b', 'x  y', "it's", 'back\\slash', 'two\\\\back', "q\\'t", '$HOME', '*', '', '~/x', '#no comment', 'a|b', 'c&d', '(e)', '`f`', '"g"', 'h>i', '{j,k}', 'l\nm', '!bang'];
-    const r = await tsm(['run', 'q', '--', 'printf', '%s\\n', ...words], env);
+    const words = ['a;b', 'x  y', "it's", 'back\\slash', 'two\\\\back', "q\\'t", '$HOME', '*', '', '~/x', '~user', '==', '=ls', 'FOO=bar', '#no comment', 'a|b', 'c&d', '(e)', '`f`', '"g"', 'h>i', '{j,k}', 'l\nm', '!bang'];
+    // Each word is framed in brackets, so a word split at a newline (two frames) cannot read as the one (the house's read, #22).
+    const r = await tsm(['run', 'q', '--', 'printf', '[%s]\\n', ...words], env);
     assert.equal(r.code, 0, r.stderr);
     const command = d.calls[0]!.arguments.command as string;
     assert.ok(command.startsWith('printf '), command);
@@ -254,7 +256,7 @@ test('ux-18: after --, each word is one argument of the command under sh, bash, 
     assert.ok(shells.length >= 2, `shells found: ${shells.join(', ')}`);
     for (const shell of shells) {
       const out = await new Promise<string>((resolve, reject) => execFile(shell, ['-c', command], { env: { PATH: '/usr/bin:/bin', HOME: tmp } }, (e, stdout, stderr) => (e ? reject(new Error(`${shell}: ${e.message} ${stderr}`)) : resolve(stdout))));
-      assert.equal(out, `${words.join('\n')}\n`, shell);
+      assert.equal(out, `${words.map((w) => `[${w}]`).join('\n')}\n`, shell);
     }
     // Plain words stay as they are; without --, the words are a command line for the shell to parse.
     await tsm(['run', 'q', '--', 'git', '-C', 'repo', 'log', '--oneline', '-5'], env);
@@ -317,6 +319,13 @@ test('a flag’s value takes the type of the tool’s parameter: text stays text
     const extra = await tsm(['screen', 's', 'extra'], env);
     assert.equal(extra.code, 1);
     assert.match(extra.stderr, /screen: unexpected word extra/);
+    // A flags-only tool's stray-word hint is built from the tool's schema: session_list takes no
+    // parameters, so the hint says so and never suggests a --session it does not have (the house's
+    // read, #22 comment 6264958172).
+    const none = await tsm(['session_list', 'foo'], env);
+    assert.equal(none.code, 1);
+    assert.match(none.stderr, /session_list takes no arguments \(unexpected word foo\)/);
+    assert.doesNotMatch(none.stderr, /--session/);
     assert.equal(d.calls.length, expected.length, 'none of the errors reached the daemon');
   } finally {
     await d.close();
@@ -413,10 +422,10 @@ test('--until-done keeps awaiting past the per-call wait until the Run has ended
   const env = { TSM_URL: `ws://127.0.0.1:${port}`, TSM_TOKEN: 'tk' };
   try {
     const pending = tsm(['run', 'u', '--wait', '0', '--until-done', '--json', '--', 'sleep', '9'], env);
-    // A zero initial wait becomes one long poll, rather than thousands of immediate calls: the first
-    // call's wait is the long poll's, and no second call follows it (the house's read of 4e37a11, #22).
-    const end = Date.now() + 5000;
-    while (!waits.length && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
+    // A zero initial wait becomes one long poll, rather than thousands of immediate calls. Poll for
+    // the shell to start and the long-poll await to be issued, so a loaded machine does not fail a
+    // fixed wait (the house's read, #22 comment 6264958172).
+    await until(() => Boolean(sh) && waits.length > 0, 5000);
     assert.ok(sh, 'the shell started');
     assert.deepEqual(waits, [55_000]);
     await new Promise((r) => setTimeout(r, 200));
