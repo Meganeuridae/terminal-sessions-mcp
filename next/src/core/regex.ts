@@ -26,8 +26,12 @@
  * matched against a 64 KiB line takes seconds. So each compiled pattern gets a
  * match window, `matchWindow(re)`: MAX_MATCH_INPUT characters for an ordinary
  * pattern, fewer for a large one, sized so that one match costs about the same
- * (tens of milliseconds) whatever the pattern. `testBounded` matches the head of
- * a line within that window and says when it cut (G11: truncation is visible).
+ * (MATCH_COST units of engine work, tens of milliseconds) whatever the pattern.
+ * The window never falls under MIN_WINDOW, so the largest patterns accepted
+ * (a size of a few thousand) cost up to a few times MATCH_COST; nothing costs
+ * more. `execBounded` and `testBounded` match the head of a line within that
+ * window and say when they cut (G11: truncation is visible); watches match
+ * through them too (StreamMatcher in ansi.ts).
  *
  * Where the engine is unavailable, patterns fall back to the backtracking engine
  * behind a refusal of the classic catastrophic shapes; `LINEAR_REGEX` says which
@@ -45,8 +49,15 @@ export const MAX_EXPANDED_LENGTH = 2000;
 /** The most characters of one line a caller's pattern is matched against (its head). */
 export const MAX_MATCH_INPUT = 64 * 1024;
 
-/** The smallest match window any accepted pattern gets. */
-const MIN_WINDOW = 2048;
+/**
+ * The smallest match window any accepted pattern gets. A pattern of size
+ * MATCH_COST / MIN_WINDOW or more (a thousand literal characters) is matched on
+ * exactly this much of a line, at MIN_WINDOW × size units of work: the floor is
+ * where the bound on one match gives way to seeing a line's head at all (the
+ * house's read of ed4ecac, #22: at 2,048 the thousand-dot pattern cost twice the
+ * bound).
+ */
+export const MIN_WINDOW = 1024;
 
 /** Engine work allowed per match: pattern size (atoms × copies) × input characters; about 20–170 ns each. */
 const MATCH_COST = 1_000_000;
@@ -132,15 +143,22 @@ export function matchWindow(re: RegExp): number {
 }
 
 /**
- * Test `re` against the head of `text` within its match window, so one enormous
+ * Run `re` against the head of `text` within its match window, so one enormous
  * line costs a bounded match. `clipped` says the text was cut: a match beyond
- * the window is not seen. The regex's `lastIndex` is reset first.
+ * the window is not seen, and `$` is the window's end. The regex's `lastIndex`
+ * is reset first.
  */
-export function testBounded(re: RegExp, text: string): { matched: boolean; clipped: boolean } {
+export function execBounded(re: RegExp, text: string): { match: RegExpExecArray | null; clipped: boolean } {
   const w = matchWindow(re);
   const clipped = text.length > w;
   re.lastIndex = 0;
-  return { matched: re.test(clipped ? text.slice(0, w) : text), clipped };
+  return { match: re.exec(clipped ? text.slice(0, w) : text), clipped };
+}
+
+/** `execBounded` as a yes or no. */
+export function testBounded(re: RegExp, text: string): { matched: boolean; clipped: boolean } {
+  const r = execBounded(re, text);
+  return { matched: r.match !== null, clipped: r.clipped };
 }
 
 /** The fallback: refuse back-references and the classic exponential shapes. */

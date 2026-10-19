@@ -4,10 +4,14 @@
  * (§6), never through this.
  */
 import { err } from './errors.js';
-import { compileUserRegex } from './regex.js';
+import { compileUserRegex, execBounded } from './regex.js';
 
-// CSI, OSC (BEL or ST terminated), DCS/SOS/PM/APC strings, and two-byte escapes.
-const SEQ = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[P^_X][^\x1b]*\x1b\\|\x1b[@-Z\\-_]|\x9b[0-?]*[ -/]*[@-~]/g;
+// CSI, OSC (BEL or ST terminated), DCS/SOS/PM/APC strings, and escape sequences
+// proper: ESC, any intermediates (0x20–0x2f), one final byte (0x30–0x7e). The
+// last covers the two-byte forms (ESC 7, ESC =, ESC c) and the charset
+// designations (ESC ( B, which `tput sgr0` prints before ESC [ m: the house's
+// read of ed4ecac, #22, found `(B` left in the text).
+const SEQ = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[P^_X][^\x1b]*\x1b\\|\x1b[ -/]*[0-~]|\x9b[0-?]*[ -/]*[@-~]/g;
 // C0 controls other than tab and newline (CR is kept for the line splitter below).
 const CTRL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 
@@ -24,13 +28,17 @@ export const PARTIAL_QUIET_MS = 500;
 /**
  * Compile a caller's line pattern (watch, wait_for, `ready.pattern`, `fail.pattern`):
  * on the linear-time engine (`compileUserRegex`), and refused when it matches the
- * empty string, since it would then match every line (`x*`, `(error)?`, `^$`).
- * Throws invalid_argument, so a bad pattern fails when the watch or service is
- * created, never later.
+ * empty string: one that matches it anywhere (`x*`, `(error)?`) would match every
+ * line, and one that matches only an empty line (`^$`, `^\s*$`) could never
+ * match, since the splitter offers no empty line. Throws invalid_argument, so a
+ * bad pattern fails when the watch or service is created, never later.
  */
 export function compileLinePattern(pattern: string): RegExp {
   const re = compileUserRegex(pattern);
-  if (re.test('')) throw err('invalid_argument', `pattern /${pattern}/ matches the empty string, so it would match every line: make it require at least one character`);
+  if (re.test('')) {
+    const why = re.test('x') ? 'the empty string, so it would match every line' : 'only an empty line, which is never offered for matching (empty lines are dropped)';
+    throw err('invalid_argument', `pattern /${pattern}/ matches ${why}: make it require at least one character`);
+  }
   return re;
 }
 
@@ -39,6 +47,8 @@ export interface LineMatch {
   match: string;
   /** The whole line it was found in, control sequences stripped. */
   line: string;
+  /** The line is longer than the pattern's match window: only its head was searched (`$` meant the window's end). */
+  clipped?: true;
 }
 
 export interface LineSplitterOptions {
@@ -171,7 +181,10 @@ export interface StreamMatcherOptions {
  * first, reported when the line is complete, so a split write is never reported
  * cut short and no text is matched twice. An unterminated line is matched once
  * the stream has been quiet for `partialAfterMs` when `onPartial` is given; a
- * line that matched that way is not matched again when it completes.
+ * line that matched that way is not matched again when it completes. A line is
+ * matched on its head within the pattern's match window (`execBounded`), as
+ * search matches it, so a long pattern on a long line costs a bounded match on
+ * the daemon's thread; a hit on such a line says `clipped`.
  */
 export class StreamMatcher {
   private readonly lines: LineSplitter;
@@ -218,7 +231,10 @@ export class StreamMatcher {
   }
 
   private test(line: string): LineMatch | undefined {
-    const m = this.re.exec(line);
-    return m ? { match: m[0], line } : undefined;
+    const r = execBounded(this.re, line);
+    if (!r.match) return undefined;
+    const hit: LineMatch = { match: r.match[0], line };
+    if (r.clipped) hit.clipped = true;
+    return hit;
   }
 }

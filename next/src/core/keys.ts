@@ -177,12 +177,14 @@ function unknown(name: string, prefix = '', base = name): TermError {
  * too: only once the name is known not to be a modifier chord (`C-r` is never `cr`).
  */
 function canonical(name: string, hyphens = false): string | undefined {
+  // Own properties only: `constructor` or `__proto__` is no key, whatever Object.prototype holds
+  // (the house's read of ed4ecac, #22: `constructor` decoded to the text of a function).
   const k = name.toLowerCase();
-  if (NAMED_KEYS[k] !== undefined) return k;
+  if (Object.hasOwn(NAMED_KEYS, k)) return k;
   let squeezed = k.replace(/[\s_]/g, '');
   if (hyphens) squeezed = squeezed.replace(/-/g, '');
-  if (NAMED_KEYS[squeezed] !== undefined) return squeezed;
-  return KEY_ALIASES[squeezed];
+  if (Object.hasOwn(NAMED_KEYS, squeezed)) return squeezed;
+  return Object.hasOwn(KEY_ALIASES, squeezed) ? KEY_ALIASES[squeezed] : undefined;
 }
 
 /** Split `Ctrl+Shift+Up`, `C-M-a`, `Alt-x` into prefixes (`c`, `m`, `s`) and the base key; undefined when it has no modifier. */
@@ -191,7 +193,8 @@ function splitModifiers(name: string): { prefixes: Set<'c' | 'm' | 's'>; base: s
   let rest = name;
   for (;;) {
     const m = /^([a-z]+)[-+]/i.exec(rest);
-    const mod = m ? MODIFIERS[m[1]!.toLowerCase()] : undefined;
+    const word = m?.[1]!.toLowerCase();
+    const mod = word !== undefined && Object.hasOwn(MODIFIERS, word) ? MODIFIERS[word] : undefined;
     if (!m || mod === undefined || rest.length === m[0].length) break;
     prefixes.add(mod);
     rest = rest.slice(m[0].length);
@@ -204,7 +207,7 @@ function splitModifiers(name: string): { prefixes: Set<'c' | 'm' | 's'>; base: s
 function ctrlChar(ch: string): string | undefined {
   const c = ch.charCodeAt(0);
   if (ch.length === 1 && ((c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a))) return String.fromCharCode(c & 0x1f);
-  const p = CTRL_PUNCT[ch];
+  const p = Object.hasOwn(CTRL_PUNCT, ch) ? CTRL_PUNCT[ch] : undefined;
   return p === undefined ? undefined : String.fromCharCode(p);
 }
 
@@ -252,7 +255,7 @@ export function decodeKey(name: string, opts: KeyOptions = {}): string {
     return esc + (shift ? '\x1b[Z' : '\t');
   }
   const mod = 1 + (shift ? 1 : 0) + (meta ? 2 : 0) + (ctrl ? 4 : 0);
-  const bytes = NAMED_KEYS[b] ?? '';
+  const bytes = Object.hasOwn(NAMED_KEYS, b) ? NAMED_KEYS[b]! : '';
   const final = FINAL.exec(bytes)?.[1];
   if (final !== undefined) return `\x1b[1;${mod}${final}`;
   const code = TILDE.exec(bytes)?.[1];

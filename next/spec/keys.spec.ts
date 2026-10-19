@@ -56,6 +56,17 @@ test('unknown keys are rejected before anything is written, and the error names 
   assert.ok(Object.keys(NAMED_KEYS).includes('insert'));
 });
 
+test('a property of Object.prototype is no key: the lookups see own names only', () => {
+  for (const bad of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf', 'Constructor']) {
+    assert.throws(() => decodeKey(bad), (e: Error & { code?: string }) => e.code === 'invalid_argument' && e.message.includes(`Unknown key '${bad}'`), bad);
+    assert.throws(() => inputBytes(undefined, [bad]), /Unknown key/, bad);
+  }
+  // Neither as a modifier word nor as the key under one.
+  assert.throws(() => decodeKey('constructor-c'), /Unknown key 'constructor-c'/);
+  assert.throws(() => decodeKey('C-constructor'), /Unknown key 'C-constructor'/);
+  assert.throws(() => decodeKey('C-valueOf'), /Unknown key/);
+});
+
 test('ux-22: common spellings of keys and chords decode like the canonical names', () => {
   const same: Record<string, string> = {
     'Ctrl-C': 'C-c', 'Ctrl+C': 'C-c', 'ctrl-c': 'C-c', 'CTRL+c': 'C-c', '^C': 'C-c', '^c': 'C-c', 'Control-D': 'C-d', 'Ctl-z': 'C-z',

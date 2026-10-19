@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { compileUserRegex, foldCase, LINEAR_LOOKBEHIND, LINEAR_NULLABLE_REPETITION, LINEAR_REGEX, MAX_MATCH_INPUT, matchWindow, testBounded } from '../src/core/regex.js';
+import { compileUserRegex, execBounded, foldCase, LINEAR_LOOKBEHIND, LINEAR_NULLABLE_REPETITION, LINEAR_REGEX, MAX_MATCH_INPUT, MIN_WINDOW, matchWindow, testBounded } from '../src/core/regex.js';
 
 test('regex: the linear-time engine is in force on this Node', () => {
   assert.equal(LINEAR_REGEX, true);
@@ -201,7 +201,17 @@ test('er-9: a large pattern gets a smaller match window, and testBounded says wh
   const small = compileUserRegex('ERROR');
   assert.equal(matchWindow(small), MAX_MATCH_INPUT);
   const big = compileUserRegex('(a?)'.repeat(200));
-  assert.ok(matchWindow(big) < MAX_MATCH_INPUT && matchWindow(big) >= 2048, String(matchWindow(big)));
+  assert.ok(matchWindow(big) < MAX_MATCH_INPUT && matchWindow(big) >= MIN_WINDOW, String(matchWindow(big)));
+  // The floor: a thousand literal characters get MIN_WINDOW, where the cost of one match is MIN_WINDOW × size.
+  const huge = compileUserRegex('a'.repeat(1000));
+  assert.equal(matchWindow(huge), MIN_WINDOW);
+  assert.ok(MIN_WINDOW * 1000 <= 2_000_000, 'the largest common pattern costs at most twice MATCH_COST');
+  const t0 = performance.now();
+  testBounded(huge, 'b'.repeat(MAX_MATCH_INPUT));
+  assert.ok(performance.now() - t0 < 1000, `the floor case took ${Math.round(performance.now() - t0)} ms`);
+  // execBounded gives the match itself, from the same window.
+  assert.deepEqual(execBounded(small, `${'x'.repeat(100)}ERROR`).match?.[0], 'ERROR');
+  assert.equal(execBounded(small, `${'x'.repeat(MAX_MATCH_INPUT)}ERROR`).match, null);
   assert.deepEqual(testBounded(small, `${'x'.repeat(100)}ERROR`), { matched: true, clipped: false });
   // Past the window the head is matched; the cut is reported.
   assert.deepEqual(testBounded(small, `${'x'.repeat(MAX_MATCH_INPUT)}ERROR`), { matched: false, clipped: true });

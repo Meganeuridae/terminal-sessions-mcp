@@ -20,6 +20,7 @@
  * evidence and a repeat count on the monitor, not the journal (m2-16).
  */
 import { compileLinePattern, LineSplitter } from './ansi.js';
+import { testBounded } from './regex.js';
 import type { Journal } from './journal.js';
 import { describeSpec, hasReadinessProbe, LIVENESS_MS, MAX_TIMER_MS, tcpConnect, type Connect, type ServiceSpec, type TcpTarget } from './probes.js';
 import type { JournalEvent, OutputStream, Principal, RunInfo, Seq, ServiceStatus } from './types.js';
@@ -222,11 +223,13 @@ export class ServiceMonitor {
   private onLine(line: string): boolean {
     if (this.disposed || ended(this.statusValue)) return false;
     const evidence = line.trim();
-    if (this.failRe?.test(line)) {
+    // Matched on the line's head within the pattern's match window, as watches and search are
+    // (the house's read of ed4ecac, #22: a long pattern on a 64 KiB line held the thread for seconds).
+    if (this.failRe && testBounded(this.failRe, line).matched) {
       this.onFail(evidence);
       return true;
     }
-    if (this.readyRe?.test(line)) {
+    if (this.readyRe && testBounded(this.readyRe, line).matched) {
       this.onReadyLine(evidence);
       return true;
     }

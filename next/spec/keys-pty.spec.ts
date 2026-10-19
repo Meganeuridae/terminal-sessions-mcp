@@ -44,7 +44,7 @@ def main(w):
 curses.wrapper(main)
 `;
 
-async function until(fn: () => boolean, ms = 5000): Promise<void> {
+async function until(fn: () => boolean, ms = 15_000): Promise<void> {
   const end = Date.now() + ms;
   while (!fn()) {
     if (Date.now() > end) throw new Error('condition not met in time');
@@ -74,9 +74,13 @@ async function readKeys(keys: string[], useMode: boolean): Promise<{ read: strin
     await screen.settled();
     const appCursor = screen.applicationCursorKeys;
     p.write(inputBytes(undefined, keys, { appCursor: useMode && appCursor }));
-    await new Promise((r) => setTimeout(r, 150)); // let ESCDELAY resolve any lone ESC
+    // A pause before `q`, so a lone ESC in the keys is resolved by ESCDELAY and not joined with the q
+    // as Alt-q. Its length is a floor, not a verdict: a slower machine only makes it longer.
+    await new Promise((r) => setTimeout(r, 150));
     p.write('q');
-    await Promise.race([exited, new Promise((r) => setTimeout(r, 5000))]);
+    // The verdict waits for the program to exit and write its file; a loaded runner gets time.
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 15_000))]);
+    await until(() => fs.existsSync(out), 2000).catch(() => undefined);
     return { read: fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '(no output)', appCursor };
   } finally {
     try {
