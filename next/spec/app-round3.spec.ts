@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { App, commitReadDelivery, type Caller, type RunResult } from '../src/api/app.js';
+import { App, commitReadDelivery, takeReadCommit, type Caller, type RunResult } from '../src/api/app.js';
 import { cutPlumbing } from '../src/core/plumbing.js';
 import { serviceOutcomeKey } from '../src/core/session.js';
 import { SessionRegistry } from '../src/api/registry.js';
@@ -391,4 +391,27 @@ test('78c4d6e 10: a service outcome marks the status event the result rendered, 
   assert.equal(live.session.outcomeDeliveredTo(serviceOutcomeKey(runId, 'ready', readySeq), A.principal), true, 'the ready the result carried is delivered');
   assert.equal(live.session.outcomeDeliveredTo(serviceOutcomeKey(runId, 'ready', recoverySeq), A.principal), false, 'the recovery the result never carried is still announced');
   await app.cancel(A, { session: s, runId });
+});
+
+test('a reviewer’s read (6270045466): a read with `advance: false` stages no commit and moves no cursor, deferred or not', async () => {
+  const s = 'no-advance';
+  await app.sessionOpen(A, { id: s });
+  await app.run(A, { session: s, command: 'echo shown-unasked', wait: 5000 });
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  // The run's own result moved the cursor to its end; later output is unread.
+  await app.run(A, { session: s, command: 'echo later', wait: 5000, queue: true });
+  const r0 = await app.read(A, { session: s, since: 0 });
+  const at = live.session.cursorsOf(A.principal).read;
+  assert.equal(at, r0.nextCursor);
+  live.session.journal.append({ type: 'output', data: 'appended-after\r\n', stream: 'pty' });
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-na', deferReadDelivery: true };
+  const staged = await app.read(deferred, { session: s, since: 0, advance: false });
+  assert.match(staged.text!, /appended-after/);
+  assert.equal(takeReadCommit(staged), undefined, 'nothing staged for a deferred caller');
+  const direct = await app.read(A, { session: s, since: 0, advance: false });
+  assert.match(direct.text!, /appended-after/);
+  assert.equal(live.session.cursorsOf(A.principal).read, at, 'neither read moved the cursor');
+  const counted = await app.read(A, { session: s, since: 0 });
+  assert.equal(live.session.cursorsOf(A.principal).read, counted.nextCursor, 'an ordinary read still does');
 });

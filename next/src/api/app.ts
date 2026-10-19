@@ -799,7 +799,10 @@ export class App {
 
   /** Stage the caller's `read`-cursor advance to `to` for a result that showed the session's output as a whole (a page, a tail, the screen). */
   private advanceReadTo<T extends object>(result: T, caller: Caller, id: string, to: Seq): T {
-    return this.advanceRead(result, caller, () => this.markRead(id, caller.principal, to));
+    return this.advanceRead(result, caller, () => {
+      const now = this.registry.get(id);
+      if (now) this.markRead(now, caller.principal, to);
+    });
   }
 
   /** The live Session a Run belongs to, if it is a Run of the session's current shell. */
@@ -876,21 +879,19 @@ export class App {
     const id = sessionId(s);
     return this.advanceRead(result, caller, () => {
       const now = this.registry.get(id);
-      if (now) this.markRead(id, caller.principal, this.readCursorAfterRun(now, caller.principal, runId, to));
+      if (now) this.markRead(now, caller.principal, this.readCursorAfterRun(now, caller.principal, runId, to));
     });
   }
 
   /**
-   * Advance a principal's read cursor on what the name is now, looked up when the commit runs: a
-   * staged commit can run after the entry it read was closed and the name reopened, and the old
-   * life's Session would then hand the book that life's cursors whole, behind the new life's (the
-   * house's read of 78c4d6e, #22). The journal is continuous across lives (G1), so the position
-   * means the same on the new life; a live session takes no cursor past its journal, history takes
-   * it as given, and neither moves a cursor back. A forgotten name takes nothing.
+   * Advance a principal's read cursor on `s`, the entry the name has when the commit runs (its
+   * callers look it up then, once): a staged commit can run after the entry it read was closed and
+   * the name reopened, and the old life's Session would then hand the book that life's cursors
+   * whole, behind the new life's (the house's read of 78c4d6e, #22). The journal is continuous
+   * across lives (G1), so the position means the same on the new life; a live session takes no
+   * cursor past its journal, history takes it as given, and neither moves a cursor back.
    */
-  private markRead(id: string, principal: Principal, at: Seq): void {
-    const s = this.registry.get(id);
-    if (!s) return;
+  private markRead(s: AnySession, principal: Principal, at: Seq): void {
     if (s.kind === 'live') {
       if (at <= s.session.journal.lastSeq) s.session.markRead(principal, at);
     } else s.markRead(principal, at);
@@ -1244,12 +1245,18 @@ export class App {
 
   // ───────────── the journal ─────────────
 
-  /** Read by cursor (G11); see `readJournal`. Advances the caller's `read` cursor on a live session. */
-  async read(caller: Caller, o: { session: string } & ReadOptions): Promise<ReadResult> {
+  /**
+   * Read by cursor (G11); see `readJournal`. Advances the caller's `read` cursor (G22) unless
+   * `advance: false`: a read for output a tool shows beside its answer without being asked for
+   * (the compat launch's tail) counts as nothing read (a reviewer's read of the fixes for comment
+   * 6270045466, #22). The tools never pass it.
+   */
+  async read(caller: Caller, o: { session: string; advance?: boolean } & ReadOptions): Promise<ReadResult> {
     const s = this.find(caller, o.session, 'observe');
-    const { session: _, ...opts } = o;
+    const { session: _, advance, ...opts } = o;
     if (o.runId !== undefined) opts.runId = this.findRun(caller, o.runId, sessionId(s)).run.runId;
     const r = await readJournal(readSource(s), opts, { resultBytes: this.resultBytes });
+    if (advance === false) return r;
     // A page of one Run leaves other Runs' unread output unread (see readCursorAfterRun); a page of the session reads to its cursor.
     if (opts.runId !== undefined) return this.advanceReadAfterRun(r, caller, s, opts.runId, r.nextCursor);
     return this.advanceReadTo(r, caller, sessionId(s), r.nextCursor);

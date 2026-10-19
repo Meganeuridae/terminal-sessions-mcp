@@ -1,7 +1,7 @@
 /** One grammar for the marks a Run prints and the readers cut around (core/plumbing.ts). */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cutPlumbing, exitMark, probeMark, startMark } from '../src/core/plumbing.js';
+import { cutPlumbing, exitMark, nonceOf, probeMark, startMark } from '../src/core/plumbing.js';
 import { inlineLines, inlineProbe } from '../src/core/session.js';
 
 /** What the shell prints for a typed line: the split words joined. */
@@ -179,4 +179,14 @@ test('a wrapper-shaped line in a Run’s output is output: only the echo lines a
   assert.equal(cutPlumbing(`${typed(N)}$ ${typed(N)}out\n<<<EXIT:${N}:0>>>\n`, marker), 'out\n');
   // Nothing but the echo (a Run cut off before any output) is no output.
   assert.equal(cutPlumbing(typed(N).trimEnd(), marker), '');
+});
+
+test('a reviewer’s read (6270045466): nonceOf names the nonce a printed mark carries, and nothing for text that is no mark', () => {
+  assert.equal(nonceOf('<<<EXIT:74ef5182:0>>>'), '74ef5182');
+  assert.equal(nonceOf('<<<PROBE:74ef5182>>>'), '74ef5182');
+  assert.equal(nonceOf('<<<PROBE:74ef5182:4242:74ef5182>>>'), '74ef5182');
+  assert.equal(nonceOf('<<<START:74ef5182:4242>>>'), '74ef5182');
+  assert.equal(nonceOf(`echo "<<<EXI""T:74ef5182:$?>>>"`), undefined, 'the typed echo is split so it is no mark');
+  assert.equal(nonceOf('plain output'), undefined);
+  assert.equal(nonceOf(`. '/tmp/x/tsm-cmd-1'`), undefined);
 });

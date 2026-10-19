@@ -11,7 +11,7 @@
 import { clocks } from '../core/clock.js';
 import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
-import { exitMark, probeMark } from '../core/plumbing.js';
+import { exitMark, nonceOf, probeMark } from '../core/plumbing.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
 import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
 import { commitReadDelivery, takeReadCommit, type App, type ReadResult, type SessionSummary } from './app.js';
@@ -78,13 +78,14 @@ class Drawn {
 
 /**
  * A read for a tool's answer carries its commit in `d`. A read for what the tool shows beside its
- * answer, unasked (the launch's tail: `d` null), moves no cursor: a tail reads the session's end,
- * and its commit would take the cursor past other Runs' older output the tail did not show; start's
- * own rule covers the service Run's output (the house's read of 78c4d6e, #22).
+ * answer, unasked (the launch's tail: `d` null), asks the App for no cursor advance at all
+ * (`advance: false`): a tail reads the session's end, and its commit would take the cursor past
+ * other Runs' older output the tail did not show; start's own rule covers the service Run's output
+ * (the house's read of 78c4d6e, #22; a reviewer's read of the fixes for comment 6270045466).
  */
 async function readFor(ctx: ToolContext, d: Drawn | null, o: Parameters<App['read']>[1]): Promise<ReadResult> {
   if (d) return d.track(await ctx.app.read(ctx.caller, o));
-  return ctx.app.read({ ...ctx.caller, deferReadDelivery: true }, o);
+  return ctx.app.read(ctx.caller, { ...o, advance: false });
 }
 
 /**
@@ -131,8 +132,6 @@ async function runOutput(ctx: ToolContext, session: string, runId: string, raw: 
  */
 const TYPED_LINE = /(?:command )?\. '(?:[^'\n]|'\\'')*\/tsm-cmd-\d+'(?:; echo "<<<EXI""T:[0-9a-f]+:\$\?>>>")?|eval \(__tsm_collect '(?:[^'\n]|'\\'')*\/tsm-cmd-\d+' \$status\)/;
 const PLUMBING = new RegExp(`${TYPED_LINE.source}|${exitMark().source}|${probeMark().source}`, 'g');
-/** The nonce a mark, or the chained exit echo, carries (the core's spelling of the marks). */
-const MARK_NONCE = /(?:EXIT|PROBE|EXI""T):([^:>\s]+)/;
 
 /**
  * What tells the daemon's plumbing from a program's in a stretch of the session's text: the nonces
@@ -155,8 +154,9 @@ function plumbingIn(ctx: ToolContext, session: string, from: Seq, to: Seq): Plum
 
 /** A log line without the plumbing; null when nothing else was on it (a soft wrap can leave part of a long echo). */
 function withoutPlumbing(line: string, p: Plumbing): string | null {
+  // The typed line is the daemon's whatever it carries (it names the command file); a printed mark is cut by whose nonce it bears.
   const kept = line.replace(PLUMBING, (m) => {
-    const nonce = MARK_NONCE.exec(m)?.[1];
+    const nonce = nonceOf(m);
     return nonce === undefined || p.byShape || p.nonces.has(nonce) ? '' : m;
   });
   if (kept === line) return line;

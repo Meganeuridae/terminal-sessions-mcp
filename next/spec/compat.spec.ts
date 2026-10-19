@@ -15,6 +15,7 @@ import { App, type Caller } from '../src/api/app.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { callTool, toolsFor } from '../src/api/tools.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
+import { fakeShellBackend } from './fake-shell.js';
 import { until } from './testhost.js';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-compat-'));
@@ -377,5 +378,86 @@ test('6270946953: launch’s watch for error patterns is measured on the monoton
   } finally {
     lag = 0;
     await call('killSession', { session: 'mono', graceful: false });
+  }
+});
+
+// ───────────── a reviewer's read of the fixes for #22 comment 6270045466: the marker strategy's plumbing in the logs ─────────────
+
+/** A registry over the scripted shell with no integration marks: Runs take the marker strategy, and their plumbing is printed as marks with a recorded nonce. */
+async function markerHarness(): Promise<{ app: App; registry: SessionRegistry; call(name: string, args: Obj): Promise<Obj & unknown[]>; close(): Promise<void> }> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-compat-marker-'));
+  const backend = fakeShellBackend(
+    (sh) => {
+      sh.on(/^echo /, (line) => ({ output: `${line.slice(5)}\r\n`, exit: 0 }));
+      sh.on(/^sleep/, () => ({ hang: true }));
+    },
+    { marks: 'none' },
+  );
+  const registry = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true });
+  const app = new App({ registry, defaultWaitMs: 2000 });
+  return {
+    app,
+    registry,
+    call: async (name, args) => JSON.parse((await callTool(name, args, { app, caller: A, resultText: 'json' }, compat)).text) as Obj & unknown[],
+    close: async () => {
+      await registry.closeAll();
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** A marker Run left running in `session`: its nonce is recorded, and its range reaches everything appended while it runs. */
+async function hungMarkerRun(h: Awaited<ReturnType<typeof markerHarness>>, session: string): Promise<{ nonce: string; journal: import('../src/core/journal.js').Journal }> {
+  const hung = await h.call('runCommand', { session, command: 'sleep 99', timeout: -1 });
+  const live = h.registry.get(session);
+  assert.ok(live?.kind === 'live');
+  const run = live.session.listRuns().find((r) => r.runId === hung.runId)!;
+  assert.equal(run.strategy, 'marker', JSON.stringify(run));
+  assert.ok(run.nonce, 'the marker Run recorded its nonce');
+  return { nonce: run.nonce!, journal: live.session.journal };
+}
+
+test('a reviewer’s read: a tail whose window the daemon’s own lines fill reads further back for the lines asked, and at its cap says the shortfall instead of returning fewer in silence', async () => {
+  const h = await markerHarness();
+  try {
+    for (let i = 1; i <= 3; i++) await h.call('runCommand', { session: 'fill', command: `echo real-${i}` });
+    const { nonce, journal } = await hungMarkerRun(h, 'fill');
+    const mark = `<<<EXIT:${nonce}:0>>>\r\n`;
+    // 200 lines of the Run's own end mark: a 3-line tail first reads 56 lines, all plumbing, and reads further back until it has three.
+    for (let i = 0; i < 200; i++) journal.append({ type: 'output', data: mark, stream: 'pty' });
+    const found = lines(await h.call('tailLogs', { session: 'fill', lines: 3 }));
+    assert.equal(found.length, 3, JSON.stringify(found));
+    assert.ok(!found[0]!.startsWith('[earlier output'), `three lines were found further back, so no note: ${JSON.stringify(found)}`);
+    assert.ok(found.every((l) => !l.includes('<<<EXIT')), 'none of the plumbing');
+    assert.ok(found.some((l) => l.includes('real-3') || l.includes('sleep 99')), JSON.stringify(found));
+    // More plumbing than the tail's cap: nothing but marks in the last 10,000 lines, said as such, with the earlier page named.
+    for (let i = 0; i < 10_100; i++) journal.append({ type: 'output', data: mark, stream: 'pty' });
+    const short = lines(await h.call('tailLogs', { session: 'fill', lines: 3 }));
+    assert.equal(short.length, 1, JSON.stringify(short));
+    assert.match(short[0]!, /^\[earlier output not shown \(the daemon's own lines took the rest of the 10000 lines read\); read \{"session": "fill", "tail": 3, "until": \d+\} shows what came before\]$/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a reviewer’s read: a raw tail whose first shown line begins at the first event read, with older output before it, marks the line and includes that event in its advice', async () => {
+  const h = await markerHarness();
+  try {
+    await h.call('runCommand', { session: 'rawhead', command: 'echo earlier' });
+    const { nonce, journal } = await hungMarkerRun(h, 'rawhead');
+    // Exactly the raw tail's page of 2,000 events: a real line at its head, the Run's end marks, two real lines at the end
+    // (the last without a line end, so no empty line follows them).
+    const headSeq = journal.append({ type: 'output', data: 'head-line\r\n', stream: 'pty' }).seq;
+    for (let i = 0; i < 1997; i++) journal.append({ type: 'output', data: `<<<EXIT:${nonce}:0>>>\r\n`, stream: 'pty' });
+    journal.append({ type: 'output', data: 'tail-a\r\n', stream: 'pty' });
+    journal.append({ type: 'output', data: 'tail-b', stream: 'pty' });
+    const raw = lines(await h.call('tailLogs', { session: 'rawhead', lines: 3, raw: true }));
+    assert.equal(raw.length, 4, JSON.stringify(raw));
+    const m = /^\[earlier output not shown \(the first line begins before what was read\); read \{"session": "rawhead", "tail": 3, "until": (\d+)\} shows what came before, and the first line below whole\]$/.exec(raw[0]!);
+    assert.ok(m, raw[0]);
+    assert.equal(Number(m![1]), headSeq, 'the earlier page includes the event the first shown line begins in');
+    assert.deepEqual(raw.slice(1), ['…head-line', 'tail-a', 'tail-b']);
+  } finally {
+    await h.close();
   }
 });

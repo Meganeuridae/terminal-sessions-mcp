@@ -30,6 +30,9 @@ export const exitMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<EXIT:$
  * from before it was printed).
  */
 export const probeMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<PROBE:${nonce}(?::(\\d+)(?::(${NONCE}|))?)?>>>`);
+const MARK_NONCE = new RegExp(`<<<(?:START|EXIT|PROBE):(${NONCE})`);
+/** The nonce a printed mark carries, for a reader that found the mark by its shape and must know whose it is (the compat pack's logs); undefined for text that is no mark. */
+export const nonceOf = (mark: string): string | undefined => MARK_NONCE.exec(mark)?.[1];
 /**
  * A typed line's text as the echo may show it: a line editor redrawing a long typed line can break
  * it anywhere, so whitespace may fall between any two characters, and bash 5.2 wrapping a line at a

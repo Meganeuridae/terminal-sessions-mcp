@@ -959,7 +959,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const lines = p.text === '' ? [] : p.text.split('\n');
   while (lines.length - drop > 1 && bytes > maxBytes) bytes -= utf8Length(lines[drop++]!) + 1;
   const kept = lines.slice(drop);
-  const text = cutTail(kept.join('\n'), maxBytes).text;
+  const tail = cutTail(kept.join('\n'), maxBytes);
+  const text = tail.text;
   // Fewer lines than asked is truncation only when older output was cut (by the walk's bounds, or
   // retention). So is the head of a line asked for that lies past what was projected: past the input
   // cap, or past the start of a window that older output precedes — one line longer than the cap is
@@ -972,7 +973,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const first = firstEventOf(outs, kept.length);
   const counts: NonNullable<ReadResult['lines']> = { requested: n, returned: kept.length };
   if (first !== undefined && kept.length > 0) {
-    const cutHead = drop === 0 && (headCut || cutTail(kept.join('\n'), maxBytes).cut);
+    const cutHead = drop === 0 && (headCut || tail.cut);
     if (cutHead) counts.cutHead = true;
     // The previous page must re-include this event when the shown lines begin inside it or its head
     // was cut here; otherwise the plain `seq[0] - 1` reaches what came before (so `before` is left off).
