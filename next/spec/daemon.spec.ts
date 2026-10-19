@@ -58,6 +58,43 @@ async function until(pred: () => boolean, ms: number, what: string): Promise<voi
   }
 }
 
+/**
+ * CPU time a process has used so far, in ms: a difference of it tells spinning from idling
+ * whatever the machine's load, where a lifetime %cpu would not (the house's read of 59f660b,
+ * #22). From /proc where there is one (10 ms ticks); else from ps, whose time has centiseconds
+ * on macOS.
+ */
+function cpuMs(pid: number): number {
+  const stat = `/proc/${pid}/stat`;
+  if (fs.existsSync(stat)) {
+    const line = fs.readFileSync(stat, 'utf8');
+    const after = line.slice(line.lastIndexOf(')') + 2).split(' '); // past the command name, which may hold spaces
+    return (Number(after[11]) + Number(after[12])) * 10; // utime + stime, fields 14 and 15 of the line
+  }
+  let s = 0;
+  for (const part of execFileSync('ps', ['-o', 'time=', '-p', String(pid)], { encoding: 'utf8' }).trim().split(':')) s = s * 60 + Number(part);
+  return Math.round(s * 1000);
+}
+
+/** The launcher the shell integration wrote for the one session under `dir`. */
+function launcherOf(dir: string): string | undefined {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      const f = launcherOf(p);
+      if (f) return f;
+    } else if (e.name === 'launch.sh') return p;
+  }
+  return undefined;
+}
+
+/** /health as the local principal sees it. */
+async function health(d: Daemon): Promise<{ sessions: Array<{ id: string; journal: { coldFailed: string | null } }> }> {
+  const res = await fetch(`${urlOf(d).replace(/^ws/, 'http')}/health`);
+  assert.equal(res.status, 200);
+  return (await res.json()) as { sessions: Array<{ id: string; journal: { coldFailed: string | null } }> };
+}
+
 async function stop(d: Daemon): Promise<number | null> {
   if (d.child.exitCode !== null) return d.child.exitCode;
   d.child.kill('SIGTERM');
@@ -169,19 +206,27 @@ test('tsg-5: when the log reader goes away (EPIPE) termd neither spins nor loses
   try {
     await until(() => listening(d) !== undefined, 10_000, 'termd to listen');
     const port = Number(new URL(urlOf(d)).port);
-    d.child.stderr!.destroy(); // the reader of the pipe exits
-    // Make it log: refused Hosts are warnings.
-    for (let i = 0; i < 20; i++) {
-      await new Promise<void>((r) => {
+    const refuse = () =>
+      new Promise<void>((r) => {
         const s = net.connect(port, '127.0.0.1', () => s.end(`GET /health HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n`));
         s.on('close', () => r());
         s.on('error', () => r());
         s.resume();
       });
-    }
-    await new Promise((r) => setTimeout(r, 500));
-    const cpu = Number(execFileSync('ps', ['-o', '%cpu=', '-p', String(d.child.pid)], { encoding: 'utf8' }).trim());
-    assert.ok(cpu < 50, `termd is spinning at ${cpu}% CPU`);
+    // A refused Host is a warning on stderr: seen once while the reader is still here, so the
+    // twenty writes after it has gone are known to happen, each meeting EPIPE.
+    const logged = d.lines.length;
+    await refuse();
+    await until(() => d.lines.slice(logged).some((l) => l.includes('"evil.example"') && l.includes('"warn"')), 5000, 'the refused Host logged');
+    d.child.stderr!.destroy(); // the reader of the pipe exits
+    assert.ok(d.child.stderr!.destroyed);
+    const before = cpuMs(d.child.pid!);
+    for (let i = 0; i < 20; i++) await refuse();
+    await sleep(500);
+    const spent = cpuMs(d.child.pid!) - before;
+    assert.ok(spent < 250, `termd spent ${spent} ms of CPU on twenty refused requests and half a second of nothing: spinning`);
+    // Still serving: a proper request is answered.
+    assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200);
     const code = await stop(d);
     assert.equal(code, 0, 'the drain completed');
   } finally {
@@ -221,15 +266,21 @@ test('jr2-2/tsg-1: a second termd on another port that finds the data dir locked
   const a = termd(['--port', '0', '--data-dir', dataDir, '--no-usage-log']);
   try {
     await until(() => listening(a) !== undefined, 10_000, 'the first termd');
-    // A finished run leaves the shell idle at its prompt, so the journal only changes if someone writes to it.
-    await call(urlOf(a), 'run', { session: 'l1', command: 'true', wait: 10_000 });
-    await sleep(300);
+    // A finished Run is in the journal when its result is back. What the live daemon may still
+    // append (its prompt) is its own; what the second must not add is any record of a recovery.
+    const r = await call(urlOf(a), 'run', { session: 'l1', command: 'true', wait: 10_000 });
+    assert.equal(r.state, 'exited', JSON.stringify(r));
     const journal = path.join(dataDir, 'sessions', 'l1', 'journal.jsonl');
     const before = fs.readFileSync(journal, 'utf8');
+    assert.match(before, /"run\.end"/);
     const b = termd(['--port', '0', '--data-dir', dataDir, '--no-usage-log']);
     assert.equal(await b.exited, 1);
     assert.match(b.lines.join('\n'), /another termd is using the data dir/);
-    assert.equal(fs.readFileSync(journal, 'utf8'), before, 'the live journal is untouched');
+    const after = fs.readFileSync(journal, 'utf8');
+    assert.ok(after.startsWith(before), 'nothing was inserted into the live journal');
+    assert.doesNotMatch(after.slice(before.length), /"recovered"|daemon-restart/, `the second daemon wrote into the live journal: ${after.slice(before.length)}`);
+    const seqs = after.trim().split('\n').map((l) => (JSON.parse(l) as { seq: number }).seq);
+    assert.deepEqual(seqs, [...new Set(seqs)].sort((x, y) => x - y), 'seqs unique and increasing');
   } finally {
     await stop(a);
   }
@@ -287,46 +338,58 @@ test('readiness: SIGTERM at the listening announcement drains cleanly', async ()
   }
 });
 
-test('an empty TSM_SESSION_OOM_SCORE_ADJ is the default (200), not 0; an empty flag value is an error like any other', async () => {
-  const dataDir = path.join(tmp, 'oom-env');
-  const d = termd(['--port', '0', '--data-dir', dataDir, '--no-usage-log', '--shell', '/bin/bash'], { env: { TSM_SESSION_OOM_SCORE_ADJ: '' } });
-  try {
-    await until(() => listening(d) !== undefined, 10_000, 'termd to listen');
-    const r = await call(urlOf(d), 'run', { session: 'oom', command: 'true', wait: 10_000 });
-    assert.equal(r.state, 'exited', JSON.stringify(r));
-    const find = (dir: string): string | undefined => {
-      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        const p = path.join(dir, e.name);
-        if (e.isDirectory()) {
-          const f = find(p);
-          if (f) return f;
-        } else if (e.name === 'launch.sh') return p;
-      }
-      return undefined;
-    };
-    const launcher = find(path.join(dataDir, 'sessions', 'oom'));
-    assert.ok(launcher, 'the session shell has a launcher');
-    assert.match(fs.readFileSync(launcher, 'utf8'), /echo 200 > \/proc\/self\/oom_score_adj/, 'the default preference, not none');
-  } finally {
-    await stop(d);
-  }
+test("the sessions' oom_score_adj: an empty TSM_SESSION_OOM_SCORE_ADJ is the default (200), a value is written, the flag beats the variable, 0 writes nothing, and an empty flag value is an error like any other", async () => {
+  // What the shell's launcher will write (the house's read of 59f660b, #22: only the empty-variable case was pinned).
+  const written = async (name: string, argv: string[], env: NodeJS.ProcessEnv): Promise<string> => {
+    const dataDir = path.join(tmp, name);
+    const d = termd(['--port', '0', '--data-dir', dataDir, '--no-usage-log', '--shell', '/bin/bash', ...argv], { env });
+    try {
+      await until(() => listening(d) !== undefined, 10_000, 'termd to listen');
+      const r = await call(urlOf(d), 'run', { session: 'oom', command: 'true', wait: 10_000 });
+      assert.equal(r.state, 'exited', JSON.stringify(r));
+      const launcher = launcherOf(path.join(dataDir, 'sessions', 'oom'));
+      assert.ok(launcher, 'the session shell has a launcher');
+      return /echo (\d+) > \/proc\/self\/oom_score_adj/.exec(fs.readFileSync(launcher, 'utf8'))?.[1] ?? 'nothing';
+    } finally {
+      await stop(d);
+    }
+  };
+  assert.equal(await written('oom-env', [], { TSM_SESSION_OOM_SCORE_ADJ: '' }), '200', 'an empty variable is unset: the default, not none');
+  assert.equal(await written('oom-var', [], { TSM_SESSION_OOM_SCORE_ADJ: '300' }), '300', 'the variable is read');
+  assert.equal(await written('oom-flag', ['--session-oom-score-adj', '150'], { TSM_SESSION_OOM_SCORE_ADJ: '300' }), '150', 'the flag beats the variable');
+  assert.equal(await written('oom-zero', ['--session-oom-score-adj', '0'], {}), 'nothing', '0 is no preference');
   const bad = termd(['--port', '0', '--data-dir', path.join(tmp, 'oom-bad'), '--no-usage-log', '--session-oom-score-adj', '']);
   assert.equal(await bad.exited, 2);
   assert.match(bad.lines.join('\n'), /--session-oom-score-adj is empty/);
 });
 
-test('--disk-floor-bytes takes a whole number of bytes; 0 turns the floor off; anything else is an error', async () => {
+test('--disk-floor-bytes takes a whole number of bytes; 0 turns the floor off (history reaches the disk); a floor no filesystem clears keeps history in memory and /health says why; anything else is an error', async () => {
   const bad = termd(['--port', '0', '--data-dir', path.join(tmp, 'floor-bad'), '--no-usage-log', '--disk-floor-bytes', '200MB']);
   assert.equal(await bad.exited, 2);
   assert.match(bad.lines.join('\n'), /--disk-floor-bytes must be a whole number of bytes/);
-  const off = termd(['--port', '0', '--data-dir', path.join(tmp, 'floor-off'), '--no-usage-log', '--shell', '/bin/bash', '--disk-floor-bytes', '0']);
-  try {
-    await until(() => listening(off) !== undefined, 10_000, 'termd with the floor off');
-    const r = await call(urlOf(off), 'run', { session: 'nofloor', command: 'echo ok', wait: 10_000 });
-    assert.equal(r.state, 'exited', JSON.stringify(r));
-  } finally {
-    await stop(off);
-  }
+  // The same Run under no floor and under one above any free space (the house's read of 59f660b, #22:
+  // the floor-off case only checked that the Run completed, which it does either way).
+  const under = async (name: string, floor: string): Promise<{ journal: string; coldFailed: string | null }> => {
+    const dataDir = path.join(tmp, name);
+    const d = termd(['--port', '0', '--data-dir', dataDir, '--no-usage-log', '--shell', '/bin/bash', '--disk-floor-bytes', floor]);
+    try {
+      await until(() => listening(d) !== undefined, 10_000, `termd with the floor at ${floor}`);
+      const r = await call(urlOf(d), 'run', { session: 's', command: 'echo ok', wait: 10_000 });
+      assert.equal(r.state, 'exited', `commands are unaffected by the floor: ${JSON.stringify(r)}`);
+      const file = path.join(dataDir, 'sessions', 's', 'journal.jsonl');
+      const h = (await health(d)).sessions.find((s) => s.id === 's');
+      assert.ok(h, 'the session is in /health');
+      return { journal: fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '', coldFailed: h.journal.coldFailed };
+    } finally {
+      await stop(d);
+    }
+  };
+  const off = await under('floor-off', '0');
+  assert.match(off.journal, /"run\.end"/, 'with the floor off, history reaches the disk');
+  assert.equal(off.coldFailed, null);
+  const high = await under('floor-high', String(Number.MAX_SAFE_INTEGER));
+  assert.doesNotMatch(high.journal, /"run\.end"/, 'below the floor nothing of the Run reaches the disk');
+  assert.match(String(high.coldFailed), /below the floor/, '/health names the cause');
 });
 
 // ───────────── the house's read of 59f660b (#22): logs, flags, startup and shutdown ─────────────

@@ -31,9 +31,9 @@ let dirs = 0;
 const dataDir = () => path.join(tmp, `d${++dirs}`);
 const code = (e: unknown) => (e instanceof TermError ? e.code : String(e));
 
-/** A node child running `src`; resolves each stdout line to `lines`. */
-function child(src: string): { proc: ChildProcess; lines: string[]; line: (re: RegExp, ms?: number) => Promise<string>; exited: Promise<number | null> } {
-  const proc = spawn(process.execPath, ['--input-type=module', '-e', src], { stdio: ['ignore', 'pipe', 'pipe'] });
+/** A node child running `src`; resolves each stdout line to `lines`. With `stdin`, the child can be written to. */
+function child(src: string, opts: { stdin?: boolean } = {}): { proc: ChildProcess; lines: string[]; line: (re: RegExp, ms?: number) => Promise<string>; exited: Promise<number | null> } {
+  const proc = spawn(process.execPath, ['--input-type=module', '-e', src], { stdio: [opts.stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
   const lines: string[] = [];
   let buf = '';
   let err = '';
@@ -163,17 +163,25 @@ test('jr2-2: a holder that exits without releasing leaves no lock behind; racing
     const race = dataDir();
     fs.mkdirSync(race, { recursive: true });
     if (stale) fs.writeFileSync(path.join(race, LOCK_FILE), JSON.stringify({ pid: 999_999, startedAt: Date.now() - 60_000, hostname: os.hostname() }));
+    // A start barrier, not a wall-clock instant (the house's read of 59f660b, #22): every racer says it is
+    // ready, then waits for the word, so they take the lock together however slowly the machine starts them.
     const racers = Array.from({ length: 6 }, () =>
-      child(`
+      child(
+        `
         import { acquireDataDirLock } from ${JSON.stringify(LOCK_JS)};
-        const go = ${Date.now() + 400};
-        while (Date.now() < go) {}
-        try { acquireDataDirLock(${JSON.stringify(race)}); console.log('won'); setTimeout(() => process.exit(0), 1500); }
-        catch (e) { console.log(e.code === 'data_dir_locked' ? 'refused' : 'error ' + e.message); process.exit(0); }
-      `),
+        process.stdin.once('data', () => {
+          try { acquireDataDirLock(${JSON.stringify(race)}); console.log('won'); setTimeout(() => process.exit(0), 1500); }
+          catch (e) { console.log(e.code === 'data_dir_locked' ? 'refused' : 'error ' + e.message); process.exit(0); }
+        });
+        console.log('ready');
+      `,
+        { stdin: true },
+      ),
     );
+    await Promise.all(racers.map((r) => r.line(/^ready$/)));
+    for (const r of racers) r.proc.stdin!.write('go\n');
     await Promise.all(racers.map((r) => r.exited));
-    const outcomes = racers.map((r) => r.lines[0]);
+    const outcomes = racers.map((r) => r.lines.find((l) => l !== 'ready'));
     assert.equal(outcomes.filter((o) => o === 'won').length, 1, `${stale ? 'stale' : 'free'}: ${outcomes.join(', ')}`);
     assert.equal(outcomes.filter((o) => o === 'refused').length, 5, outcomes.join(', '));
   }
