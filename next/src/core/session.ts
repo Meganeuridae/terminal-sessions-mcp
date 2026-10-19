@@ -66,7 +66,7 @@ export interface SessionOptions {
   integrationGraceMs?: number;
   /** After the handshake, how long `start` waits for the first prompt at most (it then resolves in `starting`). */
   startupCapMs?: number;
-  /** Linux: process Runs' oom_score_adj (0 or unset: unchanged); see the daemon's --session-oom-score-adj. */
+  /** Linux: the shell's and process Runs' oom_score_adj (0 or unset: unchanged); see the daemon's --session-oom-score-adj. */
   oomScoreAdj?: number;
   /** Temp files and the session's own shell history live here. */
   tempDir?: string;
@@ -610,7 +610,7 @@ export class Session {
     }
     const launcher = this.opts.integration?.launcher;
     const bootstrap = integrated ? { key: this.markKey, ...(launcher && { launcher }) } : undefined;
-    this.pty = this.backend.spawnShell({ shell: this.opts.shell, args, cwd: this.opts.cwd, env, cols: this.screen.cols, rows: this.screen.rows, ...(bootstrap && { bootstrap }) });
+    this.pty = this.backend.spawnShell({ shell: this.opts.shell, args, cwd: this.opts.cwd, env, cols: this.screen.cols, rows: this.screen.rows, ...(bootstrap && { bootstrap }), ...(this.opts.oomScoreAdj !== undefined && { oomScoreAdj: this.opts.oomScoreAdj }) });
     this.pty.onData((d) => this.onPtyData(d));
     this.pty.onExit((e) => this.onPtyExit(e));
     // G25: the daemon's emulator is the sole responder to terminal queries.

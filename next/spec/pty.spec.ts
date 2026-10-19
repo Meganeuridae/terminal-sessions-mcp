@@ -272,6 +272,18 @@ test('/bin/sh: G5 fallback — no integration, marker strategy, observed exits, 
   }
 });
 
+test('a shell started without an integration launcher gets the session oom_score_adj from the backend', { skip: process.platform !== 'linux' ? 'oom_score_adj is Linux\'s' : false }, async () => {
+  // Only the launcher raised it: a shell with `integration: false` kept the daemon's (the house's read of 2c35df8, #22).
+  const backend = new NodePtyBackend();
+  const out: string[] = [];
+  const p = backend.spawnShell({ shell: '/bin/sh', args: [], cwd: tmp, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', TERM: 'dumb' }, cols: 80, rows: 24, oomScoreAdj: 321 });
+  p.onData((d) => out.push(d));
+  const exited = new Promise<PtyExit>((r) => p.onExit(r));
+  p.write('cat /proc/$$/oom_score_adj; exit\n');
+  await exited;
+  assert.match(out.join(''), /\n321\r?\n/, out.join(''));
+});
+
 test('/bin/bash: a process Run inherits no terminal master, and its line is not in any argv', async () => {
   // Two sessions open: before, a process Run in either held both terminals' masters.
   const a = await real('/bin/bash');

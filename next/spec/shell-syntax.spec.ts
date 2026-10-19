@@ -10,7 +10,7 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { processLaunch } from '../src/backends/node-pty.js';
+import { processLaunch, shellLaunch } from '../src/backends/node-pty.js';
 import { inlineLines } from '../src/core/session.js';
 import { prepareIntegration } from '../src/shell/integration.js';
 import { hasShell } from './fake-shell.js';
@@ -58,6 +58,8 @@ test('the fish integration parses', { skip: !FISH }, () => {
 
 test('the process launcher and the lines typed for a declared shell parse in sh, bash, zsh and fish', () => {
   for (const keeps of [true, false]) parses('/bin/bash', ['-n', '-c', processLaunch(keeps)], `the process launcher (${keeps ? 'with' : 'without'} descriptor 3)`);
+  // The text that starts a shell without an integration launcher runs under bash or, without one, /bin/sh.
+  for (const sh of ['/bin/bash', '/bin/sh']) parses(sh, ['-n', '-c', shellLaunch(200)], `the shell launcher under ${sh}`);
   const bodies = [`printf '%s\\n' "it's" 'quoted' \\\\back %d; (exit 3)`, `f() {\n${Array.from({ length: 80 }, (_, i) => `  echo line-${i}-${'x'.repeat(40)}`).join('\n')}\n}\nf | wc -l`];
   for (const body of bodies) {
     const posix = inlineLines(body, 'abcd1234', false).join('\n');

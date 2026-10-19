@@ -17,6 +17,11 @@ export interface SpawnShellOptions {
    * a private file for the shell's PID before exec'ing the shell.
    */
   bootstrap?: { key: string; launcher?: string };
+  /**
+   * Linux: the shell's oom_score_adj (0 or unset: unchanged); see the daemon's --session-oom-score-adj.
+   * An integration's launcher sets it itself; the backend sets it for a shell started without one.
+   */
+  oomScoreAdj?: number;
 }
 
 export interface PtyExit {

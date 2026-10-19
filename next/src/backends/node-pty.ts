@@ -244,6 +244,11 @@ export function processLaunch(readsLine: boolean, oomScoreAdj = 0): string {
   ].join('\n');
 }
 
+/** The text that starts a shell without an integration launcher: its oom_score_adj raised (see oomLine), then `exec` of the shell and its arguments. */
+export function shellLaunch(oomScoreAdj: number): string {
+  return [...oomLine(oomScoreAdj), 'exec "$@"'].join('\n');
+}
+
 /**
  * The line that raises a session process's oom_score_adj on Linux (no /proc elsewhere): the
  * kernel then takes it before the daemon, whose death would lose every session. The preference
@@ -305,8 +310,19 @@ export class NodePtyBackend implements ExecutionBackend {
     // The launcher runs under bash where there is one (`-p`: no BASH_ENV, no imported functions), so
     // its loop can close the terminal masters of the sessions opened before this one, which node-pty
     // leaves open to every child (the house's read of d5873f0). Without bash it runs under /bin/sh
-    // and skips the loop.
-    const through = launcher ? (this.bash ? [this.bash, ['-p', launcher, opts.shell, ...opts.args]] : ['/bin/sh', [launcher, opts.shell, ...opts.args]]) : [opts.shell, opts.args];
+    // and skips the loop. A shell without integration has no launcher to raise its oom_score_adj
+    // (the house's read of 2c35df8, #22): on Linux the constant text of shellLaunch does, and
+    // execs the shell, which keeps its pid.
+    const oom = !launcher && process.platform === 'linux' && opts.oomScoreAdj !== undefined && opts.oomScoreAdj > 0 ? shellLaunch(opts.oomScoreAdj) : undefined;
+    const through = launcher
+      ? this.bash
+        ? [this.bash, ['-p', launcher, opts.shell, ...opts.args]]
+        : ['/bin/sh', [launcher, opts.shell, ...opts.args]]
+      : oom !== undefined
+        ? this.bash
+          ? [this.bash, ['--noprofile', '--norc', '-p', '-c', oom, 'termd-shell', opts.shell, ...opts.args]]
+          : ['/bin/sh', ['-c', oom, 'termd-shell', opts.shell, ...opts.args]]
+        : [opts.shell, opts.args];
     const p = pty.spawn(through[0] as string, through[1] as string[], {
       name: 'xterm-256color',
       cwd: opts.cwd,
