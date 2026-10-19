@@ -97,6 +97,14 @@ export interface ProcessHandle {
   readonly pid: number;
   /** The process group the daemon owns (the leader's pid for a detached spawn), recorded on run.start (jr2-4). */
   readonly pgid?: number;
+  /**
+   * The leader's frame-free start on Linux — clock ticks after boot, and the boot id they count from —
+   * read when the leader is known and recorded on run.start, so recovery can judge the group across a
+   * wall-clock step (the house's read of the 36 commits, #22, comment 6269992150, item 4). Absent off
+   * Linux and for a backend whose pids are not real processes.
+   */
+  readonly startTicks?: number;
+  readonly bootId?: string;
   onStdout(listener: (data: string) => void): () => void;
   onStderr(listener: (data: string) => void): () => void;
   /** The leader's exit (or `spawnError` when it never started). */

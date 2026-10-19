@@ -65,12 +65,50 @@ export interface ProcessRow {
   zombie: boolean;
 }
 
-/** The machine's boot id (Linux), read once: /proc/sys/kernel/random/boot_id, trimmed. Undefined elsewhere or when unreadable. */
-function readBootId(): string | undefined {
-  if (process.platform !== 'linux') return undefined;
+let bootIdCache: { value: string | undefined } | undefined;
+
+/** The machine's boot id (Linux), read once per daemon from /proc/sys/kernel/random/boot_id, trimmed. Undefined elsewhere or when unreadable. */
+export function bootId(): string | undefined {
+  if (bootIdCache) return bootIdCache.value;
+  let value: string | undefined;
+  if (process.platform === 'linux') {
+    try {
+      const id = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      value = id.length ? id : undefined;
+    } catch {
+      value = undefined;
+    }
+  }
+  bootIdCache = { value };
+  return value;
+}
+
+/**
+ * The start time, in clock ticks after boot, from one /proc/<pid>/stat line (field 22). The comm field
+ * (2) may hold spaces and parentheses, so the fields are counted after the last ')' (the house's read
+ * of the 36 commits, #22, comment 6269992150, item 4). Undefined when the line does not parse.
+ */
+export function statStartTicks(stat: string): number | undefined {
+  const close = stat.lastIndexOf(')');
+  if (close === -1) return undefined;
+  // pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads itrealvalue starttime …
+  const start = Number(stat.slice(close + 2).split(' ')[19]);
+  return Number.isFinite(start) ? start : undefined;
+}
+
+/**
+ * A live pid's frame-free start on Linux — its start ticks and the boot id they count from — read
+ * through the same parser the process listing and the lock use, so every side agrees on the unit.
+ * The backend records it on a process Run's run.start when the group leader is known; recovery and
+ * the lock compare it. Undefined off Linux, when the pid is gone, or when either part is unreadable.
+ */
+export function procStart(pid: number): { startTicks: number; bootId: string } | undefined {
+  if (process.platform !== 'linux' || !(pid > 0)) return undefined;
+  const id = bootId();
+  if (id === undefined) return undefined;
   try {
-    const id = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    return id.length ? id : undefined;
+    const startTicks = statStartTicks(fs.readFileSync(`/proc/${pid}/stat`, 'utf8'));
+    return startTicks === undefined ? undefined : { startTicks, bootId: id };
   } catch {
     return undefined;
   }
@@ -101,7 +139,7 @@ function procRows(): ProcessRow[] | undefined {
     const btime = Number(/^btime (\d+)$/m.exec(fs.readFileSync('/proc/stat', 'utf8'))?.[1]);
     if (!Number.isFinite(btime)) return undefined;
     const hz = 100; // USER_HZ: 100 on every mainstream Linux ABI
-    const bootId = readBootId();
+    const boot = bootId();
     const out: ProcessRow[] = [];
     for (const name of fs.readdirSync('/proc').filter((n) => /^\d+$/.test(n))) {
       let stat: string;
@@ -110,12 +148,12 @@ function procRows(): ProcessRow[] | undefined {
       } catch {
         continue; // gone meanwhile
       }
-      // pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads itrealvalue starttime …
+      // The fields after the comm (which may hold spaces and parentheses): state ppid pgrp …; the start
+      // ticks come from the one parser every side uses (statStartTicks), frame-free for recovery.
       const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
       const pgid = Number(f[2]);
-      const start = Number(f[19]);
-      // starttime is in clock ticks after boot: frame-free, so recovery compares it without a wall-clock frame.
-      if (Number.isFinite(pgid) && Number.isFinite(start)) out.push({ pid: Number(name), pgid, startMs: Math.floor(btime + start / hz) * 1000, startTicks: start, ...(bootId !== undefined && { bootId }), zombie: f[0] === 'Z' });
+      const start = statStartTicks(stat);
+      if (Number.isFinite(pgid) && start !== undefined) out.push({ pid: Number(name), pgid, startMs: Math.floor(btime + start / hz) * 1000, startTicks: start, ...(boot !== undefined && { bootId: boot }), zombie: f[0] === 'Z' });
     }
     return out;
   } catch {
@@ -168,23 +206,6 @@ export function livingGroups(pgids: number[]): number[] {
 /** This process's own start (ms): a lock naming our pid but written before we started is a predecessor's. */
 const selfStartMs = Date.now() - process.uptime() * 1000;
 
-/** This process's own start in clock ticks after boot (Linux): recorded in the lock so a second start can compare frame-free. */
-function selfStartTicks(): number | undefined {
-  if (process.platform !== 'linux') return undefined;
-  return procStartTicks(process.pid);
-}
-
-/** A pid's start in clock ticks after boot (Linux): /proc/<pid>/stat field 22. Undefined off Linux or when gone. */
-function procStartTicks(pid: number): number | undefined {
-  if (process.platform !== 'linux') return undefined;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const start = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]);
-    return Number.isFinite(start) ? start : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 /** Whether a live pid's command names termd: a wall-clock step must not take the lock from a running daemon (macOS, where there are no ticks). */
 function commandNamesTermd(pid: number): boolean {
@@ -249,10 +270,10 @@ function holderLive(h: LockHolder): 'live' | 'stale' | 'self' {
   if (h.pid === process.pid) return h.startedAt >= selfStartMs - 1000 ? 'self' : 'stale';
   if (!(h.pid > 0) || !exists(h.pid)) return 'stale';
   if (h.bootId !== undefined && process.platform === 'linux') {
-    const bootId = readBootId();
-    if (bootId !== undefined && bootId !== h.bootId) return 'stale'; // a different boot: the pid is a new process
-    const ticks = procStartTicks(h.pid);
-    if (h.startTicks !== undefined && ticks !== undefined) return ticks === h.startTicks ? 'live' : 'stale';
+    const boot = bootId();
+    if (boot !== undefined && boot !== h.bootId) return 'stale'; // a different boot: the pid is a new process
+    const now = procStart(h.pid);
+    if (h.startTicks !== undefined && now !== undefined) return now.startTicks === h.startTicks ? 'live' : 'stale';
   }
   const info = processInfo(h.pid);
   if (info === null) return 'stale';
@@ -358,10 +379,10 @@ export function acquireDataDirLock(dataDir: string): DataDirLock {
       },
     };
   };
-  const bootId = readBootId();
-  const startTicks = selfStartTicks();
+  // Our own frame-free start (Linux), through the reader recovery and the listing use.
+  const self = procStart(process.pid);
   for (let attempt = 0; attempt < 50; attempt++) {
-    const me: LockHolder = { pid: process.pid, startedAt: Date.now(), hostname: os.hostname(), nonce: randomBytes(8).toString('hex'), ...(startTicks !== undefined && { startTicks }), ...(bootId !== undefined && { bootId }) };
+    const me: LockHolder = { pid: process.pid, startedAt: Date.now(), hostname: os.hostname(), nonce: randomBytes(8).toString('hex'), ...(self && { startTicks: self.startTicks, bootId: self.bootId }) };
     const raw = JSON.stringify(me) + '\n';
     const tmp = `${file}.${process.pid}.${me.nonce}.tmp`;
     try {

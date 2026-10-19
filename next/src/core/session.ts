@@ -1394,14 +1394,22 @@ export class Session {
     return rec;
   }
 
-  private startRun(run: RunRecord, info: { cwd: string; envBasis?: EnvBasis; pid?: number; pgid?: number | undefined }): void {
+  private startRun(run: RunRecord, info: { cwd: string; envBasis?: EnvBasis; pid?: number; pgid?: number | undefined; startTicks?: number | undefined; bootId?: string | undefined }): void {
     // er-4: the geometry the Run starts at; its transcript is projected at this width (§6 rule 1).
     const ev: Parameters<Journal['append']>[0] = { type: 'run.start', runId: run.runId, cwd: info.cwd, cols: this.screen.cols, rows: this.screen.rows };
     if (run.line !== undefined) ev.line = run.line;
     if (info.envBasis) ev.envBasis = info.envBasis;
-    // jr2-4: a process Run's pid and process group, so a recovery can find what outlived a crash.
+    // jr2-4: a process Run's pid and process group, so a recovery can find what outlived a crash; and the
+    // leader's frame-free start (Linux ticks and boot id, from the backend), so recovery can judge the
+    // group across a wall-clock step (comment 6269992150, item 4). Recorded only with a group.
     if (info.pid !== undefined && info.pid > 0) ev.pid = info.pid;
-    if (info.pgid !== undefined && info.pgid > 0) ev.pgid = info.pgid;
+    if (info.pgid !== undefined && info.pgid > 0) {
+      ev.pgid = info.pgid;
+      if (info.startTicks !== undefined && info.bootId !== undefined) {
+        ev.startTicks = info.startTicks;
+        ev.bootId = info.bootId;
+      }
+    }
     if (run.target === 'shell') {
       // What the output holds besides the command's own, so history cuts it as the live transcript
       // does (core/plumbing.ts; the house's read of 39787b3, #22). A line typed at the prompt is
@@ -2213,7 +2221,7 @@ export class Session {
       return;
     }
     run.process = proc;
-    this.startRun(run, { cwd: this.cwdPath, envBasis: run.envBasis, pid: proc.pid, pgid: proc.pgid });
+    this.startRun(run, { cwd: this.cwdPath, envBasis: run.envBasis, pid: proc.pid, pgid: proc.pgid, startTicks: proc.startTicks, bootId: proc.bootId });
     const output = (stream: 'stdout' | 'stderr') => (d: string) => {
       if (!isTerminal(run.state)) {
         this.append({ type: 'output', data: d, stream, runId: run.runId, attribution: 'exact' });

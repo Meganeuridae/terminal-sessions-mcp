@@ -372,6 +372,16 @@ test('/bin/bash: a process Run that leaves a child in the background says so (le
     // RunInfo carries no pgid; run.start does.)
     const start = journal.since(0).events.find((e) => e.type === 'run.start' && e.runId === r.runId) as Extract<JournalEvent, { type: 'run.start' }>;
     assert.ok(start.pgid !== undefined && groupLives(start.pgid), 'the child keeps the group alive after the Run ended');
+    // On Linux run.start also records the leader's frame-free start — its /proc start ticks and the boot
+    // id — so recovery can judge the group across a wall-clock step (the house's read of the 36 commits,
+    // #22, item 4). Off Linux there are no ticks: both stay absent.
+    if (process.platform === 'linux') {
+      assert.ok(typeof start.startTicks === 'number' && start.startTicks > 0, `run.start carries the leader's start ticks: ${JSON.stringify(start)}`);
+      assert.equal(start.bootId, fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(), 'and the boot id they count from');
+    } else {
+      assert.deepEqual([start.startTicks, start.bootId], [undefined, undefined]);
+      console.log(`# run.start carries no start ticks on ${process.platform}: the frame-free check is Linux-only and is skipped`);
+    }
     const c = await session.cancel(r.runId, AGENT);
     assert.ok(c.steps.length > 0, JSON.stringify(c));
     await until(() => !groupLives(start.pgid!), 3000, 'the group to end');

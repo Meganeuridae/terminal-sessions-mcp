@@ -17,7 +17,7 @@ import { SessionRegistry } from '../src/api/registry.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermError } from '../src/core/errors.js';
 import { Journal } from '../src/core/journal.js';
-import { acquireDataDirLock, LOCK_FILE } from '../src/core/lock.js';
+import { acquireDataDirLock, bootId, LOCK_FILE, procStart, statStartTicks } from '../src/core/lock.js';
 import { FileStore } from '../src/core/stores.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -276,5 +276,26 @@ test('jr2-2: a wall-clock step back does not take the lock from a live daemon (t
     assert.equal((JSON.parse(fs.readFileSync(lockFile, 'utf8')) as { pid: number }).pid, holder.pid, 'the live holder still holds it');
   } finally {
     holder.kill('SIGKILL');
+  }
+});
+
+test('the /proc stat parser counts fields after the last ")" (a comm with spaces and parentheses), and procStart reads a live pid frame-free on Linux (the house\'s read of the 36 commits, #22, item 4)', () => {
+  // Field 22 (starttime) sits at index 19 after the comm; a comm like "my (odd) comm" must not shift it.
+  const after = 'S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 12345678 500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0';
+  assert.equal(statStartTicks(`1234 (my (odd) comm) ${after}`), 98765);
+  assert.equal(statStartTicks(`1234 (node) ${after}`), 98765);
+  assert.equal(statStartTicks('garbage'), undefined);
+  assert.equal(statStartTicks('1234 (x) S 1'), undefined, 'too few fields');
+  if (process.platform === 'linux') {
+    const self = procStart(process.pid);
+    assert.ok(self, 'our own start reads');
+    assert.equal(self.startTicks, statStartTicks(fs.readFileSync('/proc/self/stat', 'utf8')), 'the same parser, the same unit');
+    assert.equal(self.bootId, fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim());
+    assert.equal(bootId(), self.bootId, 'read once, cached');
+    assert.equal(procStart(2_147_483_000), undefined, 'a pid that is not there');
+  } else {
+    assert.equal(procStart(process.pid), undefined);
+    assert.equal(bootId(), undefined);
+    console.log(`# procStart is Linux-only: the /proc read is skipped on ${process.platform}`);
   }
 });

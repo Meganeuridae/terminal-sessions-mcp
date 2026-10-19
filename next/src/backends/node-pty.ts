@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import * as pty from 'node-pty';
 import { err } from '../core/errors.js';
 import { processLaunch, shellLaunch, viaBash } from '../core/launch.js';
+import { procStart } from '../core/lock.js';
 import type { ExecutionBackend, ForegroundInfo, ProcessHandle, PtyExit, PtyHandle, SpawnProcessOptions, SpawnShellOptions } from './types.js';
 
 const signalName = (n: number | undefined): string | undefined => {
@@ -349,6 +350,9 @@ export class NodePtyBackend implements ExecutionBackend {
     const errL = new Set<(d: string) => void>();
     const exitL = new Set<(e: PtyExit) => void>();
     const pgid = child.pid;
+    // The leader's frame-free start (Linux), read now that its pid is known, through the reader recovery
+    // and the lock use, so run.start records what orphanGroups will compare (comment 6269992150, item 4).
+    const start = child.pid !== undefined ? procStart(child.pid) : undefined;
     let fired = false;
     let spawned = false;
     let leaderExited = false;
@@ -419,6 +423,7 @@ export class NodePtyBackend implements ExecutionBackend {
       get pgid() {
         return pgid ?? -1;
       },
+      ...(start && { startTicks: start.startTicks, bootId: start.bootId }),
       onStdout: (l) => (outL.add(l), () => outL.delete(l)),
       onStderr: (l) => (errL.add(l), () => errL.delete(l)),
       onExit: (l) => (exitL.add(l), () => exitL.delete(l)),
