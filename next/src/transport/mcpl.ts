@@ -243,6 +243,13 @@ interface Opening {
   held: Map<string, { t: Target; seg: Segment }>;
   opens: number;
 }
+
+/**
+ * Where a catch-up summary pins the cursor: the earliest start among the omitted range and the gone
+ * ranges it names. Pinned at the omitted range's start, the later one, it let the cursor pass a gone
+ * range before the host acknowledged it (the house's read of 78c4d6e, #22).
+ */
+export const summaryFloor = (o: Omitted | undefined, gaps: ReadonlyArray<{ from: Seq }>): Seq => Math.min(o?.from ?? Number.POSITIVE_INFINITY, ...gaps.map((g) => g.from));
 const targetOf = (entry: AnySession): Target => (entry.kind === 'live' ? entry.session : entry);
 const liveOf = (t: Target): Session | undefined => ('kind' in t && t.kind === 'history' ? undefined : (t as Session));
 
@@ -594,7 +601,7 @@ export class McplLane {
     const own = boundary !== undefined ? unqualify(String(boundary)) : undefined;
     const before = own !== undefined ? seqOfMessageId(own, sid, t.journal) : undefined;
     if (boundary !== undefined && before === undefined) {
-      throw new RpcError(INVALID_PARAMS, `history.beforeMessageId is not a message id of this channel: ids look like ${NODE_NAME}/${sid}~<epoch>:<kind>:<seq>, as channels/incoming and channels/open history give them, and the node, the session and the epoch must be this channel's`, { beforeMessageId: String(boundary).slice(0, 200) });
+      throw new RpcError(INVALID_PARAMS, `history.beforeMessageId is not a message id of this channel: ids look like ${NODE_NAME}/${sid}~<epoch>:<kind>[~<qualifier>]:<seq>, as channels/incoming and channels/open history give them, and the node, the session and the epoch must be this channel's`, { beforeMessageId: String(boundary).slice(0, 200) });
     }
     // The history is read before anything changes: a read that fails (a store error) refuses the
     // open with nothing opened, as a refused parameter does. While it is read, the channel is
@@ -1001,7 +1008,9 @@ export class McplLane {
    */
   private maySyncReturn(session: Session, run: RunInfo): boolean {
     if (session.isAwaitedBy(run.runId, this.me)) return true;
-    return run.principal === this.me && this.app.extras(session).services.get(run.runId) !== undefined && Date.now() - run.admittedAt < this.app.maxWaitMs + HOLD_MS;
+    // The Run's age on the monotonic clock (see Session.runAgeMs): a Run this daemon life did not admit has no start in flight here.
+    const age = session.runAgeMs(run.runId);
+    return run.principal === this.me && age !== undefined && this.app.extras(session).services.get(run.runId) !== undefined && age < this.app.maxWaitMs + HOLD_MS;
   }
 
   private onSegment(session: Session, seg: Segment): void {
@@ -1229,11 +1238,10 @@ export class McplLane {
       // (the segmenter's read, comment 6265082050 on #22: the catch-up never told the host of it).
       if (omitted || scan.lost?.length) {
         const gaps = scan.lost ?? [];
-        // The summary pins at the earliest of what it names. Pinned at the omitted range's start, the
-        // later one, it let the cursor pass the gone range before the host acknowledged it, and the
-        // reconnect's rescan, starting past the gap, named only the omitted messages (the house's read
-        // of 78c4d6e, #22).
-        const from = Math.min(omitted?.from ?? Number.POSITIVE_INFINITY, ...gaps.map((g) => g.from));
+        // The summary pins at the earliest of what it names (`summaryFloor`): pinned later, it let the cursor
+        // pass the gone range before the host acknowledged it, and the reconnect's rescan, starting past
+        // the gap, named only the omitted messages (the house's read of 78c4d6e, #22).
+        const from = summaryFloor(omitted, gaps);
         const to = omitted?.to ?? gaps[gaps.length - 1]!.to;
         this.owe(p.st, to);
         w.summary = this.summary(p.t, omitted, scan.lost);

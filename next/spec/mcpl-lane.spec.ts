@@ -23,7 +23,7 @@ import type { SegmenterOptions } from '../src/core/segmenter.js';
 import { seqOfMessageId } from '../src/core/segmenter.js';
 import type { Session } from '../src/core/session.js';
 import { Outbound, type Message } from '../src/transport/jsonrpc.js';
-import { FEATURE_SETS, manifest, McplLane, NODE_NAME } from '../src/transport/mcpl.js';
+import { FEATURE_SETS, manifest, McplLane, NODE_NAME, summaryFloor } from '../src/transport/mcpl.js';
 import { TermServer } from '../src/transport/server.js';
 import { FULL_GRANT, TestHost, sleep, until, type Delivery, type Msg } from './testhost.js';
 
@@ -1238,17 +1238,28 @@ test("a history boundary is an id of this channel: another session's id, this se
   }
 });
 
-test('a catch-up summary of omitted messages and a gone range names the two ranges apart, in its text and its metadata', () => {
-  // The floor's pin at the earliest of the two is shown end to end above; this is the message itself (the house's read of 78c4d6e, #22).
+test('a catch-up summary of omitted messages and gone ranges names them apart, and its floor is the earliest start among them', () => {
+  // The floor's pin is shown end to end above with one gone range; here the message itself, with two gone ranges
+  // and with one past the omitted range (the house's read of 78c4d6e, #22; a reviewer's read of the fixes for #22 comment 6270045466).
   const lane = new McplLane({} as unknown as App, { principal: A, connectionId: 'c-sum' }, new Outbound(() => undefined), () => undefined);
   try {
     const t = { kind: 'history', id: 'sm', journal: { epoch: 'e1' } };
     const summary = (lane as unknown as { summary: (t: unknown, o: unknown, lost: unknown) => { seq: number; messageId: string; head: string; metadata: Record<string, unknown> } }).summary.bind(lane);
-    const both = summary(t, { count: 4, from: 228, to: 240, kinds: { run: 4 } }, [{ from: 1, to: 226 }]);
+    const omitted = { count: 4, from: 228, to: 240, kinds: { run: 4 } };
+    const both = summary(t, omitted, [{ from: 1, to: 226 }]);
     assert.equal(both.seq, 240);
     assert.equal(both.messageId, 'sm~e1:summary:240');
     assert.match(both.head, /^\[terminal\] sm: 4 earlier messages .*\(4 completions\) · seq 228–240 · seq 1–226 gone past retention, with whatever happened then · read session=sm since=227 as=events$/);
     assert.deepEqual([both.metadata.count, both.metadata.from, both.metadata.to, both.metadata.lostFrom, both.metadata.lostTo], [4, 228, 240, 1, 226]);
+    assert.equal(summaryFloor(omitted, [{ from: 1 }]), 1);
+    const two = summary(t, omitted, [{ from: 1, to: 100 }, { from: 150, to: 226 }]);
+    assert.match(two.head, / · seq 1–100, 150–226 gone past retention, with whatever happened then · read session=sm since=227 as=events$/);
+    assert.deepEqual([two.seq, two.metadata.lostFrom, two.metadata.lostTo], [240, 1, 226]);
+    assert.equal(summaryFloor(omitted, [{ from: 1 }, { from: 150 }]), 1, 'the earliest of three starts');
+    const after = summary(t, omitted, [{ from: 300, to: 310 }]);
+    assert.deepEqual([after.seq, after.metadata.from, after.metadata.lostFrom, after.metadata.lostTo], [240, 228, 300, 310]);
+    assert.equal(summaryFloor(omitted, [{ from: 300 }]), 228, 'a gone range past the omitted range: the omitted start pins');
+    assert.equal(summaryFloor(undefined, [{ from: 5 }, { from: 2 }]), 2);
     const gapOnly = summary(t, undefined, [{ from: 1, to: 226 }]);
     assert.equal(gapOnly.seq, 226);
     assert.deepEqual([gapOnly.metadata.count, gapOnly.metadata.lostFrom, gapOnly.metadata.lostTo], [0, 1, 226]);
@@ -1433,5 +1444,30 @@ test('an open whose follow fails leaves no channel opening, nothing registered a
     assert.equal(f.inside.states.get('ff')?.owed.size ?? 0, 0, 'nothing owed');
   } finally {
     await f.close();
+  }
+});
+
+test("a young service Run stays hold-eligible across a wall-clock step: the ready its start returns is not pushed beside it", { timeout: 30_000 }, async (t) => {
+  // The age was Date.now against the journaled admittedAt: stepped two minutes forward, the Run looked older than
+  // any call could wait, its ready was not held, and the host got it twice (G28).
+  const d = await daemon();
+  const real = Date.now.bind(Date);
+  let offset = 0;
+  t.mock.method(Date, 'now', () => real() + offset);
+  try {
+    const a = await d.host('ta', 'sm-a');
+    await a.call('session_open', { session: 'smono' });
+    const starting = a.call('start', { session: 'smono', command: "sh -c 'sleep 1; echo listening; sleep 5'", target: 'process', ready: { pattern: 'listening' }, wait: 8000 });
+    await sleep(300);
+    offset = 120_000; // the wall clock steps forward while the start waits for ready
+    const st = await starting;
+    assert.equal(st.structured?.service, 'ready', st.text);
+    const runId = st.structured?.runId as string;
+    await a.noDelivery((x) => x.metadata.runId === runId && x.tags.includes('terminal:service-ready'), 3000, 'after a start that returned ready');
+    offset = 0;
+    await a.call('cancel', { runId });
+    await a.close();
+  } finally {
+    await d.stop();
   }
 });

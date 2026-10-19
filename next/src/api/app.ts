@@ -749,10 +749,16 @@ export class App {
   private recoverRun(idem: string): RunResult | undefined {
     this.indexRecoveredIdem();
     const hit = this.recoveredIdem!.get(idem);
-    if (!hit || Date.now() - hit.run.admittedAt > this.idem.windowMs) return undefined;
+    if (!hit || this.runAgeMs(hit.session, hit.run) > this.idem.windowMs) return undefined;
     const r = hit.run;
     const last = r.seq.end ?? r.seq.admit;
     return { runId: r.runId, session: hit.session, target: r.target, state: r.state, cwd: r.cwd ?? '', attribution: r.attribution, output: { text: '', truncated: false, seq: [r.seq.admit, last], nextCursor: last } };
+  }
+
+  /** The Run's age for a window this daemon life measures: monotonic when this life admitted it, else the wall clock's, the only stamp a recovered Run has (a reviewer's read of the fixes for #22 comment 6270045466). */
+  private runAgeMs(sessionId: string, run: RunInfo): number {
+    const s = this.registry.get(sessionId);
+    return (s?.kind === 'live' ? s.session.runAgeMs(run.runId) : undefined) ?? Date.now() - run.admittedAt;
   }
 
   /** A retried `run` or `start` (G16): the same Run, awaited again — never a second execution. */

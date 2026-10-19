@@ -767,7 +767,7 @@ message's `metadata` is structured: `{node, session, state, cwd, controller, kin
 runId?, exit?, outputFrom?, outputTo?, nextCursor?, supersedes?}`, where `seq` is the journal
 event the message reports — what the `delivered` cursor advances to — and message and event
 ids are node-qualified (`<node>/<session>~<epoch>:<kind>:<seq>`, a digest's with `~<runId>`
-after the kind; the epoch is the journal's, so a forgotten name's new journal never reuses an
+and a screen's with its ordinal after the kind; the epoch is the journal's, so a forgotten name's new journal never reuses an
 id), so two daemons never collide in a host's dedup window. A history boundary
 (`beforeMessageId`) must be one of these ids; any other form is refused, not read as no
 boundary. The idle segment of draft 3 is dropped: a prompt without a Run is not

@@ -163,6 +163,8 @@ export const UNKNOWN_TYPER: Principal = 'human:unknown';
 
 interface RunRecord extends RunInfo {
   waiters: Array<(r: RunInfo) => void>;
+  /** The monotonic clock at admission, for the ages this daemon life measures (see `runAgeMs`); never journaled, so a Run rebuilt from the journal has none. */
+  admittedMono?: number;
   /** Called on any state change (start or end). */
   changeWaiters?: Array<() => void>;
   process?: ProcessHandle;
@@ -206,7 +208,7 @@ const MAX_ORPHAN_LINES = 32;
  */
 const probeLine = (nonce: string) => ` echo "<<<PRO""BE:${nonce}>>>"`;
 const publicRun = (r: RunRecord): RunInfo => {
-  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, shellPid: _sh, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, ...info } = r;
+  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, shellPid: _sh, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, ...info } = r;
   return { ...info, seq: { ...info.seq } };
 };
 
@@ -1389,6 +1391,7 @@ export class Session {
       principal: init.principal,
       state: 'queued',
       admittedAt: admitted?.ts ?? this.now(),
+      admittedMono: clocks.monotonic(),
       seq: { admit: admitted?.seq ?? this.journal.lastSeq },
       attribution: init.target === 'process' ? 'exact' : 'temporal',
       waiters: [],
@@ -2487,6 +2490,17 @@ export class Session {
 
   run(runId: string): RunInfo {
     return publicRun(this.getRun(runId));
+  }
+
+  /**
+   * How long ago the Run was admitted, on the monotonic clock, for a hold or a window this daemon
+   * life measures: against the journaled wall-clock stamp, a step forward ended a young service
+   * Run's hold (a reviewer's read of the fixes for #22 comment 6270045466). Undefined for a Run this life did not admit,
+   * whose only stamp is the wall clock's.
+   */
+  runAgeMs(runId: string): number | undefined {
+    const r = this.runs.get(runId);
+    return r?.admittedMono === undefined ? undefined : clocks.monotonic() - r.admittedMono;
   }
 
   listRuns(): RunInfo[] {
