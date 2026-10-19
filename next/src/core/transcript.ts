@@ -59,24 +59,31 @@
  *    `maxLines` (default 50 000) caps the logical lines returned, keeping the
  *    head or tail. When keeping the tail, input older than the last
  *    `maxLines + 2·rows` newlines is not projected (it cannot contribute to the
- *    last `maxLines` lines of line-oriented output) and counts as omitted; when
- *    keeping the head, projection stops once `maxLines` lines are complete and
- *    the rest counts as omitted. Any omission or dropped line sets `truncated`.
- *    Input omitted from the head still applies the lasting terminal state it
- *    set (modes, the scroll region, character sets: `persistentState` in
- *    screen.ts), so the tail of apt-style output projects as the terminal shows it.
+ *    last `maxLines` lines of line-oriented output) and counts as omitted; a
+ *    full-screen program's time on the alternate screen counts as `rows + 1`
+ *    lines there, however many newlines it wrote, since only its final frame
+ *    projects (rule 5), and the cut never lands inside it. When keeping the
+ *    head, projection stops once `maxLines` lines are complete and the rest
+ *    counts as omitted. Any omission or dropped line sets `truncated`. Input
+ *    omitted from the head still applies the lasting terminal state it set
+ *    (modes, the scroll region, character sets: `persistentState` in screen.ts),
+ *    so the tail of apt-style output projects as the terminal shows it.
  *
  * Good for reading and search; never presented as a screen (G14).
  *
  * Cost: the emulator is fed in batches sized so that no row can scroll out of
- * its small scrollback before it is read; rows are moved into the projection as
- * they scroll, so memory is bounded by the kept text, not by the range, and
- * time is linear in the projected bytes.
+ * its small scrollback before it is read, and so that no control sequence is
+ * split; rows are moved into the projection as they scroll, so memory is
+ * bounded by the kept text, not by the range, and time is linear in the
+ * projected bytes. With `maxInputBytes`, the chunks are cut to the budget as
+ * they are gathered (what is dropped leaves only its lasting state behind), so
+ * a range far larger than the budget costs the budget; with `maxLines` alone,
+ * the range is gathered whole before the newline count cuts it.
  */
 import xterm from '@xterm/headless';
 import type { IBuffer, Terminal as TerminalType } from '@xterm/headless';
 import { persistentState } from './screen.js';
-import { headIndex, tailIndex, utf8Length } from './text.js';
+import { headIndex, sequenceEnd, tailIndex, utf8Length } from './text.js';
 
 const { Terminal } = xterm;
 
@@ -120,7 +127,7 @@ export interface TranscriptOptions {
 
 /** Rows of scrollback in the scratch emulator; each batch may add at most this many. */
 const SCRATCH_SCROLLBACK = 4096;
-/** Largest batch in UTF-16 units, so the event loop is yielded to regularly. */
+/** Largest batch in UTF-16 units, so the event loop is yielded to regularly; one control sequence longer than this is still fed whole. */
 const MAX_BATCH = 512 * 1024;
 const DEFAULT_MAX_LINES = 50_000;
 
@@ -129,6 +136,16 @@ interface Segment {
   key: string;
   pipe: boolean;
   data: string;
+  /** UTF-8 bytes of `data`. */
+  bytes: number;
+}
+
+/** The byte budget applied while the chunks are gathered (rule 7, Cost): what it dropped, and the lasting state of a dropped head. */
+interface Budget {
+  max: number;
+  keep: 'head' | 'tail';
+  omitted: number;
+  state: string;
 }
 
 /** Numeric value of a CSI parameter (sub-parameters take their first value). */
@@ -209,9 +226,27 @@ class Projector {
     // with the rows it was counted from (er-2).
     const removed = n.length - this.rows;
     await this.feed('\x1b[3J');
-    // Move the saved cursor up by the rows removed above it (xterm internals; skipped if they change).
+    this.rebaseSavedCursor(removed);
+  }
+
+  /** Move the saved cursor up by the rows removed above it (xterm internals; skipped if they change). */
+  private rebaseSavedCursor(removed: number): void {
     const saved = (this.term as unknown as { _core?: { buffers?: { normal?: { savedY?: unknown } } } })._core?.buffers?.normal;
     if (saved && typeof saved.savedY === 'number' && removed > 0) saved.savedY = Math.max(0, saved.savedY - removed);
+  }
+
+  /**
+   * Drop the normal buffer's rows above the cursor's, which becomes the top row.
+   * The saved cursor moves with it, as after ED 3: a DECRC after a clear would
+   * otherwise land on the row it was saved on counted from the dropped top (the
+   * house's read of ed4ecac, #22: `cleared`, eight blank lines, `RESTORED`, where
+   * a terminal writes RESTORED over cleared).
+   */
+  private clearToCursorRow(): void {
+    const n = this.term.buffer.normal;
+    const removed = n.baseY + n.cursorY;
+    this.term.clear();
+    this.rebaseSavedCursor(removed);
   }
 
   get cursorX(): number {
@@ -277,7 +312,7 @@ class Projector {
       this.rowsOut(buf, 0, lastNonEmpty(buf) + 1);
       this.out.close();
       // Drop the kept rows; the cursor's row moves to the top and the erase blanks it.
-      this.term.clear();
+      this.clearToCursorRow();
     }
     return false;
   }
@@ -296,7 +331,7 @@ class Projector {
       this.rowsOut(buf, cursorRow + 1, last + 1);
       this.out.close();
     }
-    this.term.clear();
+    this.clearToCursorRow();
     return false;
   }
 
@@ -340,11 +375,15 @@ function lastNonEmpty(buf: IBuffer, from = 0): number {
 
 /**
  * End of the next batch of `data` from `from`: the longest prefix whose worst-case
- * row count fits `budget`, ending at a safe point (after a newline, or before an
- * ESC) so the scrollback-clearing ED 3 between batches never lands inside a
- * sequence. Rows are bounded by line feeds (LF, VT, FF, IND, NEL), two per escape
- * (an escape can reposition the cursor to force a wrap), and printed cells over
- * the width.
+ * row count fits `budget`, ending at a safe point (after a newline, before or
+ * after a control sequence) so the scrollback-clearing ED 3 between batches never
+ * lands inside a sequence. A sequence is taken whole, its payload counted as no
+ * cells, and one that straddles MAX_BATCH extends the batch to its end; one that
+ * never ends in `data` ends the batch before it, or is the rest of the data (the
+ * house's read of ed4ecac, #22: a batch cut inside a long OSC let the ED 3 end it,
+ * and the rest of its payload printed). Rows are bounded by line feeds (LF, VT,
+ * FF, IND, NEL), two per sequence (it can reposition the cursor to force a wrap),
+ * and printed cells over the width.
  */
 function batchEnd(data: string, from: number, budget: number, cols: number): number {
   let feeds = 0;
@@ -352,25 +391,33 @@ function batchEnd(data: string, from: number, budget: number, cols: number): num
   let cells = 0;
   let safe = from;
   const limit = Math.min(data.length, from + MAX_BATCH);
-  for (let i = from; i < limit; i++) {
+  let i = from;
+  while (i < limit) {
     const c = data.charCodeAt(i);
-    if (c === 0x0a || c === 0x0b || c === 0x0c || c === 0x84 || c === 0x85) {
-      feeds++;
-    } else if (c === 0x1b || c === 0x9b) {
+    let next = i + 1;
+    if (c === 0x1b || c === 0x9b) {
+      const e = sequenceEnd(data, i);
+      if (e === undefined) return i > from ? i : data.length;
       if (i > from) safe = i;
       escapes++;
+      next = e;
+    } else if (c === 0x0a || c === 0x0b || c === 0x0c || c === 0x84 || c === 0x85) {
+      feeds++;
     } else if (c >= 0x20 && c !== 0x7f && !(c >= 0x80 && c < 0xa0)) {
       cells += c >= 0x1100 ? 2 : 1;
+      // A surrogate pair is one character: never split.
+      if ((c & 0xfc00) === 0xd800 && (data.charCodeAt(i + 1) & 0xfc00) === 0xdc00) next = i + 2;
     }
     if (feeds + 2 * escapes + Math.ceil(cells / cols) + 1 > budget) {
       if (safe > from) return safe;
-      // No safe point: printable text can be split anywhere but inside a surrogate pair.
-      const end = (c & 0xfc00) === 0xdc00 ? i - 1 : i;
-      return end > from ? end : Math.min(data.length, from + 2);
+      // No safe point: printable text can be split anywhere between characters; at least one unit goes.
+      return i > from ? i : next;
     }
-    if (c === 0x0a) safe = i + 1;
+    if (c === 0x0a || c === 0x1b || c === 0x9b) safe = next;
+    i = next;
   }
-  return limit;
+  // At the cap, not inside a sequence (a straddling one moved `i` past it) and not inside a pair.
+  return i < data.length && (data.charCodeAt(i) & 0xfc00) === 0xdc00 && i - 1 > from ? i - 1 : i;
 }
 
 const pipeToTty = (s: string): string => s.replace(/\n/g, '\r\n');
@@ -381,20 +428,63 @@ const pipeToTty = (s: string): string => s.replace(/\n/g, '\r\n');
  * that source ends the line. Held ends are emitted, in the order they began,
  * before a note and at the end. A header segment precedes each change of source
  * when `label` gives one.
+ *
+ * With a `budget`, what cannot survive `cutInput` is dropped as it arrives, so
+ * the memory held is the budget's, not the range's (the house's read of
+ * ed4ecac, #22: 400 MiB of chunks under a 1 KiB budget peaked at 808 MiB): when
+ * the tail is kept, a whole emitted segment goes once the segments after it
+ * hold the budget, and a segment or a held line is cut to its last budget's
+ * worth (not inside a sequence) once it holds twice that; when the head is kept,
+ * everything after the budget is full goes. A dropped head leaves its lasting state in
+ * `budget.state`, as `cutInput`'s does. The exact cut is still `cutInput`'s.
  */
-function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']): Segment[] {
+function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label'], budget?: Budget): Segment[] {
   const out: Segment[] = [];
-  const held = new Map<string, { info: SourceInfo; pipe: boolean; data: string }>();
+  let outBytes = 0;
+  const held = new Map<string, { info: SourceInfo; pipe: boolean; data: string; bytes: number; full: boolean }>();
   let notes = 0;
+  const drop = (data: string, bytes: number) => {
+    budget!.omitted += bytes;
+    if (budget!.keep === 'tail') budget!.state = persistentState(budget!.state + persistentState(data));
+  };
   const emit = (key: string, pipe: boolean, info: SourceInfo | undefined, data: string) => {
+    const bytes = utf8Length(data);
+    if (budget?.keep === 'head' && outBytes >= budget.max) {
+      drop(data, bytes);
+      return;
+    }
+    outBytes += bytes;
     const last = out[out.length - 1];
     if (last && last.key === key) {
       last.data += data;
-      return;
+      last.bytes += bytes;
+    } else {
+      const header = info && label?.(info);
+      if (header) {
+        const h = `${header}\n`;
+        out.push({ key: `n:${notes++}`, pipe: true, data: h, bytes: utf8Length(h) });
+        outBytes += utf8Length(h);
+      }
+      out.push({ key, pipe, data, bytes });
     }
-    const header = info && label?.(info);
-    if (header) out.push({ key: `n:${notes++}`, pipe: true, data: `${header}\n` });
-    out.push({ key, pipe, data });
+    if (budget?.keep !== 'tail') return;
+    // Kept tail: the segments after the first hold the budget, so the first cannot survive the cut.
+    while (out.length > 1 && outBytes - out[0]!.bytes >= budget.max) {
+      const gone = out.shift()!;
+      outBytes -= gone.bytes;
+      drop(gone.data, gone.bytes);
+    }
+    // One source's run past twice the budget: only its last budget's worth can survive.
+    const end = out[out.length - 1]!;
+    if (end.bytes > 2 * budget.max) {
+      const cut = tailStart(end.data, budget.max);
+      const gone = end.data.slice(0, cut);
+      end.data = end.data.slice(cut);
+      outBytes -= end.bytes;
+      end.bytes = utf8Length(end.data);
+      outBytes += end.bytes;
+      drop(gone, utf8Length(gone));
+    }
   };
   const flush = () => {
     for (const [key, h] of held) if (h.data) emit(key, h.pipe, h.info, h.data);
@@ -403,7 +493,8 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
   for (const ch of chunks) {
     if (typeof ch !== 'string' && 'note' in ch) {
       flush();
-      out.push({ key: `n:${notes++}`, pipe: true, data: `${ch.note}\n` });
+      const n = `${ch.note}\n`;
+      emit(`n:${notes++}`, true, undefined, n);
       continue;
     }
     const c = typeof ch === 'string' ? { data: ch } : ch;
@@ -415,19 +506,37 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       // A Run's pipes together are labelled `stdout`.
       const info: SourceInfo = { stream: pipe ? 'stdout' : 'pty' };
       if (pipe && c.runId !== undefined) info.runId = c.runId;
-      h = { info, pipe, data: '' };
+      h = { info, pipe, data: '', bytes: 0, full: false };
       held.set(key, h);
     }
     // Only the new data is searched for a LF, so a long unfinished line costs its length once.
     const nl = c.data.lastIndexOf('\n');
     if (nl === -1) {
+      if (h.full) {
+        drop(c.data, utf8Length(c.data));
+        continue;
+      }
       h.data += c.data;
+      h.bytes += utf8Length(c.data);
+      if (budget && h.bytes > 2 * budget.max) {
+        // An unfinished line past twice the budget: only a budget's worth of it can survive. Kept
+        // head: that worth is its start, and the rest of the line (`full`) is dropped as it comes.
+        const cut = budget.keep === 'tail' ? tailStart(h.data, budget.max) : headIndex(h.data, budget.max);
+        const gone = budget.keep === 'tail' ? h.data.slice(0, cut) : h.data.slice(cut);
+        h.data = budget.keep === 'tail' ? h.data.slice(cut) : h.data.slice(0, cut);
+        h.bytes = utf8Length(h.data);
+        h.full = budget.keep === 'head';
+        drop(gone, utf8Length(gone));
+      }
       continue;
     }
-    emit(key, pipe, h.info, h.data + c.data.slice(0, nl + 1));
+    if (h.full) drop(c.data.slice(0, nl + 1), utf8Length(c.data.slice(0, nl + 1)));
+    emit(key, pipe, h.info, h.full ? h.data : h.data + c.data.slice(0, nl + 1));
     // Re-inserted, so the held ends keep the order in which they began.
     held.delete(key);
     h.data = c.data.slice(nl + 1);
+    h.bytes = utf8Length(h.data);
+    h.full = false;
     if (h.data) held.set(key, h);
   }
   flush();
@@ -439,8 +548,16 @@ function dropHead(segs: Segment[], k: number, at: number, dropped: string[]): vo
   for (let i = 0; i < k; i++) dropped.push(segs[i]!.data);
   dropped.push(segs[k]!.data.slice(0, at));
   segs[k]!.data = segs[k]!.data.slice(at);
+  segs[k]!.bytes = utf8Length(segs[k]!.data);
   segs.splice(0, k);
   if (!segs[0]!.data) segs.shift();
+}
+
+/** Where the last `max` UTF-8 bytes of `data` start, moved to a line boundary when one lies in the first half of them (rule 7). */
+function tailStart(data: string, max: number): number {
+  const start = tailIndex(data, max);
+  const nl = data.indexOf('\n', start);
+  return nl !== -1 && utf8Length(data.slice(start, nl + 1)) <= max / 2 ? nl + 1 : start;
 }
 
 /**
@@ -456,12 +573,7 @@ function cutInput(segs: Segment[], max: number, keep: 'head' | 'tail', dropped: 
     let k = segs.length - 1;
     while (k >= 0 && acc + sizes[k]! <= max) acc += sizes[k--]!;
     // Segment k holds the cut; the budget left for it is max - acc.
-    const seg = segs[k]!;
-    let start = tailIndex(seg.data, max - acc);
-    // Prefer a line boundary within the first half of what is kept.
-    const nl = seg.data.indexOf('\n', start);
-    if (nl !== -1 && utf8Length(seg.data.slice(start, nl + 1)) <= max / 2) start = nl + 1;
-    dropHead(segs, k, start, dropped);
+    dropHead(segs, k, tailStart(segs[k]!.data, max - acc), dropped);
   } else {
     let acc = 0;
     let k = 0;
@@ -471,26 +583,74 @@ function cutInput(segs: Segment[], max: number, keep: 'head' | 'tail', dropped: 
     const nl = end > 0 ? seg.data.lastIndexOf('\n', end - 1) : -1;
     if (nl !== -1 && utf8Length(seg.data.slice(nl + 1, end)) <= max / 2) end = nl + 1;
     seg.data = seg.data.slice(0, end);
+    seg.bytes = utf8Length(seg.data);
     segs.splice(k + 1);
     if (!seg.data) segs.pop();
   }
   return total - segs.reduce((a, s) => a + utf8Length(s.data), 0);
 }
 
-/** Keep only input after the newline that precedes the last `n` newlines (rule 7, tail). Returns bytes omitted; the omitted data goes to `dropped`. */
-function cutToLastNewlines(segs: Segment[], n: number, dropped: string[]): number {
+/** A switch to or from the alternate screen (modes 47, 1047, 1049), matched at `lastIndex`. */
+const ALT_SWITCH = /\x1b\[\?([0-9;]*)([hl])/y;
+
+/** The last alternate-screen switch in `d` that starts before `i`: where, and whether it enters. */
+function altSwitchBefore(d: string, i: number): { at: number; enter: boolean } | undefined {
+  let j = i;
+  while (j > 0 && (j = d.lastIndexOf('\x1b[?', j - 1)) !== -1) {
+    ALT_SWITCH.lastIndex = j;
+    const m = ALT_SWITCH.exec(d);
+    if (m && m[1]!.split(';').some((p) => ALT_MODES.has(Number(p)))) return { at: j, enter: m[2] === 'h' };
+  }
+  return undefined;
+}
+
+/**
+ * Keep only input after the newline that precedes the last `n` newlines (rule 7,
+ * tail). Newlines inside a full-screen program's time on the alternate screen
+ * are not counted: the program's frames project as one final frame of at most
+ * `rows` lines (plus the line it interrupted), whatever they contained, so that
+ * time counts as `rows + 1`, and the cut never lands inside it (the house's read
+ * of ed4ecac, #22: five frames of 29 lines cut `before` from a three-line
+ * projection). Returns bytes omitted; the omitted data goes to `dropped`.
+ */
+function cutToLastNewlines(segs: Segment[], n: number, rows: number, dropped: string[]): number {
+  const cut = (k: number, at: number): number => {
+    const omitted = segs.slice(0, k).reduce((a, s) => a + utf8Length(s.data), 0) + utf8Length(segs[k]!.data.slice(0, at));
+    dropHead(segs, k, at, dropped);
+    return omitted;
+  };
+  // Whether the range ends inside a full-screen program: the last switch in the pty's output says.
+  let inAlt = false;
+  const lastSwitch: Array<{ at: number; enter: boolean } | undefined> = [];
+  for (let k = segs.length - 1; k >= 0; k--) {
+    const sw = segs[k]!.pipe ? undefined : altSwitchBefore(segs[k]!.data, segs[k]!.data.length);
+    lastSwitch[k] = sw;
+    if (sw) {
+      inAlt = sw.enter;
+      break;
+    }
+  }
   let seen = 0;
   for (let k = segs.length - 1; k >= 0; k--) {
-    const d = segs[k]!.data;
+    const seg = segs[k]!;
+    const d = seg.data;
     let i = d.length;
+    let sw = k in lastSwitch ? lastSwitch[k] : seg.pipe ? undefined : altSwitchBefore(d, i);
     while (i > 0) {
       const nl = d.lastIndexOf('\n', i - 1);
-      if (nl === -1) break;
-      if (++seen > n) {
-        const omitted = segs.slice(0, k).reduce((a, s) => a + utf8Length(s.data), 0) + utf8Length(d.slice(0, nl + 1));
-        dropHead(segs, k, nl + 1, dropped);
-        return omitted;
+      if (sw && sw.at > nl) {
+        if (!sw.enter) inAlt = true;
+        else if (inAlt) {
+          inAlt = false;
+          seen += rows + 1;
+          if (seen > n) return cut(k, sw.at);
+        }
+        i = sw.at;
+        sw = altSwitchBefore(d, i);
+        continue;
       }
+      if (nl === -1) break;
+      if (!inAlt && ++seen > n) return cut(k, nl + 1);
       i = nl;
     }
   }
@@ -506,11 +666,12 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
   const rows = int(opts.rows, 30, 1);
   const maxLines = int(opts.maxLines, DEFAULT_MAX_LINES, 1);
   const keep = opts.keep ?? 'tail';
-  const segs = segments(chunks, opts.label);
-  let omitted = 0;
-  const dropped: string[] = [];
-  if (opts.maxInputBytes !== undefined) omitted += cutInput(segs, Math.max(0, opts.maxInputBytes), keep, dropped);
-  if (keep === 'tail') omitted += cutToLastNewlines(segs, maxLines + 2 * rows, dropped);
+  const budget: Budget | undefined = opts.maxInputBytes !== undefined ? { max: Math.max(0, opts.maxInputBytes), keep, omitted: 0, state: '' } : undefined;
+  const segs = segments(chunks, opts.label, budget);
+  let omitted = budget?.omitted ?? 0;
+  const dropped: string[] = budget?.state ? [budget.state] : [];
+  if (budget) omitted += cutInput(segs, budget.max, keep, dropped);
+  if (keep === 'tail') omitted += cutToLastNewlines(segs, maxLines + 2 * rows, rows, dropped);
   // The omitted head still set lasting terminal state (rule 7): a scroll region, modes, character sets.
   const state = dropped.length ? persistentState(dropped.map(persistentState).join('')) : '';
   if (state && segs[0]) segs[0].data = state + segs[0].data;

@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
+import { persistentState } from '../src/core/screen.js';
 import { project, transcript } from '../src/core/transcript.js';
 import type { ProjectChunk } from '../src/core/transcript.js';
 
@@ -142,6 +143,76 @@ test('emu-8: a full-screen program leaves its final frame in the transcript', as
   assert.equal(await text(['$ vim f\r\n', '\x1b[?1049h\x1b[Hline one\r\n~\r\n~']), '$ vim f\nline one\n~\n~');
   // An empty last frame adds nothing.
   assert.equal(await text(['$ less\r\n\x1b[?1049h\x1b[H\x1b[2J\x1b[?1049l$ ']), '$ less\n$');
+});
+
+test('rule 4: a saved cursor is rebased when the screen clears, as after the scrollback is cleared', async () => {
+  // 60 lines on 10 rows, DECSC, ED 2, `cleared`, DECRC, `RESTORED`: a terminal writes RESTORED over cleared.
+  const sixty = Array.from({ length: 60 }, (_, i) => `line ${i}\r\n`).join('');
+  const p = await project([`${sixty}\x1b7\x1b[2Jcleared\x1b8RESTORED`], { cols: 40, rows: 10 });
+  const lines = p.text.split('\n');
+  assert.equal(lines.length, 61);
+  assert.equal(lines[59], 'line 59');
+  assert.equal(lines[60], 'RESTORED');
+  // The same across an alternate-screen entry that keeps the content (mode 47 saves no cursor of its own).
+  const q = await project([`${sixty}\x1b7\x1b[?47hframe\x1b[?47l\x1b8OVER`], { cols: 40, rows: 10 });
+  assert.ok(q.text.endsWith('line 59\nframe\nOVER'), q.text.split('\n').slice(-4).join('|'));
+});
+
+test('a batch never ends inside a control sequence: a long OSC payload across the batch cap does not print', async () => {
+  const lines = Array.from({ length: 100 }, (_, i) => `line ${i}\r\n`).join('');
+  const payload = `\x1b]52;c;${'A'.repeat(600_000)}\x07`;
+  for (const cols of [80, 120, 140, 200]) {
+    const p = await project([`${lines}${payload}after\r\n`], { cols, rows: 30 });
+    const out = p.text.split('\n');
+    assert.equal(out.length, 101, `${cols} columns: ${out.length} lines`);
+    assert.equal(out.at(-1), 'after', `${cols} columns`);
+    assert.equal(p.truncated, false);
+  }
+  // Chunked as a PTY delivers it, and with the payload unterminated to the end of the range.
+  const chunks: string[] = [];
+  const data = `${lines}${payload}after\r\n`;
+  for (let i = 0; i < data.length; i += 4096) chunks.push(data.slice(i, i + 4096));
+  assert.equal((await project(chunks, { cols: 140, rows: 30 })).text.split('\n').at(-1), 'after');
+  const open = await project([`${lines}\x1b]52;c;${'A'.repeat(600_000)}`], { cols: 140, rows: 30 });
+  assert.equal(open.text.split('\n').length, 100, 'an unterminated payload prints nothing');
+});
+
+test('rule 7: the tail cut does not count the newlines of a full-screen program\'s frames, which project as one frame', async () => {
+  const frame = (f: number) => `\x1b[H\x1b[2Jframe ${f}${'\r\n'.repeat(28)}`;
+  const chunks = ['before\r\n', '\x1b[?1049h', ...[0, 1, 2, 3, 4].map(frame), '\x1b[?1049l', 'after\r\n'];
+  const p = await project(chunks, { cols: 80, rows: 30, maxLines: 10 });
+  assert.deepEqual(p.text.split('\n'), ['before', 'frame 4', 'after']);
+  assert.equal(p.truncated, false);
+  assert.equal(p.omittedInputBytes, 0);
+  // A range that ends inside the program keeps the line it interrupted too.
+  const inside = await project(['before\r\n', '\x1b[?1049h', ...[0, 1, 2].map(frame)], { cols: 80, rows: 30, maxLines: 10 });
+  assert.deepEqual(inside.text.split('\n'), ['before', 'frame 2']);
+  assert.equal(inside.truncated, false);
+  // Lines outside the program still count, and the cut never lands inside the program's time.
+  const many = Array.from({ length: 100 }, (_, i) => `L${i}\r\n`).join('');
+  const r = await project([many, '\x1b[?1049h', frame(1), '\x1b[?1049l', 'after\r\n'], { cols: 80, rows: 30, maxLines: 10 });
+  assert.equal(r.truncated, true);
+  assert.ok(r.omittedInputBytes > 0);
+  assert.deepEqual(r.text.split('\n').slice(-2), ['frame 1', 'after']);
+  assert.equal(r.text.split('\n').length, 10);
+});
+
+test('rule 7: the lasting state of an omitted head still applies: a scroll region, a character set and a shift', async () => {
+  // Eight lines from the top row into a region of rows 2–5: lines 1 to 4 scroll out of the region and are
+  // gone, as a terminal shows it (a region from row 1 scrolls into the scrollback, which the projection keeps).
+  // The budget lands in the omitted head's line, within reach of the boundary, so the kept input is the eight lines.
+  const lines = Array.from({ length: 8 }, (_, i) => `line ${i}\r\n`).join('');
+  const region = await project([`\x1b[2;5r${'h'.repeat(300)}\r\n`, lines], { cols: 80, rows: 10, maxInputBytes: 100 });
+  assert.deepEqual(region.text.split('\n'), ['line 0', 'line 5', 'line 6', 'line 7']);
+  assert.equal(region.omittedInputBytes, 6 + 300 + 2);
+  // G1 = DEC graphics and shift out, set in the omitted head, draw the box characters of the tail.
+  const box = await project([`\x1b)0\x0e${'h'.repeat(30)}\r\n`, 'lqqk\r\n'], { cols: 80, rows: 10, maxInputBytes: 10 });
+  assert.deepEqual(box.text.split('\n'), ['┌──┐']);
+  assert.equal(box.omittedInputBytes, 3 + 1 + 30 + 2);
+  // With keypad mode, a reset and a soft reset in the head's state (not visible in text; the state string shows them).
+  assert.equal(persistentState('\x1b=\x1b[?1h'), '\x1b=\x1b[?1h');
+  assert.equal(persistentState('\x1b[1;5r\x1bc\x1b='), '\x1bc\x1b=');
+  assert.equal(persistentState('\x0e\x1b[!p'), '\x0e\x1b[!p');
 });
 
 // ───────────── rules 2 and 4 across batches: the saved cursor (er-2) ─────────────
@@ -348,6 +419,33 @@ test('tg-4: a 20 MB single line and a 18 MB full-screen redraw flood both projec
   assert.equal(out[0], '$ top');
   assert.equal(out[1], 'frame 39999');
   assert.equal(out.at(-1), '$');
+});
+
+test('Cost: with maxInputBytes, memory follows the budget, not the range (chunks are cut as they are gathered)', async () => {
+  // 128 MiB of lines, made as they are read, under a 1 KiB budget.
+  function* big(): Generator<string> {
+    for (let i = 0; i < 2048; i++) yield `${'x'.repeat(64 * 1024 - 1)}\n`;
+  }
+  const { value: r, heapRise } = await timed(() => project(big(), { cols: 80, maxInputBytes: 1024 }));
+  assert.ok(heapRise < 48 * MB, `heap rose ${Math.round(heapRise / MB)} MB for 128 MiB of input`);
+  assert.equal(r.truncated, true);
+  assert.ok(r.omittedInputBytes >= 2048 * 64 * 1024 - 1024);
+  assert.match(r.text, /^x+$/);
+  // The omitted head's lasting state still applies, and the exact cut is unchanged: a line boundary is preferred.
+  const logs = Array.from({ length: 200 }, (_, i) => `log line ${i} ${'.'.repeat(20)}\r\n`);
+  const cut = await project(['\x1b[2;5r', ...logs], { cols: 80, rows: 10, maxInputBytes: 1000 });
+  assert.match(cut.text.split('\n')[0]!, /^log line \d+ \.{20}$/);
+  assert.equal(cut.text.split('\n').length, 4, 'the region from the omitted head holds: the first kept line above it, the last three in it');
+  assert.equal(cut.text.split('\n').at(-1), `log line 199 ${'.'.repeat(20)}`);
+  // Kept head: a single source past the budget keeps its start, and later chunks cost nothing.
+  function* head(): Generator<string> {
+    yield 'first line\r\n';
+    for (let i = 0; i < 512; i++) yield `${'y'.repeat(64 * 1024 - 1)}\n`;
+  }
+  const h = await timed(() => project(head(), { cols: 80, maxInputBytes: 1024, keep: 'head' }));
+  assert.ok(h.heapRise < 48 * MB, `heap rose ${Math.round(h.heapRise / MB)} MB`);
+  assert.equal(h.value.text.split('\n')[0], 'first line');
+  assert.equal(h.value.truncated, true);
 });
 
 test('emu-3: many tiny chunks cost parser time, not a timer each', async () => {

@@ -146,6 +146,41 @@ test('jr2-10: the match limit stops the scan where the next match starts: contin
   assert.deepEqual(seen, Array.from({ length: 300 }, (_, i) => `hit ${i}`));
 });
 
+test('jr2-10: the after-context of the last match is complete even when the next line is the match past the limit', async () => {
+  const src = source();
+  for (const l of ['m1', 'm2', 'x', 'y']) out(src.journal, `${l}\r\n`);
+  const r = await search(src, { pattern: '^m', since: 0, limit: 1, context: 2 });
+  assert.deepEqual(lines(r), ['m1']);
+  assert.deepEqual(r.matches[0]!.after, ['m2', 'x'], 'two lines of after-context, as asked');
+  assert.equal(r.more, true);
+  assert.equal(r.stoppedBy, 'limit');
+  // Continuing finds the match past the limit first, with its own context.
+  const next = await search(src, { pattern: '^m', since: r.nextCursor!, ...(r.nextOffset ? { offset: r.nextOffset } : {}), limit: 1, context: 2 });
+  assert.deepEqual(lines(next), ['m2']);
+  assert.deepEqual(next.matches[0]!.after, ['x', 'y']);
+  assert.equal(next.more, false);
+  // The context lines read past the limit are never matches: `x` and `y` match nothing here, but a matching one would not count.
+  const strict = await search(src, { pattern: '.', since: 0, limit: 1, context: 2 });
+  assert.deepEqual(lines(strict), ['m1']);
+  assert.deepEqual(strict.matches[0]!.after, ['m2', 'x']);
+});
+
+test('a context line cut by the raw bound is marked clipped on the match it belongs to', async () => {
+  const src = source();
+  // 300 KiB of colour codes, then text: the raw head kept for the line holds no text at all.
+  out(src.journal, `${'\x1b[31m'.repeat(60_000)}text\r\nneedle\r\n`);
+  const r = await search(src, { pattern: '^needle', since: 0, context: 1 });
+  assert.equal(r.matches.length, 1);
+  assert.deepEqual(r.matches[0]!.before, ['']);
+  assert.equal(r.matches[0]!.clipped, true, 'the context line is not what it was');
+  assert.equal(r.clippedLines, 1);
+  // The raw cut leaves no half sequence to show as text.
+  const h = source();
+  out(h.journal, `${'\x1b[31m'.repeat(60_000)}\r\nneedle\r\n`);
+  const r2 = await search(h, { pattern: '^needle', since: 0, context: 1 });
+  assert.deepEqual(r2.matches[0]!.before, ['']);
+});
+
 test('jr2-10 / jr2-11: a scan reports the holes it spans: past retention at its start, and gap events inside', async () => {
   const src = source();
   out(src.journal, 'before hole\r\n');

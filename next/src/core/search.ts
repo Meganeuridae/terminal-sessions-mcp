@@ -19,10 +19,17 @@
  *    its last state).
  * 4. Gaps. A `gap` event (output lost to retention, a torn write or a store
  *    failure) ends every unfinished line: nothing is joined across a hole.
- * 5. Bounds. A line's raw bytes are kept up to MAX_LINE_RAW, and it is matched
- *    on its head within the pattern's match window (`testBounded`); longer lines
- *    are counted in `clippedLines` (G11: the cut is visible). Displayed lines
- *    and context are cut at MAX_SHOWN characters, marked `clipped`.
+ * 5. Bounds. A line's raw bytes are kept up to MAX_LINE_RAW (cut before a
+ *    control sequence the cut would split), and it is matched on its head within
+ *    the pattern's match window (`testBounded`); longer lines are counted in
+ *    `clippedLines` (G11: the cut is visible). Displayed lines and context are
+ *    cut at MAX_SHOWN characters, marked `clipped`; a context line cut either
+ *    way marks the match it belongs to.
+ * 6. The limit. Once `limit` matches are found, the first line that matches
+ *    beyond them ends the matching, and the scan goes on only as far as the
+ *    after-context of the last matches needs (`full` says when nothing more is
+ *    wanted); `stop` is where that further match began, so a continuation finds
+ *    it first.
  *
  * The scanner is incremental: feed events in order, in as many calls as the
  * caller likes (searchJournal pages, yields and stops on a budget), and ask
@@ -30,7 +37,7 @@
  */
 import { stripAnsi } from './ansi.js';
 import { testBounded } from './regex.js';
-import { indexAtByte, utf8Length } from './text.js';
+import { indexAtByte, unfinishedSequence, utf8Length } from './text.js';
 import type { JournalEvent, Seq } from './types.js';
 
 export interface SearchMatch {
@@ -90,10 +97,10 @@ export class LineScanner {
   lines = 0;
   /** Lines matched only on their head (rule 5). */
   clippedLines = 0;
-  /** `limit` matches were found and another matched: the scan should stop; `stop` is where to continue. */
-  full = false;
-  /** Where the first match past `limit` starts (set with `full`). */
+  /** Where the first match past `limit` starts (set once the limit is reached). */
   stop: Resume | undefined;
+  /** The limit was reached: lines still complete the last matches' after-context, but nothing more is matched. */
+  private limited = false;
   private readonly context: number;
   private readonly limit: number;
   private readonly recent: Array<{ text: string; cut: boolean }> = [];
@@ -106,6 +113,16 @@ export class LineScanner {
   ) {
     this.context = Math.max(0, Math.min(20, opts.context ?? 2));
     this.limit = Math.max(1, opts.limit ?? 50);
+  }
+
+  /**
+   * `limit` matches were found, another matched, and their after-context is
+   * complete: the scan should stop (the house's read of ed4ecac, #22: stopping
+   * at the further match itself left the after-context short); `stop` is where
+   * to continue.
+   */
+  get full(): boolean {
+    return this.limited && this.waiting.length === 0;
   }
 
   /**
@@ -159,7 +176,9 @@ export class LineScanner {
       if (!carry.cut) {
         const room = MAX_LINE_RAW - carry.raw.length;
         if (piece.length > room) {
-          carry.raw += piece.slice(0, room);
+          // Cut before a control sequence the cut would split, so no half of one shows as text.
+          const head = carry.raw + piece.slice(0, room);
+          carry.raw = head.slice(0, unfinishedSequence(head));
           carry.cut = true;
         } else carry.raw += piece;
       }
@@ -175,7 +194,9 @@ export class LineScanner {
   private complete(c: Carry, seq: Seq): void {
     const line = cleanLine(c.raw);
     this.lines++;
+    // A line shown shorter than it was, by MAX_SHOWN or by the raw cut, is clipped wherever it appears.
     const view = shown(line);
+    if (c.cut) view.cut = true;
     for (const m of this.waiting) {
       if (m.after.length < this.context) {
         m.after.push(view.text);
@@ -183,17 +204,18 @@ export class LineScanner {
       }
     }
     while (this.waiting.length && this.waiting[0]!.after.length >= this.context) this.waiting.shift();
+    if (this.limited) return; // only the after-context was wanted of this line
     const t = testBounded(this.re, line);
     if (t.clipped || c.cut) this.clippedLines++;
     if (t.matched) {
       if (this.matches.length >= this.limit) {
-        this.full = true;
+        this.limited = true;
         this.stop = c.start;
         return;
       }
       const m: SearchMatch = { seq, lineNumber: this.lines, line: view.text, before: this.recent.map((r) => r.text), after: [], cursor: c.start.cursor };
       if (c.start.offset > 0) m.offset = c.start.offset;
-      if (view.cut || t.clipped || c.cut || this.recent.some((r) => r.cut)) m.clipped = true;
+      if (view.cut || t.clipped || this.recent.some((r) => r.cut)) m.clipped = true;
       this.matches.push(m);
       if (this.context > 0) this.waiting.push(m);
     }
