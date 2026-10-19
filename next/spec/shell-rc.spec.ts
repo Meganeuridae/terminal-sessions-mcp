@@ -330,7 +330,7 @@ for (const line of ['PROMPT_COMMAND="history -a"', 'PROMPT_COMMAND="if true; the
   test(`/bin/bash: a typed line ending in a PROMPT_COMMAND assignment (${line}) is closed at the next prompt, and the next Run goes on`, { skip: !hasShell('/bin/bash') }, async () => {
     // Here the heal is the only closer: the new value runs at the next prompt in place of our hook.
     // A flag that stood the heal down for the whole line left this Run open and the next command's
-    // start ignored (the reviewer's read of the r16 commits, #22); the heal now stands down only for
+    // start ignored (the reviewer's read of 2f32e8a..a088780, #22); the heal now stands down only for
     // a command the line itself runs, and a command named only inside the assignment's quoted value
     // does not count.
     const x = await realSession('/bin/bash', { login: false });

@@ -99,7 +99,7 @@ if [ "$\{1-}" = reinit ]; then
   # The typed reinit (the daemon's line at the prompt of a bash whose rc replaced PROMPT_COMMAND
   # outright) runs nothing of that value after our hook — precmd runs the folded user part itself —
   # so it is solo too; left non-solo, promptvars off kept the flag set for good (the reviewer's read
-  # of the r16 commits, #22).
+  # of 2f32e8a..a088780, #22).
   if [ "$\{2-}" = typed ]; then __tsm_reinit_solo=1; fi
   unset __tsm_pcs __tsm_e
   __tsm_reinit_pending=1
@@ -246,7 +246,7 @@ __tsm_preexec() {
   # own; leaving the text empty for it keeps the heal working at the prompt that follows it. The
   # text is kept, not a flag: a later firing is the line's own only if the line runs that command
   # (__tsm_line_has) — a flag alone stood the heal down at the next prompt too, where it was the only
-  # closer of a line that merely assigned PROMPT_COMMAND (the reviewer's read of the r16 commits).
+  # closer of a line that merely assigned PROMPT_COMMAND (the reviewer's read of 2f32e8a..a088780).
   case $__line in ". '"*tsm-cmd-*"'") __tsm_line_text= ;; *) __tsm_line_text=$__line ;; esac
   __tsm_opened=
   __tsm_text "$__line"
@@ -317,7 +317,7 @@ __tsm_debug() {
   # promptvars off, where nothing else can: so the trap stands down while detection is not armed
   # (the rc's own commands after the trap was set, and the hook itself) and for a command of the
   # user's prompt part (the leftover is made of those); the first armed command that is neither is
-  # the line someone typed, and clears the flag (the reviewer's read of the r16 commits, #22).
+  # the line someone typed, and clears the flag (the reviewer's read of 2f32e8a..a088780, #22).
   if [ "$\{__tsm_reinit_pending:-0}" != 0 ]; then
     if [ -z "$__tsm_prompt_active" ] || __tsm_word_in "$BASH_COMMAND" "$__tsm_user_pc"; then
       __tsm_restore "$__o"
@@ -336,7 +336,7 @@ __tsm_debug() {
       # next prompt's precmd runs and closes the Run — without it the Run read as idle while
       # \`sleep 3\` ran on (the house's read, #22 comment 6264958172). A command the line does not
       # run is the prompt's own at the next prompt, healed as before: for a line that only assigned
-      # PROMPT_COMMAND the heal is the only closer (the reviewer's read of the r16 commits).
+      # PROMPT_COMMAND the heal is the only closer (the reviewer's read of 2f32e8a..a088780).
       __tsm_fold_pc
     else
       # A command of the prompt's own (it stands in PROMPT_COMMAND) is never a Run.

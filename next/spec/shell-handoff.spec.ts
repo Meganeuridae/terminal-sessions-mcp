@@ -298,7 +298,7 @@ for (const [how, rc] of [
     // __tsm_reinit_pending set for good with promptvars off; "appends to" has a part of the inherited
     // value still to run after the hook, where PS1 cannot clear the flag either: the DEBUG trap stands
     // down for that part's commands and clears the flag at the first command that is not one of them,
-    // so no phantom Run opens and the next Run is detected (the reviewer's read of the r16 commits, #22).
+    // so no phantom Run opens and the next Run is detected (the reviewer's read of 2f32e8a..a088780, #22).
     const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': rc }, startupCapMs: 1500 });
     try {
       const handoff = await x.run('exec /bin/bash', 20_000);

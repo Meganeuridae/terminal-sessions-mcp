@@ -240,7 +240,7 @@ function boundedLogger(limit: number): (msg: string, e: unknown) => void {
 /**
  * Does a process group we may still signal exist? True while any member lives; EPERM means the id is
  * now a stranger's (reused), so false. Named for what it answers: the backend's groupAlive answers
- * "does any process of the group remain", where EPERM is true (the reviewer's read of the r16 commits).
+ * "does any process of the group remain", where EPERM is true (the reviewer's read of 2f32e8a..a088780).
  */
 function ourGroupAlive(pgid: number): boolean {
   try {

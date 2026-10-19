@@ -1289,7 +1289,7 @@ export class Session {
       const job = this.foregroundJob();
       const total = opts.timeoutMs ?? 3000;
       // The close wait is the longest wait on the shutdown path: measured on the monotonic clock, as is
-      // the reapJob deadline it hands on (the reviewer's read of the r16 commits, #22).
+      // the reapJob deadline it hands on (the reviewer's read of 2f32e8a..a088780, #22).
       const started = clocks.monotonic();
       const graceful = opts.graceful ?? true;
       if (graceful) {
