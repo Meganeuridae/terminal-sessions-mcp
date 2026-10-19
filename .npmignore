@@ -21,5 +21,6 @@ test-results/
 
 # 2.0 (next/): sources, specs and acceptance checks stay out; next/dist, next/gui and next/config ship
 next/spec/
+next/dist/spec/
 next/acceptance/
 next/tsconfig.json

@@ -93,7 +93,11 @@ export function sequenceEnd(data: string, e: number): number | undefined {
     else kind = 'esc';
     i++;
     if (kind === 'esc') {
-      // ESC, intermediates (0x20–0x2f), then one final byte.
+      // ESC, intermediates (0x20–0x2f), then one final byte (0x30–0x7e). With no intermediate the
+      // byte after ESC is the final one: ESC 7, ESC 8, ESC =, ESC >, ESC M are two bytes (the house's
+      // read of b047b92: xterm's keypad modes are ESC = and ESC >).
+      const first = data.charCodeAt(i - 1);
+      if (first < 0x20 || first > 0x2f) return i; // the final byte, or a malformed sequence ending here
       while (i < data.length && data.charCodeAt(i) >= 0x20 && data.charCodeAt(i) <= 0x2f) i++;
       return i < data.length ? i + 1 : undefined;
     }

@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { configuredEnv, historyIsolationEnv, scrubDaemonEnv } from '../src/core/env.js';
+import { configuredEnv, historyIsolationEnv, redactSnapshot, scrubDaemonEnv } from '../src/core/env.js';
 import { AGENT, scriptedSession as harness } from './fake-shell.js';
 
 test('ux-8: launcher state never reaches a session — Volta recursion, npm/npx lifecycle, the launching agent host\'s session identity', () => {
@@ -80,4 +80,10 @@ test('ux-3/G6: history tools the rc loads are pointed at the session\'s own dire
   assert.equal(g.pty.opts.env.ATUIN_DB_PATH, '/mine.db');
   assert.equal(g.pty.opts.env.ATUIN_AUTO_SYNC, undefined, 'the creation env took history in hand: nothing is added');
   await g.session.close();
+});
+
+test('G26: a journaled environment snapshot carries no TSM credential, by name, whatever else it holds', () => {
+  const vars = { TSM_TOKEN: 't', TSM_MARK_KEY: 'k', TSM_SOME_SECRET: 's', TSM_DB_PASSWORD: 'p', TSM_DATA_DIR: '/d', TOKEN: 'not-ours', HOME: '/h', PATH: '/bin' };
+  assert.deepEqual(redactSnapshot(vars), { TSM_DATA_DIR: '/d', TOKEN: 'not-ours', HOME: '/h', PATH: '/bin' });
+  assert.deepEqual(redactSnapshot({}), {});
 });

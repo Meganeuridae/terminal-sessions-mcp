@@ -75,3 +75,16 @@ test('er-1: safeCut never splits a control sequence, a surrogate pair or a CRLF;
   assert.equal(sequenceEnd('\x1b(B!', 0), 3);
   assert.equal(sequenceEnd('\x1b]0;never', 0), undefined);
 });
+
+test('two-byte ESC sequences end after their one final byte; intermediates still take a final byte after them', () => {
+  for (const two of ['\x1b7', '\x1b8', '\x1b=', '\x1b>', '\x1bM', '\x1bc']) {
+    assert.equal(sequenceEnd(two, 0), 2, JSON.stringify(two));
+    assert.equal(sequenceEnd(`${two}X`, 0), 2, `${JSON.stringify(two)} does not take the character after it`);
+    assert.equal(unfinishedSequence(`abc${two}`), 5, `${JSON.stringify(two)} is complete at the end of the data`);
+  }
+  assert.equal(sequenceEnd('\x1b(B', 0), 3, 'an intermediate, then the final byte');
+  assert.equal(sequenceEnd('\x1b(', 0), undefined, 'an intermediate still waiting for its final byte');
+  assert.equal(unfinishedSequence('abc\x1b('), 3);
+  assert.equal(sequenceEnd('\x1b[?1l', 0), 5);
+  assert.equal(sequenceEnd('\x1b[?1h\x1b=', 5), 7, 'xterm turns keypad mode on with CSI ?1h ESC =');
+});
