@@ -997,7 +997,7 @@ export class TermServer {
         this.unfollow(conn, sessionParam(p));
         return {};
       case 'terminal/attach':
-        return this.nativeAttach(conn, p, after);
+        return this.nativeAttach(conn, p, after, onSent);
       case 'terminal/detach':
         return this.nativeDetach(conn, p);
       default:
@@ -1104,7 +1104,7 @@ export class TermServer {
    * once the response is on the wire, so the client has the snapshot before the
    * first event. A history-only session answers with its transcript instead.
    */
-  private async nativeAttach(conn: Conn, p: Record<string, unknown>, after: (fn: () => void) => void): Promise<unknown> {
+  private async nativeAttach(conn: Conn, p: Record<string, unknown>, after: (fn: () => void) => void, onSent: (fn: () => void) => void): Promise<unknown> {
     const sid = sessionParam(p);
     const role = p.role ?? 'auto';
     if (role !== 'auto' && role !== 'observer' && role !== 'controller') throw new RpcError(INVALID_PARAMS, 'role must be auto, observer or controller');
@@ -1124,7 +1124,7 @@ export class TermServer {
       for (let attempt = 0; ; attempt++) {
         const s = this.observable(conn, sid);
         this.unfollow(conn, sid);
-        const r = s.kind === 'history' ? await this.attachHistory(conn, s, sid, stillWanted, after) : await this.attachLive(conn, s, sid, role, stillWanted, after);
+        const r = s.kind === 'history' ? await this.attachHistory(conn, s, sid, stillWanted, after, onSent) : await this.attachLive(conn, s, sid, role, stillWanted, after);
         if (r !== undefined) return r;
         if (attempt === 2) throw err('busy', `session ${sid} kept changing while the attach waited; try again`, { session: sid });
       }
@@ -1140,13 +1140,15 @@ export class TermServer {
   }
 
   /** A history-only session attaches with its transcript; undefined when the name changed during the read (the caller starts over). */
-  private async attachHistory(conn: Conn, s: HistorySession, sid: string, stillWanted: () => void, after: (fn: () => void) => void): Promise<Record<string, unknown> | undefined> {
+  private async attachHistory(conn: Conn, s: HistorySession, sid: string, stillWanted: () => void, after: (fn: () => void) => void, onSent: (fn: () => void) => void): Promise<Record<string, unknown> | undefined> {
     const app = this.opts.app;
     const read = await app.read(conn.caller, { session: sid, tail: TRANSCRIPT_READ_LINES, maxBytes: 256 * 1024 });
     stillWanted();
     if (app.registry.get(sid) !== s) return undefined;
-    // The transcript is being handed to this principal: advance the read cursor the deferred read staged (G22).
-    commitReadDelivery(read);
+    // The transcript is handed to this principal once the response is written: the read cursor the
+    // deferred read staged advances then (G22), as for every result on this connection, so a reply
+    // that never reaches the client moves nothing (the house's read of 78c4d6e, #22).
+    onSent(() => commitReadDelivery(read));
     const lastSeq = s.journal.lastSeq;
     const f = this.follow(conn, sid, s.journal, lastSeq);
     after(() => this.startFollower(conn, sid, f));

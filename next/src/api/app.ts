@@ -10,6 +10,7 @@
 import { createHash } from 'node:crypto';
 import { err, TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
+import type { PlumbingOf } from '../core/plumbing.js';
 import { validateServiceSpec, type ServiceSpec } from '../core/probes.js';
 import { journalRunText, promptLine, Segmenter, type SegmenterOptions } from '../core/segmenter.js';
 import { ServiceManager, type ServiceInfo } from '../core/services.js';
@@ -141,19 +142,36 @@ export interface Caller {
 /**
  * A result that returned content to its caller stages its `read`-cursor advance here when the
  * caller's delivery is deferred: the transport runs it from `ToolResult.onSent`, once the write
- * succeeded. Symbol-keyed, so it never enters the envelope or its schema.
+ * succeeded. Symbol-keyed and not enumerable, so it never enters the envelope or its schema, and
+ * no copy of the result (a spread, an idempotency entry's compact copy) carries the closure and
+ * the Session it holds (the house's read of 78c4d6e, #22).
  */
 const READ_COMMIT = Symbol('readCommit');
 
+function stageReadCommit(result: object, commit: () => void): void {
+  Object.defineProperty(result, READ_COMMIT, { value: commit, configurable: true, enumerable: false, writable: true });
+}
+
+/**
+ * Take a result's staged `read`-cursor commit off it, to run later: a tool that answers from
+ * several App results carries their commits on its own result and keeps nothing else of them.
+ * Undefined when nothing was staged.
+ */
+export function takeReadCommit(result: unknown): (() => void) | undefined {
+  if (result === null || typeof result !== 'object') return undefined;
+  const commit = (result as Record<symbol, unknown>)[READ_COMMIT];
+  if (typeof commit !== 'function') return undefined;
+  delete (result as Record<symbol, unknown>)[READ_COMMIT];
+  return commit as () => void;
+}
+
 /** Advance a deferred caller's `read` cursor now that its result was delivered (no-op if nothing was staged). */
 export function commitReadDelivery(result: unknown): void {
-  if (result === null || typeof result !== 'object') return;
-  const commit = (result as Record<symbol, unknown>)[READ_COMMIT];
-  if (typeof commit === 'function') {
-    delete (result as Record<symbol, unknown>)[READ_COMMIT];
-    (commit as () => void)();
-  }
+  takeReadCommit(result)?.();
 }
+
+/** The journal event whose service status a start result rendered, for `outcomeSent`; off the result, so no copy or envelope carries it. */
+const statusSeqOf = new WeakMap<object, Seq>();
 
 interface Extras {
   services: ServiceManager;
@@ -287,8 +305,17 @@ class Idempotency {
   }
 }
 
-/** A RunResult without its output text: what an idempotency entry keeps (the replay awaits the Run again). */
-const compactRun = (r: RunResult): RunResult => ({ ...r, output: { ...r.output, text: '' } });
+/**
+ * A RunResult without its output text: what an idempotency entry keeps (the replay awaits the Run
+ * again). It carries no staged read commit either: the spread leaves it, since it is not
+ * enumerable, and it is dropped here as well so the entry can never hold a Session through it
+ * (the house's read of 78c4d6e, #22).
+ */
+const compactRun = (r: RunResult): RunResult => {
+  const c: RunResult = { ...r, output: { ...r.output, text: '' } };
+  takeReadCommit(c);
+  return c;
+};
 /**
  * A busy outcome admitted nothing, so the key forgets it and the retry can run — except the once-only
  * refusal `declared-shell-ended` (§8.1), which fails closed because the declared shell the line may have
@@ -757,19 +784,25 @@ export class App {
     return e;
   }
 
-  /** The live Session a Run belongs to, if it is a Run of the session's current shell. */
   /**
    * A result returned content to the caller: advance its `read` cursor (G22). When the caller's
    * delivery is deferred (a connection that can drop), stage the advance on the result for the
    * transport to run once the write succeeded; otherwise advance now (the house's read of 1cabc6a,
-   * #22). Either way the target is fixed here, at the state the result reflects.
+   * #22). The commit finds the session by name when it runs (see markRead), and decides where the
+   * cursor lands then, not when the result is staged (see advanceReadAfterRun).
    */
   private advanceRead<T extends object>(result: T, caller: Caller, commit: () => void): T {
-    if (caller.deferReadDelivery) (result as Record<symbol, unknown>)[READ_COMMIT] = commit;
+    if (caller.deferReadDelivery) stageReadCommit(result, commit);
     else commit();
     return result;
   }
 
+  /** Stage the caller's `read`-cursor advance to `to` for a result that showed the session's output as a whole (a page, a tail, the screen). */
+  private advanceReadTo<T extends object>(result: T, caller: Caller, id: string, to: Seq): T {
+    return this.advanceRead(result, caller, () => this.markRead(id, caller.principal, to));
+  }
+
+  /** The live Session a Run belongs to, if it is a Run of the session's current shell. */
   private liveRunner(s: AnySession, runId: string): Session | undefined {
     if (s.kind !== 'live') return undefined;
     try {
@@ -834,15 +867,30 @@ export class App {
 
   /**
    * Stage the caller's `read`-cursor advance for a result that showed one Run's output (run, await,
-   * read with a runId), on a live session or history: where it lands is readCursorAfterRun's rule.
+   * start, read with a runId), on a live session or history: where it lands is readCursorAfterRun's
+   * rule, applied when the commit runs. Decided when the result was staged, two results outstanding
+   * at once would each freeze a target below the other's unread output, and the cursor would stay
+   * behind after both were delivered (the house's read of 78c4d6e, #22).
    */
   private advanceReadAfterRun<T extends object>(result: T, caller: Caller, s: AnySession, runId: string, to: Seq): T {
-    const at = this.readCursorAfterRun(s, caller.principal, runId, to);
-    return this.advanceRead(result, caller, () => this.markRead(s, caller.principal, at));
+    const id = sessionId(s);
+    return this.advanceRead(result, caller, () => {
+      const now = this.registry.get(id);
+      if (now) this.markRead(id, caller.principal, this.readCursorAfterRun(now, caller.principal, runId, to));
+    });
   }
 
-  /** Advance a principal's read cursor on an entry: a live session takes no cursor past its journal; history takes it as given. */
-  private markRead(s: AnySession, principal: Principal, at: Seq): void {
+  /**
+   * Advance a principal's read cursor on what the name is now, looked up when the commit runs: a
+   * staged commit can run after the entry it read was closed and the name reopened, and the old
+   * life's Session would then hand the book that life's cursors whole, behind the new life's (the
+   * house's read of 78c4d6e, #22). The journal is continuous across lives (G1), so the position
+   * means the same on the new life; a live session takes no cursor past its journal, history takes
+   * it as given, and neither moves a cursor back. A forgotten name takes nothing.
+   */
+  private markRead(id: string, principal: Principal, at: Seq): void {
+    const s = this.registry.get(id);
+    if (!s) return;
     if (s.kind === 'live') {
       if (at <= s.session.journal.lastSeq) s.session.markRead(principal, at);
     } else s.markRead(principal, at);
@@ -882,11 +930,13 @@ export class App {
     }
     if (isTerminal(r.state as RunInfo['state'])) s.session.markOutcomeDelivered(r.runId, caller.principal);
     // A start result carried this service status: the lane does not announce that status event again
-    // (mcpl-13) — that event, named by its seq, not a later return to the same status (the house's read
-    // of 2f357bd, #22). A status that moved on before the result was written is announced as usual.
+    // (mcpl-13) — the very event the result rendered, named by its seq, never the status as it stands
+    // at the write: a ready, unhealthy, ready flap before the write would mark the later ready, which
+    // the result never carried, and the recovery would go unannounced (the house's read of 2f357bd
+    // and of 78c4d6e, #22). A status that moved on before the write is announced as usual.
     if (r.service !== undefined && r.service !== 'starting') {
-      const info = this.extras(s.session).services.get(r.runId)?.info();
-      if (info?.status === r.service && info.seq !== undefined) s.session.markOutcomeDelivered(serviceOutcomeKey(r.runId, r.service, info.seq), caller.principal);
+      const seq = statusSeqOf.get(r);
+      if (seq !== undefined) s.session.markOutcomeDelivered(serviceOutcomeKey(r.runId, r.service, seq), caller.principal);
     }
   }
 
@@ -927,9 +977,10 @@ export class App {
       to = t.seq[1];
       truncated = t.truncated;
     } else {
-      // History is rendered by the one renderer the segmenter uses too: the plumbing a marker Run
-      // left in the journal is cut by shape, since the nonce is gone with the live session (the
-      // house's read of 1cabc6a, #22), at the size the Run recorded, else the session's.
+      // History is rendered by the one renderer the segmenter uses too: the plumbing a Run left in
+      // the journal is cut by the strategy and nonce its run.start recorded, by shape only for a Run
+      // journaled before they were (the house's read of 1cabc6a and of 39787b3, #22), at the size
+      // the Run recorded, else the session's.
       const o = s.runOutput(run.runId, { maxBytes: HISTORY_INPUT_BYTES });
       const t = await journalRunText(o, { ...geometryOf(s), maxInputBytes: HISTORY_INPUT_BYTES }, run);
       text = t.text;
@@ -997,7 +1048,9 @@ export class App {
         const s = this.registry.get(prev.session);
         const monitor = s?.kind === 'live' ? this.extras(s.session).services.get(prev.runId) : undefined;
         if (!s || s.kind !== 'live' || !monitor) return this.replayRun(caller, prev, o.wait);
-        const res: RunResult = { ...(await this.serviceResult(caller, s.session, prev.runId, await this.settled(monitor, o.wait))), replayed: true };
+        // The result itself, not a copy: the status event it rendered rides with it for outcomeSent.
+        const res = await this.serviceResult(caller, s.session, prev.runId, await this.settled(monitor, o.wait));
+        res.replayed = true;
         // The first call created the session: its replay says so too, as a replayed run does (the house's read of 1cabc6a, #22).
         if (prev.created) res.created = true;
         return res;
@@ -1045,8 +1098,10 @@ export class App {
     if (run.within !== undefined) res.within = run.within;
     if (run.line !== undefined) res.line = head(run.line, 200);
     res.integration = session.integration;
-    this.advanceRead(res, caller, () => session.markRead(caller.principal, out.nextCursor));
-    return res;
+    if (info.seq !== undefined) statusSeqOf.set(res, info.seq);
+    // The one rule for a result that showed a Run's output (G22): another Run's unread output stays
+    // unread, for a start as for a run or an await (the house's read of 78c4d6e, #22).
+    return this.advanceReadAfterRun(res, caller, this.entry(session), runId, out.nextCursor);
   }
 
   // ───────────── watches (§4) ─────────────
@@ -1156,8 +1211,7 @@ export class App {
     const session = this.liveFor(caller, o.session, 'observe');
     await session.screen.settled();
     const snap = session.snapshot();
-    this.advanceRead(snap, caller, () => session.markRead(caller.principal, snap.seq));
-    return snap;
+    return this.advanceReadTo(snap, caller, session.id, snap.seq);
   }
 
   async control(caller: Caller, o: { session: string; action: 'take' | 'release' | 'status'; idempotencyKey?: string }): Promise<{ controller: Principal | null; replayed?: boolean }> {
@@ -1198,7 +1252,27 @@ export class App {
     const r = await readJournal(readSource(s), opts, { resultBytes: this.resultBytes });
     // A page of one Run leaves other Runs' unread output unread (see readCursorAfterRun); a page of the session reads to its cursor.
     if (opts.runId !== undefined) return this.advanceReadAfterRun(r, caller, s, opts.runId, r.nextCursor);
-    return this.advanceRead(r, caller, () => this.markRead(s, caller.principal, r.nextCursor));
+    return this.advanceReadTo(r, caller, sessionId(s), r.nextCursor);
+  }
+
+  /**
+   * How the daemon's plumbing is told from a program's in the session's output between `from` and
+   * `to` (observe): the strategy and nonce each Run there recorded in its run.start, for a reader of
+   * the session's text as a whole, which no Run renderer cuts for (the compat pack's logs). A Run's
+   * own text is cut by the renderers; a Run journaled before the recording has neither, and its
+   * marks are found by shape (the house's read of 78c4d6e, #22).
+   */
+  runPlumbing(caller: Caller, o: { session: string; from: Seq; to: Seq }): Array<Pick<PlumbingOf, 'strategy' | 'nonce'>> {
+    const s = this.find(caller, o.session, 'observe');
+    const out: Array<Pick<PlumbingOf, 'strategy' | 'nonce'>> = [];
+    for (const r of s.listRuns()) {
+      if ((r.seq.end ?? Number.POSITIVE_INFINITY) < o.from || r.seq.admit > o.to) continue;
+      const p: Pick<PlumbingOf, 'strategy' | 'nonce'> = {};
+      if (r.strategy !== undefined) p.strategy = r.strategy;
+      if (r.nonce !== undefined) p.nonce = r.nonce;
+      out.push(p);
+    }
+    return out;
   }
 
   /** Regex over output lines with seq anchors and context (§11 `search`). */

@@ -364,8 +364,9 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   survive a daemon restart only under the keeper backend: without it, a stopping daemon
   hangs up each shell as a closing terminal does, so the shell and its foreground job end
   while a job the shell detached on purpose (`nohup`, `setsid`, `disown`) lives on, and
-  process Runs' groups are ended. A live session's state names its
-  backend; a session whose shell ended reports `closed` or `recovered` in its place.
+  process Runs' groups are ended. A live entry's summary names its backend, cwd and
+  integration, a live entry whose shell has exited included; a history entry (closed, or
+  recovered with no shell to reattach) reports `closed` or its recovery class in their place.
   A disk that refuses writes never takes the daemon or a session down: the ring carries
   on, the failure is reported (`/health`, journal stats), and the file store catches up
   from the ring when writes succeed again; a torn last line is cut on open, never
@@ -727,8 +728,9 @@ Descriptor:
 
 `state` is the session's (`starting | idle | busy | unavailable | exited`, or `tui` while a
 full-screen program holds the terminal) and `integration` its level (`rich | basic | none`,
-G5); a session whose shell ended carries `state: exited` and its recovery class instead of
-a cwd.
+G5). A live entry whose shell has exited still carries its cwd and integration with
+`state: exited`; a history entry (closed, or recovered with no shell) carries `state: exited`
+and its recovery class instead of them.
 
 `channels/open` returns history only when the host asks (`history.limit`, ≤ 500),
 rebuilt by the same segmenter as live messages and stamped with event times, and attaches

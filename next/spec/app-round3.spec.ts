@@ -10,8 +10,9 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { App, type Caller } from '../src/api/app.js';
+import { App, commitReadDelivery, type Caller, type RunResult } from '../src/api/app.js';
 import { cutPlumbing } from '../src/core/plumbing.js';
+import { serviceOutcomeKey } from '../src/core/session.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { callTool, TOOLS, type ResultText, type ToolResult } from '../src/api/tools.js';
 import { validate } from '../src/api/validate.js';
@@ -263,4 +264,131 @@ test('a read whose result is never delivered leaves the read cursor where it was
   assert.equal(typeof r.onSent, 'function');
   r.onSent!(); // the transport wrote the result
   assert.ok(live.session.cursorsOf(A.principal).read > before, 'once delivered, the cursor advances');
+});
+
+// ───────────── the house's read of 78c4d6e (#22): the read cursor ─────────────
+
+test('78c4d6e 6: two deferred results outstanding at once leave the cursor at the later Run’s end, not frozen below it', async () => {
+  // B runs X then Y in a shared session; a deferred A reads each by its runId. Staged together and
+  // then committed together, A ends at Y's end — the target is decided at the commit, not when the
+  // result was staged, where each froze a target below the other's unread output.
+  const s = 'two-deferred';
+  await callTool('session_open', { session: s, visibility: 'shared' }, { app, caller: B, resultText: 'transcript' }, TOOLS);
+  const x = await app.run(B, { session: s, command: 'echo X', wait: 5000 });
+  const y = await app.run(B, { session: s, command: 'echo Y', wait: 5000 });
+  assert.equal(x.state, 'exited');
+  assert.equal(y.state, 'exited');
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  assert.equal(live.session.cursorsOf(A.principal).read, 0, 'A has read nothing');
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws6', deferReadDelivery: true };
+  const rx = await app.read(deferred, { session: s, runId: x.runId! });
+  const ry = await app.read(deferred, { session: s, runId: y.runId! });
+  assert.match(rx.text!, /X/);
+  assert.match(ry.text!, /Y/);
+  assert.equal(live.session.cursorsOf(A.principal).read, 0, 'both staged, nothing committed yet');
+  commitReadDelivery(rx);
+  commitReadDelivery(ry);
+  assert.equal(live.session.cursorsOf(A.principal).read, ry.nextCursor, 'after both are delivered the cursor is at Y’s end, with nothing unread between');
+});
+
+test('78c4d6e 19: the read commit does not survive into an idempotency entry’s compact copy', async () => {
+  const s = 'compact-sym';
+  await app.sessionOpen(A, { id: s });
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-compact', deferReadDelivery: true };
+  const key = 'k-compact';
+  const r = await app.run(deferred, { session: s, command: 'echo hi', idempotencyKey: key, wait: 5000 });
+  assert.equal(r.state, 'exited');
+  // The delivered result carries the staged commit until it is run, then no longer.
+  assert.ok(Object.getOwnPropertySymbols(r).length >= 1, 'the staged commit rides the result');
+  commitReadDelivery(r);
+  assert.deepEqual(Object.getOwnPropertySymbols(r), [], 'the delivered result has no symbol left');
+  // The idempotency entry keeps a compact copy; it holds no read-commit symbol, so no Session leaks through it.
+  await new Promise((res) => setImmediate(res));
+  const entries = (app as unknown as { idem: { entries: Map<string, { value: Promise<unknown> }> } }).idem.entries;
+  const entry = entries.get(`${A.principal}\u0000${key}`);
+  assert.ok(entry, 'the key was remembered');
+  const stored = (await entry.value) as RunResult;
+  assert.deepEqual(Object.getOwnPropertySymbols(stored), [], 'the compact copy carries no symbol');
+  assert.equal(stored.output.text, '', 'it is the compact copy (no output text)');
+});
+
+test('78c4d6e: run, await, start and screen advance a deferred caller’s read cursor only once their result is written', async () => {
+  const s = 'deferred-tools';
+  await callTool('session_open', { session: s }, { app, caller: A, resultText: 'transcript' }, TOOLS);
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-tools', deferReadDelivery: true };
+  const cur = () => live.session.cursorsOf(A.principal).read;
+
+  const commits = async (name: string, args: Record<string, unknown>): Promise<void> => {
+    const before = cur();
+    const r = await callTool(name, args, { app, caller: deferred, resultText: 'transcript' }, TOOLS);
+    assert.equal(r.isError, undefined, `${name}: ${r.text}`);
+    assert.equal(cur(), before, `${name}: nothing committed before the write`);
+    assert.equal(typeof r.onSent, 'function', `${name}: the result carries its commit`);
+    r.onSent!();
+    assert.ok(cur() >= before, `${name}: the cursor advances on the write`);
+  };
+
+  await commits('run', { session: s, command: 'echo one' });
+  const two = await callTool('run', { session: s, command: 'echo two' }, { app, caller: deferred, resultText: 'transcript' }, TOOLS);
+  two.onSent!();
+  await commits('await', { runId: (two.structured as { runId: string }).runId });
+  await commits('start', { session: s, command: 'sleep 30', name: 'svc', target: 'process' });
+  await commits('screen', { session: s });
+  const st = live.session.listRuns().find((x) => x.target === 'process');
+  if (st) await app.cancel(A, { session: s, runId: st.runId });
+});
+
+test('78c4d6e 9: a staged commit that runs after a close and reopen lands on the new life, never dragging the persisted cursor back', async () => {
+  const s = 'reopen-cursor';
+  await app.sessionOpen(A, { id: s });
+  await app.run(A, { session: s, command: 'echo one', wait: 5000 });
+  const life1 = registry.get(s);
+  assert.ok(life1?.kind === 'live');
+  // A deferred read of the session on life1: its commit is staged, not run (the connection has not written).
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws9', deferReadDelivery: true };
+  const staged = await app.read(deferred, { session: s, since: 0 });
+  const stagedTarget = staged.nextCursor;
+  // The name is closed and reopened: a new life, the journal continuous across it (G1).
+  await app.sessionClose(A, { session: s });
+  await app.sessionOpen(A, { id: s });
+  const life2 = registry.get(s);
+  assert.ok(life2?.kind === 'live' && life2.session !== life1.session);
+  // life2 advances the cursor further, and the book is persisted at that point.
+  await app.run(A, { session: s, command: 'echo two', wait: 5000 });
+  await app.read(A, { session: s, since: 0 });
+  const ahead = life2.session.cursorsOf(A.principal).read;
+  assert.ok(ahead > stagedTarget, `the new life is ahead of the stale target (${ahead} > ${stagedTarget})`);
+  // Now the stale staged commit runs: it resolves the live entry by name and commits onto the new life,
+  // never handing the old life's cursors to the book whole and dragging the persisted cursor back.
+  commitReadDelivery(staged);
+  await app.sessionClose(A, { session: s });
+  const hist = registry.get(s);
+  assert.ok(hist?.kind === 'history');
+  assert.ok(hist.cursorsOf(A.principal).read >= ahead, `the persisted cursor did not fall behind (${hist.cursorsOf(A.principal).read} >= ${ahead})`);
+});
+
+test('78c4d6e 10: a service outcome marks the status event the result rendered, so a ready→unhealthy→ready flap before the write does not swallow the recovery', async () => {
+  const s = 'flap';
+  await app.sessionOpen(A, { id: s });
+  // The service is ready at once, then says FAIL, then is ready again: three status events.
+  const st = await app.start(A, { session: s, name: 'svc', target: 'process', command: `bash -c 'echo READY; sleep 0.3; echo FAIL; sleep 0.3; echo READY-AGAIN; sleep 10'`, ready: { pattern: 'READY' }, fail: { pattern: 'FAIL' }, wait: 5000 });
+  assert.equal(st.service, 'ready', JSON.stringify(st));
+  const runId = st.runId!;
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const monitor = app.extras(live.session).services.get(runId)!;
+  const readySeq = monitor.info().seq!;
+  assert.equal(typeof readySeq, 'number');
+  // The flap plays out: unhealthy, then ready again at a new seq.
+  await until(() => monitor.info().status === 'ready' && (monitor.info().seq ?? 0) > readySeq, 5000, 'the recovery ready, at a new seq');
+  const recoverySeq = monitor.info().seq!;
+  assert.ok(recoverySeq > readySeq);
+  // The start result is now written: it carried the first ready, so that is what counts as delivered.
+  app.outcomeSent(A, st);
+  assert.equal(live.session.outcomeDeliveredTo(serviceOutcomeKey(runId, 'ready', readySeq), A.principal), true, 'the ready the result carried is delivered');
+  assert.equal(live.session.outcomeDeliveredTo(serviceOutcomeKey(runId, 'ready', recoverySeq), A.principal), false, 'the recovery the result never carried is still announced');
+  await app.cancel(A, { session: s, runId });
 });
