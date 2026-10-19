@@ -291,6 +291,7 @@ export class RunIndex {
         // and once recovery has judged the group a later restart does not judge it again (comment 6269992150).
         if (ev.recoveredEnd) r.recoveredEnd = true;
         if (ev.groupJudged) r.groupJudged = true;
+        if (ev.lastAliveTs !== undefined) r.lastAliveTs = ev.lastAliveTs;
         this.openIds.delete(ev.runId);
         return;
       }

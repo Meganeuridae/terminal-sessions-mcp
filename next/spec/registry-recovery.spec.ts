@@ -327,6 +327,44 @@ test('jr2-4: on Linux recovery compares process starts frame-free — a boot id 
   assert.deepEqual(sel(run({}), [row({ startMs: T })]), [1001], 'wall-clock fallback when ticks are absent');
 });
 
+test('jr2-4: a recovery that could not judge a Run\'s group keeps the dead daemon\'s last evidence on the lost end, and the next recovery bounds the group by it, not by the first recovery\'s time (the house\'s read of the 36 commits, #22, item 2)', async () => {
+  // First recovery, unable to judge (the scripted backend disables endOrphans, which leaves the same
+  // journal a missing process listing does: a lost end with no groupJudged). The dead daemon's last
+  // event is the Run's start, at T_death.
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'nl');
+  const T_death = 1_000_000;
+  const j = new Journal({ cold: new FileStore(sdir), sessionId: 'nl', now: () => T_death });
+  journalProcess(j, 'r1-unjudged', 4242);
+  j.close();
+  fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+  const r = rig(dir);
+  const run = hist(r.reg.get('nl')).run('r1-unjudged');
+  assert.equal(run.state, 'lost');
+  assert.equal(run.recoveredEnd, true, 'the end is recovery\'s');
+  assert.equal(run.groupJudged, undefined, 'nothing judged the group');
+  assert.equal(run.lastAliveTs, T_death, 'the dead daemon\'s last evidence rides on the end');
+  assert.ok(run.endedAt !== undefined && run.endedAt > T_death, 'the end itself carries the recovery\'s (later) time');
+  await r.reg.closeAll();
+
+  // Second recovery, through the rule: a leaderless group in the old pgid whose members started after
+  // the daemon died but before the first recovery cannot be the Run's — the cap at lastAliveTs leaves it.
+  const self = { pid: 500, pgid: 400 };
+  const T_rec1 = T_death + 60_000;
+  const cand = (over: Partial<RunInfo>): OrphanCandidate => ({
+    key: 'nl\0r1-unjudged',
+    run: { ...run, pgid: 4242, endedAt: T_rec1, recoveredEnd: true, ...over },
+    lastTs: T_rec1 + 5000, // the first-recovery daemon's own last event: not the bound
+  });
+  const row = (pid: number, startMs: number): ProcessRow => ({ pid, pgid: 4242, startMs, zombie: false });
+  const sel = (c: OrphanCandidate, procs: ProcessRow[]) => [...orphanGroups([c], procs, self).keys()];
+  assert.deepEqual(sel(cand({ lastAliveTs: T_death }), [row(4301, T_death + 20_000), row(4302, T_death + 40_000)]), [], 'members started between the death and the first recovery: left alone');
+  assert.deepEqual(sel(cand({ lastAliveTs: T_death }), [row(4301, T_death - 1000), row(4302, T_death + 40_000)]), [4242], 'a member that was there before the daemon died: the Run\'s, the later one its descendant');
+  // An end written by an older recovery, before lastAliveTs was recorded: the end time stands as before.
+  const { lastAliveTs: _recorded, ...older } = run;
+  assert.deepEqual(sel({ ...cand({}), run: { ...older, pgid: 4242, endedAt: T_rec1, recoveredEnd: true } }, [row(4301, T_death + 20_000)]), [4242], 'without the recorded evidence the bound falls back to the end');
+});
+
 // ───────────── jr2-12: command files ─────────────
 
 test('jr2-12/G26: recovery deletes a crashed life\'s command files, and forget deletes the command directory', async () => {

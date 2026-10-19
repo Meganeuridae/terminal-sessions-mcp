@@ -513,6 +513,10 @@ export class SessionRegistry {
         recoveredEnd: true,
       };
       if (outcome) ev.groupJudged = true;
+      // The dead daemon's last evidence, kept on the end: a recovery that could not judge the group (no
+      // process listing) leaves the Run a candidate, and the next recovery must bound its group by when
+      // the daemon died, not by this recovery's time (comment 6269992150, item 2).
+      if (last?.ts !== undefined) ev.lastAliveTs = last.ts;
       journal.append(ev);
       lost.add(run.runId);
     }
@@ -1125,7 +1129,10 @@ export function orphanGroups(candidates: OrphanCandidate[], procs: ProcessRow[],
     const listingBoot = members.find((p) => p.bootId !== undefined)?.bootId;
     if (run.bootId !== undefined && listingBoot !== undefined && run.bootId !== listingBoot) continue;
     const started = run.startedAt ?? run.admittedAt;
-    const ended = run.endedAt;
+    // A recovery-written end carries the recovery's time, which is no evidence of when the group could
+    // form: the bound is the dead daemon's last evidence the end recorded, so a reused pgid whose
+    // members started after the daemon died but before the recovery is left alone (comment 6269992150, item 2).
+    const ended = run.endedAt !== undefined && run.recoveredEnd && run.lastAliveTs !== undefined ? Math.min(run.endedAt, run.lastAliveTs) : run.endedAt;
     const leader = members.find((p) => p.pid === g);
     const sinceStart = (p: ProcessRow) => p.startMs >= started - 2000;
     // The leader started with the Run: by ticks when both were recorded (same boot, no wall-clock

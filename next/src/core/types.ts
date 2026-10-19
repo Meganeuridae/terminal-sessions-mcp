@@ -41,7 +41,7 @@ export type EventInput =
   /** `shell`/`within`: a Run declared for the shell in front of the terminal (§8.1): the kind of shell, and the Run whose program it is (null: what replaced the session's shell). */
   | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string; shell?: string; within?: string | null }
   | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number; startTicks?: number; bootId?: string; strategy?: RunStrategy; nonce?: string }
-  | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true }
+  | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true; lastAliveTs?: number }
   | { type: 'prompt'; cwd: string; phase: 'start' | 'end' }
   | { type: 'cwd'; path: string }
   | { type: 'env.snapshot'; count: number; vars?: Record<string, string> }
@@ -145,6 +145,12 @@ export interface RunInfo {
   recoveredEnd?: true;
   /** Recovery has judged this Run's process group (ended it or left it): a later restart does not judge it again. */
   groupJudged?: true;
+  /**
+   * For a recovery-written end: the last journal time the daemon that ran the Run was known alive (its
+   * last event before it died). The Run's group could not have formed after it, so a later recovery
+   * bounds the group by this, never by the recovery's own time (comment 6269992150, item 2).
+   */
+  lastAliveTs?: number;
   /**
    * A process Run whose process group still had members when its own process exited (a child it
    * left in the background): they run on, their output is journaled without the Run's id, and
