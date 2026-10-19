@@ -11,7 +11,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const SRC = fileURLToPath(new URL('../../src/', import.meta.url));
+/** `next/src`, found by walking up from wherever this spec runs (compiled under next/dist/spec, or next/spec under a TypeScript runner): `../../src` from the latter would be the 1.x tree. */
+const SRC = (() => {
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  while (!fs.existsSync(path.join(dir, 'next', 'src')) && path.dirname(dir) !== dir) dir = path.dirname(dir);
+  return `${path.join(dir, 'next', 'src')}/`;
+})();
 
 /** What each layer may import, by top-level directory under `next/src` (`core` is the bottom; `backends/types` are the one thing it needs). */
 const ALLOWED: Record<string, string[]> = {

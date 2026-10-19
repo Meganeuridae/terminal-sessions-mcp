@@ -435,7 +435,7 @@ npx ts-node examples/service-management.ts
 
 ## Requirements
 
-- **Node.js** 20.x, 22.x or 24.x (20 is the floor since 2.0 joined the package; Node 25+ not yet supported due to node-pty compatibility)
+- **Node.js** 20.19 or later within 20.x, 22.x or 24.x (20.19 is the floor since 2.0 joined the package: the earliest Node 20 that loads its dependencies; Node 25+ not yet supported due to node-pty compatibility)
 - **Headless Chrome** (via Puppeteer) for screenshots
 - **Modern browser** for web GUI (Chrome, Firefox, Safari, Edge)
 

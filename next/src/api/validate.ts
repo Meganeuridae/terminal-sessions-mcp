@@ -10,8 +10,7 @@
  * would not have looked into — so nothing inherited from Object.prototype can
  * pass as a declared parameter.
  */
-import { own } from '../core/keys.js';
-import { distance } from '../core/keys.js';
+import { distance, own } from '../core/keys.js';
 
 export interface Schema {
   type?: 'object' | 'string' | 'number' | 'integer' | 'boolean' | 'array';

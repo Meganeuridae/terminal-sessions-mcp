@@ -209,7 +209,7 @@ test('tailLogs on a 30,000-line session returns the lines asked for, clean or ra
     assert.ok(tail.filter(isLine).length >= 497, `raw ${raw}: the output's own lines, counted as lines`);
   }
   const most = lines(await call('tailLogs', { session: 'long', lines: 10_000 }));
-  assert.match(most[0]!, /^\[earlier output not shown: these lines come from the last 1 MiB; read \{"session": "long", "tail": 10000, "until": \d+\}/, 'the bound cut lines that were asked for: said');
+  assert.match(most[0]!, /^\[earlier output not shown \((?:the tail reached a bound|the raw tail reached)[^)]*\); read \{"session": "long", "tail": 10000, "until": \d+\}/, 'the bound cut lines that were asked for: said, with why');
   assert.ok(most.length > 5000 && most.length <= 10_001, `${most.length} lines`);
   assert.ok(most.slice(1).filter(isLine).length >= most.length - 3, 'whole lines up to the end');
 });

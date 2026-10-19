@@ -179,8 +179,9 @@ const tailAsked = (n: number) => Math.min(2 * n + 50, 10_000);
  * its escape codes, from the session's last events. `cut` names the oldest event shown when
  * older output exists beyond the bound.
  */
-async function tailLines(ctx: ToolContext, session: string, n: number, raw: boolean, d: Drawn): Promise<{ lines: string[]; cut?: Seq }> {
-  const res = (lines: string[], cut: Seq | undefined) => (cut !== undefined ? { lines: lines.slice(-n), cut } : { lines: lines.slice(-n) });
+async function tailLines(ctx: ToolContext, session: string, n: number, raw: boolean, d: Drawn): Promise<{ lines: string[]; cut?: Seq; why?: string }> {
+  /** The last n lines, and where the cut was when older output exists beyond what was read, with why. */
+  const res = (lines: string[], cutAt: Seq | undefined, why: string) => (cutAt !== undefined ? { lines: lines.slice(-n), cut: cutAt, why } : { lines: lines.slice(-n) });
   if (raw) {
     const { events, cut } = await tailEvents(ctx, session, n, summaryOf(ctx, session)?.rows ?? DEFAULT_GEOMETRY.rows, d);
     let text = '';
@@ -188,10 +189,10 @@ async function tailLines(ctx: ToolContext, session: string, n: number, raw: bool
       if (e.type === 'output') text += e.data;
       else if (e.type === 'run.start' && e.line !== undefined) text += `${text === '' || text.endsWith('\n') ? '' : '\n'}$ ${e.line}\n`;
     }
-    return res(withoutPlumbingLines(text.split(/\r?\n/)), cut);
+    return res(withoutPlumbingLines(text.split(/\r?\n/)), cut, 'the raw tail reached its byte or page bound');
   }
   const r = d.track(await ctx.app.read(ctx.caller, { session, tail: tailAsked(n), commands: true, maxBytes: TAIL_BYTES }));
-  return res(withoutPlumbingLines(r.text ? r.text.split('\n') : []), r.truncated ? r.seq[0] : undefined);
+  return res(withoutPlumbingLines(r.text ? r.text.split('\n') : []), r.truncated ? r.seq[0] : undefined, gapsText(r) ?? 'the tail reached a bound, or a line longer than it');
 }
 
 /** 1.x's launch statuses from a service's. */
@@ -392,8 +393,8 @@ export const COMPAT_TOOLS: ToolDef[] = [
       const asked = typeof a.lines === 'number' && a.lines > 0 ? Math.floor(a.lines) : 50;
       const n = Math.min(asked, 10_000);
       const d = new Drawn();
-      const { lines, cut } = await tailLines(ctx, session, n, a.raw === true, d);
-      if (cut !== undefined) lines.unshift(`[earlier output not shown: these lines come from the last 1 MiB; read {"session": "${session}", "tail": ${n}, "until": ${cut - 1}} shows what came before]`);
+      const { lines, cut, why } = await tailLines(ctx, session, n, a.raw === true, d);
+      if (cut !== undefined) lines.unshift(`[earlier output not shown (${why}); read {"session": "${session}", "tail": ${n}, "until": ${cut - 1}} shows what came before]`);
       if (asked > 10_000) lines.unshift(`[tailLogs returns at most 10000 lines; ${asked} were asked]`);
       return d.sent(json(lines));
     },
