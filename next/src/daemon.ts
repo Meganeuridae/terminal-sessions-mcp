@@ -30,6 +30,7 @@
  * value that looks like another flag is an error, never a silent fallback to an
  * unauthenticated default.
  */
+import { setting } from './core/env.js';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
@@ -220,8 +221,6 @@ function log(level: LogLevel, msg: string, fields: Record<string, unknown> = {})
   write(rec);
 }
 
-/** An environment variable that is set to something: an empty one is unset, not a value (the house's read of 59f660b, #22). */
-const env = (name: string): string | undefined => process.env[name] || undefined;
 
 /** At most `limit` stray-exception lines a minute, and a line a minute saying how many more were dropped (tsg-5). */
 function boundedLogger(limit: number): (msg: string, e: unknown) => void {
@@ -427,19 +426,19 @@ async function main(): Promise<void> {
   process.on('unhandledRejection', (e) => stray('unhandled rejection (daemon keeps serving)', e));
 
   // Resolved here: the integration builds launcher paths from it, and the shell starts in the session's cwd (the house's read of 1d83ffa).
-  const dataDir = path.resolve(f['data-dir'] ?? env('TSM_DATA_DIR') ?? path.join(os.homedir(), '.tsm'));
+  const dataDir = path.resolve(f['data-dir'] ?? setting('TSM_DATA_DIR') ?? path.join(os.homedir(), '.tsm'));
   // The 1.x names are read where the 2.0 ones are not set, so a daemon command written for 1.x
   // (connectome-host's setup guide: `--host localhost --headless`, SESSION_SERVER_PORT in the
   // unit) starts termd and says what it took from where (the house's review of #11).
   if (f.headless) log('info', "--headless is a 1.x flag: termd has no separate GUI server (the GUI is served at the daemon's own address), so it changes nothing");
   const oneX = (name: string, newName: string) => log('info', `using ${name} (a 1.x setting); ${newName} is the 2.0 name`);
-  if (f.host === undefined && env('TSM_HOST') === undefined && env('SESSION_SERVER_HOST') !== undefined) oneX('SESSION_SERVER_HOST', 'TSM_HOST');
-  if (f.port === undefined && env('TSM_PORT') === undefined && env('SESSION_SERVER_PORT') !== undefined) oneX('SESSION_SERVER_PORT', 'TSM_PORT');
-  let host = (f.host ?? env('TSM_HOST') ?? env('SESSION_SERVER_HOST') ?? '127.0.0.1').trim();
+  if (f.host === undefined && setting('TSM_HOST') === undefined && setting('SESSION_SERVER_HOST') !== undefined) oneX('SESSION_SERVER_HOST', 'TSM_HOST');
+  if (f.port === undefined && setting('TSM_PORT') === undefined && setting('SESSION_SERVER_PORT') !== undefined) oneX('SESSION_SERVER_PORT', 'TSM_PORT');
+  let host = (f.host ?? setting('TSM_HOST') ?? setting('SESSION_SERVER_HOST') ?? '127.0.0.1').trim();
   // `[::1]` is a URL's spelling of an IPv6 address; the bind wants it bare (the house's read of 59f660b, #22).
   if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
   if (!host) fail('--host must be an address');
-  const portSetting = (f.port ?? env('TSM_PORT') ?? env('SESSION_SERVER_PORT') ?? '3101').trim();
+  const portSetting = (f.port ?? setting('TSM_PORT') ?? setting('SESSION_SERVER_PORT') ?? '3101').trim();
   const port = /^\d+$/.test(portSetting) ? Number(portSetting) : NaN;
   if (host.toLowerCase() === 'localhost') {
     // One address is bound, and a name resolves to one of two: on a host where localhost is
@@ -469,8 +468,8 @@ async function main(): Promise<void> {
     }
   }
   const tokenOnArgv = f.token !== undefined;
-  if (f.token === undefined && env('TSM_TOKEN') === undefined && env('SESSION_SERVER_TOKEN') !== undefined) oneX('SESSION_SERVER_TOKEN', 'TSM_TOKEN');
-  const shared = f.token ?? env('TSM_TOKEN') ?? env('SESSION_SERVER_TOKEN');
+  if (f.token === undefined && setting('TSM_TOKEN') === undefined && setting('SESSION_SERVER_TOKEN') !== undefined) oneX('SESSION_SERVER_TOKEN', 'TSM_TOKEN');
+  const shared = f.token ?? setting('TSM_TOKEN') ?? setting('SESSION_SERVER_TOKEN');
   // tsg-20: argv is world-readable (ps). With a token on it, say so. The process title is `termd`
   // and the port, and nothing a flag value could carry: a cleanup such as `pkill -f node` run from
   // a session would otherwise take a daemon whose data dir or host has "node" in its name, and
@@ -524,7 +523,7 @@ async function main(): Promise<void> {
   // build before the daemon, whose death loses every session. The preference counts against
   // every process on the machine, so a shared host may want less, or 0.
   // An empty TSM_SESSION_OOM_SCORE_ADJ is unset (the default), not 0; an empty flag value is an error like any other.
-  const oomSetting = f['session-oom-score-adj'] ?? env('TSM_SESSION_OOM_SCORE_ADJ') ?? '200';
+  const oomSetting = f['session-oom-score-adj'] ?? setting('TSM_SESSION_OOM_SCORE_ADJ') ?? '200';
   const oomAdj = /^\d+$/.test(oomSetting.trim()) ? Number(oomSetting) : NaN;
   if (!Number.isInteger(oomAdj) || oomAdj < 0 || oomAdj > 1000) fail('--session-oom-score-adj must be an integer from 0 to 1000');
   registryOpts.sessionOomScoreAdj = oomAdj;
@@ -545,7 +544,7 @@ async function main(): Promise<void> {
   if (rb !== undefined || ra !== undefined) registryOpts.retention = retention;
   // A cap bounds one session; the floor bounds the machine (the house's review of #11, shell tools
   // 4). Below it, journals keep their ring and leave the disk alone until space returns.
-  const floorSetting = f['disk-floor-bytes'] ?? env('TSM_DISK_FLOOR_BYTES') ?? String(200 * 1024 * 1024);
+  const floorSetting = f['disk-floor-bytes'] ?? setting('TSM_DISK_FLOOR_BYTES') ?? String(200 * 1024 * 1024);
   const floor = /^\d+$/.test(floorSetting.trim()) ? Number(floorSetting) : NaN;
   if (!Number.isInteger(floor) || floor < 0) fail('--disk-floor-bytes must be a whole number of bytes (0 turns the floor off)');
   if (floor > 0) registryOpts.diskFloorBytes = floor;

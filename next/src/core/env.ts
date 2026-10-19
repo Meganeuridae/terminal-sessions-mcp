@@ -119,3 +119,10 @@ export function redactSnapshot(vars: Record<string, string>): Record<string, str
   for (const [k, v] of Object.entries(vars)) if (!/^TSM_(?:.*_)?(?:TOKEN|KEY|SECRET|PASSWORD)$/.test(k)) out[k] = v;
   return out;
 }
+
+/**
+ * A setting read from the daemon's own environment: set to something, or absent. An empty
+ * variable is unset, not a value (the house's read of 59f660b, #22): `TSM_DATA_DIR=""` must not
+ * become a data directory named "", in termd, in the shim that starts it, or in the CLI.
+ */
+export const setting = (name: string, env: NodeJS.ProcessEnv = process.env): string | undefined => env[name] || undefined;

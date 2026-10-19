@@ -29,6 +29,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
 import { analyze, readUsage, UNFINISHED } from '../api/usage.js';
+import { setting } from '../core/env.js';
 
 /** A result state the usage module calls unfinished (running, starting, queued). */
 const isUnfinished = (state: unknown): boolean => typeof state === 'string' && UNFINISHED.has(state);
@@ -272,9 +273,9 @@ function exitCode(tool: string, structured: Record<string, unknown>): number {
 
 /** The GUI is served by termd at its own origin (§12); the page reads `?token=` once and forgets it from the address bar. */
 function guiUrl(): string {
-  const ws = new URL(process.env.TSM_URL ?? 'ws://127.0.0.1:3101');
+  const ws = new URL(setting('TSM_URL') ?? 'ws://127.0.0.1:3101');
   const http = new URL(`${ws.protocol === 'wss:' ? 'https:' : 'http:'}//${ws.host}/`);
-  const token = process.env.TSM_TOKEN || ws.searchParams.get('token');
+  const token = setting('TSM_TOKEN') ?? ws.searchParams.get('token');
   if (token) http.searchParams.set('token', token);
   return http.toString();
 }
@@ -295,7 +296,7 @@ function usageReport(argv: string[]): void {
     if (v === undefined) throw new Error(`--${m[1]} needs a value`);
     opts[m[1]!] = v;
   }
-  const file = opts.file ?? path.join(process.env.TSM_DATA_DIR ?? path.join(os.homedir(), '.tsm'), 'usage.jsonl');
+  const file = opts.file ?? path.join(setting('TSM_DATA_DIR') ?? path.join(os.homedir(), '.tsm'), 'usage.jsonl');
   // A date that does not parse, or a log that cannot be read, is an error — not an empty
   // report that says nothing was recorded (the house's read of 4e37a11, #22).
   const since = opts.since !== undefined ? Date.parse(opts.since) : Number.NEGATIVE_INFINITY;
@@ -354,8 +355,9 @@ async function main(): Promise<void> {
   // The syntax is checked before any daemon is asked: a stray word or a flag without its value is a
   // usage error whether or not termd runs, and `--json` means tsm's own flag only before `--`.
   const syntax = parse(argv, undefined);
-  const url = new URL(process.env.TSM_URL ?? 'ws://127.0.0.1:3101');
-  if (process.env.TSM_TOKEN) url.searchParams.set('token', process.env.TSM_TOKEN);
+  const url = new URL(setting('TSM_URL') ?? 'ws://127.0.0.1:3101');
+  const token = setting('TSM_TOKEN');
+  if (token) url.searchParams.set('token', token);
   url.searchParams.set('profile', 'full');
   url.searchParams.set('resultText', syntax.json ? 'json' : 'transcript');
   url.searchParams.set('connection', `tsm-${process.pid}`);
