@@ -250,6 +250,24 @@ const TYPEAHEAD_GRACE_MS = 150;
  * to the beginning; the tty's line kill in canonical mode, which takes the ^E with the rest).
  */
 const CLEAR_WHOLE_LINE = '\x05\x15';
+
+/**
+ * Does `text` open a heredoc (`<<WORD`, `<<-WORD`, quoted or not; never `<<<`) that no later line
+ * closes? A conservative reading: an operator inside a string counts as one too, and then the
+ * text simply gets no capture line.
+ */
+export function hasOpenHeredoc(text: string): boolean {
+  const lines = text.split('\n');
+  const re = /(?<!<)<<(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_][\w-]*))/g;
+  for (let i = 0; i < lines.length; i++) {
+    for (const m of lines[i]!.replaceAll('<<<', '').matchAll(re)) {
+      const word = m[2] ?? m[3] ?? m[4]!;
+      const strip = m[1] === '-';
+      if (!lines.slice(i + 1).some((l) => (strip ? l.replace(/^\t+/, '') : l) === word)) return true;
+    }
+  }
+  return false;
+}
 /** After a line submitted at a declared prompt, how long the shell's own group in front must stand before it means the command ended (the shell may not have forked it yet). */
 const FOREGROUND_SETTLE_MS = 200;
 /** How often a declared Run held behind a submitted line looks again (no event ends such a hold). */
@@ -1908,7 +1926,10 @@ export class Session {
     // so the shell and its prompt see the command's own. The empty line before it ends a command
     // whose last line continued with a backslash. The end hook reads and unsets the variable.
     // (bash's PIPESTATUS and zsh's pipestatus in one line: each is empty in the other shell.)
-    if (capturePipeStatus) text += this.flavor === 'fish' ? '\nset -g __tsm_pst $pipestatus $status; __tsm_setst $__tsm_pst[-1]\n' : '\n__tsm_st=$? __tsm_ps="${PIPESTATUS[*]-}${pipestatus[*]-}"; return $__tsm_st\n';
+    // A heredoc the text never terminates ends at the end of the file, and would take the capture
+    // line in as its last lines — into whatever it feeds (the house's read of e1d2b8b): no capture
+    // then, and the Run reports no pipeStatus. (Fish has no heredocs.)
+    if (capturePipeStatus && (this.flavor === 'fish' || !hasOpenHeredoc(text))) text += this.flavor === 'fish' ? '\nset -g __tsm_pst $pipestatus $status; __tsm_setst $__tsm_pst[-1]\n' : '\n__tsm_st=$? __tsm_ps="${PIPESTATUS[*]-}${pipestatus[*]-}"; return $__tsm_st\n';
     if (this.commandDir !== this.tempDir && !this.commandDirTrusted()) {
       // jr2-3: the short directory lives under /tmp, where a cleaner may remove it and anyone
       // may create a directory of that name. Not provably ours: the session's own directory

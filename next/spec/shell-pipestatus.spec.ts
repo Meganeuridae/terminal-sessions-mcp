@@ -8,6 +8,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { hasShell, realSession } from './fake-shell.js';
 
 const shells = ['/bin/bash', '/bin/zsh', '/opt/homebrew/bin/fish', '/usr/bin/fish'].filter(hasShell);
@@ -39,8 +41,36 @@ for (const shell of shells) {
       // Nothing of the capture stays in the shell between Runs.
       const leak = await x.run(fish ? 'set -q __tsm_pst; and echo leaked; or echo clean' : '[ -n "${__tsm_ps+x}${__tsm_st+x}" ] && echo leaked || echo clean');
       assert.equal(leak.text.trim(), 'clean');
+      // A producer the next command stopped reading ends on SIGPIPE: the statuses say 141, the exit is head's.
+      const head = await x.run('seq 1 1000000 | head -n 1');
+      assert.deepEqual([head.exit, head.pipeStatus, head.text.trim()], [0, [141, 0], '1']);
+      if (!fish) {
+        // A heredoc the text never terminates ends at the end of the file: the capture line must not
+        // become part of it (it did: the file held `__tsm_st=0 …`). No capture, so no pipeStatus.
+        const out = path.join(x.tmp, 'heredoc-out.txt');
+        const open = await x.run(`cat > '${out}' <<EOF\nkey=value`);
+        assert.equal(open.exit, 0);
+        assert.equal(fs.readFileSync(out, 'utf8'), 'key=value\n', 'the file holds the heredoc body alone');
+        assert.equal(open.pipeStatus, undefined);
+        // A terminated heredoc feeding a pipeline still gets its statuses.
+        const closed = await x.run(`sh -c 'cat; exit 4' <<EOF | tail -n 1\nbody\nEOF`);
+        assert.deepEqual([closed.exit, closed.pipeStatus, closed.text.trim()], [0, [4, 0], 'body']);
+      }
     } finally {
       await x.close();
     }
   });
 }
+
+test('an open heredoc is recognised, quoted or not, with <<- and tab-indented terminators; here-strings and closed heredocs are not', async () => {
+  const { hasOpenHeredoc } = await import('../src/core/session.js');
+  assert.equal(hasOpenHeredoc('cat > f <<EOF\nkey=value\n'), true);
+  assert.equal(hasOpenHeredoc("cat <<'EOF'\nbody\n"), true);
+  assert.equal(hasOpenHeredoc('cat <<"EOF"\nbody\nEOF\n'), false);
+  assert.equal(hasOpenHeredoc('cat <<EOF\nbody\nEOF\n'), false);
+  assert.equal(hasOpenHeredoc('cat <<-EOF\n\tbody\n\tEOF\n'), false);
+  assert.equal(hasOpenHeredoc('cat <<-EOF\n\tbody\n'), true);
+  assert.equal(hasOpenHeredoc('cat <<< "a string"\n'), false);
+  assert.equal(hasOpenHeredoc('echo plain | tail -n 1\n'), false);
+  assert.equal(hasOpenHeredoc('cat <<A\nx\nA\ncat <<B\ny\n'), true, 'the second heredoc is open');
+});

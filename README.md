@@ -55,9 +55,10 @@ Ten core tools, one verb each (DESIGN §11, §11.1):
 Every result has two renderings: a readable transcript closed by one status line —
 `[run r4-1a2b exited 1 in 8.2s · shell · cwd /w/app · next=4990]` — and a structured
 envelope (`structuredContent`) whose `state` is the only authority on whether a command
-finished. The exit is the shell's own; for a pipeline the result also carries each command's
-status (`pipeStatus`), and the status line says when one before the last failed, since
-`make | tee log` exits as `tee` did. The text block is the transcript when the connection asks for it
+finished. The exit is the shell's own; for a pipeline (the last one of a multi-line command) the
+result also carries each command's status (`pipeStatus`), and the status line says when one before
+the last failed, since `make | tee log` exits as `tee` did; a producer that `head` stopped reading
+(status 141, SIGPIPE) is not called a failure. The text block is the transcript when the connection asks for it
 (`TSM_RESULT_TEXT=transcript` for the shim, `?resultText=transcript` on the URL; the
 shipped configs set it) and the envelope as JSON otherwise — the default, for hosts whose
 scripts parse tool text (agent-framework's code execution). Opt-in tiers: `terminal.control` (`signal`, `control`, `resize`,

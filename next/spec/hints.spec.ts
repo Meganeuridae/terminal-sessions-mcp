@@ -62,3 +62,13 @@ test('the status line reports a failure earlier in a pipeline beside the exit, a
   assert.doesNotMatch(text(base({ line: 'a | b', pipeStatus: [0, 0] })), /pipeline statuses/);
   assert.doesNotMatch(text(base({ line: 'a | b', exit: 1, pipeStatus: [0, 1] })), /pipeline statuses/, 'the last command failing is what the exit already says');
 });
+
+test('a producer that the next command stopped reading (141, SIGPIPE) is not a failure when the last command exited 0; it is named when something else failed too', () => {
+  const head = text(base({ line: 'seq 1 1000000 | head -n 1', pipeStatus: [141, 0] }));
+  assert.doesNotMatch(head, /pipeline statuses/, '`… | head` ends this way every time');
+  const headThenFail = text(base({ line: 'yes | head -n 1 | false', exit: 1, pipeStatus: [141, 0, 1] }));
+  assert.match(headThenFail, /pipeline statuses 141 \| 0 \| 1: a command before the last one failed \(141: ended by SIGPIPE when the next command stopped reading\)/);
+  const mixed = text(base({ line: 'a | b | c', pipeStatus: [141, 2, 0] }));
+  assert.match(mixed, /pipeline statuses 141 \| 2 \| 0: a command before the last one failed/);
+  assert.doesNotMatch(mixed, /SIGPIPE/, 'the 141 is the normal end here; the 2 is the failure');
+});

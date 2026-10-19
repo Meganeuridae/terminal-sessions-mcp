@@ -145,9 +145,14 @@ function runStatus(r: RunResult): string {
       const armed = r.target === 'shell' && looksLikeErrexit(r.line) ? ` — this turned on set -e in the shell itself, where it stays on: the next failing command ends the whole shell and the command running then ends lost; ${SET_E_NOTE}. set +e turns it off` : '';
       const left = r.leftovers ? ` — it left processes running in its group (a child put in the background): they run on, their output is journaled without this Run's id; cancel ${r.runId ?? 'this Run'} ends them, as does closing the session` : '';
       // A failure earlier in the pipeline (shell tools 3): the exit alone would read as success.
+      // 141 is SIGPIPE: the producer ended because the next command stopped reading, which is how
+      // `… | head` normally ends, so it is not a failure when the last command exited 0 (the
+      // house's read of e1d2b8b).
       const ps = r.pipeStatus ?? [];
-      const earlierFailed = ps.length > 1 && ps.slice(0, -1).some((x) => x !== 0);
-      const pipe = earlierFailed ? ` — pipeline statuses ${ps.join(' | ')}: a command before the last one failed${r.exit === ps[ps.length - 1] && r.exit === 0 ? '; the exit is the last command’s (pipefail is off)' : ''}` : '';
+      const last = ps[ps.length - 1];
+      const failed = ps.length > 1 ? ps.slice(0, -1).filter((x) => x !== 0 && !(x === 141 && last === 0)) : [];
+      const sigpipe = failed.includes(141) ? ' (141: ended by SIGPIPE when the next command stopped reading)' : '';
+      const pipe = failed.length ? ` — pipeline statuses ${ps.join(' | ')}: a command before the last one failed${sigpipe}${r.exit === last && r.exit === 0 ? '; the exit is the last command’s (pipefail is off)' : ''}` : '';
       return `exited ${r.exit ?? '?'}${r.signal ? ` (${r.signal})` : ''} in ${fmt(r.durationMs ?? 0)}${pipe}${armed}${left}`;
     }
     case 'cancelled': {
