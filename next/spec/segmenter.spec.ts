@@ -124,6 +124,19 @@ test('a full-screen program sends its screen after a quiet period, then at most 
   seg.dispose();
 });
 
+test('a watch segment says when the hit was on the line\'s head only, and carries clipped (the house\'s read of the 38 commits, #22)', () => {
+  const src = fakeSource();
+  const seg = new Segmenter(src);
+  const out = collect(seg);
+  src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 3, match: 'ERROR', line: 'ERROR: boom' });
+  src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 5, match: 'ERROR', line: 'ERROR: long', clipped: true });
+  assert.equal(out.length, 2);
+  assert.ok(!out[0]!.head.includes("(matched on the line's head)") && out[0]!.metadata.clipped === undefined, out[0]!.head);
+  assert.ok(out[1]!.head.endsWith("(matched on the line's head) · read since=4"), out[1]!.head);
+  assert.equal(out[1]!.metadata.clipped, true);
+  seg.dispose();
+});
+
 test('service and watch events become lifecycle messages for the principal who set them up; replay rebuilds them', async () => {
   const src = fakeSource();
   const seg = new Segmenter(src);

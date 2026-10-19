@@ -1374,6 +1374,7 @@ type JournalEvent =
   | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true; lastAliveTs? }
                                     // leftovers: a process Run's group had members when its process exited; pipeStatus: a pipeline's statuses, one per command (§8.1);
                                     // recoveredEnd: recovery wrote this end; groupJudged: recovery ended or left its group; lastAliveTs: the dead daemon's last journal time, which bounds the group a later recovery may take for the Run's
+  | { seq; ts; type: 'run.judged';  runId }                                                     // recovery judged this Run's group (ended or left it) after the Run had ended: folds into groupJudged, so no later restart judges it again
   | { seq; ts; type: 'run.waiting'; runId; lastLine; silentMs; state }                        // G15's input-wanted heuristic, journaled with its evidence
   | { seq; ts; type: 'service';     runId; status: 'starting'|'ready'|'running'|'unhealthy'|'exited'|'lost'; probe; principal; name?; evidence?; exit? }  // §8.3; principal started it
   | { seq; ts; type: 'prompt';      cwd; phase: 'start'|'end' }                              // A and B marks

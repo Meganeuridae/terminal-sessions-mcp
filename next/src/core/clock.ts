@@ -13,8 +13,8 @@ export const timerMs = (ms: number): number => Math.min(MAX_TIMER_MS, Math.max(0
 /**
  * The monotonic clock intervals are measured on, which a wall-clock step never moves; a test may
  * replace it. One exception: a watch's age for output the manager did not stamp on arrival — output
- * from before the manager existed — falls back to the journal's wall-clock age, clamped at zero
- * (watches.ts `ageOf`), since there is no monotonic stamp for it (the house's read of the 36 commits,
- * #22, comment 6269992150).
+ * from before the manager existed, or older than the newest 8,192 output events it saw — falls back
+ * to the journal's wall-clock age, clamped at zero (watches.ts `ageOf`), since there is no monotonic
+ * stamp for it (the house's read of the 36 commits, #22, comment 6269992150).
  */
 export const clocks = { monotonic: (): number => performance.now() };

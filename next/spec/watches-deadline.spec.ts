@@ -80,6 +80,39 @@ function bare() {
   return { journal, host, manager, startRun, out, firings, close: () => (manager.dispose(), journal.close()) };
 }
 
+test('an ended Run’s last output and a stream’s quiet partial line keep their arrival stamps once other output has come (the house’s read of the 38 commits, #22)', async (t) => {
+  const f = bare();
+  try {
+    // Run r printed and ended; Run q printed since. A silence wait answering for r ages r's last
+    // output: the previous stamps kept only each Run's newest output and dropped a Run's at its end,
+    // so this age came from the wall clock, and a forward step of 10 s certified 10 s of quiet.
+    f.startRun('r');
+    f.out('x\n', 'r');
+    f.journal.append({ type: 'run.end', runId: 'r', state: 'exited', exit: 0, durationMs: 1 });
+    f.startRun('q');
+    f.out('y\n', 'q');
+    const wall = Date.now();
+    t.mock.method(Date, 'now', () => wall + 10_000);
+    const w = await f.manager.waitFor({ silenceMs: 500, runId: 'r' }, 2000);
+    assert.equal(w.matched, true);
+    const quiet = Number(/no output for ([\d.]+)ms/.exec(String(w.match))?.[1]);
+    assert.ok(quiet < 5000, `the ended Run's last output is aged on the monotonic clock: ${w.match}`);
+    // A process Run's stderr left a prompt without a newline, then stdout printed: a wait replaying the
+    // output must age the stderr line by its arrival, not by the stepped wall clock, so it is not flushed
+    // as already quiet; it is matched once the partial delay has really passed.
+    f.startRun('p', 'process');
+    f.journal.append({ type: 'output', runId: 'p', data: 'password: ', stream: 'stderr' });
+    f.out('progress\n', 'p', 'stdout');
+    t.mock.method(Date, 'now', () => wall + 20_000);
+    const t0 = performance.now();
+    const hit = await f.manager.waitFor({ pattern: 'password:', runId: 'p' }, 5000, 0);
+    assert.equal(hit.matched, true);
+    assert.ok(performance.now() - t0 >= 150, `the partial line waited its delay instead of being flushed as stale: ${(performance.now() - t0).toFixed(0)} ms`);
+  } finally {
+    f.close();
+  }
+});
+
 test('a silence measured from earlier output takes its age from the monotonic clock, whatever the wall clock did since', async (t) => {
   const f = bare();
   try {

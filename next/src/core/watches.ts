@@ -17,11 +17,13 @@
  * Every pattern compiles on the linear-time engine, and a bad one is refused
  * with invalid_argument when the watch or wait is created.
  *
- * Quiet is measured on the monotonic clock. Output the manager saw arrive is
- * stamped as it arrives, so a silence measured from an earlier output is as exact
- * as one measured from arming; only output from before the manager existed takes
- * its age from the journal's wall-clock time, clamped at zero (the house's read of
- * 3eade8a, #22: a forward step of 10 s certified 5 s of silence in 1 ms).
+ * Quiet is measured on the monotonic clock. Every output event the manager saw arrive is
+ * stamped as it arrives (the newest 8,192 are kept), so a silence measured from an earlier
+ * output, a stream's quiet partial line or an ended Run's last output is as exact as one
+ * measured from arming; only output from before the manager existed, or older than the stamps
+ * kept, takes its age from the journal's wall-clock time, clamped at zero (the house's read of
+ * 3eade8a, #22: a forward step of 10 s certified 5 s of silence in 1 ms; and of the 38 commits
+ * after 78c4d6e: a Run's other stream and an ended Run's last output were aged on the wall clock).
  */
 import { randomBytes } from 'node:crypto';
 import { compileLinePattern, PARTIAL_QUIET_MS, StreamMatcher } from './ansi.js';
@@ -313,11 +315,8 @@ interface WatchRecord extends WatchInfo {
   lastFiredMono?: number | undefined;
 }
 
-/** The newest output the manager saw arrive, on the monotonic clock: by Run, and overall under `*`. */
-interface Stamp {
-  seq: Seq;
-  at: number;
-}
+/** How many output events keep their arrival stamp: enough for every live partial line and every ended Run's last output a wait may age (the house's read of the 38 commits, #22). */
+const STAMPS_KEPT = 8192;
 
 export class WatchManager {
   private readonly watches = new Map<string, WatchRecord>();
@@ -325,26 +324,27 @@ export class WatchManager {
   private counter = 0;
   /** Waits in flight, so closing the session ends them at once (m2-24). */
   private readonly waits = new Set<(reason: string) => void>();
-  private readonly stamps = new Map<string, Stamp>();
+  /** When each output event arrived, on the monotonic clock, by seq; the oldest stamps go as new ones come. */
+  private readonly stamps = new Map<Seq, number>();
 
   constructor(private readonly host: WatchHost) {
     this.off = host.journal.subscribe((ev) => {
       if (ev.type === 'watch.fired') return;
       if (ev.type === 'output') {
-        const stamp = { seq: ev.seq, at: clocks.monotonic() };
-        this.stamps.set('*', stamp);
-        if (ev.runId !== undefined) this.stamps.set(ev.runId, stamp);
-      } else if (ev.type === 'run.end') this.stamps.delete(ev.runId);
+        // Every output event is stamped, not only a Run's newest: a process Run's other stream and
+        // an ended Run's last output are aged too, by a wait replaying a quiet partial line or a
+        // silence wait answering for an ended Run (the house's read of the 38 commits, #22).
+        this.stamps.set(ev.seq, clocks.monotonic());
+        if (this.stamps.size > STAMPS_KEPT) this.stamps.delete(this.stamps.keys().next().value!);
+      }
       for (const w of [...this.watches.values()]) w.predicate.feed(ev);
     });
   }
 
-  /** How long ago an output event arrived: exact when it was stamped on arrival, else the journal's wall-clock age, clamped at zero. */
+  /** How long ago an output event arrived: exact when it was stamped on arrival, else (from before the manager existed, or older than the stamps kept) the journal's wall-clock age, clamped at zero. */
   private ageOf(ev: JournalEvent): number {
-    const s = this.stamps.get(ev.type === 'output' && ev.runId !== undefined ? ev.runId : '*');
-    if (s?.seq === ev.seq) return Math.max(0, clocks.monotonic() - s.at);
-    const any = this.stamps.get('*');
-    if (any?.seq === ev.seq) return Math.max(0, clocks.monotonic() - any.at);
+    const at = this.stamps.get(ev.seq);
+    if (at !== undefined) return Math.max(0, Math.round(clocks.monotonic() - at));
     return Math.max(0, Date.now() - ev.ts);
   }
 

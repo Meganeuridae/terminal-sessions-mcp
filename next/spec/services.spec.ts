@@ -332,6 +332,18 @@ test('m2-5: a start whose pattern the engine refuses fails with invalid_argument
   if (s?.kind === 'live') await until(() => s.session.listRuns().every((r) => r.state !== 'running' && r.state !== 'starting'), 3000, 'no Run left running');
 });
 
+test('a fail-pattern match on a line longer than the splitter keeps says it matched on the line\'s head too (the house\'s read of the 38 commits, #22)', () => {
+  const f = fake('process');
+  // A cheap pattern on a line past MAX_LINE: the splitter kept the head and dropped the rest, and the evidence says so.
+  const m = f.monitor({ ready: { pattern: 'up' }, fail: { pattern: 'BOOM' } });
+  f.start();
+  f.out('up\n');
+  f.out(`BOOM ${'z'.repeat(70_000)}\n`, 'stdout');
+  assert.equal(m.status, 'unhealthy');
+  assert.match(String(m.info().evidence), /^BOOM z+ \(matched on the line's head\)$/);
+  m.dispose();
+});
+
 test('a fail-pattern match on a line longer than the pattern\'s window says it matched on the line\'s head (the house\'s read of the 36 commits, #22)', () => {
   const f = fake('process');
   // A costly pattern gets a small match window, so a moderate line is matched on its head.

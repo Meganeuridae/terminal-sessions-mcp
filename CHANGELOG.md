@@ -6,7 +6,9 @@ A new implementation, built to `docs/redesign/DESIGN.md` and its guarantees (G1�
 beside the 1.x session server, MCP bridge, GUI and CLI. It lives in `next/`; its binaries are
 `termd`, `tsm` and `tsm-shim`. Nothing of 1.x is removed or renamed: `terminal-sessions-mcp`,
 `session-server`, `session-gui` and `session-cli` run 1.x as before, on ports 3100 and 3200,
-while `termd` listens on 3101. Making 2.0 the default — the 1.x names pointing at the shim and
+while `termd` listens on 3101 by default (it takes `SESSION_SERVER_PORT` when neither `--port` nor
+`TSM_PORT` is set, so a shell that exports it for the 1.x server points `termd` at that port too:
+`next/README.md`, "Upgrading from 1.x"). Making 2.0 the default — the 1.x names pointing at the shim and
 `termd`, the 1.x code retired — is a later release (`next/README.md`, "Upgrading from 1.x").
 
 ### Added
@@ -30,8 +32,8 @@ while `termd` listens on 3101. Making 2.0 the default — the 1.x names pointing
   mcpl-cc-bridge's real host code (`next/acceptance/`).
 - **Sharing**: several principals per session (per-agent tokens), one controller seat,
   provenance on every input, observers that cannot act, private and shared sessions.
-- **Measure**: every tool call recorded (names and hashes only) to `usage.jsonl`; `tsm usage`
-  reports use, errors and confusion signatures.
+- **Measure**: every tool call but the GUI's own successful reads recorded (names and hashes
+  only) to `usage.jsonl`; `tsm usage` reports use, errors and confusion signatures.
 - **The 1.x tool names on 2.0**: `tsm-shim --profile compat` (or `TSM_PROFILE=compat`) serves
   `runCommand`, `tailLogs`, `searchLogs`, `sendInput`, `sendSignal`, `listSessions`,
   `killSession`, `killAll`, `launch` and `takeScreenshot` over `termd`, for a 1.x host

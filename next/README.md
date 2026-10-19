@@ -247,8 +247,9 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   user's work, set it lower or to 0. History on disk is kept forever unless
   `--retention-days` or `--retention-bytes` says otherwise; a long-lived deployment should
   set one.
-- **Measure.** Every tool call is recorded (names and hashes, never contents) in
-  `~/.tsm/usage.jsonl`; `tsm usage` reports per-tool use, errors and confusion signatures.
+- **Measure.** Every tool call but the GUI's own successful reads is recorded (names and hashes,
+  never contents) in `~/.tsm/usage.jsonl`; `tsm usage` reports per-tool use, errors and confusion
+  signatures.
 
 ## CLI
 
