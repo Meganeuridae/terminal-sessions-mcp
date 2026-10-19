@@ -188,7 +188,11 @@ test('G28: a terminal Run result is marked delivered only when the transport say
   r.onSent!();
   assert.equal(s.session.outcomeDeliveredTo(runId, A.principal), true);
   const running = await callTool('run', { session: 'sent1', command: 'sleep 1', wait: 0 }, { app, caller: A, resultText: 'transcript' }, TOOLS);
-  assert.equal(running.onSent, undefined, 'a running result delivers no outcome');
+  // onSent now also advances the read cursor on delivery (the house's read of 1cabc6a, #22), so a running
+  // result may carry it; what must hold is that calling it delivers no outcome for a Run still running.
+  const runId2 = running.structured?.runId as string;
+  running.onSent?.();
+  assert.equal(s.session.outcomeDeliveredTo(runId2, A.principal), false, 'a running result delivers no outcome');
   await sleep(1100);
 });
 

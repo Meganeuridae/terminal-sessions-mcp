@@ -59,10 +59,11 @@ Ten core tools, one verb each (DESIGN §11, §11.1):
 | `session_list`, `session_open`, `session_close` | manage sessions |
 | `session_declare_shell` | declare that the foreground program is a shell, so subsequent Runs execute there |
 
-Every result has two renderings: a readable transcript closed by one status line —
+Every successful result has two renderings: a readable transcript closed by one status line —
 `[run r4-1a2b exited 1 in 8.2s · shell · cwd /w/app · next=4990]` — and a structured
 envelope (`structuredContent`) whose `state` is the only authority on whether a command
-finished. The exit is the shell's own; for a pipeline (the last one of a multi-line command) the
+finished. A failed call comes back as an error result whose text opens with the code
+(`session_not_found: …`) and which carries no envelope. The exit is the shell's own; for a pipeline (the last one of a multi-line command) the
 result also carries each command's status (`pipeStatus`, not in a declared shell, whose end marker
 carries `$?` alone), and the status line says when one before
 the last failed, since `make | tee log` exits as `tee` did; a producer that `head` stopped reading
@@ -74,9 +75,10 @@ looks like it opened another shell, turned on `set -e`, or ran `ssh` without a t
 part of the status line, so a host reading the JSON gets the facts (`line`, `state`, `reason`)
 and no hint field. Opt-in tiers: `terminal.control` (`signal`, `control`, `resize`,
 `session_env_capture`), `terminal.services` (`start` with readiness and health probes),
-`terminal.watch` (`watch`, `unwatch`, `watches`, `wait_for`), `terminal.search` (`search`). Mutating tools take an
-`idempotencyKey` (a fresh UUID per operation): a retry returns the first outcome instead of
-running twice, also across a daemon restart for `run` and `start`.
+`terminal.watch` (`watch`, `unwatch`, `watches`, `wait_for`), `terminal.search` (`search`). Mutating tools of these
+tiers take an `idempotencyKey` (a fresh UUID per operation): a retry returns the first outcome
+instead of running twice, also across a daemon restart for `run` and `start`. The 1.x
+compatibility tools do not take one (1.x had none) and ignore one passed to them.
 
 A result `lost` means the daemon could not observe the command's end and refuses to
 guess (DESIGN G3); the reason says why. The common self-inflicted one is `shell-exited

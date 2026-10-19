@@ -7,7 +7,7 @@
  * `code: message`), which MCP permits.
  */
 import { TermError } from '../core/errors.js';
-import type { App, Caller, ReadResult, RunResult, SearchResult, SessionSummary } from './app.js';
+import { commitReadDelivery, type App, type Caller, type ReadResult, type RunResult, type SearchResult, type SessionSummary } from './app.js';
 import type { GapInfo } from './reader.js';
 import { COMPAT_TOOLS } from './compat.js';
 import { looksLikeErrexit, looksLikeShellOpener, oneShotSshWithoutTty } from './hints.js';
@@ -67,10 +67,14 @@ const render = (ctx: ToolContext, transcript: string, structured: Record<string,
 
 const TERMINAL = new Set(['exited', 'cancelled', 'lost']);
 
-/** A Run result, marked delivered (G28) once the transport has written it (mcpl-1). */
+/** A Run result, marked delivered (G28) and its read cursor advanced (G22) once the transport has written it (mcpl-1; the house's read of 1cabc6a, #22). */
 function runResult(ctx: ToolContext, r: RunResult): ToolResult {
   const res = renderRun(r, ctx.resultText);
-  if (r.runId !== undefined && (TERMINAL.has(r.state) || r.service !== undefined)) res.onSent = () => ctx.app.outcomeSent(ctx.caller, r);
+  const outcome = r.runId !== undefined && (TERMINAL.has(r.state) || r.service !== undefined);
+  res.onSent = () => {
+    if (outcome) ctx.app.outcomeSent(ctx.caller, r);
+    commitReadDelivery(r);
+  };
   return res;
 }
 
@@ -242,7 +246,7 @@ const RUN_OUTPUT: Schema = {
     integration: { type: 'string' },
     shell: { type: 'string', description: 'A declared shell’s Run: the kind of shell in front (bash, sh, zsh, fish…).' },
     within: { description: 'With shell: the runId whose program is that shell, or null for the program that replaced the session’s shell.' },
-    waiting: { type: 'object', properties: { kind: { type: 'string', enum: ['input', 'tui'] }, lastLine: { type: 'string' }, silentMs: { type: 'number' }, heuristic: { type: 'boolean' } }, required: ['kind', 'heuristic'] },
+    waiting: { type: 'object', properties: { kind: { type: 'string', enum: ['input', 'tui'] }, lastLine: { type: 'string' }, silentMs: { type: 'number' }, state: { type: 'string' }, heuristic: { type: 'boolean' } }, required: ['kind', 'state', 'heuristic'] },
     ignored: { type: 'array', items: { type: 'string' } },
     created: { type: 'boolean' },
     service: { type: 'string', enum: SERVICE_STATUS },
@@ -539,7 +543,11 @@ export const TOOLS: ToolDef[] = [
     async run(ctx, a) {
       const o = pick<Parameters<App['read']>[1]>(a, ['session', 'since', 'offset', 'until', 'tail', 'runId', 'as', 'maxBytes', 'limit']);
       if (o.since === undefined && o.tail === undefined && o.runId === undefined) o.tail = 50;
-      return renderRead(await ctx.app.read(ctx.caller, o), ctx.resultText);
+      const r = await ctx.app.read(ctx.caller, o);
+      const res = renderRead(r, ctx.resultText);
+      // The read cursor advances only once this result reaches the caller (G22; the house's read of 1cabc6a, #22).
+      res.onSent = () => commitReadDelivery(r);
+      return res;
     },
   },
   {
@@ -553,9 +561,11 @@ export const TOOLS: ToolDef[] = [
     async run(ctx, a) {
       const s = await ctx.app.screen(ctx.caller, { session: a.session as string });
       const structured = env(s);
-      if (ctx.resultText === 'json') return { text: JSON.stringify(s, null, 2), structured };
+      // The read cursor advances only once this result reaches the caller (G22; the house's read of 1cabc6a, #22).
+      const onSent = () => commitReadDelivery(s);
+      if (ctx.resultText === 'json') return { text: JSON.stringify(s, null, 2), structured, onSent };
       const status = `[screen ${a.session as string} ${s.cols}x${s.rows}${s.alt ? ' · full-screen program' : ''} · cursor ${s.cursor.x},${s.cursor.y} · seq ${s.seq}${s.title ? ` · title "${s.title}"` : ''}${s.droppedUnits ? ` · approximate: ${s.droppedUnits} output units dropped under backlog` : ''}]`;
-      return { text: s.lines.join('\n').replace(/\n+$/, '') + '\n' + status, structured };
+      return { text: s.lines.join('\n').replace(/\n+$/, '') + '\n' + status, structured, onSent };
     },
   },
   {

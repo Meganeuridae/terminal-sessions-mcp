@@ -12,7 +12,7 @@ import { compileUserRegex } from '../core/regex.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
 import { project, type ProjectChunk } from '../core/transcript.js';
 import type { JournalEvent, Seq, ServiceStatus } from '../core/types.js';
-import type { App, SessionSummary } from './app.js';
+import { commitReadDelivery, type App, type SessionSummary } from './app.js';
 import { looksLikeShellOpener } from './hints.js';
 import type { ToolContext, ToolDef, ToolResult } from './tools.js';
 
@@ -320,7 +320,10 @@ export const COMPAT_TOOLS: ToolDef[] = [
       if (r.state === 'queued') res.note = `queued behind the running command: it runs in the session's own shell when that ends; await {"runId": "${r.runId}"} gets its exit code`;
       if (r.state === 'lost' && r.reason) res.note = `outcome unknown: ${r.reason}`;
       const out = json(res);
-      if (r.runId !== undefined && (r.state === 'exited' || r.state === 'cancelled' || r.state === 'lost')) out.onSent = () => ctx.app.outcomeSent(ctx.caller, r);
+      out.onSent = () => {
+        if (r.runId !== undefined && (r.state === 'exited' || r.state === 'cancelled' || r.state === 'lost')) ctx.app.outcomeSent(ctx.caller, r);
+        commitReadDelivery(r);
+      };
       return out;
     },
   },
@@ -506,7 +509,8 @@ export const COMPAT_TOOLS: ToolDef[] = [
         // 1.x wrote a PNG there; a `success: true` without the file would be a lie (the house's read of 1cabc6a, #22).
         if (typeof a.outputPath === 'string') return json({ success: false, error: `outputPath ${a.outputPath}: ${SCREEN_TEXT_ONLY}; call again without outputPath for the text`, text });
         // In json mode the text is the envelope, as for every other tool (the house's read of 1cabc6a, #22).
-        return { text: ctx.resultText === 'json' ? JSON.stringify(structured, null, 2) : text, structured };
+        // The read cursor advances once this reaches the caller (G22; the house's read of 1cabc6a, #22).
+        return { text: ctx.resultText === 'json' ? JSON.stringify(structured, null, 2) : text, structured, onSent: () => commitReadDelivery(s) };
       } catch (e) {
         if (e instanceof TermError) return json({ success: false, error: e.message });
         throw e;

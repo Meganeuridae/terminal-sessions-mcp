@@ -193,3 +193,24 @@ test('texts: session and run errors name a next step, and no guarantee label lea
   assert.match(obsWatch.text, /^session_exited:.*only its owner \(agent:a@test\) can start a new shell/);
   assert.doesNotMatch(obsWatch.text, /session_open starts a new shell/);
 });
+
+test('a read whose result is never delivered leaves the read cursor where it was (G22): the advance waits for the write', async () => {
+  // A connection that drops before the result is written must count nothing read; the cursor advances
+  // only when the transport runs the result's onSent (the house's read of 1cabc6a, #22, comment 6263057673).
+  const s = 'deliver';
+  // B's Run writes output A has not read, in a shared session A may observe.
+  await callTool('session_open', { session: s, visibility: 'shared' }, { app, caller: B, resultText: 'transcript' }, TOOLS);
+  await callTool('run', { session: s, command: 'echo from-B' }, { app, caller: B, resultText: 'transcript' }, TOOLS);
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const before = live.session.cursorsOf(A.principal).read;
+  assert.equal(before, 0, 'A has read nothing yet');
+  // A reads over a connection that can drop: deferReadDelivery, as the transport sets it.
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws', deferReadDelivery: true };
+  const r = await callTool('read', { session: s, since: 0 }, { app, caller: deferred, resultText: 'transcript' }, TOOLS);
+  assert.match(r.text, /from-B/, 'the page carried the output');
+  assert.equal(live.session.cursorsOf(A.principal).read, before, 'the result was not delivered: the cursor has not moved');
+  assert.equal(typeof r.onSent, 'function');
+  r.onSent!(); // the transport wrote the result
+  assert.ok(live.session.cursorsOf(A.principal).read > before, 'once delivered, the cursor advances');
+});

@@ -50,7 +50,7 @@ import { createServer, type IncomingMessage, type Server as HttpServer, type Ser
 import type { AddressInfo, Server as NetServer, Socket } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
-import type { App, Caller } from '../api/app.js';
+import { commitReadDelivery, type App, type Caller } from '../api/app.js';
 import { guiPrincipal, type PrincipalResolver } from '../api/principals.js';
 import type { AnySession, HistorySession, LiveSession } from '../api/registry.js';
 import { callTool, TOOLS, toolsFor, type Profile, type ResultText, type ToolDef, type ToolResult } from '../api/tools.js';
@@ -690,7 +690,8 @@ export class TermServer {
       credential,
       label: sanitizeLabel(q.get('connection')),
       ws,
-      caller: { principal, connectionId: id },
+      // A ws connection can drop before a result is written, so its read cursor advances only on delivery (G22).
+      caller: { principal, connectionId: id, deferReadDelivery: true },
       out: new Outbound((m) => this.send(ws, m)),
       lane: null,
       profile: PROFILES.includes(profileQ as Profile) ? (profileQ as Profile) : (this.opts.profile ?? 'core'),
@@ -1142,6 +1143,8 @@ export class TermServer {
     const read = await app.read(conn.caller, { session: sid, tail: TRANSCRIPT_READ_LINES, maxBytes: 256 * 1024 });
     stillWanted();
     if (app.registry.get(sid) !== s) return undefined;
+    // The transcript is being handed to this principal: advance the read cursor the deferred read staged (G22).
+    commitReadDelivery(read);
     const lastSeq = s.journal.lastSeq;
     const f = this.follow(conn, sid, s.journal, lastSeq);
     after(() => this.startFollower(conn, sid, f));

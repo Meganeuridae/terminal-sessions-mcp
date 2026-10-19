@@ -93,7 +93,10 @@ it every new server needs a hand-written rule set or a preset baked into the bri
    `suggestedTreatment` rules from every declared feature set in declaration order and
    compile to a `WakePolicy`: a rule whose behavior is `immediate` becomes a `wake` entry;
    any other behavior becomes a `hold` entry. `tagsAll` → one AND-set; `tagsAny` → one
-   AND-set per tag; `tagsNone` is not expressible in the bridge's rule form — skip the rule
+   AND-set per tag; a rule with both `tagsAll` and `tagsAny` cannot be compiled to AND-sets
+   without weakening it (a `tagsAny` tag would then match alone, against mcpl-core 0.3.0's
+   "only if ALL"), so skip such a rule and log it, as for `tagsNone`; termd's own rules use
+   `tagsAny` only. `tagsNone` is not expressible in the bridge's rule form — skip the rule
    and log it. Precedence approximation: the bridge checks all `wake` rules before all
    `hold` rules, not first-match over the producer's order; document this.
 3. **Acceptance is pinned to a manifest revision and is invalidated by change** — SPEC
@@ -260,7 +263,8 @@ a surprise, and the note is noise.
 **Change.** Let a channel descriptor opt out of speech routing, e.g.
 `metadata.speech: 'none'` (or a recipe field `routeSpeech: false` on the `mcplServers`
 entry), so a text-only turn woken by such a channel goes to the conversation's default
-destination and does not open the channel. termd would set it on terminal channels.
+destination and does not open the channel. termd sets it on every terminal channel's
+descriptor (`metadata.speech: 'none'`).
 
 **Tests.** A wake from a `speech: 'none'` channel followed by a text-only turn: nothing is
 published there and its desired state stays closed.
@@ -268,7 +272,7 @@ published there and its desired state stays closed.
 ### A4 — No change: tool tiers via tool policy (note)
 
 `src/mcpl/tool-policy.ts` applies `enabledTools` / `disabledTools` with `*` wildcards at
-both listing and dispatch. A recipe that wants the terminal's core tier lists the nine
+both listing and dispatch. A recipe that wants the terminal's core tier lists the ten
 core tool names, or disables `start,watch*,wait_for,unwatch,signal,control,resize,session_env_capture,search` — simpler still, it enables the `terminal.core` feature set. The server
 additionally filters `tools/list` by enabled feature sets, as discord-mcpl does; the host's
 policy remains authoritative. Document the snippet in the terminal server's README when

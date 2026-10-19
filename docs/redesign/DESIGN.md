@@ -250,8 +250,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   level is known and reported: `rich` (prompt-start, prompt-end, pre-execution and
   end-with-exit marks, cwd, command line), `basic` (end marks only), `none` (fallback
   strategy). Under `basic` and `none`, only daemon-issued Runs have boundaries, and
-  results say so: every Run result carries `integration`, and under `none` the status line
-  reports the cwd as unknown. Integration that a command removes (hooks cleared, `exec` into a new
+  results say so: a Run result from the live session carries `integration`, and under `none`
+  the status line reports the cwd as unknown. A Run read back from a closed session's history
+  reports the directory its `run.start` recorded and omits the live integration level (the
+  daemon is no longer running the shell to report it). Integration that a command removes (hooks cleared, `exec` into a new
   shell) heals at the next prompt where the shell allows it; the Run that broke it ends
   `lost`, never left `running`. An unverified replacement program is `unavailable` for
   shell Runs (including queued admission); it remains observable and accepts explicit
@@ -347,9 +349,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   remembered, so its retry can run. The memory is bounded per principal and in total, oldest
   evicted first. A client never blindly resends input after an ambiguous outcome.
 - **G17.** A session has at most one controller at a time. Observers may not type, signal,
-  resize or destroy. The controller is visible in session state and to every Attachment.
-  Handoff is explicit (`release`, `take`, owner override). Terminal dimensions are set by the
-  controller only; observers scale their own view.
+  resize or destroy, with two exceptions that need no seat: a principal may `cancel` a Run it
+  started, and the owner may `session_close` its own session. The controller is visible in
+  session state and to every Attachment. Handoff is explicit (`release`, `take`, owner
+  override). Terminal dimensions are set by the controller only; observers scale their own view.
 - **G18.** Permission verbs are `observe | type | run | signal | resize | destroy`, enforced
   in the application layer for every adapter. MCPL grants govern the host's access to the
   server; they do not replace terminal-side authorization.
@@ -394,7 +397,9 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 - **G22.** Delivery is tracked per `(principal, session)` with two cursors whose meanings
   are fixed. `delivered`: the highest `seq` the host accepted, from a `channels/incoming`
   result or a `push/event` response. `read`: the highest `seq` whose content a tool result
-  returned to that principal (`run`, `await`, `read`, `screen`). Presence says "new since
+  *delivered* to that principal (`run`, `await`, `read`, `screen`) — advanced when the result
+  is written to the connection, not when the method computes it, so a call orphaned by a
+  dropped connection counts nothing read. Presence says "new since
   your last read" from `read`; catch-up after reconnect resumes from `delivered`, and
   `delivered` never advances past a lifecycle message still owed to that principal (a
   completion settles a moment after its `run.end`, so a later event can be accepted first).
@@ -417,9 +422,11 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 
 ### Results
 
-- **G27.** Every tool result carries a structured envelope whose `state` field is the only
-  authority on whether a Run completed; the readable text is derived from the same result
-  and never has to be parsed to learn it.
+- **G27.** Every successful tool result carries a structured envelope whose `state` field is
+  the only authority on whether a Run completed; the readable text is derived from the same
+  result and never has to be parsed to learn it. A failed call is an `isError` result whose
+  text opens with the error code and which carries no envelope (MCP carries a tool failure in
+  the result); only the compat pack answers in 1.x's `{success: false}` shape.
 
 ### Safety
 
@@ -951,28 +958,33 @@ it. Tests exercise it directly. Tool names below are the MCP projection.
 | `snapshot` | later: render the current screen to SVG/PNG from the emulator buffer | image block |
 
 `wait` values sit below the host's 60 s request timeout, which is what turns a timeout into
-an ordinary `running` (G3). Every mutating tool accepts an `idempotencyKey` (G16).
+an ordinary `running` (G3). Every mutating tool of the core, control, services, watch and
+search tiers accepts an `idempotencyKey` (G16); the compat pack does not — it reproduces the
+1.x tools, which had no such key, and ignores one passed to it.
 
-**Result shape.** Every tool returns one result in two renderings. The **text** is a
+**Result shape.** Every successful tool returns one result in two renderings. The **text** is a
 readable transcript for the model — the command's output as a human would see it, closed by
 one fixed-format status line such as `[run r41 exited 1 in 8.2s · next=4990]`. The
-**structured envelope** is `structuredContent` conforming to the tool's `outputSchema`
-(MCP 2025-06-18), with stable fields a script can rely on: `runId`, `state`, `exit`,
-`durationMs`, `nextCursor`, `truncated`, `output`, in camelCase like the rest of the MCPL
-wire. A script must never have to parse prose to tell `exited` from `running`; the
+**structured envelope** is `structuredContent`, conforming to the tool's `outputSchema` where
+it declares one (`run`, `await`, `start`, `read`, `screen`, `cancel`, `session_list`,
+`session_open`, `search`, `watch`, `watches`, `wait_for`); the other tools return a documented
+envelope without a published schema. Stable fields a script can rely on: `runId`, `state`,
+`exit`, `durationMs`, `nextCursor`, `truncated`, `output`, in camelCase like the rest of the
+MCPL wire. A failed call is an `isError` result that carries no envelope (G27). A script must never have to parse prose to tell `exited` from `running`; the
 envelope's `state` is the only authority on completion (G27). Until a host's script runner
 prefers `structuredContent` — agent-framework's `code_execution` hands scripts the text
 today, see `UPSTREAM-CHANGES.md` — a per-connection `resultText: transcript | json` setting
 defaults to `json`, which is what the current tool emits, and hosts opt into `transcript`
 in their server entry.
 
-**Tiers.** The default surface is nine single-purpose tools — `run`, `await`, `read`,
-`screen`, `input`, `cancel`, `session_list`, `session_open`, `session_close` — judged by
+**Tiers.** The default surface is ten single-purpose tools — `run`, `await`, `read`,
+`screen`, `input`, `cancel`, `session_list`, `session_open`, `session_close` and
+`session_declare_shell` — judged by
 Codex's test: does the core complete common workflows on its own? Start, wait, read, look,
-type, stop, and manage sessions do; that is why `await` on a run id is core and the
+type, stop, declare a shell in front, and manage sessions do; that is why `await` on a run id is core and the
 pattern, idle and silence waits are not. The core maps onto what a Claude already knows from
 Claude Code's `Bash`, background tasks and terminal pane, and onto Codex's `exec_command` /
-`write_stdin` pair unbundled. Nine plain tools beat six with folded modes. Everything else
+`write_stdin` pair unbundled. Ten plain tools beat six with folded modes. Everything else
 is opt-in progressive disclosure: `terminal.control` (`signal`, `control`, `resize`,
 `session_env_capture`), `terminal.services` (`start`), `terminal.watch` (`watch`, `unwatch`,
 `watches`, `wait_for`), `terminal.search` (`search`), and later `terminal.snapshot`. The mechanism is two-layered, because
@@ -1233,8 +1245,10 @@ Deferred from milestone 1, with reasons: services and probes (their own contract
 watches and `wait_for` (a second event source; cheap, but not needed for the sentence);
 in-flight digests and the presence injection (both depend on the `read` cursor semantics
 being right in practice first — evidence); the GUI as a native client (the old GUI still
-works against the compat pack); tiers and profiles (evidence from Measure decides the
-boundary).
+works against the 1.x server, which ships beside 2.0 — the compat pack serves the 1.x *tool
+names* to MCP hosts, not the 1.x GUI's own `session.create`/`exec`/`output`/`search`
+WebSocket protocol, which termd does not speak); tiers and profiles (evidence from Measure
+decides the boundary).
 
 **Milestone 2 — swap-in.** Everything that makes milestone 1 pleasant and lets it replace
 the deployed daemon: the compat pack under the old tool names; services and the three
@@ -1367,7 +1381,7 @@ started the Run. The presence line reads `build: `npm run build` → 0 (3m12s)`.
 `read{runId:"r42"}` returns the attributed output (G12).
 
 **Start and forget.** `start{command:"npm run dev", ready:{pattern:"listening on"}}` →
-`{runId:"r17", status:"ready"}` after 3 s. Output flows as throttled digests.
+`{runId:"r17", state:"running", service:"ready"}` after 3 s. Output flows as throttled digests.
 `watch{pattern:"ERROR|EADDRINUSE", label:"dev-errors"}` later fires as
 `terminal:watch=dev-errors`, which wakes the agent. When the dev server dies, the Service
 reports `exited` from the observed end mark (G9), not `running` because bash is alive.

@@ -68,8 +68,8 @@ export interface RunResult {
   within?: string | null;
   /** The session's integration level (G5): under `none`, only daemon-issued Runs have boundaries and the cwd is not tracked. */
   integration?: string;
-  /** A running Run that seems to wait for someone (G15, heuristic): a prompt-like last line after silence, or a full-screen program. */
-  waiting?: { kind: 'input' | 'tui'; lastLine?: string; silentMs?: number; heuristic: true };
+  /** A running Run that seems to wait for someone (G15, heuristic): a prompt-like last line after silence, or a full-screen program; carries the session state G15 asks for. */
+  waiting?: { kind: 'input' | 'tui'; lastLine?: string; silentMs?: number; state: string; heuristic: true };
   /** Arguments that did not apply (e.g. `cwd` for a session that already exists). */
   ignored?: string[];
   created?: boolean;
@@ -117,6 +117,30 @@ export interface Caller {
   principal: Principal;
   /** Identifies the connection for attachments. */
   connectionId: string;
+  /**
+   * The caller reaches the daemon over a connection that can drop before a result is written: its
+   * `read` cursor must advance only once the result has been delivered (G22), so output a dropped
+   * connection never received is not counted read (the house's read of 1cabc6a, #22, comment
+   * 6263057673). The transport sets this; a direct caller leaves it off and the cursor advances at once.
+   */
+  deferReadDelivery?: boolean;
+}
+
+/**
+ * A result that returned content to its caller stages its `read`-cursor advance here when the
+ * caller's delivery is deferred: the transport runs it from `ToolResult.onSent`, once the write
+ * succeeded. Symbol-keyed, so it never enters the envelope or its schema.
+ */
+const READ_COMMIT = Symbol('readCommit');
+
+/** Advance a deferred caller's `read` cursor now that its result was delivered (no-op if nothing was staged). */
+export function commitReadDelivery(result: unknown): void {
+  if (result === null || typeof result !== 'object') return;
+  const commit = (result as Record<symbol, unknown>)[READ_COMMIT];
+  if (typeof commit === 'function') {
+    delete (result as Record<symbol, unknown>)[READ_COMMIT];
+    (commit as () => void)();
+  }
 }
 
 interface Extras {
@@ -715,6 +739,18 @@ export class App {
   }
 
   /** The live Session a Run belongs to, if it is a Run of the session's current shell. */
+  /**
+   * A result returned content to the caller: advance its `read` cursor (G22). When the caller's
+   * delivery is deferred (a connection that can drop), stage the advance on the result for the
+   * transport to run once the write succeeded; otherwise advance now (the house's read of 1cabc6a,
+   * #22). Either way the target is fixed here, at the state the result reflects.
+   */
+  private advanceRead<T extends object>(result: T, caller: Caller, commit: () => void): T {
+    if (caller.deferReadDelivery) (result as Record<symbol, unknown>)[READ_COMMIT] = commit;
+    else commit();
+    return result;
+  }
+
   private liveRunner(s: AnySession, runId: string): Session | undefined {
     if (s.kind !== 'live') return undefined;
     try {
@@ -769,13 +805,14 @@ export class App {
       res.integration = session.integration;
       const waiting = this.waitingEvidence(session, run);
       if (waiting) res.waiting = waiting;
-      session.markRead(caller.principal, this.readCursorAfterRun(s, caller.principal, run.runId, out.nextCursor));
+      const target = this.readCursorAfterRun(s, caller.principal, run.runId, out.nextCursor);
+      this.advanceRead(res, caller, () => session.markRead(caller.principal, target));
       // The outcome counts as delivered (G28) only once the transport wrote it: see outcomeSent.
     } else {
       // This result returned the history to the caller: the cursor moves as it does for `read` (G22),
       // so presence stops reporting what the caller has now seen (the house's read of 1cabc6a, #22).
-      if (s.kind === 'live') s.session.markRead(caller.principal, out.nextCursor);
-      else s.markRead(caller.principal, out.nextCursor);
+      const sink = s.kind === 'live' ? s.session : s;
+      this.advanceRead(res, caller, () => sink.markRead(caller.principal, out.nextCursor));
     }
     return res;
   }
@@ -828,7 +865,8 @@ export class App {
    */
   private waitingEvidence(session: Session, run: RunInfo): RunResult['waiting'] | undefined {
     if (run.state !== 'running' || run.target !== 'shell') return undefined;
-    if (session.screen.alt) return { kind: 'tui', heuristic: true };
+    // G15 carries the session state alongside the line and the silence (the house's read of 1cabc6a, #22).
+    if (session.screen.alt) return { kind: 'tui', state: session.state, heuristic: true };
     const recent = session.journal.tail(64);
     let lastOut: JournalEvent | undefined;
     for (let i = recent.length - 1; i >= 0; i--) {
@@ -842,7 +880,7 @@ export class App {
     if (silentMs < 3000) return undefined;
     const line = promptLine(session.snapshot());
     if (line === undefined) return undefined;
-    return { kind: 'input', lastLine: head(line, 200), silentMs, heuristic: true };
+    return { kind: 'input', lastLine: head(line, 200), silentMs, state: session.state, heuristic: true };
   }
 
   /** The Run's output as result text: the tail, capped, with the cut visible and the route to all of it. */
@@ -979,7 +1017,7 @@ export class App {
     if (run.within !== undefined) res.within = run.within;
     if (run.line !== undefined) res.line = head(run.line, 200);
     res.integration = session.integration;
-    session.markRead(caller.principal, out.nextCursor);
+    this.advanceRead(res, caller, () => session.markRead(caller.principal, out.nextCursor));
     return res;
   }
 
@@ -1090,7 +1128,7 @@ export class App {
     const session = this.liveFor(caller, o.session, 'observe');
     await session.screen.settled();
     const snap = session.snapshot();
-    session.markRead(caller.principal, snap.seq);
+    this.advanceRead(snap, caller, () => session.markRead(caller.principal, snap.seq));
     return snap;
   }
 
@@ -1132,8 +1170,10 @@ export class App {
     const r = await readJournal(readSource(s), opts, { resultBytes: this.resultBytes });
     // A page of one Run leaves other Runs' unread output unread (see readCursorAfterRun).
     const at = opts.runId !== undefined ? this.readCursorAfterRun(s, caller.principal, opts.runId, r.nextCursor) : r.nextCursor;
-    if (s.kind === 'live' && at <= s.session.journal.lastSeq) s.session.markRead(caller.principal, at);
-    else if (s.kind === 'history') s.markRead(caller.principal, at);
+    this.advanceRead(r, caller, () => {
+      if (s.kind === 'live' && at <= s.session.journal.lastSeq) s.session.markRead(caller.principal, at);
+      else if (s.kind === 'history') s.markRead(caller.principal, at);
+    });
     return r;
   }
 
