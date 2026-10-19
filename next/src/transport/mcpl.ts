@@ -847,6 +847,11 @@ export class McplLane {
     return this.enabled('terminal.live', 'pushEvents') || (this.open.has(channelId(sessionId)) && this.enabled('terminal.channels', 'channels.incoming'));
   }
 
+  /** `carries`, for the endpoint: whether a tool may promise this connection notifications about `sessionId` (the house's read of 2f357bd, #22). */
+  deliversTo(sessionId: string): boolean {
+    return this.carries(sessionId);
+  }
+
   /** A closed life's owed entries whose message will never come (its segmenter has drained) stop pinning the cursor (mcpl-7). */
   private releaseUnsettled(t: Target, upTo: Seq): void {
     const st = this.stateOf(t);

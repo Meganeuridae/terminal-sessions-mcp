@@ -51,7 +51,7 @@ import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import type { App, Caller } from '../api/app.js';
 import { guiPrincipal, type PrincipalResolver } from '../api/principals.js';
-import type { AnySession } from '../api/registry.js';
+import type { AnySession, HistorySession, LiveSession } from '../api/registry.js';
 import { callTool, TOOLS, toolsFor, type Profile, type ResultText, type ToolDef, type ToolResult } from '../api/tools.js';
 import { clipField, newUsageKey, usageDigest, type UsageRecord } from '../api/usage.js';
 import { err, TermError } from '../core/errors.js';
@@ -112,8 +112,14 @@ export interface ServerOptions {
   highWaterBytes?: number;
   /** How long close() waits for clients to finish the closing handshake before terminating them (default 1000 ms). */
   shutdownGraceMs?: number;
-  /** Called for every tools/call (§16 Measure). */
+  /** Called for every tools/call except the GUI's successful read-only calls, which are its own bookkeeping (§16 Measure, tsg-16). */
   usage?: { record(r: UsageRecord): void };
+}
+
+/** An attach of one session waiting on its snapshot or transcript; `gen` moves when terminal/detach arrives meanwhile (tsg-4). */
+interface AttachWait {
+  gen: number;
+  waiting: number;
 }
 
 type ConnKind = 'pending' | 'mcp' | 'mcpl' | 'native' | 'gui';
@@ -136,8 +142,12 @@ interface Conn {
   gui: boolean;
   kind: ConnKind;
   followers: Map<string, Follower>;
-  /** Bumped by terminal/detach so an attach that was waiting on the screen does not attach after it. */
-  attachGen: Map<string, number>;
+  /**
+   * Attaches waiting on their snapshot, by session, so a terminal/detach meanwhile stops them attaching
+   * after it. An entry lives only while an attach waits (the in-flight bound caps them), so a detach
+   * naming a session that does not exist leaves nothing behind (the house's read of 2f357bd, #22).
+   */
+  attaching: Map<string, AttachWait>;
   inFlight: number;
   /** Set first thing in onClose: an await that resumes after it must not attach anything (tsg-4). */
   closed: boolean;
@@ -238,8 +248,11 @@ function plain(res: ServerResponse, status: number, text: string, extra: Record<
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
+/** Session names are at most 64 characters (the registry's rule), so nothing keyed by one grows with what a client sends. */
+const MAX_SESSION_NAME = 64;
+
 function sessionParam(p: Record<string, unknown>): string {
-  if (typeof p.session !== 'string' || p.session === '') throw new RpcError(INVALID_PARAMS, 'session must be a non-empty string');
+  if (typeof p.session !== 'string' || p.session === '' || p.session.length > MAX_SESSION_NAME) throw new RpcError(INVALID_PARAMS, `session must be a string of 1 to ${MAX_SESSION_NAME} characters`);
   return p.session;
 }
 
@@ -250,6 +263,9 @@ const TOOL_NAMES: ReadonlySet<string> = new Set(TOOLS.map((t) => t.name));
 const READ_ONLY_TOOLS: ReadonlySet<string> = new Set(['session_list', 'screen', 'read', 'search', 'watches', 'listSessions', 'tailLogs', 'searchLogs']);
 /** Close code for a connection that never sent anything (policy violation). */
 const CLOSE_IDLE = 1008;
+/** A history attach reads this many lines of the end of the journal and carries at most this many. */
+const TRANSCRIPT_READ_LINES = 5000;
+const TRANSCRIPT_LINES = 3000;
 const MISDIRECTED = 'misdirected request: this Host is not served here; start termd with --allow-host <host:port> to serve it';
 
 export class TermServer {
@@ -257,7 +273,7 @@ export class TermServer {
   private readonly wss: WebSocketServer;
   private readonly conns = new Set<Conn>();
   private readonly opts: ServerOptions;
-  private readonly statics = new StaticFiles();
+  private readonly statics: StaticFiles;
   private readonly startedAt = Date.now();
   private offRegistry: (() => void) | undefined;
   private allowed: HostPattern[] = [];
@@ -269,6 +285,8 @@ export class TermServer {
 
   constructor(opts: ServerOptions) {
     this.opts = opts;
+    // A GUI file that cannot be read is a broken install: the operator's log says which (the house's read of 2f357bd, #22).
+    this.statics = new StaticFiles({ onError: (pathname, file, error) => this.emit('warn', 'GUI asset unavailable', { path: pathname, file, error }) });
     this.http = createServer((req, res) => this.onHttp(req, res));
     this.http.on('clientError', (_e, socket) => refuse(socket, 400, 'Bad Request'));
     this.wss = new WebSocketServer({ noServer: true, maxPayload: opts.maxPayload ?? 4 * 1024 * 1024 });
@@ -289,14 +307,31 @@ export class TermServer {
           // The name only to a principal that may see the session (G18); anyone else just re-lists.
           if (conn.watchSessions) conn.out.notify('terminal/sessionsChanged', visible ? { type: c.type, session: c.id } : { type: c.type });
           const f = conn.followers.get(c.id);
-          if (f && c.type !== 'created') {
-            // Closed or removed: the stream for this session ends, and the subscriber is told so.
+          if (f && c.type === 'created') {
+            if (!visible) {
+              // The new life is one this principal may not observe (reopened private, G18): nothing of
+              // the name flows to it any more, and it is told the stream ended (the house's read of 2f357bd, #22).
+              this.unfollow(conn, c.id);
+              conn.out.notify('terminal/closed', { session: c.id, reason: 'forbidden' });
+            } else if (s?.kind === 'live' && f.source !== s.session.journal && !f.ending) {
+              // A history-only session given a new life continues the same seq numbering in a
+              // new journal: follow it from the same cursor, so the stream goes on with no hole.
+              // One still delivering the closed life's end is left to finish, and ends with it.
+              this.startFollower(conn, c.id, this.follow(conn, c.id, s.session.journal, f.cursor));
+            }
+          } else if (f && c.type === 'closed') {
+            // The stream ends with the session, but only once everything retained has been delivered:
+            // a subscriber paused at a full socket still gets the end of the life, its exit included
+            // (the house's read of 2f357bd, #22).
+            f.onceCaughtUp(() => {
+              if (conn.followers.get(c.id) !== f) return;
+              this.unfollow(conn, c.id);
+              conn.out.notify('terminal/closed', { session: c.id, reason: 'session-closed' });
+            });
+          } else if (f) {
+            // Removed: its journal is gone, and the subscriber is told so.
             this.unfollow(conn, c.id);
             conn.out.notify('terminal/closed', { session: c.id, reason: `session-${c.type}` });
-          } else if (f && c.type === 'created') {
-            // A history-only session given a new life continues the same seq numbering in a
-            // new journal: follow it from the same cursor, so the stream goes on with no hole.
-            if (s?.kind === 'live' && f.source !== s.session.journal) this.startFollower(conn, c.id, this.follow(conn, c.id, s.session.journal, f.cursor));
           }
           if (!conn.lane) continue;
           if (c.type === 'created') {
@@ -664,7 +699,7 @@ export class TermServer {
       gui,
       kind: gui ? 'gui' : 'pending',
       followers: new Map(),
-      attachGen: new Map(),
+      attaching: new Map(),
       inFlight: 0,
       closed: false,
       closedClean: false,
@@ -735,7 +770,9 @@ export class TermServer {
   private onClose(conn: Conn, code: number): void {
     // First, before anything can yield: an attach or open that resumes after this must not attach (tsg-4).
     conn.closed = true;
-    conn.closedClean = code === 1000 || code === 1001;
+    // 1005 is a close frame that carries no status (`ws.close()` with no code): still a close on purpose,
+    // unlike 1006, which is no close frame at all (the house's read of 2f357bd, #22).
+    conn.closedClean = code === 1000 || code === 1001 || code === 1005;
     if (conn.pendingTimer) clearTimeout(conn.pendingTimer);
     this.conns.delete(conn);
     const guard = (what: string, fn: () => void) => {
@@ -768,27 +805,36 @@ export class TermServer {
     }
   }
 
-  /** Write one message; `onSent` runs once it was handed to the socket without error, never when the connection closed first. */
-  private send(ws: WebSocket, m: Message, onSent?: () => void): void {
-    if (ws.readyState !== ws.OPEN) return;
+  /**
+   * Write one message. `onSent` runs once it was handed to the socket without error, never when
+   * the connection closed first. `onDone` runs once in every case — written, failed, or skipped
+   * because the socket is not open — which is when the request it answers stops being in flight.
+   */
+  private send(ws: WebSocket, m: Message, onSent?: () => void, onDone?: () => void): void {
+    if (ws.readyState !== ws.OPEN) {
+      onDone?.();
+      return;
+    }
     try {
       const data = JSON.stringify(m);
-      if (!onSent) ws.send(data);
+      if (!onSent && !onDone) ws.send(data);
       else ws.send(data, (e) => {
-        if (e) return;
         try {
-          onSent();
+          if (!e) onSent?.();
         } catch (err) {
           this.emit('error', 'onSent hook failed', { error: errText(err) });
+        } finally {
+          onDone?.();
         }
       });
     } catch (e) {
       this.emit('error', 'send failed', { error: errText(e) });
+      onDone?.();
     }
   }
 
-  private reply(conn: Conn, id: Id | null, error: { code: number; message: string; data?: unknown }): void {
-    this.send(conn.ws, { jsonrpc: '2.0', id, error });
+  private reply(conn: Conn, id: Id | null, error: { code: number; message: string; data?: unknown }, onDone?: () => void): void {
+    this.send(conn.ws, { jsonrpc: '2.0', id, error }, undefined, onDone);
   }
 
   private async onMessage(conn: Conn, data: RawData): Promise<void> {
@@ -817,14 +863,24 @@ export class TermServer {
       this.emit('debug', 'dropped a notification-form request (it needs an id)', { ...this.connFields(conn), method: clip(msg.method, 64) });
       return;
     }
-    // §12: work in flight per connection is bounded, notifications included.
+    // §12: work in flight per connection is bounded, notifications included. A request is in
+    // flight until its reply reached the socket, not merely until it was queued: a client that
+    // stops reading is refused once `limit` replies wait for it, instead of the queue growing
+    // with every request it keeps sending (the house's read of 2f357bd, #22). The refusal says
+    // the request did not run, so sending it again is safe.
     const limit = this.opts.maxInFlight ?? 128;
     if (conn.inFlight >= limit) {
-      if (isCall) this.reply(conn, id, { code: OVERLOADED, message: 'too many requests in flight on this connection', data: { limit } });
+      if (isCall) this.reply(conn, id, { code: OVERLOADED, message: 'too many requests in flight on this connection; this one was not run: send it again once earlier ones have answered', data: { limit, executed: false } });
       else this.emit('debug', 'dropped a notification: too much in flight', { ...this.connFields(conn), method: clip(msg.method, 64), limit });
       return;
     }
     conn.inFlight++;
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      conn.inFlight--;
+    };
     // Frames from one TCP packet are delivered in one tick; yield so a response's
     // continuation (e.g. a channel registration) runs before the next request.
     await Promise.resolve();
@@ -833,7 +889,7 @@ export class TermServer {
     try {
       const result = await this.dispatch(conn, msg, (fn) => afters.push(fn), (fn) => sent.push(fn));
       // G28: a result counts as delivered only once it is on the wire, so its hooks wait for the write.
-      if (isCall) this.send(conn.ws, { jsonrpc: '2.0', id: id as Id, result: result ?? {} }, sent.length ? () => sent.forEach((fn) => fn()) : undefined);
+      if (isCall) this.send(conn.ws, { jsonrpc: '2.0', id: id as Id, result: result ?? {} }, sent.length ? () => sent.forEach((fn) => fn()) : undefined, release);
       // Continuations that must follow the response on the wire (e.g. channels/register after the policy receipt).
       if (afters.length) {
         setTimeout(() => {
@@ -851,11 +907,12 @@ export class TermServer {
         this.emit('error', 'request failed', { ...this.connFields(conn), method: clip(msg.method, 64), error: errText(e) });
       }
       if (!isCall) return;
-      if (e instanceof RpcError) this.reply(conn, id, { code: e.code, message: e.message, data: e.data });
-      else if (e instanceof TermError) this.reply(conn, id, { code: INVALID_PARAMS, message: `${e.code}: ${e.message}`, data: { code: e.code, ...(e.data ?? {}) } });
-      else this.reply(conn, id, { code: INTERNAL, message: e instanceof Error ? e.message : String(e) });
+      if (e instanceof RpcError) this.reply(conn, id, { code: e.code, message: e.message, data: e.data }, release);
+      else if (e instanceof TermError) this.reply(conn, id, { code: INVALID_PARAMS, message: `${e.code}: ${e.message}`, data: { code: e.code, ...(e.data ?? {}) } }, release);
+      else this.reply(conn, id, { code: INTERNAL, message: e instanceof Error ? e.message : String(e) }, release);
     } finally {
-      conn.inFlight--;
+      // A notification has no reply to wait for; a call's slot goes when its reply has been written.
+      if (!isCall) release();
       this.sweepClosed(conn);
     }
   }
@@ -895,8 +952,9 @@ export class TermServer {
           instructions:
             'Persistent terminal sessions. `run` executes a command and waits; a still-running command returns its runId ' +
             '(`await` it or `read` its output) and keeps running. `screen` shows the terminal now; `input` types into it. ' +
+            // What an MCPL host is promised depends on its grant, unknown at initialize (the house's read of 2f357bd, #22).
             (wantsMcpl
-              ? 'A command you started that outlives your wait is reported when it ends; open a session’s channel to follow everything that happens in it.'
+              ? 'When your host grants terminal.live push events, a command you started that outlives your wait is reported when it ends; otherwise `await` it or `read` with the returned cursor. Open a session’s channel to follow everything that happens in it.'
               : 'Use `read` with the returned cursor to see what happened since.'),
         };
       }
@@ -918,7 +976,10 @@ export class TermServer {
         const name = typeof p.name === 'string' ? p.name : '';
         const args = (p.arguments ?? {}) as Record<string, unknown>;
         const t0 = Date.now();
-        const r = await callTool(name, args, { app, caller: conn.caller, resultText: conn.resultText, notifications: conn.kind === 'mcpl' }, this.availableTools(conn));
+        // A tool's advice about notifications holds only when this connection's grant delivers them for the
+        // session it names; being an MCPL host is not enough (the house's read of 2f357bd, #22).
+        const notifications = conn.lane !== null && conn.lane.deliversTo(typeof args.session === 'string' ? args.session : '');
+        const r = await callTool(name, args, { app, caller: conn.caller, resultText: conn.resultText, notifications }, this.availableTools(conn));
         this.afterToolCall(conn, name, args, r, Date.now() - t0);
         if (r.onSent) onSent(r.onSent);
         return { content: [{ type: 'text', text: r.text }], structuredContent: r.structured, ...(r.isError ? { isError: true } : {}) };
@@ -939,7 +1000,17 @@ export class TermServer {
         // ── MCPL: everything else in the family is the lane's (§10) ──
         if (McplLane.METHODS.has(req.method)) {
           if (!conn.lane) throw new RpcError(METHOD_NOT_FOUND, 'not an MCPL connection');
-          return conn.lane.handle(req.method, p, { isRequest: req.id !== undefined, after });
+          const ctx = { isRequest: req.id !== undefined, after };
+          if (req.method !== 'featureSets/update') return conn.lane.handle(req.method, p, ctx);
+          // A grant changes which tools the host may list: initialize promised `tools.listChanged`, so
+          // the host is told to list again, after the receipt is on the wire; a malformed grant that
+          // leaves no tools changes them too (the house's read of 2f357bd, #22).
+          const before = this.availableTools(conn).map((t) => t.name).join(' ');
+          try {
+            return await conn.lane.handle(req.method, p, ctx);
+          } finally {
+            if (this.availableTools(conn).map((t) => t.name).join(' ') !== before) after(() => conn.out.notify('notifications/tools/list_changed'));
+          }
         }
         if (req.id === undefined) return undefined;
         throw new RpcError(METHOD_NOT_FOUND, `method not found: ${clip(req.method, 64) as string}`);
@@ -1007,6 +1078,9 @@ export class TermServer {
     let since = journal.lastSeq;
     if (p.since !== undefined) {
       if (typeof p.since !== 'number' || !Number.isInteger(p.since) || p.since < 0) throw new RpcError(INVALID_PARAMS, 'since must be a non-negative integer');
+      // A cursor past the journal names events that do not exist: refused, with where the journal ends,
+      // rather than moved back to deliver events the caller said it had (the house's read of 2f357bd, #22).
+      if (p.since > journal.lastSeq) throw new RpcError(INVALID_PARAMS, `since ${p.since} is past the journal's last seq ${journal.lastSeq}`, { lastSeq: journal.lastSeq });
       since = p.since;
     }
     const f = this.follow(conn, sid, journal, since);
@@ -1027,65 +1101,102 @@ export class TermServer {
    * first event. A history-only session answers with its transcript instead.
    */
   private async nativeAttach(conn: Conn, p: Record<string, unknown>, after: (fn: () => void) => void): Promise<unknown> {
-    const app = this.opts.app;
-    const principal = conn.caller.principal;
     const sid = sessionParam(p);
     const role = p.role ?? 'auto';
     if (role !== 'auto' && role !== 'observer' && role !== 'controller') throw new RpcError(INVALID_PARAMS, 'role must be auto, observer or controller');
-    const s = this.observable(conn, sid);
-    this.unfollow(conn, sid);
-    const gen = conn.attachGen.get(sid) ?? 0;
-    const summary = () => app.sessionList(conn.caller).find((x) => x.id === sid) ?? null;
     // tsg-4: the connection may close, or detach, while this waits; nothing may attach for it afterwards.
-    const stillWanted = () => {
+    const wait = conn.attaching.get(sid) ?? { gen: 0, waiting: 0 };
+    wait.waiting++;
+    conn.attaching.set(sid, wait);
+    const gen = wait.gen;
+    const stillWanted = (): void => {
       if (conn.closed) throw new RpcError(INVALID_REQUEST, 'the connection closed during the attach');
-      if ((conn.attachGen.get(sid) ?? 0) !== gen) throw new RpcError(INVALID_REQUEST, 'attach superseded by terminal/detach');
+      if (wait.gen !== gen) throw new RpcError(INVALID_REQUEST, 'attach superseded by terminal/detach');
     };
-
-    if (s.kind === 'history') {
-      const read = await app.read(conn.caller, { session: sid, tail: 5000, maxBytes: 256 * 1024 });
-      stillWanted();
-      const lastSeq = s.journal.lastSeq;
-      const f = this.follow(conn, sid, s.journal, lastSeq);
-      after(() => this.startFollower(conn, sid, f));
-      return {
-        principal,
-        role: 'observer',
-        controller: null,
-        attachmentId: null,
-        snapshot: null,
-        transcript: (read.text ?? '').split('\n').slice(-3000).join('\n'),
-        lastSeq,
-        // With each ended Run's duration, as a live session's activity shows it.
-        runs: s.listRuns().slice(-50).map((r) => (r.endedAt === undefined ? r : { ...r, durationMs: r.endedAt - (r.startedAt ?? r.admittedAt) })),
-        info: summary(),
-      };
+    try {
+      // The name can change hands while the snapshot or transcript is awaited: a new life begins, a
+      // shell exits. What was read then describes the wrong life, so the attach starts over on what
+      // the name is now (the house's read of 2f357bd, #22).
+      for (let attempt = 0; ; attempt++) {
+        const s = this.observable(conn, sid);
+        this.unfollow(conn, sid);
+        const r = s.kind === 'history' ? await this.attachHistory(conn, s, sid, stillWanted, after) : await this.attachLive(conn, s, sid, role, stillWanted, after);
+        if (r !== undefined) return r;
+        if (attempt === 2) throw err('busy', `session ${sid} kept changing while the attach waited; try again`, { session: sid });
+      }
+    } finally {
+      wait.waiting--;
+      if (wait.waiting === 0 && conn.attaching.get(sid) === wait) conn.attaching.delete(sid);
     }
+  }
 
-    // The screen with the seq it reflects exactly (G13), so the follower from there delivers every
-    // later event once and nothing earlier. The emulator reports the seq of the last output it
-    // parsed; before it has parsed any, no output is at or before the lastSeq read ahead of the
-    // wait (settled() covers every write issued by then), so that one is exact.
+  /** The session's summary as this connection sees it, for an attach response. */
+  private summaryOf(conn: Conn, sid: string): unknown {
+    return this.opts.app.sessionList(conn.caller).find((x) => x.id === sid) ?? null;
+  }
+
+  /** A history-only session attaches with its transcript; undefined when the name changed during the read (the caller starts over). */
+  private async attachHistory(conn: Conn, s: HistorySession, sid: string, stillWanted: () => void, after: (fn: () => void) => void): Promise<Record<string, unknown> | undefined> {
+    const app = this.opts.app;
+    const read = await app.read(conn.caller, { session: sid, tail: TRANSCRIPT_READ_LINES, maxBytes: 256 * 1024 });
+    stillWanted();
+    if (app.registry.get(sid) !== s) return undefined;
+    const lastSeq = s.journal.lastSeq;
+    const f = this.follow(conn, sid, s.journal, lastSeq);
+    after(() => this.startFollower(conn, sid, f));
+    const lines = (read.text ?? '').split('\n');
+    return {
+      principal: conn.caller.principal,
+      role: 'observer',
+      controller: null,
+      attachmentId: null,
+      snapshot: null,
+      transcript: lines.slice(-TRANSCRIPT_LINES).join('\n'),
+      // Cut at the read's byte cap, or to the last lines: the transcript does not start where the history does.
+      truncated: read.truncated || lines.length > TRANSCRIPT_LINES,
+      lastSeq,
+      // With each ended Run's duration, as a live session's activity shows it.
+      runs: s.listRuns().slice(-50).map((r) => (r.endedAt === undefined ? r : { ...r, durationMs: r.endedAt - (r.startedAt ?? r.admittedAt) })),
+      info: this.summaryOf(conn, sid),
+    };
+  }
+
+  /**
+   * A live session attaches with the screen and the seq it reflects exactly (G13), so the follower
+   * from there delivers every later event once and nothing earlier; undefined when the session was
+   * closed or replaced while the screen settled (the caller starts over on what the name is now).
+   */
+  private async attachLive(conn: Conn, s: LiveSession, sid: string, role: 'auto' | 'observer' | 'controller', stillWanted: () => void, after: (fn: () => void) => void): Promise<Record<string, unknown> | undefined> {
+    const principal = conn.caller.principal;
     const session = s.session;
     const before = session.journal.lastSeq;
     await session.screen.settled();
     stillWanted();
-    if (app.registry.get(sid) !== s) throw err('session_not_found', `session ${sid} was closed`, { session: sid });
+    if (this.opts.app.registry.get(sid) !== s) return undefined;
     const snap = session.screen.serialize();
-    const at = snap.seq > 0 ? snap.seq : before;
+    // Every output event at or before `before` was issued to the screen before the wait, and settled()
+    // covers every write issued; the emulator reports the seq of the last output it applied, which the
+    // wait may have carried further. The snapshot therefore reflects the later of the two. Events
+    // between the last output and `before` are not output and change no screen; starting after them
+    // keeps an attach from reporting, every time, a gap over notes retention has since dropped (the
+    // house's read of 2f357bd, #22).
+    const at = Math.max(snap.seq, before);
     // Everything from here to the return runs in the tick the snapshot was taken in.
     const mine = session.listAttachments().find((a) => a.connectionId === conn.id && a.principal === principal);
     const att = mine ?? session.attach(principal, conn.id, role);
     const f = this.follow(conn, sid, session.journal, at);
     after(() => this.startFollower(conn, sid, f));
+    const snapshot: Record<string, unknown> = { data: snap.data, cols: snap.cols, rows: snap.rows, alt: snap.alt, seq: at };
+    // Output the emulator discarded under pressure is damage the snapshot carries; screen.snapshot() says the same.
+    if (session.screen.droppedUnits > 0) snapshot.droppedUnits = session.screen.droppedUnits;
     return {
       principal,
       role: att.role,
       controller: session.currentController,
       attachmentId: att.attachmentId,
-      snapshot: { data: snap.data, cols: snap.cols, rows: snap.rows, alt: snap.alt, seq: at },
+      snapshot,
       runs: session.listRuns().slice(-50),
-      info: summary(),
+      info: this.summaryOf(conn, sid),
     };
   }
 
@@ -1108,7 +1219,9 @@ export class TermServer {
    */
   private nativeDetach(conn: Conn, p: Record<string, unknown>): unknown {
     const sid = sessionParam(p);
-    conn.attachGen.set(sid, (conn.attachGen.get(sid) ?? 0) + 1);
+    // An attach of this session still waiting on its snapshot must not attach after this (tsg-4); nothing is kept when none waits.
+    const wait = conn.attaching.get(sid);
+    if (wait) wait.gen++;
     this.unfollow(conn, sid);
     const s = this.opts.app.registry.get(sid);
     let detached = 0;

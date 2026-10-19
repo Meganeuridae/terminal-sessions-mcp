@@ -59,7 +59,11 @@ export function classify(v: unknown): Frame {
   if (Array.isArray(v)) return { kind: 'invalid', id: null, code: INVALID_REQUEST, message: 'batches are not supported; send one message per frame' };
   if (!isPlainObject(v)) return { kind: 'invalid', id: null, code: INVALID_REQUEST, message: 'a message must be a JSON object' };
   const hasId = Object.hasOwn(v, 'id') && v.id !== undefined;
-  if (hasId && v.id !== null && !isId(v.id)) return { kind: 'invalid', id: null, code: INVALID_REQUEST, message: 'id must be a string or a number' };
+  const badId = hasId && v.id !== null && !isId(v.id);
+  const isResponse = !Object.hasOwn(v, 'method') && (Object.hasOwn(v, 'result') || Object.hasOwn(v, 'error'));
+  // A bad id on a request is answered (with id null, as the spec says); on a response it is one more
+  // malformed response, dropped below like the rest (the house's read of 2f357bd, #22).
+  if (badId && !isResponse) return { kind: 'invalid', id: null, code: INVALID_REQUEST, message: 'id must be a string or a number' };
   const id = hasId ? (v.id as Id | null) : undefined;
   if (Object.hasOwn(v, 'method')) {
     if (typeof v.method !== 'string' || v.method === '') return { kind: 'invalid', id: id ?? null, code: INVALID_REQUEST, message: 'method must be a non-empty string' };
@@ -74,7 +78,7 @@ export function classify(v: unknown): Frame {
   if (!Object.hasOwn(v, 'result') && !Object.hasOwn(v, 'error')) return { kind: 'invalid', id: id ?? null, code: INVALID_REQUEST, message: 'a message needs a method (request) or a result or error (response)' };
   // A response to one of ours. A malformed one is dropped, never answered: two peers answering
   // each other's bad responses would loop forever.
-  if (!hasId || v.id === null) return { kind: 'invalid', id: undefined, code: INVALID_REQUEST, message: 'a response needs an id' };
+  if (!hasId || v.id === null || badId) return { kind: 'invalid', id: undefined, code: INVALID_REQUEST, message: 'a response needs a string or number id' };
   const msg: Response = { jsonrpc: '2.0', id: v.id as Id };
   if (Object.hasOwn(v, 'error') && v.error !== undefined) {
     const e = v.error;

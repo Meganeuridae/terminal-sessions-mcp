@@ -9,7 +9,11 @@
  * the low-water mark it resumes from the journal by cursor, and when retention
  * has moved past the cursor meanwhile, the first thing it sends is a gap naming
  * the range that is gone. Daemon memory held for a stalled subscriber is bounded
- * by the high-water mark plus one event.
+ * by the high-water mark plus one page of events, and a page is small right after
+ * a stall: the first page after one is a handful of events, growing while the
+ * socket keeps taking them, so a socket that fills after every event costs one
+ * small read per event, not two thousand parsed to send one (the house's read of
+ * 2f357bd, #22).
  */
 import type { Journal } from '../core/journal.js';
 import type { JournalEvent, Seq } from '../core/types.js';
@@ -33,8 +37,10 @@ export interface FollowerSink {
   open(): boolean;
 }
 
-/** Events read from the journal per page while catching up. */
-const PAGE_SIZE = 2000;
+/** Most events read from the journal per page while catching up. */
+export const PAGE_SIZE = 2000;
+/** The first page's size, and every page's right after a stall: what a resume costs at most. */
+export const MIN_PAGE = 16;
 
 export interface FollowerOptions {
   /** Stop sending when this many bytes are queued (default 1 MiB); resume at a quarter of it. */
@@ -52,21 +58,24 @@ export class Follower {
   private off: (() => void) | undefined;
   private timer: NodeJS.Timeout | undefined;
   private cursorValue: Seq;
+  private page = MIN_PAGE;
   private readonly highWater: number;
   private readonly lowWater: number;
   private readonly pollMs: number;
   private readonly onError: ((e: unknown) => void) | undefined;
+  private caughtUp: Array<() => void> = [];
   /** The first gap this follower reported, for the subscribe response. */
   firstGap: FollowerGap | undefined;
 
   constructor(
     /** The journal this follower reads. */
     readonly source: JournalSource,
+    /** Events after this seq are delivered; it is taken as given (a caller who wants it bounded by `lastSeq` checks first). */
     cursor: Seq,
     private readonly sink: FollowerSink,
     opts: FollowerOptions = {},
   ) {
-    this.cursorValue = Math.max(0, Math.min(cursor, source.lastSeq));
+    this.cursorValue = Math.max(0, cursor);
     this.highWater = opts.highWaterBytes ?? 1024 * 1024;
     this.lowWater = Math.floor(this.highWater / 4);
     this.pollMs = opts.pollMs ?? 25;
@@ -80,6 +89,23 @@ export class Follower {
 
   get state(): FollowerState {
     return this.stateValue;
+  }
+
+  /** Something waits for this follower to deliver what is retained and then end it (its session closed). */
+  get ending(): boolean {
+    return this.caughtUp.length > 0;
+  }
+
+  /**
+   * Run `fn` once every retained event has been delivered: now when the follower is live,
+   * else when it next catches up. A closed follower runs nothing (its stream ended already).
+   * The endpoint uses this to end a stream after its session closed without cutting a
+   * paused subscriber off from the end of it (the house's read of 2f357bd, #22).
+   */
+  onceCaughtUp(fn: () => void): void {
+    if (this.stateValue === 'closed') return;
+    if (this.stateValue === 'live') return fn();
+    this.caughtUp.push(fn);
   }
 
   /**
@@ -107,6 +133,7 @@ export class Follower {
     this.off = undefined;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+    this.caughtUp = [];
   }
 
   private onLive(ev: JournalEvent): void {
@@ -131,7 +158,7 @@ export class Follower {
       if (!this.sink.open()) return this.close();
       if (this.sink.buffered() >= this.highWater) return this.pause();
       const before = this.cursorValue;
-      const r = this.source.since(this.cursorValue, PAGE_SIZE);
+      const r = this.source.since(this.cursorValue, this.page);
       if (r.gap) {
         // G11: truncation is visible. The cursor moves past what is gone.
         const g: FollowerGap = { from: r.gap.from, to: r.gap.to, reason: r.gap.reason };
@@ -147,10 +174,15 @@ export class Follower {
       }
       if (!r.more) {
         this.stateValue = 'live';
+        const waiting = this.caughtUp;
+        this.caughtUp = [];
+        for (const fn of waiting) fn();
         return;
       }
       // A page that says `more` but moved nothing would spin here forever, holding the event loop.
       if (this.cursorValue === before) throw new Error(`journal returned no events after seq ${before} but reported more`);
+      // The socket took a whole page: the next may be bigger.
+      this.page = Math.min(this.page * 4, PAGE_SIZE);
     }
   }
 
@@ -167,6 +199,8 @@ export class Follower {
   private pause(): void {
     if (this.stateValue === 'closed') return;
     this.stateValue = 'paused';
+    // The resume reads a small page first: the socket may fill again after one event.
+    this.page = MIN_PAGE;
     if (this.timer) return;
     const poll = (): void => {
       this.timer = undefined;

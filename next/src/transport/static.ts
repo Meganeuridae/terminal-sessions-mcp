@@ -4,7 +4,9 @@
  * exact content types, `nosniff`, and a Content-Security-Policy that allows
  * only the daemon's own origin plus its own WebSocket. No path from a request
  * ever reaches the filesystem: a request either names a whitelisted asset or
- * gets 404.
+ * gets 404. A whitelisted asset whose file is missing or unreadable is a broken
+ * install, not a wrong URL: it answers 500 naming the asset, and is reported
+ * (the house's read of 2f357bd, #22).
  */
 import * as fs from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -42,7 +44,7 @@ function packageFile(spec: string): string | undefined {
 }
 
 /** The whitelist: request path → asset. */
-function guiAssets(guiDir = defaultGuiDir()): Map<string, StaticAsset> {
+function guiAssets(guiDir: string | undefined): Map<string, StaticAsset> {
   const gui = (name: string): string | undefined => (guiDir ? path.join(guiDir, name) : undefined);
   const index: StaticAsset = { file: gui('index.html'), type: HTML };
   return new Map<string, StaticAsset>([
@@ -75,13 +77,27 @@ function contentSecurityPolicy(host: string): string {
   ].join('; ');
 }
 
+export interface StaticFilesOptions {
+  /** Where the page and its script live (default: the package's `next/gui`). */
+  guiDir?: string | undefined;
+  /** Told of a whitelisted asset that could not be served: its request path, the file looked for, and why. */
+  onError?: (pathname: string, file: string | undefined, error: string) => void;
+}
+
 export class StaticFiles {
-  private readonly assets = guiAssets();
+  private readonly assets: Map<string, StaticAsset>;
+  private readonly onError: StaticFilesOptions['onError'];
+
+  constructor(opts: StaticFilesOptions = {}) {
+    this.assets = guiAssets(opts.guiDir ?? defaultGuiDir());
+    this.onError = opts.onError;
+  }
 
   /**
-   * Answer a request for a whitelisted asset (200, 404 when its file is missing, 405 for a
-   * method other than GET or HEAD); false when `pathname` is not one. The caller has checked
-   * Host and Origin. Files are read on every request: edits to the GUI show up at once.
+   * Answer a request for a whitelisted asset (200; 500 when its file is missing or unreadable,
+   * reported through `onError`; 405 for a method other than GET or HEAD); false when `pathname`
+   * is not one. The caller has checked Host and Origin. Files are read on every request: edits
+   * to the GUI show up at once.
    */
   serve(req: IncomingMessage, res: ServerResponse, pathname: string, host: string): boolean {
     const asset = this.assets.get(pathname);
@@ -99,9 +115,12 @@ export class StaticFiles {
     if (req.method !== 'GET' && req.method !== 'HEAD') return text(405, 'method not allowed', { allow: 'GET, HEAD' });
     let body: Buffer;
     try {
-      body = fs.readFileSync(asset.file ?? '');
-    } catch {
-      return text(404, 'not found');
+      if (asset.file === undefined) throw new Error('its package is not installed');
+      body = fs.readFileSync(asset.file);
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e);
+      this.onError?.(pathname, asset.file, why);
+      return text(500, `gui asset unavailable: ${pathname} (${why})`);
     }
     headers['content-type'] = asset.type;
     headers['content-length'] = String(body.length);

@@ -94,7 +94,7 @@ async function start(opts: Partial<ServerOptions> & { prepare?: (dataDir: string
 }
 
 /** Server internals a test may look at. */
-const conns = (s: TermServer) => (s as unknown as { conns: Set<{ id: string; ws: WebSocket; followers: Map<string, Follower> }> }).conns;
+const conns = (s: TermServer) => (s as unknown as { conns: Set<{ id: string; ws: WebSocket; followers: Map<string, Follower>; attaching: Map<string, unknown>; inFlight: number }> }).conns;
 
 class Client {
   readonly inbound: Msg[] = [];
@@ -234,6 +234,33 @@ async function until(pred: () => boolean, ms = 3000, what = 'condition'): Promis
   }
 }
 
+/** A gate a test holds: the code under test awaits `reached()`, `entered` tells the test it got there, `release()` lets it go. */
+function gated(): { entered: Promise<void>; reached(): Promise<void>; release(): void } {
+  let enter!: () => void;
+  let open!: () => void;
+  const entered = new Promise<void>((r) => (enter = r));
+  const gate = new Promise<void>((r) => (open = r));
+  return {
+    entered,
+    reached: () => {
+      enter();
+      return gate;
+    },
+    release: () => open(),
+  };
+}
+
+/** Hold the next `settled()` of a screen behind a gate (one call only: a session close awaits it too). */
+function holdSettled(screen: { settled(): Promise<void> }): ReturnType<typeof gated> {
+  const gate = gated();
+  const settled = screen.settled.bind(screen);
+  screen.settled = () => {
+    screen.settled = settled;
+    return gate.reached().then(settled);
+  };
+  return gate;
+}
+
 function liveSession(h: Harness, id: string) {
   const s = h.registry.get(id);
   assert.ok(s && s.kind === 'live', `session ${id} is live`);
@@ -319,6 +346,9 @@ test('api-1/sec-2: malformed frames get JSON-RPC errors; the daemon keeps servin
       ['{"jsonrpc":"2.0","id":11,"method":"terminal/subscribe","params":{"session":{}}}', 11, -32602],
       ['{"jsonrpc":"2.0","id":12,"method":"terminal/attach","params":{"session":"nope"}}', 12, -32602],
       ['{"jsonrpc":"2.0","id":13,"method":"terminal/subscribe","params":{"session":"survivor","since":-4}}', 13, -32602],
+      ['{"jsonrpc":"2.0","id":17,"method":"terminal/subscribe","params":{"session":"survivor","since":1000000}}', 17, -32602],
+      ['{"jsonrpc":"2.0","id":18,"method":"terminal/attach","params":{"session":"survivor","role":"owner"}}', 18, -32602],
+      [`{"jsonrpc":"2.0","id":19,"method":"terminal/detach","params":{"session":"${'n'.repeat(65)}"}}`, 19, -32602],
       ['{"jsonrpc":"2.0","id":14,"method":"channels/open","params":{}}', 14, -32601],
       ['{"jsonrpc":"2.0","id":15,"method":"no/such"}', 15, -32601],
       ['{"jsonrpc":"2.0","method":7}', null, -32600],
@@ -330,8 +360,14 @@ test('api-1/sec-2: malformed frames get JSON-RPC errors; the daemon keeps servin
       assert.equal(r.error?.code, code, `${frame} → ${JSON.stringify(r)}`);
     }
     // Response-shaped frames are never answered (two peers could answer each other forever): stray,
-    // malformed or id-less responses are dropped. Binary garbage is a parse error.
-    for (const frame of ['{"jsonrpc":"2.0","id":99,"error":"boom"}', '{"jsonrpc":"2.0","id":98,"result":1}', '{"jsonrpc":"2.0","id":null,"error":{"code":1,"message":"x"}}', '{"result":{}}']) c.raw(frame);
+    // malformed or id-less responses are dropped, and so is one with an unusable id (the house's read
+    // of 2f357bd, #22). Frames are handled in order, so once the ping after them is answered, any
+    // answer to them would have arrived. Binary garbage is a parse error.
+    const strays = () => c.inbound.filter((m) => m.method === undefined);
+    assert.equal(strays().length, 0);
+    for (const frame of ['{"jsonrpc":"2.0","id":99,"error":"boom"}', '{"jsonrpc":"2.0","id":98,"result":1}', '{"jsonrpc":"2.0","id":null,"error":{"code":1,"message":"x"}}', '{"result":{}}', '{"jsonrpc":"2.0","id":true,"result":1}', '{"jsonrpc":"2.0","id":{},"error":{"code":1,"message":"x"}}']) c.raw(frame);
+    assert.deepEqual(await c.request('ping'), {});
+    assert.deepEqual(strays(), [], 'no response-shaped frame was answered');
     const garbage = await c.rawReply('\u0000ÿ{', null);
     assert.equal(garbage.error?.code, -32700);
     const odd = await c.call('run', { session: 'survivor', command: ['x'] } as unknown as Record<string, unknown>);
@@ -430,8 +466,9 @@ test('api-11: a client reusing another connection label cannot detach its attach
     assert.equal(bo.structured.role, 'observer');
     b.close();
     await b.closed;
-    await sleep(50);
     const s = liveSession(h, 'hij');
+    // The server has processed b's close once b's own attachment is gone; the seat is checked after that, not after a pause.
+    await until(() => !s.listAttachments().some((x) => x.principal === 'agent:b@test'), 2000, "b's attachment to go with b's connection");
     assert.equal(s.currentController, 'agent:a@test', 'the seat survives another principal disconnecting under the same label');
     const typed = await a.call('input', { session: 'hij', text: 'x' });
     assert.equal(typed.isError, undefined, typed.text);
@@ -959,33 +996,35 @@ test('tsg-4: an attach that races its connection closing leaves no attachment an
     await setup.call('session_open', { session: 'orph', visibility: 'shared' });
     await setup.call('control', { session: 'orph', action: 'release' });
     const s = liveSession(h, 'orph');
-    // The snapshot waits for the emulator (output streaming); the client leaves meanwhile.
-    const screen = s.screen as { settled(): Promise<void> };
-    const settled = screen.settled.bind(screen);
-    screen.settled = () => sleep(150).then(settled);
+    // The snapshot waits for the emulator (output streaming); the client leaves while it waits. The
+    // wait is a gate the test holds: it sees the attach reach it, closes the client, then lets it go.
     for (let i = 0; i < 5; i++) {
+      const gate = holdSettled(s.screen);
       const c = await Client.open(h.port);
       c.raw(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'terminal/attach', params: { session: 'orph', role: 'auto' } }));
-      await sleep(10);
+      await gate.entered;
       c.close();
       await c.closed;
+      await until(() => conns(h.server).size === 1, 2000, 'the server to see the close');
+      gate.release();
+      await new Promise((r) => setImmediate(r)); // the attach resumes in microtasks once the gate opens
     }
-    await sleep(400);
-    screen.settled = settled;
     assert.deepEqual(s.listAttachments().filter((a) => a.principal === 'agent:a@test' && a.connectionId !== [...conns(h.server)][0]?.id).length, 0, 'no orphan attachments');
     assert.equal(s.currentController, null, 'the owner did not take the seat for a dead connection');
 
     // The same through the application layer: a session_open whose spawn outlives its connection.
     const ensure = h.registry.ensure.bind(h.registry);
+    const spawnGate = gated();
     h.registry.ensure = (async (o: Parameters<typeof ensure>[0]) => {
-      await sleep(150);
+      await spawnGate.reached();
       return ensure(o);
     }) as typeof h.registry.ensure;
     const c = await Client.open(h.port);
     c.raw(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'session_open', arguments: { session: 'orph2' } } }));
-    await sleep(20);
+    await spawnGate.entered;
     c.close();
     await c.closed;
+    spawnGate.release();
     await until(() => h.registry.get('orph2')?.kind === 'live', 2000, 'the late spawn');
     const s2 = liveSession(h, 'orph2');
     await until(() => s2.listAttachments().length === 0, 2000, 'the late attachment to be swept');
@@ -1001,14 +1040,19 @@ test('tsg-14: a tools/call or terminal/* sent as a notification is not executed'
   const h = await start();
   try {
     const c = await Client.open(h.port);
-    await c.call('session_open', { session: 'nf' });
+    await c.call('session_open', { session: 'nf', visibility: 'shared' });
     c.raw(JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'run', arguments: { session: 'nf2', command: 'echo hello' } } }));
-    c.raw(JSON.stringify({ jsonrpc: '2.0', method: 'terminal/attach', params: { session: 'nf' } }));
+    // Another principal's attach, as a notification: had it run, it would be a second attachment.
+    const b = await Client.open(h.port, { token: 'tb' });
+    b.raw(JSON.stringify({ jsonrpc: '2.0', method: 'terminal/attach', params: { session: 'nf' } }));
     assert.deepEqual(await c.request('ping'), {});
+    assert.deepEqual(await b.request('ping'), {});
     await sleep(50);
     assert.equal(h.registry.get('nf2'), undefined, 'the notification-form run did not execute');
     assert.equal(h.usage.filter((u) => u.session === 'nf2').length, 0);
-    assert.equal(liveSession(h, 'nf').listAttachments().length, 1, 'only the session_open attachment');
+    assert.deepEqual(liveSession(h, 'nf').listAttachments().map((a) => a.principal), ['agent:a@test'], 'only the session_open attachment');
+    assert.equal(h.logs.filter((l) => l.msg === 'dropped a notification-form request (it needs an id)').length, 2);
+    b.close();
     c.close();
   } finally {
     await h.close();
@@ -1048,9 +1092,9 @@ test('G28 plumbing: ToolResult.onSent runs once after the response is written, a
   const def = TOOLS.find((t) => t.name === 'session_list')!;
   const original = def.run;
   let sent = 0;
-  let delay = 0;
+  let gate: ReturnType<typeof gated> | undefined;
   def.run = async (ctx, a) => {
-    await sleep(delay);
+    await gate?.reached();
     return { ...(await original(ctx, a)), onSent: () => void sent++ };
   };
   const h = await start();
@@ -1060,11 +1104,16 @@ test('G28 plumbing: ToolResult.onSent runs once after the response is written, a
     await until(() => sent === 1, 1000, 'onSent');
     await sleep(50);
     assert.equal(sent, 1, 'exactly once');
-    delay = 200;
+    // The call is held until the connection is gone; its slot is released when the write is skipped (2f357bd, #22).
+    gate = gated();
+    const conn = [...conns(h.server)][0]!;
     c.raw(JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/call', params: { name: 'session_list', arguments: {} } }));
-    await sleep(20);
+    await gate.entered;
+    assert.equal(conn.inFlight, 1);
     c.ws.terminate();
-    await sleep(400);
+    await until(() => conns(h.server).size === 0, 2000, 'the server to see the close');
+    gate.release();
+    await until(() => conn.inFlight === 0, 2000, 'the held call to finish');
     assert.equal(sent, 1, 'a result that could not be written is not delivered');
   } finally {
     def.run = original;
@@ -1222,14 +1271,443 @@ test("log-1: the log says where each connection's tools come from — the profil
     assert.equal(warns[0]!.connection, (since(n).find((r) => r.msg === 'connection opened')!).connection);
     n = h.logs.length;
     const late = await Client.open(h.port, { connection: 'late' });
-    await init(late, mcpl);
-    await late.request('featureSets/update', { effectiveCapabilities: ['tools'] });
+    // The grant follows the initialize in the same write, so no round trip has to fit inside the 60 ms grace.
+    const lateInit = init(late, mcpl);
+    const lateGrant = late.request('featureSets/update', { effectiveCapabilities: ['tools'] });
+    await Promise.all([lateInit, lateGrant]);
     await sleep(200);
     assert.equal(since(n).filter((r) => r.level === 'warn').length, 0, 'a grant within the grace: no warning');
     assert.match(String(since(n).find((r) => String(r.msg).startsWith('grant received'))!.msg), /^grant received: 20 tools; enabled terminal\.core, terminal\.control, terminal\.services, terminal\.watch, terminal\.search; not enabled: terminal\.live \(missing pushEvents\)/);
     for (const c of [plain, host, silent, late]) c.close();
   } finally {
     McplLane.grantWarnMs = warnWas;
+    await h.close();
+  }
+});
+
+// ───────────────────────────── the house's read of 2f357bd (#22) ─────────────────────────────
+
+function historyDir(dataDir: string, id: string, visibility: 'private' | 'shared', events: Array<Record<string, unknown>>): void {
+  const dir = path.join(dataDir, 'sessions', id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'session.json'), JSON.stringify({ owner: 'agent:a@test', visibility }));
+  const ts = Date.now();
+  fs.writeFileSync(path.join(dir, 'journal.jsonl'), events.map((e, i) => JSON.stringify({ seq: i + 1, ts, ...e })).join('\n') + '\n');
+}
+
+test('2f357bd-1 (G18): a subscriber to a shared session that is reopened private is cut off from the new life and told so', async () => {
+  const h = await start();
+  try {
+    const a = await Client.open(h.port);
+    await a.call('session_open', { session: 'vis', visibility: 'shared' });
+    const b = await Client.open(h.port, { token: 'tb' });
+    const closed = await a.call('session_close', { session: 'vis' });
+    assert.equal(closed.isError, undefined, closed.text);
+    const sub = (await b.request('terminal/subscribe', { session: 'vis', since: 0 })) as { lastSeq: number };
+    await until(() => eventsOf(b, 'vis').length >= sub.lastSeq, 2000, 'the shared history');
+    const old = sub.lastSeq;
+    // The owner gives the name a new, private life.
+    const reopened = await a.call('session_open', { session: 'vis', visibility: 'private' });
+    assert.equal(reopened.structured.created, true, reopened.text);
+    assert.equal((reopened.structured.info as { visibility: string }).visibility, 'private');
+    const ended = await b.next((m) => m.method === 'terminal/closed');
+    assert.deepEqual(ended.params, { session: 'vis', reason: 'forbidden' });
+    const ran = await a.call('run', { session: 'vis', command: 'echo hello' });
+    assert.equal(ran.structured.state, 'exited', ran.text);
+    assert.deepEqual(await b.request('ping'), {});
+    assert.deepEqual(eventsOf(b, 'vis').filter((e) => e.seq > old), [], 'nothing of the private life reached the former observer');
+    await assert.rejects(b.request('terminal/subscribe', { session: 'vis' }), /forbidden/);
+    assert.equal(((await b.request('terminal/sessions', {})) as { sessions: Array<{ id: string }> }).sessions.some((x) => x.id === 'vis'), false);
+    a.close();
+    b.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('2f357bd-2: a detach naming a session that does not exist keeps nothing on the connection, and session names are bounded', async () => {
+  const h = await start();
+  try {
+    const c = await Client.open(h.port);
+    for (let i = 0; i < 40; i++) assert.deepEqual(await c.request('terminal/detach', { session: `ghost-${i}` }), { session: `ghost-${i}`, detached: 0 });
+    const conn = [...conns(h.server)][0]!;
+    assert.equal(conn.attaching.size, 0, 'no per-session state outlives a detach');
+    await assert.rejects(c.request('terminal/detach', { session: 'x'.repeat(65) }), /1 to 64 characters/);
+    await c.call('session_open', { session: 'real' });
+    await c.request('terminal/attach', { session: 'real' });
+    assert.equal(conn.attaching.size, 0, 'an attach that answered waits no more');
+    c.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('2f357bd-3: a reply is in flight until written, so a client that stops reading is refused once the limit of replies waits for it, and the queue stays bounded', async () => {
+  const LIMIT = 8;
+  const HIGH = 64 * 1024;
+  const h = await start({ maxInFlight: LIMIT, highWaterBytes: HIGH });
+  try {
+    const c = await Client.open(h.port, { profile: 'full' });
+    await c.call('session_open', { session: 'deaf' });
+    const s = liveSession(h, 'deaf');
+    await c.request('terminal/subscribe', { session: 'deaf' });
+    const conn = [...conns(h.server)][0]!;
+    const one = JSON.stringify(await c.request('tools/list')).length;
+    assert.ok(one > 10_000, `a tools/list reply is ${one} bytes`);
+    // The client stops reading; a flood fills the kernel's buffers and pauses the follower at the high-water mark (as jr-15 shows).
+    c.ws.pause();
+    const chunk = 'y'.repeat(8 * 1024);
+    for (let i = 0; i < 2500; i++) {
+      s.journal.append({ type: 'note', text: `${i}:${chunk}`, principal: 'agent:a@test' });
+      if (i % 100 === 0) await sleep(1);
+    }
+    assert.equal(conn.followers.get('deaf')!.state, 'paused');
+    const base = conn.ws.bufferedAmount;
+    // Now every reply waits on the socket: the limit of them, and a small refusal for each request past it.
+    const N = 1500;
+    for (let i = 0; i < N; i++) c.raw(JSON.stringify({ jsonrpc: '2.0', id: 1000 + i, method: 'tools/list' }));
+    await until(() => conn.inFlight === LIMIT, 3000, 'the limit of replies waiting on the socket');
+    await sleep(300); // whatever frames are still being handled are refused with a small reply each
+    assert.equal(conn.inFlight, LIMIT, 'no more than the limit is in flight while the client reads nothing');
+    const queued = conn.ws.bufferedAmount - base;
+    assert.ok(queued < LIMIT * one + N * 400, `queued ${queued} more bytes for ${N} requests whose replies would come to ${((N * one) / 1048576).toFixed(1)} MiB`);
+    c.ws.resume();
+    await until(() => conn.inFlight === 0, 15_000, 'the slots to go as the replies are written');
+    assert.deepEqual(await c.request('ping'), {}, 'once the client reads again the connection serves it');
+    const answered = c.inbound.filter((m) => typeof m.id === 'number' && m.id >= 1000);
+    assert.equal(answered.length, N, 'every request was answered: a reply or a refusal');
+    const refused = answered.filter((m) => m.error?.code === -32050);
+    assert.ok(refused.length > 0 && refused.length < N, `${refused.length} refused`);
+    assert.deepEqual(refused[0]!.error!.data, { limit: LIMIT, executed: false });
+    assert.match(refused[0]!.error!.message, /not run/);
+    c.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('2f357bd-4: closing a session does not cut a paused subscriber off: it gets everything to the exit, then terminal/closed', async () => {
+  const HIGH = 64 * 1024;
+  const h = await start({ highWaterBytes: HIGH });
+  try {
+    const owner = await Client.open(h.port);
+    await owner.call('session_open', { session: 'slowview' });
+    const s = liveSession(h, 'slowview');
+    const ownerConn = [...conns(h.server)][0]!;
+    const viewer = await Client.open(h.port);
+    await viewer.request('terminal/subscribe', { session: 'slowview' });
+    const from = s.journal.lastSeq;
+    viewer.ws.pause();
+    const conn = [...conns(h.server)].find((x) => x !== ownerConn)!;
+    const chunk = 'z'.repeat(8 * 1024);
+    for (let i = 0; i < 400; i++) {
+      s.journal.append({ type: 'note', text: `${i}:${chunk}`, principal: 'agent:a@test' });
+      if (i % 100 === 0) await sleep(1);
+    }
+    const follower = conn.followers.get('slowview')!;
+    assert.equal(follower.state, 'paused');
+    const closed = await owner.call('session_close', { session: 'slowview' });
+    assert.equal(closed.isError, undefined, closed.text);
+    const hist = h.registry.get('slowview')!;
+    assert.equal(hist.kind, 'history');
+    const last = hist.kind === 'history' ? hist.lastSeq : -1;
+    assert.equal(conn.followers.get('slowview'), follower, 'the stream is kept until it has delivered the end');
+    assert.equal(follower.ending, true);
+    viewer.ws.resume();
+    const ended = await viewer.next((m) => m.method === 'terminal/closed', 15_000);
+    assert.deepEqual(ended.params, { session: 'slowview', reason: 'session-closed' });
+    const evs = eventsOf(viewer, 'slowview');
+    assertContiguous(evs.map((e) => e.seq), from + 1, last, 'everything to the end, after the stall');
+    assert.ok(evs.some((e) => e.type === 'session.exit'), 'the exit itself was streamed');
+    assert.equal(conn.followers.has('slowview'), false);
+    owner.close();
+    viewer.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('2f357bd-6: a history attach during which the name gets a new life answers with that life, and its events follow', async () => {
+  const h = await start({ prepare: (dataDir) => historyDir(dataDir, 'reborn2', 'shared', [1, 2, 3].map((i) => ({ type: 'note', text: `old${i}`, principal: 'agent:a@test' }))) });
+  try {
+    const owner = await Client.open(h.port);
+    const viewer = await Client.open(h.port, { token: 'tb' });
+    const read = h.app.read.bind(h.app);
+    const gate = gated();
+    (h.app as { read: App['read'] }).read = (async (caller, o) => {
+      await gate.reached();
+      return read(caller, o);
+    }) as App['read'];
+    const attach = viewer.send('terminal/attach', { session: 'reborn2' });
+    await gate.entered;
+    const opened = await owner.call('session_open', { session: 'reborn2' });
+    assert.equal(opened.structured.created, true, opened.text);
+    gate.release();
+    const r = (await attach).result as { snapshot: { seq: number } | null; role: string };
+    assert.ok(r.snapshot, 'attached to the new life, not described by the old transcript');
+    assert.equal(r.role, 'observer');
+    const ran = await owner.call('run', { session: 'reborn2', command: 'echo hello' });
+    assert.equal(ran.structured.state, 'exited', ran.text);
+    const s = liveSession(h, 'reborn2');
+    await until(() => eventsOf(viewer, 'reborn2').at(-1)?.seq === s.journal.lastSeq, 3000, "the new life's events");
+    assert.ok(eventsOf(viewer, 'reborn2').some((e) => e.type === 'output' && e.data.includes('hello')));
+    (h.app as { read: App['read'] }).read = read;
+    owner.close();
+    viewer.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('2f357bd-7 (G13): an attach starts after the last event the snapshot covers, not at the last output, so notes after it are neither replayed nor reported as a gap', async () => {
+  const h = await start();
+  try {
+    const c = await Client.open(h.port);
+    await c.call('session_open', { session: 'notes' });
+    const ran = await c.call('run', { session: 'notes', command: 'echo hello' });
+    assert.equal(ran.structured.state, 'exited', ran.text);
+    const s = liveSession(h, 'notes');
+    await s.screen.settled();
+    const lastOutput = s.screen.serialize().seq;
+    for (let i = 0; i < 10; i++) s.journal.append({ type: 'note', text: `n${i}`, principal: 'agent:a@test' });
+    const last = s.journal.lastSeq;
+    assert.ok(lastOutput < last);
+    for (let i = 0; i < 3; i++) {
+      const r = (await c.request('terminal/attach', { session: 'notes' })) as { snapshot: { seq: number } };
+      assert.equal(r.snapshot.seq, last, `attach ${i}: the snapshot reflects everything journaled before it`);
+    }
+    s.journal.append({ type: 'note', text: 'after', principal: 'agent:a@test' });
+    await until(() => eventsOf(c, 'notes').some((e) => e.seq === last + 1), 2000, 'the next event');
+    assert.deepEqual(eventsOf(c, 'notes').filter((e) => e.seq <= last), [], 'nothing the snapshot already covers is replayed');
+    assert.equal(c.inbound.filter((m) => m.method === 'terminal/gap').length, 0);
+    c.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('2f357bd-8/9: an MCPL host is promised completion reports only as its grant allows, the watch tool says when it cannot be notified, and a grant that changes the tools sends tools/list_changed', async () => {
+  const h = await start();
+  const caps = { experimental: { mcpl: { version: '0.5', pushEvents: true, contextHooks: { beforeInference: true }, channels: { register: true, publish: true, incoming: true, lifecycle: true }, featureSets: true } } };
+  const listChanged = (c: Client) => c.inbound.filter((m) => m.method === 'notifications/tools/list_changed').length;
+  try {
+    const host = await Client.open(h.port, { resultText: 'transcript' }); // the status line carries the watch tool's advice
+    const init = (await host.request('initialize', { protocolVersion: '2025-06-18', capabilities: caps, clientInfo: { name: 'spec', version: '0' } })) as { instructions: string; capabilities: { tools: { listChanged: boolean } } };
+    assert.equal(init.capabilities.tools.listChanged, true);
+    assert.match(init.instructions, /When your host grants terminal\.live push events, a command you started that outlives your wait is reported when it ends; otherwise `await` it/);
+    assert.equal(((await host.request('tools/list', {})) as { tools: unknown[] }).tools.length, 10);
+    // Tools only: the control, services, watch and search tiers come with it; push events do not.
+    await host.request('featureSets/update', { effectiveCapabilities: ['tools'] });
+    await host.next((m) => m.method === 'notifications/tools/list_changed');
+    assert.equal(((await host.request('tools/list', {})) as { tools: unknown[] }).tools.length, 20);
+    await host.call('session_open', { session: 'w1' });
+    const w = await host.call('watch', { session: 'w1', pattern: 'never' });
+    assert.equal(w.isError, undefined, w.text);
+    assert.match(w.text, /cannot receive notifications/);
+    // The same grant again changes no tool: nothing is announced. Push events granted: the watch tool promises delivery.
+    await host.request('featureSets/update', { effectiveCapabilities: ['tools'] });
+    await host.request('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'] });
+    await sleep(50);
+    assert.equal(listChanged(host), 0, 'the tool set did not change');
+    const w2 = await host.call('watch', { session: 'w1', pattern: 'never2' });
+    assert.doesNotMatch(w2.text, /cannot receive notifications/);
+    // A grant that takes tools away announces that too.
+    await host.request('featureSets/update', { effectiveCapabilities: ['tools', 'pushEvents'], enabled: ['terminal.core', 'terminal.live'] });
+    await host.next((m) => m.method === 'notifications/tools/list_changed');
+    assert.equal(((await host.request('tools/list', {})) as { tools: unknown[] }).tools.length, 10);
+    // A plain MCP host: no grant, no deliveries; the instructions and the watch tool say so.
+    const plain = await Client.open(h.port, { profile: 'full', resultText: 'transcript' });
+    const pi = (await plain.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} })) as { instructions: string };
+    assert.match(pi.instructions, /Use `read` with the returned cursor/);
+    await plain.call('session_open', { session: 'w2' });
+    assert.match((await plain.call('watch', { session: 'w2', pattern: 'never' })).text, /cannot receive notifications/);
+    host.close();
+    plain.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test("2f357bd-10: an attach snapshot carries the screen's damage count when output was dropped under pressure", async () => {
+  const h = await start();
+  try {
+    const c = await Client.open(h.port);
+    await c.call('session_open', { session: 'dmg' });
+    const s = liveSession(h, 'dmg');
+    const clean = (await c.request('terminal/attach', { session: 'dmg' })) as { snapshot: Record<string, unknown> };
+    assert.equal('droppedUnits' in clean.snapshot, false, 'an undamaged screen says nothing');
+    (s.screen as unknown as { dropped: number }).dropped = 7; // what compaction leaves behind
+    assert.equal(s.screen.snapshot().droppedUnits, 7);
+    const damaged = (await c.request('terminal/attach', { session: 'dmg' })) as { snapshot: { droppedUnits?: number } };
+    assert.equal(damaged.snapshot.droppedUnits, 7);
+    c.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('2f357bd smaller: a history attach says when its transcript was cut; a close frame without a status code is still a close on purpose', async () => {
+  const h = await start({
+    prepare: (dataDir) => {
+      historyDir(dataDir, 'long', 'private', Array.from({ length: 4000 }, (_, i) => ({ type: 'output', data: `line ${i + 1}\r\n`, stream: 'pty' })));
+      historyDir(dataDir, 'short', 'private', [{ type: 'output', data: 'only line\r\n', stream: 'pty' }]);
+    },
+  });
+  try {
+    const c = await Client.open(h.port);
+    const cut = (await c.request('terminal/attach', { session: 'long' })) as { transcript: string; truncated: boolean };
+    assert.equal(cut.truncated, true, 'the response says the transcript does not start where the history does');
+    assert.ok(cut.transcript.split('\n').length <= 3000);
+    assert.match(cut.transcript, /line 4000/);
+    assert.doesNotMatch(cut.transcript, /\bline 500\b/);
+    const whole = (await c.request('terminal/attach', { session: 'short' })) as { transcript: string; truncated: boolean };
+    assert.equal(whole.truncated, false);
+    assert.match(whole.transcript, /only line/);
+    // ws.close() with no code arrives as 1005: the seat is given up at once, as after 1000.
+    const owner = await Client.open(h.port, { profile: 'full' });
+    await owner.call('session_open', { session: 'seat5', visibility: 'shared' });
+    await owner.call('control', { session: 'seat5', action: 'release' });
+    const b = await Client.open(h.port, { token: 'tb' });
+    assert.equal(((await b.request('terminal/attach', { session: 'seat5', role: 'controller' })) as { role: string }).role, 'controller');
+    const s = liveSession(h, 'seat5');
+    b.ws.close(); // no status code
+    await until(() => !s.listAttachments().some((a) => a.principal === 'agent:b@test'), 2000, "b's attachment to go");
+    assert.equal(s.currentController, null);
+    assert.equal(s.info().seatReservedUntil, undefined, 'a close frame without a code is a close on purpose, not a drop');
+    assert.ok(h.logs.some((l) => l.msg === 'connection closed' && l.code === 1005));
+    c.close();
+    owner.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test("2f357bd paths: a detach while an attach waits on the screen supersedes it; a session closed while it waits attaches to the history instead", async () => {
+  const h = await start();
+  try {
+    const owner = await Client.open(h.port);
+    await owner.call('session_open', { session: 'waitd', visibility: 'shared' });
+    const s = liveSession(h, 'waitd');
+    const ownerConn = [...conns(h.server)][0]!;
+    const c = await Client.open(h.port, { token: 'tb' });
+    const conn = [...conns(h.server)].find((x) => x !== ownerConn)!;
+    let gate = holdSettled(s.screen);
+    const attach = c.send('terminal/attach', { session: 'waitd' });
+    await gate.entered;
+    assert.equal(conn.attaching.size, 1, 'the wait is registered while it lasts');
+    assert.deepEqual(await c.request('terminal/detach', { session: 'waitd' }), { session: 'waitd', detached: 0 });
+    gate.release();
+    const r = await attach;
+    assert.equal(r.error?.code, -32600, JSON.stringify(r));
+    assert.match(r.error!.message, /superseded by terminal\/detach/);
+    assert.equal(s.listAttachments().some((a) => a.connectionId === conn.id), false, 'nothing attached after the detach');
+    assert.equal(conn.attaching.size, 0);
+    // Closed while the screen settles: what the name is now is its history, and that is what attaches.
+    gate = holdSettled(s.screen);
+    const attach2 = c.send('terminal/attach', { session: 'waitd' });
+    await gate.entered;
+    const closed = await owner.call('session_close', { session: 'waitd' });
+    assert.equal(closed.isError, undefined, closed.text);
+    gate.release();
+    const r2 = (await attach2).result as { snapshot: unknown; transcript: string; info: { closed?: boolean } };
+    assert.equal(r2.snapshot, null, JSON.stringify(r2));
+    assert.equal(typeof r2.transcript, 'string');
+    assert.equal(r2.info.closed, true);
+    assert.equal(conn.attaching.size, 0);
+    c.close();
+    owner.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('2f357bd paths: a notification over the in-flight bound is dropped and logged; unsubscribe ends the stream; a subscribe is refused for a session the principal may not observe; a positive cursor replays from there', async () => {
+  const h = await start({ maxInFlight: 1 });
+  try {
+    const c = await Client.open(h.port);
+    await c.call('session_open', { session: 'p1' });
+    const s = liveSession(h, 'p1');
+    for (let i = 0; i < 5; i++) s.journal.append({ type: 'note', text: `n${i}`, principal: 'agent:a@test' });
+    const last = s.journal.lastSeq;
+    const sub = (await c.request('terminal/subscribe', { session: 'p1', since: last - 2 })) as { nextCursor: number; live: boolean; gap: null };
+    assert.deepEqual([sub.nextCursor, sub.live, sub.gap], [last, true, null]);
+    await until(() => eventsOf(c, 'p1').length >= 2, 2000, 'the replay');
+    assertContiguous(eventsOf(c, 'p1').map((e) => e.seq), last - 1, last, 'from the cursor');
+    s.journal.append({ type: 'note', text: 'live', principal: 'agent:a@test' });
+    await c.request('ping'); // the event went out before the ping was even sent
+    assert.equal(eventsOf(c, 'p1').at(-1)?.seq, last + 1);
+    assert.deepEqual(await c.request('terminal/unsubscribe', { session: 'p1' }), {});
+    s.journal.append({ type: 'note', text: 'unheard', principal: 'agent:a@test' });
+    await c.request('ping');
+    assert.equal(eventsOf(c, 'p1').at(-1)?.seq, last + 1, 'nothing after the unsubscribe');
+    const conn = [...conns(h.server)][0]!;
+    assert.equal(conn.followers.size, 0);
+    // One call in flight is the limit: a notification arriving then is dropped, and the log says so.
+    const r = await c.call('run', { session: 'p1', command: 'sleep 9', wait: 0 });
+    const held = c.send('tools/call', { name: 'await', arguments: { session: 'p1', runId: r.structured.runId, wait: 300 } });
+    await until(() => conn.inFlight === 1, 1000, 'the held call');
+    c.raw(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
+    await until(() => h.logs.some((l) => l.msg === 'dropped a notification: too much in flight'), 1000, 'the drop to be logged');
+    const dropped = h.logs.find((l) => l.msg === 'dropped a notification: too much in flight')!;
+    assert.deepEqual([dropped.method, dropped.limit], ['notifications/initialized', 1]);
+    await held;
+    // Another principal may not observe a private session: the subscribe is refused, as the attach is.
+    const b = await Client.open(h.port, { token: 'tb' });
+    await assert.rejects(b.request('terminal/subscribe', { session: 'p1' }), /forbidden: agent:b@test may not observe session p1/);
+    await assert.rejects(b.request('terminal/subscribe', { session: 'nope' }), /session_not_found/);
+    b.close();
+    c.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('2f357bd paths: a journal that fails to read ends the subscription visibly (an error on subscribe, terminal/closed on a resume); the daemon-wide connection bound answers 503', async () => {
+  const HIGH = 64 * 1024;
+  const h = await start({ highWaterBytes: HIGH, maxConnections: 3, maxConnectionsPerPrincipal: 2 });
+  try {
+    const c = await Client.open(h.port);
+    await c.call('session_open', { session: 'eio' });
+    const s = liveSession(h, 'eio');
+    const since = s.journal.since.bind(s.journal);
+    let failing = false;
+    (s.journal as { since: typeof since }).since = (cursor, limit) => {
+      if (failing) throw new Error('EIO: read failed');
+      return since(cursor, limit);
+    };
+    failing = true;
+    const bad = await c.send('terminal/subscribe', { session: 'eio', since: 0 });
+    assert.equal(bad.error?.code, -32603, JSON.stringify(bad));
+    assert.match(bad.error!.message, /EIO/);
+    const conn = [...conns(h.server)][0]!;
+    assert.equal(conn.followers.size, 0, 'a subscription that could not start is not kept');
+    failing = false;
+    await c.request('terminal/subscribe', { session: 'eio' });
+    c.ws.pause();
+    const chunk = 'q'.repeat(8 * 1024);
+    for (let i = 0; i < 200; i++) {
+      s.journal.append({ type: 'note', text: `${i}:${chunk}`, principal: 'agent:a@test' });
+      if (i % 50 === 0) await sleep(1);
+    }
+    assert.equal(conn.followers.get('eio')!.state, 'paused');
+    failing = true;
+    c.ws.resume();
+    const ended = await c.next((m) => m.method === 'terminal/closed', 5000);
+    assert.deepEqual(ended.params, { session: 'eio', reason: 'error' });
+    assert.equal(conn.followers.has('eio'), false);
+    assert.ok(h.logs.some((l) => l.msg === 'journal read failed; subscription ended' && l.session === 'eio'));
+    // Three connections in all: the fourth is refused with 503, whoever it is.
+    const c2 = await Client.open(h.port, { token: 'tb' });
+    const c3 = await Client.open(h.port, { token: 'th' });
+    assert.deepEqual(await tryUpgrade(`ws://127.0.0.1:${h.port}/?token=tb`), { status: 503 });
+    assert.ok(h.logs.some((l) => l.msg === 'upgrade refused: too many connections'));
+    c3.close();
+    await until(() => conns(h.server).size === 2, 2000, 'a slot to free');
+    const c4 = await Client.open(h.port, { token: 'tb' });
+    c4.close();
+    c2.close();
+    c.close();
+  } finally {
     await h.close();
   }
 });
