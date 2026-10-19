@@ -1,0 +1,6 @@
+{
+  "name": "term-sessions-next",
+  "private": true,
+  "type": "module",
+  "description": "Milestone 1 of the terminal-sessions rearchitecture (docs/redesign/DESIGN.md). Lives beside the deployed code until swap-in; becomes src/ at milestone 2."
+}

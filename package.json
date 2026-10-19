@@ -11,7 +11,7 @@
     "session-cli": "./dist/cli/session-cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && tsc -p next/tsconfig.json",
     "test": "npm run build && node --test",
     "dev": "tsc --watch",
     "start": "node dist/src/server/start-session-server.js",
@@ -21,7 +21,11 @@
     "mcp-server": "ts-node src/mcp/mcp-stdio-server.ts",
     "cli": "ts-node cli/session-cli.ts",
     "prepublishOnly": "npm run build",
-    "postinstall": "node -e \"const fs=require('fs'),path=require('path');try{const p=path.join(path.dirname(require.resolve('node-pty/package.json')),'build/Release/spawn-helper');fs.chmodSync(p,0o755);}catch(e){}\""
+    "postinstall": "node -e \"const fs=require('fs'),path=require('path');try{const p=path.join(path.dirname(require.resolve('node-pty/package.json')),'build/Release/spawn-helper');fs.chmodSync(p,0o755);}catch(e){}\"",
+    "build:next": "tsc -p next/tsconfig.json",
+    "test:next": "npm run build:next && node --test next/dist/spec/*.spec.js",
+    "acceptance:af": "npm run build:next && node next/acceptance/agent-framework.mjs",
+    "acceptance:bridge": "npm run build:next && bun next/acceptance/bridge.ts"
   },
   "keywords": [
     "mcp",
@@ -40,17 +44,20 @@
     "url": "https://github.com/antra-tess/terminal-sessions-mcp.git"
   },
   "dependencies": {
+    "@animalabs/mcpl-core": "0.3.0",
     "@modelcontextprotocol/sdk": "^1.11.2",
-    "@xterm/addon-fit": "^0.10.0",
-    "@xterm/addon-web-links": "^0.11.0",
-    "@xterm/xterm": "^5.5.0",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-serialize": "0.14.0",
+    "@xterm/addon-web-links": "0.12.0",
+    "@xterm/headless": "6.0.0",
+    "@xterm/xterm": "6.0.0",
     "ansi-to-html": "^0.7.2",
     "express": "^5.1.0",
     "node-pty": "^1.0.0",
     "puppeteer": "^24.29.1",
     "socket.io": "^4.8.1",
     "strip-ansi": "^7.1.0",
-    "ws": "^8.16.0"
+    "ws": "8.21.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.5",
