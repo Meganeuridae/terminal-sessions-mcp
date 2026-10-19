@@ -10,17 +10,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
+import { CORE_TOOLS } from '../src/api/tools.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import type { SegmenterOptions } from '../src/core/segmenter.js';
 import { seqOfMessageId } from '../src/core/segmenter.js';
 import type { Session } from '../src/core/session.js';
 import { Outbound, type Message } from '../src/transport/jsonrpc.js';
-import { McplLane, NODE_NAME } from '../src/transport/mcpl.js';
+import { FEATURE_SETS, McplLane, NODE_NAME } from '../src/transport/mcpl.js';
 import { TermServer } from '../src/transport/server.js';
 import { FULL_GRANT, TestHost, sleep, until, type Delivery, type Msg } from './testhost.js';
 
@@ -33,7 +35,8 @@ async function daemon(o: { dataDir?: string; segmenter?: SegmenterOptions } = {}
   const dataDir = o.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-lane-'));
   const registry = new SessionRegistry({ dataDir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
   const app = new App({ registry, defaultWaitMs: 5000, segmenter: o.segmenter ?? { runSettleMs: 30, cadenceMs: 400, needsInputMs: 700 } });
-  const server = new TermServer({ app, resolver: new TokenMapResolver({ tokens: { ta: A, tb: B, th: 'human:test:9' } }), host: '127.0.0.1', port: 0, version: 'lane-spec', log: () => undefined });
+  const logs: string[] = [];
+  const server = new TermServer({ app, resolver: new TokenMapResolver({ tokens: { ta: A, tb: B, th: 'human:test:9' } }), host: '127.0.0.1', port: 0, version: 'lane-spec', log: (line) => logs.push(line) });
   const port = (await server.listen()).port;
   const host = (token: string, connection: string, extra: Partial<ConstructorParameters<typeof TestHost>[0]> = {}) => new TestHost({ port, token, connection, mcpl: true, ...extra }).connect();
   const stop = async (s: { keep?: boolean; reason?: string } = {}) => {
@@ -42,7 +45,7 @@ async function daemon(o: { dataDir?: string; segmenter?: SegmenterOptions } = {}
     await closing;
     if (!s.keep) fs.rmSync(dataDir, { recursive: true, force: true });
   };
-  return { dataDir, registry, app, server, port, host, stop };
+  return { dataDir, registry, app, server, port, host, stop, logs };
 }
 
 function live(registry: SessionRegistry, id: string): Session {
@@ -86,6 +89,7 @@ for (const via of ['push', 'channel'] as const) {
         const second = await a.call('run', { session: 'refusal', command: 'sleep 0.15; echo second', wait: 0 });
         await a.delivery(aboutRun(second.structured!.runId));
         await until(() => attempts >= 2, 3000, 'a retry with the same stable id');
+        assert.ok(d.logs.some((l) => /refused/.test(l) && /queue_full/.test(l) && l.includes(got.messageId)), `a log line names the refusal, its reason and the message: ${d.logs.filter((l) => /refus/.test(l))}`);
         const s = live(d.registry, 'refusal');
         assert.ok(s.cursorsOf(A).delivered < s.run(firstId).seq.end!, 'later acceptance cannot skip the rejected outcome');
         assert.equal(new Set(a.deliveries().filter(aboutRun(firstId)).map((v) => v.messageId)).size, 1);
@@ -299,8 +303,8 @@ test("mcpl-5: notes are small, rate-limited and never more than a share of reten
     const b = await d.host('tb', 'nb-b');
     const pub = (session: string, text: string) => b.request('channels/publish', { channelId: `terminal:${session}`, content: [{ type: 'text', text }] });
     await assert.rejects(pub('nb', 'x'.repeat(5000)), (e: { code: number }) => e.code === -32602, 'over 4 KiB is refused');
-    // 1/16 of 64 KiB: 4 KiB of notes at a time.
-    for (let i = 0; i < 4; i++) await pub('nb', 'y'.repeat(1000));
+    // 1/16 of 64 KiB: 4 KiB of notes at a time, as the store writes them (about 1,100 bytes for a 1,000-byte text).
+    for (let i = 0; i < 3; i++) await pub('nb', 'y'.repeat(1000));
     await assert.rejects(pub('nb', 'y'.repeat(1000)), (e: { code: number; message: string }) => e.code === -32050 && /1\/16 of its retention/.test(e.message));
     const rd = await a.call('read', { session: 'nb', runId: r.structured?.runId });
     assert.match(rd.text, /owner-history/);
@@ -528,8 +532,9 @@ test('mcpl-13 (lane half): a service status the start result carried is not push
     const st = await start();
     assert.equal(st.structured?.service, 'ready', st.text);
     const runId = st.structured?.runId as string;
-    // The start tool records the status its result carried once the result is on the wire (onSent).
-    assert.equal(s.outcomeDeliveredTo(`${runId}:service=ready`, A), true);
+    // The start tool records the status event its result carried once the result is on the wire (onSent): that event, not every later `ready`.
+    const readySeq = d.app.extras(s).services.get(runId)!.info().seq;
+    assert.equal(s.outcomeDeliveredTo(`${runId}:service=ready@${readySeq}`, A), true);
     await a.noDelivery((x) => x.metadata.runId === runId && x.tags.includes('terminal:service-ready'), 3000, 'after a start that returned ready');
     // A status the start never returned is pushed.
     await a.call('cancel', { runId });
@@ -704,7 +709,7 @@ test('ux-25: a first connection after plain-MCP use gets the completion it is ow
     assert.deepEqual(about.map((x) => x.metadata.runId).sort(), newest.sort(), 'the newest ones');
     const summary = a2.deliveries().filter((x) => x.tags.includes('terminal:missed'));
     assert.equal(summary.length, 1);
-    assert.match(summary[0]!.text, /^\[terminal\] ux2: 10 earlier messages while you were away not replayed \(10 completions\) · seq \d+–\d+ · read session=ux2 since=\d+/);
+    assert.match(summary[0]!.text, /^\[terminal\] ux2: 10 earlier messages while you were away not replayed \(10 completions\) · seq \d+–\d+ · read session=ux2 since=\d+ as=events$/);
     await a2.close();
     const a3 = await d.host('ta', 'ux-a3');
     await a3.noDelivery(() => true, 800, 'the summary settled what it covered');
@@ -778,4 +783,198 @@ test("MCPL 2: a progress digest's id carries its Run, so two Runs digested at th
   } finally {
     await d.stop();
   }
+});
+
+// ───────────── the house's read of 2f357bd (#22) ─────────────
+
+for (const first of ['never carried', 'refused on an open channel'] as const) {
+  test(`a channels-only host that reconnects and opens the channel after its grant gets the completion it was owed (${first})`, async () => {
+    const d = await daemon();
+    const grant = ['tools', 'channels.register', 'channels.lifecycle', 'channels.incoming'];
+    try {
+      const a = await d.host('ta', 'co-a', { grant, answer: (m) => {
+        if (m.method !== 'channels/incoming') return undefined;
+        const msgs = (m.params as { messages: Array<{ messageId: string; tags: string[] }> }).messages;
+        return { results: msgs.map((x) => ({ messageId: x.messageId, accepted: !x.tags.includes('terminal:run-finished'), reason: 'busy' })) };
+      } });
+      await a.call('session_open', { session: 'co' });
+      if (first === 'refused on an open channel') await a.request('channels/open', { channelId: 'terminal:co' });
+      const r = await a.call('run', { session: 'co', command: 'sleep 0.3; echo owed-to-channel', wait: 20 });
+      const runId = r.structured?.runId as string;
+      const s = live(d.registry, 'co');
+      await until(() => s.run(runId).state === 'exited', 4000, 'the run to end');
+      if (first === 'refused on an open channel') await a.delivery(aboutRun(runId), 3000);
+      else {
+        await sleep(300);
+        assert.equal(a.deliveries().filter(aboutRun(runId)).length, 0, 'nothing could carry it');
+      }
+      await a.close();
+      const a2 = await d.host('ta', 'co-a2', { grant });
+      await sleep(400); // the grant's catch-up had nothing to carry it on either
+      assert.equal(a2.deliveries().filter(aboutRun(runId)).length, 0);
+      await a2.request('channels/open', { channelId: 'terminal:co' });
+      const got = await a2.delivery(aboutRun(runId), 4000);
+      assert.equal(got.via, 'incoming');
+      assert.match(got.text, /owed-to-channel/);
+      await until(() => s.cursorsOf(A).delivered >= s.run(runId).seq.end!, 2000, 'accepted: the cursor passes it');
+      await a2.close();
+    } finally {
+      await d.stop();
+    }
+  });
+}
+
+test("a second connection of the same principal never settles what the first still owes on its open channel", async () => {
+  const d = await daemon();
+  try {
+    const b = await d.host('tb', 'two-b');
+    await b.call('session_open', { session: 'two', visibility: 'shared' });
+    let errors = 0;
+    const a1: TestHost = await d.host('ta', 'two-a1', { answer: (m) => {
+      if (m.method !== 'channels/incoming' || errors > 0) return undefined;
+      const p = m.params as { messages: Array<{ tags: string[] }> };
+      if (!p.messages.some((v) => v.tags.includes('terminal:run-finished'))) return undefined;
+      errors++;
+      queueMicrotask(() => a1.respondError(m, -32000, 'temporary overload'));
+      return new Promise(() => undefined);
+    } });
+    await a1.request('channels/open', { channelId: 'terminal:two' });
+    // Push on, channel closed: B's Run is none of this connection's business, but A still owes it on the other.
+    const a2 = await d.host('ta', 'two-a2');
+    const r = await b.call('run', { session: 'two', command: 'sleep 0.3; echo theirs', wait: 20 });
+    const runId = r.structured?.runId as string;
+    await until(() => errors === 1, 4000, 'the first delivery, failed');
+    await until(() => a1.deliveries().filter(aboutRun(runId)).length >= 2, 4000, 'the completion sent again on the open channel');
+    const s = live(d.registry, 'two');
+    await until(() => s.cursorsOf(A).delivered >= s.run(runId).seq.end!, 2000, 'accepted: the cursor passes it');
+    assert.equal(a2.deliveries().filter(aboutRun(runId)).length, 0, 'never by push to the connection whose channel is closed');
+    await a1.close();
+    await a2.close();
+    await b.close();
+  } finally {
+    await d.stop();
+  }
+});
+
+test("a service's return to ready after an unhealthy spell is pushed; only the ready its start returned is withheld", { timeout: 20_000 }, async () => {
+  const d = await daemon();
+  const srv = net.createServer().listen(0, '127.0.0.1');
+  await new Promise((r) => srv.once('listening', r));
+  const port = (srv.address() as net.AddressInfo).port;
+  try {
+    const a = await d.host('ta', 'flap-a');
+    await a.call('session_open', { session: 'flap' });
+    const st = await a.call('start', { session: 'flap', command: 'sleep 30', target: 'process', ready: { tcp: { port } }, health: { tcp: { port }, intervalMs: 250 }, wait: 5000 });
+    assert.equal(st.structured?.service, 'ready', st.text);
+    const runId = st.structured?.runId as string;
+    const about = (status: string) => (x: Delivery) => x.metadata.runId === runId && x.tags.includes(`terminal:service-${status}`);
+    await a.noDelivery(about('ready'), 2500, 'for the ready the start result carried');
+    srv.close();
+    await a.delivery(about('unhealthy'), 5000);
+    await new Promise<void>((r) => srv.listen(port, '127.0.0.1', () => r()));
+    const back = await a.delivery(about('ready'), 5000);
+    assert.equal(back.via, 'push');
+    await a.call('cancel', { runId });
+    await a.close();
+  } finally {
+    srv.close();
+    await d.stop();
+  }
+});
+
+test("the owner is not pushed another principal's watch; the one who set it is", async () => {
+  const d = await daemon();
+  try {
+    const a = await d.host('ta', 'ow-a');
+    await a.call('session_open', { session: 'ow', visibility: 'shared' });
+    const b = await d.host('tb', 'ow-b');
+    const w = await b.call('watch', { session: 'ow', pattern: 'needle-[0-9]+', label: 'theirs' });
+    assert.equal(w.isError, undefined, w.text);
+    await a.call('run', { session: 'ow', command: 'echo needle-42' });
+    const got = await b.delivery((x) => x.tags.includes('terminal:watch'), 4000);
+    assert.equal(got.via, 'push');
+    await a.noDelivery((x) => x.tags.includes('terminal:watch'), 600, "to the owner about another principal's watch");
+    await a.close();
+    await b.close();
+  } finally {
+    await d.stop();
+  }
+});
+
+test('a completion a synchronous call returned leaves nothing held or owed in the lane', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-lane-'));
+  const registry = new SessionRegistry({ dataDir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
+  const app = new App({ registry, segmenter: { runSettleMs: 10 } });
+  const out: Outbound = new Outbound((m) => {
+    const req = m as Msg;
+    if (req.method !== undefined && req.id !== undefined) setImmediate(() => out.handleResponse({ jsonrpc: '2.0', id: req.id!, result: TestHost.accept(req) } as never));
+  });
+  const caller = { principal: A, connectionId: 'c-held' };
+  const lane = new McplLane(app, caller, out, () => undefined);
+  try {
+    await app.sessionOpen(caller, { id: 'hd' });
+    await lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, { isRequest: true, after: (fn) => fn() });
+    for (let i = 0; i < 8; i++) {
+      const r = await app.run(caller, { session: 'hd', command: `echo held-${i}` });
+      assert.equal(r.state, 'exited');
+      app.outcomeSent(caller, r); // what the tool layer does once the result is on the wire
+    }
+    await sleep(400);
+    const st = (lane as unknown as { states: Map<string, { held: Map<string, unknown>; owed: Set<number> }> }).states.get('hd');
+    assert.ok(st, 'the lane keeps state for the session');
+    assert.equal(st.held.size, 0, `held: ${[...st.held.keys()]}`);
+    assert.equal(st.owed.size, 0, `owed: ${[...st.owed]}`);
+  } finally {
+    lane.dispose();
+    await registry.closeAll();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('the note budget counts what the journal stores, keeps to the share even for a small retention, and survives a daemon restart', { timeout: 30_000 }, async () => {
+  const d1 = await daemon();
+  let d2: Awaited<ReturnType<typeof daemon>> | undefined;
+  const pub = (h: TestHost, session: string, text: string) => h.request('channels/publish', { channelId: `terminal:${session}`, content: [{ type: 'text', text }] });
+  const overShare = (e: { code: number; message: string }) => e.code === -32050 && /1\/16 of its retention/.test(e.message);
+  try {
+    const a = await d1.host('ta', 'nb2-a');
+    await a.call('session_open', { session: 'nb2', retention: { maxBytes: 64 * 1024 } });
+    // 1/16 of 64 KiB is 4,096 bytes of notes as the store writes them: three 1,000-byte texts (about 1,100 stored each) fit, a fourth does not.
+    for (let i = 0; i < 3; i++) await pub(a, 'nb2', 'y'.repeat(1000));
+    await assert.rejects(pub(a, 'nb2', 'y'.repeat(1000)), overShare);
+    // The smallest retention a session may ask for: the share is 1,024 bytes, and a note is never allowed past it.
+    await a.call('session_open', { session: 'nb3', retention: { maxBytes: 16 * 1024 } });
+    await assert.rejects(pub(a, 'nb3', 'z'.repeat(1000)), (e: { code: number; message: string }) => e.code === -32602 && /at most \d+ bytes/.test(e.message));
+    await pub(a, 'nb3', 'ok');
+    await a.close();
+    await d1.stop({ keep: true });
+    d2 = await daemon({ dataDir: d1.dataDir });
+    const a2 = await d2.host('ta', 'nb2-a2');
+    await a2.call('session_open', { session: 'nb2' }); // a new life of the name; its journal still holds the three notes
+    await assert.rejects(pub(a2, 'nb2', 'y'.repeat(1000)), overShare);
+    await a2.close();
+  } finally {
+    await (d2 ?? d1).stop();
+  }
+});
+
+test('listing channels reads the sessions once, not once per session, and the core set names every core tool', () => {
+  let reads = 0;
+  const entries = Array.from({ length: 1000 }, (_, i) => ({ kind: 'history', id: `h${i}`, owner: A, visibility: 'private', closed: false, recovered: 'history-only', journal: { lastSeq: 1, runs: {} }, retention: {} }));
+  const app = {
+    registry: { list: () => (reads++, entries), get: (id: string) => entries.find((e) => e.id === id) },
+    can: () => true,
+    sessionList: () => (reads++, entries.map((e) => ({ id: e.id, owner: e.owner, state: 'exited' }))),
+  } as unknown as App;
+  const lane = new McplLane(app, { principal: A, connectionId: 'c-list' }, new Outbound(() => undefined), () => undefined);
+  try {
+    const channels = lane.listChannels();
+    assert.equal(channels.length, 1000);
+    assert.equal(channels[7]!.metadata.owner, A);
+    assert.equal(channels[7]!.metadata.state, 'exited');
+    assert.ok(reads <= 2, `the sessions were read ${reads} times`);
+  } finally {
+    lane.dispose();
+  }
+  for (const name of CORE_TOOLS) assert.ok(FEATURE_SETS['terminal.core'].description.includes(name), `terminal.core names ${name}`);
 });

@@ -210,6 +210,13 @@ test('channels/open returns history only when asked, bounded by the limit, stamp
   assert.match(two.history[1]!.content[0]!.text, /echo h3/);
   assert.equal(two.historyTruncated, true);
   assert.ok(Date.parse(two.history[0]!.timestamp) <= Date.parse(two.history[1]!.timestamp));
+  // A fractional limit is a whole one (the house's read of 2f357bd): never a way past the cap.
+  await a.request('channels/close', { channelId: 'terminal:hist' });
+  const frac = (await a.request('channels/open', { channelId: 'terminal:hist', history: { limit: 2.5 } })) as { history: unknown[]; historyTruncated?: boolean };
+  assert.equal(frac.history.length, 2);
+  assert.equal(frac.historyTruncated, true);
+  await a.request('channels/close', { channelId: 'terminal:hist' });
+  await assert.rejects(a.request('channels/open', { channelId: 'terminal:hist', history: { limit: 'all' } }), (e: { code: number }) => e.code === -32602);
   await a.close();
 });
 

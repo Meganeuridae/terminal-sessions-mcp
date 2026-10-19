@@ -797,7 +797,7 @@ No `observe`; the server never reads the user's message. Gated on
 
 | Feature set | `uses` | Carries |
 |---|---|---|
-| `terminal.core` | `tools` | the nine core tools (§11) |
+| `terminal.core` | `tools` | the ten core tools (§11, `session_declare_shell` among them) |
 | `terminal.control` | `tools` | `signal`, `control`, `resize`, `session_env_capture` |
 | `terminal.services` | `tools` | `start` |
 | `terminal.watch` | `tools` | `watch`, `unwatch`, `watches`, `wait_for` |

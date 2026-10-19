@@ -17,8 +17,8 @@ beside the 1.x session server, MCP bridge, GUI and CLI. It lives in `next/`; its
   programs and other terminals' integrations cannot spoof them) or from the process itself; a
   command still running when `wait` ends keeps running and can be awaited; nothing invents an
   exit status (`lost` with a reason instead).
-- **Tools**: nine core tools (`run`, `await`, `read`, `screen`, `input`, `cancel`,
-  `session_list`, `session_open`, `session_close`) with transcript text plus a structured
+- **Tools**: ten core tools (`run`, `await`, `read`, `screen`, `input`, `cancel`,
+  `session_list`, `session_open`, `session_close`, `session_declare_shell`) with transcript text plus a structured
   envelope; opt-in tiers for control, services with readiness and health probes, watches and
   `wait_for`, and `search`. Idempotency keys on every mutating tool.
 - **MCPL**: sessions as channels with dual delivery, completions and service/watch events as

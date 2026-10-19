@@ -795,8 +795,13 @@ export class App {
       return; // a Run of an earlier life: its completion was settled in that life
     }
     if (isTerminal(r.state as RunInfo['state'])) s.session.markOutcomeDelivered(r.runId, caller.principal);
-    // A start result carried this service status: the lane does not announce it again (mcpl-13).
-    if (r.service !== undefined && r.service !== 'starting') s.session.markOutcomeDelivered(`${r.runId}:service=${r.service}`, caller.principal);
+    // A start result carried this service status: the lane does not announce that status event again
+    // (mcpl-13) — that event, named by its seq, not a later return to the same status (the house's read
+    // of 2f357bd, #22). A status that moved on before the result was written is announced as usual.
+    if (r.service !== undefined && r.service !== 'starting') {
+      const info = this.extras(s.session).services.get(r.runId)?.info();
+      if (info?.status === r.service && info.seq !== undefined) s.session.markOutcomeDelivered(`${r.runId}:service=${r.service}@${info.seq}`, caller.principal);
+    }
   }
 
   /**
