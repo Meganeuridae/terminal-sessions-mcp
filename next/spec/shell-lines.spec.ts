@@ -77,6 +77,10 @@ for (const shell of shells) {
       const r = await x.session.awaitRun(p.run.runId, 3000);
       assert.equal(r.state, 'exited');
       assert.equal(r.exit, 0);
+      // The process Run ran in the cwd the `cd` moved to: its output is that directory (the house's
+      // read of a6d0c35, #22: the test asserted only the exit, not where it ran). /bin/pwd prints the
+      // physical path, so compare against the resolved one (macOS /var is a symlink to /private/var).
+      assert.equal((await x.session.runTranscript(r.runId)).text.trim(), fs.realpathSync(path.join(x.tmp, 'a%41b b;c')));
     } finally {
       await x.close();
     }
@@ -94,10 +98,12 @@ for (const shell of shells) {
       const hist = await x.run(shell.endsWith('zsh') ? 'fc -ln 1' : 'history');
       assert.match(hist.text, /echo typed-by-a-human/, 'typed commands are in the session history');
       assert.doesNotMatch(hist.text, /tsm-cmd-/, 'no plumbing in history');
+      // While the session (and its fake HOME) still exist: the user's own history file was not written
+      // by it. After close the fake HOME is gone, so this check belongs here (the house's read of a6d0c35, #22).
+      assert.ok(!fs.existsSync(path.join(x.home, userHist)) || !/tsm-cmd|typed-by/.test(fs.readFileSync(path.join(x.home, userHist), 'utf8')), "the user's history file was not written");
     } finally {
       await x.close();
     }
-    assert.ok(!fs.existsSync(path.join(x.home, userHist)) || !/tsm-cmd|typed-by/.test(fs.readFileSync(path.join(x.home, userHist), 'utf8')), 'the user\'s history file was not written');
   });
 
   test(`${shell}: G7/G26 (core-7, api-4, jr-6, sec-4, shell-2): the shell sees neither the daemon's credentials nor the launching terminal's identity, nor its own mark key`, async () => {

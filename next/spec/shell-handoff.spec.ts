@@ -22,11 +22,12 @@ for (const shell of shells) {
       const expectedHash = createHash('sha256').update(x.integrationKey).digest('hex');
       const child = path.join(x.tmp, 'child.cjs');
       const receipt = path.join(x.tmp, 'receipt');
+      const bgReceipt = path.join(x.tmp, 'receipt-bg');
       fs.writeFileSync(child, `
 const fs = require('node:fs');
 const { createHash } = require('node:crypto');
 const key = Object.values(process.env).flatMap(v => [...v.matchAll(/(?:^|;k=)([a-f0-9]{32})(?=\\x07|$)/g)]).map(m => m[1]).find(k => createHash('sha256').update(k).digest('hex') === ${JSON.stringify(expectedHash)});
-fs.writeFileSync(${JSON.stringify(receipt)}, key ? 'leaked' : 'private');
+fs.writeFileSync(process.env.RECEIPT || ${JSON.stringify(receipt)}, key ? 'leaked' : 'private');
 setTimeout(() => {
   if (key) process.stdout.write('\\x1b]133;D;0;k=' + key + '\\x07');
   setTimeout(() => { console.log('ACTUAL-END'); process.exit(7); }, 200);
@@ -40,11 +41,14 @@ setTimeout(() => {
       assert.equal(fs.readFileSync(receipt, 'utf8'), 'private');
       assert.deepEqual([result.state, result.exit], ['exited', 7]);
       assert.match(result.text, /ACTUAL-END/);
-      // Disarming a hint must not leave a background child with a reusable credential.
-      await x.run(`: ' exec '; ${cmd} later &`);
+      // Disarming a hint must not leave a background child with a reusable credential. The background
+      // child writes a receipt of its own, so the check proves it ran and found no key, rather than
+      // passing on the foreground run's receipt (the house's read of a6d0c35, #22).
+      await x.run(`: ' exec '; env RECEIPT=${quote(bgReceipt)} ${cmd} later &`);
       const later = await x.run('sleep 1.2; false');
       assert.deepEqual([later.state, later.exit], ['exited', 1]);
       assert.equal(fs.readFileSync(receipt, 'utf8'), 'private');
+      assert.equal(fs.readFileSync(bgReceipt, 'utf8'), 'private', 'the background child ran and inherited no reusable key');
       assert.equal(fs.readdirSync(path.join(x.tmp, 'integration')).filter((f) => f.startsWith('key-')).length, 0);
     } finally { await x.close(); }
   });

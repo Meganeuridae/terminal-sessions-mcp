@@ -112,6 +112,28 @@ for (const shell of ['/bin/bash', '/bin/zsh', ...(FISH ? [FISH] : [])].filter(ha
   });
 }
 
+test('bash: ss-6: close reaches SIGKILL for a foreground job that ignores the hangup and SIGTERM', { skip: !hasShell('/bin/bash') }, async () => {
+  // The existing ss-6 job ends at SIGTERM; this one ignores HUP and TERM, so close must escalate
+  // to SIGKILL (the house's read of a6d0c35, #22: no spec reached that step).
+  const tag = `tsm-kill-${process.pid}`;
+  const x = await realSession('/bin/bash');
+  try {
+    const a = await x.session.admitWhenAvailable({ target: 'shell', line: `python3 -c 'import signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)' ${tag}`, principal: AGENT });
+    assert.ok(a.admitted);
+    await until(() => pgrep(tag).length > 0, 5000, 'job');
+    await sleep(300);
+  } finally {
+    await x.close();
+  }
+  try {
+    await until(() => pgrep(tag).length === 0, 3000, 'the job to be killed');
+    const notes = x.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'note' }> => e.type === 'note');
+    assert.ok(notes.some((n) => /survived the hangup; sent SIGTERM, then SIGKILL/.test(n.text)), notes.map((n) => n.text).join(' | '));
+  } finally {
+    reap(tag);
+  }
+});
+
 const SHIM = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-path-shim-'));
 fs.writeFileSync(path.join(SHIM, 'python3'), '#!/bin/sh\necho SHIM-PYTHON\n', { mode: 0o755 });
 after(() => fs.rmSync(SHIM, { recursive: true, force: true }));
