@@ -184,7 +184,8 @@ export function renderRead(r: ReadResult, mode: ResultText): ToolResult {
   if (mode === 'json') return { text: JSON.stringify(r, null, 2), structured };
   const body = r.text !== undefined ? r.text : JSON.stringify(r.events, null, 1);
   const next = `since=${r.nextCursor}${r.nextOffset ? ` offset=${r.nextOffset}` : ''}`;
-  const lines = r.lines ? ` · ${r.lines.returned} of ${r.lines.requested} lines` : '';
+  // A tail says where a read of what came before it ends, and when its first line is missing its head (the house's read of 78c4d6e, #22).
+  const lines = r.lines ? ` · ${r.lines.returned} of ${r.lines.requested} lines${r.lines.cutHead ? ' (the first cut at its head)' : ''}${r.lines.before !== undefined ? ` · earlier: read until=${r.lines.before}` : ''}` : '';
   const status = `[read ${r.session}${r.runId ? ` run ${r.runId}` : ''} seq ${r.seq[0]}–${r.seq[1]}${lines} · next: ${next}${r.more ? ` · more: read ${next}` : ''}${r.splitLine ? ' · last line continues' : ''}${gapsBit(r)}${r.truncated ? ' · truncated' : ''}]`;
   return { text: (body ? body + '\n' : '') + status, structured };
 }
@@ -271,7 +272,7 @@ const READ_OUTPUT: Schema = {
     more: { type: 'boolean' },
     gap: GAP,
     gaps: { type: 'array', items: GAP },
-    lines: { type: 'object', properties: { requested: { type: 'integer' }, returned: { type: 'integer' } }, required: ['requested', 'returned'] },
+    lines: { type: 'object', properties: { requested: { type: 'integer' }, returned: { type: 'integer' }, cutHead: { type: 'boolean' }, before: { type: 'integer' } }, required: ['requested', 'returned'] },
     truncated: { type: 'boolean' },
     splitLine: { type: 'boolean' },
     oldestSeq: { type: 'integer' },

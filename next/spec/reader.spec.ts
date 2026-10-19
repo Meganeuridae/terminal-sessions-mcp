@@ -224,7 +224,9 @@ test('er-13 / atc-16: tail with runId gives the last lines of that Run', async (
   out(src.journal, 'after the run\r\n');
   const r = await readJournal(src, { runId: 'r1', tail: 3 }, { resultBytes: 16384 });
   assert.equal(r.text, '4998\n4999\n5000');
-  assert.deepEqual(r.lines, { requested: 3, returned: 3 });
+  // The lines begin inside the first event shown (the 1 KiB chunks do not fall on line ends): a read of
+  // what came before must include that event, so its earlier lines are in one page or the other.
+  assert.deepEqual(r.lines, { requested: 3, returned: 3, before: r.seq[0] });
   assert.equal(r.truncated, false, 'exactly what was asked is not a cut');
   assert.equal(r.runId, 'r1');
 });
@@ -527,7 +529,8 @@ test('1cabc6a 5: a tail of one line longer than the old input cap keeps the whol
   const cut = await readJournal(huge, { runId: 'r1', tail: 1, maxBytes: 1024 * 1024 }, { resultBytes: 16384 });
   assert.ok(cut.text!.length > 0 && cut.text!.length < 1_300_000);
   assert.equal(cut.truncated, true, 'the line came back without its head');
-  assert.deepEqual(cut.lines, { requested: 1, returned: 1 });
+  // The one line is shown with its head gone: said as such, and what came before must re-include its event whole.
+  assert.deepEqual(cut.lines, { requested: 1, returned: 1, cutHead: true, before: cut.seq[0] });
 });
 
 test('1cabc6a 6: a control string longer than any lookback (an OSC 52 clipboard) never leaks its payload into a page, whatever the page size', async () => {
@@ -721,4 +724,72 @@ test('G11 / er-1 / er-8 / er-12 through the App and a real shell: pages by since
     await registry.closeAll();
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ───────────── the house's read of 78c4d6e (#22): a leading recovery hole counted once; where a tail's earlier page ends ─────────────
+
+test('78c4d6e 17: a recovery hole recorded as a store-failed gap event at the head of what is retained is one hole, under its recorded reason, in pages, tails and searches', async () => {
+  // A ring that keeps about two events: the hole's own gap event comes to head what is retained, as a
+  // recovered journal's does when the disk never took the events before it.
+  const j = new Journal({ sessionId: 's', hot: new MemoryStore(600) });
+  const src = source({ journal: j });
+  for (let i = 1; i <= 4; i++) out(j, `gone ${i} ${'x'.repeat(1000)}\r\n`); // seq 1–4, each over the ring, dropped by it
+  j.append({ type: 'gap', from: 1, to: 4, reason: 'store-failed' }); // seq 5
+  out(j, 'kept\r\n'); // seq 6
+  assert.equal(j.oldestSeq, 5, 'the gap event heads what is retained');
+  const page = await readJournal(src, { since: 0, as: 'events' }, { resultBytes: 16384 });
+  assert.deepEqual(page.gap, { from: 1, to: 4, reason: 'store-failed' }, 'the recorded hole, not a retention hole in front of it');
+  assert.equal(page.gaps, undefined, 'one hole, not two');
+  const text = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
+  assert.deepEqual(text.gap, { from: 1, to: 4, reason: 'store-failed' });
+  assert.equal(text.gaps, undefined);
+  assert.equal(text.text, '[… 4 journal events missing (seq 1–4: the journal store never took them) …]\nkept');
+  const tail = await readJournal(src, { tail: 5 }, { resultBytes: 16384 });
+  assert.deepEqual(tail.gap, { from: 1, to: 4, reason: 'store-failed' });
+  assert.equal(tail.gaps, undefined);
+  const found = await searchJournal(src, { pattern: 'kept' });
+  assert.deepEqual(found.gap, { from: 1, to: 4, reason: 'store-failed' });
+  assert.equal(found.gaps, undefined);
+  // A retention hole that reaches further back than the recorded one is reported for its own part only.
+  const j2 = new Journal({ sessionId: 's', hot: new MemoryStore(600) });
+  const src2 = source({ journal: j2 });
+  for (let i = 1; i <= 4; i++) out(j2, `gone ${i} ${'x'.repeat(1000)}\r\n`); // seq 1–4
+  j2.append({ type: 'gap', from: 3, to: 4, reason: 'store-failed' }); // seq 5: the disk refused 3–4 only
+  out(j2, 'kept\r\n'); // seq 6
+  const both = await readJournal(src2, { since: 0, as: 'events' }, { resultBytes: 16384 });
+  assert.deepEqual(both.gaps, [
+    { from: 1, to: 2, reason: 'retention' },
+    { from: 3, to: 4, reason: 'store-failed' },
+  ]);
+});
+
+test('78c4d6e 16: a tail says where a read of what came before it ends, and whether its first line has its head', async () => {
+  const src = source();
+  out(src.journal, 'one\r\ntwo\r\n'); // seq 1
+  out(src.journal, 'three\r\nfour\r\n'); // seq 2
+  out(src.journal, 'five\r\n'); // seq 3
+  // The last three lines begin where seq 2 begins: what came before ends at the plain seq[0] - 1, so `before` is left off.
+  const aligned = await readJournal(src, { tail: 3 }, { resultBytes: 16384 });
+  assert.equal(aligned.text, 'three\nfour\nfive');
+  assert.equal(aligned.seq[0], 2);
+  assert.deepEqual(aligned.lines, { requested: 3, returned: 3 });
+  // The first line shown begins inside seq 2: a read until seq 1 would skip `three`, so what came before must include seq 2 itself.
+  const inside = await readJournal(src, { tail: 2 }, { resultBytes: 16384 });
+  assert.equal(inside.text, 'four\nfive');
+  assert.deepEqual(inside.lines, { requested: 2, returned: 2, before: 2 });
+  assert.equal(inside.seq[0], 2);
+  // Everything retained is shown whole: the lines have their heads, and `before` is left off.
+  const all = await readJournal(src, { tail: 9 }, { resultBytes: 16384 });
+  assert.deepEqual(all.lines, { requested: 9, returned: 5 });
+  // A whole line dropped from the head for bytes is not a cut line, and the one shown keeps its head.
+  const long = source();
+  out(long.journal, `${'a'.repeat(3000)}\r\n`); // seq 1
+  out(long.journal, 'short\r\n'); // seq 2
+  const cut = await readJournal(long, { tail: 2, maxBytes: 1024 }, { resultBytes: 16384 });
+  assert.equal(cut.truncated, true);
+  assert.deepEqual(cut.lines, { requested: 2, returned: 1 }, 'a whole line dropped from the head is not a cut line');
+  // One line over the cap comes back without its head: said so, and what came before must re-include its event whole.
+  const one = await readJournal(long, { tail: 1, until: 1, maxBytes: 1024 }, { resultBytes: 16384 });
+  assert.equal(one.text!.length, 1024);
+  assert.deepEqual(one.lines, { requested: 1, returned: 1, cutHead: true, before: 1 });
 });

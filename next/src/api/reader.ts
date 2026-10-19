@@ -122,8 +122,15 @@ export interface ReadResult {
   /** The page ends mid-line: the next page's first line continues this page's last one. */
   splitLine?: boolean;
   oldestSeq?: Seq;
-  /** Tail reads: lines asked for and returned. Fewer returned without `truncated`: the range holds no more. */
-  lines?: { requested: number; returned: number };
+  /**
+   * Tail reads: lines asked for and returned. Fewer returned without `truncated`: the range holds no
+   * more. `cutHead`: the first line returned is missing its head (it lies past a cap). `before`: the
+   * `until` of a tail read of what came before this result, present only when it must include the
+   * first event shown (`seq[0]`) — the shown lines begin inside that event, or its head was cut here,
+   * so the part before them is in neither page under the plain `seq[0] - 1` (the house's read of
+   * 78c4d6e, #22). Absent, a read `until: seq[0] - 1` reaches what came before.
+   */
+  lines?: { requested: number; returned: number; cutHead?: true; before?: Seq };
 }
 
 export interface SearchResult {
@@ -207,8 +214,8 @@ const OPEN_SEQUENCE_BYTES = 1024 * 1024;
 /** Projections tried for one page before its text is accepted over budget. */
 const FIT_ATTEMPTS = 6;
 
-/** The line a hole leaves in text (G11). */
-function gapNote(g: GapInfo): string {
+/** The line a hole leaves in text (G11); the compat pack's raw tail marks its holes with it too. */
+export function gapNote(g: GapInfo): string {
   const n = g.to - g.from + 1;
   return `[… ${n} journal event${n === 1 ? '' : 's'} missing (seq ${g.from}–${g.to}: ${describeGap(g.reason)}) …]`;
 }
@@ -251,6 +258,19 @@ function retentionGap(journal: Journal, from: Seq, to: Seq): GapInfo | undefined
 /** A gap event standing for a hole the journal holds no event for (a Run's range cut, or events lost since the walk began). */
 const gapEvent = (g: GapInfo): Gap => ({ type: 'gap', seq: g.to, ts: Date.now(), from: g.from, to: g.to, reason: g.reason });
 
+/**
+ * The part of a hole a read inferred that no gap event among the events read already covers. A
+ * recovery hole stands in the journal as a `store-failed` gap event right after it, and when that
+ * event heads what is retained, the range before it reads as `retention` too, so the one hole would
+ * be reported twice, first under the wrong reason (the house's read of 78c4d6e, #22). The inferred
+ * hole is kept up to the recorded one; undefined when nothing of it is left.
+ */
+function beforeRecorded(gap: GapInfo, events: Iterable<JournalEvent>): GapInfo | undefined {
+  let to = gap.to;
+  for (const e of events) if (isGap(e) && e.from <= to && e.to >= gap.from) to = Math.min(to, e.from - 1);
+  return to >= gap.from ? { ...gap, to } : undefined;
+}
+
 function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | undefined; until?: Seq | undefined }): Walk {
   const journal = src.journal;
   let cursor = o.since;
@@ -267,6 +287,7 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
     end = first.to;
     if (first.truncated) gap = retentionGap(journal, from, end);
   } else if (first.gap) gap = { ...first.gap };
+  if (gap) gap = beforeRecorded(gap, [...first.events, ...('gaps' in first ? (first.gaps ?? []) : [])]);
   if (o.until !== undefined) end = Math.min(end, o.until);
   /** Holes have been reported through this seq. */
   let reported = gap?.to ?? from - 1;
@@ -283,7 +304,8 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
       const events: JournalEvent[] = [...r.events];
       // Events gone since the walk began (retention while a search yielded) are a hole, not a seam
       // to join lines across: a gap event stands where they were (the house's read of 1cabc6a, #22).
-      const lost = !resumed ? undefined : 'truncated' in r ? retentionGap(journal, (cursor ?? 0) + 1, Math.min(end, events[0] ? events[0].seq - 1 : end)) : r.gap;
+      const inferred = !resumed ? undefined : 'truncated' in r ? retentionGap(journal, (cursor ?? 0) + 1, Math.min(end, events[0] ? events[0].seq - 1 : end)) : r.gap;
+      const lost = inferred && beforeRecorded(inferred, [...events, ...('gaps' in r ? (r.gaps ?? []) : [])]);
       if (lost && lost.to > reported) events.unshift(gapEvent({ from: Math.max(lost.from, reported + 1), to: lost.to, reason: 'retention' }));
       if ('gaps' in r && r.gaps) {
         // A Run's output is filtered to its own events: its holes come apart and are placed among
@@ -849,8 +871,9 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     end = o.until !== undefined ? Math.min(ro.to, o.until) : ro.to;
     older = ro.truncated;
     events = [...ro.events, ...(ro.gaps ?? [])].sort((a, b) => a.seq - b.seq);
-    // Nothing of the range retained: the hole is the range (the house's read of 1cabc6a, #22).
-    const lost = ro.truncated && ro.events.length === 0 ? retentionGap(journal, Math.max(ro.from, (o.since ?? 0) + 1), end) : undefined;
+    // Nothing of the range retained: the hole is the range (the house's read of 1cabc6a, #22), less what a recorded gap already says.
+    const inferred = ro.truncated && ro.events.length === 0 ? retentionGap(journal, Math.max(ro.from, (o.since ?? 0) + 1), end) : undefined;
+    const lost = inferred && beforeRecorded(inferred, events);
     if (lost) events.unshift(gapEvent(lost));
   } else {
     // Walk back from the end until the lines, the byte cap, the event bound, `since` or retention stops it.
@@ -865,11 +888,13 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       if (o.since !== undefined && cursor <= o.since) break;
       const batch = journal.tail(512, cursor).filter((e) => o.since === undefined || e.seq > o.since);
       if (batch.length === 0) {
-        // The range's start: what retention took of it is a hole, all of it when nothing is retained.
-        const lost = retentionGap(journal, (o.since ?? 0) + 1, cursor);
-        if (lost) {
+        // The range's start: what retention took of it is a hole, all of it when nothing is retained,
+        // less what a gap event at the head of the retained events already records.
+        const inferred = retentionGap(journal, (o.since ?? 0) + 1, cursor);
+        if (inferred) {
           older = true;
-          parts.push([gapEvent(lost)]);
+          const lost = beforeRecorded(inferred, parts[parts.length - 1] ?? []);
+          if (lost) parts.push([gapEvent(lost)]);
         }
         break;
       }
@@ -943,7 +968,17 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const reach = lastLinesBytes(outs, n);
   const headCut = reach > cap || (older && reach >= inputBytes);
   const truncated = cutByBytes || (kept.length < n && older) || headCut;
-  return withGapInfo<Omit<ReadResult, 'session'>>({ text, seq: [firstEventOf(outs, kept.length) ?? end, end], nextCursor: end, more: false, truncated, lines: { requested: n, returned: kept.length } }, gaps);
+  // Whether the first line returned has its head, and where a read of what came before must end (see ReadResult.lines).
+  const first = firstEventOf(outs, kept.length);
+  const counts: NonNullable<ReadResult['lines']> = { requested: n, returned: kept.length };
+  if (first !== undefined && kept.length > 0) {
+    const cutHead = drop === 0 && (headCut || cutTail(kept.join('\n'), maxBytes).cut);
+    if (cutHead) counts.cutHead = true;
+    // The previous page must re-include this event when the shown lines begin inside it or its head
+    // was cut here; otherwise the plain `seq[0] - 1` reaches what came before (so `before` is left off).
+    if (!first.atStart || cutHead) counts.before = first.seq;
+  }
+  return withGapInfo<Omit<ReadResult, 'session'>>({ text, seq: [first?.seq ?? end, end], nextCursor: end, more: false, truncated, lines: counts }, gaps);
 }
 
 /** UTF-8 bytes from the end of the output back to where its last `n` lines begin (by raw line ends); all of it when it holds no more lines. */
@@ -967,12 +1002,15 @@ function lastLinesBytes(outs: Output[], n: number): number {
 }
 
 /**
- * The seq of the first output event whose bytes reach the last `lines` lines, by
- * the raw line ends (an estimate the projection can only narrow: it never makes a
- * line out of no LF, except a full-screen frame).
+ * The first output event whose bytes reach the last `lines` lines, by the raw line ends (an
+ * estimate the projection can only narrow: it never makes a line out of no LF, except a
+ * full-screen frame), and whether those lines begin where the event does. When they begin inside
+ * it, the event is not shown whole, and a page ending at the seq before it would skip its head
+ * (the house's read of 78c4d6e, #22).
  */
-function firstEventOf(outs: Output[], lines: number): Seq | undefined {
-  if (outs.length === 0 || lines === 0) return outs[outs.length - 1]?.seq;
+function firstEventOf(outs: Output[], lines: number): { seq: Seq; atStart: boolean } | undefined {
+  if (outs.length === 0) return undefined;
+  if (lines === 0) return { seq: outs[outs.length - 1]!.seq, atStart: false };
   let seen = 0;
   for (let k = outs.length - 1; k >= 0; k--) {
     const d = outs[k]!.data;
@@ -982,11 +1020,15 @@ function firstEventOf(outs: Output[], lines: number): Seq | undefined {
     for (;;) {
       const nl = d.lastIndexOf('\n', i - 1);
       if (nl === -1) break;
-      if (++seen >= lines) return nl + 1 < d.length ? outs[k]!.seq : (outs[k + 1]?.seq ?? outs[k]!.seq);
+      if (++seen >= lines) {
+        if (nl + 1 < d.length) return { seq: outs[k]!.seq, atStart: false };
+        const next = outs[k + 1];
+        return next ? { seq: next.seq, atStart: true } : { seq: outs[k]!.seq, atStart: false };
+      }
       i = nl;
     }
   }
-  return outs[0]!.seq;
+  return { seq: outs[0]!.seq, atStart: true };
 }
 
 // ───────────── search ─────────────
