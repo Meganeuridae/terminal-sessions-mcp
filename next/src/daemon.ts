@@ -193,13 +193,14 @@ class RotatingFile {
   }
 }
 
-function write(rec: LogRecord): void {
+/** One record to where log lines go; with `toStderr`, to stderr as well when a log file has it (a startup failure, see `fail`). */
+function write(rec: LogRecord, toStderr = false): void {
   if (LEVELS[rec.level] < LEVELS[minLevel]) return;
   const line = JSON.stringify(rec) + '\n';
   if (logFile) {
     try {
       logFile.write(line);
-      return;
+      if (!toStderr) return;
     } catch (e) {
       // Once: the file is given up and stderr takes over, starting with why (the house's read of 59f660b, #22).
       const file = logFile.file;
@@ -216,10 +217,15 @@ function write(rec: LogRecord): void {
   }
 }
 
-function log(level: LogLevel, msg: string, fields: Record<string, unknown> = {}): void {
+/** The one spelling of a log record: a timestamp, the level, the message, and the fields that have a value. */
+function record(level: LogLevel, msg: string, fields: Record<string, unknown> = {}): LogRecord {
   const rec: LogRecord = { ts: new Date().toISOString(), level, msg };
   for (const [k, v] of Object.entries(fields)) if (v !== undefined) rec[k] = v;
-  write(rec);
+  return rec;
+}
+
+function log(level: LogLevel, msg: string, fields: Record<string, unknown> = {}): void {
+  write(record(level, msg, fields));
 }
 
 
@@ -331,14 +337,7 @@ const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T | undefined> =>
  * house's read of the shim, #22 comment 6269349177).
  */
 function fail(message: string, code = 2): never {
-  log('error', message);
-  if (logFile && !stderrGone) {
-    try {
-      process.stderr.write(JSON.stringify({ ts: new Date().toISOString(), level: 'error', msg: message }) + '\n');
-    } catch {
-      // the reader is gone; the log file has it
-    }
-  }
+  write(record('error', message), true);
   process.exit(code);
 }
 
