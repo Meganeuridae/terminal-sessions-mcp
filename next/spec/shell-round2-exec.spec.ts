@@ -95,10 +95,12 @@ for (const shell of ['/bin/bash', '/bin/zsh', ...(FISH ? [FISH] : [])].filter(ha
     const tag = `tsm-hup-${process.pid}-${shell.split('/').pop()}`;
     const x = await realSession(shell);
     try {
-      const a = await x.session.admitWhenAvailable({ target: 'shell', line: `python3 -c 'import signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(60)' ${tag}`, principal: AGENT });
+      const a = await x.session.admitWhenAvailable({ target: 'shell', line: `python3 -c 'import signal,time,sys; signal.signal(signal.SIGHUP, signal.SIG_IGN); sys.stdout.write("HUPREADY\\n"); sys.stdout.flush(); time.sleep(60)' ${tag}`, principal: AGENT });
       assert.ok(a.admitted);
       await until(() => pgrep(tag).length > 0, 5000, 'job');
-      await sleep(300);
+      // Wait for the job's own line, not a fixed delay: it prints once its hangup handler is set, so a
+      // slow host (a 10% CPU quota) does not let close reach it before then (the house's read, #22 comment 6269901528).
+      await until(() => x.journal.since(0).events.some((e) => e.type === 'output' && e.data.includes('HUPREADY')), 5000, 'the job installed its handler');
     } finally {
       await x.close();
     }
@@ -118,10 +120,12 @@ test('bash: ss-6: close reaches SIGKILL for a foreground job that ignores the ha
   const tag = `tsm-kill-${process.pid}`;
   const x = await realSession('/bin/bash');
   try {
-    const a = await x.session.admitWhenAvailable({ target: 'shell', line: `python3 -c 'import signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)' ${tag}`, principal: AGENT });
+    const a = await x.session.admitWhenAvailable({ target: 'shell', line: `python3 -c 'import signal,time,sys; signal.signal(signal.SIGHUP, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN); sys.stdout.write("HUPREADY\\n"); sys.stdout.flush(); time.sleep(60)' ${tag}`, principal: AGENT });
     assert.ok(a.admitted);
     await until(() => pgrep(tag).length > 0, 5000, 'job');
-    await sleep(300);
+    // The job prints once both handlers are set; waiting for that, not a fixed delay, keeps close from
+    // reaching it first on a slow host (the house's read, #22 comment 6269901528).
+    await until(() => x.journal.since(0).events.some((e) => e.type === 'output' && e.data.includes('HUPREADY')), 5000, 'the job installed its handlers');
   } finally {
     await x.close();
   }

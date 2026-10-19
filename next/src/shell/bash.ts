@@ -406,10 +406,33 @@ __tsm_word_in() {
 # operators. The quoted value of each PROMPT_COMMAND assignment in the line is dropped first: it names
 # the prompt's commands whether or not the line runs them, and a compound value ("if …; then cmd; fi")
 # would otherwise match at the next prompt and leave that Run unclosed. The line's first command is
-# never a later firing, so it needs a separator before it. Residual: a line that runs a command and
-# then ends by assigning the same text to PROMPT_COMMAND reads the next prompt's run of it as its own.
+# never a later firing, so it needs a separator before it.
+#
+# When the line installs $1 as PROMPT_COMMAND, an ordinary run of $1 before that install ran with our
+# hook still in place (the DEBUG trap stands aside while PROMPT_COMMAND is intact), so it never
+# reached this branch. The run that does reach it at the next prompt is the installed value's, which
+# the heal must close. So only an ordinary run of $1 that comes AFTER the last install of it is the
+# line's own here: a run-then-install line (cmd; then PROMPT_COMMAND="cmd") has none, and its Run ends
+# at the next prompt instead of staying busy for good (the house's read, #22 comment 6269901528).
 __tsm_line_has() {
-  local __t=$__tsm_line_text __h __v __q __dq=\\" __sq=\\'
+  local __t=$__tsm_line_text __h __v __q __val __inst= __suf= __dq=\\" __sq=\\'
+  while :; do
+    case $__t in
+      *PROMPT_COMMAND+=[$__dq$__sq]*) __h=$\{__t%%PROMPT_COMMAND+=[$__dq$__sq]*}; __v=$\{__t#"$__h"PROMPT_COMMAND+=} ;;
+      *PROMPT_COMMAND=[$__dq$__sq]*) __h=$\{__t%%PROMPT_COMMAND=[$__dq$__sq]*}; __v=$\{__t#"$__h"PROMPT_COMMAND=} ;;
+      *) break ;;
+    esac
+    __q=$\{__v%"$\{__v#?}"}
+    __v=$\{__v#?}
+    case $__v in *"$__q"*) __val=$\{__v%%"$__q"*}; __v=$\{__v#*"$__q"} ;; *) __val=$__v; __v= ;; esac
+    # Did this assignment install $1 as (a command of) PROMPT_COMMAND? The suffix is what the line
+    # runs after it; the last such install wins.
+    case " $__val " in *[[:space:]\\;\\(\\{\\&\\|]"$1"[[:space:]\\;\\)\\}\\&\\|]*) __inst=1; __suf=$__v ;; esac
+    case "$__val " in "$1"[[:space:]\\;\\)\\}\\&\\|]*) __inst=1; __suf=$__v ;; esac
+    __t=$__h$__v
+  done
+  if [ -n "$__inst" ]; then __t=$__suf; fi
+  # Strip any assignments still in the region being searched (the whole line, or the suffix).
   while :; do
     case $__t in
       *PROMPT_COMMAND+=[$__dq$__sq]*) __h=$\{__t%%PROMPT_COMMAND+=[$__dq$__sq]*}; __v=$\{__t#"$__h"PROMPT_COMMAND+=} ;;

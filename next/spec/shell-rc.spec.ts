@@ -283,6 +283,18 @@ test('/bin/zsh: a ZDOTDIR a startup file sets chooses the next file read and is 
   }
 });
 
+test('/bin/zsh: a ZDOTDIR set in .zlogin is the user’s afterwards, not undone by the shim', { skip: !hasShell('/bin/zsh') }, async () => {
+  // .zlogin is the last startup file; the .zlogin shim keeps a ZDOTDIR it set, as the .zprofile and
+  // .zshrc shims do, so nested zsh read the user's files from there (the house's read, #22 comment
+  // 6269901528: .zlogin's keep had no test, and without it the value is undone to what it was before).
+  const x = await realSession('/bin/zsh', { login: true, rc: { '.zlogin': 'export ZDOTDIR="$HOME/zl"\n' } });
+  try {
+    assert.equal((await x.run('echo "${ZDOTDIR-unset}"')).text.trim(), `${x.home}/zl`);
+  } finally {
+    await x.close();
+  }
+});
+
 test('/bin/zsh: a plugin that replaces the line-init widget after startup does not stop the prompt-end marks', { skip: !hasShell('/bin/zsh') }, async () => {
   const x = await realSession('/bin/zsh');
   try {
@@ -334,3 +346,22 @@ for (const line of ['PROMPT_COMMAND="history -a"', 'PROMPT_COMMAND="if true; the
     }
   });
 }
+
+test('/bin/bash: a typed line that runs a prompt command and then installs it ends at the next prompt, and the session goes idle', { skip: !hasShell('/bin/bash') }, async () => {
+  // `history -a; PROMPT_COMMAND="history -a"` runs history -a now, then installs it. At the next
+  // prompt the installed PROMPT_COMMAND folds and runs; that fold is the prompt, so the open typed
+  // Run's D mark belongs before it. Left unclosed, the session stayed busy for good until someone
+  // typed another line (the house's read, #22 comment 6269901528).
+  const x = await realSession('/bin/bash', { login: false });
+  try {
+    x.session.input('echo typed-$((40+2)); history -a; PROMPT_COMMAND="history -a"\n', { principal: AGENT });
+    await until(() => x.session.listRuns().some((r) => r.origin === 'agent' && r.state === 'exited'), 6000, 'the typed Run ended');
+    await until(() => x.session.shellAvailable().ok, 3000, 'the session went idle');
+    assert.equal(x.session.info().state, 'idle');
+    const back = await x.run('echo back', 4000);
+    assert.deepEqual([back.state, back.exit, back.text.trim()], ['exited', 0, 'back'], 'a Run runs within a second');
+    assert.equal(x.session.listRuns().filter((r) => r.origin === 'agent').length, 1, 'one typed Run');
+  } finally {
+    await x.close();
+  }
+});
