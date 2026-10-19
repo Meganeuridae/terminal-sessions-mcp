@@ -214,8 +214,11 @@ export function readUsage(file: string): UsageRecord[] {
     let text: string;
     try {
       text = fs.readFileSync(f, 'utf8');
-    } catch {
-      continue;
+    } catch (e) {
+      // A generation that is not there is simply absent; one that cannot be read (permissions, a
+      // directory) is an error, not an empty log (the house's read of 4e37a11, #22).
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw e;
     }
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;

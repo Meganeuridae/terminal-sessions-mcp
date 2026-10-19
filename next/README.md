@@ -22,7 +22,7 @@ presence) to hosts that support it — agent-framework (connectome) and Claude C
 ```bash
 npm install -g term-sessions-mcp     # bins: termd, tsm, tsm-shim
 termd                                 # ws://127.0.0.1:3101 · GUI at http://127.0.0.1:3101/
-tsm run demo 'echo hello; pwd'        # exit code = the command's; 2 while still running
+tsm run demo 'echo hello; pwd'        # exit code = the command's; 124 while still running
 ```
 
 Process Runs need bash: `/bin/bash`, or a `bash` on the daemon's PATH (NixOS). It closes the
@@ -227,6 +227,9 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
 `tsm` is the tool table over the same endpoint, `--json` on every command:
 `tsm run build 'npm test' --wait 20000`, `tsm await r41`, `tsm read build --since 4812`,
 `tsm screen build`, `tsm input build --keys C-c`, `tsm sessions`, `tsm gui`, `tsm usage`.
+After `--`, each word is one argument of the command, quoted for the session's shell, so its own
+flags and odd characters arrive whole: `tsm run build -- git log --oneline -5`. Flag values take
+the type of the tool's parameter; a yes/no flag stands alone (`--queue`, `--force`).
 `TSM_URL` and `TSM_TOKEN` point it at a daemon.
 
 ## Upgrading from 1.x

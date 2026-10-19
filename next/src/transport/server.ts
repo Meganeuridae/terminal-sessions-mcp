@@ -140,6 +140,8 @@ interface Conn {
   initialized: boolean;
   /** A same-origin browser: the GUI. */
   gui: boolean;
+  /** The tsm CLI (`?client=cli`): with the GUI, the native family — not an agent surface — in usage records (the house's read of 4e37a11, #22). */
+  cli: boolean;
   kind: ConnKind;
   followers: Map<string, Follower>;
   /**
@@ -476,7 +478,7 @@ export class TermServer {
       ts: Date.now(),
       principal: clipField(conn.caller.principal, 256),
       connection: conn.label ?? conn.id,
-      host: conn.lane ? 'mcpl' : conn.gui || conn.kind === 'native' ? 'native' : 'mcp',
+      host: conn.lane ? 'mcpl' : conn.gui || conn.cli || conn.kind === 'native' ? 'native' : 'mcp',
       profile: conn.profile,
       tool: known ? tool : '(unknown)',
       ok: !r.isError,
@@ -697,6 +699,7 @@ export class TermServer {
       resultText: textQ === 'json' || textQ === 'transcript' ? textQ : (this.opts.resultText ?? 'json'),
       initialized: false,
       gui,
+      cli: q.get('client') === 'cli',
       kind: gui ? 'gui' : 'pending',
       followers: new Map(),
       attaching: new Map(),

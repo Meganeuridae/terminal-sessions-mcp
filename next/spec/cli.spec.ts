@@ -2,11 +2,12 @@
  * tsm as a process: its exit codes are the contract scripts rely on — a Run's
  * exit code, 128+N for a signal, 124 while running, 75 when busy, 1 on error,
  * including a daemon connection lost before the result (jr-18) — its argument
- * forms (`await <runId>`, durations, `--`), and `tsm gui`.
+ * forms (`await <runId>`, durations, `--`, values typed by the tool's schema),
+ * its output to a slow reader, `tsm gui` and `tsm usage`.
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -15,6 +16,8 @@ import { WebSocketServer } from 'ws';
 import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
+import { TOOLS } from '../src/api/tools.js';
+import type { UsageRecord } from '../src/api/usage.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermServer } from '../src/transport/server.js';
 import { FakeShell } from './fake-shell.js';
@@ -24,14 +27,24 @@ const TSM = path.resolve(here, '../src/cli/tsm.js');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-function tsm(argv: string[], env: NodeJS.ProcessEnv): Promise<{ code: number | null; stdout: string; stderr: string }> {
+interface Ran {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/** Run tsm; `readAfterMs` starts reading its stdout only then, as a slow consumer of a pipe would. */
+function tsm(argv: string[], env: NodeJS.ProcessEnv, opts: { readAfterMs?: number } = {}): Promise<Ran> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [TSM, ...argv], { env: { ...process.env, TSM_TOKEN: '', ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
-    child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+    const read = () => child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+    if (opts.readAfterMs) setTimeout(read, opts.readAfterMs);
+    else read();
     child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
-    child.on('exit', (code) => resolve({ code, stdout, stderr }));
+    // 'close' follows the last byte of both pipes; 'exit' can come before stdout is drained.
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
   });
 }
 
@@ -49,7 +62,14 @@ test('tsm exit codes: the Run exit code, 124 while running, 75 when busy, 1 on e
     };
   };
   const registry = new SessionRegistry({ dataDir: path.join(tmp, 'd'), backend, defaultShell: '/bin/bash', noUserRc: true });
-  const server = new TermServer({ app: new App({ registry, defaultWaitMs: 2000 }), resolver: new TokenMapResolver({ tokens: { tk: 'agent:cli@test' } }), host: '127.0.0.1', port: 0 });
+  const usage: UsageRecord[] = [];
+  const server = new TermServer({
+    app: new App({ registry, defaultWaitMs: 2000 }),
+    resolver: new TokenMapResolver({ tokens: { tk: 'agent:cli@test' } }),
+    host: '127.0.0.1',
+    port: 0,
+    usage: { record: (r) => usage.push(r) },
+  });
   const { port } = await server.listen();
   const env = { TSM_URL: `ws://127.0.0.1:${port}`, TSM_TOKEN: 'tk' };
   try {
@@ -72,6 +92,9 @@ test('tsm exit codes: the Run exit code, 124 while running, 75 when busy, 1 on e
     const denied = await tsm(['sessions'], { ...env, TSM_TOKEN: 'wrong' });
     assert.equal(denied.code, 1);
     assert.match(denied.stderr, /refused the credential \(401\): set TSM_TOKEN/, 'ux-18: a bad token is reported as such');
+    // The CLI is the native family, with the GUI: `tsm usage` does not read its calls as an agent's.
+    assert.ok(usage.length >= 6, `usage records: ${usage.length}`);
+    assert.deepEqual(new Set(usage.map((u) => u.host)), new Set(['native']), JSON.stringify(usage.map((u) => [u.tool, u.host])));
   } finally {
     await server.close();
     await registry.closeAll();
@@ -99,7 +122,7 @@ test('jr-18: tsm exits 1 with a message when the daemon connection closes before
   }
 });
 
-test('tsm gui prints the GUI URL, with the token when one is configured', async () => {
+test('tsm gui prints the GUI URL, with the token when one is configured, as JSON with --json', async () => {
   const plain = await tsm(['gui'], { TSM_URL: 'ws://127.0.0.1:3101' });
   assert.equal(plain.code, 0);
   assert.equal(plain.stdout.trim(), 'http://127.0.0.1:3101/');
@@ -107,6 +130,8 @@ test('tsm gui prints the GUI URL, with the token when one is configured', async 
   assert.equal(withToken.stdout.trim(), 'https://term.example:8443/?token=a+b%26c');
   const inUrl = await tsm(['gui'], { TSM_URL: 'ws://localhost:3175/?token=t1', TSM_TOKEN: '' });
   assert.equal(inUrl.stdout.trim(), 'http://localhost:3175/?token=t1');
+  const json = await tsm(['gui', '--json'], { TSM_URL: 'ws://127.0.0.1:3101' });
+  assert.deepEqual(JSON.parse(json.stdout), { url: 'http://127.0.0.1:3101/' });
 });
 
 test('atc-5/tsg-2/atc-25/ux-18: a signal exits 128+N; await <runId>; durations; -- ends option parsing', async () => {
@@ -145,7 +170,7 @@ test('atc-5/tsg-2/atc-25/ux-18: a signal exits 128+N; await <runId>; durations; 
     assert.equal((JSON.parse(waited.stdout) as { runId: string }).runId, runId);
     const cancelled = await tsm(['cancel', runId], env);
     assert.equal(cancelled.code, 0, `a cancel that ended the Run: ${cancelled.stdout}`);
-    // -- stops option parsing: the command's own flags reach the command.
+    // -- stops option parsing: the command's own flags reach the command, plain words as they are.
     const git = await tsm(['run', 'g1', '--wait', '2s', '--', 'git', '-C', 'repo', 'log', '--oneline', '-5'], env);
     assert.equal(git.code, 0, git.stdout + git.stderr);
     assert.match(git.stdout, /ran: git -C repo log --oneline -5/);
@@ -158,41 +183,211 @@ test('atc-5/tsg-2/atc-25/ux-18: a signal exits 128+N; await <runId>; durations; 
   }
 });
 
-/** A daemon stand-in that answers every tools/call with a canned envelope, for outcomes a scripted session cannot stage quickly. */
-async function cannedDaemon(answers: Record<string, Record<string, unknown>>): Promise<{ port: number; close(): Promise<void> }> {
-  const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
-  await new Promise<void>((r) => wss.once('listening', () => r()));
-  wss.on('connection', (ws) => {
-    ws.on('message', (d) => {
-      const m = JSON.parse(d.toString()) as { id: number; method: string; params: { name: string } };
-      if (m.method === 'initialize') ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-06-18', capabilities: {} } }));
-      else ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: '[canned]' }], structuredContent: answers[m.params.name] ?? {} } }));
-    });
-  });
-  return { port: (wss.address() as { port: number }).port, close: () => new Promise<void>((r) => wss.close(() => r())) };
+interface Canned {
+  port: number;
+  /** Every tools/call, in order. */
+  calls: Array<{ name: string; arguments: Record<string, unknown> }>;
+  /** The request target of every connection (the CLI's query string). */
+  urls: string[];
+  close(): Promise<void>;
 }
 
-test('atc-20: start and cancel exit nonzero on failure states; a signal with no exit code is never success', async () => {
-  const cases: Array<[string[], Record<string, unknown>, number]> = [
-    [['cancel', 'r9'], { runId: 'r9', state: 'running', contract: 'shell', escalation: 'session_close', steps: ['^C', '^\\', 'SIGTERM', 'SIGKILL'] }, 1],
-    [['cancel', 'r9'], { runId: 'r9', state: 'cancelled', contract: 'shell', steps: ['^C'] }, 0],
-    [['start', 's', '--command', 'x'], { runId: 'r1', state: 'running', service: 'ready' }, 0],
-    [['start', 's', '--command', 'x'], { runId: 'r1', state: 'running', service: 'starting' }, 124],
-    [['start', 's', '--command', 'x'], { runId: 'r1', state: 'running', service: 'unhealthy' }, 1],
-    [['start', 's', '--command', 'x'], { runId: 'r1', state: 'exited', exit: 0, service: 'exited' }, 1],
-    [['await', 'r1'], { runId: 'r1', state: 'exited', signal: 'SIGTERM' }, 143],
-    [['await', 'r1'], { runId: 'r1', state: 'exited', signal: 'SIGWHAT' }, 1],
-    [['await', 'r1'], { runId: 'r1', state: 'lost', reason: 'daemon-restart' }, 1],
-    [['await', 'r1'], { runId: 'r1', state: 'queued' }, 124],
+/**
+ * A daemon stand-in for outcomes a scripted session cannot stage quickly: it lists the real
+ * tools (the CLI types each flag by their schemas), records every tools/call and answers it
+ * with a canned envelope — the next of a list when a tool is asked more than once, the last
+ * one repeating.
+ */
+async function cannedDaemon(answers: Record<string, Record<string, unknown> | Array<Record<string, unknown>>>): Promise<Canned> {
+  const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise<void>((r) => wss.once('listening', () => r()));
+  const calls: Canned['calls'] = [];
+  const urls: string[] = [];
+  const left = Object.fromEntries(Object.entries(answers).map(([k, v]) => [k, Array.isArray(v) ? [...v] : [v]]));
+  wss.on('connection', (ws, req) => {
+    urls.push(req.url ?? '');
+    ws.on('message', (d) => {
+      const m = JSON.parse(d.toString()) as { id: number; method: string; params?: { name: string; arguments: Record<string, unknown> } };
+      const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }));
+      if (m.method === 'initialize') return reply({ protocolVersion: '2025-06-18', capabilities: {} });
+      if (m.method === 'tools/list') return reply({ tools: TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
+      const call = m.params!;
+      calls.push({ name: call.name, arguments: call.arguments });
+      const queue = left[call.name] ?? [];
+      const structured = queue.length > 1 ? queue.shift()! : (queue[0] ?? {});
+      reply({ content: [{ type: 'text', text: '[canned]' }], structuredContent: structured });
+    });
+  });
+  return { port: (wss.address() as { port: number }).port, calls, urls, close: () => new Promise<void>((r) => wss.close(() => r())) };
+}
+
+test('atc-20: exit codes agree with the header for every state of run, await, start and cancel', async () => {
+  const cases: Array<[string[], Record<string, unknown>, number, string]> = [
+    [['cancel', 'r9'], { runId: 'r9', state: 'running', contract: 'shell', escalation: 'session_close', steps: ['^C', '^\\', 'SIGTERM', 'SIGKILL'] }, 1, 'cancel: the Run survived'],
+    [['cancel', 'r9'], { runId: 'r9', state: 'cancelled', contract: 'shell', steps: ['^C'] }, 0, 'cancel: ended'],
+    [['cancel', 'r9'], { runId: 'r9', state: 'exited', exit: 0, contract: 'shell' }, 0, 'cancel: the Run had already ended'],
+    [['cancel', 'r9'], { runId: 'r9', state: 'lost', reason: 'daemon-shutdown', contract: 'shell' }, 1, 'cancel: lost — its end was never observed'],
+    [['start', '--session', 's', '--command', 'x'], { runId: 'r1', state: 'running', service: 'ready' }, 0, 'start: ready'],
+    [['start', '--session', 's', '--command', 'x'], { runId: 'r1', state: 'running', service: 'running' }, 0, 'start: alive with no readiness condition to check is success'],
+    [['start', '--session', 's', '--command', 'x'], { runId: 'r1', state: 'running', service: 'starting' }, 124, 'start: starting'],
+    [['start', '--session', 's', '--command', 'x'], { runId: 'r1', state: 'running', service: 'unhealthy' }, 1, 'start: unhealthy'],
+    [['start', '--session', 's', '--command', 'x'], { runId: 'r1', state: 'exited', exit: 0, service: 'exited' }, 1, 'start: exited'],
+    [['start', '--session', 's', '--command', 'x'], { runId: 'r1', state: 'lost', service: 'lost' }, 1, 'start: lost'],
+    [['start', '--session', 's', '--command', 'x'], { state: 'busy', busy: { runId: 'r0', reason: 'running' } }, 75, 'start: busy'],
+    [['await', 'r1'], { runId: 'r1', state: 'exited', signal: 'SIGTERM' }, 143, 'await: a signal'],
+    [['await', 'r1'], { runId: 'r1', state: 'exited', signal: 'SIGWHAT' }, 1, 'await: an unknown signal is never success'],
+    [['await', 'r1'], { runId: 'r1', state: 'exited' }, 1, 'await: exited with neither a code nor a signal — status unknown'],
+    [['await', 'r1'], { runId: 'r1', state: 'lost', reason: 'daemon-restart' }, 1, 'await: lost'],
+    [['await', 'r1'], { runId: 'r1', state: 'queued' }, 124, 'await: queued'],
+    [['run', 'q', 'x'], { runId: 'r1', state: 'exited', exit: 300 }, 255, 'run: a code past 255 is clamped'],
+    [['run', 'q', 'x'], { state: 'busy', busy: { reason: 'human-editing', line: 'git sta' } }, 75, 'run: busy with a person editing a line'],
+    [['run', 'q', '--until-done', '--', 'timeout', '1', 'sleep', '5'], { runId: 'r1', state: 'exited', exit: 124 }, 124, 'run --until-done: a 124 is the command’s own'],
   ];
-  for (const [argv, answer, code] of cases) {
-    const d = await cannedDaemon({ [argv[0] === 'await' ? 'await' : argv[0]!]: answer });
+  for (const [argv, answer, code, why] of cases) {
+    const d = await cannedDaemon({ [argv[0]!]: answer });
     try {
       const r = await tsm(argv, { TSM_URL: `ws://127.0.0.1:${d.port}` });
-      assert.equal(r.code, code, `${argv.join(' ')} → ${JSON.stringify(answer)}: ${r.stderr}`);
+      assert.equal(r.code, code, `${why}: ${argv.join(' ')} → ${JSON.stringify(answer)}: ${r.stderr}`);
     } finally {
       await d.close();
     }
+  }
+});
+
+test('ux-18: after --, each word is one argument of the command under sh, bash, zsh, dash and fish', async () => {
+  const d = await cannedDaemon({ run: { runId: 'r1', state: 'exited', exit: 0 } });
+  const env = { TSM_URL: `ws://127.0.0.1:${d.port}` };
+  try {
+    // Every kind of word a shell would split, expand or read as syntax.
+    const words = ['a;b', 'x  y', "it's", 'back\\slash', 'two\\\\back', "q\\'t", '$HOME', '*', '', '~/x', '#no comment', 'a|b', 'c&d', '(e)', '`f`', '"g"', 'h>i', '{j,k}', 'l\nm', '!bang'];
+    const r = await tsm(['run', 'q', '--', 'printf', '%s\\n', ...words], env);
+    assert.equal(r.code, 0, r.stderr);
+    const command = d.calls[0]!.arguments.command as string;
+    assert.ok(command.startsWith('printf '), command);
+    const shells = ['/bin/sh', '/bin/bash', '/bin/zsh', '/bin/dash', '/usr/bin/fish', '/opt/homebrew/bin/fish', '/usr/local/bin/fish'].filter((s) => fs.existsSync(s));
+    assert.ok(shells.length >= 2, `shells found: ${shells.join(', ')}`);
+    for (const shell of shells) {
+      const out = await new Promise<string>((resolve, reject) => execFile(shell, ['-c', command], { env: { PATH: '/usr/bin:/bin', HOME: tmp } }, (e, stdout, stderr) => (e ? reject(new Error(`${shell}: ${e.message} ${stderr}`)) : resolve(stdout))));
+      assert.equal(out, `${words.join('\n')}\n`, shell);
+    }
+    // Plain words stay as they are; without --, the words are a command line for the shell to parse.
+    await tsm(['run', 'q', '--', 'git', '-C', 'repo', 'log', '--oneline', '-5'], env);
+    assert.equal(d.calls[1]!.arguments.command, 'git -C repo log --oneline -5');
+    await tsm(['run', 'q', 'echo a | cat; echo "b c"'], env);
+    assert.equal(d.calls[2]!.arguments.command, 'echo a | cat; echo "b c"');
+    await tsm(['run', 'q', 'env', '--', 'FOO=a b', 'cmd'], env);
+    assert.equal(d.calls[3]!.arguments.command, "env 'FOO=a b' cmd");
+  } finally {
+    await d.close();
+  }
+});
+
+test('a large --json result reaches a reader that starts late, whole, and tsm still exits by its code', async () => {
+  const text = 'x'.repeat(1_200_000);
+  const d = await cannedDaemon({ read: { nextCursor: 1, text } });
+  try {
+    const r = await tsm(['read', 'big', '--since', '0', '--json'], { TSM_URL: `ws://127.0.0.1:${d.port}` }, { readAfterMs: 1000 });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout.length, JSON.stringify({ nextCursor: 1, text }, null, 2).length + 1, 'every byte arrived');
+    assert.equal((JSON.parse(r.stdout) as { text: string }).text.length, text.length);
+  } finally {
+    await d.close();
+  }
+});
+
+test('a flag’s value takes the type of the tool’s parameter: text stays text, a yes/no flag stands alone', async () => {
+  const d = await cannedDaemon({});
+  const env = { TSM_URL: `ws://127.0.0.1:${d.port}` };
+  try {
+    const expected: Array<[string[], string, Record<string, unknown>]> = [
+      [['search', '--session', 'q', '--pattern', '404'], 'search', { session: 'q', pattern: '404' }],
+      [['input', 'q', '--text', '012345'], 'input', { session: 'q', text: '012345' }],
+      [['run', 'q', '--command', 'true'], 'run', { session: 'q', command: 'true' }],
+      [['run', 'q', '--queue', 'echo', 'hi'], 'run', { session: 'q', queue: true, command: 'echo hi' }],
+      [['run', 'q', '--queue=false', 'echo', 'hi'], 'run', { session: 'q', queue: false, command: 'echo hi' }],
+      [['input', 'q', '--keys', 'Enter,C-c', '--sensitive'], 'input', { session: 'q', keys: ['Enter', 'C-c'], sensitive: true }],
+      [['input', 'q', '--keys', '["Enter","C-c"]'], 'input', { session: 'q', keys: ['Enter', 'C-c'] }],
+      [['start', '--session', 's', '--command', 'x', '--ready', '{"pattern":"ok"}', '--wait=5s', '--name', '42'], 'start', { session: 's', command: 'x', ready: { pattern: 'ok' }, wait: 5000, name: '42' }],
+      [['read', 'q', '--since', '0', '--tail=3', '--run-id', 'r7', '--as', 'events'], 'read', { session: 'q', since: 0, tail: 3, runId: 'r7', as: 'events' }],
+      [['open', 's', '--cwd', '123', '--shell', '/bin/sh'], 'session_open', { session: 's', cwd: '123', shell: '/bin/sh' }],
+      [['close', 's', '--force'], 'session_close', { session: 's', force: true }],
+      [['await', 'r1', '--wait', '250'], 'await', { runId: 'r1', wait: 250 }],
+    ];
+    // The canned answers carry no state, so the exit code says nothing here; a parse error would show on stderr.
+    for (const [argv] of expected) assert.equal((await tsm(argv, env)).stderr, '', argv.join(' '));
+    assert.deepEqual(
+      d.calls.map((c) => [c.name, c.arguments]),
+      expected.map(([, name, args]) => [name, args]),
+    );
+    const missing = await tsm(['run', 'q', '--wait'], env);
+    assert.equal(missing.code, 1);
+    assert.match(missing.stderr, /--wait needs a value/);
+    const badJson = await tsm(['start', '--session', 's', '--command', 'x', '--ready', '{bad'], env);
+    assert.equal(badJson.code, 1);
+    assert.match(badJson.stderr, /--ready: not valid JSON/);
+    const stray = await tsm(['start', 's', '--command', 'x'], env);
+    assert.equal(stray.code, 1);
+    assert.match(stray.stderr, /start takes --flags only \(unexpected word s\)/);
+    const extra = await tsm(['screen', 's', 'extra'], env);
+    assert.equal(extra.code, 1);
+    assert.match(extra.stderr, /screen: unexpected word extra/);
+    assert.equal(d.calls.length, expected.length, 'none of the errors reached the daemon');
+  } finally {
+    await d.close();
+  }
+});
+
+test('every shorthand reaches its tool, over a connection that asks for the full profile as the native family', async () => {
+  const d = await cannedDaemon({});
+  const env = { TSM_URL: `ws://127.0.0.1:${d.port}` };
+  try {
+    const expected: Array<[string[], string, Record<string, unknown>]> = [
+      [['sessions'], 'session_list', {}],
+      [['open', 's', '--cwd', '/tmp'], 'session_open', { session: 's', cwd: '/tmp' }],
+      [['close', 's'], 'session_close', { session: 's' }],
+      [['declare', 's', 'fish'], 'session_declare_shell', { session: 's', shell: 'fish' }],
+      [['screen', 's'], 'screen', { session: 's' }],
+      [['input', 's', 'hello', 'world'], 'input', { session: 's', text: 'hello world' }],
+      [['signal', 's', '--signal', 'SIGINT'], 'signal', { session: 's', signal: 'SIGINT' }],
+      [['control', 's', 'take'], 'control', { session: 's', action: 'take' }],
+      [['env-capture', 's'], 'session_env_capture', { session: 's' }],
+      [['await', 's', 'r1'], 'await', { session: 's', runId: 'r1' }],
+      [['cancel', 'r1'], 'cancel', { runId: 'r1' }],
+      [['wait_for', '--session', 's', '--pattern', 'ok'], 'wait_for', { session: 's', pattern: 'ok' }],
+    ];
+    // The canned answers carry no state, so the exit code says nothing here; a parse error would show on stderr.
+    for (const [argv] of expected) assert.equal((await tsm(argv, env)).stderr, '', argv.join(' '));
+    assert.deepEqual(
+      d.calls.map((c) => [c.name, c.arguments]),
+      expected.map(([, name, args]) => [name, args]),
+    );
+    assert.equal(d.urls.length, expected.length);
+    for (const u of d.urls) {
+      const q = new URL(u, 'ws://x').searchParams;
+      assert.equal(q.get('profile'), 'full', u);
+      assert.equal(q.get('client'), 'cli', u);
+    }
+  } finally {
+    await d.close();
+  }
+});
+
+test('--until-done awaits again and again until the Run has ended, not once', async () => {
+  const d = await cannedDaemon({
+    run: { runId: 'r1', state: 'running', session: 'u' },
+    await: [{ runId: 'r1', state: 'running' }, { runId: 'r1', state: 'running' }, { runId: 'r1', state: 'exited', exit: 3 }],
+  });
+  try {
+    const r = await tsm(['run', 'u', '--until-done', '--json', '--', 'sleep', '9'], { TSM_URL: `ws://127.0.0.1:${d.port}` });
+    assert.equal(r.code, 3, r.stderr);
+    assert.deepEqual((JSON.parse(r.stdout) as { state: string; exit: number }).exit, 3);
+    assert.deepEqual(
+      d.calls.map((c) => c.name),
+      ['run', 'await', 'await', 'await'],
+    );
+    assert.deepEqual(d.calls[1]!.arguments, { runId: 'r1', wait: 55_000, session: 'u' });
+  } finally {
+    await d.close();
   }
 });
 
@@ -255,4 +450,41 @@ test('--until-done keeps awaiting past the per-call wait until the Run has ended
     await server.close();
     await registry.closeAll({ graceful: false });
   }
+});
+
+test('tsm usage: the report and --since; a date that does not parse or a log that cannot be read is an error', async () => {
+  const T0 = Date.parse('2026-10-19T10:00:00Z');
+  const record = (ts: number, tool: string): UsageRecord => ({ ts, principal: 'agent:a@x', connection: 'c1', host: 'mcp', profile: 'full', tool, ok: true, ms: 5, args: [] });
+  const file = path.join(tmp, 'usage.jsonl');
+  fs.writeFileSync(file, [record(T0, 'run'), record(T0 + 1000, 'read'), record(T0 + 2000, 'await')].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const all = await tsm(['usage', '--file', file, '--json'], {});
+  assert.equal(all.code, 0, all.stderr);
+  const report = JSON.parse(all.stdout) as { calls: number; agentCalls: number };
+  assert.deepEqual([report.calls, report.agentCalls], [3, 3]);
+  const since = await tsm(['usage', `--file=${file}`, '--since', new Date(T0 + 1500).toISOString(), '--json'], {});
+  assert.equal((JSON.parse(since.stdout) as { calls: number }).calls, 1);
+  const text = await tsm(['usage', '--file', file], {});
+  assert.match(text.stdout, /^3 calls, /);
+  const garbage = await tsm(['usage', '--file', file, '--since', 'garbage'], {});
+  assert.equal(garbage.code, 1, garbage.stdout);
+  assert.match(garbage.stderr, /--since: not a date/);
+  assert.equal(garbage.stdout, '');
+  const dir = await tsm(['usage', '--file', tmp], {});
+  assert.equal(dir.code, 1, `a directory is not a log: ${dir.stdout}`);
+  assert.match(dir.stderr, /cannot read the usage log/);
+  if (process.getuid?.() !== 0) {
+    const sealed = path.join(tmp, 'sealed.jsonl');
+    fs.copyFileSync(file, sealed);
+    fs.chmodSync(sealed, 0);
+    const r = await tsm(['usage', '--file', sealed], {});
+    assert.equal(r.code, 1, `mode 000: ${r.stdout}`);
+    assert.match(r.stderr, /cannot read the usage log/);
+    fs.chmodSync(sealed, 0o600);
+  }
+  const missing = await tsm(['usage', '--file', path.join(tmp, 'none.jsonl')], {});
+  assert.equal(missing.code, 0);
+  assert.match(missing.stdout, /^no usage recorded in /);
+  const unknown = await tsm(['usage', '--bogus'], {});
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.stderr, /unknown argument --bogus/);
 });
