@@ -8,7 +8,10 @@
     "terminal-sessions-mcp": "./dist/src/mcp/mcp-stdio-server.js",
     "session-server": "./dist/src/server/start-session-server.js",
     "session-gui": "./dist/gui/src/start-gui.js",
-    "session-cli": "./dist/cli/session-cli.js"
+    "session-cli": "./dist/cli/session-cli.js",
+    "termd": "./next/dist/src/daemon.js",
+    "tsm": "./next/dist/src/cli/tsm.js",
+    "tsm-shim": "./next/dist/src/shim/stdio.js"
   },
   "scripts": {
     "build": "tsc && tsc -p next/tsconfig.json",
@@ -67,6 +70,6 @@
     "typescript": "^5.0.0"
   },
   "engines": {
-    "node": ">=18.0.0 <25.0.0"
+    "node": ">=20.0.0 <25.0.0"
   }
 }
