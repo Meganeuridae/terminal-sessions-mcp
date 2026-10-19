@@ -70,7 +70,7 @@ export function prepareIntegration(shellPath: string, opts: PrepareOptions = {})
   // one's own oom_score_adj needs no privilege, and /proc is Linux's. The amount is the
   // daemon's setting: the preference is machine-wide, so a shared host may want none.
   // The descriptors the shell would inherit are closed and its oom_score_adj raised with the same
-  // lines every child of the daemon starts through (backends/launch.ts); the key file is written
+  // lines every child of the daemon starts through (core/launch.ts); the key file is written
   // between them, owner-only, and the shell starts with the mask it inherited.
   fs.writeFileSync(launcher,
     `${closeFdsLine('0|1|2')}\n` +

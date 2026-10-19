@@ -17,7 +17,7 @@ import { configuredEnv, historyIsolationEnv, parseEnvNul, redactSnapshot, type E
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
 import { livingGroups } from './lock.js';
-import { clocks } from './clock.js';
+import { clocks, timerMs } from './clock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
@@ -1401,7 +1401,7 @@ export class Session {
         const i = waiters.indexOf(left);
         if (i !== -1) waiters.splice(i, 1);
         resolve();
-      }, ms);
+      }, timerMs(ms));
       waiters.push(left);
     });
   }
@@ -1541,7 +1541,8 @@ export class Session {
    * of quiet, as §8.1 says: output or input since the submission means the person's command is still
    * going, so the period counts from the last of it, not from the submission (the house's read of
    * 07ab3dd, #22: counted from the submission, the hold ended while the program printed and read, and
-   * a Run's wrapper was typed into it).
+   * a Run's wrapper was typed into it). `lastActivity` is stamped by both: onPtyData for output, and
+   * input() for what is typed, so a keystroke counts at once, not only through its echo.
    */
   private submittedQuietSince(): number {
     return Math.max(this.submittedAt ?? 0, this.lastActivity);
@@ -1608,7 +1609,7 @@ export class Session {
       const layer = this.layers.at(-1);
       if (layer) this.drainDeclared(layer.within);
       this.notifyAvailable();
-    }, Math.min(ms, 2 ** 31 - 1));
+    }, timerMs(ms));
     this.editingTimer.unref();
   }
 
@@ -1630,7 +1631,7 @@ export class Session {
         const i = this.availabilityWaiters.indexOf(waiter);
         if (i !== -1) this.availabilityWaiters.splice(i, 1);
         resolve(false);
-      }, ms);
+      }, timerMs(ms));
       this.availabilityWaiters.push(waiter);
     });
   }
@@ -2245,7 +2246,7 @@ export class Session {
         const i = run.waiters.indexOf(finish);
         if (i !== -1) run.waiters.splice(i, 1);
         finish(publicRun(run));
-      }, waitMs);
+      }, timerMs(waitMs));
       run.waiters.push(finish);
     });
   }
