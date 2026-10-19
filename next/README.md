@@ -48,8 +48,10 @@ Then connect a host (configurations in [`next/config/`](config/)):
   the shim its own `TSM_DATA_DIR` or dial the unit's port), or `TSM_NO_SPAWN=1` says never to.
   A check that does not answer, or fails (under cron or `sudo -u`, `systemctl --user` cannot
   reach the user manager without `XDG_RUNTIME_DIR`; over ssh, `launchctl` has no GUI domain to
-  ask while the LaunchAgent is on disk), starts nothing either: the shim says so and names
-  `TSM_NO_SPAWN=1`. With a supervisor unit of your own name, set `TSM_NO_SPAWN=1` in the shim's
+  ask), starts nothing either: the shim says so and names `TSM_NO_SPAWN=1`. The one exception is
+  macOS with no LaunchAgent plist on disk (`~/Library/LaunchAgents/com.animalabs.termd.plist` or
+  the machine's): a failed `launchctl` query then counts as no supervisor, since nothing of yours
+  is installed for launchd to run. With a supervisor unit of your own name, set `TSM_NO_SPAWN=1` in the shim's
   configuration. A termd the shim started that exits is reported on the shim's stderr with what
   termd said (its stderr, kept in `<data-dir>/termd.stderr.log`, where termd also says a startup
   failure found after its log opened; else the end of its log), and started again when the port

@@ -33,7 +33,9 @@
  *    TSM_NO_SPAWN=1, the address came from a 1.x setting, or a supervisor manages
  *    a termd for that port or out of the same data dir (launchd's job on macOS,
  *    systemd's user unit on Linux; a check that does not answer, or fails, is not
- *    taken as "no supervisor"). A termd started here that exits is reported with
+ *    taken as "no supervisor" — except, on macOS, a failed launchctl query with no
+ *    LaunchAgent plist on disk, which is: nothing of this user's is installed). A
+ *    termd started here that exits is reported with
  *    what it said (its stderr, else the end of its log), and started again when
  *    the port is refused later: soon when it had served, 30 s after a start that
  *    never answered. The daemon gets a minimal environment (HOME, USER, LOGNAME, SHELL,
@@ -227,8 +229,8 @@ function noStartReason(): string | undefined {
   return undefined;
 }
 
-/** A supervised termd: who manages it, the port it serves and the data dir it uses (both from the unit's text). */
-type Supervisor = { kind: 'managed'; by: string; port: string; dataDir: string } | { kind: 'none' } | { kind: 'unknown'; why: string };
+/** A supervised termd: who manages it, the port it serves and the data dir it uses (both from the unit's text; the data dir undefined where the text does not tell it). */
+type Supervisor = { kind: 'managed'; by: string; port: string; dataDir: string | undefined } | { kind: 'none' } | { kind: 'unknown'; why: string };
 const SUPERVISOR_CHECK_MS = 1500;
 const SUPERVISOR_CACHE_MS = 30_000;
 let supervisorCache: { at: number; result: Supervisor } | undefined;
@@ -254,25 +256,118 @@ function ask(cmd: string, args: string[]): Promise<Asked> {
 }
 
 /**
- * The port a unit's text gives termd: `--port N` (`--port=N`), else TSM_PORT, else SESSION_SERVER_PORT
- * in its environment — the order termd reads them in, so a unit that sets both is read as termd reads
- * it (the house's read of the shim, #22 comment 6269349177) — else termd's default.
+ * What a unit's text says termd is started with: its arguments, one entry per word as termd receives
+ * them, and its environment. Each source is read so that a value with spaces stays whole (the house's
+ * read of the 38 commits, #22 comment 6274370651): `launchctl print` lists arguments and environment
+ * one per line; a plist holds each in a `<string>`; `systemctl show` prints ExecStart's argv unquoted,
+ * so an option's value is the words up to the next option, and quotes an Environment assignment that
+ * has spaces.
  */
-function unitPort(text: string): string {
-  return /--port[=\s]+(\d+)/.exec(text)?.[1] ?? /\bTSM_PORT\W+(\d+)/.exec(text)?.[1] ?? /\bSESSION_SERVER_PORT\W+(\d+)/.exec(text)?.[1] ?? '3101';
+interface UnitText {
+  argv: string[];
+  env: Record<string, string>;
+}
+
+/** A `launchctl print` answer: the `arguments = { … }` and `environment = { … }` blocks, one entry per line. */
+function launchctlUnit(out: string): UnitText {
+  const block = (name: string): string[] => {
+    const m = new RegExp(`^\\s*${name} = \\{\\n([\\s\\S]*?)^\\s*\\}`, 'm').exec(out);
+    return m ? m[1]!.split('\n').map((l) => l.trim()).filter(Boolean) : [];
+  };
+  const env: Record<string, string> = {};
+  for (const line of block('environment')) {
+    const m = /^(\w+) => (.*)$/.exec(line);
+    if (m) env[m[1]!] = m[2]!;
+  }
+  return { argv: block('arguments'), env };
+}
+
+/**
+ * A `systemctl show` answer: `argv[]=` inside ExecStart, unquoted, and Environment's words. Undefined
+ * when ExecStart has text in a shape not read here, since its port and data dir are then unknown.
+ */
+function systemctlUnit(execStart: string, environment: string): UnitText | undefined {
+  let argv: string[] = [];
+  if (execStart) {
+    const m = /argv\[\]=(.*?)(?: ; |\s*\}\s*$|$)/.exec(execStart);
+    if (!m) return undefined;
+    argv = joinOptionValues(m[1]!.split(' ').filter(Boolean));
+  }
+  const env: Record<string, string> = {};
+  for (const word of quotedWords(environment)) {
+    const eq = word.indexOf('=');
+    if (eq > 0) env[word.slice(0, eq)] = word.slice(eq + 1);
+  }
+  return { argv, env };
+}
+
+/** Words of a list systemd prints, double-quoted where a word has spaces (`\"` and `\\` inside stand for the characters). */
+function quotedWords(text: string): string[] {
+  const words: string[] = [];
+  const re = /"((?:[^"\\]|\\.)*)"|(\S+)/g;
+  for (const m of text.matchAll(re)) words.push(m[1] !== undefined ? m[1].replace(/\\(.)/g, '$1') : m[2]!);
+  return words;
+}
+
+/**
+ * Split words of an unquoted command line, re-joined so each option's value is one entry: the words
+ * after an option, up to the next one, are its value (the launcher's flags each take one value or
+ * none, and nothing positional follows them). Words before the first option are left as they are.
+ */
+function joinOptionValues(words: string[]): string[] {
+  const out: string[] = [];
+  let options = false;
+  let inValue = false;
+  for (const w of words) {
+    if (w.startsWith('--')) {
+      options = true;
+      out.push(w);
+      inValue = w.includes('='); // `--flag=value`: more words belong to the value
+    } else if (!options) out.push(w);
+    else if (inValue) out[out.length - 1] += ` ${w}`;
+    else {
+      out.push(w);
+      inValue = true;
+    }
+  }
+  return out;
+}
+
+/** The value a unit gives an option: the entry after `--flag`, or what follows `--flag=`; undefined when the flag is absent, null when it has no value. */
+function unitArg(u: UnitText, flag: string): string | undefined | null {
+  const i = u.argv.findIndex((a) => a === flag || a.startsWith(`${flag}=`));
+  if (i < 0) return undefined;
+  const a = u.argv[i]!;
+  if (a.length > flag.length) return a.slice(flag.length + 1);
+  const next = u.argv[i + 1];
+  return next === undefined || next.startsWith('--') ? null : next;
+}
+
+/**
+ * The port a unit gives termd: `--port N` (`--port=N`), else TSM_PORT, else SESSION_SERVER_PORT in its
+ * environment — the order termd reads them in, so a unit that sets both is read as termd reads it
+ * (the house's read of the shim, #22 comment 6269349177) — else termd's default.
+ */
+function unitPort(u: UnitText): string {
+  return unitArg(u, '--port') ?? u.env.TSM_PORT ?? u.env.SESSION_SERVER_PORT ?? '3101';
 }
 
 /**
  * The data dir a unit's termd uses: `--data-dir`, else TSM_DATA_DIR in its environment, else termd's
- * default. The unit runs as this user from $HOME (the launcher starts there), so `~`, `$HOME` and
+ * default; undefined when the unit names the flag without a value, since nothing then says which dir
+ * it is. The unit runs as this user from $HOME (the launcher starts there), so `~`, `$HOME` and
  * systemd's `%h` are this home, and a relative path is taken from it.
  */
-function unitDataDir(text: string): string {
-  const named = /--data-dir[=\s]+(\S+)/.exec(text)?.[1] ?? /\bTSM_DATA_DIR(?:\s*=>\s*|=|\s+)(\S+)/.exec(text)?.[1];
+function unitDataDir(u: UnitText): string | undefined {
+  const arg = unitArg(u, '--data-dir');
+  if (arg === null) return undefined;
+  const named = arg ?? (u.env.TSM_DATA_DIR || undefined); // an empty TSM_DATA_DIR is unset, as for termd
   const home = os.homedir();
   if (named === undefined) return path.join(home, '.tsm');
-  return path.resolve(home, named.replace(/^["']|["';]+$/g, '').replace(/^(~|\$\{?HOME\}?|%h)(?=\/|$)/, home));
+  return path.resolve(home, named.replace(/^(~|\$\{?HOME\}?|%h)(?=\/|$)/, home));
 }
+
+const managed = (by: string, u: UnitText): Supervisor => ({ kind: 'managed', by, port: unitPort(u), dataDir: unitDataDir(u) });
 
 /** Whether two paths name one directory: by what they resolve to on disk where they exist, else by their spelling. */
 function sameDir(a: string, b: string): boolean {
@@ -293,8 +388,9 @@ function sameDir(a: string, b: string): boolean {
  * with EADDRINUSE, and ran on with nothing to restart it (the house's review of #11). The question
  * is whether the unit runs termd or will — a running unit need not be enabled, an enabled one starts
  * at login — and a check that does not answer, or fails, is not taken as "no" (the house's read of
- * 4e37a11, #22, and of the shim, #22 comment 6269349177). Asked at each start that is due, at most
- * once per SUPERVISOR_CACHE_MS.
+ * 4e37a11, #22, and of the shim, #22 comment 6269349177), with one exception: on macOS a failed
+ * launchctl query with no LaunchAgent plist on disk is "no", since nothing of this user's is
+ * installed for launchd to run. Asked at each start that is due, at most once per SUPERVISOR_CACHE_MS.
  */
 async function supervisedTermd(): Promise<Supervisor> {
   const now = clocks.monotonic();
@@ -316,8 +412,11 @@ async function checkSupervisor(): Promise<Supervisor> {
       // the agent's — as a systemd unit that is enabled but inactive is.
       if (r.status === 113) {
         if (!plist) return { kind: 'none' };
-        const text = plistText(plist);
-        return { kind: 'managed', by: `the LaunchAgent ${LAUNCH_AGENT} (${plist}; not loaded now, loaded at login)`, port: unitPort(text), dataDir: unitDataDir(text) };
+        const unit = plistUnit(plist);
+        // A plist that cannot be read is no answer either: its port and data dir are whatever it says,
+        // not the defaults (the house's read of the 38 commits, #22 comment 6274370651).
+        if ('error' in unit) return { kind: 'unknown', why: `the LaunchAgent ${LAUNCH_AGENT} is on disk (${plist}) but could not be read (${unit.error}), so its port and data dir are unknown` };
+        return managed(`the LaunchAgent ${LAUNCH_AGENT} (${plist}; not loaded now, loaded at login)`, unit);
       }
       // Any other failure is no answer: over ssh there is no gui domain to ask (exit 112), while the
       // agent may well be running at the console. With its plist on disk that is unknown; with none,
@@ -325,7 +424,7 @@ async function checkSupervisor(): Promise<Supervisor> {
       if (!plist) return { kind: 'none' };
       return { kind: 'unknown', why: `launchctl print failed (${r.failed}) and the LaunchAgent ${LAUNCH_AGENT} is on disk (${plist}), so whether it runs termd is unknown` };
     }
-    return { kind: 'managed', by: `the launchd job ${LAUNCH_AGENT}`, port: unitPort(r.out), dataDir: unitDataDir(r.out) };
+    return managed(`the launchd job ${LAUNCH_AGENT}`, launchctlUnit(r.out));
   }
   if (process.platform === 'linux') {
     const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,ExecStart,Environment']);
@@ -344,8 +443,9 @@ async function checkSupervisor(): Promise<Supervisor> {
     const running = ['active', 'activating', 'reloading', 'deactivating'].includes(prop('ActiveState'));
     const enabled = /^(enabled|static|linked|indirect|generated|transient|alias)/.test(prop('UnitFileState'));
     if (!running && !enabled) return { kind: 'none' };
-    const text = `${prop('ExecStart')} ${prop('Environment')}`;
-    return { kind: 'managed', by: 'the systemd user unit termd', port: unitPort(text), dataDir: unitDataDir(text) };
+    const unit = systemctlUnit(prop('ExecStart'), prop('Environment'));
+    if (!unit) return { kind: 'unknown', why: `the systemd user unit termd's ExecStart is not in the shape read here (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown` };
+    return managed('the systemd user unit termd', unit);
   }
   return { kind: 'none' };
 }
@@ -359,13 +459,21 @@ function launchAgentOnDisk(): string | undefined {
   return undefined;
 }
 
-/** A plist's arguments and environment as a unit's text: its tags become spaces, so the unit readers apply. */
-function plistText(file: string): string {
+/** The LaunchAgent's plist: ProgramArguments' `<string>`s, whole, and EnvironmentVariables' pairs; or why it could not be read. */
+function plistUnit(file: string): UnitText | { error: string } {
+  let xml: string;
   try {
-    return fs.readFileSync(file, 'utf8').replace(/<[^>]*>/g, ' ');
-  } catch {
-    return '';
+    xml = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    return { error: (e as NodeJS.ErrnoException).code ?? (e as Error).message };
   }
+  const text = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  const args = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(xml)?.[1] ?? '';
+  const argv = [...args.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => text(m[1]!));
+  const env: Record<string, string> = {};
+  const dict = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(xml)?.[1] ?? '';
+  for (const m of dict.matchAll(/<key>([\s\S]*?)<\/key>\s*<string>([\s\S]*?)<\/string>/g)) env[text(m[1]!)] = text(m[2]!);
+  return { argv, env };
 }
 
 const out = (m: unknown) => process.stdout.write(JSON.stringify(m) + '\n');
@@ -426,11 +534,13 @@ const ASKED_MAX = 4096;
  * What to replay on a new connection so it is in the host's state: its `initialize`; the MCPL grant
  * (the last request-form `featureSets/update` the daemon accepted) with every reduction since —
  * notification-form updates only ever add `disabled` feature sets (MCPL §6.7), so all of them since
- * the grant fold into one set, however many there were (the house's read of 4e37a11, #22); a later
- * request-form update the daemon refused after running it, replayed after the grant — the daemon
- * fails closed on a malformed one, to an empty grant with no tools, and only its own handling of the
- * same request puts the new connection where the host was told the old one was (the house's read of
- * the shim, #22 comment 6269349177); a refusal the daemon did not run (`executed: false`) changed
+ * the grant fold into one set, however many there were (the house's read of 4e37a11, #22); every
+ * later request-form update the daemon refused after running it, replayed after the grant in the
+ * order sent — the daemon fails closed on a malformed one, to an empty grant with no tools, and only
+ * its own handling of the same requests puts the new connection where the host was told the old one
+ * was (the house's read of the shim, #22 comment 6269349177); all of them, since a later refusal that
+ * left the lane as it was must not stand in for one that failed it closed (the house's read of the 38
+ * commits, #22 comment 6274370651); a refusal the daemon did not run (`executed: false`) changed
  * nothing and is not kept; and the channels the host has open (reopened without `history`: catch-up
  * resumes from the principal's `delivered` cursor, G22). A request's effect is recorded when its
  * answer arrives, a notification's when it does (it is never answered, and one that waits out the
@@ -440,11 +550,13 @@ interface Grant {
   m: Parsed;
   seq: number;
 }
-const replay: { initialize?: Parsed; initialized?: Parsed; grant?: Grant; refusedGrant?: Grant; reduced: Map<string, number>; channels: Map<string, Parsed> } = {
+const replay: { initialize?: Parsed; initialized?: Parsed; grant?: Grant; refused: Grant[]; reduced: Map<string, number>; channels: Map<string, Parsed> } = {
+  refused: [],
   reduced: new Map(),
   channels: new Map(),
 };
 const REDUCED_MAX = 10_000;
+const REFUSED_MAX = 10_000;
 /** Channels closed while an open was pending, with the close's seq: a later answer to an earlier open does not reopen them. */
 const closedAt = new Map<string, number>();
 /** What was replayed under an id, for the log: `refusedBefore` when the daemon refused it on the connection before, so a refusal now is the expected answer. */
@@ -502,23 +614,30 @@ function answered(p: Pending, m: Parsed): void {
 }
 
 /**
- * The daemon answered a request-form featureSets/update. Accepted, it is the grant. Refused after
- * running it, it is kept to be replayed after the grant: a malformed one failed the lane closed, and
- * the daemon's own handling of it is what fails the new connection closed too — the shim does not
- * read the refusal to tell a fail-closed from one that left the lane as it was (the house's read of
- * the shim, #22 comment 6269349177). Refused without running (the in-flight bound), it changed nothing.
+ * The daemon answered a request-form featureSets/update. Accepted, it is the grant, and the refusals
+ * before it no longer matter. Refused after running it, it is kept, with every other refusal since the
+ * grant, to be replayed after it in the order sent: a malformed one failed the lane closed, and the
+ * daemon's own handling of them is what fails the new connection closed too — the shim does not read
+ * a refusal to tell a fail-closed from one that left the lane as it was, so it keeps them all (the
+ * house's read of the shim, #22 comment 6269349177, and of the 38 commits, #22 comment 6274370651).
+ * Refused without running (the in-flight bound says `executed: false`), it changed nothing.
  */
 function grantAnswered(p: Pending, m: Parsed): void {
   if (m.error === undefined) {
     replay.grant = { m: p.m, seq: p.seq };
-    if (replay.refusedGrant && replay.refusedGrant.seq < p.seq) delete replay.refusedGrant;
+    replay.refused = replay.refused.filter((r) => r.seq > p.seq);
     // Reductions before this grant are its to carry (or not); those sent after it still bind.
     for (const [n, at] of replay.reduced) if (at < p.seq) replay.reduced.delete(n);
     return;
   }
   const notRun = isObj(m.error) && isObj(m.error.data) && m.error.data.executed === false;
-  if (notRun || (replay.grant?.seq ?? -1) > p.seq || (replay.refusedGrant?.seq ?? -1) > p.seq) return;
-  replay.refusedGrant = { m: p.m, seq: p.seq };
+  if (notRun || (replay.grant?.seq ?? -1) > p.seq) return;
+  if (replay.refused.length >= REFUSED_MAX) {
+    log(`more than ${REFUSED_MAX} refused featureSets/update requests since the last accepted grant; this one will not be replayed after a reconnect`);
+    return;
+  }
+  replay.refused.push({ m: p.m, seq: p.seq });
+  if (replay.refused.length > 1 && replay.refused[replay.refused.length - 2]!.seq > p.seq) replay.refused.sort((a, b) => a.seq - b.seq);
 }
 
 /** A channels/open the daemon accepted: remember the channel (by the id the daemon gave it) until the host closes it. */
@@ -731,6 +850,10 @@ async function startDaemon(): Promise<void> {
       // One termd per data dir (the lock in core/lock.ts). A termd started here with the unit's data
       // dir would either exit at once, locked out, or take the dir while the unit's was down and leave
       // the unit failing on every restart (the house's read of the shim, #22 comment 6269349177).
+      if (sup.dataDir === undefined) {
+        noteNotStarted(`${sup.by} serves port ${sup.port}, and its unit names --data-dir without a value, so the data dir its termd uses is unknown: none is started here, as it may be ${dataDir} (TSM_NO_SPAWN=1 skips the check)`);
+        return;
+      }
       if (sameDir(sup.dataDir, dataDir)) {
         noteNotStarted(`${sup.by} serves port ${sup.port} out of the data dir ${dataDir}, which a termd for port ${port} started here would use too: none is started here (one termd per data dir; give this shim another TSM_DATA_DIR, or dial port ${sup.port})`);
         return;
@@ -816,7 +939,7 @@ function replayState(sock: WebSocket): void {
   if (replay.initialize) items.push({ m: replay.initialize, request: true, method: 'initialize' });
   if (replay.initialized) items.push({ m: replay.initialized, request: false, method: 'notifications/initialized' });
   if (replay.grant) items.push({ m: replay.grant.m, request: true, method: 'featureSets/update' });
-  if (replay.refusedGrant) items.push({ m: replay.refusedGrant.m, request: true, method: 'featureSets/update', refusedBefore: true });
+  for (const r of replay.refused) items.push({ m: r.m, request: true, method: 'featureSets/update', refusedBefore: true });
   if (replay.reduced.size) items.push({ m: { jsonrpc: '2.0', method: 'featureSets/update', params: { disabled: [...replay.reduced.keys()] } } as Parsed, request: false, method: 'featureSets/update' });
   for (const [channel, m] of replay.channels) items.push({ m, request: true, method: 'channels/open', channel });
   replaying = { items, next: 0, outstanding: 0, sock };

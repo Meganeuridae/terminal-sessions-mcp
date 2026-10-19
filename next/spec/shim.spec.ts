@@ -373,7 +373,7 @@ test("tg-19: the replay follows what the daemon accepted — not a channel close
   }
 });
 
-test("tg-19: a grant the daemon refused by failing closed is replayed to fail closed again: after a reconnect the new connection has no more than the host was told — no tools, no channel — until the host grants anew (the house's read of the shim, #22 comment 6269349177)", async () => {
+test("tg-19: a grant the daemon refused by failing closed is replayed to fail closed again, with every refusal since the grant in order: after a reconnect the new connection has no more than the host was told — no tools, no channel — until the host grants anew (the house's read of the shim, #22 comment 6269349177; of the 38 commits, #22 comment 6274370651)", async () => {
   const d = await daemon();
   const s = shim({ TSM_URL: `ws://127.0.0.1:${d.port}` });
   const tools = async (id: number): Promise<number> => {
@@ -395,6 +395,13 @@ test("tg-19: a grant the daemon refused by failing closed is replayed to fail cl
     // deliveries until a valid grant — and refuses it. That is what the host was told.
     s.send({ jsonrpc: '2.0', id: 5, method: 'featureSets/update', params: { effectiveCapabilities: caps, deniedCapabilities: ['tools'] } });
     assert.ok((await s.next(byId(5))).error, 'the overlapping grant is refused');
+    // A second refusal that leaves the lane as it is — params that are not an object, refused by the
+    // frame classifier before dispatch, with nothing said about whether it ran — must not stand in for
+    // the one that failed the lane closed (the house's read of the 38 commits, #22 comment 6274370651).
+    s.send({ jsonrpc: '2.0', id: 55, method: 'featureSets/update', params: 'not an object' });
+    const classifier = await s.next(byId(55));
+    assert.equal(classifier.error?.code, -32602, JSON.stringify(classifier));
+    assert.equal(classifier.error?.data, undefined, 'refused before dispatch: nothing says whether it ran');
     assert.equal(await tools(6), 0, 'the host was told: no tools');
     const first = laneOf(d)!;
     assert.equal(first.has('channels.lifecycle'), false, 'the daemon failed closed');
@@ -409,6 +416,8 @@ test("tg-19: a grant the daemon refused by failing closed is replayed to fail cl
     assert.equal(second.has('channels.lifecycle'), false, 'the lane failed closed again');
     assert.equal(second.open.size, 0, 'the channel is not open on it');
     assert.match(s.err.join(''), /replay of featureSets\/update refused \(-32602 .*overlap.*\), as it was on the connection before: the new connection is where the host was told it is/);
+    assert.match(s.err.join(''), /replay of featureSets\/update refused \(-32602 params must be an object\), as it was on the connection before/);
+    assert.equal(s.err.join('').match(/as it was on the connection before/g)?.length, 2, 'both refusals were replayed');
     assert.match(s.err.join(''), /replay of channels\/open for terminal:fc refused/);
     assert.ok(noReplayedAnswer(s));
     // The host grants anew: the tools are back and the channel opens; a later reconnect replays this
@@ -424,7 +433,48 @@ test("tg-19: a grant the daemon refused by failing closed is replayed to fail cl
       return l !== null && l !== second && l.open.size > 0;
     }, 8000, 'the channel to be reopened on the third connection');
     assert.equal(laneOf(d)!.has('channels.lifecycle'), true, 'the new grant was replayed');
-    assert.equal(s.err.join('').match(/as it was on the connection before/g)?.length, 1, 'the refused grant is not replayed once a later grant was accepted');
+    assert.equal(s.err.join('').match(/as it was on the connection before/g)?.length, 2, 'the refusals are not replayed once a later grant was accepted');
+    s.end();
+    assert.equal(await s.exited, 0);
+  } finally {
+    s.child.kill();
+    await d.close();
+  }
+});
+
+test("tg-19: a featureSets/update the daemon refused without running it (the in-flight bound: executed: false) is not replayed, so the new connection gets the accepted grant alone (the house's read of the 38 commits, #22 comment 6274370651)", async () => {
+  const d = await daemon();
+  const s = shim({ TSM_URL: `ws://127.0.0.1:${d.port}` });
+  try {
+    s.send(initMcpl(1));
+    await s.next(byId(1));
+    s.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    const narrow = ['tools', 'pushEvents', 'channels.register', 'channels.incoming', 'channels.publish'];
+    s.send({ jsonrpc: '2.0', id: 2, method: 'featureSets/update', params: { effectiveCapabilities: narrow } });
+    assert.ok((await s.next(byId(2))).result, 'the narrow grant is accepted');
+    assert.equal(laneOf(d)!.has('channels.lifecycle'), false);
+    // A Run that never ends, and 128 waits on it: the daemon's bound on requests in flight is full.
+    s.send(call(3, 'run', { session: 'ov', command: 'sleep 30', wait: 100 }));
+    const run = structured(await s.next(byId(3)));
+    assert.equal(run.state, 'running', JSON.stringify(run));
+    for (let i = 0; i < 128; i++) s.send(call(100 + i, 'await', { runId: run.runId, wait: 8000 }));
+    await until(() => [...conns(d.server)].some((c) => c.inFlight >= 128), 5000, 'the bound to be full');
+    // A wider grant now is refused unrun — the daemon says so — and the lane is as it was.
+    s.send({ jsonrpc: '2.0', id: 4, method: 'featureSets/update', params: { effectiveCapabilities: [...narrow, 'channels.lifecycle'] } });
+    const refused = await s.next(byId(4));
+    assert.equal(refused.error?.code, -32050, JSON.stringify(refused));
+    assert.equal((refused.error?.data as { executed: boolean }).executed, false);
+    const first = laneOf(d)!;
+    assert.equal(first.has('channels.lifecycle'), false);
+    for (const c of conns(d.server)) c.ws.terminate();
+    // The waits fail with -32000 (their outcome is unknown); the replay is initialize and the grant,
+    // nothing else: the refused update, run afresh, would widen the lane past what the host was told.
+    s.send({ jsonrpc: '2.0', id: 5, method: 'ping' });
+    assert.deepEqual((await s.next(byId(5), 8000)).result, {});
+    const second = laneOf(d)!;
+    assert.notEqual(second, first);
+    assert.equal(second.has('channels.lifecycle'), false, 'the unrun refusal was not replayed');
+    assert.doesNotMatch(s.err.join(''), /replay of featureSets\/update/);
     s.end();
     assert.equal(await s.exited, 0);
   } finally {
@@ -757,8 +807,9 @@ function unitStub(u: Unit): Stub {
     'LoadState=loaded',
     `ActiveState=${u.active === false ? 'inactive' : 'active'}`,
     `UnitFileState=${u.enabled ? 'enabled' : 'disabled'}`,
+    // As systemd 255 prints them: the argv unquoted, an assignment with spaces in double quotes.
     `ExecStart={ path=/bin/sh ; argv[]=/bin/sh /pkg/next/config/termd-launch.sh ${args.join(' ')} ; ignore_errors=no }`,
-    `Environment=${env.map(([k, v]) => `${k}=${v}`).join(' ')}`,
+    `Environment=${env.map(([k, v]) => (/\s/.test(v) ? `"${k}=${v}"` : `${k}=${v}`)).join(' ')}`,
   ];
   const launchctl = [
     'com.animalabs.termd = {',
@@ -882,16 +933,23 @@ test("tg-19: a supervisor's termd on the shim's port is left to it, and a check 
   }
 });
 
-test("tg-19: the supervisor check fails closed and reads a unit as termd does: a query that fails starts nothing (systemctl without its bus; launchctl without a GUI domain while the LaunchAgent is on disk), a LaunchAgent on disk but not loaded is the agent's port, a unit enabled but inactive or one whose port is in its environment is the unit's, TSM_PORT is read before SESSION_SERVER_PORT, and a unit for another port out of the same data dir stops the start (the house's read of the shim, #22 comment 6269349177)", async () => {
+test("tg-19: the supervisor check fails closed and reads a unit as termd does: a query that fails starts nothing (systemctl without its bus; launchctl without a GUI domain while the LaunchAgent is on disk), a LaunchAgent on disk but not loaded is the agent's port and one that cannot be read is unknown, a unit enabled but inactive or one whose port is in its environment is the unit's, TSM_PORT is read before SESSION_SERVER_PORT, a unit for another port out of the same data dir stops the start, and a data dir with spaces is read whole from each supervisor's text (the house's read of the shim, #22 comment 6269349177; of the 38 commits, #22 comment 6274370651)", async () => {
   const port = await unusedPort();
   const darwin = process.platform === 'darwin';
   const linux = process.platform === 'linux';
-  /** A HOME whose LaunchAgents holds the shipped plist for `unitPort`. */
-  const plistHome = (name: string, unitPort: number): string => {
+  /** A HOME whose LaunchAgents holds the shipped plist for `unitPort`, with `--data-dir dataDir` added when given. */
+  const plistHome = (name: string, unitPort: number, dataDir?: string): string => {
     const home = path.join(tmp, `home-${name}`);
     fs.mkdirSync(path.join(home, 'Library', 'LaunchAgents'), { recursive: true });
-    const plist = fs.readFileSync(path.resolve(here, '../../config/com.animalabs.termd.plist'), 'utf8').replace('<string>3101</string>', `<string>${unitPort}</string>`);
+    let plist = fs.readFileSync(path.resolve(here, '../../config/com.animalabs.termd.plist'), 'utf8').replace('<string>3101</string>', `<string>${unitPort}</string>`);
+    if (dataDir) plist = plist.replace(`<string>${unitPort}</string>`, `<string>${unitPort}</string>\n    <string>--data-dir</string><string>${dataDir}</string>`);
     fs.writeFileSync(path.join(home, 'Library', 'LaunchAgents', 'com.animalabs.termd.plist'), plist);
+    return home;
+  };
+  /** As plistHome, with the plist unreadable (mode 0): launchd would load it, the shim cannot read it. */
+  const unreadablePlistHome = (name: string, unitPort: number): string => {
+    const home = plistHome(name, unitPort);
+    fs.chmodSync(path.join(home, 'Library', 'LaunchAgents', 'com.animalabs.termd.plist'), 0o000);
     return home;
   };
   interface Case {
@@ -900,12 +958,19 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     /** The supervisor's answer, given the shim's data dir. */
     stub: keyof typeof STUBS | ((dataDir: string) => Stub);
     home?: string;
-    /** `default`: TSM_DATA_DIR unset, so the shim's termd would use $HOME/.tsm, as the unit's does. */
-    dataDir?: 'default';
-    expect: 'unknown' | 'managed' | 'shared' | 'start';
+    /** `default`: TSM_DATA_DIR unset, so the shim's termd would use $HOME/.tsm, as the unit's does; a path: the shim's TSM_DATA_DIR (one with spaces, read whole from the unit's text). */
+    dataDir?: 'default' | string;
+    expect: 'unknown' | 'managed' | 'shared' | 'dangling' | 'start';
     says: RegExp;
   }
+  const spaced = (name: string) => path.join(tmp, `sup ${name} with spaces`);
   const cases: Case[] = [
+    { name: 'shared-data-dir-with-spaces-in-argv', when: true, stub: (dataDir) => unitStub({ port: 3101, dataDir }), dataDir: spaced('argv'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup argv with spaces, which a termd for port \d+ started here would use too/ },
+    { name: 'shared-data-dir-with-spaces-in-environment', when: true, stub: (dataDir) => unitStub({ port: 3101, env: { TSM_DATA_DIR: dataDir } }), dataDir: spaced('env'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup env with spaces, which a termd/ },
+    { name: 'launchctl-not-loaded-plist-shared-with-spaces', when: darwin, stub: 'none', home: plistHome('not-loaded-spaces', 3101, spaced('plist')), dataDir: spaced('plist'), expect: 'shared', says: /LaunchAgent com\.animalabs\.termd \(.*\) serves port 3101 out of the data dir \S+\/sup plist with spaces, which a termd/ },
+    { name: 'launchctl-not-loaded-plist-unreadable', when: darwin && process.getuid?.() !== 0, stub: 'none', home: unreadablePlistHome('unreadable', port), expect: 'unknown', says: /the LaunchAgent com\.animalabs\.termd is on disk \(\S+\.plist\) but could not be read \(EACCES\), so its port and data dir are unknown/ },
+    { name: 'execstart-in-another-shape', when: linux, stub: () => ({ launchctl: 'exit 113', systemctl: "printf '%s\\n' 'LoadState=loaded' 'ActiveState=active' 'UnitFileState=disabled' 'ExecStart=/bin/sh /pkg/next/config/termd-launch.sh --port 3101' 'Environment='" }), expect: 'unknown', says: /ExecStart is not in the shape read here/ },
+    { name: 'data-dir-flag-without-a-value', when: true, stub: () => unitStub({ port: 'none', dataDir: '--port 3101' }), expect: 'dangling', says: /names --data-dir without a value, so the data dir its termd uses is unknown: none is started here/ },
     { name: 'systemctl-no-bus', when: linux, stub: 'failed', expect: 'unknown', says: /systemctl --user show termd failed \(Failed to connect to bus: No medium found\), so whether a unit manages termd is unknown; the user manager is reached through XDG_RUNTIME_DIR/ },
     { name: 'launchctl-no-domain-plist', when: darwin, stub: 'failed', home: plistHome('no-domain', port), expect: 'unknown', says: /launchctl print failed \(Could not find domain for user gui: 501\) and the LaunchAgent com\.animalabs\.termd is on disk \(\S+\.plist\), so whether it runs termd is unknown/ },
     { name: 'launchctl-no-domain-no-plist', when: darwin, stub: 'failed', expect: 'start', says: /started termd/ },
@@ -920,7 +985,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   const run = async (c: Case): Promise<void> => {
     const home = c.home ?? path.join(tmp, `home-${c.name}`);
     fs.mkdirSync(home, { recursive: true });
-    const dataDir = c.dataDir === 'default' ? path.join(home, '.tsm') : path.join(tmp, `sup-${c.name}`);
+    const dataDir = c.dataDir === 'default' ? path.join(home, '.tsm') : (c.dataDir ?? path.join(tmp, `sup-${c.name}`));
     // Where a start is expected, termd exits 2 at once (its log path is a directory): the start is what is checked, not a daemon.
     if (c.expect === 'start') fs.mkdirSync(path.join(dataDir, 'termd.log'), { recursive: true });
     const stub = typeof c.stub === 'function' ? c.stub(dataDir) : c.stub;
