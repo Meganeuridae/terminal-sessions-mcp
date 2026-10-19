@@ -671,6 +671,11 @@ test('mcpl-19: a message queued for an open channel is not sent as channels/inco
     await lane.handle('channels/open', { channelId: 'terminal:rd' }, ctx);
     await sleep(100);
     const s = live(registry, 'rd');
+    // The control: the same append, with the grant intact, goes out as channels/incoming; without it the
+    // revocation case passed when nothing was ever queued (the house's read of 78c4d6e, #22).
+    const controls = () => sent.filter((m) => (m as Msg).method === 'channels/incoming').flatMap((m) => ((m as Msg).params as { messages: Array<{ tags: string[] }> }).messages).filter((x) => x.tags.includes('terminal:control'));
+    s.journal.append({ type: 'control', controller: null, by: A, how: 'release' });
+    await until(() => controls().length === 1, 2000, 'the seat change on channels/incoming');
     s.journal.append({ type: 'control', controller: null, by: A, how: 'release' });
     // Revoke channels.incoming while its message waits in the batch.
     lane.updatePolicy({ effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'channels.incoming') }, 'request');
@@ -678,6 +683,7 @@ test('mcpl-19: a message queued for an open channel is not sent as channels/inco
     await sleep(200);
     const after = sent.slice(mark).filter((m) => (m as Msg).method === 'channels/incoming');
     assert.equal(after.length, 0, 'nothing on channels/incoming after the reduction');
+    assert.equal(controls().length, 1, 'the revoked message never went');
   } finally {
     lane.dispose();
     await registry.closeAll();
@@ -1013,7 +1019,8 @@ test('listing channels reads the sessions once, not once per session, and the co
     summary: () => {
       throw new Error('a channel listing must not build full summaries');
     },
-    summaryHeader: (e: { id: string; owner: string }) => ({ id: e.id, owner: e.owner, state: 'exited', controller: null, recovered: 'history-only' }),
+    // The real helper, so a header that came to be built from the full summary fails here; a stub showed only that the lane called it (the house's read of 78c4d6e, #22).
+    summaryHeader: App.prototype.summaryHeader,
   } as unknown as App;
   const lane = new McplLane(app, { principal: A, connectionId: 'c-list' }, new Outbound(() => undefined), () => undefined);
   try {
@@ -1058,4 +1065,98 @@ test('G24: no feature set declares rollback, in the declarations and in the mani
   assert.ok(Object.keys(sets).length >= 9, 'the manifest carries the feature sets');
   for (const [name, decl] of Object.entries(sets)) assert.ok(!decl.rollback, `${name} declares rollback in the manifest`);
   assert.doesNotMatch(JSON.stringify(manifest()), /"rollback"\s*:\s*true/);
+});
+
+// ───────────── the house's read of 78c4d6e (#22) ─────────────
+
+/**
+ * Hold a live session's renders of one Run (what a history page reads for it) until `release` is called;
+ * `reached` resolves at the first. Only that Run's: a `run` result and the live segmenter render Runs the
+ * same way, and a gate on every render deadlocks the caller whose Run should end during the hold.
+ */
+function holdTranscripts(s: Session, runId: unknown): { reached: Promise<void>; release: () => void; restore: () => void } {
+  let release = () => undefined as void;
+  let reached = () => undefined as void;
+  const gate = new Promise<void>((r) => (release = r));
+  const first = new Promise<void>((r) => (reached = r));
+  const orig = s.runTranscript.bind(s);
+  (s as unknown as { runTranscript: Session['runTranscript'] }).runTranscript = async (id) => {
+    if (id !== runId) return orig(id);
+    reached();
+    await gate;
+    return orig(id);
+  };
+  return { reached: first, release, restore: () => delete (s as unknown as { runTranscript?: unknown }).runTranscript };
+}
+
+test("a channel opened while its session runs gets the Run that ended during the open's history read", { timeout: 20_000 }, async () => {
+  // The open read its page and only then recorded the channel; a Run of another principal that ended
+  // meanwhile was settled as owed to nobody, and the opener never heard of it. The control, with the
+  // read not held, passed at the same head.
+  const d = await daemon();
+  try {
+    const b = await d.host('tb', 'or-b');
+    await b.call('session_open', { session: 'or', visibility: 'shared' });
+    const first = await b.call('run', { session: 'or', command: 'echo or-first' }); // a Run for the page to render
+    const s = live(d.registry, 'or');
+    for (const held of [false, true]) {
+      const a = await d.host('ta', held ? 'or-a-held' : 'or-a-control');
+      const hold = held ? holdTranscripts(s, first.structured?.runId) : undefined;
+      const opening = a.request('channels/open', { channelId: 'terminal:or', history: { limit: 10 } }) as Promise<{ history?: Array<{ metadata: Record<string, unknown> }> }>;
+      if (hold) await hold.reached;
+      const second = await b.call('run', { session: 'or', command: 'echo or-second' });
+      if (hold) {
+        await sleep(150); // the segmenter builds the Run's message while the open still reads
+        hold.release();
+      }
+      const res = await opening;
+      hold?.restore();
+      const paged = (res.history ?? []).map((m) => m.metadata.runId);
+      assert.ok(paged.includes(first.structured?.runId), `the page has the first Run: ${JSON.stringify(paged)}`);
+      if (held) assert.ok(!paged.includes(second.structured?.runId), 'the page predates the second Run');
+      const got = await a.delivery(aboutRun(second.structured?.runId), 4000);
+      assert.equal(got.via, 'incoming', `${held ? 'held' : 'control'}: on the channel`);
+      await sleep(300);
+      assert.equal(a.deliveries().filter(aboutRun(second.structured?.runId)).length, 1, 'once');
+      await a.request('channels/close', { channelId: 'terminal:or' });
+      await a.close();
+    }
+    await b.close();
+  } finally {
+    await d.stop();
+  }
+});
+
+test("a lane disposed while an open reads history registers nothing, follows nothing and answers the open with an error", async () => {
+  // The open resumed after its read on a disposed lane and followed the session: a segmenter and journal
+  // subscription nothing would ever remove, and a result for a connection that was gone.
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-lane-'));
+  const registry = new SessionRegistry({ dataDir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
+  const app = new App({ registry, segmenter: { runSettleMs: 10 } });
+  const out = new Outbound(() => undefined);
+  const caller = { principal: A, connectionId: 'c-od' };
+  const lane = new McplLane(app, caller, out, () => undefined);
+  const watched = (lane as unknown as { watched: Map<string, unknown> }).watched;
+  try {
+    const ctx = { isRequest: true, after: (fn: () => void) => fn() };
+    await lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, ctx);
+    // Opened after the grant, with no endpoint to announce it: nothing follows it until a channel opens.
+    await app.sessionOpen(caller, { id: 'od', visibility: 'shared' });
+    const one = await app.run(caller, { session: 'od', command: 'echo od-one', wait: 5000 });
+    const s = live(registry, 'od');
+    const hold = holdTranscripts(s, one.runId);
+    assert.equal(watched.size, 0);
+    const opening = lane.handle('channels/open', { channelId: 'terminal:od', history: { limit: 5 } }, ctx);
+    await hold.reached;
+    lane.dispose();
+    hold.release();
+    await assert.rejects(opening, (e: Error & { code?: number }) => e.code === -32603 && /closed/.test(e.message));
+    hold.restore();
+    assert.equal(watched.size, 0, 'a disposed lane follows nothing');
+    assert.equal((lane as unknown as { open: Set<string> }).open.size, 0, 'and opens nothing');
+  } finally {
+    lane.dispose();
+    await registry.closeAll();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
 });
