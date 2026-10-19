@@ -1390,9 +1390,16 @@ test('2f357bd-4: closing a session does not cut a paused subscriber off: it gets
     // the backpressure, with a bound so a stream that never pauses fails rather than hangs (the house's
     // read of 78c4d6e, #22).
     const follower = conn.followers.get('slowview')!;
-    for (let i = 0; i < 20_000 && follower.state !== 'paused'; i++) {
+    // A pause that holds across a turn of the loop is the socket's: a burst of synchronous appends
+    // queues frames the loop has not written yet, which pauses the follower for an instant and drains
+    // without the viewer reading a byte, and a close in that instant found the stream already
+    // delivered (CI's macOS runner on Node 24). The viewer is paused, so a full socket stays full.
+    for (let i = 0; i < 20_000; i++) {
       s.journal.append({ type: 'note', text: `${i}:${chunk}`, principal: 'agent:a@test' });
-      if (i % 100 === 0) await sleep(1);
+      if (follower.state === 'paused') {
+        await sleep(5);
+        if (follower.state === 'paused') break;
+      } else if (i % 100 === 0) await sleep(1);
     }
     assert.equal(follower.state, 'paused', 'the follower pauses once the socket and the high-water mark fill');
     const closed = await owner.call('session_close', { session: 'slowview' });
