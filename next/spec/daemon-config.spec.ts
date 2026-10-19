@@ -388,7 +388,10 @@ test('tsg-21: the plist is valid and runs the launcher; the systemd unit lets te
   const unit = fs.readFileSync(path.join(CONFIG, 'termd.service'), 'utf8');
   assert.doesNotMatch(unit, /^UMask=/m);
   assert.match(unit, /^OOMPolicy=continue$/m);
-  assert.match(unit, /^KillMode=mixed$/m);
+  // KillMode=process: systemd signals termd alone, so termd can hang up its shells as a closing
+  // terminal does and the jobs they detached on purpose survive, as the daemon header promises;
+  // KillMode=mixed would SIGKILL the whole cgroup and take those with it (the house's read, #22).
+  assert.match(unit, /^KillMode=process$/m);
   assert.match(unit, /^WorkingDirectory=%h$/m);
   assert.match(unit, /termd-launch\.sh/);
   // Both supervisors raise the open-file limit to the same 65536 the launcher aims for (a session costs about five).

@@ -43,6 +43,7 @@ import type { Profile } from './api/tools.js';
 import { USAGE_GENERATIONS } from './api/usage.js';
 import { NodePtyBackend } from './backends/node-pty.js';
 import type { ExecutionBackend, ProcessHandle, PtyHandle, SpawnProcessOptions, SpawnShellOptions } from './backends/types.js';
+import { clocks } from './core/clock.js';
 import type { JournalEvent } from './core/types.js';
 import { errText, LOOPBACK_BINDS, parseAllowHost, PROFILES, TermServer, type LogLevel, type LogRecord } from './transport/server.js';
 
@@ -254,13 +255,19 @@ function groupAlive(pgid: number): boolean {
  */
 class OwnedProcessGroups implements ExecutionBackend {
   readonly kind: string;
-  private readonly groups = new Set<number>();
+  /**
+   * The process handle of every process Run, keyed by its group id. Signals go through the handle's
+   * own `kill`, which checks the group is still the Run's before it signals (groupStillOurs), so a
+   * group number reused by a stranger within the prune window is never signalled (the house's read,
+   * #22 comment 6264958172). A bare `process.kill(-pgid)` here would skip that check.
+   */
+  private readonly groups = new Map<number, ProcessHandle>();
 
   constructor(private readonly inner: ExecutionBackend) {
     this.kind = inner.kind;
     // Forget dead groups promptly: a pgid kept after its group died could be reused by a stranger's.
     setInterval(() => {
-      for (const g of this.groups) if (!groupAlive(g)) this.groups.delete(g);
+      for (const [g, h] of this.groups) if (!(h.groupAlive?.() ?? groupAlive(g))) this.groups.delete(g);
     }, 2000).unref();
   }
 
@@ -274,27 +281,26 @@ class OwnedProcessGroups implements ExecutionBackend {
 
   spawnProcess(opts: SpawnProcessOptions): ProcessHandle {
     const h = this.inner.spawnProcess(opts);
-    const pgid = h.pid;
+    const pgid = h.pgid ?? h.pid;
     if (pgid > 0) {
-      this.groups.add(pgid);
+      this.groups.set(pgid, h);
       h.onExit(() => {
-        if (!groupAlive(pgid)) this.groups.delete(pgid);
+        if (!(h.groupAlive?.() ?? groupAlive(pgid))) this.groups.delete(pgid);
       });
     }
     return h;
   }
 
   live(): number[] {
-    return [...this.groups].filter(groupAlive);
+    return [...this.groups].filter(([g, h]) => h.groupAlive?.() ?? groupAlive(g)).map(([g]) => g);
   }
 
   signalAll(signal: NodeJS.Signals): void {
-    for (const g of this.groups) {
-      try {
-        process.kill(-g, signal);
-      } catch {
-        this.groups.delete(g);
-      }
+    for (const [g, h] of this.groups) {
+      // The handle signals the group only while it is still the Run's; once it is gone the handle
+      // latches and the group is forgotten here.
+      h.kill(signal);
+      if (!(h.groupAlive?.() ?? groupAlive(g))) this.groups.delete(g);
     }
   }
 
@@ -304,8 +310,8 @@ class OwnedProcessGroups implements ExecutionBackend {
     for (const [signal, ms] of [['SIGTERM', graceMs], ['SIGKILL', 1000]] as const) {
       if (!this.live().length) break;
       this.signalAll(signal);
-      const until = Date.now() + ms;
-      while (this.live().length && Date.now() < until) await new Promise((r) => setTimeout(r, 25));
+      const until = clocks.monotonic() + ms;
+      while (this.live().length && clocks.monotonic() < until) await new Promise((r) => setTimeout(r, 25));
     }
     return left;
   }

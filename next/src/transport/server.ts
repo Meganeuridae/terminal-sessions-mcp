@@ -55,6 +55,7 @@ import { guiPrincipal, type PrincipalResolver } from '../api/principals.js';
 import type { AnySession, HistorySession, LiveSession } from '../api/registry.js';
 import { callTool, TOOLS, toolsFor, type Profile, type ResultText, type ToolDef, type ToolResult } from '../api/tools.js';
 import { clipField, newUsageKey, usageDigest, type UsageRecord } from '../api/usage.js';
+import { clocks } from '../core/clock.js';
 import { err, TermError } from '../core/errors.js';
 import type { Principal, Seq } from '../core/types.js';
 import { Follower, type JournalSource } from './follower.js';
@@ -433,8 +434,9 @@ export class TermServer {
         }
       }
       const grace = this.opts.shutdownGraceMs ?? 1000;
-      const until = Date.now() + grace;
-      while (this.conns.size > 0 && Date.now() < until) await new Promise((r) => setTimeout(r, 20));
+      // Measured on the monotonic clock, so a backward wall-clock step cannot stretch the wait (#22).
+      const until = clocks.monotonic() + grace;
+      while (this.conns.size > 0 && clocks.monotonic() < until) await new Promise((r) => setTimeout(r, 20));
       // A client that never answers the close frame does not hold the daemon hostage (sec-7).
       for (const c of this.conns) c.ws.terminate();
       await new Promise<void>((r) => this.wss.close(() => r()));

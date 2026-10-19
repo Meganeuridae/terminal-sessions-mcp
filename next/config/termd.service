@@ -29,9 +29,14 @@ OOMPolicy=continue
 #   ExecStart=... --retention-days 30          (or --retention-bytes 200000000 per session)
 # Whatever the caps, termd stops writing history to disk while the data dir's filesystem has
 # less than 200 MiB free (--disk-floor-bytes; 0 turns it off) and resumes when space returns.
-# SIGTERM to termd alone: it drains its sessions (Runs end with reason daemon-shutdown) and
-# kills what they left; only what survives that is killed when the stop times out.
-KillMode=mixed
+# On stop, systemd signals termd alone (KillMode=process), not the whole cgroup. termd drains its
+# sessions (Runs end with reason daemon-shutdown) and hangs up each shell as a closing terminal
+# does: a foreground job ends with it, while a job a session detached on purpose (setsid, nohup,
+# disown) lives on, matching the header of daemon.ts. KillMode=mixed would instead SIGKILL the
+# whole cgroup when the stop times out, taking those detached jobs with it (the house's read, #22
+# comment 6264958172). If termd itself does not exit within TimeoutStopSec it gets SIGKILL — only
+# termd, never the sessions' surviving jobs.
+KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=20
 

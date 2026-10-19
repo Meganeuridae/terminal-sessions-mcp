@@ -494,7 +494,8 @@
   let deferredReattach = null;
   function reattach() {
     if (!state.current) return;
-    const wait = lastReattach + 1000 - Date.now();
+    // performance.now() is monotonic: a backward wall-clock step cannot defer the next reattach (#22).
+    const wait = lastReattach + 1000 - performance.now();
     if (wait > 0) {
       deferredReattach ??= setTimeout(() => {
         deferredReattach = null;
@@ -502,7 +503,7 @@
       }, wait);
       return;
     }
-    lastReattach = Date.now();
+    lastReattach = performance.now();
     const id = state.current;
     state.current = null;
     select(id);
