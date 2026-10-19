@@ -6,9 +6,11 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { App, Caller, SearchResult } from '../src/api/app.js';
+import type { App, Caller, ReadResult, SearchResult, SessionSummary } from '../src/api/app.js';
+import { describeGap } from '../src/api/reader.js';
 import { callTool, TOOLS, type ResultText } from '../src/api/tools.js';
 import { validate, ValidationError, type Schema } from '../src/api/validate.js';
+import type { GapReason } from '../src/core/types.js';
 
 const A: Caller = { principal: 'agent:a@test', connectionId: 'ct' };
 /** An App with only the methods a tool calls. */
@@ -19,12 +21,38 @@ test('search: the status line names the gap the scan spanned and the lines it se
   const r: SearchResult = { session: 's', matches: [], scanned: [1, 4], more: false, bounded: false, gap: { from: 2, to: 40, reason: 'retention' }, clippedLines: 1 };
   const search = async (res: SearchResult, mode: ResultText = 'transcript') => callTool('search', { session: 's', pattern: 'needle' }, ctx(stub({ search: async () => res }), mode), TOOLS);
   const one = await search(r);
-  assert.equal(one.text, '(no matches)\n[search s · 0 matches · scanned seq 1–4 · gap 2–40 not retained · 1 line longer than the match window, searched on its head only]');
-  const several: SearchResult = { session: 's', matches: [], scanned: [1, 9], more: false, bounded: false, gaps: [{ from: 2, to: 3, reason: 'store-error' }, { from: 5, to: 5 }], clippedLines: 3 };
-  assert.match((await search(several)).text, /scanned seq 1–9 · 2 gaps: gap 2–3 missing \(store-error\), gap 5–5 not retained · 3 lines longer than the match window, searched on their head only\]$/);
+  assert.equal(one.text, '(no matches)\n[search s · 0 matches · scanned seq 1–4 · gap 2–40 (past retention) · 1 line longer than the match window, searched on its head only]');
+  const several: SearchResult = { session: 's', matches: [], scanned: [1, 9], more: false, bounded: false, gaps: [{ from: 2, to: 3, reason: 'store-error' }, { from: 5, to: 5, reason: 'retention' }], clippedLines: 3 };
+  assert.match((await search(several)).text, /scanned seq 1–9 · 2 gaps: gap 2–3 \(the journal store failed\), gap 5–5 \(past retention\) · 3 lines longer than the match window, searched on their head only\]$/);
   const clean = await search({ session: 's', matches: [], scanned: [1, 4], more: false, bounded: false });
   assert.equal(clean.text, '(no matches)\n[search s · 0 matches · scanned seq 1–4]');
   assert.equal((JSON.parse((await search(r, 'json')).text) as SearchResult).clippedLines, 1, 'json mode is the envelope');
+});
+
+test('a hole is worded once: read’s status line says of it what the text’s gap line says, for every reason the journal records', async () => {
+  const reasons: GapReason[] = ['retention', 'keeper-overflow', 'torn-write', 'store-error', 'store-failed'];
+  for (const reason of reasons) {
+    const why = describeGap(reason);
+    assert.notEqual(why, 'lost', reason);
+    const r: ReadResult = { session: 's', seq: [1, 9], nextCursor: 9, more: false, truncated: false, text: `[… 3 journal events missing (seq 4–6: ${why}) …]`, gap: { from: 4, to: 6, reason } };
+    const out = await callTool('read', { session: 's', since: 0 }, ctx(stub({ read: async () => r })), TOOLS);
+    assert.ok(out.text.endsWith(` · gap 4–6 (${why})]`), out.text);
+    validate(out.structured, TOOLS.find((t) => t.name === 'read')!.outputSchema!);
+  }
+});
+
+test('the session_list schema declares every field a summary may carry, services’ evidence included', () => {
+  const full: Required<SessionSummary> = {
+    id: 's', owner: 'agent:a@test', visibility: 'private', state: 'idle', controller: null, cwd: '/', integration: 'rich', backend: 'node-pty', pid: 1, currentRun: null, lastSeq: 9, oldestSeq: 1,
+    retention: { maxBytes: 1 << 20 }, recovered: 'continuous', closed: false, createdAt: 0, lastActivity: 0, declared: { shell: 'sh', within: null }, cols: 80, rows: 24,
+    services: [{ runId: 'r1', name: 'svc', status: 'ready', evidence: 'listening' }], watches: 1, runs: [{ runId: 'r1', target: 'shell', state: 'running', principal: 'agent:a@test', line: 'x', admittedAt: 0 }], runsOmitted: 0,
+  };
+  const schema = TOOLS.find((t) => t.name === 'session_list')!.outputSchema!;
+  validate({ sessions: [full] }, schema);
+  const summary = (schema.properties!.sessions as Schema).items!;
+  assert.deepEqual(Object.keys(full).filter((k) => !(k in summary.properties!)), [], 'a summary field the schema does not name');
+  const service = (summary.properties!.services as Schema).items!.properties!;
+  assert.deepEqual(Object.keys(full.services[0]!).filter((k) => !(k in service)), [], 'a service field the schema does not name');
 });
 
 test('the validator refuses what each check is for: enum, minLength, integer, minimum, maximum, boolean, array, items', () => {

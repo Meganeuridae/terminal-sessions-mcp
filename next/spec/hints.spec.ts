@@ -5,7 +5,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { looksLikeErrexit, looksLikeShellOpener, oneShotSshWithoutTty, renderRun } from '../src/api/tools.js';
+import { looksLikeErrexit, looksLikeShellOpener, oneShotSshWithoutTty } from '../src/api/hints.js';
+import { renderRun } from '../src/api/tools.js';
 import type { RunResult } from '../src/api/app.js';
 
 const base = (over: Partial<RunResult>): RunResult => ({

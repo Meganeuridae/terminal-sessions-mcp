@@ -81,14 +81,15 @@ function ownWords(line: string): string {
 const ERREXIT = /(?:^|[;&|\n{]\s*|\b(?:then|do|else)\s+)set\s+(?:-[A-Za-df-z]*e[A-Za-z]*\b|-o\s+errexit\b)/;
 export const looksLikeErrexit = (line: string | undefined): boolean => line !== undefined && ERREXIT.test(ownWords(line));
 
+/** ssh's single-letter options that take a value (ssh(1)). */
+const SSH_OPT_WITH_ARG: ReadonlySet<string> = new Set([...'bBcDeEFIiJLlmOopPQRSWw']);
+
 /**
  * Is the line a one-shot `ssh [options] host command` without `-t`/`-tt`? Such a remote
  * command has no terminal: a cancel here ends ssh and nothing reaches the command, and a
  * dropped connection does not hang it up, so it runs on until it writes to the closed
  * connection. Returns the host for the hint, or undefined. A hint only.
  */
-/** ssh's single-letter options that take a value (ssh(1)). */
-const SSH_OPT_WITH_ARG: ReadonlySet<string> = new Set([...'bBcDeEFIiJLlmOopPQRSWw']);
 export function oneShotSshWithoutTty(line: string | undefined): string | undefined {
   if (line === undefined) return undefined;
   const words = line.trim().split(/\s+/);

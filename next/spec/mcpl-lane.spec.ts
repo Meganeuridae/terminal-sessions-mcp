@@ -308,7 +308,7 @@ test("mcpl-5: notes are small, rate-limited and never more than a share of reten
     await assert.rejects(pub('nb', 'y'.repeat(1000)), (e: { code: number; message: string }) => e.code === -32050 && /1\/16 of its retention/.test(e.message));
     const rd = await a.call('read', { session: 'nb', runId: r.structured?.runId });
     assert.match(rd.text, /owner-history/);
-    assert.doesNotMatch(rd.text, /not retained/);
+    assert.doesNotMatch(rd.text, / · (\d+ )?gaps? /, 'no hole: the owner’s history was not evicted');
     await a.call('session_open', { session: 'nr', visibility: 'shared' });
     const burst = await Promise.allSettled(Array.from({ length: 7 }, () => pub('nr', 'hi')));
     assert.equal(burst.filter((x) => x.status === 'fulfilled').length, 5, 'a burst of five');

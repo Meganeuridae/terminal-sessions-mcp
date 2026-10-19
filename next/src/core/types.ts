@@ -79,6 +79,8 @@ export type ServiceStatus = 'starting' | 'ready' | 'running' | 'unhealthy' | 'ex
 export type JournalEvent = EventInput & { seq: Seq; ts: number };
 export type EventType = JournalEvent['type'];
 export type EventOf<T extends EventType> = Extract<JournalEvent, { type: T }>;
+/** Why a range of the journal is gone: the `gap` event's reasons, the one list every report of a hole draws on. */
+export type GapReason = EventOf<'gap'>['reason'];
 
 /** The terminal size a session, a transcript or a history read gets when nothing recorded one. */
 export const DEFAULT_GEOMETRY = { cols: 120, rows: 30 } as const;

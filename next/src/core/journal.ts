@@ -18,7 +18,7 @@
  */
 import { RunIndex } from './runindex.js';
 import { MemoryStore, newEpoch, type JournalStore } from './stores.js';
-import type { EventInput, JournalEvent, Seq } from './types.js';
+import type { EventInput, GapReason, JournalEvent, Seq } from './types.js';
 
 export type JournalListener = (event: JournalEvent) => void;
 
@@ -62,8 +62,6 @@ export interface JournalStats {
   droppedAfterClose: number;
 }
 
-/** Gap reasons beyond Appendix A's `retention | keeper-overflow` (see the Appendix A amendment requested in types.ts). */
-type GapReason = Extract<EventInput, { type: 'gap' }>['reason'];
 const gapEvent = (from: Seq, to: Seq, reason: GapReason): EventInput => ({ type: 'gap', from, to, reason });
 
 const RETRY_MIN_MS = 1000;

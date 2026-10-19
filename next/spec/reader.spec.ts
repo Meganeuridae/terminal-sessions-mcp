@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readJournal, searchJournal, type ReadResult } from '../src/api/reader.js';
 import { Journal } from '../src/core/journal.js';
-import { MemoryStore } from '../src/core/stores.js';
+import { lineBytes, MemoryStore } from '../src/core/stores.js';
 import { project } from '../src/core/transcript.js';
 import { endRun, out, readAll, source, startRun } from './reader-fixture.spec.js';
 
@@ -341,6 +341,60 @@ test('jr2-11 / G11: a cursor older than retention starts the text with the hole 
   const r = await readJournal(src, { since: 0, maxBytes: 4096 }, { resultBytes: 16384 });
   assert.deepEqual(r.gap, { from: 1, to: oldest - 1, reason: 'retention' });
   assert.ok(r.text!.startsWith(`[… ${oldest - 1} journal events missing (seq 1–${oldest - 1}: past retention) …]`), r.text!.slice(0, 80));
+});
+
+test('every result reports the holes it spans the same way: events pages and events tails carry gap and gaps as text pages do, and store-failed is named', async () => {
+  const src = source();
+  out(src.journal, 'a\r\n'); // seq 1
+  src.journal.append({ type: 'gap', from: 2, to: 2, reason: 'torn-write' }); // seq 2
+  out(src.journal, 'b\r\n'); // seq 3
+  src.journal.append({ type: 'gap', from: 4, to: 4, reason: 'store-failed' }); // seq 4
+  out(src.journal, 'c\r\n'); // seq 5
+  const text = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
+  assert.equal(text.text, 'a\n[… 1 journal event missing (seq 2–2: a torn write) …]\nb\n[… 1 journal event missing (seq 4–4: the journal store never took them) …]\nc');
+  const page = await readJournal(src, { since: 0, as: 'events' }, { resultBytes: 16384 });
+  assert.deepEqual(page.gap, { from: 2, to: 2, reason: 'torn-write' });
+  assert.deepEqual(page.gaps, text.gaps, 'the same holes, reported the same way');
+  assert.equal(page.gaps?.length, 2);
+  const tail = await readJournal(src, { tail: 3, as: 'events' }, { resultBytes: 16384 });
+  assert.deepEqual(tail.events!.map((e) => e.seq), [3, 4, 5]);
+  assert.deepEqual(tail.gap, { from: 4, to: 4, reason: 'store-failed' }, 'the one hole the tail spans');
+  assert.equal(tail.gaps, undefined);
+  const cut = await readJournal(src, { since: 0, as: 'events', limit: 1 }, { resultBytes: 16384 });
+  assert.equal(cut.gap, undefined, 'a page that ends before a hole does not span it');
+  const after = await readJournal(src, { since: 4, as: 'events' }, { resultBytes: 16384 });
+  assert.equal(after.gap, undefined);
+});
+
+test('an events page and an events tail keep to maxBytes in bytes, as the store writes the events, not in characters', async () => {
+  const src = source();
+  // About 1,060 characters an event, about 2,060 bytes stored: a budget counted in characters took three.
+  for (let i = 0; i < 6; i++) out(src.journal, `${'é'.repeat(1000)} ${i}\n`);
+  const budget = 4096;
+  const tail = await readJournal(src, { tail: 6, as: 'events', maxBytes: budget }, { resultBytes: 16384 });
+  assert.ok(tail.events!.reduce((a, e) => a + lineBytes(e), 0) <= budget, `${tail.events!.length} events`);
+  assert.equal(tail.truncated, true);
+  const page = await readJournal(src, { since: 0, as: 'events', maxBytes: budget }, { resultBytes: 16384 });
+  assert.ok(page.events!.reduce((a, e) => a + lineBytes(e), 0) <= budget, `${page.events!.length} events`);
+  assert.equal(page.more, true);
+});
+
+test('a text tail with `commands` heads each Run’s output with its line where it started, as 1.x logged commands', async () => {
+  const src = source();
+  src.journal.append({ type: 'run.admit', runId: 'r1', target: 'shell', principal: 'agent:a@test', origin: 'self', queued: false, line: 'echo one' });
+  src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/', line: 'echo one' });
+  out(src.journal, 'one\r\n');
+  endRun(src.journal, 'r1');
+  startRun(src.journal, 'r2', 'shell'); // a start without a line heads nothing
+  out(src.journal, 'two\r\n');
+  endRun(src.journal, 'r2');
+  const headed = await readJournal(src, { tail: 10, commands: true }, { resultBytes: 16384 });
+  assert.equal(headed.text, '$ echo one\none\ntwo');
+  assert.deepEqual(headed.lines, { requested: 10, returned: 3 });
+  const plain = await readJournal(src, { tail: 10 }, { resultBytes: 16384 });
+  assert.equal(plain.text, 'one\ntwo');
+  const two = await readJournal(src, { tail: 2, commands: true }, { resultBytes: 16384 });
+  assert.equal(two.text, 'one\ntwo', 'the heading is a line like any other: the last N lines');
 });
 
 // ───────────── er-2: apt-style output read by tail and by pages ─────────────

@@ -43,30 +43,61 @@
  * - Gaps are visible (G11, G19): output lost to retention, a torn write or a
  *   store failure appears in the text as a `[… N journal events missing …]`
  *   line where it was lost, and in `gap` (and `gaps`, when a page spans more
- *   than one).
+ *   than one). Every result — text or events, page or tail — reports the holes
+ *   it spans the same way, and `describeGap` is the one wording of why.
  * - `tail: N` gives the last N lines of the range (the session, a Run with
  *   `runId`, bounded by `since` and `until`), up to `maxBytes`. `lines` says
  *   how many were asked for and returned: fewer returned without `truncated`
  *   means the range holds no more; `truncated` means `maxBytes`, retention, the
  *   scan bound or the projection's input cap cut lines (or a line's head) that
- *   were asked for. As events, the tail is the newest N events whose JSON fits
- *   `maxBytes`.
+ *   were asked for. As events, the tail is the newest N events whose stored
+ *   lines fit `maxBytes`. `commands` heads each Run's output in a text tail with
+ *   `$ <line>` where it started (the 1.x log shape the compat pack serves).
  */
 import type { Journal } from '../core/journal.js';
 import { compileUserRegex } from '../core/regex.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
 import { persistentState } from '../core/screen.js';
+import { lineBytes } from '../core/stores.js';
 import { countLines, cutTail, headIndex, indexAtByte, safeCut, sequenceEnd, unfinishedSequence, utf8Length } from '../core/text.js';
 import { project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
-import { DEFAULT_GEOMETRY, type EventOf, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
+import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
 
-/** A hole in the journal (G11, G19), as a result reports it. */
+/** A hole in the journal (G11, G19), as a result reports it: the `gap` event's range and reason. */
 export interface GapInfo {
   from: Seq;
   to: Seq;
-  /** `retention`, `torn-write`, `store-error`, `keeper-overflow`. */
-  reason?: string;
+  reason: GapReason;
+}
+
+/** Why a hole's events are gone, in a result's words: the one wording for the gap line in text and for a status line. */
+export function describeGap(reason: GapReason): string {
+  switch (reason) {
+    case 'retention':
+      return 'past retention';
+    case 'torn-write':
+      return 'a torn write';
+    case 'store-error':
+      return 'the journal store failed';
+    case 'store-failed':
+      return 'the journal store never took them';
+    case 'keeper-overflow':
+      return 'keeper overflow';
+  }
+}
+
+/** The holes a result spans, for its status line or a note: the first three, each with `describeGap`'s wording; undefined when none. */
+export function gapsText(r: { gap?: GapInfo; gaps?: GapInfo[] }): string | undefined {
+  const one = (g: GapInfo) => `gap ${g.from}–${g.to} (${describeGap(g.reason)})`;
+  if (r.gaps?.length) return `${r.gaps.length} gaps: ${r.gaps.slice(0, 3).map(one).join(', ')}${r.gaps.length > 3 ? ', …' : ''}`;
+  return r.gap ? one(r.gap) : undefined;
+}
+
+/** Lines a search matched on their head only, being longer than the pattern's match window (G11); undefined when none. */
+export function clippedText(n: number | undefined): string | undefined {
+  if (!n) return undefined;
+  return `${n} line${n === 1 ? '' : 's'} longer than the match window, searched on ${n === 1 ? 'its' : 'their'} head only`;
 }
 
 export interface ReadResult {
@@ -131,6 +162,8 @@ export interface ReadOptions {
   as?: 'text' | 'events';
   maxBytes?: number;
   limit?: number;
+  /** Text tails: head each Run's output with `$ <line>` where it started (its run.start), as 1.x logged commands. */
+  commands?: boolean;
 }
 
 export interface SearchOptions {
@@ -177,8 +210,7 @@ const FIT_ATTEMPTS = 6;
 /** The line a hole leaves in text (G11). */
 function gapNote(g: GapInfo): string {
   const n = g.to - g.from + 1;
-  const why = g.reason === 'retention' ? 'past retention' : g.reason === 'torn-write' ? 'a torn write' : g.reason === 'store-error' ? 'the journal store failed' : g.reason === 'keeper-overflow' ? 'keeper overflow' : 'lost';
-  return `[… ${n} journal event${n === 1 ? '' : 's'} missing (seq ${g.from}–${g.to}: ${why}) …]`;
+  return `[… ${n} journal event${n === 1 ? '' : 's'} missing (seq ${g.from}–${g.to}: ${describeGap(g.reason)}) …]`;
 }
 
 const gapOf = (g: Gap): GapInfo => ({ from: g.from, to: g.to, reason: g.reason });
@@ -217,7 +249,7 @@ function retentionGap(journal: Journal, from: Seq, to: Seq): GapInfo | undefined
 }
 
 /** A gap event standing for a hole the journal holds no event for (a Run's range cut, or events lost since the walk began). */
-const gapEvent = (g: GapInfo): Gap => ({ type: 'gap', seq: g.to, ts: Date.now(), from: g.from, to: g.to, reason: 'retention' });
+const gapEvent = (g: GapInfo): Gap => ({ type: 'gap', seq: g.to, ts: Date.now(), from: g.from, to: g.to, reason: g.reason });
 
 function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | undefined; until?: Seq | undefined }): Walk {
   const journal = src.journal;
@@ -767,26 +799,27 @@ function eventsPage(src: ReadSource, o: ReadOptions, maxBytes: number): Omit<Rea
   const w = walk(src, o);
   const start = o.since ?? 0;
   const page: JournalEvent[] = [];
+  const gaps: GapInfo[] = w.gap ? [w.gap] : [];
   let bytes = 0;
   let more = false;
   outer: for (;;) {
     const batch = w.next();
     if (batch.length === 0) break;
     for (const e of batch) {
-      // `maxBytes` is the page size: JSON of the events, at least one of them.
-      const b = JSON.stringify(e).length;
+      // `maxBytes` is the page size: the events as the store writes them, at least one of them.
+      const b = lineBytes(e);
       if (page.length >= limit || (page.length > 0 && bytes + b > maxBytes)) {
         more = true;
         break outer;
       }
       page.push(e);
+      if (isGap(e)) gaps.push(gapOf(e));
       bytes += b;
     }
   }
   const next = more ? page[page.length - 1]!.seq : Math.max(w.end, page[page.length - 1]?.seq ?? start);
   const r: Omit<ReadResult, 'session'> = { events: page, seq: [page[0]?.seq ?? start + 1, next], nextCursor: Math.min(next, journal.lastSeq), more, truncated: false };
-  if (w.gap) r.gap = w.gap;
-  return r;
+  return withGapInfo(r, gaps);
 }
 
 // ───────────── tail ─────────────
@@ -856,18 +889,19 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     events = parts.reverse().flat();
   }
   if (o.as === 'events') {
-    // The newest events whose JSON fits `maxBytes` (at least one), at most n and 2,000; fewer than
-    // asked is a cut unless the range holds no more (the house's read of 1cabc6a, #22).
+    // The newest events whose stored lines fit `maxBytes` (at least one), at most n and 2,000; fewer
+    // than asked is a cut unless the range holds no more (the house's read of 1cabc6a, #22).
     const ev: JournalEvent[] = [];
     let bytes = 0;
     for (let i = events.length - 1; i >= 0 && ev.length < Math.min(n, 2000); i--) {
-      const b = JSON.stringify(events[i]).length;
+      const b = lineBytes(events[i]!);
       if (ev.length > 0 && bytes + b > maxBytes) break;
       ev.push(events[i]!);
       bytes += b;
     }
     ev.reverse();
-    return { events: ev, seq: [ev[0]?.seq ?? end, end], nextCursor: end, more: false, truncated: ev.length < n && (older || ev.length < events.length), lines: { requested: n, returned: ev.length } };
+    const r: Omit<ReadResult, 'session'> = { events: ev, seq: [ev[0]?.seq ?? end, end], nextCursor: end, more: false, truncated: ev.length < n && (older || ev.length < events.length), lines: { requested: n, returned: ev.length } };
+    return withGapInfo(r, ev.filter(isGap).map(gapOf));
   }
   const chunks: ProjectChunk[] = [];
   const sources = new Set<string>();
@@ -886,6 +920,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       outs.push(e);
       sources.add(sourceKey(e));
       chunks.push(chunkOf(e));
+    } else if (o.commands && e.type === 'run.start' && e.line !== undefined) {
+      chunks.push({ note: `$ ${e.line}` });
     }
   }
   const opts: Parameters<typeof project>[1] = { cols: geometry.cols, rows: geometry.rows, maxInputBytes: cap, keep: 'tail', maxLines: n };
@@ -901,8 +937,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const text = cutTail(kept.join('\n'), maxBytes).text;
   // Fewer lines than asked is truncation only when older output was cut (by the walk's bounds, or
   // retention). So is the head of a line asked for that lies past what was projected: past the input
-  // cap, or past the start of a window that older output precedes. A tail of one line longer than the
-  // cap came back without its head and said nothing (the house's read of 1cabc6a, #22).
+  // cap, or past the start of a window that older output precedes — one line longer than the cap is
+  // such a line, and comes back cut with `truncated` set (the house's read of 1cabc6a, #22).
   const inputBytes = outs.reduce((a, e) => a + utf8Length(e.data), 0);
   const reach = lastLinesBytes(outs, n);
   const headCut = reach > cap || (older && reach >= inputBytes);

@@ -8,12 +8,10 @@
  */
 import { TermError } from '../core/errors.js';
 import { commitReadDelivery, type App, type Caller, type ReadResult, type RunResult, type SearchResult, type SessionSummary } from './app.js';
-import type { GapInfo } from './reader.js';
+import { clippedText, gapsText, type GapInfo } from './reader.js';
 import { COMPAT_TOOLS } from './compat.js';
 import { looksLikeErrexit, looksLikeShellOpener, oneShotSshWithoutTty } from './hints.js';
 import { validate, ValidationError, type Schema } from './validate.js';
-
-export { looksLikeErrexit, looksLikeShellOpener, oneShotSshWithoutTty } from './hints.js';
 
 export type Tier = 'core' | 'control' | 'services' | 'watch' | 'search' | 'compat';
 export type Profile = 'core' | 'full' | 'compat';
@@ -191,12 +189,9 @@ export function renderRead(r: ReadResult, mode: ResultText): ToolResult {
   return { text: (body ? body + '\n' : '') + status, structured };
 }
 
-/** The holes a read or a search spanned, for its status line: output lost to retention, a torn write or a store failure. */
-function gapsBit(r: { gap?: GapInfo; gaps?: GapInfo[] }): string {
-  const one = (g: GapInfo) => `gap ${g.from}–${g.to} ${g.reason && g.reason !== 'retention' ? `missing (${g.reason})` : 'not retained'}`;
-  if (r.gaps?.length) return ` · ${r.gaps.length} gaps: ${r.gaps.slice(0, 3).map(one).join(', ')}${r.gaps.length > 3 ? ', …' : ''}`;
-  return r.gap ? ` · ${one(r.gap)}` : '';
-}
+/** The holes a read or a search spanned, as a status-line item (the reader words them). */
+const gapsBit = (r: { gap?: GapInfo; gaps?: GapInfo[] }): string => item(gapsText(r));
+const item = (text: string | undefined): string => (text ? ` · ${text}` : '');
 
 export function renderSearch(r: SearchResult, mode: ResultText): ToolResult {
   const structured = env(r);
@@ -207,12 +202,18 @@ export function renderSearch(r: SearchResult, mode: ResultText): ToolResult {
   // What the scan did not see, as the envelope says it and as read's status line does: the holes it
   // spanned, and the lines longer than the match window, searched on their head only; without
   // these, `(no matches)` read as a whole answer (the house's read of 1cabc6a, #22).
-  const clipped = r.clippedLines ? ` · ${r.clippedLines} line${r.clippedLines === 1 ? '' : 's'} longer than the match window, searched on ${r.clippedLines === 1 ? 'its' : 'their'} head only` : '';
-  const status = `[search ${r.session} · ${r.matches.length} match${r.matches.length === 1 ? '' : 'es'}${more} · scanned seq ${r.scanned[0]}–${r.scanned[1]}${r.bounded ? ' · older history not scanned: pass since' : ''}${gapsBit(r)}${clipped}]`;
+  const status = `[search ${r.session} · ${r.matches.length} match${r.matches.length === 1 ? '' : 'es'}${more} · scanned seq ${r.scanned[0]}–${r.scanned[1]}${r.bounded ? ' · older history not scanned: pass since' : ''}${gapsBit(r)}${item(clippedText(r.clippedLines))}]`;
   return { text: `${body || '(no matches)'}\n${status}`, structured };
 }
 
 const SERVICE_STATUS = ['starting', 'ready', 'running', 'unhealthy', 'exited', 'lost'];
+
+/** A hole a result spans (reader.ts GapInfo): the `gap` event's range and reason. */
+const GAP: Schema = {
+  type: 'object',
+  properties: { from: { type: 'integer' }, to: { type: 'integer' }, reason: { type: 'string', enum: ['retention', 'keeper-overflow', 'torn-write', 'store-error', 'store-failed'] } },
+  required: ['from', 'to', 'reason'],
+};
 
 const RUN_OUTPUT: Schema = {
   type: 'object',
@@ -268,8 +269,8 @@ const READ_OUTPUT: Schema = {
     nextCursor: { type: 'integer' },
     nextOffset: { type: 'integer', description: 'The page ended inside the event after nextCursor: continue with since=nextCursor, offset=nextOffset.' },
     more: { type: 'boolean' },
-    gap: { type: 'object', properties: { from: { type: 'integer' }, to: { type: 'integer' }, reason: { type: 'string' } }, required: ['from', 'to'] },
-    gaps: { type: 'array', items: { type: 'object', properties: { from: { type: 'integer' }, to: { type: 'integer' }, reason: { type: 'string' } }, required: ['from', 'to'] } },
+    gap: GAP,
+    gaps: { type: 'array', items: GAP },
     lines: { type: 'object', properties: { requested: { type: 'integer' }, returned: { type: 'integer' } }, required: ['requested', 'returned'] },
     truncated: { type: 'boolean' },
     splitLine: { type: 'boolean' },
@@ -325,7 +326,10 @@ const SUMMARY: Schema = {
     closed: { type: 'boolean' },
     createdAt: { type: 'number' },
     lastActivity: { type: 'number' },
-    services: { type: 'array', items: { type: 'object', properties: { runId: { type: 'string' }, name: { type: 'string' }, status: { type: 'string', enum: SERVICE_STATUS } }, required: ['runId', 'status'] } },
+    declared: { type: 'object', description: 'The innermost declared shell, where run goes now: its kind and the runId whose program it is (null: it replaced the session’s shell).', properties: { shell: { type: 'string' }, within: { description: 'runId, or null' } }, required: ['shell', 'within'] },
+    cols: { type: 'integer' },
+    rows: { type: 'integer' },
+    services: { type: 'array', items: { type: 'object', properties: { runId: { type: 'string' }, name: { type: 'string' }, status: { type: 'string', enum: SERVICE_STATUS }, evidence: { type: 'string' } }, required: ['runId', 'status'] } },
     watches: { type: 'integer' },
     runs: {
       type: 'array',
@@ -385,8 +389,8 @@ const SEARCH_OUTPUT: Schema = {
     nextOffset: { type: 'integer' },
     stoppedBy: { type: 'string', enum: ['limit', 'time', 'size'] },
     clippedLines: { type: 'integer' },
-    gap: { type: 'object' },
-    gaps: { type: 'array', items: { type: 'object' } },
+    gap: GAP,
+    gaps: { type: 'array', items: GAP },
   },
   required: ['session', 'matches', 'scanned', 'more', 'bounded'],
 };

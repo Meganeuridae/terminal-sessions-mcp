@@ -56,6 +56,16 @@ export interface JournalStore {
  * Approximate serialized size: every string, number and nested value counts, so
  * an `env.snapshot` or a long `run.admit` line weighs what it holds (jr-21).
  */
+/** The line the file store writes for an event: its JSON and a newline. */
+const lineOf = (event: JournalEvent): string => JSON.stringify(event) + '\n';
+
+/**
+ * The stored size of an event, UTF-8 bytes of its line: the one count for what a retention budget
+ * holds and what a page of events weighs, wherever it is estimated (the reader's events pages, a
+ * note's share of retention, a rotation header's bound).
+ */
+export const lineBytes = (event: JournalEvent): number => Buffer.byteLength(lineOf(event));
+
 export function approxBytes(v: unknown): number {
   switch (typeof v) {
     case 'string':
@@ -684,7 +694,7 @@ export class FileStore implements JournalStore {
    * what a failure means (it never crashes the daemon, G19).
    */
   append(event: JournalEvent): void {
-    const buf = Buffer.from(JSON.stringify(event) + '\n');
+    const buf = Buffer.from(lineOf(event));
     // Below the floor the disk is left alone (shell tools 4): the journal keeps the ring and retries.
     if (this.floor && !this.floor.allow(this.dir, buf.length)) throw new Error(`journal ${this.active}: the disk's free space is below the floor; history stays in memory until space returns`);
     if (this.dirty) {

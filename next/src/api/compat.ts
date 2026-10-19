@@ -11,10 +11,10 @@ import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
 import { exitMark, probeMark } from '../core/plumbing.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
-import { project, type ProjectChunk } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
 import { commitReadDelivery, type App, type SessionSummary } from './app.js';
 import { looksLikeShellOpener } from './hints.js';
+import { clippedText, gapsText } from './reader.js';
 import type { ToolContext, ToolDef, ToolResult } from './tools.js';
 
 const json = (value: unknown): ToolResult => ({
@@ -108,20 +108,23 @@ const withoutPlumbingLines = (lines: string[]): string[] =>
 
 /** The most output the compat tail reads back for its lines: the last 1 MiB. */
 const TAIL_BYTES = 1024 * 1024;
+/** Pages of events a raw tail reads back at most (each the reader's 2,000 events or TAIL_BYTES). */
+const TAIL_PAGES = 64;
 
 /**
- * The session's last events, oldest first: enough output for `n` lines and a screenful of redraw,
- * paged backwards by `until`, within TAIL_BYTES. `cut` names the oldest event read when older
- * output exists beyond the bound. (A line count, where the reader's event tail counted events —
- * the house's read of 1cabc6a, #22.)
+ * The session's last events for `n` raw lines, oldest first: enough output for them and a screenful
+ * of redraw, paged backwards by `until`, each page within the reader's byte cap, within TAIL_BYTES
+ * in all. `cut` names the oldest event read when older output exists beyond a bound: the bytes, or
+ * the pages. (A line count, where the reader's event tail counts events — the house's read of
+ * 1cabc6a, #22.)
  */
 async function tailEvents(ctx: ToolContext, session: string, n: number, rows: number): Promise<{ events: JournalEvent[]; cut?: Seq }> {
   const pages: JournalEvent[][] = [];
   let until: Seq | undefined;
   let lineEnds = 0;
   let bytes = 0;
-  for (let page = 0; page < 64; page++) {
-    const o: Parameters<App['read']>[1] = { session, tail: 2000, as: 'events' };
+  for (let page = 0; page < TAIL_PAGES; page++) {
+    const o: Parameters<App['read']>[1] = { session, tail: 2000, as: 'events', maxBytes: TAIL_BYTES };
     if (until !== undefined) o.until = until;
     const r = await ctx.app.read(ctx.caller, o);
     const ev = r.events ?? [];
@@ -135,39 +138,35 @@ async function tailEvents(ctx: ToolContext, session: string, n: number, rows: nu
     const first = ev[0]!.seq;
     const older = r.oldestSeq !== undefined && first > r.oldestSeq;
     if (!older || lineEnds >= n + 2 * rows + 1) break;
-    if (bytes >= TAIL_BYTES) return { events: pages.reverse().flat(), cut: first };
+    if (bytes >= TAIL_BYTES || page === TAIL_PAGES - 1) return { events: pages.reverse().flat(), cut: first };
     until = first - 1;
   }
   return { events: pages.reverse().flat() };
 }
 
+/** A tail of `n` clean lines asks the reader for more: the plumbing filter removes about one line per Run, and a tail is at most 10,000 lines. */
+const tailAsked = (n: number) => Math.min(2 * n + 50, 10_000);
+
 /**
  * The last `n` lines of a session as 1.x logged them: `$ <command>` where each Run started,
- * the shell's plumbing removed, the rest projected as the terminal showed it (or raw, with its
- * escape codes, when asked).
+ * the shell's plumbing removed, the rest projected as the terminal showed it — one `read` of the
+ * tail with `commands`, so the cap, the holes and `truncated` are the reader's — or raw, with
+ * its escape codes, from the session's last events. `cut` names the oldest event shown when
+ * older output exists beyond the bound.
  */
 async function tailLines(ctx: ToolContext, session: string, n: number, raw: boolean): Promise<{ lines: string[]; cut?: Seq }> {
-  const s = summaryOf(ctx, session);
-  const cols = s?.cols ?? DEFAULT_GEOMETRY.cols;
-  const rows = s?.rows ?? DEFAULT_GEOMETRY.rows;
-  const { events, cut } = await tailEvents(ctx, session, n, rows);
-  const res = (lines: string[]) => (cut !== undefined ? { lines: lines.slice(-n), cut } : { lines: lines.slice(-n) });
+  const res = (lines: string[], cut: Seq | undefined) => (cut !== undefined ? { lines: lines.slice(-n), cut } : { lines: lines.slice(-n) });
   if (raw) {
+    const { events, cut } = await tailEvents(ctx, session, n, summaryOf(ctx, session)?.rows ?? DEFAULT_GEOMETRY.rows);
     let text = '';
     for (const e of events) {
       if (e.type === 'output') text += e.data;
       else if (e.type === 'run.start' && e.line !== undefined) text += `${text === '' || text.endsWith('\n') ? '' : '\n'}$ ${e.line}\n`;
     }
-    return res(withoutPlumbingLines(text.split(/\r?\n/)));
+    return res(withoutPlumbingLines(text.split(/\r?\n/)), cut);
   }
-  const chunks: ProjectChunk[] = [];
-  for (const e of events) {
-    if (e.type === 'output') chunks.push({ data: e.data, stream: e.stream, ...(e.runId !== undefined ? { runId: e.runId } : {}) });
-    else if (e.type === 'run.start' && e.line !== undefined) chunks.push({ note: `$ ${e.line}` });
-  }
-  // Lines the plumbing filter removes (about one per Run) come out of the slack above n.
-  const p = await project(chunks, { cols, rows, keep: 'tail', maxLines: Math.min(2 * n + 50, 20_000), maxInputBytes: TAIL_BYTES });
-  return res(withoutPlumbingLines(p.text === '' ? [] : p.text.split('\n')));
+  const r = await ctx.app.read(ctx.caller, { session, tail: tailAsked(n), commands: true, maxBytes: TAIL_BYTES });
+  return res(withoutPlumbingLines(r.text ? r.text.split('\n') : []), r.truncated ? r.seq[0] : undefined);
 }
 
 /** 1.x's launch statuses from a service's. */
@@ -236,7 +235,8 @@ export const COMPAT_TOOLS: ToolDef[] = [
       // 1.x launched into a fresh session in `cwd`; into an existing one, change there first (atc-22). The command
       // goes in a group of its own, so a `&` or `;` in it cannot split it from the cd and run in the old directory;
       // the newline before the closing brace keeps a trailing `&` or comment from taking it (the house's read of 1cabc6a, #22).
-      const exists = summaryOf(ctx, name)?.state !== undefined && summaryOf(ctx, name)?.state !== 'exited';
+      const existing = summaryOf(ctx, name);
+      const exists = existing !== undefined && existing.state !== 'exited';
       const command = exists && typeof a.cwd === 'string' ? `cd -- ${shq(a.cwd)} && {\n${a.command as string}\n}` : (a.command as string);
       // Without patterns 1.x waited 2 s and said `running`: wait just past the 2 s liveness window (atc-7).
       const o: Parameters<App['start']>[1] = { session: name, command, name, wait: ready || fail ? 30_000 : 2_500 };
@@ -484,6 +484,11 @@ export const COMPAT_TOOLS: ToolDef[] = [
       const notes: string[] = [];
       if (r.bounded) notes.push(`older output was not searched (the search covers the last 50,000 journal events); read {"session": "${session}", "tail": 200, "until": ${r.scanned[0] - 1}} shows what came before`);
       if (r.more) notes.push(`more matches exist (stopped by ${r.stoppedBy ?? 'the 100-match limit'})`);
+      // What the scan did not see, in the core search's words (tools.ts renderSearch): holes it spanned, lines matched on their head only.
+      const gaps = gapsText(r);
+      if (gaps) notes.push(`output is missing where the search looked: ${gaps}`);
+      const clipped = clippedText(r.clippedLines);
+      if (clipped) notes.push(clipped);
       if (notes.length) out.push({ note: notes.join('; ') });
       return json(out);
     },

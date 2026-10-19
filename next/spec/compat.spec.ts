@@ -196,6 +196,24 @@ test('runCommand output: raw keeps the stream, paged output comes whole, and pas
   assert.ok(clean.includes('END-OF-BIG'), JSON.stringify(clean));
 });
 
+test('tailLogs on a 30,000-line session returns the lines asked for, clean or raw, and says when the 1 MiB bound cut them', async () => {
+  // 30,000 lines of 110 bytes: 3.3 MB, of which the last 1 MiB holds about 9,500 lines.
+  const r = await call('runCommand', { session: 'long', command: `awk 'BEGIN { for (i = 1; i <= 30000; i++) printf "line %06d %s\\n", i, "${'x'.repeat(98)}" }'`, timeout: 55_000 });
+  assert.equal(r.exitCode, 0, JSON.stringify({ state: r.state, note: r.note }));
+  const isLine = (l: string) => /^line \d{6} x{98}$/.test(l);
+  for (const raw of [false, true]) {
+    const tail = lines(await call('tailLogs', { session: 'long', lines: 500, raw }));
+    assert.equal(tail.length, 500, `raw ${raw}: lines asked for are lines returned`);
+    assert.ok(!tail[0]!.startsWith('[earlier output'), `raw ${raw}: the 500 lines are all there, nothing was cut`);
+    assert.ok(tail.includes(`line 030000 ${'x'.repeat(98)}`), `raw ${raw}: ${tail.slice(-3).join('|')}`);
+    assert.ok(tail.filter(isLine).length >= 497, `raw ${raw}: the output's own lines, counted as lines`);
+  }
+  const most = lines(await call('tailLogs', { session: 'long', lines: 10_000 }));
+  assert.match(most[0]!, /^\[earlier output not shown: these lines come from the last 1 MiB; read \{"session": "long", "tail": 10000, "until": \d+\}/, 'the bound cut lines that were asked for: said');
+  assert.ok(most.length > 5000 && most.length <= 10_001, `${most.length} lines`);
+  assert.ok(most.slice(1).filter(isLine).length >= most.length - 3, 'whole lines up to the end');
+});
+
 test('sendInput types text and keys as asked; sendSignal interrupts the foreground command', async () => {
   const asked = await call('runCommand', { session: 'io', command: 'read -p "k? " k; echo "got [$k]"', timeout: -1 });
   await until(() => summary('io')?.runs?.some((x) => x.runId === asked.runId && x.state === 'running') === true, 5000, 'read to be running');
