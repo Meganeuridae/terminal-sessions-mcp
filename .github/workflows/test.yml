@@ -80,6 +80,10 @@ jobs:
           node-version: 22
           cache: npm
       - uses: oven-sh/setup-bun@v2
+        # Pinned like the hosts: the bridge check runs under this bun, and a bun release must not
+        # change its result either. Move it with the bridge pin.
+        with:
+          bun-version: 1.4.3
       - run: npm ci
       - name: Build agent-framework
         working-directory: .hosts/agent-framework

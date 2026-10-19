@@ -36,11 +36,22 @@ const { TestHost, sleep } = await import(path.join(DIST, 'spec/testhost.js'));
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 23), ...a);
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-accept-af-'));
+// A check that hangs (a host that never reconnects, a shell that never ends) ends here with a verdict,
+// not at the CI job's limit half an hour later with no summary (the house's read of 9f168ff, #22).
+const DEADLINE_MS = 120_000;
+const deadline = setTimeout(() => {
+  log(`FAIL: the check did not finish within ${DEADLINE_MS / 1000} s`);
+  fs.rmSync(tmp, { recursive: true, force: true });
+  process.exit(1);
+}, DEADLINE_MS);
 const registry = new SessionRegistry({ dataDir: path.join(tmp, 'data'), backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
 const app = new App({ registry, segmenter: { runSettleMs: 50 } });
-const server = new TermServer({ app, resolver: new TokenMapResolver({ tokens: { ta: 'agent:scout@test', tb: 'agent:observer@test' } }), host: '127.0.0.1', port: 0, version: 'acceptance' });
+const serverLog = [];
+const server = new TermServer({ app, resolver: new TokenMapResolver({ tokens: { ta: 'agent:scout@test', tb: 'agent:observer@test' } }), host: '127.0.0.1', port: 0, version: 'acceptance', log: (line) => serverLog.push(line) });
 const { port } = await server.listen();
 log('termd on', port);
+/** How many connections termd has accepted from the scout's host so far. */
+const scoutConnections = () => serverLog.filter((l) => l.includes('"connection opened"') && l.includes('"agent:scout@test"')).length;
 
 const membrane = new MockMembrane();
 const framework = await AgentFramework.create({
@@ -68,6 +79,7 @@ const context = () =>
     .map((m) => (m.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join(' '))
     .join('\n');
 const SESSION = `acc${process.pid}`;
+const CHANNEL = `terminal:${SESSION}`;
 let failures = 0;
 const check = async (name, fn) => {
   try {
@@ -78,6 +90,16 @@ const check = async (name, fn) => {
     log('FAIL', name, '\n  ', e.message);
   }
 };
+/** `p`, or a failure naming `what` after `ms`; the timer never outlives the race. */
+const within = (p, ms, what) =>
+  new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`timed out: ${what}`)), ms);
+    p.then(
+      (v) => (clearTimeout(t), resolve(v)),
+      (e) => (clearTimeout(t), reject(e)),
+    );
+  });
+const journal = () => registry.get(SESSION).session.journal.since(0).events;
 
 try {
   await check('grant and tools', async () => {
@@ -89,7 +111,22 @@ try {
   const opened = await call('session_open', { session: SESSION, visibility: 'shared' });
   assert.equal(opened.isError, undefined, opened.text);
   const observer = await new TestHost({ port, token: 'tb', connection: 'observer', mcpl: true }).connect();
-  await observer.request('channels/open', { channelId: `terminal:${SESSION}` });
+  await observer.request('channels/open', { channelId: CHANNEL });
+
+  // The host routes an agent's plain reply to the channel that woke it. So the scout's host opens the
+  // session's channel, as the agent's own channel_open tool does: the completion then arrives on that
+  // channel, and the prose the model answers with reaches termd's channels/publish. On a closed channel
+  // a completion is a push event with no channel to answer into; the host kept the prose in its archive,
+  // nothing reached termd, and the mcpl-1 check below passed with publish typing into the shell (the
+  // house's read of 9f168ff, #22). The channel registers with the host a moment after session_open.
+  await check("the scout's host opens the session's channel", async () => {
+    let open;
+    for (const until = Date.now() + 3000; ; await sleep(100)) {
+      open = await framework.executeToolCall({ id: 'open-1', name: 'channel_open', input: { channelId: CHANNEL, serverId: 'terminal' }, callerAgentName: 'scout' });
+      if (!open.isError || Date.now() > until) break;
+    }
+    assert.ok(!open.isError, `channel_open: ${open.error}`);
+  });
 
   // The model will answer the wake with ordinary prose, as agents do.
   const marker = path.join(tmp, 'SHOULD_NOT_EXIST');
@@ -104,10 +141,19 @@ try {
   });
 
   await check('disconnect and reconnect while it runs', async () => {
+    // The drop and the new link are both shown: the host's link closes and reconnects, termd accepts one
+    // more connection from the scout, and the Run is still in flight (the house's read of 9f168ff, #22).
+    const before = scoutConnections();
+    const closed = new Promise((r) => conn.once('close', (...a) => r(a)));
+    const reconnected = new Promise((r) => conn.once('reconnect', r));
     await conn.reconnectAfterFailure();
+    await within(closed, 3000, 'the link closing');
+    await within(reconnected, 5000, 'the link coming back');
     const until = Date.now() + 5000;
     while (!(conn.isConnected && conn.policyEstablished) && Date.now() < until) await sleep(50);
     assert.ok(conn.isConnected && conn.policyEstablished, 'reconnected with a policy');
+    assert.equal(scoutConnections(), before + 1, `termd accepted a new connection from the scout:\n${serverLog.slice(-10).join('\n')}`);
+    assert.equal(registry.get(SESSION).session.run(runId).state, 'running', 'the Run was in flight across the drop');
   });
 
   await check('a useful completion notification through the host', async () => {
@@ -135,14 +181,21 @@ try {
     assert.notEqual(s.session.currentController, 'agent:observer@test');
   });
 
-  await check("the agent's speech is never typed into the shell (mcpl-1), and no inference loop", async () => {
-    await sleep(2500);
-    const s = registry.get(SESSION);
-    const events = s.session.journal.since(0).events;
+  await check("the agent's speech reached the session as a note, never typed into the shell (mcpl-1), and no inference loop", async () => {
+    // Waits for the reply itself, not a fixed time: a sleep passed while the reply never reached termd.
+    const scoutNotes = (events) => events.filter((e) => e.type === 'note' && e.principal === 'agent:scout@test');
+    const until = Date.now() + 8000;
+    while (!scoutNotes(journal()).length && !journal().some((e) => e.type === 'input') && Date.now() < until) await sleep(100);
+    const events = journal();
     assert.ok(!events.some((e) => e.type === 'input'), 'no input events');
     assert.ok(!fs.existsSync(marker), 'the prose did not execute');
-    const notes = events.filter((e) => e.type === 'note');
-    log('   notes recorded from speech:', notes.length, 'inference calls:', membrane.calls.length);
+    const notes = scoutNotes(events);
+    const routing = traces.filter((t) => t.type === 'mcpl:speech-routed' || t.type === 'mcpl:speech-route-failed').map((t) => `${t.type}${t.reason ? ` (${t.reason})` : ''}`);
+    assert.equal(notes.length, 1, `notes from the scout's reply: ${notes.length}; the host's routing: ${routing.join('; ') || 'nothing routed'}`);
+    assert.match(notes[0].text, /A sensible follow-up/);
+    // A note is not delivered back to its author; a further wake would follow it within this settle.
+    await sleep(1000);
+    log('   inference calls:', membrane.calls.length);
     assert.ok(membrane.calls.length <= 2, `inference calls: ${membrane.calls.length}`);
   });
 
@@ -153,6 +206,7 @@ try {
   await server.close();
   await registry.closeAll();
   fs.rmSync(tmp, { recursive: true, force: true });
+  clearTimeout(deadline);
 }
 log(failures ? `${failures} FAILED` : 'ALL PASSED');
 process.exit(failures ? 1 : 0);

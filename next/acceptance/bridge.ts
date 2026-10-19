@@ -52,18 +52,49 @@ const termd = spawn('node', [path.resolve(import.meta.dir, '../dist/src/daemon.j
 let termdLog = ''
 termd.stdout.on('data', (d) => (termdLog += d))
 termd.stderr.on('data', (d) => (termdLog += d))
-for (let i = 0; i < 100; i++) {
+// termd's end is noted from the start, however it comes: the cleanup below once waited on an exit event
+// that had already fired for a termd a signal killed, and the check hung with no verdict (the house's
+// read of 9f168ff, #22).
+let termdEnd: { code: number | null; signal: NodeJS.Signals | null } | null = null
+termd.once('exit', (code, signal) => (termdEnd = { code, signal }))
+// The daemon's own pid, from its health answer: `node` on PATH may be a version manager's shim that
+// runs the daemon as a child of its own, and a signal to the shim leaves the daemon running.
+let termdPid: number | null = null
+const alive = (pid: number) => {
   try {
-    if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+// A check that hangs ends here with the termd log and a verdict, not at the CI job's limit half an hour later.
+const DEADLINE_MS = 120_000
+const deadline = setTimeout(() => {
+  log(`FAIL: the check did not finish within ${DEADLINE_MS / 1000} s`)
+  log(termdLog.slice(-2000))
+  if (termdPid !== null && alive(termdPid)) process.kill(termdPid, 'SIGKILL')
+  termd.kill('SIGKILL')
+  fs.rmSync(tmp, { recursive: true, force: true })
+  process.exit(1)
+}, DEADLINE_MS)
+for (let i = 0; i < 100 && !termdEnd; i++) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/health`)
+    if (r.ok) {
+      termdPid = ((await r.json()) as { pid: number }).pid
+      break
+    }
   } catch {}
   await sleep(100)
 }
-log('termd on', port)
+log('termd on', port, 'pid', termdPid)
 
 const SESSION = `br${process.pid}`
 const wake = { wake: [['terminal:run-finished'], ['terminal:run-lost'], ['terminal:session-exited'], ['terminal:needs-input']], hold: [['terminal:output'], ['terminal:screen']] }
 const gate = new WakeGate(wake)
 const deliveries: any[] = []
+const hostLog: string[] = []
 const cfg: any = {
   transport: { url: `ws://127.0.0.1:${port}/?resultText=transcript`, token: 'ta' },
   grant: ['tools', 'pushEvents', 'channels.register', 'channels.lifecycle', 'channels.incoming', 'channels.publish', 'contextHooks.beforeInference.inject.beforeUser'],
@@ -76,7 +107,7 @@ const cfg: any = {
 const h = new McplServerHandle('terminal', cfg, {
   deliver: (m: any) => deliveries.push(m),
   toolsChanged: () => {},
-  log: () => {},
+  log: (line: string) => hostLog.push(line),
 })
 const obsDeliveries: any[] = []
 const observer = new McplServerHandle('terminal', { ...cfg, transport: { ...cfg.transport, token: 'tb' } }, { deliver: (m: any) => obsDeliveries.push(m), toolsChanged: () => {}, log: () => {} })
@@ -102,6 +133,7 @@ const waitFor = async (pred: () => boolean, ms: number, what: string) => {
     await sleep(50)
   }
 }
+const completions = (runId: string) => deliveries.filter((d) => d.text.includes(runId) && /→ exit/.test(d.text))
 
 try {
   h.start()
@@ -127,14 +159,22 @@ try {
   })
 
   await check('disconnect and reconnect while it runs', async () => {
+    // The drop is shown, not assumed: the handle notices its link close, comes back ready on a connection
+    // it made later, and the Run is still in flight (the house's read of 9f168ff, #22).
+    const was = h.connectedAt as number
+    const logged = hostLog.length
     ;(h as any).conn?.close?.()
-    await sleep(100)
-    await waitFor(() => h.status === 'ready', 5000, 'reconnected')
+    await waitFor(() => hostLog.slice(logged).some((l) => /connection closed/.test(l)), 3000, 'the handle noticing the close')
+    await waitFor(() => h.status === 'ready' && (h.connectedAt as number | null) !== null && (h.connectedAt as number) > was, 5000, 'reconnected on a new connection')
+    const st = await call('await', { runId, wait: 0 })
+    if (st.structured?.state !== 'running') fail(`the Run across the drop: ${st.text}`)
   })
 
+  let firstCompletionAt = 0
   await check('one useful completion notification, and it wakes the session', async () => {
     await waitFor(() => deliveries.some((d) => d.text.includes(runId)), 8000, 'completion delivery')
-    const mine = deliveries.filter((d) => d.text.includes(runId) && /→ exit/.test(d.text))
+    firstCompletionAt = Date.now()
+    const mine = completions(runId)
     if (mine.length !== 1) fail(`deliveries for the run: ${mine.length}`)
     const d = mine[0]
     if (!/bridge-output/.test(d.text)) fail(d.text)
@@ -161,33 +201,61 @@ try {
   await check('mcpl_send (publish) records a note and never types', async () => {
     await h.openChannel(`terminal:${SESSION}`)
     const before = deliveries.length
-    await h.publish(`terminal:${SESSION}`, 'echo typed-by-publish')
+    // Recorded is shown twice over: termd's answer names the note, and the observer, with the channel
+    // open, receives it (the house's read of 9f168ff, #22).
+    const answer = (await h.publish(`terminal:${SESSION}`, 'echo typed-by-publish')) as { delivered?: boolean; messageId?: string } | undefined
+    if (answer?.delivered !== true || typeof answer.messageId !== 'string') fail(`publish answered ${JSON.stringify(answer)}`)
+    await waitFor(() => obsDeliveries.some((d) => /typed-by-publish/.test(d.text)), 3000, 'the observer receiving the note')
     await sleep(1200)
     const screen = await call('screen', { session: SESSION })
+    // The screen must be the session's: a failed read, with no text to match, is no evidence.
+    if (screen.isError) fail(`screen: ${screen.text}`)
+    if (!/bridge-output/.test(screen.text)) fail(`the screen does not show the session's output:\n${screen.text}`)
     if (/typed-by-publish/.test(screen.text)) fail(`typed into the shell:\n${screen.text}`)
     const echoes = deliveries.slice(before).filter((d) => /typed-by-publish/.test(d.text))
     if (echoes.length) fail('a note came back as a delivery (loop risk)')
   })
 
-  await check('presence through the bridge hook', async () => {
+  await check('presence through the bridge hook names the session', async () => {
     const inj = await h.beforeInference('hello', 'inf-1', 'conv', 1)
     const text = JSON.stringify(inj)
-    if (!text.includes(`[terminal] ${SESSION}`) && !text.includes('idle, nothing new')) fail(text)
+    if (!text.includes('[terminal]') || !text.includes(SESSION)) fail(text)
+  })
+
+  await check('still one completion for the Run two seconds on: nothing re-delivered after the reconnect', async () => {
+    // Counted right after the first arrived, a late duplicate could not fail the check.
+    await sleep(Math.max(0, firstCompletionAt + 2000 - Date.now()))
+    const mine = completions(runId)
+    if (mine.length !== 1) fail(`deliveries for the run: ${mine.length}`)
   })
 } finally {
   await call('session_close', { session: SESSION, force: true }).catch(() => undefined)
   h.close()
   observer.close()
   // Wait for termd to exit before this process does: an orphaned termd whose stderr pipe
-  // closed under it never finished shutting down (tsg-5). SIGKILL after 5 s.
-  const exited = new Promise((resolve) => (termd.exitCode !== null ? resolve(undefined) : termd.once('exit', resolve)))
-  termd.kill('SIGTERM')
-  if (!(await Promise.race([exited.then(() => true), sleep(5000).then(() => false)]))) {
+  // closed under it never finished shutting down (tsg-5). SIGKILL after 5 s. The daemon is
+  // addressed by its own pid where the health answer gave one, else as the child.
+  if (termdEnd) {
+    const end = termdEnd as { code: number | null; signal: NodeJS.Signals | null }
+    log(`termd ended before the cleanup: ${end.signal ?? `code ${end.code}`}`)
+  }
+  const own = termdPid === null || termdPid === termd.pid
+  const stopped = () => (own ? termdEnd !== null : !alive(termdPid as number))
+  const stop = async (signal: NodeJS.Signals, graceMs: number) => {
+    if (stopped()) return true
+    try {
+      if (own) termd.kill(signal)
+      else process.kill(termdPid as number, signal)
+    } catch {}
+    for (const end = Date.now() + graceMs; !stopped() && Date.now() < end; ) await sleep(100)
+    return stopped()
+  }
+  if (!(await stop('SIGTERM', 5000))) {
     log('termd did not exit within 5 s of SIGTERM; killing it')
-    termd.kill('SIGKILL')
-    await exited
+    await stop('SIGKILL', 2000)
   }
   fs.rmSync(tmp, { recursive: true, force: true })
+  clearTimeout(deadline)
 }
 if (failures) log(termdLog.slice(-2000))
 log(failures ? `${failures} FAILED` : 'ALL PASSED')
