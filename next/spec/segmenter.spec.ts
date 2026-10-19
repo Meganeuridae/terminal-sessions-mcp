@@ -144,6 +144,33 @@ test('service and watch events become lifecycle messages for the principal who s
   seg.dispose();
 });
 
+test('G23: the other producers set tags too — a session exit, needs-input, a note, a progress digest and a screen — and none claims chat:addressed', async (t) => {
+  // The house's read of 78c4d6e (#22): the test below covers four tag-setting producers; a chat:addressed added to any of these five passed it.
+  const src = fakeSource();
+  const seg = new Segmenter(src, { runSettleMs: 5, cadenceMs: 40, screenQuietMs: 20 });
+  t.after(() => seg.dispose());
+  const out = collect(seg);
+  src.runs.set('r1', { runId: 'r1', sessionId: 's1', target: 'shell', origin: 'self', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'exact', line: 'read name' });
+  src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/w' });
+  src.journal.append({ type: 'output', data: 'Name? ', stream: 'pty', runId: 'r1' });
+  src.journal.append({ type: 'run.waiting', runId: 'r1', lastLine: 'Name?', silentMs: 5000, state: 'busy' });
+  src.journal.append({ type: 'note', text: 'please wait', principal: 'agent:b@t', channel: 'terminal:s1' });
+  await sleep(120);
+  src.screen.alt = true;
+  src.screen.lines = ['htop', '', '', '', ''];
+  src.journal.append({ type: 'screen.mode', alt: true });
+  await sleep(80);
+  src.journal.append({ type: 'session.exit', code: 0 });
+  await sleep(20);
+  const kinds = new Set<string>(out.map((s) => s.kind));
+  for (const k of ['needs-input', 'note', 'output', 'screen', 'session-exit']) assert.ok(kinds.has(k), `a ${k} segment was produced: ${[...kinds].join(', ')}`);
+  for (const s of out) {
+    assert.ok(s.tags.length > 0, `${s.kind} carries tags`);
+    assert.ok(!s.tags.includes('chat:addressed'), `${s.kind} claims chat:addressed: ${s.tags.join(', ')}`);
+    for (const tag of s.tags) assert.ok(tag.startsWith('terminal:') || /^chat:from-(human|agent|self)$/.test(tag), `${s.kind}: ${tag} is neither a terminal:* tag nor a sender facet`);
+  }
+});
+
 test('G23: no segment claims chat:addressed — a Run’s end, a service, a watch, a human’s input carry terminal:* tags and at most a chat:from-* sender', async () => {
   // Tags describe and never authorize (G23): whether a finished run deserves attention is the
   // consumer's rule. Nothing checked this, so a run message tagged chat:addressed passed the

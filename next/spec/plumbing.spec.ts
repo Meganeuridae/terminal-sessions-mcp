@@ -103,3 +103,38 @@ test('a typed line the editor redrew in pieces, its nonce split, is still cut wh
   const raw = `sh$  . '/tmp/t/tsm-cmd-2'; echo "<<<EXI""T:f3e7c64\r\nc:$?>>>" . '/tmp/t/tsm-cmd-2'; echo "<<<EXI""T:f3e7c64\nafter\n<<<EXIT:f3e7c64c:0>>>\nsh$ `;
   assert.equal(cutPlumbing(raw, { strategy: 'marker', nonce: 'f3e7c64c' }), 'after\n');
 });
+
+test('a probe that went unanswered (a program ignoring ^C read it) leaves only its echo struck: the output printed after it stays, up to the accepted answer', () => {
+  // The house's read of 78c4d6e (#22): the cut moved back to the earliest unanswered echo, and the output after it was gone.
+  const inline = { strategy: 'inline' as const, nonce: N };
+  const echo = ` printf '<<<PRO''BE:${N}:%s:%s>>>\\n' "$$" "$\{__tsm_r-}"`;
+  // The session's own cancel sequence: ^C, a probe the program read as input (echoed, unanswered), more output,
+  // ^\ ends the program, the second probe is answered by the shell.
+  const run = `\r\nout1\r\n^C\r\n${echo}\r\nout2\r\n^\\\r\n$ ${echo}\r\n<<<PROBE:${N}:1000:${N}>>>\r\n$ `;
+  assert.equal(cutPlumbing(run, inline), 'out1\r\n^C\r\nout2\r\n^\\\r\n');
+  // The second probe's echo missing (echo off): the output ends at the answer, the first echo struck.
+  assert.equal(cutPlumbing(`\r\nout1\r\n^C\r\n${echo}\r\nout2\r\n<<<PROBE:${N}:1000:${N}>>>\r\n`, inline), 'out1\r\n^C\r\nout2\r\n');
+  // The marker strategy's probe line, the same way.
+  const typedProbe = ` echo "<<<PRO""BE:${N}>>>"`;
+  assert.equal(cutPlumbing(`${typed(N)}out1\n^C\n${typedProbe}\nout2\n^\\\n${typedProbe}\n<<<PROBE:${N}>>>\n$ `, { strategy: 'marker', nonce: N }), 'out1\n^C\nout2\n^\\\n');
+  // Live, by the pid the transcript knows: the same.
+  assert.equal(cutPlumbing(`\r\nA\r\n${echo}\r\nB\r\n$ ${echo}\r\n<<<PROBE:${N}:1000:>>>\r\n`, { ...inline, pid: '1000' }), 'A\r\nB\r\n');
+});
+
+test('a typed line the editor wraps inside its nonce is still cut: bash 5.2 at a narrow width writes the margin character again after a carriage return', () => {
+  // The house's read of 78c4d6e (#22): at 26 columns the probe line's echo held `a1b2c\rc3d4`, and the line stayed in the output.
+  const nonce = 'a1b2c3d4';
+  const inline = { strategy: 'inline' as const, nonce };
+  const echo = ` printf '<<<PRO''BE:a1b2c\rc3d4:%s:%s>>>\\n' "$$" "$\{__tsm_r-}"`;
+  assert.equal(cutPlumbing(`\r\nout\r\n^C\r\n$ ${echo}\r\n<<<PROBE:${nonce}:1000:${nonce}>>>\r\n$ `, inline), 'out\r\n^C\r\n');
+  // The wrapper's own echo, wrapped the same way, in the inline and the marker strategies.
+  const typedStart = ` printf '<<<STAR''T:a1b2c\rc3d4:%s>>>\\n' "$$"; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:a1b2c\rc3d4:%s>>>\\n' "$?"\r\n<<<START:${nonce}:4242>>>\r\nhello\r\n<<<EXIT:${nonce}:0>>>\r\n`;
+  assert.equal(cutPlumbing(typedStart, inline), 'hello\r\n');
+  const marker = ` command . '/tmp/t/tsm-cmd-1'; echo "<<<EXI""T:a1b2c\rc3d4:$?>>>"\r\nout\r\n<<<EXIT:${nonce}:0>>>\r\n`;
+  assert.equal(cutPlumbing(marker, { strategy: 'marker', nonce }), 'out\r\n');
+  // A wrap at the margin inside the split word, with a blank before the carriage return (readline's form).
+  const inWord = ` echo "<<<EXI""T \r T:${nonce}:$?>>>"\r\nout\r\n<<<EXIT:${nonce}:0>>>\r\n`;
+  assert.equal(cutPlumbing(inWord, { strategy: 'marker', nonce }), 'out\r\n');
+  // The printed marks are never taken for echoes: the allowance adds nothing to `EXIT`.
+  assert.equal(cutPlumbing(`${typed(nonce)}<<<EXIT:${nonce}:0>>>\n`, { strategy: 'marker', nonce }), '');
+});

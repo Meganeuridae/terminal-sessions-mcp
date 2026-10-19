@@ -672,6 +672,9 @@ test('a compaction that leaves the visible text unchanged is a new screen: the l
   assert.equal(screens.length, 2, 'the unchanged frame is sent again, now saying what it misses');
   assert.equal(screens[1]!.metadata.droppedUnits, 3);
   assert.equal(screens[1]!.supersedes, screens[0]!.messageId);
+  // Taken at the same seq, it has an id of its own: a repeated id is one the lane's sent-set drops (the house's read of 78c4d6e, #22).
+  assert.notEqual(screens[1]!.messageId, screens[0]!.messageId);
+  assert.equal(seqOfMessageId(screens[1]!.messageId), screens[1]!.seq, 'the seq still reads from the id');
   // Nothing else changed: no third screen.
   src.journal.append({ type: 'output', data: 'same', stream: 'pty' });
   await sleep(150);
@@ -750,4 +753,41 @@ test('a prompt with a combining mark is found at the cursor; needs-input does no
   await sleep(100);
   assert.equal(src.journal.since(0).events.filter((e) => e.type === 'run.waiting').length, 0);
   seg.dispose();
+});
+
+test('a digest holds a partial line that ends inside a control sequence until the sequence completes', async (t) => {
+  // The house's read of 78c4d6e (#22): `done\r\nworking ESC [ 3`, then quiet, digested as `done\nworking [3`.
+  const src = fakeSource();
+  startRun(src, 'seq');
+  const seg = new Segmenter(src, { cadenceMs: 40 });
+  t.after(() => seg.dispose());
+  const out = collect(seg);
+  src.journal.append({ type: 'output', data: 'done\r\nworking \x1b[3', stream: 'pty', runId: 'seq' });
+  await sleep(110);
+  const first = out.filter((s) => s.kind === 'output').at(-1);
+  assert.equal(first?.body, 'done', 'the partial line waits: what the sequence does to it is not known yet');
+  src.journal.append({ type: 'output', data: '2mon it', stream: 'pty', runId: 'seq' });
+  await sleep(110);
+  const second = out.filter((s) => s.kind === 'output').at(-1);
+  assert.equal(second?.body, 'done\nworking on it');
+});
+
+test('the carry is cut on a safe boundary: a digest never begins with half a surrogate pair or the tail of a control sequence', async (t) => {
+  // The house's read of 78c4d6e (#22): the cut at 4,096 units put a lone low surrogate at a digest's head, and `;5;196m` at another's.
+  const src = fakeSource();
+  startRun(src, 'pair');
+  startRun(src, 'csi');
+  const seg = new Segmenter(src, { cadenceMs: 40 });
+  t.after(() => seg.dispose());
+  const out = collect(seg);
+  // 4,301 units with no newline: the last 4,096 begin inside a pair.
+  src.journal.append({ type: 'output', data: `${'a'.repeat(100)}${'😀'.repeat(2100)}z`, stream: 'pty', runId: 'pair' });
+  // The last 4,096 units begin inside ESC [ 38 ; 5 ; 196 m.
+  src.journal.append({ type: 'output', data: `${'b'.repeat(5000)}\x1b[38;5;196m${'z'.repeat(4090)}`, stream: 'pty', runId: 'csi' });
+  await sleep(110);
+  const pair = out.find((s) => s.kind === 'output' && s.runId === 'pair');
+  assert.ok(pair?.body?.startsWith('😀'), `whole pairs only: ${JSON.stringify(pair?.body?.slice(0, 4))}`);
+  assert.ok(!/[\ud800-\udfff]/.test(pair!.body!.replace(/😀/g, '')), 'no lone surrogate anywhere');
+  const csi = out.find((s) => s.kind === 'output' && s.runId === 'csi');
+  assert.match(csi!.body!, /^z+$/, `the colour is applied, not shown: ${JSON.stringify(csi?.body?.slice(0, 12))}`);
 });

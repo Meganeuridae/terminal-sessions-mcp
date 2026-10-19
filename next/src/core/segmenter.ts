@@ -24,7 +24,7 @@ import type { Journal } from './journal.js';
 import type { RunOutput } from './runindex.js';
 import { cutPlumbing } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
-import { tailStart } from './text.js';
+import { safeCut, tailStart, unfinishedSequence } from './text.js';
 import { project } from './transcript.js';
 import { DEFAULT_GEOMETRY, type EventOf, type JournalEvent, type OutputStream, type Principal, type RunInfo, type ScreenSnapshot, type Seq } from './types.js';
 
@@ -124,13 +124,15 @@ export interface ReplaySource {
  * A message's stable id: `<session>~<epoch>:<kind>:<seq>`, which the lane qualifies with the
  * node. The journal's epoch is kept across lives and restarts, so replayed messages keep their
  * ids (G22), and is new when a forgotten name starts `seq` over, so an id never names two
- * events (mcpl-4). A Run's progress digest carries the Run's id too, `<kind>~<runId>`: two Runs
- * in one session, each printing a line and going quiet, had digests at the same journal seq
- * and so the same id, and the lane's sent-set dropped the second as a repeat (the house's
- * review of #11).
+ * events (mcpl-4). A qualifier may follow the kind, `<kind>~<qualifier>`, where one seq can carry
+ * two segments of the kind: a Run's progress digest carries the Run's id (two Runs in one session,
+ * each printing a line and going quiet, had digests at the same journal seq and so the same id,
+ * and the lane's sent-set dropped the second as a repeat: the house's review of #11), and a
+ * screen its ordinal (a screen that differed from the last only in what the emulator had dropped,
+ * at the same seq, repeated its id and was dropped the same way: the house's read of 78c4d6e, #22).
  */
-export function segmentId(session: string, journal: Journal, kind: SegmentKind, seq: Seq, runId?: string): string {
-  return `${session}~${journal.epoch}:${kind}${runId !== undefined ? `~${runId}` : ''}:${seq}`;
+export function segmentId(session: string, journal: Journal, kind: SegmentKind, seq: Seq, qualifier?: string): string {
+  return `${session}~${journal.epoch}:${kind}${qualifier !== undefined ? `~${qualifier}` : ''}:${seq}`;
 }
 
 /** The seq a message id reports, when it is one of ours. */
@@ -319,11 +321,11 @@ export function liveSource(s: SegmentSource, cols?: number): ReplaySource {
 class Render {
   constructor(readonly src: ReplaySource) {}
 
-  base(kind: SegmentKind, seq: Seq, extra: Record<string, unknown> = {}, ts = Date.now()): Pick<Segment, 'kind' | 'seq' | 'ts' | 'messageId' | 'metadata'> {
+  /** `qualifier` goes after the kind in the id (a digest's Run, a screen's ordinal; see segmentId). */
+  base(kind: SegmentKind, seq: Seq, extra: Record<string, unknown> = {}, ts = Date.now(), qualifier?: string): Pick<Segment, 'kind' | 'seq' | 'ts' | 'messageId' | 'metadata'> {
     const meta: Record<string, unknown> = { session: this.src.id, state: this.src.state, controller: this.src.controller };
     if (this.src.cwd !== undefined) meta.cwd = this.src.cwd;
-    const ofRun = kind === 'output' && typeof extra.runId === 'string' ? extra.runId : undefined;
-    return { kind, seq, ts, messageId: segmentId(this.src.id, this.src.journal, kind, seq, ofRun), metadata: { ...meta, ...extra } };
+    return { kind, seq, ts, messageId: segmentId(this.src.id, this.src.journal, kind, seq, qualifier), metadata: { ...meta, ...extra } };
   }
 
   async run(ev: RunEnd): Promise<Segment | undefined> {
@@ -751,8 +753,12 @@ const NOT_ECHOED = '[input not echoed — not shown]';
 const NOT_RECONSTRUCTED = '[input edited with cursor, history or completion keys — not shown]';
 /** Output of a Run already in flight when the segmenter starts is counted from a bounded read. */
 const INFLIGHT_COUNT_BYTES = 1024 * 1024;
-/** Timers and cadences run on the monotonic clock: a wall-clock step scheduled a screen a minute out and showed a Run's age as negative (the house's read of 3eade8a, #22). */
 
+/**
+ * The live segmenter: builds segments as its session's journal grows, for the lanes subscribed to
+ * it. Its timers and cadences run on the monotonic clock: a wall-clock step scheduled a screen a
+ * minute out and showed a Run's age as negative (the house's read of 3eade8a, #22).
+ */
 export class Segmenter {
   private readonly listeners = new Set<(s: Segment) => void>();
   private readonly off: () => void;
@@ -777,6 +783,8 @@ export class Segmenter {
   /** Monotonic; negative infinity until a screen was sent, so the first is never held to a cadence from zero. */
   private lastScreenAt = Number.NEGATIVE_INFINITY;
   private lastScreenId: string | undefined;
+  /** Screens sent in this segmenter's life: each screen's id carries its ordinal (see segmentId). */
+  private screens = 0;
   /** The last screen's text; undefined when none was sent for this program, so a blank first frame is still a screen. */
   private lastScreenText: string | undefined;
   /** The emulator's dropped-unit count the last screen reported. */
@@ -1035,8 +1043,8 @@ export class Segmenter {
       const fresh: string[] = [];
       let end = nl;
       // Only the newest lines can survive, so read back from the end until there are enough. A
-      // newline at index 0 ends an empty first line: searching before it must find nothing, where
-      // A search before index 0 finds nothing: `lastIndexOf('\n', -1)` would search from 0 (the house's read of 3eade8a, #22).
+      // newline at index 0 ends an empty first line, and a search before index 0 must find nothing:
+      // `lastIndexOf('\n', -1)` would search from 0 (the house's read of 3eade8a, #22).
       while (end >= 0 && fresh.length < DIGEST_LINES) {
         const start = end > 0 ? buf.lastIndexOf('\n', end - 1) : -1;
         const line = cleanLine(buf.slice(start + 1, end)).trimEnd();
@@ -1049,8 +1057,10 @@ export class Segmenter {
     }
     if (buf.length > CARRY_MAX) {
       // A line that never ends (a progress bar): what follows its last carriage return is what shows.
+      // The cut lands on a safe boundary, never inside a control sequence or a surrogate pair (the
+      // house's read of 78c4d6e, #22: a digest began with a lone low surrogate, another with `;5;196m`).
       const cr = buf.lastIndexOf('\r', buf.length - 2);
-      buf = cr !== -1 && buf.length - cr - 1 <= CARRY_MAX ? buf.slice(cr + 1) : buf.slice(-CARRY_MAX);
+      buf = buf.slice(safeCut(buf, cr !== -1 && buf.length - cr - 1 <= CARRY_MAX ? cr + 1 : buf.length - CARRY_MAX));
     }
     w.carry = buf;
   }
@@ -1063,13 +1073,16 @@ export class Segmenter {
   private digest(w: RunWatch): void {
     const run = runOf(this.s, w.runId);
     if (!run || w.bytes === w.bytesAtLastDigest || (this.alt && !w.pipes) || this.disposing) return;
-    const partial = cleanLine(w.carry).trimEnd();
+    // A carry that ends inside a control sequence is held until the sequence completes (or the Run
+    // ends): what it does to the line is not known yet, and its payload is not text (the house's
+    // read of 78c4d6e, #22: `working ESC [ 3` showed as `working [3` until the next read).
+    const partial = unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
     const tail = (partial ? [...w.lines, partial] : w.lines).slice(-DIGEST_LINES).join('\n');
     const seq = this.s.journal.lastSeq;
     // The Run's start is a wall-clock stamp; a step back since then is not a negative age.
     const elapsed = Math.max(0, Date.now() - (run.startedAt ?? run.admittedAt));
     const seg: Segment = {
-      ...this.render.base('output', seq, { runId: w.runId, bytes: w.bytes, ...(w.bytesAtLeast ? { bytesAtLeast: true } : {}), elapsedMs: elapsed, nextCursor: seq }),
+      ...this.render.base('output', seq, { runId: w.runId, bytes: w.bytes, ...(w.bytesAtLeast ? { bytesAtLeast: true } : {}), elapsedMs: elapsed, nextCursor: seq }, Date.now(), w.runId),
       lifecycle: false,
       tags: ['terminal:output', 'terminal:running'],
       head: `[terminal] ${this.s.id}: running \`${describeRun(run)}\` ${fmtDuration(elapsed)} · ${w.bytesAtLeast ? 'at least ' : ''}${fmtBytes(w.bytes)} so far · run ${w.runId}`,
@@ -1160,8 +1173,10 @@ export class Segmenter {
     this.firstScreenPending = false;
     // Output the emulator dropped under pressure is part of what the screen does not show (§6).
     const dropped = snap.droppedUnits ? ` · ${snap.droppedUnits} output units were dropped under pressure, so the screen may be incomplete` : '';
+    // Its own ordinal in the id: a screen that differs from the last only in what was dropped, or one
+    // taken between a compaction and the parse of the kept batch, is at the same seq as the last.
     const seg: Segment = {
-      ...this.render.base('screen', snap.seq, { cols: snap.cols, rows: snap.rows, ...(snap.droppedUnits ? { droppedUnits: snap.droppedUnits } : {}) }),
+      ...this.render.base('screen', snap.seq, { cols: snap.cols, rows: snap.rows, ...(snap.droppedUnits ? { droppedUnits: snap.droppedUnits } : {}) }, Date.now(), String(++this.screens)),
       lifecycle: false,
       tags: ['terminal:screen'],
       head: `[terminal] ${this.s.id}: full-screen program${snap.title ? ` "${oneLine(snap.title, 60)}"` : ''} · screen at seq ${snap.seq}${dropped} (screen session=${this.s.id} for the current one)`,

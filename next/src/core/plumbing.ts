@@ -30,12 +30,25 @@ export const exitMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<EXIT:$
  * from before it was printed).
  */
 export const probeMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<PROBE:${nonce}(?::(\\d+)(?::(${NONCE}|))?)?>>>`);
+/**
+ * A typed line's text as the echo may show it: a line editor redrawing a long typed line can break
+ * it anywhere, so whitespace may fall between any two characters, and bash 5.2 wrapping a line at a
+ * narrow width writes the character at the margin again after a carriage return (`a1b2c\rc3d4`
+ * inside a nonce: the house's read of 78c4d6e, #22, found such a probe line kept in a cancelled
+ * Run's output), so any character may be followed by whitespace and itself again (the carriage
+ * return is whitespace to the regex, and gone from stripEscapes's text). The unknown nonce keeps its class.
+ */
+const redrawn = (s: string): string => {
+  if (s === NONCE) return NONCE;
+  const chars = s.split('').map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return chars.map((c) => `${c}(?:\\s*${c})?`).join('\\s*');
+};
+/** A mark's word as the typed lines spell it, split by two quotes (`EXI""T`), each piece as it may be redrawn. */
+const splitWord = (a: string, b: string): string => `${redrawn(a)}\\s*(?:${redrawn('""')}|${redrawn("''")})\\s*${redrawn(b)}`;
 /** The echo of a typed line that runs a Run: the wrapper's end marker or the inline start marker, split. */
-/** A known nonce as the echo may show it: a line editor redrawing a long typed line can break it anywhere, so whitespace may fall between its characters. */
-const redrawn = (nonce: string): string => (nonce === NONCE ? NONCE : nonce.split('').map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s*'));
-const wrapperEcho = (nonce: string): RegExp => new RegExp(`<<<(?:EXI(?:""|'')T|STAR(?:""|'')T):${redrawn(nonce)}:`, 'g');
+const wrapperEcho = (nonce: string): RegExp => new RegExp(`${redrawn('<<<')}\\s*(?:${splitWord('EXI', 'T')}|${splitWord('STAR', 'T')})\\s*:\\s*${redrawn(nonce)}\\s*:`, 'g');
 /** The echo of a probe line typed after a ^C, split. */
-const probeEcho = (nonce: string): RegExp => new RegExp(`<<<PRO(?:""|'')BE:${nonce}`, 'g');
+const probeEcho = (nonce: string): RegExp => new RegExp(`${redrawn('<<<')}\\s*${splitWord('PRO', 'BE')}\\s*:\\s*${redrawn(nonce)}`, 'g');
 /** A probe answer with its nonce (1), pid (2) and token (3). */
 const probeAnswer = (nonce: string): RegExp => new RegExp(`<<<PROBE:(${nonce})(?::(\\d+)(?::(${NONCE}|))?)?>>>`, 'g');
 
@@ -58,10 +71,13 @@ export interface PlumbingOf {
  * line. Under `marker` and `inline` the marks carry the Run's nonce, and the cut is by it: the
  * echo of the typed line (its last echo: typed ahead of the prompt it echoes twice), an inline
  * Run's start-marker line or the rest of it (the output begins right after `>>>`), and
- * everything from the end marker on, or from the probe answer the session accepted — from the
- * start of that probe's echo line. A probe the session rejected (answered by a nested shell: its
- * pid is not the one the start marker named, or its token is not the Run's) is struck from the
- * output with its echo line, and the output goes on past it (the house's read of 39787b3, #22).
+ * everything from the end marker on, or from the probe answer the session accepted. Before that
+ * end, every probe's echo line and every rejected answer's line is struck on its own, and the
+ * output between them stays: a probe the session rejected (answered by a nested shell: its pid is
+ * not the one the start marker named, or its token is not the Run's) is not an end (the house's
+ * read of 39787b3, #22), and a probe nothing answered, because a program ignoring ^C read it,
+ * leaves only its echo behind, with what the program printed after it still output (the house's
+ * read of 78c4d6e, #22: the cut moved back to that echo and the output after it was gone).
  * Without a recorded nonce the same shapes are found with any nonce, which can take a program
  * line in a mark's shape for one. The cut is found on the text without escape sequences and
  * made in the raw.
@@ -100,31 +116,23 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     return [s, e === -1 ? rest.length : e + 1];
   };
   let to = exitMark(nonce).exec(rest)?.index ?? rest.length;
-  let accepted = -1;
   const struck: Array<[number, number]> = [];
-  const answers: number[] = [];
   for (const m of rest.matchAll(probeAnswer(nonce))) {
     if (m.index >= to) break;
-    answers.push(m.index);
     // Accepted as the session accepts it (applyInlineMarker): the marker strategy's answer names
     // no pid; an inline answer must carry the Run's token, or no token with the very pid the start
     // marker named (the declared shell replaced in place by an exec); from before tokens, that pid,
     // or any when the output does not say which.
     const ok = m[2] === undefined || (m[3] !== undefined ? m[3] === m[1] || (m[3] === '' && pid !== undefined && m[2] === pid) : pid === undefined || m[2] === pid);
     if (ok) {
-      accepted = to = m.index;
+      to = m.index;
       break;
     }
     struck.push(lineOf(m.index));
   }
-  const echoes = [...rest.matchAll(probeEcho(nonce))].map((m) => m.index).filter((i) => i < to);
-  if (accepted !== -1) {
-    // The accepted probe's own echo: the last one before its answer with no other answer between
-    // (a probe answered by nothing leaves an echo alone). The cut moves back to its line.
-    const own = echoes.filter((i) => !answers.some((a) => a > i && a < accepted)).at(-1);
-    if (own !== undefined) to = lineOf(own)[0];
-  }
-  for (const i of echoes) if (i < to) struck.push(lineOf(i));
+  // Each probe's echo line before the end is plumbing on its own, the accepted probe's included; a
+  // probe nothing answered leaves only its echo, and what was printed after it stays.
+  for (const m of rest.matchAll(probeEcho(nonce))) if (m.index < to) struck.push(lineOf(m.index));
   const kept: Array<[number, number]> = [];
   let pos = 0;
   for (const [s, e] of struck.sort((a, b) => a[0] - b[0])) {

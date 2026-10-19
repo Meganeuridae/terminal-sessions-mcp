@@ -162,9 +162,11 @@ test('defect 10: a marker Run read from history has the daemon’s wrapper cut, 
     '<<<EXIT:74ef5182:0>>>\n' +
     'bash-3.2$';
   assert.equal(cutPlumbing(fromHistory), 'MARKED-OUTPUT\n', 'wrapper, end marker and prompt are cut');
-  // The end-marker probe typed after a ^C (its own mark, split in the echo) and what follows it go too.
+  // The end-marker probe typed after a ^C (its own mark, split in the echo), its answer and what follows
+  // the answer go too. Output between the echo and the answer is the program's (its last words, flushed
+  // after the probe was typed ahead) and stays (the house's read of 78c4d6e, #22: the cut from the echo lost it).
   const withProbe = 'OUT\n echo "<<<PRO""BE:74ef5182>>>"\nleftover\n<<<PROBE:74ef5182>>>\n<<<EXIT:74ef5182:130>>>\nbash-3.2$';
-  assert.equal(cutPlumbing(withProbe), 'OUT\n');
+  assert.equal(cutPlumbing(withProbe), 'OUT\nleftover\n');
   // Ordinary output with no marker in it is left whole.
   const plain = 'line one\nline two\n';
   assert.equal(cutPlumbing(plain), plain);
