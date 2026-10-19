@@ -73,9 +73,13 @@ export interface PlumbingOf {
  * end mark, and the marks are not output. Under `basic` the first line is the echo of the typed
  * line. Under `marker` and `inline` the marks carry the Run's nonce, and the cut is by it: the
  * echo of the typed line at the output's head (the lines echoing it without a break: typed ahead
- * of the prompt it echoes twice, and a redraw shows it in pieces), an inline
- * Run's start-marker line or the rest of it (the output begins right after `>>>`), and
- * everything from the end marker on, or from the probe answer the session accepted. Before that
+ * of the prompt it echoes twice, and a redraw shows it in pieces); under `inline` everything
+ * through the start-marker line (the output begins right after `>>>`), whatever a slow shell
+ * printed between the echo and the marker included (a login banner, its first prompt showing the
+ * line again); and everything from the end marker on, or from the probe answer the session
+ * accepted. A later line in the echo's shape is the program's. The marker strategy has no start
+ * marker, so a shell that prints its banner and shows the typed line again before it runs it
+ * (one still starting when the line was typed) leaves those lines in its first Run. Before that
  * end, every probe's echo line and every rejected answer's line is struck on its own, and the
  * output between them stays: a probe the session rejected (answered by a nested shell: its pid is
  * not the one the start marker named, or its token is not the Run's) is not an end (the house's
@@ -96,27 +100,37 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   const nonce = of.nonce ?? NONCE;
   const { text, map } = stripEscapes(raw);
   let from = 0;
-  // The typed line's echo is the output's first line, and only the lines that follow it without a
-  // break are more of it: the same line echoed again (typed ahead of its prompt), or the pieces of
-  // a redraw, which can split the nonce across lines. A line in the echo's shape after the start
-  // marker or after output is the program's: `history 1` in a declared bash prints the typed line
-  // with the Run's own nonce, and the rule that took the last such line for the echo cut everything
-  // before it (the house's read of 78c4d6e, #22, comment 6269901528).
-  const echoes = [...text.matchAll(wrapperEcho(nonce))].map((m) => [m.index, m.index + m[0].length] as const);
-  for (;;) {
-    const nl = text.indexOf('\n', from);
-    const lineEnd = nl === -1 ? text.length : nl;
-    if (!echoes.some(([s, e]) => s < lineEnd && e > from)) break;
-    if (nl === -1) return '';
-    from = nl + 1;
-  }
   let pid: string | undefined = of.pid;
-  const start = startMark(nonce).exec(text.slice(from));
-  if (start?.index === 0) {
+  const echoes = [...text.matchAll(wrapperEcho(nonce))].map((m) => [m.index, m.index + m[0].length] as const);
+  const start = startMark(nonce).exec(text);
+  if (start && (echoes.length === 0 || echoes[0]![0] < start.index)) {
+    // An inline Run's output begins after its start marker: what the text holds before it is the
+    // shell's, not the Run's (the typed line's echo, a banner or prompt a slow shell printed after
+    // the line was typed, the pieces' acknowledgements), and a line in the echo's shape after the
+    // marker is the program's (`history 1` prints the typed line with the Run's own nonce, and the
+    // rule that took the last such line for the echo cut everything before it: the house's read of
+    // 78c4d6e, #22, comment 6269901528).
     pid = start[1];
-    const nl = text.indexOf('\n', from + start[0].length);
+    const nl = text.indexOf('\n', start.index + start[0].length);
     from = nl === -1 ? text.length : nl + 1;
-  } else if (of.strategy === 'inline' && text[from] === '\n') from++;
+  } else {
+    // The typed line's echo is the output's first line, and only the lines that follow it without a
+    // break are more of it: the same line echoed again (typed ahead of its prompt), or the pieces of
+    // a redraw, which can split the nonce across lines. A line in the echo's shape after output is
+    // the program's (`history 1` prints the typed line with the Run's own nonce), and a shell still
+    // starting when the line was typed shows it again after its banner, which the marker strategy,
+    // with no start marker, cannot tell from the program's: those lines stay in its first Run.
+    if (echoes.length && echoes[0]![0] < (text.indexOf('\n') === -1 ? text.length : text.indexOf('\n'))) {
+      for (;;) {
+        const nl = text.indexOf('\n', from);
+        const lineEnd = nl === -1 ? text.length : nl;
+        if (!echoes.some(([s, e]) => s < lineEnd && e > from)) break;
+        if (nl === -1) return '';
+        from = nl + 1;
+      }
+    }
+    if (of.strategy === 'inline' && text[from] === '\n') from++;
+  }
   const rest = text.slice(from);
   const lineOf = (i: number): [number, number] => {
     const s = rest.lastIndexOf('\n', i - 1) + 1;

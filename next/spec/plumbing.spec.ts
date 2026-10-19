@@ -167,6 +167,9 @@ test('a wrapper-shaped line in a Run’s output is output: only the echo lines a
   assert.equal(cutPlumbing(`\r\nbefore-2\r\n${recalled}\r\n<<<EXIT:${N}:0>>>`, inline), `before-2\r\n${recalled}\r\n`);
   // History: the echo line, the start marker, then the output with the recalled line in it.
   assert.equal(cutPlumbing(`${typedStart}\r\n<<<START:${N}:4242>>>\r\nbefore-2\r\n${recalled}\r\n<<<EXIT:${N}:0>>>\r\n`, inline), `before-2\r\n${recalled}\r\n`);
+  // A shell still starting when the line was typed (ssh: the line echoed locally, then the login banner, then the
+  // remote prompt showing the line again) prints all of that before the start marker: everything through the marker is the shell's.
+  assert.equal(cutPlumbing(`${typedStart}\r\nLast login: today\r\n$ ${typedStart}\r\n<<<START:${N}:4242>>>\r\nbefore-2\r\n${recalled}\r\n<<<EXIT:${N}:0>>>\r\n`, inline), `before-2\r\n${recalled}\r\n`);
   // `history | tail -n 3` and `fc -l -1` print it among other lines, or with a tab.
   const tail3 = `  500  ls\r\n  501  cd /tmp\r\n  502 ${typedStart}`;
   assert.equal(cutPlumbing(`\r\nbefore-2\r\n${tail3}\r\n<<<EXIT:${N}:0>>>`, inline), `before-2\r\n${tail3}\r\n`);

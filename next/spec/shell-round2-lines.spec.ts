@@ -136,7 +136,13 @@ test('fish: ss-12: the first Run of a none-to-rich transition keeps its output',
   try {
     assert.equal(x.session.integration, 'none');
     const r = await run(x, 'echo first; echo second', 8000);
-    assert.deepEqual([r.state, r.exit, r.text], ['exited', 0, 'first\nsecond']);
+    // The shell was still starting when the line was typed: the terminal echoed it, then fish printed its banner and
+    // showed the line again at its first prompt. The marker strategy has no start marker to cut up to, and a line in
+    // the typed line's shape after output is the program's (`history 1` prints it), so those lines stay above the
+    // output; the output itself and the end marker are what the rule must get right.
+    assert.deepEqual([r.state, r.exit], ['exited', 0]);
+    assert.ok(r.text.endsWith('first\nsecond'), JSON.stringify(r.text));
+    assert.ok(!r.text.includes('<<<EXIT'), 'the end marker is cut');
     await until(() => x.session.integration === 'rich', 3000, 'rich');
     assert.equal((await run(x, 'echo third')).text, 'third');
   } finally {
