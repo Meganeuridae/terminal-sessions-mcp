@@ -13,8 +13,9 @@ test('a line typed ahead during a Run is seen even when PS1 takes longer than th
   const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': "PS1='$(sleep 0.4)\\$ '\n" }, editingStaleMs: 5000 });
   try {
     assert.equal((await x.run('echo ready')).text.trim(), 'ready');
-    const a = x.session.admit({ target: 'shell', line: 'sleep 0.6', principal: AGENT });
-    assert.ok(a.admitted);
+    // (The prompt after `echo ready` takes 0.4 s to print: wait it out, as `run` does.)
+    const a = await x.session.admitWhenAvailable({ target: 'shell', line: 'sleep 0.6', principal: AGENT }, 3000);
+    assert.ok(a.admitted, JSON.stringify(a));
     // A person types their next command while the Run runs, without Enter; an agent queues one.
     x.session.input('echo typed-ahead-marker', { principal: AGENT });
     const q = x.session.admit({ target: 'shell', line: 'echo queued-ran', principal: AGENT, queue: true });
