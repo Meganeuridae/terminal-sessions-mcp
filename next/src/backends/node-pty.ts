@@ -135,6 +135,75 @@ class NodePty implements PtyHandle {
 }
 
 /**
+ * Can `cmd` be executed — as the kernel will resolve it (a relative path against the cwd's real
+ * directory, not the symlink's parent) and with its interpreter present? The reason otherwise, in
+ * the shape of a spawn error (the house's read of d5873f0: a path the launcher cannot exec got the
+ * launcher's exit 127, which a command that ran could also return).
+ */
+function executable(cmd: string, PATH: string | undefined, cwd: string): { ok: true } | { ok: false; error: string } {
+  let real = cwd;
+  try {
+    real = fs.realpathSync(cwd);
+  } catch {
+    // the cwd as given
+  }
+  const check = (file: string): string | undefined => {
+    let st: fs.Stats;
+    try {
+      st = fs.statSync(file);
+    } catch {
+      return 'ENOENT';
+    }
+    if (!st.isFile()) return 'EACCES';
+    try {
+      fs.accessSync(file, fs.constants.X_OK);
+    } catch {
+      return 'EACCES';
+    }
+    // A script whose interpreter is missing cannot be executed either (ENOENT from execve).
+    const fd = fs.openSync(file, 'r');
+    try {
+      const head = Buffer.alloc(256);
+      const n = fs.readSync(fd, head, 0, head.length, 0);
+      const line = head.subarray(0, n).toString('utf8').split('\n', 1)[0] ?? '';
+      if (line.startsWith('#!')) {
+        const interp = line.slice(2).trim().split(/\s+/)[0];
+        if (interp && !fs.existsSync(interp)) return `ENOENT (its interpreter ${interp} is missing)`;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    return undefined;
+  };
+  if (cmd.includes('/')) {
+    const e = check(path.resolve(real, cmd));
+    return e ? { ok: false, error: `${e.split(' ')[0]} spawn ${cmd} ${e}` } : { ok: true };
+  }
+  for (const d of (PATH ?? '/usr/bin:/bin').split(':')) {
+    const file = path.resolve(real, d === '' ? '.' : d, cmd);
+    const e = check(file);
+    if (e === undefined) return { ok: true };
+    if (e.startsWith('ENOENT (')) return { ok: false, error: `ENOENT spawn ${cmd} ${e}` };
+  }
+  return { ok: false, error: `ENOENT spawn ${cmd} ENOENT` };
+}
+
+/** A process that never started: its handle reports the spawn error and nothing else (core-15: no exit, no signal). */
+function failedSpawn(error: string): ProcessHandle {
+  const exitL = new Set<(e: PtyExit) => void>();
+  queueMicrotask(() => exitL.forEach((l) => l({ exitCode: null, spawnError: error })));
+  return {
+    pid: -1,
+    pgid: -1,
+    onStdout: () => () => undefined,
+    onStderr: () => () => undefined,
+    onExit: (l) => (exitL.add(l), () => exitL.delete(l)),
+    kill: () => undefined,
+    groupAlive: () => false,
+  };
+}
+
+/**
  * What every process Run starts through: `/bin/bash -p -c PROCESS_LAUNCH termd-process <argv…>`.
  * It closes every descriptor above stderr before the command runs. node-pty opens each
  * session's terminal master without close-on-exec, and Node passes a child every descriptor
@@ -152,23 +221,7 @@ class NodePty implements PtyHandle {
  * as a command named 12). Its privileged mode skips BASH_ENV and imported shell functions
  * before cleanup; the Run's line still executes in /bin/sh, with the environment it was given plus
  * what bash exports on its way (`PWD`, `SHLVL`) and without `_` (the house measured it).
- */
-/** Is `cmd` a file that may be executed, by path or on `PATH`? */
-function executable(cmd: string, PATH: string | undefined, cwd: string): boolean {
-  const ok = (p: string) => {
-    try {
-      const file = path.resolve(cwd, p);
-      fs.accessSync(file, fs.constants.X_OK);
-      return fs.statSync(file).isFile();
-    } catch {
-      return false;
-    }
-  };
-  if (cmd.includes('/')) return ok(cmd);
-  return (PATH ?? '/usr/bin:/bin').split(':').some((d) => ok(path.join(d, cmd)));
-}
-
-/**
+ *
  * The launcher's text; with `readsLine`, descriptor 3 carries the Run's own text: the launcher
  * keeps it through the close loop and execs `/bin/sh`, which reads it, closes it and runs the text
  * (see spawnProcess).
@@ -181,7 +234,7 @@ export function processLaunch(readsLine: boolean, oomScoreAdj = 0): string {
     'eval "unset __tsm_l __tsm_line; $__tsm_line"',
   ].join('\n');
   return [
-    `if [ -d /dev/fd ]; then for f in /dev/fd/*; do case "\${f##*/}" in ${readsLine ? '0|1|2|3' : '0|1|2'}) ;; *) eval "exec \${f##*/}>&-" 2>/dev/null || :;; esac; done; fi`,
+    `if [ -d /dev/fd ]; then for __tsm_fd in /dev/fd/*; do case "\${__tsm_fd##*/}" in ${readsLine ? '0|1|2|3' : '0|1|2'}) ;; *) eval "exec \${__tsm_fd##*/}>&-" 2>/dev/null || :;; esac; done; unset __tsm_fd; fi`,
     ...oomLine(oomScoreAdj),
     ...(readsLine
       // Read the descriptor itself: Linux cannot reopen Node's socket as /dev/fd/3.
@@ -217,7 +270,7 @@ export function findBash(PATH: string | undefined = process.env.PATH, standard =
     }
   };
   if (ok(standard)) return standard;
-  for (const d of (PATH ?? '').split(':')) if (d !== '' && ok(path.join(d, 'bash'))) return path.join(d, 'bash');
+  for (const d of (PATH ?? '').split(':')) if (d !== '' && ok(path.resolve(d, 'bash'))) return path.resolve(d, 'bash'); // resolved now, not against each Run's cwd
   return undefined;
 }
 
@@ -236,14 +289,25 @@ export class NodePtyBackend implements ExecutionBackend {
    * process Runs are refused with this reason rather than ending `lost` one by one.
    */
   processSupport(): { ok: true } | { ok: false; reason: string } {
-    if (!this.bash) return { ok: false, reason: 'process Runs need bash (/bin/bash, or a bash on the daemon’s PATH) to close inherited descriptors before the command runs, and this host has none: install it (Alpine: apk add bash)' };
-    if (!fs.existsSync('/dev/fd')) return { ok: false, reason: 'process Runs need /dev/fd to list the descriptors to close before the command runs, and this host has none' };
+    if (!this.bash) return { ok: false, reason: 'process Runs need bash (/bin/bash, or a bash on the daemon’s PATH) to close inherited descriptors before the command runs, and this host has none: install it (Alpine: apk add bash), then restart termd — the check runs once at startup' };
+    // /dev/fd must be a directory listing this process's own descriptors (a loop over an empty one ran `exec *>&-`).
+    try {
+      const names = fs.readdirSync('/dev/fd');
+      if (!['0', '1', '2'].every((n) => names.includes(n))) return { ok: false, reason: 'process Runs need /dev/fd to list the process’s descriptors so the ones a command would inherit can be closed, and this host’s /dev/fd does not' };
+    } catch {
+      return { ok: false, reason: 'process Runs need /dev/fd to list the descriptors to close before the command runs, and this host has none' };
+    }
     return { ok: true };
   }
 
   spawnShell(opts: SpawnShellOptions): PtyHandle {
     const launcher = opts.bootstrap?.launcher;
-    const p = pty.spawn(launcher ? '/bin/sh' : opts.shell, launcher ? [launcher, opts.shell, ...opts.args] : opts.args, {
+    // The launcher runs under bash where there is one (`-p`: no BASH_ENV, no imported functions), so
+    // its loop can close the terminal masters of the sessions opened before this one, which node-pty
+    // leaves open to every child (the house's read of d5873f0). Without bash it runs under /bin/sh
+    // and skips the loop.
+    const through = launcher ? (this.bash ? [this.bash, ['-p', launcher, opts.shell, ...opts.args]] : ['/bin/sh', [launcher, opts.shell, ...opts.args]]) : [opts.shell, opts.args];
+    const p = pty.spawn(through[0] as string, through[1] as string[], {
       name: 'xterm-256color',
       cwd: opts.cwd,
       env: opts.env,
@@ -258,7 +322,7 @@ export class NodePtyBackend implements ExecutionBackend {
     if (!cmd) throw new Error('spawnProcess: empty argv');
     // detached: own process group, so cancel can signal the group (G29). stdin is
     // /dev/null: no verb writes to a process Run's stdin, so a reader sees EOF
-    // instead of hanging (core-12). The command starts through PROCESS_LAUNCH (below),
+    // instead of hanging (core-12). The command starts through processLaunch (above),
     // whose exec keeps the pid, so the group leader is the command itself. A command
     // that cannot be found or run is spawned directly, so the failure is a spawn error,
     // not the launcher's exit 127 (core-15: nothing ran, no signal was observed).
@@ -268,30 +332,21 @@ export class NodePtyBackend implements ExecutionBackend {
     if (!support.ok) throw err('unsupported', support.reason);
     const bash = this.bash!;
     const script = opts.line !== undefined && cmd === '/bin/sh' && args.length === 0 ? `${opts.line}\n` : undefined;
+    if (script === undefined) {
+      // A command the kernel could not execute is never spawned at all: the handle reports the
+      // spawn error (nothing ran), where the launcher's exec would have given an exit 127 that a
+      // command which ran could also return (core-15; the house's read of d5873f0).
+      const can = executable(cmd, opts.env.PATH, opts.cwd);
+      if (!can.ok) return failedSpawn(can.error);
+    }
     const launched =
       script !== undefined
         ? ([bash, ['--noprofile', '--norc', '-p', '-c', processLaunch(true, opts.oomScoreAdj ?? 0), 'termd-process']] as const)
-        : executable(cmd, opts.env.PATH, opts.cwd)
-          ? ([bash, ['--noprofile', '--norc', '-p', '-c', processLaunch(false, opts.oomScoreAdj ?? 0), 'termd-process', cmd, ...args]] as const)
-          : ([cmd, args] as const);
+        : ([bash, ['--noprofile', '--norc', '-p', '-c', processLaunch(false, opts.oomScoreAdj ?? 0), 'termd-process', cmd, ...args]] as const);
     const child = spawnChild(launched[0], [...launched[1]], { cwd: opts.cwd, env: opts.env, stdio: script !== undefined ? ['ignore', 'pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'], detached: true });
-    if (script !== undefined) {
-      const feed = child.stdio[3] as NodeJS.WritableStream | null;
-      feed?.on('error', () => undefined); // the shell may exit before reading it all
-      feed?.end(script);
-    }
-    // (Both streams are piped above; the conditional stdio array widens their types.)
-    const stdout = child.stdout!;
-    const stderr = child.stderr!;
-    // The journal stores UTF-8 text, not arbitrary binary streams. Node's streaming
-    // decoder preserves split characters and replaces invalid sequences with U+FFFD.
-    stdout.setEncoding('utf8');
-    stderr.setEncoding('utf8');
     const outL = new Set<(d: string) => void>();
     const errL = new Set<(d: string) => void>();
     const exitL = new Set<(e: PtyExit) => void>();
-    stdout.on('data', (d: string) => outL.forEach((l) => l(d)));
-    stderr.on('data', (d: string) => errL.forEach((l) => l(d)));
     const pgid = child.pid;
     let fired = false;
     let spawned = false;
@@ -302,10 +357,30 @@ export class NodePtyBackend implements ExecutionBackend {
       exitL.forEach((l) => l(e));
     };
     child.on('spawn', () => (spawned = true));
+    // Before anything touches the streams: out of descriptors (EMFILE, ENFILE) Node returns a
+    // child with no stdio and emits the error on the next tick (the house's read of d5873f0).
+    // A spawn failure is not an exit: nothing ran, and no signal was observed (core-15).
+    child.on('error', (e: NodeJS.ErrnoException) => {
+      if (spawned) return;
+      fire({ exitCode: null, spawnError: e.code ? `${e.code} ${e.message}` : e.message });
+    });
+    if (script !== undefined) {
+      const feed = child.stdio[3] as NodeJS.WritableStream | null | undefined;
+      feed?.on('error', () => undefined); // the shell may exit before reading it all
+      feed?.end(script);
+    }
+    const stdout = child.stdout;
+    const stderr = child.stderr;
+    // The journal stores UTF-8 text, not arbitrary binary streams. Node's streaming
+    // decoder preserves split characters and replaces invalid sequences with U+FFFD.
+    stdout?.setEncoding('utf8');
+    stderr?.setEncoding('utf8');
+    stdout?.on('data', (d: string) => outL.forEach((l) => l(d)));
+    stderr?.on('data', (d: string) => errL.forEach((l) => l(d)));
     // Report the exit once the pipes are drained, so the Run's last output lands
     // before its end; a group member that keeps the pipes open only delays it by
     // DRAIN_MS.
-    let open = 2;
+    let open = (stdout ? 1 : 0) + (stderr ? 1 : 0);
     let pendingExit: PtyExit | undefined;
     let drainTimer: NodeJS.Timeout | undefined;
     const settle = () => {
@@ -314,8 +389,8 @@ export class NodePtyBackend implements ExecutionBackend {
         fire(pendingExit);
       }
     };
-    stdout.on('end', () => (open--, settle()));
-    stderr.on('end', () => (open--, settle()));
+    stdout?.on('end', () => (open--, settle()));
+    stderr?.on('end', () => (open--, settle()));
     child.on('exit', (code, signal) => {
       leaderExited = true;
       pendingExit = signal ? { exitCode: null, signal } : { exitCode: code };
@@ -323,11 +398,19 @@ export class NodePtyBackend implements ExecutionBackend {
       drainTimer.unref();
       settle();
     });
-    // A spawn failure is not an exit: nothing ran, and no signal was observed (core-15).
-    child.on('error', (e: NodeJS.ErrnoException) => {
-      if (spawned) return;
-      fire({ exitCode: null, spawnError: e.code ? `${e.code} ${e.message}` : e.message });
-    });
+    // Once the Run's group has been seen empty after its leader exited, or its number seen held by a
+    // stranger, nothing is signalled again (a latch: the number could go to a new group of a
+    // stranger whose own leader exits — the house's read of d5873f0).
+    let gone = false;
+    const ours = (): boolean => {
+      if (pgid === undefined || gone) return false;
+      if (!leaderExited) return true;
+      if (!groupAlive(pgid) || !groupStillOurs(pgid)) {
+        gone = true;
+        return false;
+      }
+      return true;
+    };
     return {
       get pid() {
         return child.pid ?? -1;
@@ -339,12 +422,11 @@ export class NodePtyBackend implements ExecutionBackend {
       onStderr: (l) => (errL.add(l), () => errL.delete(l)),
       onExit: (l) => (exitL.add(l), () => exitL.delete(l)),
       kill(signal) {
-        if (pgid === undefined) return;
         // The group, not the leader: members survive a leader that exited (tg-12). Once the
         // leader has exited, only a group that is still the Run's is signalled (see groupStillOurs).
-        if (leaderExited && !groupStillOurs(pgid)) return;
+        if (!ours()) return;
         try {
-          process.kill(-pgid, signal);
+          process.kill(-pgid!, signal);
         } catch {
           if (child.exitCode === null && child.signalCode === null) {
             try {
@@ -355,7 +437,7 @@ export class NodePtyBackend implements ExecutionBackend {
           }
         }
       },
-      groupAlive: () => pgid !== undefined && groupAlive(pgid) && (!leaderExited || groupStillOurs(pgid)),
+      groupAlive: () => ours() && groupAlive(pgid!),
     };
   }
 }

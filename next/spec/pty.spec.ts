@@ -9,6 +9,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { findBash, groupStillOurs, NodePtyBackend } from '../src/backends/node-pty.js';
+import type { PtyExit } from '../src/backends/types.js';
 import { Journal } from '../src/core/journal.js';
 import { Session } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
@@ -402,4 +403,55 @@ test('bash is a checked requirement for process Runs: found at /bin/bash or on P
   } finally {
     await session.close();
   }
+});
+
+test('a later session’s shell holds no earlier session’s terminal master: the launcher closes what the daemon leaks to it', { skip: process.platform !== 'linux' ? 'readlink of /dev/fd entries needs /proc' : false }, async () => {
+  const a = await real('/bin/bash');
+  const b = await real('/bin/bash');
+  const textOf = (j: Journal, runId: string) => j.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'output' }> => e.type === 'output' && e.runId === runId).map((e) => e.data).join('');
+  try {
+    const held = await runWait(b.session, "for f in /dev/fd/*; do readlink \"$f\"; done 2>/dev/null | grep -c ptmx || true");
+    assert.match(textOf(b.journal, held.runId), /(^|\n)0\r?\n/, 'the second shell holds no pty master (the first session’s, before this change)');
+    const heldA = await runWait(a.session, "for f in /dev/fd/*; do readlink \"$f\"; done 2>/dev/null | grep -c ptmx || true");
+    assert.match(textOf(a.journal, heldA.runId), /(^|\n)0\r?\n/);
+  } finally {
+    await a.session.close();
+    await b.session.close();
+  }
+});
+
+test('a command the kernel could not execute is never spawned: the handle reports the spawn error, naming a missing interpreter; a relative argv through a symlinked cwd still gets the descriptor cleanup', async () => {
+  const backend = new NodePtyBackend();
+  const missing = await new Promise<PtyExit>((resolve) => backend.spawnProcess({ argv: ['./no-such-tool'], cwd: tmp, env: {} }).onExit(resolve));
+  assert.match(missing.spawnError ?? '', /^ENOENT spawn \.\/no-such-tool/);
+  const noInterp = path.join(tmp, 'no-interp.sh');
+  fs.writeFileSync(noInterp, '#!/nonexistent/interp\necho never\n', { mode: 0o755 });
+  const interp = await new Promise<PtyExit>((resolve) => backend.spawnProcess({ argv: [noInterp], cwd: tmp, env: {} }).onExit(resolve));
+  assert.match(interp.spawnError ?? '', /ENOENT .*its interpreter \/nonexistent\/interp is missing/);
+  const notExec = path.join(tmp, 'not-exec.sh');
+  fs.writeFileSync(notExec, 'echo never\n', { mode: 0o644 });
+  const eacces = await new Promise<PtyExit>((resolve) => backend.spawnProcess({ argv: [notExec], cwd: tmp, env: {} }).onExit(resolve));
+  assert.match(eacces.spawnError ?? '', /^EACCES spawn /);
+  // The cwd is a symlink: `../bin/tool` resolves against the real directory, as the kernel does, so
+  // the preflight says yes and the tool runs through the launcher (clean descriptors), not directly.
+  fs.mkdirSync(path.join(tmp, 'real', 'sub'), { recursive: true });
+  fs.mkdirSync(path.join(tmp, 'real', 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'real', 'bin', 'tool'), '#!/bin/sh\n/bin/ls /dev/fd\n', { mode: 0o755 });
+  const link = path.join(tmp, 'link-to-sub');
+  fs.symlinkSync(path.join(tmp, 'real', 'sub'), link);
+  let text = '';
+  const child = backend.spawnProcess({ argv: ['../bin/tool'], cwd: link, env: {} });
+  child.onStdout((d) => (text += d));
+  const exit = await new Promise<PtyExit>((resolve) => child.onExit(resolve));
+  assert.equal(exit.exitCode, 0, JSON.stringify(exit));
+  assert.deepEqual(text.trim().split(/\s+/).sort(), cleanChildFds, 'through the launcher: only the standard descriptors');
+});
+
+test('the launcher’s loop variable does not replace a caller’s `f`', async () => {
+  const backend = new NodePtyBackend();
+  let text = '';
+  const child = backend.spawnProcess({ argv: ['/bin/sh'], line: 'printf %s "$f"', cwd: tmp, env: { f: 'from-the-caller', PATH: '/usr/bin:/bin' } });
+  child.onStdout((d) => (text += d));
+  const exit = await new Promise<PtyExit>((resolve) => child.onExit(resolve));
+  assert.deepEqual([exit.exitCode, text], [0, 'from-the-caller']);
 });
