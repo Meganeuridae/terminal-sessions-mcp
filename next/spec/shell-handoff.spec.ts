@@ -279,12 +279,15 @@ test('/bin/bash: the reinit is not typed while a program the rc started is readi
   // A raw-mode reader the rc started is a child and leaves the terminal non-canonical; non-canonical
   // does not prove readline. Without the child check the daemon would type the reinit into that
   // program (the house's read, #22 comment 6269901528). `read -e`/`read -n` builtins have no child
-  // and stay a stated limit; this is the external-reader case the child check catches.
+  // and stay a stated limit; this is the external-reader case the child check catches. The rc puts
+  // the terminal in non-canonical mode itself before the reader starts, and the cap is generous: on a
+  // slow runner the interpreter's startup outran a 500 ms cap, and the gate, seeing a canonical
+  // terminal to the end, gave the canonical note instead.
   const reader = `${PY} -c 'import sys,tty; tty.setcbreak(sys.stdin.fileno()); sys.stdout.write("PYREADY\\n"); sys.stdout.flush(); d=sys.stdin.read(1); sys.stdout.write("PYGOT:["+d+"]\\n"); sys.stdout.flush()'`;
   const x = await realSession('/bin/bash', {
     login: false,
-    rc: { '.bashrc': `PROMPT_COMMAND=:\nif [ -n "\${SECOND-}" ]; then ${reader}; fi\n` },
-    startupCapMs: 500,
+    rc: { '.bashrc': `PROMPT_COMMAND=:\nif [ -n "\${SECOND-}" ]; then stty -icanon 2>/dev/null; ${reader}; fi\n` },
+    startupCapMs: 2000,
     integrationGraceMs: 400,
   });
   try {
