@@ -2,7 +2,8 @@
 /**
  * stdio ↔ WebSocket shim for hosts that only speak stdio (§12). Every line on
  * stdin goes to the daemon, every message from the daemon goes to stdout. It
- * adds no protocol logic, only what keeps the pipe honest:
+ * adds no protocol logic, only what keeps the pipe honest (`tsm-shim --help` lists the
+ * settings; this header says what the shim does with them):
  *
  *  - Lines read before the socket opens are queued and sent in order once it
  *    does, so `printf '…' | tsm-shim` gets its answers. A request that waits
@@ -59,7 +60,7 @@
  * may wait for a connection, default 15000; a whole number of milliseconds, empty = default).
  */
 import { clocks, MAX_TIMER_MS } from '../core/clock.js';
-import { setting } from '../core/env.js';
+import { parseDuration, setting } from '../core/env.js';
 import { execFile, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -90,7 +91,7 @@ Settings (an empty value is unset):
   TSM_TOKEN               credential, sent as ?token=
   TSM_PROFILE             core (default) | full | compat (the 1.x tool names); --profile wins
   TSM_RESULT_TEXT         json (default) | transcript: the text form of tool results
-  TSM_CONNECT_TIMEOUT_MS  how long a request may wait for a connection, default 15000
+  TSM_CONNECT_TIMEOUT_MS  how long a request may wait for a connection, default 15000 (15s, 2m also read)
   TSM_DATA_DIR            data dir of a termd started here, default ~/.tsm (relative: from the cwd)
   TSM_NO_SPAWN=1          never start termd
   1.x names, read where the TSM_* name is unset: SESSION_SERVER_URL, or SESSION_SERVER_HOST +
@@ -111,7 +112,7 @@ if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) {
 const COMPAT_BINS: ReadonlySet<string> = new Set(['terminal-sessions-mcp']);
 /** Set by the dedicated entry file of a compat bin (see the header): the name the host invoked. */
 const INVOKED_AS = Symbol.for('term-sessions.shim.invokedAs');
-/** The tool profiles the daemon serves (transport/server.ts PROFILES; the shim imports nothing of the daemon's). */
+/** The tool profiles the daemon serves (transport/server.ts PROFILES; the shim imports nothing of the transport's). */
 const PROFILES: ReadonlySet<string> = new Set(['core', 'full', 'compat']);
 
 /** Where to connect, and whether this address may be served by a daemon we start (atc-6). */
@@ -151,11 +152,13 @@ function chooseProfile(argv: string[]): string | undefined {
 function msSetting(name: string, fallback: number): number {
   const raw = setting(name);
   if (raw === undefined) return fallback;
-  if (!/^\d+$/.test(raw.trim()) || Number(raw) > MAX_TIMER_MS) {
-    log(`${name} must be a whole number of milliseconds (0 to ${MAX_TIMER_MS}), not ${JSON.stringify(raw)}`);
+  // The grammar tsm's flags use (core/env.ts): `15000`, `15s`, `2m`.
+  const ms = parseDuration(raw);
+  if (ms === undefined || ms > MAX_TIMER_MS) {
+    log(`${name} must be a duration (milliseconds, or 500ms, 20s, 2m, 1h; at most ${MAX_TIMER_MS} ms), not ${JSON.stringify(raw)}`);
     process.exit(2);
   }
-  return Number(raw);
+  return ms;
 }
 
 const chosen = target1x();

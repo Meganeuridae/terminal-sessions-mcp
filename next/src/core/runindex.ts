@@ -158,7 +158,8 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
   // writes again, which may be long after the Run ended — is not among the range's events: it goes
   // with the result all the same, seated where its hole ends (within the Run's whole range, so that
   // `narrowOutput` places it the same for every `range`), and the reader shows the hole where it is
-  // instead of a complete Run (the house's read of cc8c909..39787b3, #22).
+  // instead of a complete Run (the house's read of cc8c909..39787b3, #22). The seat may be a live
+  // event's seq: `narrowOutput` sorts by seq and keeps both.
   for (const g of journal.runs.gapsWithin(lo, hi)) {
     if (g.seq <= hi) continue;
     gaps.push({ ...g, seq: Math.min(g.to, to) });

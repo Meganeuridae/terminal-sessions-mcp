@@ -559,7 +559,7 @@ test("tg-19: a profile that is none of core, full, compat and a connect timeout 
   for (const bad of ['abc', 'Infinity', '-1', '1e3']) {
     const s = shim({ TSM_CONNECT_TIMEOUT_MS: bad });
     assert.equal(await exitWithin(s), 2, bad);
-    assert.match(s.err.join(''), /TSM_CONNECT_TIMEOUT_MS must be a whole number of milliseconds/);
+    assert.match(s.err.join(''), /TSM_CONNECT_TIMEOUT_MS must be a duration/);
   }
 });
 

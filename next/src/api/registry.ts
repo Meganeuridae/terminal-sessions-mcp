@@ -620,8 +620,11 @@ export class SessionRegistry {
       // A record that named no owner is read again at every attempt: repaired, or written where there
       // was none, it names the owner without a restart of the daemon, as the refusal says (the house's
       // read of cc8c909..39787b3, #22).
-      if (recordRefusal(o.id, slot.meta)) this.rereadRecord(slot);
-      const refusal = recordRefusal(o.id, slot.meta);
+      let refusal = recordRefusal(o.id, slot.meta);
+      if (refusal) {
+        this.rereadRecord(slot);
+        refusal = recordRefusal(o.id, slot.meta);
+      }
       if (refusal) throw refusal;
       if (!this.mayReuse(slot, o.owner)) {
         throw err('forbidden', `session ${o.id} belongs to another principal; only its owner may open it again`, { id: o.id });

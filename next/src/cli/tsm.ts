@@ -29,7 +29,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
 import { analyze, readUsage, UNFINISHED } from '../api/usage.js';
-import { setting } from '../core/env.js';
+import { parseDuration, setting } from '../core/env.js';
 
 /** A result state the usage module calls unfinished (running, starting, queued). */
 const isUnfinished = (state: unknown): boolean => typeof state === 'string' && UNFINISHED.has(state);
@@ -92,16 +92,6 @@ const SHORT: Record<string, { tool: string; positional: string[]; join?: string;
 };
 
 const camel = (k: string) => k.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
-
-/** `500ms`, `20s`, `1.5s`, `2m`, `1h` → milliseconds; a plain integer is milliseconds already. */
-function parseDuration(v: string): number | undefined {
-  const m = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(v.trim());
-  if (!m) return undefined;
-  const n = Number(m[1]);
-  const unit = m[2] ?? 'ms';
-  const ms = n * (unit === 'h' ? 3_600_000 : unit === 'm' ? 60_000 : unit === 's' ? 1000 : 1);
-  return Math.round(ms);
-}
 
 const isDurationKey = (k: string) => k === 'wait' || /Ms$/.test(k);
 /** Keys that are text even without a schema to say so. */

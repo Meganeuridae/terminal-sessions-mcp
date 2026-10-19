@@ -126,3 +126,16 @@ export function redactSnapshot(vars: Record<string, string>): Record<string, str
  * become a data directory named "", in termd, in the shim that starts it, or in the CLI.
  */
 export const setting = (name: string, env: NodeJS.ProcessEnv = process.env): string | undefined => env[name] || undefined;
+
+/**
+ * A duration as a setting or a flag spells it, in milliseconds: `500ms`, `20s`, `1.5s`, `2m`, `1h`,
+ * or a plain number of milliseconds; undefined when it is none of these. One grammar for tsm's
+ * flags and the shim's settings.
+ */
+export function parseDuration(v: string): number | undefined {
+  const m = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(v.trim());
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  const unit = m[2] ?? 'ms';
+  return Math.round(n * (unit === 'h' ? 3_600_000 : unit === 'm' ? 60_000 : unit === 's' ? 1000 : 1));
+}
