@@ -412,6 +412,8 @@ export class SessionRegistry {
     // A lock whose holder is gone means the previous daemon did not drain: said in the log, not only by what recovery does next (the house's read of 59f660b, #22).
     const stale = this.dirLock.tookOver;
     if (stale) this.opts.log?.('warn', 'took over the data dir lock of a daemon that is gone (it did not drain)', { pid: stale.pid, startedAt: stale.startedAt !== undefined ? new Date(stale.startedAt).toISOString() : undefined, hostname: stale.hostname });
+    // Said once per take, since the lock itself has no log (a reviewer's read of the fixes for #22 comment 6269992150).
+    if (this.dirLock.noHardLinks) this.opts.log?.('warn', "the data dir's filesystem has no hard links: the lock is created by an exclusive write instead of link(), whose brief empty window the age guard covers", { dataDir: this.opts.dataDir });
   }
 
   /** Flush every session's cursors and give up the data dir's lock. Sessions are not closed: see `closeAll`. */
@@ -468,6 +470,13 @@ export class SessionRegistry {
     const retention = recordRefusal(id, meta) ? {} : this.retentionFor(undefined, meta.retention);
     const store = new FileStore(dir, this.storeOptions(retention));
     const gone = expired(store, retention, Date.now());
+    // The last event the dead daemon wrote, read before the journal opens: opening a journal over a torn
+    // last line (or a failed high water) appends a gap stamped with this recovery's time, and read after
+    // that, `last` was the gap — so lastAliveTs and the orphan bound became the recovery's own clock,
+    // which let a stranger's reused group read as a Run's (a reviewer's read of the fixes for #22
+    // comment 6269992150). The store has already cut a torn tail at open, so this is the last whole event;
+    // a header-only file gives undefined, and still reaches endOrphans below.
+    const last = store.tail(1)[0];
     // The journal is opened before the store is judged empty: a file holding only a rotation header
     // has no last seq, yet the header names Runs still open, whose process groups recovery must end.
     // Age retention had dropped every file but the header-bearing one, so recovery returned here and
@@ -483,7 +492,6 @@ export class SessionRegistry {
     }
     // Nothing runs under this name now: a dead life's command files (command text, env captures) go (jr2-12, G26).
     if (!gone) removeLeftovers(this.opts.dataDir, id, dir);
-    const last = store.tail(1)[0];
     return { id, dir, store, meta, retention, journal, last, gone };
   }
 
@@ -536,6 +544,11 @@ export class SessionRegistry {
           ? `recovery: ${outcome.text} with ${run.runId}, which recovery ended lost`
           : `recovery: ${outcome.text}; it outlived ${run.runId}, which had ended`;
       journal.append({ type: 'note', text, principal: SYSTEM });
+      // A Run that had ended before the daemon died (leftovers) keeps its own end: the judgement is
+      // recorded as its own event, which the run index folds into groupJudged, so a later restart does
+      // not judge the group again with another note and warning (a reviewer's read of the fixes for #22
+      // comment 6269992150). A Run recovery ended lost just now carries it on its end.
+      if (!lost.has(run.runId)) journal.append({ type: 'run.judged', runId: run.runId });
     }
     // Mark the restart once: a session closed on purpose, or history since an earlier restart, gains nothing.
     if (meta.closedAt === undefined && last?.type !== 'recovered') journal.append({ type: 'recovered', class: 'history-only' });

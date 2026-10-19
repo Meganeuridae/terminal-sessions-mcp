@@ -365,6 +365,60 @@ test('jr2-4: a recovery that could not judge a Run\'s group keeps the dead daemo
   assert.deepEqual(sel({ ...cand({}), run: { ...older, pgid: 4242, endedAt: T_rec1, recoveredEnd: true } }, [row(4301, T_death + 20_000)]), [4242], 'without the recorded evidence the bound falls back to the end');
 });
 
+test('jr2-4: a torn last line does not move the dead daemon\'s last evidence to the recovery\'s clock — lastAliveTs is the last whole event (a reviewer\'s read of the fixes for #22 comment 6269992150)', async () => {
+  // Opening the journal over a torn tail appends a torn-write gap stamped now; read after that, `last`
+  // was the gap, so the lost end's lastAliveTs (and the orphan bound) became the recovery's own time.
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'torn');
+  const T_death = 1_000_000;
+  const j = new Journal({ cold: new FileStore(sdir), sessionId: 'torn', now: () => T_death });
+  journalProcess(j, 'r1-torn', 4242);
+  j.append({ type: 'output', data: 'tick\n', stream: 'stdout', runId: 'r1-torn' });
+  j.close();
+  const file = path.join(sdir, 'journal.jsonl');
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').slice(0, -5)); // the crash tore the last line
+  fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+  const r = rig(dir);
+  const h = hist(r.reg.get('torn'));
+  const run = h.run('r1-torn');
+  assert.equal(run.state, 'lost');
+  assert.equal(run.lastAliveTs, T_death, `the last whole event's time, not the recovery's: ${run.lastAliveTs}`);
+  assert.ok(h.journal.since(0).events.some((e) => e.type === 'gap' && e.reason === 'torn-write'), 'the torn tail is still recorded as a gap');
+  await r.reg.closeAll();
+});
+
+test('jr2-4: a group recovery left for an ended Run with leftovers is judged once — a second restart adds no note (a reviewer\'s read of the fixes for #22 comment 6269992150)', { timeout: 15_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'once');
+  const kids = detachedKids();
+  try {
+    // A leaderless group whose member started long after the Run ended: a stranger's by the rule, left.
+    const strangers = kids.spawn('/bin/sh', ['-c', 'sleep 410 & exit 0']);
+    await kids.exited(strangers);
+    assert.ok(groupAlive(strangers));
+    const ts = Date.now() - 30_000;
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'once', now: () => ts });
+    journalProcess(j, 'r1-left', strangers);
+    j.append({ type: 'run.end', runId: 'r1-left', state: 'exited', exit: 0, durationMs: 5, leftovers: true });
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    const leftNotes = (h: HistorySession) => h.journal.since(0).events.filter((e) => e.type === 'note' && e.text.includes('left running') && e.text.includes('r1-left')).length;
+    const r1 = rig(dir, { terminateOrphans: true });
+    const h1 = hist(r1.reg.get('once'));
+    assert.equal(leftNotes(h1), 1, 'the first recovery records that it left the group');
+    assert.equal(h1.run('r1-left').groupJudged, true, 'and that the group was judged');
+    assert.ok(groupAlive(strangers), 'the group was left alone');
+    await r1.reg.closeAll();
+    const r2 = rig(dir, { terminateOrphans: true });
+    const h2 = hist(r2.reg.get('once'));
+    assert.equal(leftNotes(h2), 1, 'the second recovery does not judge it again');
+    assert.equal(h2.run('r1-left').groupJudged, true, 'the judgement survives the restart');
+    await r2.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
 // ───────────── jr2-12: command files ─────────────
 
 test('jr2-12/G26: recovery deletes a crashed life\'s command files, and forget deletes the command directory', async () => {

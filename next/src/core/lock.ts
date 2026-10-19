@@ -18,6 +18,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { err } from './errors.js';
+import { syncDir } from './stores.js';
 
 export const LOCK_FILE = 'termd.lock';
 
@@ -43,6 +44,8 @@ export interface DataDirLock {
   readonly file: string;
   /** Set when the lock was taken from a holder that is gone: what its file said (empty when it was torn). The daemon logs it (the house's read of 59f660b, #22). */
   readonly tookOver?: Partial<LockHolder>;
+  /** Set when the directory's filesystem refused link(): the lock was created by an exclusive write instead (the registry logs it once). */
+  readonly noHardLinks?: true;
   /** Give the lock up (idempotent). The file is removed only by the handle that took it, while it holds it. */
   release(): void;
 }
@@ -304,19 +307,6 @@ function writeSyncedTemp(tmp: string, raw: string): void {
   fs.chmodSync(tmp, 0o600);
 }
 
-/** fsync the directory so a create or rename survives a crash; a filesystem that cannot is left (the rename/link is still atomic). */
-function syncDir(file: string): void {
-  let dir: number | undefined;
-  try {
-    dir = fs.openSync(path.dirname(file), 'r');
-    fs.fsyncSync(dir);
-  } catch {
-    // a filesystem that cannot sync a directory
-  } finally {
-    if (dir !== undefined) fs.closeSync(dir);
-  }
-}
-
 const rmTemp = (tmp: string) => {
   try {
     fs.rmSync(tmp, { force: true });
@@ -349,8 +339,7 @@ function takeOver(file: string, staleRaw: string, tmp: string): boolean {
   try {
     if (readRaw(file) !== staleRaw) return false;
     fs.renameSync(tmp, file);
-    syncDir(file);
-    return true;
+    return true; // the caller syncs the directory once the take is registered, so a sync error never orphans a held lock
   } finally {
     fs.rmSync(guard, { recursive: true, force: true });
   }
@@ -363,15 +352,23 @@ function takeOver(file: string, staleRaw: string, tmp: string): boolean {
  * dead process (or by a pid reused since) is taken over. Within one process the lock is shared: its
  * taker releases it.
  */
-export function acquireDataDirLock(dataDir: string): DataDirLock {
+export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: string, newPath: string) => void } = {}): DataDirLock {
   const dir = path.resolve(dataDir);
   const file = path.join(dir, LOCK_FILE);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const link = opts.link ?? ((existing: string, newPath: string) => fs.linkSync(existing, newPath));
+  // The directory's filesystem has no hard links (exFAT, some SMB and FUSE mounts): link() refuses with
+  // one of these, where the exclusive write worked. The lock then falls back to that write of the same
+  // synced content; the age guard still covers the brief window an exclusive write opens, and the
+  // registry says so once (a reviewer's read of the fixes for #22 comment 6269992150).
+  const noLinksCode = (code: string | undefined) => code === 'EPERM' || code === 'ENOTSUP' || code === 'EOPNOTSUPP' || code === 'EXDEV';
+  let noHardLinks = false;
   const take = (raw: string, tookOver?: Partial<LockHolder>): DataDirLock => {
     taken.set(file, raw);
     return {
       file,
       ...(tookOver ? { tookOver } : {}),
+      ...(noHardLinks ? { noHardLinks: true as const } : {}),
       release() {
         // A handle from before the file was lost and taken again must not release the new take.
         if (taken.get(file) === raw) taken.delete(file);
@@ -391,16 +388,34 @@ export function acquireDataDirLock(dataDir: string): DataDirLock {
       rmTemp(tmp);
       throw e;
     }
+    let created = false;
     try {
-      fs.linkSync(tmp, file);
-      rmTemp(tmp);
-      syncDir(file);
-      return take(raw);
+      link(tmp, file);
+      created = true;
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (noLinksCode(code)) {
+        noHardLinks = true;
+        try {
+          writeSyncedTemp(file, raw); // an exclusive ('wx') create of the same content, fsynced
+          created = true;
+        } catch (e2) {
+          if ((e2 as NodeJS.ErrnoException).code !== 'EEXIST') {
+            rmTemp(tmp);
+            throw e2;
+          }
+        }
+      } else if (code !== 'EEXIST') {
         rmTemp(tmp);
         throw e;
       }
+    }
+    if (created) {
+      rmTemp(tmp);
+      // Registered before the directory sync: a sync error then propagates with the lock ours to release at exit.
+      const lock = take(raw);
+      syncDir(file);
+      return lock;
     }
     const current = readRaw(file);
     if (current === undefined) {
@@ -434,7 +449,11 @@ export function acquireDataDirLock(dataDir: string): DataDirLock {
         throw lockedError(dataDir, file, holder, `termd pid ${holder.pid}${holder.hostname !== os.hostname() ? ` (written on host ${holder.hostname})` : ''}`);
       }
     }
-    if (takeOver(file, current, tmp)) return take(raw, holder ?? {});
+    if (takeOver(file, current, tmp)) {
+      const lock = take(raw, holder ?? {});
+      syncDir(file);
+      return lock;
+    }
     rmTemp(tmp);
     sleepSync(10);
   }

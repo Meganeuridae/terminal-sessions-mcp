@@ -299,3 +299,26 @@ test('the /proc stat parser counts fields after the last ")" (a comm with spaces
     console.log(`# procStart is Linux-only: the /proc read is skipped on ${process.platform}`);
   }
 });
+
+test('a filesystem without hard links: a link() refused with EPERM falls back to the exclusive write of the synced content, and the handle says so (a reviewer\'s read of the fixes for #22 comment 6269992150)', () => {
+  const dir = dataDir();
+  const noLinks = () => {
+    throw Object.assign(new Error('EPERM: operation not permitted, link'), { code: 'EPERM' });
+  };
+  const lock = acquireDataDirLock(dir, { link: noLinks });
+  try {
+    assert.equal(lock.noHardLinks, true, 'the registry logs this once');
+    assert.equal(readLock(dir).pid, process.pid, 'taken through the exclusive write');
+    assert.deepEqual(fs.readdirSync(dir).filter((n) => n.endsWith('.tmp')), [], 'no temp left behind');
+    // The lock is a lock: another take in this process shares it, and a stale one is still taken over by rename.
+    assert.equal(acquireDataDirLock(dir, { link: noLinks }).file, lock.file);
+  } finally {
+    lock.release();
+  }
+  assert.equal(fs.existsSync(path.join(dir, LOCK_FILE)), false);
+  fs.writeFileSync(path.join(dir, LOCK_FILE), JSON.stringify({ pid: 999_999, startedAt: Date.now() - 60_000, hostname: os.hostname() }));
+  const over = acquireDataDirLock(dir, { link: noLinks });
+  assert.equal(over.tookOver?.pid, 999_999, 'a stale lock is taken over without link()');
+  assert.equal(readLock(dir).pid, process.pid);
+  over.release();
+});

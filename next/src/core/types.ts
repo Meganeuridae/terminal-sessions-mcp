@@ -42,6 +42,8 @@ export type EventInput =
   | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string; shell?: string; within?: string | null }
   | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number; startTicks?: number; bootId?: string; strategy?: RunStrategy; nonce?: string }
   | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true; lastAliveTs?: number }
+  /** Recovery judged this Run's process group (ended it or left it) after the Run had already ended: the run index folds it into groupJudged, so no later restart judges it again. */
+  | { type: 'run.judged'; runId: string }
   | { type: 'prompt'; cwd: string; phase: 'start' | 'end' }
   | { type: 'cwd'; path: string }
   | { type: 'env.snapshot'; count: number; vars?: Record<string, string> }

@@ -125,14 +125,22 @@ export function writeDurably(file: string, text: string): void {
     }
     throw e;
   }
+  syncDir(file);
+}
+
+/**
+ * fsync the directory holding `file`, so a rename or create survives a crash. Only a filesystem that
+ * cannot sync a directory is ignored (the rename is still atomic); a real I/O error means the change
+ * may not survive a crash and the numbering could come back lower (G10), so it is rethrown (comment
+ * 6269992150). The one rule for the stores and the lock (a reviewer's read of the fixes for #22
+ * comment 6269992150: the lock had its own copy that swallowed everything).
+ */
+export function syncDir(file: string): void {
   let dir: number | undefined;
   try {
     dir = fs.openSync(path.dirname(file), 'r');
     fs.fsyncSync(dir);
   } catch (e) {
-    // Only a filesystem that cannot sync a directory is ignored (the rename is still atomic); a real
-    // I/O error means the rename may not survive a crash and the numbering could come back lower (G10),
-    // so it is not swallowed (comment 6269992150).
     if (!cannotSyncDir((e as NodeJS.ErrnoException).code)) throw e;
   } finally {
     if (dir !== undefined) fs.closeSync(dir);

@@ -295,6 +295,12 @@ export class RunIndex {
         this.openIds.delete(ev.runId);
         return;
       }
+      case 'run.judged': {
+        // Recovery judged an ended Run's group: not a candidate again (a reviewer's read of the fixes for #22 comment 6269992150).
+        const r = this.runs.get(ev.runId);
+        if (r) r.groupJudged = true;
+        return;
+      }
       case 'gap': {
         // Kept here, with the lineage every life of the name shares, so a Run's reads see a hole
         // recorded after the Run ended, by this life or an earlier one (the house's read of
