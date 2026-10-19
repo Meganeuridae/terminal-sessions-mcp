@@ -56,7 +56,9 @@ async function real(shell: string, backend: NodePtyBackend = new NodePtyBackend(
     backend,
     journal,
     integrationGraceMs: 4000,
-    tempDir: tmp,
+    // Each session's own: two sessions sharing one command directory number their files alike
+    // (tsm-cmd-1), and one removed the other's before its shell read it.
+    tempDir: fs.mkdtempSync(path.join(tmp, `session-${id}-`)),
     env: { TSM_MARK: 'present' },
   };
   if (integ.kind !== 'none') so.integration = integ;
