@@ -161,3 +161,25 @@ test("the shells' oom_score_adj is the daemon's setting: written when set, absen
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const [how, rc] of [
+  ['assigns', "PROMPT_COMMAND='history -a'\n"],
+  ['appends to', "PROMPT_COMMAND+='; history -a'\n"],
+] as const) {
+  test(`an exec into a bash whose rc ${how} PROMPT_COMMAND still integrates, and the rc's own command is never a Run`, { skip: !hasShell('/bin/bash') }, async () => {
+    const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': rc }, startupCapMs: 1500 });
+    try {
+      const handoff = await x.run('exec /bin/bash', 20_000);
+      assert.deepEqual([handoff.state, handoff.reason], ['lost', 'shell-replaced']);
+      const back = await x.run('echo back', 20_000);
+      assert.deepEqual([back.state, back.exit, back.text.trim()], ['exited', 0, 'back']);
+      assert.equal(x.session.integration, 'rich');
+      assert.ok(!x.session.listRuns().some((r) => (r.line ?? '').includes('history -a')), "the rc's command opened no Run");
+      const notes = x.journal.since(0).events.filter((e) => e.type === 'note').map((e) => (e as { text: string }).text);
+      if (how === 'assigns') assert.ok(notes.some((t) => /did not load the shell integration/.test(t)), `the daemon reloaded it: ${JSON.stringify(notes)}`);
+      assert.equal((await x.run('echo again')).text.trim(), 'again');
+    } finally {
+      await x.close();
+    }
+  });
+}

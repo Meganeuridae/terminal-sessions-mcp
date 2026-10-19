@@ -378,7 +378,8 @@ async function main(): Promise<void> {
   });
   process.on('unhandledRejection', (e) => stray('unhandled rejection (daemon keeps serving)', e));
 
-  const dataDir = f['data-dir'] ?? process.env.TSM_DATA_DIR ?? path.join(os.homedir(), '.tsm');
+  // Resolved here: the integration builds launcher paths from it, and the shell starts in the session's cwd (the house's read of 1d83ffa).
+  const dataDir = path.resolve(f['data-dir'] ?? process.env.TSM_DATA_DIR ?? path.join(os.homedir(), '.tsm'));
   // The 1.x names are read where the 2.0 ones are not set, so a daemon command written for 1.x
   // (connectome-host's setup guide: `--host localhost --headless`, SESSION_SERVER_PORT in the
   // unit) starts termd and says what it took from where (the house's review of #11).

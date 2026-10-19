@@ -5,6 +5,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type { JournalEvent } from '../src/core/types.js';
 import { AGENT, hasShell, realSession, until } from './fake-shell.js';
 
@@ -233,6 +235,62 @@ test('/bin/zsh: core-13: hooks removed at runtime heal at the next prompt; the R
     assert.ok(x.session.listRuns().every((r) => r.origin === 'self'), 'no phantom Runs');
     assert.ok(await x.session.waitAvailable(2000), 'the prompt confirmed the shell is available');
     assert.equal(x.session.state, 'idle');
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: a DEBUG trap set by a sourced file or an eval does not lose the next Run', { skip: !hasShell('/bin/bash') }, async () => {
+  const x = await realSession('/bin/bash');
+  try {
+    const trapper = path.join(x.tmp, 'trapper.sh');
+    fs.writeFileSync(trapper, "trap 'true' DEBUG\n");
+    assert.equal((await x.run(`source '${trapper}'`)).exit, 0);
+    const after = await x.run('echo after-source');
+    assert.deepEqual([after.state, after.text.trim()], ['exited', 'after-source']);
+    assert.equal((await x.run(`eval "trap 'true' DEBUG"`)).exit, 0);
+    const after2 = await x.run('echo after-eval');
+    assert.deepEqual([after2.state, after2.text.trim()], ['exited', 'after-eval']);
+    assert.equal((await x.run(`. '${trapper}'`)).exit, 0);
+    assert.deepEqual((await x.run('echo after-dot')).text.trim(), 'after-dot');
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: a PROMPT_COMMAND bash runs differently from its text (a compound command, a leading blank) is healed, and the next Runs go on', { skip: !hasShell('/bin/bash') }, async () => {
+  const x = await realSession('/bin/bash');
+  try {
+    assert.equal((await x.run('__hpc_fn() { HPC_RAN=1; }')).exit, 0);
+    assert.equal((await x.run("PROMPT_COMMAND='if true; then __hpc_fn; fi'")).exit, 0);
+    const a = await x.run('echo next-1');
+    assert.deepEqual([a.state, a.exit, a.text.trim()], ['exited', 0, 'next-1']);
+    assert.equal((await x.run("PROMPT_COMMAND=' __hpc_fn'")).exit, 0);
+    const b = await x.run('echo next-2');
+    assert.deepEqual([b.state, b.exit, b.text.trim()], ['exited', 0, 'next-2']);
+    assert.equal((await x.run('echo "$HPC_RAN"')).text.trim(), '1', "the user's command ran as the prompt's own");
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/zsh: a ZDOTDIR a startup file sets chooses the next file read and is the user’s afterwards', { skip: !hasShell('/bin/zsh') }, async () => {
+  const x = await realSession('/bin/zsh', { login: true, rc: { '.zprofile': 'export ZDOTDIR="$HOME/zd"\n', 'zd/.zshrc': 'export FROM_ZD=yes\n' } });
+  try {
+    assert.equal((await x.run('echo "${FROM_ZD-no} $ZDOTDIR"')).text.trim(), `yes ${x.home}/zd`);
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/zsh: a plugin that replaces the line-init widget after startup does not stop the prompt-end marks', { skip: !hasShell('/bin/zsh') }, async () => {
+  const x = await realSession('/bin/zsh');
+  try {
+    assert.equal((await x.run('__plug_init() { :; }; zle -N zle-line-init __plug_init')).exit, 0);
+    const r = await x.run('echo after-plugin');
+    assert.deepEqual([r.state, r.text.trim()], ['exited', 'after-plugin']);
+    await until(() => x.journal.since(r.seq.end ?? 0).events.some((e) => e.type === 'prompt' && e.phase === 'end'), 3000, 'a prompt-end mark after the Run');
+    assert.equal((await x.run('echo still')).text.trim(), 'still');
   } finally {
     await x.close();
   }

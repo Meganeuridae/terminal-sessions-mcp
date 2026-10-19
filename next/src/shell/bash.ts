@@ -26,6 +26,8 @@ export const BASH_RC = `__tsm_st0=$?
 # returns.
 
 if [ "$\{1-}" = reinit ] && [ -n "$\{__tsm_key-}" ]; then
+  # Already integrated. Typed by the daemon (its hello came after the startup cap): nothing to do.
+  if [ "$\{2-}" = typed ]; then return 0; fi
   # An armed exec did not replace this shell (it failed, or only redirected).
   __tsm_exec_disarm
   __tsm_setst "$__tsm_st0"
@@ -76,9 +78,23 @@ if [ -n "$__tsm_key" ]; then
 fi
 
 if [ "$\{1-}" = reinit ]; then
-  # Sourced from an inherited PROMPT_COMMAND by a fresh bash: its rc already ran.
+  # Sourced from an inherited PROMPT_COMMAND by a fresh bash: its rc already ran. What that rc
+  # appended to the inherited value (its own \`+=\`) is the user's part from here on — the tail
+  # folds it in — and the handoff's own element goes. Whatever of it still runs at this prompt
+  # is the prompt's own, not a Run: the DEBUG trap stands down until our hook has run once
+  # (the house's read of 1d83ffa). A second word, "typed", means the daemon typed this line at
+  # the prompt of a bash whose rc replaced PROMPT_COMMAND outright (no hello came): the whole
+  # value is then the user's part, and the prompt's hook is left to PROMPT_COMMAND.
   export -n PROMPT_COMMAND
-  PROMPT_COMMAND=
+  __tsm_pcs=()
+  for __tsm_e in "$\{PROMPT_COMMAND[@]}"; do
+    __tsm_e=$\{__tsm_e//' . "$TSM_BASH_RC" reinit'/}
+    case $__tsm_e in *[![:space:]\\;]*) __tsm_pcs+=("$__tsm_e") ;; esac
+  done
+  unset PROMPT_COMMAND
+  if [ "$\{#__tsm_pcs[@]}" -gt 0 ]; then PROMPT_COMMAND=("$\{__tsm_pcs[@]}"); fi
+  unset __tsm_pcs __tsm_e
+  __tsm_reinit_pending=1
   if [ -z "$__tsm_key" ]; then return 0; fi
 elif [ -z "$__tsm_no_user_rc" ]; then
   if [ -n "$__tsm_login" ]; then
@@ -216,8 +232,10 @@ __tsm_preexec() {
   __tsm_in_cmd=1
   __tsm_opened=
   __tsm_text "$__line"
-  # A command that may set a DEBUG trap: check ours at the next prompt.
-  case $__tsm_ret in *trap*) __tsm_trap_suspect=1 ;; esac
+  # A command that may set a DEBUG trap — one that names trap, or sources a file or evals text that
+  # could (the house's read of 1d83ffa: a sourced file's trap lost the next Run): check ours at the
+  # next prompt.
+  case " $__tsm_ret" in *trap*|*[[:space:]\\;\\&\\|\\(]source[[:space:]]*|*[[:space:]\\;\\&\\|\\(]eval[[:space:]]*|*[[:space:]\\;\\&\\|\\(].[[:space:]]*) __tsm_trap_suspect=1 ;; esac
   if __tsm_execs "$__tsm_ret"; then __tsm_exec_arm; fi
 }
 __tsm_precmd() {
@@ -268,6 +286,12 @@ __tsm_debug() {
   local __st=$? __o=$-
   set +eu
   __tsm_dbg_tick=1
+  # At the prompt a handoff landed on, the rest of the inherited PROMPT_COMMAND still runs after
+  # the reinit: not a Run. PS1's end mark clears this before anyone can type.
+  if [ "$\{__tsm_reinit_pending:-0}" != 0 ]; then
+    __tsm_restore "$__o"
+    return 0
+  fi
   if [ -n "$__tsm_prev_debug" ]; then
     __tsm_setst "$__st"
     eval "$__tsm_prev_debug"
@@ -314,7 +338,11 @@ __tsm_fold_pc() {
 __tsm_heal_pc() {
   local __e __own=
   for __e in "$\{PROMPT_COMMAND[@]}"; do
+    # Leading blanks are not part of what bash runs; a compound element (\`if …; then f; fi\`)
+    # runs as its simple commands, so a word of the element counts too (the house's read of 1d83ffa).
+    __e=$\{__e#"$\{__e%%[![:space:]]*}"}
     case $__e in "$BASH_COMMAND"*) __own=1 ;; esac
+    case " $__e " in *[[:space:]\\;\\(\\{\\&\\|]"$BASH_COMMAND"[[:space:]\\;\\)\\}\\&\\|]*) __own=1 ;; esac
   done
   __tsm_user_now=$__tsm_user_pc
   __tsm_heal_at=$__tsm_prompt_no
@@ -467,7 +495,7 @@ if [ -n "$\{bash_preexec_imported-}$\{__bp_imported-}" ]; then
   __tsm_pcv=$\{PROMPT_COMMAND-}
 else
   __tsm_bp=
-  if [ "$\{1-}" != reinit ]; then __tsm_fold_pc; else PROMPT_COMMAND=$__tsm_pc; fi
+  __tsm_fold_pc  # a fresh shell's rc, or what a new shell's rc appended to the handoff (reinit)
   __tsm_pcv=$__tsm_pc
   __tsm_t=$(trap -p DEBUG)
   case $__tsm_t in *__tsm_debug*) __tsm_t= ;; esac
@@ -488,7 +516,7 @@ __tsm_sel=([10]='')
 __tsm_one=([0]=1 [10]=0)
 __tsm_nz=$__tsm_pcv
 __tsm_a='\\[$\{__tsm_sel[$\{PROMPT_COMMAND:+1}0]-\\033]133;A;k=$\{__tsm_key}\\007}\\]'
-__tsm_b='\\[\\033]133;B;h=$((__tsm_pc_lost|=__tsm_one[$\{PROMPT_COMMAND:+1}0]))$\{__tsm_nz#$\{PROMPT_COMMAND:=$__tsm_pcv}};a=$((__tsm_prompt_active=1,__tsm_prompt_no+=1));k=$\{__tsm_key}\\007\\]'
+__tsm_b='\\[\\033]133;B;h=$((__tsm_pc_lost|=__tsm_one[$\{PROMPT_COMMAND:+1}0]))$\{__tsm_nz#$\{PROMPT_COMMAND:=$__tsm_pcv}};a=$((__tsm_reinit_pending=0,__tsm_prompt_active=1,__tsm_prompt_no+=1));k=$\{__tsm_key}\\007\\]'
 PS1="$__tsm_a$\{PS1-}$__tsm_b"
 # ss-1: the daemon types these two keys (ctrl-alt-shift-F12, -F11) before every line, so
 # nothing left in the editor merges with it, in any keymap: F12 empties the line (and in
@@ -508,7 +536,7 @@ unset __tsm_o
 # Re-integrated after an exec, inside the inherited PROMPT_COMMAND: run this prompt's
 # hook now. It must be the last command here: the DEBUG trap is live, and any command
 # after the hook would look like a command typed at the prompt.
-if [ "$\{1-}" = reinit ]; then
+if [ "$\{1-}" = reinit ] && [ "$\{2-}" != typed ]; then
   if [ -n "$__tsm_bp" ]; then __tsm_bp_last; else __tsm_dbg_tick=1; __tsm_precmd; eval "$__tsm_top"; fi
 fi
 `;

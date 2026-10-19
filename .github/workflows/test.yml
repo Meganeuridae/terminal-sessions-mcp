@@ -25,7 +25,8 @@ jobs:
           cache: npm
       - name: Install shells (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y zsh fish openssh-server
+        # atuin where the distribution packages it (Ubuntu 24.04 does), so the history-tool specs run rather than skip.
+        run: sudo apt-get update && sudo apt-get install -y zsh fish openssh-server && (sudo apt-get install -y atuin || true)
       - name: Secure zsh completion paths (Linux)
         if: runner.os == 'Linux'
         # Ubuntu's global compinit otherwise waits for an answer about the hosted

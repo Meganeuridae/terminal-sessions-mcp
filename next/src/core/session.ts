@@ -868,6 +868,7 @@ export class Session {
     const before = this.helloCommand ?? this.pty.command();
     const startedAt = Date.now();
     let changedAt: number | undefined;
+    let reinitTyped = false;
     const tick = (): void => {
       if (isTerminal(run.state) || this.closed || this.shellState === 'exited') return this.stopExecWatch();
       const now = this.pty.command?.();
@@ -877,8 +878,18 @@ export class Session {
         const kind = path.basename(now.trim().split(/\s+/)[0] ?? '').replace(/^-/, '');
         const wait = ['bash', 'zsh', 'fish'].includes(kind) ? (this.opts.startupCapMs ?? 15_000) : (this.opts.integrationGraceMs ?? 3000);
         if (Date.now() - changedAt >= wait) {
-          this.stopExecWatch();
-          return this.onShellReplaced(now);
+          if (kind === 'bash' && !reinitTyped) {
+            // A new bash whose rc replaced the PROMPT_COMMAND the handoff left it never loaded the
+            // integration (the house's read of 1d83ffa). The rc's path is still in its environment:
+            // load it from here, once, and wait for its hello again.
+            reinitTyped = true;
+            changedAt = Date.now();
+            this.note('the new bash did not load the shell integration (its rc replaced PROMPT_COMMAND): loading it once more');
+            this.pty.write(' . "$TSM_BASH_RC" reinit typed\n');
+          } else {
+            this.stopExecWatch();
+            return this.onShellReplaced(now);
+          }
         }
       }
       // An exec replaces the process at once, but it may come at the end of a long line: poll

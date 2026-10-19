@@ -92,3 +92,20 @@ test('fish: G29 cancel (running and right after admit) and shell-3/shell-17 nest
     await x.close();
   }
 });
+
+test('fish: a venv-style wrapper around fish_prompt is rewrapped without recursion, twice over', { skip }, async () => {
+  const x = await realSession(FISH!);
+  try {
+    for (const name of ['_old_fish_prompt', '_older_fish_prompt']) {
+      const r = await x.run(`functions -c fish_prompt ${name}; function fish_prompt; echo -n '(.venv) '; ${name}; end`);
+      assert.equal(r.exit, 0);
+      const after = await x.run('echo wrapped-ok');
+      assert.deepEqual([after.state, after.text.trim()], ['exited', 'wrapped-ok']);
+    }
+    const all = x.journal.since(0).events.filter((e) => e.type === 'output').map((e) => (e as { data: string }).data).join('');
+    assert.doesNotMatch(all, /call stack limit/);
+    assert.match(all, /\(\.venv\) /, "the venv's prompt text shows");
+  } finally {
+    await x.close();
+  }
+});

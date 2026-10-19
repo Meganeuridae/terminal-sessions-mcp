@@ -41,6 +41,11 @@ export const ZSH_ZSHENV = `# --- tsm shell integration (zsh .zshenv shim) --- ge
 __tsm_zdot_user() {
   if (( $\{+__tsm_user_zdotdir} )); then ZDOTDIR=$__tsm_user_zdotdir; else unset ZDOTDIR; fi
 }
+# A ZDOTDIR a startup file set is the user's from then on: it chooses the next file read, and it is
+# what the end of startup restores (the house's read of 1d83ffa: it was undone).
+__tsm_zdot_keep() {
+  if (( $\{+ZDOTDIR} )); then typeset -g __tsm_user_zdotdir=$ZDOTDIR; else unset __tsm_user_zdotdir; fi
+}
 __tsm_zdot_user
 if [[ -z $__tsm_no_user_rc && -f $\{ZDOTDIR:-$HOME}/.zshenv ]]; then builtin source $\{ZDOTDIR:-$HOME}/.zshenv; fi
 if [[ -n $__tsm_key ]]; then
@@ -56,6 +61,7 @@ export const ZSH_ZPROFILE = `# --- tsm shell integration (zsh .zprofile shim) --
 if [[ -z $__tsm_no_user_rc ]]; then
   __tsm_zdot_user
   if [[ -f $\{ZDOTDIR:-$HOME}/.zprofile ]]; then builtin source $\{ZDOTDIR:-$HOME}/.zprofile; fi
+  __tsm_zdot_keep
   ZDOTDIR=$__tsm_shim
 fi
 `;
@@ -64,6 +70,7 @@ export const ZSH_ZSHRC = `# --- tsm shell integration (zsh .zshrc shim) --- gene
 if [[ -z $__tsm_no_user_rc ]]; then
   __tsm_zdot_user
   if [[ -f $\{ZDOTDIR:-$HOME}/.zshrc ]]; then builtin source $\{ZDOTDIR:-$HOME}/.zshrc; fi
+  __tsm_zdot_keep
   ZDOTDIR=$__tsm_shim
 fi
 
@@ -115,6 +122,9 @@ __tsm_precmd_last() {
   __tsm_osc '133;A'
   precmd_functions=(__tsm_precmd_first $\{precmd_functions:#__tsm_precmd_(first|last)} __tsm_precmd_last)
   preexec_functions=($\{preexec_functions:#__tsm_preexec} __tsm_preexec)
+  # A plugin loaded after startup may replace the line-init widget our prompt-end mark hangs on;
+  # the hook list keeps its widget as the first hook and ours after it (the house's read of 1d83ffa).
+  if (( $+functions[add-zle-hook-widget] )); then add-zle-hook-widget line-init __tsm_line_init 2>/dev/null; fi
 }
 __tsm_preexec() {
   emulate -L zsh
@@ -195,8 +205,8 @@ __tsm_clear_line() {
   if [[ $KEYMAP == vicmd ]]; then zle vi-insert; fi
 }
 # G6, ux-3: a history tool the rc loaded (atuin, mcfly, hstr, hishtory) must not open the
-# user's global history on Up or ^R: those keys go back to zsh's own widgets, which walk
-# this session's history.
+# user's global history on Up or ^R: those keys go back to zsh's own bindings (the history
+# widgets, which walk this session's history; viins ^R is zsh's redisplay).
 __tsm_own_history_keys() {
   emulate -L zsh -o extended_glob
   zmodload -i zsh/zleparameter 2>/dev/null

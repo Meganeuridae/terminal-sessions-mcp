@@ -175,9 +175,12 @@ if test -n "$__tsm_k"; and not set -q __tsm_key; and status is-interactive
             printf '%s\\n' "$__tsm_key" > "$__tsm_dir/key-$fish_pid"
             umask $old_umask
         end
-        set -gx TSM_XDG_DATA_DIRS "$__tsm_user_dirs"
-        if test -n "$__tsm_user_dirs"
-            set -gx XDG_DATA_DIRS "$__tsm_dir:$__tsm_user_dirs"
+        # The value the shell has now, not startup's (the house's read of 1d83ffa).
+        set -g __tsm_had_xdg (set -q XDG_DATA_DIRS; and echo 1)
+        set -g __tsm_saved_xdg "$XDG_DATA_DIRS"
+        set -gx TSM_XDG_DATA_DIRS "$__tsm_saved_xdg"
+        if test -n "$__tsm_saved_xdg"
+            set -gx XDG_DATA_DIRS "$__tsm_dir:$__tsm_saved_xdg"
         else
             set -gx XDG_DATA_DIRS "$__tsm_dir:/usr/local/share:/usr/share"
         end
@@ -199,8 +202,8 @@ if test -n "$__tsm_k"; and not set -q __tsm_key; and status is-interactive
         else
             set -e PROMPT_COMMAND
         end
-        if test -n "$__tsm_user_dirs"
-            set -gx XDG_DATA_DIRS "$__tsm_user_dirs"
+        if test -n "$__tsm_had_xdg"
+            set -gx XDG_DATA_DIRS "$__tsm_saved_xdg"
         else
             set -e XDG_DATA_DIRS
         end
@@ -219,12 +222,13 @@ if test -n "$__tsm_k"; and not set -q __tsm_key; and status is-interactive
     # B at the end of the prompt, re-wrapped when a theme redefined fish_prompt.
     function __tsm_wrap_prompt
         if functions -q fish_prompt; and not string match -q '*__tsm_prompt_end*' -- (functions fish_prompt)
-            functions -e __tsm_user_prompt
-            functions -c fish_prompt __tsm_user_prompt
-            function fish_prompt
-                __tsm_user_prompt
-                __tsm_prompt_end
-            end
+            # A fresh copy each time: a venv's activate.fish wraps fish_prompt by copying it, and its
+            # copy still calls the name our last copy had, so copying over that name made the prompt
+            # call itself until fish stopped it (the house's read of 1d83ffa).
+            set -g __tsm_wrap_n (math (set -q __tsm_wrap_n; and echo $__tsm_wrap_n; or echo 0) + 1)
+            set -l inner __tsm_user_prompt_$__tsm_wrap_n
+            functions -c fish_prompt $inner
+            eval "function fish_prompt; $inner; __tsm_prompt_end; end"
         end
     end
     # ss-1: the daemon types ctrl-alt-shift-F12 and -F11 before every line: whatever the
