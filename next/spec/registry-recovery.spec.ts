@@ -13,13 +13,13 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { SessionRegistry, type AnySession, type HistorySession, type LiveSession } from '../src/api/registry.js';
+import { orphanGroups, SessionRegistry, type AnySession, type HistorySession, type LiveSession, type OrphanCandidate } from '../src/api/registry.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { Journal } from '../src/core/journal.js';
-import { groupAlive } from '../src/core/lock.js';
+import { groupAlive, type ProcessRow } from '../src/core/lock.js';
 import type { Session } from '../src/core/session.js';
 import { FileStore } from '../src/core/stores.js';
-import type { JournalEvent } from '../src/core/types.js';
+import type { JournalEvent, RunInfo } from '../src/core/types.js';
 import { FakeShell } from './fake-shell.js';
 
 const A = 'agent:a@test';
@@ -98,36 +98,73 @@ const onDisk = (sdir: string) =>
 
 // ───────────── jr2-4: orphaned process groups ─────────────
 
-test('jr2-4/G19c/G20/G29: recovery terminates the process groups a dead daemon left running — SIGTERM, then SIGKILL — and says so in the lost Run', { timeout: 20_000 }, async () => {
-  const dir = path.join(tmp, `d${++dirs}`);
-  const sdir = path.join(dir, 'sessions', 'k1');
+/** Real processes in their own groups, for the recovery tests; `end()` kills whatever is left of them. */
+function detachedKids() {
   const kids: ChildProcess[] = [];
-  const detached = (cmd: string, args: string[]) => {
+  const spawnOne = (cmd: string, args: string[]) => {
     const c = spawn(cmd, args, { detached: true, stdio: 'ignore' });
     kids.push(c);
     return c.pid!;
   };
+  const end = () => {
+    for (const c of kids) {
+      try {
+        process.kill(-c.pid!, 'SIGKILL');
+      } catch {
+        // gone
+      }
+    }
+  };
+  const exited = (pid: number) => until(() => kids.some((c) => c.pid === pid && (c.exitCode !== null || c.signalCode !== null)));
+  return { kids, spawn: spawnOne, end, exited };
+}
+
+/** A process Run's admission and start, journaled as a session would. */
+const journalProcess = (j: Journal, runId: string, pid: number) => {
+  j.append({ type: 'run.admit', runId, target: 'process', line: runId, principal: A, origin: 'self', queued: false });
+  j.append({ type: 'run.start', runId, cwd: '/', envBasis: 'configured', pid, pgid: pid });
+};
+
+test('jr2-4/G19c/G20/G29: recovery terminates the process groups a dead daemon left running — of Runs in flight and of Runs that had ended leaving children — SIGTERM, then SIGKILL, and says so', { timeout: 20_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'k1');
+  const kids = detachedKids();
   try {
     const ready = path.join(dir, 'stubborn-ready');
     fs.mkdirSync(dir, { recursive: true });
-    const polite = detached('sleep', ['401']); // ends on SIGTERM
-    const stubborn = detached('/bin/sh', ['-c', "trap '' TERM; printf ready > \"$1\"; sleep 402; :", 'recovery-test', ready]); // ignores SIGTERM, its sleep too
-    const stranger = detached('sleep', ['403']); // a live group whose leader predates the Run: a reused pid
-    const gone = detached('true', []);
-    // The synthetic Run starts with these processes, not after an arbitrary delay.
+    // A Run that exited before the daemon died, leaving a child in its group (`leftovers`): the group
+    // has no leader now, and recovery ends it as the live daemon's shutdown drain would have (the
+    // house's read of 2c35df8, #22). Another such group whose Run ended before the child started is
+    // a stranger's orphans with a reused group id, and is left alone.
+    const leftover = kids.spawn('/bin/sh', ['-c', 'sleep 404 & exit 0']);
+    const strangers = kids.spawn('/bin/sh', ['-c', 'sleep 405 & exit 0']);
+    const polite = kids.spawn('sleep', ['401']); // ends on SIGTERM
+    const stubborn = kids.spawn('/bin/sh', ['-c', "trap '' TERM; printf ready > \"$1\"; sleep 402; :", 'recovery-test', ready]); // ignores SIGTERM, its sleep too
+    const stranger = kids.spawn('sleep', ['403']); // a live group whose leader predates the Run: a reused pid
+    const clean = kids.spawn('sleep', ['406']); // a live group of a Run that exited with its group empty, as its session saw: a reused pid
+    const gone = kids.spawn('true', []);
+    // The synthetic Runs start with these processes, not after an arbitrary delay.
     // Observe the installed trap before recovery tries to exercise SIGKILL escalation.
     let ts = Date.now();
     await until(() => fs.existsSync(ready) && !groupAlive(gone));
+    await kids.exited(leftover);
+    await kids.exited(strangers);
+    assert.ok(groupAlive(leftover) && groupAlive(strangers), 'the children keep their leaderless groups alive');
     const j = new Journal({ cold: new FileStore(sdir), sessionId: 'k1', now: () => ts });
-    const proc = (runId: string, pid: number) => {
-      j.append({ type: 'run.admit', runId, target: 'process', line: runId, principal: A, origin: 'self', queued: false });
-      j.append({ type: 'run.start', runId, cwd: '/', envBasis: 'configured', pid, pgid: pid });
+    const ended = (runId: string, pid: number, leftovers: boolean) => {
+      journalProcess(j, runId, pid);
+      j.append({ type: 'run.end', runId, state: 'exited', exit: 0, durationMs: 5, ...(leftovers && { leftovers: true }) });
     };
-    proc('r1-polite', polite);
-    proc('r2-stubborn', stubborn);
-    proc('r3-gone', gone);
+    ts -= 30_000; // this Run ended half a minute before the child now in its group started
+    ended('r6-strangers', strangers, true);
+    ts += 30_000;
+    journalProcess(j, 'r1-polite', polite);
+    journalProcess(j, 'r2-stubborn', stubborn);
+    journalProcess(j, 'r3-gone', gone);
+    ended('r5-leftover', leftover, true);
+    ended('r7-clean', clean, false);
     ts += 30_000; // this Run started half a minute after its "leader" did
-    proc('r4-stranger', stranger);
+    journalProcess(j, 'r4-stranger', stranger);
     j.close();
     fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
 
@@ -141,25 +178,96 @@ test('jr2-4/G19c/G20/G29: recovery terminates the process groups a dead daemon l
     assert.deepEqual([h.run('r2-stubborn').state, h.run('r2-stubborn').reason], ['lost', `daemon-restart; process group ${stubborn} terminated`]);
     assert.equal(h.run('r3-gone').reason, 'daemon-restart');
     assert.equal(h.run('r4-stranger').reason, 'daemon-restart', 'a group that is not the Run\'s is left alone');
-    await until(() => kids[0]!.exitCode !== null || kids[0]!.signalCode !== null);
-    await until(() => kids[1]!.exitCode !== null || kids[1]!.signalCode !== null);
-    assert.equal(kids[0]!.signalCode, 'SIGTERM');
-    assert.equal(kids[1]!.signalCode, 'SIGKILL');
+    await kids.exited(polite);
+    await kids.exited(stubborn);
+    assert.equal(kids.kids.find((c) => c.pid === polite)!.signalCode, 'SIGTERM');
+    assert.equal(kids.kids.find((c) => c.pid === stubborn)!.signalCode, 'SIGKILL');
     assert.ok(!groupAlive(polite) && !groupAlive(stubborn), 'nothing of either group survives');
     assert.ok(groupAlive(stranger), 'the stranger still runs');
+    assert.ok(!groupAlive(leftover), 'the child an exited Run left in its group is ended');
+    assert.deepEqual([h.run('r5-leftover').state, h.run('r5-leftover').exit], ['exited', 0], 'the Run\'s own end stands');
+    const notes = h.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'note' }> => e.type === 'note').map((e) => e.text);
+    assert.ok(notes.some((t) => t.includes(`process group ${leftover} terminated`) && t.includes('r5-leftover')), `the journal says so: ${JSON.stringify(notes)}`);
+    assert.ok(groupAlive(strangers), 'a leaderless group whose members started after the Run ended is a stranger\'s');
+    assert.ok(groupAlive(clean), 'a Run that exited with its group empty vouches for nothing now in it');
+    assert.ok(!notes.some((t) => t.includes(`${strangers}`) || t.includes(`${clean}`)), JSON.stringify(notes));
     await r.reg.closeAll();
-    // A scripted backend's pids are not real processes: by default nothing is signalled.
-    const plain = rig(path.join(tmp, `d${++dirs}`));
+    // A scripted backend's pids are not real processes: by default nothing is signalled, even a
+    // living group a journal names.
+    const sdir2 = path.join(tmp, `d${++dirs}`, 'sessions', 'k2');
+    const bystander = kids.spawn('sleep', ['407']);
+    const j2 = new Journal({ cold: new FileStore(sdir2), sessionId: 'k2' });
+    journalProcess(j2, 'r1-bystander', bystander);
+    j2.close();
+    fs.writeFileSync(path.join(sdir2, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    const plain = rig(path.join(tmp, `d${dirs}`));
+    assert.equal(hist(plain.reg.get('k2')).run('r1-bystander').reason, 'daemon-restart');
+    assert.ok(groupAlive(bystander), 'nothing was signalled under the scripted backend');
     await plain.reg.closeAll();
   } finally {
-    for (const c of kids) {
-      try {
-        process.kill(-c.pid!, 'SIGKILL');
-      } catch {
-        // gone
-      }
-    }
+    kids.end();
   }
+});
+
+test('jr2-4/G21: a session past its age is removed only after its Runs\' process groups are ended with every other session\'s', { timeout: 10_000 }, async () => {
+  // Recovery removed an aged session's directory first, and its running Run's group lived on (the house's read of 2c35df8, #22).
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'aged');
+  const kids = detachedKids();
+  try {
+    const sleeper = kids.spawn('sleep', ['408']);
+    const ts = Date.now();
+    const j = new Journal({ cold: new FileStore(sdir, { maxAgeMs: 1000 }), sessionId: 'aged', now: () => ts });
+    journalProcess(j, 'r1-sleeper', sleeper);
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', retention: { maxAgeMs: 1000 } }), { mode: 0o600 });
+    await new Promise((res) => setTimeout(res, 1200));
+    const r = rig(dir, { terminateOrphans: true });
+    assert.equal(r.reg.get('aged'), undefined, 'past its age, the session is not surfaced');
+    assert.equal(fs.existsSync(sdir), false, 'and its files are gone');
+    await kids.exited(sleeper); // reaped once the loop runs: until then the zombie holds its pid
+    assert.equal(kids.kids.find((c) => c.pid === sleeper)!.signalCode, 'SIGTERM');
+    assert.ok(!groupAlive(sleeper), 'its Run\'s group was ended first');
+    await r.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
+test('jr2-4: which groups recovery signals — never its own, never 1, a leader that started with a Run in flight, leaderless members within the Run\'s life', () => {
+  // The rules, on a listing of the machine's processes, without a signal: each guard here failed
+  // no test when removed from the built registry (the house's read of 2c35df8, #22).
+  const self = { pid: 500, pgid: 400 };
+  const run = (runId: string, pgid: number, startedAt: number, end?: { endedAt: number; state: RunInfo['state']; leftovers?: true }): OrphanCandidate => ({
+    key: `s\0${runId}`,
+    run: { runId, sessionId: 's', target: 'process', origin: 'self', principal: A, state: end?.state ?? 'running', admittedAt: startedAt - 10, startedAt, seq: { admit: 1, start: 2 }, attribution: 'exact', pgid, ...(end && { endedAt: end.endedAt }), ...(end?.leftovers && { leftovers: true }) },
+    lastTs: 100_000,
+  });
+  const row = (pid: number, pgid: number, startMs: number, zombie = false): ProcessRow => ({ pid, pgid, startMs, zombie });
+  const T = 50_000; // the Runs' start; `ps` start times are whole seconds
+  const select = (c: OrphanCandidate[], procs: ProcessRow[]) => [...orphanGroups(c, procs, self).keys()].sort((a, b) => a - b);
+  // A leader that started with the Run (truncation allowed: 2 s before, 1 s after), not one that predates it or came later.
+  const leaders = [row(1001, 1001, T - 2000), row(1002, 1002, T + 1000), row(1003, 1003, T - 3000), row(1004, 1004, T + 2000)];
+  assert.deepEqual(select([run('a', 1001, T), run('b', 1002, T), run('c', 1003, T), run('d', 1004, T)], leaders), [1001, 1002]);
+  // Never the daemon's own pid or group, whatever the times say; never group 1 (kill(-1) is every process) or 0.
+  const own = [row(self.pid, self.pid, T), row(self.pgid, self.pgid, T), row(self.pid + 1, self.pgid, T), row(1, 1, T), row(2, 1, T)];
+  assert.deepEqual(select([run('e', self.pid, T), run('f', self.pgid, T), run('g', 1, T), run('h', 0, T)], own), []);
+  // A Run that ended: a leader now holds the freed pid (its process was reaped before its end was written), a stranger.
+  assert.deepEqual(select([run('i', 1001, T, { endedAt: T + 500, state: 'exited', leftovers: true })], leaders), []);
+  // Leaderless members: the Run's descendants when none predates the Run and none started after it ended.
+  const ended = { endedAt: T + 5000, state: 'exited' as const, leftovers: true as const };
+  assert.deepEqual(select([run('j', 2001, T, ended)], [row(2101, 2001, T), row(2102, 2001, T + 5000)]), [2001], 'a child forked as the Run exited is within its life');
+  assert.deepEqual(select([run('k', 2001, T, ended)], [row(2101, 2001, T), row(2102, 2001, T + 6000)]), [], 'one member started after the Run ended: a reused group id');
+  assert.deepEqual(select([run('l', 2001, T, ended)], [row(2101, 2001, T - 3000), row(2102, 2001, T)]), [], 'one member predates the Run');
+  assert.deepEqual(select([run('m', 2001, T, { endedAt: T + 5000, state: 'cancelled' })], [row(2101, 2001, T + 1000)]), [2001], 'a cancelled Run\'s group too');
+  assert.deepEqual(select([run('n', 2001, T, { endedAt: T + 5000, state: 'lost' })], [row(2101, 2001, T + 1000)]), [2001], 'and a lost one\'s');
+  // Leaderless members of a Run still in flight: one must predate the dead daemon's last event by a second.
+  assert.deepEqual(select([run('o', 3001, T)], [row(3101, 3001, T + 1000), row(3102, 3001, 99_000)]), [3001]);
+  assert.deepEqual(select([run('p', 3001, T)], [row(3101, 3001, 99_500), row(3102, 3001, 100_000)]), [], 'a group formed around the daemon\'s death is not the Run\'s');
+  // Zombies hold no group: a group of zombies alone is gone.
+  assert.deepEqual(select([run('q', 4001, T)], [row(4001, 4001, T, true), row(4101, 4001, T, true)]), []);
+  // One group, two Runs: both named.
+  assert.deepEqual([...orphanGroups([run('r', 1001, T), run('s', 1001, T)], leaders, self).get(1001)!], ['s\0r', 's\0s']);
 });
 
 // ───────────── jr2-12: command files ─────────────

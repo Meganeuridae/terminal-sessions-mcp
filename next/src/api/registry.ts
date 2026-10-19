@@ -23,9 +23,10 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ExecutionBackend } from '../backends/types.js';
+import { configuredEnv } from '../core/env.js';
 import { err, TermError } from '../core/errors.js';
 import { Journal, type JournalOptions } from '../core/journal.js';
-import { acquireDataDirLock, listProcesses, livingGroups, sleepSync, type DataDirLock } from '../core/lock.js';
+import { acquireDataDirLock, listProcesses, livingGroups, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { Session, trustedDir, type SessionOptions } from '../core/session.js';
 import { FileStore, FreeSpaceFloor, MemoryStore, type DiskFloor, type FileStoreOptions, type Retention } from '../core/stores.js';
@@ -195,16 +196,14 @@ class CursorBook {
     this.timer.unref();
   }
 
-  /** Write now if anything changed (atomically; best effort: cursors are advisory, delivery is at-least-once). */
+  /** Write now if anything changed (durably; best effort: cursors are advisory, delivery is at-least-once). */
   flush(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     if (!this.dirty) return;
     this.dirty = false;
-    const tmp = `${this.file}.${process.pid}.tmp`;
     try {
-      fs.writeFileSync(tmp, JSON.stringify(this.snapshot()), { mode: 0o600 });
-      fs.renameSync(tmp, this.file);
+      writeDurably(this.file, JSON.stringify(this.snapshot()));
     } catch {
       this.dirty = true; // the directory may be gone (forgotten) or the disk full: the next flush retries
     }
@@ -325,8 +324,15 @@ interface Slot {
   view: LiveEntry | HistoryEntry;
 }
 
-/** A journal opened by recovery, before its in-flight Runs are ended; `last` is the last event the dead daemon wrote. */
-type Recovering = Omit<Slot, 'cursors' | 'view'> & { retention: SessionRetention; journal: Journal; last: JournalEvent | undefined };
+/**
+ * A journal opened by recovery, before its in-flight Runs are ended; `last` is the last event the
+ * dead daemon wrote. `gone`: past its retention, so its files go — once its Runs' process groups
+ * have been ended with every other session's (the house's read of 2c35df8, #22).
+ */
+type Recovering = Omit<Slot, 'cursors' | 'view'> & { retention: SessionRetention; journal: Journal; last: JournalEvent | undefined; gone: boolean };
+
+/** A name whose record cannot be read has no known owner: nobody may reopen it until the record is repaired or the session removed. */
+const UNOWNED: Principal = 'unknown';
 
 export class SessionRegistry {
   private readonly slots = new Map<string, Slot>();
@@ -400,7 +406,8 @@ export class SessionRegistry {
    * journal is streamed once (run lifecycle events only); nothing holds a whole
    * journal in memory. Runs still open are ended `lost` — after the process
    * groups the dead daemon left running have been terminated, all sessions'
-   * together, within about 2.5 s (jr2-4).
+   * together, within about 2.5 s (jr2-4). A session past its retention is
+   * removed only after that: its Runs' groups are ended like any other's.
    */
   private recover(): void {
     // One damaged directory must not keep the daemon from starting; the daemon reports these.
@@ -432,66 +439,69 @@ export class SessionRegistry {
     const retention = this.retentionFor(undefined, meta.retention);
     const store = new FileStore(dir, this.storeOptions(retention));
     const gone = expired(store, retention, Date.now());
-    if (gone || store.lastSeq() === undefined) {
+    if (store.lastSeq() === undefined) {
       store.close();
-      // Past its retention, or every file aged out already: the whole session expires (G21, G26). An empty one is left alone.
+      // Every file aged out already: the whole session expires (G21, G26). An empty one is left alone.
       if (gone) this.removeFiles(id, dir);
       return undefined;
     }
     // Nothing runs under this name now: a dead life's command files (command text, env captures) go (jr2-12, G26).
-    removeLeftovers(this.opts.dataDir, id, dir);
+    if (!gone) removeLeftovers(this.opts.dataDir, id, dir);
     const last = store.tail(1)[0];
+    // Past its retention too, the journal is opened: its run index names the process groups to end (the house's read of 2c35df8, #22).
     const journal = new Journal({ hot: this.hotStore(retention), cold: store, sessionId: id, log: this.journalLog(id) });
-    return { id, dir, store, meta, retention, journal, last };
+    return { id, dir, store, meta, retention, journal, last, gone };
   }
 
   private finishRecovery(r: Recovering, ended: Map<string, string>): void {
     const { id, dir, store, meta, retention, journal, last } = r;
+    if (r.gone) {
+      // Past its retention: the whole session expires (G21, G26), now that its Runs' groups are ended.
+      journal.close();
+      this.removeFiles(id, dir);
+      return;
+    }
     // Every Run in flight when the daemon died — running, starting, queued, or named only by a
     // rotation header because its admission rotated out — is `lost`, never `running` (G3, G20).
     const now = Date.now();
     for (const run of journal.runs.open()) {
-      const reason = ended.get(`${id}\0${run.runId}`) ?? 'daemon-restart';
-      journal.append({ type: 'run.end', runId: run.runId, state: 'lost', reason, durationMs: Math.max(0, now - (run.startedAt ?? run.admittedAt)) });
+      const what = ended.get(`${id}\0${run.runId}`);
+      journal.append({ type: 'run.end', runId: run.runId, state: 'lost', reason: what ? `daemon-restart; ${what}` : 'daemon-restart', durationMs: Math.max(0, now - (run.startedAt ?? run.admittedAt)) });
+    }
+    // A Run that had ended, leaving children in its group (`leftovers`), says in the journal what became of them.
+    for (const run of journal.runs.list()) {
+      const what = run.endedAt !== undefined ? ended.get(`${id}\0${run.runId}`) : undefined;
+      if (what) journal.append({ type: 'note', text: `recovery: ${what}; it outlived ${run.runId}, which had ended`, principal: SYSTEM });
     }
     // Mark the restart once: a session closed on purpose, or history since an earlier restart, gains nothing.
     if (meta.closedAt === undefined && last?.type !== 'recovered') journal.append({ type: 'recovered', class: 'history-only' });
     journal.seal();
+    // A record that cannot be read names no owner. The name is nobody's to reopen until the record
+    // is repaired or the session removed — not the system principal's by default, which let anyone
+    // acting as the system start a new life on it (the house's read of 2c35df8, #22).
+    if (meta.damaged !== undefined) this.opts.log?.('warn', `session record cannot be read; nobody may reopen the session until it is repaired or removed: ${meta.damaged}`, { session: id });
+    const owner = meta.damaged !== undefined ? UNOWNED : meta.owner ?? SYSTEM;
     const cursors = new CursorBook(path.join(dir, 'cursors.json'));
-    const view = new HistoryEntry(id, journal, meta.owner ?? SYSTEM, meta.visibility ?? 'private', meta.closedAt !== undefined, retention, recordedOptions(meta, retention), cursors);
+    const view = new HistoryEntry(id, journal, owner, meta.visibility ?? 'private', meta.closedAt !== undefined, retention, recordedOptions(meta, retention), cursors);
     this.slots.set(id, { id, dir, store, meta, cursors, view });
   }
 
   /**
-   * The process groups of Runs a dead daemon left running (G19c: without the keeper, live processes
-   * do not survive a restart): SIGTERM, then SIGKILL after 2 s, bounded for every session together.
-   * A group counts as the Run's only when its leader started with the Run (not before, not after:
-   * pids are reused) or, with the leader gone, when a member predates the dead daemon's last event.
-   * Returns the lost reason per `<session>\0<runId>` of the groups it acted on.
+   * The process groups a dead daemon left running (G19c: without the keeper, live processes do not
+   * survive a restart) — of its Runs in flight, and of Runs that had ended leaving children in their
+   * group, which the live daemon's own shutdown drain would have ended (the house's read of 2c35df8,
+   * #22): SIGTERM, then SIGKILL after 2 s, bounded for every session together. Which groups are a
+   * Run's is `orphanGroups`'s rule. Returns what became of each group, per `<session>\0<runId>`.
    */
   private endOrphans(open: Recovering[]): Map<string, string> {
     const out = new Map<string, string>();
     const enabled = this.opts.terminateOrphans ?? this.opts.backend.kind !== 'scripted';
     if (!enabled || process.platform === 'win32') return out;
-    const candidates = open.flatMap((r) => r.journal.runs.open().filter((run) => run.pgid !== undefined && run.pgid > 1).map((run) => ({ r, run })));
+    const candidates = open.flatMap((r) => r.journal.runs.list().filter(mayHoldGroup).map((run) => ({ key: `${r.id}\0${run.runId}`, run, lastTs: r.last?.ts })));
     if (!candidates.length) return out;
     const procs = listProcesses();
     if (!procs) return out; // nothing can tell whose a group is: leave every process alone
-    const own = procs.find((p) => p.pid === process.pid)?.pgid;
-    const groups = new Map<number, string[]>();
-    for (const { r, run } of candidates) {
-      const g = run.pgid!;
-      if (g === process.pid || g === own) continue;
-      const members = procs.filter((p) => p.pgid === g && !p.zombie);
-      if (!members.length) continue;
-      const started = run.startedAt ?? run.admittedAt;
-      const leader = members.find((p) => p.pid === g);
-      // `ps` start times are truncated to the second; the leader is spawned at the Run's start.
-      const ours = leader
-        ? leader.startMs >= started - 2000 && leader.startMs <= started + 1000
-        : members.every((p) => p.startMs >= started - 2000) && members.some((p) => p.startMs + 1000 <= (r.last?.ts ?? 0));
-      if (ours) groups.set(g, [...(groups.get(g) ?? []), `${r.id}\0${run.runId}`]);
-    }
+    const groups = orphanGroups(candidates, procs, { pid: process.pid, pgid: procs.find((p) => p.pid === process.pid)?.pgid });
     if (!groups.size) return out;
     const signal = (g: number, sig: NodeJS.Signals) => {
       try {
@@ -516,7 +526,7 @@ export class SessionRegistry {
     const survivors = new Set(waitGone(stubborn, ORPHAN_KILL_MS));
     for (const [g, keys] of groups) {
       const what = survivors.has(g) ? `process group ${g} survived SIGKILL` : `process group ${g} terminated`;
-      for (const k of keys) out.set(k, `daemon-restart; ${what}`);
+      for (const k of keys) out.set(k, what);
     }
     return out;
   }
@@ -565,9 +575,10 @@ export class SessionRegistry {
     if (!SAFE_ID.test(id)) throw err('invalid_argument', 'session id must be 1–64 chars of [A-Za-z0-9._-], starting alphanumeric', { id });
   }
 
-  /** Refuse a name that folds onto another one, or whose history is someone else's (G18). */
+  /** Refuse a name that folds onto another one, whose record cannot be read, or whose history is someone else's (G18). */
   private checkName(o: CreateOptions, slot: Slot | undefined): void {
     if (slot) {
+      if (slot.meta.damaged !== undefined) throw damagedRecord(o.id, slot.meta.damaged);
       if (!this.mayReuse(slot, o.owner)) {
         throw err('forbidden', `session ${o.id} belongs to another principal; only its owner may open it again`, { id: o.id });
       }
@@ -612,7 +623,12 @@ export class SessionRegistry {
     } else {
       store = new FileStore(dir, this.storeOptions(retention));
       recorded = readMeta(dir);
-      // A journal this registry did not surface (recovery could not read it): its owner stands (G18).
+      // A journal this registry did not surface (recovery could not read it): its owner stands (G18),
+      // and a record that cannot be read names none.
+      if (store.lastSeq() !== undefined && recorded.damaged !== undefined) {
+        store.close();
+        throw damagedRecord(id, recorded.damaged);
+      }
       if (store.lastSeq() !== undefined && o.owner !== SYSTEM && (recorded.owner ?? SYSTEM) !== o.owner) {
         store.close();
         throw err('forbidden', `session ${id} belongs to another principal; only its owner may open it again`, { id });
@@ -631,8 +647,17 @@ export class SessionRegistry {
     try {
       writeMeta(dir, meta);
       // The integration files live in the session's own directory: a daemon that dies leaves them for
-      // the next life to overwrite, not in the system's temp dir.
-      if (options.integration !== false) integ = prepareIntegration(options.shell!, { dir: path.join(shellDir(dir), 'integration'), ...(this.opts.noUserRc || options.userRc === false ? { noUserRc: true } : {}), ...(this.opts.sessionOomScoreAdj !== undefined && { oomScoreAdj: this.opts.sessionOomScoreAdj }) });
+      // the next life to overwrite, not in the system's temp dir. The user's environment the
+      // integration preserves (zsh's ZDOTDIR, fish's XDG variables) is the one the shell starts
+      // with — the session's over the daemon's — not the daemon's own (the house's read of 2c35df8, #22).
+      if (options.integration !== false) {
+        integ = prepareIntegration(options.shell!, {
+          dir: path.join(shellDir(dir), 'integration'),
+          userEnv: configuredEnv(this.opts.daemonEnv ?? process.env, options.env ?? {}),
+          ...(this.opts.noUserRc || options.userRc === false ? { noUserRc: true } : {}),
+          ...(this.opts.sessionOomScoreAdj !== undefined && { oomScoreAdj: this.opts.sessionOomScoreAdj }),
+        });
+      }
       const so: SessionOptions = {
         id,
         owner: o.owner,
@@ -661,11 +686,21 @@ export class SessionRegistry {
       session = await Session.start(so);
     } catch (e) {
       integ?.cleanup();
+      // A start that failed is not a life: the record keeps what the last life was created with,
+      // and its closedAt, so a plain reopen starts the shell the name had and the history still
+      // reads as closed (the house's read of 2c35df8, #22). A name with no record keeps the attempt's.
+      const kept = recorded.owner !== undefined ? recorded : meta;
+      if (kept !== meta) {
+        try {
+          writeMeta(dir, kept);
+        } catch {
+          // the record in memory stands; the disk has the attempt's until the next write
+        }
+      }
       // The name keeps its history (and whatever the failed start journaled), readable and owned (G19).
       journal.seal();
       if (prev || journal.lastSeq > 0) {
-        const kept = readMeta(dir);
-        const view = new HistoryEntry(id, journal, kept.owner ?? o.owner, kept.visibility ?? options.visibility, true, retention, recordedOptions(kept, retention), cursors);
+        const view = new HistoryEntry(id, journal, kept.owner ?? o.owner, kept.visibility ?? options.visibility, kept.closedAt !== undefined, retention, recordedOptions(kept, retention), cursors);
         this.slots.set(id, { id, dir, store, meta: kept, cursors, view });
       } else {
         store.close();
@@ -705,7 +740,7 @@ export class SessionRegistry {
     return new MemoryStore(Math.min(this.opts.memoryBytes ?? DEFAULT_MEMORY_BYTES, retention.maxBytes ?? Infinity), retention.maxAgeMs !== undefined ? { maxAgeMs: retention.maxAgeMs } : {});
   }
 
-  /** Requested over recorded over daemon defaults. A bad request is refused; a bad record falls back. */
+  /** The daemon's log, naming the session, for what its journal has to say about its disk. */
   private journalLog(id: string): JournalOptions['log'] {
     const log = this.opts.log;
     return log ? (level, text) => log(level, text, { session: id }) : undefined;
@@ -715,6 +750,7 @@ export class SessionRegistry {
     return this.floor ? { ...retention, floor: this.floor } : retention;
   }
 
+  /** Requested over recorded over daemon defaults. A bad request is refused; a bad record falls back. */
   private retentionFor(requested: Retention | undefined, recorded: Retention | undefined): SessionRetention {
     const d = this.opts.retention ?? {};
     const ok = (n: unknown, min: number): n is number => typeof n === 'number' && Number.isFinite(n) && n >= min;
@@ -743,8 +779,8 @@ export class SessionRegistry {
     const s = this.slots.get(id)?.view;
     if (!s) throw err('session_not_found', `session ${id} not found`, { id });
     if (s.kind !== 'live') {
-      const why = s.closed ? 'was closed' : 'is history only (recovered from a previous daemon)';
-      throw err('session_exited', `session ${id} ${why}; its journal is readable`, { id });
+      const why = s.closed ? 'was closed' : 'has no shell (its daemon stopped; the history was recovered)';
+      throw err('session_exited', `session ${id} ${why}; its journal is readable, and its owner can open it again, which starts a new life of the name`, { id });
     }
     return s.session;
   }
@@ -891,6 +927,57 @@ export class SessionRegistry {
   }
 }
 
+/**
+ * A Run whose process group may still have members: one in flight, one that ended with children
+ * left behind (`leftovers`), or one cancelled or lost, whose end says nothing about its group. Not
+ * one that exited with its group empty, as its session saw: anything of that id now is a stranger's.
+ */
+function mayHoldGroup(run: RunInfo): boolean {
+  return run.pgid !== undefined && (run.state !== 'exited' || run.leftovers === true);
+}
+
+/** A Run recovery may end a group for: its key (`<session>\0<runId>`) and the last event its dead daemon wrote. */
+export interface OrphanCandidate {
+  key: string;
+  run: RunInfo;
+  lastTs: number | undefined;
+}
+
+/**
+ * Which of the candidates' process groups recovery signals, from a listing of the machine's
+ * processes: per group, the keys of the Runs it belonged to. Pure, so its rules are tested without
+ * a signal (the house's read of 2c35df8, #22). Never the daemon's own pid or group, and never a
+ * group below 2: `kill(-1)` reaches every process the daemon may signal.
+ *
+ * A group is the Run's when its leader started with the Run — not before, not after: pids are
+ * reused, and `ps` start times are truncated to the second — and the Run has not ended: its own
+ * process was reaped before its end was written, so a leader now holds the freed pid. With the
+ * leader gone, the kernel keeps a group's id while a member lives, so the members are descendants
+ * of whoever led it: the Run's, when none predates the Run and none started after the Run ended;
+ * for a Run still in flight, when one predates the dead daemon's last event by a second, so the
+ * group is not one formed after the daemon died.
+ */
+export function orphanGroups(candidates: OrphanCandidate[], procs: ProcessRow[], self: { pid: number; pgid: number | undefined }): Map<number, string[]> {
+  const groups = new Map<number, string[]>();
+  for (const { key, run, lastTs } of candidates) {
+    const g = run.pgid;
+    if (g === undefined || g <= 1 || g === self.pid || g === self.pgid) continue;
+    const members = procs.filter((p) => p.pgid === g && !p.zombie);
+    if (!members.length) continue;
+    const started = run.startedAt ?? run.admittedAt;
+    const ended = run.endedAt;
+    const leader = members.find((p) => p.pid === g);
+    const sinceStart = (p: ProcessRow) => p.startMs >= started - 2000;
+    const ours = leader
+      ? ended === undefined && sinceStart(leader) && leader.startMs <= started + 1000
+      : ended !== undefined
+        ? members.every((p) => sinceStart(p) && p.startMs <= ended)
+        : members.every(sinceStart) && members.some((p) => p.startMs + 1000 <= (lastTs ?? 0));
+    if (ours) groups.set(g, [...(groups.get(g) ?? []), key]);
+  }
+  return groups;
+}
+
 function expired(store: FileStore, retention: SessionRetention, now: number): boolean {
   if (retention.maxAgeMs === undefined) return false; // no age limit: history is kept until forgotten
   const newest = store.newestTs();
@@ -915,7 +1002,12 @@ interface Meta {
   closedAt?: number;
   /** The creation options every new life reuses (ux-4); retention is recorded above. */
   options?: Omit<SessionCreationOptions, 'retention'>;
+  /** In memory only: session.json is there but cannot be read (why). Nothing of the name is reopened until it is repaired or removed. */
+  damaged?: string;
 }
+
+const damagedRecord = (id: string, why: string): TermError =>
+  err('forbidden', `session ${id}'s record (session.json) cannot be read: ${why}; nobody may start a new life for it until the file is repaired or the session is removed`, { id });
 
 /** The recorded options, validated (a damaged or foreign session.json falls back field by field). */
 function recordedOptions(meta: Meta, retention: SessionRetention): SessionCreationOptions {
@@ -940,6 +1032,10 @@ function recordedOptions(meta: Meta, retention: SessionRetention): SessionCreati
   return out;
 }
 
+/**
+ * The record beside a journal: `{}` when there is none (a directory an older build made), `damaged`
+ * when there is one that cannot be read — never a guess at its owner (the house's read of 2c35df8, #22).
+ */
 function readMeta(dir: string): Meta {
   const file = path.join(dir, 'session.json');
   try {
@@ -947,20 +1043,54 @@ function readMeta(dir: string): Meta {
   } catch {
     // absent
   }
+  let raw: string;
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8')) as Meta;
-  } catch {
-    return {};
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    return { damaged: (e as Error).message };
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return { damaged: 'not a JSON object' };
+    return parsed as Meta;
+  } catch (e) {
+    return { damaged: (e as Error).message };
   }
 }
 
-/** Atomically, and private to the daemon's user: a crash mid-write never loses the owner (G18, G26); `env` may hold secrets. */
+/** Durably, and private to the daemon's user: a crash mid-write never loses the owner (G18, G26); `env` may hold secrets. */
 function writeMeta(dir: string, meta: Meta): void {
-  const file = path.join(dir, 'session.json');
+  const { damaged: _d, ...record } = meta;
+  writeDurably(path.join(dir, 'session.json'), JSON.stringify(record, null, 2));
+}
+
+/**
+ * Write `text` through a temp file beside `file`, synced to disk, then renamed over it, with the
+ * directory synced too: after a crash of the process or the machine the file is the old one or the
+ * new one, never torn or missing (the house's read of 2c35df8, #22). Owner-only (G26).
+ */
+function writeDurably(file: string, text: string): void {
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(meta, null, 2), { mode: 0o600 });
+  const data = Buffer.from(text);
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try {
+    for (let off = 0; off < data.length; ) off += fs.writeSync(fd, data, off);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.chmodSync(tmp, 0o600);
   fs.renameSync(tmp, file);
+  let dir: number | undefined;
+  try {
+    dir = fs.openSync(path.dirname(file), 'r');
+    fs.fsyncSync(dir);
+  } catch {
+    // a filesystem that cannot sync a directory: the rename is still atomic
+  } finally {
+    if (dir !== undefined) fs.closeSync(dir);
+  }
 }
 
 /** A session's shell-side files: command files and the shell's own history (0700). */

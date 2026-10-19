@@ -405,12 +405,85 @@ test('G19: a new life that fails to start keeps the history, readable and owned'
     throw new Error('spawn failed');
   };
   await rejectsWith(r.reg.ensure({ id: 'f', owner: A }), 'Error: spawn failed');
+  // A start that failed is not a life: the record keeps the last life's options and its closedAt,
+  // not the attempt's (the house's read of 2c35df8, #22).
+  await rejectsWith(r.reg.ensure({ id: 'f', owner: A, shell: '/bin/sh', cwd: os.homedir() }), 'Error: spawn failed');
+  const record = JSON.parse(fs.readFileSync(path.join(r.dir, 'sessions', 'f', 'session.json'), 'utf8')) as { options: { shell: string; cwd: string }; closedAt?: number };
+  assert.deepEqual([record.options.shell, record.options.cwd, typeof record.closedAt], ['/bin/bash', os.tmpdir(), 'number']);
   r.backend.spawnShell = spawn;
   const h = hist(r.reg.get('f'));
   assert.equal(h.owner, A);
+  assert.deepEqual([h.options.shell, h.options.cwd, h.closed], ['/bin/bash', os.tmpdir(), true]);
   assert.match(text(h.journal.since(0).events), /keep-me/);
   await rejectsWith(r.reg.ensure({ id: 'f', owner: B }), 'forbidden');
   assert.equal((await r.reg.ensure({ id: 'f', owner: A })).created, true);
+  assert.equal(r.backend.ptys[r.backend.ptys.length - 1]!.opts.shell, '/bin/bash', 'a plain reopen starts the shell the name had');
+  await cleanup(r);
+});
+
+test('G18: a session whose record cannot be read is nobody\'s to reopen — not the system\'s — until it is repaired; its history stays readable', async () => {
+  // Recovery read a damaged session.json as `{}` and made the system principal the owner, who could
+  // start a new life on it while the real owner was refused (the house's read of 2c35df8, #22).
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'dmg', owner: A })).session;
+  await run(s, A, 'echo keep-me');
+  await r.reg.close('dmg');
+  await r.reg.closeAll();
+  const file = path.join(r.dir, 'sessions', 'dmg', 'session.json');
+  fs.writeFileSync(file, '{');
+  const warnings: string[] = [];
+  const { backend, shells } = scripted();
+  const reg = new SessionRegistry({ dataDir: r.dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), log: (level, msg, fields) => void (level === 'warn' && warnings.push(`${msg} ${JSON.stringify(fields)}`)) });
+  const r2: Rig = { dir: r.dir, backend, shells, reg, changes: [] };
+  const h = hist(reg.get('dmg'));
+  assert.equal(h.owner, 'unknown');
+  assert.match(text(h.journal.since(0).events), /keep-me/);
+  assert.ok(warnings.some((w) => /record cannot be read/.test(w) && /"session":"dmg"/.test(w)), JSON.stringify(warnings));
+  for (const owner of [A, B, 'system']) {
+    await rejectsWith(reg.ensure({ id: 'dmg', owner }), 'forbidden');
+    await rejectsWith(reg.create({ id: 'dmg', owner }), 'forbidden');
+  }
+  assert.equal(fs.readFileSync(file, 'utf8'), '{', 'the file is left for repair');
+  // Repaired: the recorded owner reopens it, nobody else.
+  fs.writeFileSync(file, JSON.stringify({ owner: A, visibility: 'private' }));
+  await reg.closeAll();
+  const r3 = restart(r2);
+  assert.equal(hist(r3.reg.get('dmg')).owner, A);
+  await rejectsWith(r3.reg.ensure({ id: 'dmg', owner: B }), 'forbidden');
+  assert.equal((await r3.reg.ensure({ id: 'dmg', owner: A })).created, true);
+  await cleanup(r3, r2, r);
+});
+
+test('the integration preserves the environment the shell starts with — the session\'s over the daemon\'s — not the daemon\'s own', async () => {
+  // zsh's ZDOTDIR and fish's XDG_DATA_DIRS were read from the daemon's environment, so a session's
+  // own value appeared nowhere in its shell (the house's read of 2c35df8, #22).
+  const { backend, shells } = scripted();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-registry-'));
+  const reg = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), daemonEnv: { ...process.env, ZDOTDIR: '/daemon/zdotdir', XDG_DATA_DIRS: '/daemon/share' } });
+  const r: Rig = { dir, backend, shells, reg, changes: [] };
+  const spawned = () => backend.ptys[backend.ptys.length - 1]!.opts.env;
+  await reg.ensure({ id: 'z1', owner: A, shell: '/bin/zsh', env: { ZDOTDIR: '/session/zdotdir' } });
+  assert.equal(spawned().TSM_USER_ZDOTDIR, '/session/zdotdir');
+  assert.notEqual(spawned().ZDOTDIR, '/session/zdotdir', 'ZDOTDIR itself names the shim; the shim restores the user\'s');
+  await reg.ensure({ id: 'z2', owner: A, shell: '/bin/zsh' });
+  assert.equal(spawned().TSM_USER_ZDOTDIR, '/daemon/zdotdir', 'without a session value the daemon\'s stands, as for every variable');
+  await reg.ensure({ id: 'f1', owner: A, shell: '/usr/bin/fish', env: { XDG_DATA_DIRS: '/session/share' } });
+  assert.equal(spawned().TSM_XDG_DATA_DIRS, '/session/share');
+  assert.match(spawned().XDG_DATA_DIRS!, /:\/session\/share$/);
+  await cleanup(r);
+});
+
+test('sessionOomScoreAdj reaches a shell started without integration through the backend, as it reaches one with it through its launcher', async () => {
+  // With `integration: false` nothing set the shell's oom_score_adj: only the launcher did (the house's read of 2c35df8, #22).
+  const { backend, shells } = scripted();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-registry-'));
+  const reg = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), sessionOomScoreAdj: 500 });
+  const r: Rig = { dir, backend, shells, reg, changes: [] };
+  const spawned = () => backend.ptys[backend.ptys.length - 1]!.opts;
+  await reg.ensure({ id: 'plain', owner: A, integration: false });
+  assert.deepEqual([spawned().oomScoreAdj, spawned().bootstrap], [500, undefined], 'no launcher: the backend sets it');
+  await reg.ensure({ id: 'rich', owner: A });
+  assert.deepEqual([spawned().oomScoreAdj, typeof spawned().bootstrap?.launcher], [500, 'string']);
   await cleanup(r);
 });
 
