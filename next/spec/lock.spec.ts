@@ -12,12 +12,37 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { SessionRegistry } from '../src/api/registry.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermError } from '../src/core/errors.js';
 import { Journal } from '../src/core/journal.js';
-import { acquireDataDirLock, bootId, LOCK_FILE, procStart, statStartTicks } from '../src/core/lock.js';
+import { acquireDataDirLock, bootId, LOCK_FILE, procStart, statIsZombie, statStartTicks } from '../src/core/lock.js';
+
+/**
+ * The builtin modules as lock.js sees them: patching a function here and calling syncBuiltinESMExports
+ * reaches the module's own `import * as fs` bindings, which the test runner's mocks cannot. Every patch
+ * is restored in a finally.
+ */
+const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync; openSync: typeof fs.openSync; readFileSync: typeof fs.readFileSync; writeFileSync: typeof fs.writeFileSync };
+const cpc = createRequire(import.meta.url)('node:child_process') as { execFileSync: (file: string, args?: readonly string[], ...rest: unknown[]) => unknown };
+const eio = () => Object.assign(new Error('EIO: i/o error, fsync'), { code: 'EIO' });
+/** A directory fsync that fails with EIO while `fn` runs (file fsyncs still work). */
+function withDirFsyncEIO<T>(fn: () => T): T {
+  const real = fsc.fsyncSync;
+  fsc.fsyncSync = ((fd: number) => {
+    if (fsc.fstatSync(fd).isDirectory()) throw eio();
+    return real(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  try {
+    return fn();
+  } finally {
+    fsc.fsyncSync = real;
+    syncBuiltinESMExports();
+  }
+}
 import { FileStore } from '../src/core/stores.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -170,7 +195,8 @@ test('jr2-2: a holder that exits without releasing leaves no lock behind; racing
         `
         import { acquireDataDirLock } from ${JSON.stringify(LOCK_JS)};
         process.stdin.once('data', () => {
-          try { acquireDataDirLock(${JSON.stringify(race)}); console.log('won'); setTimeout(() => process.exit(0), 1500); }
+          // The winner holds until told: a fixed hold let a slow racer find the lock free and win too (the house's read of the 38 commits, #22).
+          try { acquireDataDirLock(${JSON.stringify(race)}); console.log('won'); process.stdin.once('data', () => process.exit(0)); }
           catch (e) { console.log(e.code === 'data_dir_locked' ? 'refused' : 'error ' + e.message); process.exit(0); }
         });
         console.log('ready');
@@ -180,6 +206,9 @@ test('jr2-2: a holder that exits without releasing leaves no lock behind; racing
     );
     await Promise.all(racers.map((r) => r.line(/^ready$/)));
     for (const r of racers) r.proc.stdin!.write('go\n');
+    // Every racer's outcome first; only then is the winner released.
+    await Promise.all(racers.map((r) => r.line(/^(won|refused|error)/)));
+    for (const r of racers) if (r.lines.includes('won')) r.proc.stdin!.write('release\n');
     await Promise.all(racers.map((r) => r.exited));
     const outcomes = racers.map((r) => r.lines.find((l) => l !== 'ready'));
     assert.equal(outcomes.filter((o) => o === 'won').length, 1, `${stale ? 'stale' : 'free'}: ${outcomes.join(', ')}`);
@@ -321,4 +350,205 @@ test('a filesystem without hard links: a link() refused with EPERM falls back to
   assert.equal(over.tookOver?.pid, 999_999, 'a stale lock is taken over without link()');
   assert.equal(readLock(dir).pid, process.pid);
   over.release();
+});
+
+// ───────────── the house's read of the 38 commits (PR #22, comment 6274603516): two holders ─────────────
+
+test('item 1: a lock naming this pid that this process did not write is a predecessor\'s, taken over — "self" means the content this process wrote (the house\'s read of the 38 commits, #22)', () => {
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, LOCK_FILE);
+  // A predecessor on the same pid, from another boot, stamped by a clock that then read later than ours does now.
+  fs.writeFileSync(file, JSON.stringify({ pid: process.pid, startedAt: Date.now() + 60_000, hostname: os.hostname(), nonce: 'predecessor', bootId: 'an-earlier-boot', startTicks: 1 }) + '\n');
+  const lock = acquireDataDirLock(dir);
+  try {
+    assert.equal(lock.tookOver?.nonce, 'predecessor', 'taken over, not taken as our own');
+    assert.ok(!fs.readFileSync(file, 'utf8').includes('predecessor'), 'the file holds our record now');
+    assert.equal(readLock(dir).pid, process.pid);
+    assert.equal(acquireDataDirLock(dir).file, file, 'what we wrote is "self" for another take in this process');
+  } finally {
+    lock.release();
+  }
+  assert.equal(fs.existsSync(file), false, 'ours to release');
+});
+
+test('item 2: the no-hard-links fallback takes the lock only if termd.lock still holds its own record after the write — a taker that read it empty wins alone (the house\'s read of the 38 commits, #22)', () => {
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, LOCK_FILE);
+  const noLinks = () => {
+    throw Object.assign(new Error('EPERM: operation not permitted, link'), { code: 'EPERM' });
+  };
+  // While this start's exclusive write is in flight (between its write and its fsync), another starter
+  // read the file empty, judged it old, and took it over: it names a live stranger (our parent) now.
+  const stranger = JSON.stringify({ pid: process.ppid, startedAt: Date.now(), hostname: os.hostname(), nonce: 'taker' }) + '\n';
+  const realOpen = fsc.openSync;
+  const realFsync = fsc.fsyncSync;
+  const lockFds = new Set<number>();
+  fsc.openSync = ((p: fs.PathLike, ...rest: unknown[]) => {
+    const fd = (realOpen as (...a: unknown[]) => number)(p, ...rest);
+    if (String(p) === file) lockFds.add(fd);
+    return fd;
+  }) as typeof fs.openSync;
+  fsc.fsyncSync = ((fd: number) => {
+    if (lockFds.delete(fd)) fsc.writeFileSync(file, stranger);
+    return realFsync(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => acquireDataDirLock(dir, { link: noLinks }), (e: unknown) => code(e) === 'data_dir_locked', 'the file is the taker\'s: refused, not a second holder');
+    assert.equal(readLock(dir).pid, process.ppid, 'the taker still holds it');
+    assert.deepEqual(fs.readdirSync(dir).filter((n) => n.endsWith('.tmp')), [], 'no temp left behind');
+  } finally {
+    fsc.openSync = realOpen;
+    fsc.fsyncSync = realFsync;
+    syncBuiltinESMExports();
+  }
+});
+
+test('item 4: an EEXIST from a link that took effect (NFS) is this attempt\'s take when termd.lock holds its record: registered and released, not left behind (the house\'s read of the 38 commits, #22)', () => {
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, LOCK_FILE);
+  const nfsLink = (a: string, b: string) => {
+    fs.linkSync(a, b);
+    throw Object.assign(new Error('EEXIST: file already exists, link'), { code: 'EEXIST' });
+  };
+  const lock = acquireDataDirLock(dir, { link: nfsLink });
+  assert.equal(lock.tookOver, undefined, 'a fresh take');
+  assert.equal(readLock(dir).pid, process.pid);
+  lock.release();
+  assert.equal(fs.existsSync(file), false, 'released, so a clean exit leaves no lock naming a dead pid');
+});
+
+test('item 5: a zombie holder is gone — its stat still has the start ticks and kill(pid, 0) succeeds, but state Z is exited (the house\'s read of the 38 commits, #22)', async () => {
+  const after = 'S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 12345678 500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0';
+  assert.equal(statIsZombie(`1234 (node) ${after}`), false);
+  assert.equal(statIsZombie(`1234 (my (odd) comm) ${after.replace(/^S/, 'Z')}`), true);
+  if (process.platform !== 'linux') {
+    console.log(`# a real zombie needs /proc: the holder check is skipped on ${process.platform}`);
+    return;
+  }
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const holder = path.join(dir, 'holder.mjs');
+  fs.writeFileSync(holder, `const { acquireDataDirLock } = await import(${JSON.stringify(LOCK_JS)}); acquireDataDirLock(${JSON.stringify(dir)}); process.kill(process.pid, 'SIGKILL');\n`);
+  // sh starts the holder, then becomes `sleep`, which never waits for it: killed, it stays a zombie.
+  const parent = spawn('sh', ['-c', `${JSON.stringify(process.execPath)} ${JSON.stringify(holder)} & exec sleep 20`], { stdio: 'ignore' });
+  try {
+    for (let i = 0; i < 200 && !fs.existsSync(path.join(dir, LOCK_FILE)); i++) await new Promise((r) => setTimeout(r, 25));
+    await new Promise((r) => setTimeout(r, 400));
+    const pid = readLock(dir).pid;
+    assert.equal(statIsZombie(fs.readFileSync(`/proc/${pid}/stat`, 'utf8')), true, 'the holder is a zombie');
+    const lock = acquireDataDirLock(dir);
+    assert.equal(lock.tookOver?.pid, pid, 'taken over: a zombie holds nothing');
+    lock.release();
+  } finally {
+    parent.kill('SIGKILL');
+  }
+});
+
+test('item 6: a liveness check that cannot answer keeps the holder — an unknown is not stale (the house\'s read of the 38 commits, #22)', async () => {
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  // A live holder (not termd) whose lock the wall clock reads as a pid reuse (its startedAt is long past):
+  // only its command line could keep it, and that check is made to fail.
+  const sleeper = spawn('sleep', ['30'], { stdio: 'ignore' });
+  const realExec = cpc.execFileSync;
+  const realRead = fsc.readFileSync;
+  cpc.execFileSync = (file, args, ...rest) => {
+    if (args?.includes('command=')) throw Object.assign(new Error('ETIMEDOUT: ps timed out'), { code: 'ETIMEDOUT' });
+    return realExec(file, args, ...rest);
+  };
+  fsc.readFileSync = ((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+    if (String(p).endsWith('/cmdline')) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    return (realRead as (...a: unknown[]) => ReturnType<typeof fs.readFileSync>)(p, ...rest);
+  }) as typeof fs.readFileSync;
+  syncBuiltinESMExports();
+  try {
+    await new Promise((r) => setTimeout(r, 50));
+    fs.writeFileSync(path.join(dir, LOCK_FILE), JSON.stringify({ pid: sleeper.pid, startedAt: Date.now() - 3_600_000, hostname: os.hostname() }));
+    assert.throws(() => acquireDataDirLock(dir), (e: unknown) => code(e) === 'data_dir_locked', 'unknown keeps the holder');
+    assert.equal(readLock(dir).pid, sleeper.pid);
+  } finally {
+    cpc.execFileSync = realExec;
+    fsc.readFileSync = realRead;
+    syncBuiltinESMExports();
+    sleeper.kill('SIGKILL');
+  }
+});
+
+test('Linux: only the frame-free branch decides — a live holder whose lock\'s start ticks or boot id differ from its own is a reused pid, taken over (the house\'s read of the 38 commits, #22)', async () => {
+  if (process.platform !== 'linux') {
+    console.log(`# start ticks and the boot id are Linux's: the frame-free decision is skipped on ${process.platform}`);
+    return;
+  }
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  // A live holder with nothing in its command line to keep it off the frame-free branch's verdict.
+  const holder = spawn(process.execPath, ['--input-type=module', '-e', `import { acquireDataDirLock } from ${JSON.stringify(LOCK_JS)}; acquireDataDirLock(${JSON.stringify(dir)}); console.log('held'); setInterval(() => {}, 1000);`], { stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let buf = '';
+      holder.stdout!.on('data', (d: Buffer) => {
+        buf += d.toString();
+        if (buf.includes('held')) resolve();
+      });
+      holder.once('exit', () => reject(new Error('holder exited before holding the lock')));
+      setTimeout(() => reject(new Error('holder timed out')), 15_000).unref();
+    });
+    const lockFile = path.join(dir, LOCK_FILE);
+    const h = JSON.parse(fs.readFileSync(lockFile, 'utf8')) as { pid: number; startTicks: number; bootId: string };
+    assert.equal(typeof h.startTicks, 'number');
+    for (const variant of [{ startTicks: h.startTicks + 1 }, { bootId: 'another-boot' }]) {
+      fs.writeFileSync(lockFile, JSON.stringify({ ...h, ...variant }) + '\n');
+      // The wall clock alone would keep it (the process started before the lock was written); the ticks or
+      // the boot id say the pid was reused, and that decides.
+      const lock = acquireDataDirLock(dir);
+      assert.equal(lock.tookOver?.pid, holder.pid, `taken over on ${JSON.stringify(variant)}`);
+      lock.release();
+    }
+  } finally {
+    holder.kill('SIGKILL');
+  }
+});
+
+test('the lock is written whole and fsynced before it is published: a link that reads the temp at publication finds the full record already synced (the house\'s read of the 38 commits, #22)', () => {
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const synced = new Set<number>();
+  const realFsync = fsc.fsyncSync;
+  fsc.fsyncSync = ((fd: number) => {
+    synced.add(fsc.fstatSync(fd).ino);
+    return realFsync(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  try {
+    let checked = false;
+    const link = (tmp: string, file: string) => {
+      const h = JSON.parse(fs.readFileSync(tmp, 'utf8')) as { pid: number; nonce: string; startedAt: number };
+      assert.deepEqual([h.pid, typeof h.nonce, typeof h.startedAt], [process.pid, 'string', 'number'], 'the whole record is there before it is published');
+      assert.ok(synced.has(fs.statSync(tmp).ino), 'and it was fsynced first');
+      checked = true;
+      fs.linkSync(tmp, file);
+    };
+    const lock = acquireDataDirLock(dir, { link });
+    assert.equal(checked, true);
+    lock.release();
+  } finally {
+    fsc.fsyncSync = realFsync;
+    syncBuiltinESMExports();
+  }
+});
+
+test('items 7 and 8: a directory fsync failing with EIO after the lock is published is reported on the handle and logged once by the registry; the lock is held (the house\'s read of the 38 commits, #22)', async () => {
+  const dir = dataDir();
+  const lock = withDirFsyncEIO(() => acquireDataDirLock(dir));
+  assert.equal(lock.unsynced, true, 'held, and the directory sync failure is reported');
+  assert.equal(readLock(dir).pid, process.pid);
+  lock.release();
+  const warnings: string[] = [];
+  const reg = withDirFsyncEIO(() => new SessionRegistry({ dataDir: path.join(dir, 'reg'), backend: new ScriptedBackend(), log: (level, text) => void (level === 'warn' && warnings.push(text)) }));
+  assert.equal(warnings.filter((w) => /lock is taken but its directory could not be synced/.test(w)).length, 1, JSON.stringify(warnings));
+  await reg.closeAll();
 });

@@ -101,7 +101,7 @@ export interface MemoryStoreOptions {
  * new one, never torn or missing (the house's read of 2c35df8, #22). Owner-only (G26). The session records, the store's own
  * metadata and the lock file are all written this way.
  */
-export function writeDurably(file: string, text: string): void {
+export function writeDurably(file: string, text: string): DurableWrite {
   const tmp = `${file}.${process.pid}.tmp`;
   const data = Buffer.from(text);
   try {
@@ -125,23 +125,38 @@ export function writeDurably(file: string, text: string): void {
     }
     throw e;
   }
-  syncDir(file);
+  const error = syncDir(file);
+  return error ? { synced: false, error } : { synced: true };
 }
 
 /**
- * fsync the directory holding `file`, so a rename or create survives a crash. Only a filesystem that
- * cannot sync a directory is ignored (the rename is still atomic); a real I/O error means the change
- * may not survive a crash and the numbering could come back lower (G10), so it is rethrown (comment
- * 6269992150). The one rule for the stores and the lock (a reviewer's read of the fixes for #22
- * comment 6269992150: the lock had its own copy that swallowed everything).
+ * What writeDurably reports once the file holds the new content: whether the directory was synced too.
+ * "Not written" is an exception; "written, directory not synced" (a real fsync error such as EIO after
+ * the rename) is this result, so a caller can tell the two apart — a reservation it must retry, an
+ * advisory write it should not rewrite forever (the house's read of the 38 commits, PR #22, comment
+ * 6274603516).
  */
-export function syncDir(file: string): void {
+export interface DurableWrite {
+  synced: boolean;
+  /** The directory fsync's error, when `synced` is false. */
+  error?: NodeJS.ErrnoException;
+}
+
+/**
+ * fsync the directory holding `file`, so a rename or create survives a crash, and say when it could
+ * not: a real I/O error (EIO) is returned to the caller, who decides what a change that may not survive
+ * a crash means for it (comment 6274603516). A filesystem that cannot sync a directory (cannotSyncDir)
+ * is not an error: the rename is still atomic. The one rule for the stores and the lock (a reviewer's
+ * read of the fixes for #22 comment 6269992150).
+ */
+export function syncDir(file: string): NodeJS.ErrnoException | undefined {
   let dir: number | undefined;
   try {
     dir = fs.openSync(path.dirname(file), 'r');
     fs.fsyncSync(dir);
+    return undefined;
   } catch (e) {
-    if (!cannotSyncDir((e as NodeJS.ErrnoException).code)) throw e;
+    return cannotSyncDir((e as NodeJS.ErrnoException).code) ? undefined : (e as NodeJS.ErrnoException);
   } finally {
     if (dir !== undefined) fs.closeSync(dir);
   }
@@ -473,17 +488,17 @@ export class FileStore implements JournalStore {
       // absent (a new journal, or one an older build wrote) or damaged: a new epoch
     }
     const meta: StoreMeta = { v: 1, epoch: newEpoch() };
-    this.metaPending = !this.writeMeta(meta);
+    this.metaPending = this.writeMeta(meta) !== 'written';
     return meta;
   }
 
   /** Atomically and privately (G26); false when the disk refuses. */
-  private writeMeta(meta: StoreMeta): boolean {
+  /** `written` (durable), `unsynced` (the file holds it, the directory fsync failed) or `failed` (nothing changed on disk). */
+  private writeMeta(meta: StoreMeta): 'written' | 'unsynced' | 'failed' {
     try {
-      writeDurably(path.join(this.dir, META), JSON.stringify(meta) + '\n');
-      return true;
+      return writeDurably(path.join(this.dir, META), JSON.stringify(meta) + '\n').synced ? 'written' : 'unsynced';
     } catch {
-      return false;
+      return 'failed';
     }
   }
 
@@ -504,7 +519,15 @@ export class FileStore implements JournalStore {
     // Confirmed only once it is on disk (the house's read of b047b92, point 1): a refused write
     // changes nothing here, so a prune cannot delete the file whose newest seq the high water was
     // to keep, and a refused reservation is never written later as if its seqs had been issued.
-    if (!this.writeMeta(meta)) return false;
+    const w = this.writeMeta(meta);
+    if (w === 'failed') return false;
+    // The file holds the new mark but its directory could not be synced, so a machine crash may bring the
+    // old file back. For a clear or a lower mark that is done: the crash can only restore the older,
+    // higher reservation, which is safe. For a raise (a higher mark, or a reservation newly marked failed)
+    // it is not done: the seqs it reserves could be reissued after a crash (G10), so memory keeps the old
+    // mark and the caller retries (the house's read of the 38 commits, PR #22, comment 6274603516).
+    const raising = (meta.highWater ?? 0) > (this.meta.highWater ?? 0) || (meta.failed === true && this.meta.failed !== true);
+    if (w === 'unsynced' && raising) return false;
     this.meta = meta;
     return true;
   }
@@ -739,7 +762,7 @@ export class FileStore implements JournalStore {
     seg.firstTs ??= event.ts;
     seg.last = event.seq;
     seg.lastTs = event.ts;
-    if (this.metaPending) this.metaPending = !this.writeMeta(this.meta);
+    if (this.metaPending) this.metaPending = this.writeMeta(this.meta) !== 'written';
   }
 
   private write(buf: Buffer): void {

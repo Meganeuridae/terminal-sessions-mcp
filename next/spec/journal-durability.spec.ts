@@ -9,9 +9,28 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { Journal } from '../src/core/journal.js';
 import { cannotSyncDir, FileStore, MemoryStore, writeDurably } from '../src/core/stores.js';
+
+/** node:fs as stores.js sees it: a patch here plus syncBuiltinESMExports reaches its `import * as fs` bindings. */
+const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync };
+/** A directory fsync that fails with EIO while `fn` runs (file fsyncs still work). */
+function withDirFsyncEIO<T>(fn: () => T): T {
+  const real = fsc.fsyncSync;
+  fsc.fsyncSync = ((fd: number) => {
+    if (fsc.fstatSync(fd).isDirectory()) throw Object.assign(new Error('EIO: i/o error, fsync'), { code: 'EIO' });
+    return real(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  try {
+    return fn();
+  } finally {
+    fsc.fsyncSync = real;
+    syncBuiltinESMExports();
+  }
+}
 import type { JournalEvent } from '../src/core/types.js';
 
 const out = (data: string, runId?: string) => ({ type: 'output', data, stream: 'pty', ...(runId ? { runId, attribution: 'temporal' as const } : {}) }) as const;
@@ -308,4 +327,37 @@ test('writeDurably surfaces a write failure and its guarded cleanup leaves no te
 test('writeDurably swallows only the directory-fsync codes that mean a filesystem cannot sync a directory — a real I/O error propagates (the house\'s read of the 36 commits, #22)', () => {
   for (const code of ['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM', 'EISDIR']) assert.equal(cannotSyncDir(code), true, code);
   for (const code of ['EIO', 'ENOSPC', 'EACCES', undefined]) assert.equal(cannotSyncDir(code), false, String(code));
+});
+
+test('writeDurably tells "written, directory not synced" (a real EIO after the rename) from "not written", which throws (the house\'s read of the 38 commits, #22)', () => {
+  const dir = tmpDir();
+  try {
+    const file = path.join(dir, 'rec.json');
+    assert.deepEqual(writeDurably(file, 'first'), { synced: true });
+    const w = withDirFsyncEIO(() => writeDurably(file, 'second'));
+    assert.equal(w.synced, false, 'the directory could not be synced');
+    assert.equal(w.error?.code, 'EIO');
+    assert.equal(fs.readFileSync(file, 'utf8'), 'second', 'but the file holds the new content: it was written');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('item 7: with the directory fsync failing, clearing the high water counts as done (a crash can only bring back the older, higher reservation) and raising it does not (the house\'s read of the 38 commits, #22)', () => {
+  const dir = tmpDir();
+  try {
+    const store = new FileStore(dir);
+    assert.equal(store.setHighWater(100, true), true);
+    // A clear while the directory cannot be synced: the file holds no mark, memory agrees, a reopened store reads none.
+    assert.equal(withDirFsyncEIO(() => store.setHighWater(0, false)), true, 'the clear is done');
+    assert.equal(store.highWater(), undefined, 'memory agrees with the disk');
+    assert.equal(new FileStore(dir).highWater(), undefined, 'a store opened after a restart reads none');
+    // A raise while the directory cannot be synced: not done, memory keeps the old mark, the caller retries.
+    assert.equal(withDirFsyncEIO(() => store.setHighWater(50, true)), false, 'the raise is not done');
+    assert.equal(store.highWater(), undefined, 'memory keeps the old mark');
+    assert.equal(store.setHighWater(50, true), true, 'the retry lands once the directory syncs again');
+    assert.deepEqual(store.highWater(), { seq: 50, failed: true });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

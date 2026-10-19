@@ -9,9 +9,28 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { SessionRegistry, type AnySession, type HistorySession, type LiveSession, type RegistryChange } from '../src/api/registry.js';
+
+/** node:fs as stores.js sees it: a patch here plus syncBuiltinESMExports reaches its `import * as fs` bindings. */
+const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync };
+/** A directory fsync that fails with EIO while `fn` runs (file fsyncs still work). */
+function withDirFsyncEIO<T>(fn: () => T): T {
+  const real = fsc.fsyncSync;
+  fsc.fsyncSync = ((fd: number) => {
+    if (fsc.fstatSync(fd).isDirectory()) throw Object.assign(new Error('EIO: i/o error, fsync'), { code: 'EIO' });
+    return real(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  try {
+    return fn();
+  } finally {
+    fsc.fsyncSync = real;
+    syncBuiltinESMExports();
+  }
+}
 import type { ScriptedBackend, ScriptedProcess } from '../src/backends/scripted.js';
 import { TermError } from '../src/core/errors.js';
 import { FileStore } from '../src/core/stores.js';
@@ -649,5 +668,35 @@ test('G19: one unreadable session directory does not keep the registry from star
   hist(r2.reg.get('fine'));
   assert.equal(r2.reg.get('weird'), undefined);
   assert.deepEqual(r2.reg.recoveryErrors.map((e) => e.id), ['weird']);
+  await cleanup(r2, r);
+});
+
+test('item 8: cursors written while their directory cannot be synced are logged once, not rewritten forever — the file holds them (the house\'s read of the 38 commits, #22)', async () => {
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'cur', owner: A })).session;
+  await run(s, A, 'echo one');
+  await r.reg.close('cur');
+  await r.reg.closeAll();
+  const warnings: string[] = [];
+  const { backend, shells } = scripted();
+  const reg = new SessionRegistry({ dataDir: r.dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), log: (level, text) => void (level === 'warn' && warnings.push(text)) });
+  const r2: Rig = { dir: r.dir, backend, shells, reg, changes: [] };
+  const h = hist(reg.get('cur'));
+  const file = path.join(r.dir, 'sessions', 'cur', 'cursors.json');
+  const readOf = () => (JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, { read: number }>)[A]!.read;
+  const said = () => warnings.filter((w) => /cursors are written but their directory could not be synced/.test(w)).length;
+  // dispose() flushes the cursors; the directory fsync fails after the rename.
+  withDirFsyncEIO(() => {
+    h.markRead(A, 5);
+    reg.dispose();
+  });
+  assert.equal(readOf(), 5, 'the file holds the cursors: they were written');
+  assert.equal(said(), 1, 'the sync failure is logged');
+  withDirFsyncEIO(() => {
+    h.markRead(A, 6);
+    reg.dispose();
+  });
+  assert.equal(readOf(), 6, 'a later change is still written');
+  assert.equal(said(), 1, 'but the failure is said once, and nothing is rewritten in a loop');
   await cleanup(r2, r);
 });

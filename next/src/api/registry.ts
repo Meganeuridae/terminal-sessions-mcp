@@ -30,7 +30,7 @@ import { Journal, type JournalOptions } from '../core/journal.js';
 import { acquireDataDirLock, groupAlive, listProcesses, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { Session, trustedDir, type SessionOptions } from '../core/session.js';
-import { FileStore, FreeSpaceFloor, MemoryStore, type DiskFloor, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
+import { FileStore, FreeSpaceFloor, MemoryStore, type DiskFloor, type DurableWrite, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
 import { DEFAULT_GEOMETRY, SYSTEM, type ControlPolicy, type Cursors, type JournalEvent, type Principal, type RunInfo, type Seq, type Visibility } from '../core/types.js';
 import { prepareIntegration } from '../shell/integration.js';
 
@@ -147,8 +147,13 @@ class CursorBook {
   private readonly map = new Map<Principal, Cursors>();
   private timer: NodeJS.Timeout | undefined;
   private dirty = false;
+  /** A directory that could not be synced has been said once: the file holds the cursors, rewriting changes nothing. */
+  private syncWarned = false;
 
-  constructor(private readonly file: string) {
+  constructor(
+    private readonly file: string,
+    private readonly log?: RegistryOptions['log'],
+  ) {
     try {
       fs.chmodSync(file, 0o600);
       for (const [p, c] of Object.entries(JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, Partial<Cursors> | null>)) {
@@ -206,9 +211,15 @@ class CursorBook {
     if (!this.dirty) return;
     this.dirty = false;
     try {
-      writeDurably(this.file, JSON.stringify(this.snapshot()));
+      const w = writeDurably(this.file, JSON.stringify(this.snapshot()));
+      // Written, but the directory could not be synced (a real fsync error): the file holds the cursors, so
+      // rewriting them changes nothing — said once, not retried forever; cursors are advisory (comment 6274603516).
+      if (!w.synced && !this.syncWarned) {
+        this.syncWarned = true;
+        this.log?.('warn', `cursors are written but their directory could not be synced: ${w.error?.message ?? 'unknown error'}`, { file: this.file });
+      }
     } catch {
-      this.dirty = true; // the directory may be gone (forgotten) or the disk full: the next flush retries
+      this.dirty = true; // not written: the directory may be gone (forgotten) or the disk full, so the next flush retries
     }
   }
 
@@ -414,6 +425,8 @@ export class SessionRegistry {
     if (stale) this.opts.log?.('warn', 'took over the data dir lock of a daemon that is gone (it did not drain)', { pid: stale.pid, startedAt: stale.startedAt !== undefined ? new Date(stale.startedAt).toISOString() : undefined, hostname: stale.hostname });
     // Said once per take, since the lock itself has no log (a reviewer's read of the fixes for #22 comment 6269992150).
     if (this.dirLock.noHardLinks) this.opts.log?.('warn', "the data dir's filesystem has no hard links: the lock is created by an exclusive write instead of link(), whose brief empty window the age guard covers", { dataDir: this.opts.dataDir });
+    // A real fsync error on the lock's directory (EIO): the lock is held; one that vanishes after a crash is taken anew (comment 6274603516).
+    if (this.dirLock.unsynced) this.opts.log?.('warn', 'the data dir lock is taken but its directory could not be synced; a lock that vanishes after a crash is simply taken anew', { dataDir: this.opts.dataDir });
   }
 
   /** Flush every session's cursors and give up the data dir's lock. Sessions are not closed: see `closeAll`. */
@@ -561,7 +574,7 @@ export class SessionRegistry {
     const refusal = recordRefusal(id, meta);
     if (refusal) this.opts.log?.('warn', refusal.message, { session: id });
     const owner = refusal ? UNOWNED : meta.owner ?? SYSTEM;
-    const cursors = new CursorBook(path.join(dir, 'cursors.json'));
+    const cursors = new CursorBook(path.join(dir, 'cursors.json'), this.opts.log);
     const view = new HistoryEntry(id, journal, owner, meta.visibility ?? 'private', meta.closedAt !== undefined, retention, recordedOptions(meta, retention), cursors);
     this.slots.set(id, { id, dir, store, meta, cursors, view });
   }
@@ -804,7 +817,7 @@ export class SessionRegistry {
     const options = this.resolveOptions(o, reuse, retention);
     const { retention: _r, ...persisted } = options;
     const meta: Meta = { owner: o.owner, visibility: options.visibility, createdAt: Date.now(), retention, options: persisted };
-    const cursors = prev?.cursors ?? new CursorBook(path.join(dir, 'cursors.json'));
+    const cursors = prev?.cursors ?? new CursorBook(path.join(dir, 'cursors.json'), this.opts.log);
     let integ: ReturnType<typeof prepareIntegration> | undefined;
     let session: Session;
     try {
@@ -812,7 +825,7 @@ export class SessionRegistry {
       // that dies mid-start leaves owned history, not a journal recovery refuses as owner-unknown (a
       // reviewer's read of the fixes for #22 comment 6269992150). A name with a record keeps it until this
       // life has started (below): a reopen must not overwrite the old retention before it succeeds.
-      if (recorded.owner === undefined) writeMeta(dir, meta);
+      if (recorded.owner === undefined) this.noteUnsynced(id, writeMeta(dir, meta));
       // The integration files live in the session's own directory: a daemon that dies leaves them for
       // the next life to overwrite, not in the system's temp dir. The user's environment the
       // integration preserves (zsh's ZDOTDIR, fish's XDG variables) is the one the shell starts
@@ -873,7 +886,7 @@ export class SessionRegistry {
     // is logged, not swallowed; the session is live and the record is retried at its next change.
     if (recorded.owner !== undefined) {
       try {
-        writeMeta(dir, meta);
+        this.noteUnsynced(id, writeMeta(dir, meta));
       } catch (we) {
         this.opts.log?.('warn', `history is live but its record could not be written: ${we instanceof Error ? we.message : String(we)}`, { session: id });
       }
@@ -882,6 +895,11 @@ export class SessionRegistry {
     this.slots.set(id, { id, dir, store, meta, cursors, view: new LiveEntry(session, () => integ?.cleanup(), retention, options) });
     this.emit({ type: 'created', id });
     return session;
+  }
+
+  /** A record that is written but whose directory could not be synced (a real fsync error): the record stands; said in the log (comment 6274603516). */
+  private noteUnsynced(id: string, w: DurableWrite): void {
+    if (!w.synced) this.opts.log?.('warn', `the session record is written but its directory could not be synced: ${w.error?.message ?? 'unknown error'}`, { session: id });
   }
 
   /** Requested over recorded over daemon defaults, for every creation option (ux-4). */
@@ -1276,9 +1294,9 @@ function readMeta(dir: string): Meta {
 }
 
 /** Durably, and private to the daemon's user: a crash mid-write never loses the owner (G18, G26); `env` may hold secrets. */
-function writeMeta(dir: string, meta: Meta): void {
+function writeMeta(dir: string, meta: Meta): DurableWrite {
   const { damaged: _d, missing: _m, ...record } = meta;
-  writeDurably(path.join(dir, 'session.json'), JSON.stringify(record, null, 2));
+  return writeDurably(path.join(dir, 'session.json'), JSON.stringify(record, null, 2));
 }
 
 
