@@ -68,9 +68,12 @@ the last failed, since `make | tee log` exits as `tee` did; a producer that `hea
 (status 141, SIGPIPE) is not called a failure. The text block is the transcript when the connection asks for it
 (`TSM_RESULT_TEXT=transcript` for the shim, `?resultText=transcript` on the URL; the
 shipped configs set it) and the envelope as JSON otherwise — the default, for hosts whose
-scripts parse tool text (agent-framework's code execution). Opt-in tiers: `terminal.control` (`signal`, `control`, `resize`,
+scripts parse tool text (agent-framework's code execution). The hints below — that a line
+looks like it opened another shell, turned on `set -e`, or ran `ssh` without a terminal — are
+part of the status line, so a host reading the JSON gets the facts (`line`, `state`, `reason`)
+and no hint field. Opt-in tiers: `terminal.control` (`signal`, `control`, `resize`,
 `session_env_capture`), `terminal.services` (`start` with readiness and health probes),
-`terminal.watch` (`watch`, `wait_for`), `terminal.search` (`search`). Mutating tools take an
+`terminal.watch` (`watch`, `unwatch`, `watches`, `wait_for`), `terminal.search` (`search`). Mutating tools take an
 `idempotencyKey` (a fresh UUID per operation): a retry returns the first outcome instead of
 running twice, also across a daemon restart for `run` and `start`.
 
@@ -81,7 +84,7 @@ runs `exit`, or when `set -e` is on in the session shell and a command fails. `s
 for scripts. In a session shell, where every Run already reports its own exit status, it
 only arms a trap: it stays on, and every later failing command ends the whole shell and the
 state in it. Keep it inside the script or a subshell (`(set -e; …)`), never in the session
-shell; the result of a Run that turns it on says so.
+shell; the status line of a Run that turns it on says so.
 
 Over MCPL, each session is a channel. What concerns you arrives on its own: a Run you
 started ending, a service you started turning ready or unhealthy, a watch you set firing, a
@@ -111,8 +114,8 @@ tsm run work 'cd /srv/app && git pull && ./build.sh'
 tsm run work 'exit'
 ```
 
-The result of the `ssh` command itself says that it looks like it opened a shell and points
-at the declaration; the kind of shell only needs naming for fish (`tsm declare work fish`).
+The status line of the `ssh` command itself says that it looks like it opened a shell and
+points at the declaration; the kind of shell only needs naming for fish (`tsm declare work fish`).
 
 Commands to a declared shell travel inline with start and end markers, so each one is a Run
 with output and exit status, and `cd`, exports and activations persist on the remote side;
@@ -144,7 +147,7 @@ A command that traps or ignores those signals — and the hangup, if the cancel 
 ssh — can run on, and nothing here knows.
 Without a terminal (`ssh host 'cmd'`,
 or `-T`), the remote command gets neither and runs until it writes to the closed
-connection; the result of such a Run says so. The process target keeps stdout and stderr
+connection; the status line of such a Run says so. The process target keeps stdout and stderr
 apart under `-T` and merges them under `-tt`; ssh's exit status is the remote command's
 either way (255 for a connection error). For remote work that must be stoppable and
 observable, run a `termd` on the remote machine with a forwarded port: it owns the remote
@@ -183,7 +186,9 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   changes nothing (the GUI is at the daemon's address), `SESSION_SERVER_HOST`,
   `SESSION_SERVER_PORT` and `SESSION_SERVER_TOKEN` are read where the `TSM_*` names are not
   set, and `--host localhost` binds 127.0.0.1, the address the shipped configs dial. The 1.x
-  frontend's settings reach the shim the same way (`tsm-shim --help`).
+  frontend's settings (`SESSION_SERVER_URL`, or `SESSION_SERVER_HOST` and `SESSION_SERVER_PORT`,
+  and `SESSION_SERVER_TOKEN`) reach the shim the same way; the `mcp.json` row of
+  [`next/config/README.md`](config/README.md) says how.
 - **Permissions.** termd's own files (journals, logs, keys, the usage log) are owner-only by
   mode whatever the umask. Sessions' shells and process Runs inherit the umask termd was
   started with, so files a session creates get the usual permissions; start termd with the
@@ -200,10 +205,12 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
 - **History on disk.** Kept whole by default; `--retention-bytes` and `--retention-days` cap it
   per session. Whatever the caps, the daemon stops writing history to disk while the data
   directory's filesystem has less than 200 MiB free (`--disk-floor-bytes`; 0 turns it off):
-  commands and their results are unaffected, the recent history stays in memory, the disk is
-  retried on a timer (so writing resumes when space returns, idle session or not), what the
-  memory ring had to drop meanwhile reads as a gap, and the daemon's log says when writes
-  stopped and when they resumed (`/health` shows a session's `journal.coldFailed` meanwhile).
+  commands and their results are unaffected, the recent history stays in memory, and while
+  the session is live the disk is retried on a timer, idle session or not, so writing resumes
+  when space returns; a session closed meanwhile gets one more try as it closes and another
+  when a session of that name is next opened, and what is still unwritten then reads as a gap,
+  as does what the memory ring had to drop. The daemon's log says when writes stopped and when
+  they resumed, and `/health` shows a live session's `journal.coldFailed` meanwhile.
 - **Limits and memory.** A session costs about five open files and, idle, about 0.3 MB in
   the daemon plus its shell (about 4 MB); a busy session holds up to 8 MiB of recent history
   in memory (`memoryBytes`) and the rest on disk. The daemon itself is about 170 MB. The
@@ -238,8 +245,10 @@ the type of the tool's parameter; a yes/no flag stands alone (`--queue`, `--forc
 (`termd`, port 3101) and thin clients (`tsm`, `tsm-shim`). The 1.x binaries
 (`terminal-sessions-mcp`, `session-server`, `session-gui`, `session-cli`) are unchanged and run
 1.x. When 2.0 becomes the default, `terminal-sessions-mcp` will point at the shim that serves the
-1.x tool names (`runCommand`, `tailLogs`, `sendInput`, …; `next/src/shim/compat.ts`), with results
-that also say whether a command is still running, and `session-server` at `termd`. The GUI is
+1.x tool names (`runCommand`, `tailLogs`, `sendInput`, …; the entry `next/src/shim/compat.ts`, the
+tools `next/src/api/compat.ts`), where `runCommand`'s result also says when a command is still
+running or queued, and `session-server` at `termd`. Until then the shim serves those names with
+`--profile compat` (`TSM_PROFILE=compat`). The GUI is
 served by `termd` itself. Nothing reads the 1.x data, which lived only in memory.
 
 ## Development

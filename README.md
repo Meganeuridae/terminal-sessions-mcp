@@ -7,9 +7,11 @@
 ## Terminal sessions 2.0, beside 1.x
 
 This package also ships **2.0**, a rearchitecture built for agents: one daemon (`termd`) that
-keeps shells alive, gives every command a run id with its exact exit status and separate stderr,
-keeps a journal of everything that happened that survives restarts, and tells an MCPL host when a
-command finishes instead of being polled. It is in [`next/`](next/README.md), with its design and
+keeps shells alive, gives every command a run id and the exit status it observed (when a command's
+end could not be seen, the result is `lost` with the reason, never a guess), keeps a journal on
+disk of everything that happened, so history outlives the daemon, and tells an MCPL host when a
+command finishes instead of being polled. Commands run in the session's shell as one terminal
+stream, as in 1.x; a process Run keeps stdout and stderr apart. It is in [`next/`](next/README.md), with its design and
 guarantees in [`docs/redesign/DESIGN.md`](docs/redesign/DESIGN.md). Its binaries are `termd`,
 `tsm` and `tsm-shim`; everything below about 1.x (`terminal-sessions-mcp`, `session-server`,
 `session-gui`, `session-cli`) is unchanged.
@@ -433,7 +435,7 @@ npx ts-node examples/service-management.ts
 
 ## Requirements
 
-- **Node.js** 18.x, 20.x, or 22.x LTS (Node 25+ not yet supported due to node-pty compatibility)
+- **Node.js** 20.x, 22.x or 24.x (20 is the floor since 2.0 joined the package; Node 25+ not yet supported due to node-pty compatibility)
 - **Headless Chrome** (via Puppeteer) for screenshots
 - **Modern browser** for web GUI (Chrome, Firefox, Safari, Edge)
 

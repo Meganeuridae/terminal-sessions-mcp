@@ -1,10 +1,13 @@
 # Changelog
 
-## Unreleased — 2.0, the rearchitecture
+## Unreleased — 2.0, the rearchitecture, beside 1.x
 
 A new implementation, built to `docs/redesign/DESIGN.md` and its guarantees (G1–G30), ships
 beside the 1.x session server, MCP bridge, GUI and CLI. It lives in `next/`; its binaries are
-`termd`, `tsm` and `tsm-shim`, and the 1.x binaries are unchanged. The package needs Node 20.
+`termd`, `tsm` and `tsm-shim`. Nothing of 1.x is removed or renamed: `terminal-sessions-mcp`,
+`session-server`, `session-gui` and `session-cli` run 1.x as before, on ports 3100 and 3200,
+while `termd` listens on 3101. Making 2.0 the default — the 1.x names pointing at the shim and
+`termd`, the 1.x code retired — is a later release (`next/README.md`, "Upgrading from 1.x").
 
 ### Added
 
@@ -29,20 +32,25 @@ beside the 1.x session server, MCP bridge, GUI and CLI. It lives in `next/`; its
   provenance on every input, observers that cannot act, private and shared sessions.
 - **Measure**: every tool call recorded (names and hashes only) to `usage.jsonl`; `tsm usage`
   reports use, errors and confusion signatures.
+- **The 1.x tool names on 2.0**: `tsm-shim --profile compat` (or `TSM_PROFILE=compat`) serves
+  `runCommand`, `tailLogs`, `searchLogs`, `sendInput`, `sendSignal`, `listSessions`,
+  `killSession`, `killAll`, `launch` and `takeScreenshot` over `termd`, for a 1.x host
+  configuration pointed at the shim; `runCommand`'s result also says when a command is still
+  running or queued, and `listSessions` returns 1.x's fields (`id`, `name`, `isAlive`,
+  `createdAt`, `lastActivity`, `logSize`, `state`). The shim also reads the 1.x settings
+  (`SESSION_SERVER_URL`, `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT`, `SESSION_SERVER_TOKEN`)
+  where the `TSM_*` ones are unset, and `termd` accepts a 1.x `session-server` command line
+  (`--headless`, `--host localhost`, the same variables).
 - Shipped host and supervisor configurations in `next/config/`.
 
 ### Changed
 
-- `terminal-sessions-mcp` is now the stdio shim; with the compat profile it serves the 1.x
-  tool names (`runCommand`, `tailLogs`, `searchLogs`, `sendInput`, `sendSignal`, `listSessions`,
-  `killSession`, `killAll`, `launch`, `takeScreenshot`) for one release, and their results also
-  say whether a command is still running. `session-server` starts `termd`.
-- Node 20 or later.
-
-### Removed
-
-- The 1.x server, GUI (socket.io, express), puppeteer screenshots (the screen is text now;
-  images return later), the old CLI and `session-gui`, and dependencies nothing imports.
+- Node 20 or later (`engines`): 2.0 needs it, and Node 18 reached its end of life.
+- `npm run build` compiles both trees; `npm test` runs 1.x's suite and `npm run test:next` 2.0's.
+- The `@xterm` packages and `ws` are pinned at the versions 2.0 uses (`@xterm/xterm` 6.0.0,
+  `@xterm/addon-fit` 0.11.0, `@xterm/addon-web-links` 0.12.0, `ws` 8.21.3); the 1.x GUI loads
+  xterm from a CDN, and 1.x's `ws` stays within 8.x. New dependencies: `@animalabs/mcpl-core`,
+  `@xterm/headless`, `@xterm/addon-serialize`.
 
 ## v1.7.0 - 2026-10-18
 
