@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { analyze, readUsage, usageDigest, newUsageKey, type UsageRecord } from '../src/api/usage.js';
+import { analyze, isAgentCall, readUsage, usageDigest, newUsageKey, type UsageRecord } from '../src/api/usage.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-usage-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -67,11 +67,12 @@ test('atc-17/ux-23: signatures follow runIds, count only agents, and `await` aft
 test('readUsage reads every rotated generation, oldest first, and skips lines that are not records', () => {
   const file = path.join(tmp, 'usage.jsonl');
   const line = (tool: string, ts: number) => JSON.stringify(rec(tool, { ts })) + '\n';
+  fs.writeFileSync(`${file}.4`, line('await', 0));
   fs.writeFileSync(`${file}.3`, line('read', 1));
   fs.writeFileSync(`${file}.2`, line('screen', 2) + '{"not":"a record"}\n' + 'null\n');
   fs.writeFileSync(`${file}.1`, line('input', 3));
   fs.writeFileSync(file, line('run', 4) + '{"torn');
-  assert.deepEqual(readUsage(file).map((r) => r.tool), ['read', 'screen', 'input', 'run']);
+  assert.deepEqual(readUsage(file).map((r) => r.tool), ['await', 'read', 'screen', 'input', 'run'], 'the oldest kept generation too');
 });
 
 test('atc-4: usage digests are keyed: one key agrees with itself, another key does not', () => {
@@ -80,5 +81,24 @@ test('atc-4: usage digests are keyed: one key agrees with itself, another key do
   const typed: Array<[string, unknown]> = [['text', '4821'], ['keys', ['Enter']]];
   assert.equal(usageDigest(k1, typed), usageDigest(k1, typed));
   assert.notEqual(usageDigest(k1, typed), usageDigest(k2, typed));
+  assert.notEqual(usageDigest(k1, typed), usageDigest(k1, [['text', '4822'], ['keys', ['Enter']]]), 'the digest follows its input');
   assert.match(usageDigest(k1, typed), /^[0-9a-f]{16}$/);
+});
+
+test('a read after a completed await is not a short wait: the Run’s end clears the session it left unfinished, and only its own mark', () => {
+  n = 0;
+  const run = (runId: string, state: string, ts: number) => rec('run', { session: 's', runId, state, wait: 0, ts });
+  const patient = [run('r1', 'running', T0), rec('await', { session: 's', runId: 'r1', state: 'exited', ts: T0 + 4000 }), rec('read', { session: 's', ts: T0 + 5000 })];
+  assert.equal(analyze(patient).signatures['read-after-short-wait']?.count, 0, 'the await saw the Run end before the read');
+  const impatient = [run('r1', 'running', T0), rec('read', { session: 's', ts: T0 + 5000 })];
+  assert.equal(analyze(impatient).signatures['read-after-short-wait']?.count, 1, 'the same read with nothing awaited');
+  const another = [run('r1', 'running', T0), run('r2', 'queued', T0 + 100), rec('await', { session: 's', runId: 'r1', state: 'exited', ts: T0 + 4000 }), rec('read', { session: 's', ts: T0 + 5000 })];
+  assert.equal(analyze(another).signatures['read-after-short-wait']?.count, 1, 'r2 still left the session unfinished');
+});
+
+test('isAgentCall: a human principal and the native host family are each excluded on their own', () => {
+  assert.equal(isAgentCall({ principal: 'human:gh:1', host: 'mcp' }), false);
+  assert.equal(isAgentCall({ principal: 'agent:a@x', host: 'native' }), false);
+  assert.equal(isAgentCall({ principal: 'agent:a@x', host: 'mcpl' }), true);
+  assert.equal(isAgentCall({ principal: 'token:default', host: 'mcp' }), true);
 });

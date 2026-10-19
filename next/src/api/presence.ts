@@ -47,8 +47,10 @@ function scanUnread(journal: Journal, read: Seq, principal: Principal): { bytes:
   for (; i >= 0; i--) {
     const e = recent[i]!;
     if (e.seq <= read) break;
-    // Command output counts; prompt redraws between commands are not news.
-    if (e.type === 'output' && e.runId !== undefined) bytes += Buffer.byteLength(e.data);
+    // Command output counts, and so does what a process group that outlived its Run writes (ss-10
+    // journals it without the Run's id); only the pty's own output between commands — prompt
+    // redraws — is not news (the house's read of 1cabc6a, #22).
+    if (e.type === 'output' && (e.runId !== undefined || e.stream !== 'pty')) bytes += Buffer.byteLength(e.data);
     else if (e.type === 'input' && e.principal.startsWith('human:') && e.principal !== principal && e.kind !== 'protocol-reply') humanTyped++;
   }
   // The scan stopped at its bound, or retention cut the range: older unread events exist.

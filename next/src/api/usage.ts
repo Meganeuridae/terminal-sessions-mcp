@@ -119,6 +119,8 @@ export function analyze(records: UsageRecord[]): UsageReport {
   const lastUnfinished = new Map<string, number>();
   /** `p|run:<id>` → when the first unfinished result for that Run came back. */
   const firstUnfinished = new Map<string, number>();
+  /** `p|session:<s>` → the Run whose unfinished result last marked the session, so that Run's end clears the mark. */
+  const unfinishedBy = new Map<string, string>();
   const lastBusy = new Map<string, number>();
   const lastInput = new Map<string, { ts: number; digest?: string }>();
   const screens = new Map<string, number[]>();
@@ -164,16 +166,23 @@ export function analyze(records: UsageRecord[]): UsageReport {
     if (RUN_TOOLS.has(r.tool) && typeof r.state === 'string') {
       if (UNFINISHED.has(r.state)) {
         for (const k of about) lastUnfinished.set(k, r.ts);
+        if (runKey && sessionKey) unfinishedBy.set(sessionKey, runKey);
         if (runKey && !firstUnfinished.has(runKey)) firstUnfinished.set(runKey, r.ts);
       } else if (r.state === 'busy') {
         for (const k of about) lastBusy.set(k, r.ts);
         if (typeof r.blockedBy === 'string') lastBusy.set(`${p}|run:${r.blockedBy}`, r.ts);
       } else if (runKey) {
-        // The Run ended: whatever an earlier unfinished result started is settled.
+        // The Run ended: whatever an earlier unfinished result started is settled — for the session
+        // too, when this Run was what left it unfinished, so a `read` after a completed `await` is
+        // not a short wait (the house's read of 1cabc6a, #22).
         const first = firstUnfinished.get(runKey);
         if (first !== undefined) extra.push(r.ts - first);
         firstUnfinished.delete(runKey);
         lastUnfinished.delete(runKey);
+        if (sessionKey && unfinishedBy.get(sessionKey) === runKey) {
+          lastUnfinished.delete(sessionKey);
+          unfinishedBy.delete(sessionKey);
+        }
       }
     }
   }

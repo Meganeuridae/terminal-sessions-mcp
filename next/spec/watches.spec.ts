@@ -172,3 +172,15 @@ test('m2-20: a coalesced firing carries the latest match, and "+N more" counts o
   assert.equal(firings()[2]!.suppressed, 4, 'ERR3–ERR6 are the four not shown');
   wm.dispose();
 });
+
+test('a `once` watch is removed after its first firing', async () => {
+  await app.sessionOpen(C, { id: 'once' });
+  const s = live('once');
+  const w = await app.watch(C, { session: 'once', pattern: 'pi.ng', once: true });
+  await app.run(C, { session: 'once', command: "printf 'pi%sng\\n' .", wait: 3000 });
+  await until(() => fired(s, w.watchId).length === 1, 3000, 'fired once');
+  assert.deepEqual(app.watches(C, { session: 'once' }).map((x) => x.watchId), [], 'gone after the firing');
+  await app.run(C, { session: 'once', command: "printf 'pi%sng\\n' .", wait: 3000 });
+  await sleep(300);
+  assert.equal(fired(s, w.watchId).length, 1, 'it does not fire again');
+});

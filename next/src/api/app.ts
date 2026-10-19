@@ -700,6 +700,11 @@ export class App {
       if (waiting) res.waiting = waiting;
       session.markRead(caller.principal, out.nextCursor);
       // The outcome counts as delivered (G28) only once the transport wrote it: see outcomeSent.
+    } else {
+      // This result returned the history to the caller: the cursor moves as it does for `read` (G22),
+      // so presence stops reporting what the caller has now seen (the house's read of 1cabc6a, #22).
+      if (s.kind === 'live') s.session.markRead(caller.principal, out.nextCursor);
+      else s.markRead(caller.principal, out.nextCursor);
     }
     return res;
   }

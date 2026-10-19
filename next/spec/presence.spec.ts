@@ -143,8 +143,70 @@ test('mcpl-2: after a daemon restart, a history-only session reports the Runs th
     assert.match(text, /rs: shell gone \(daemon restarted; history only\)/);
     assert.match(text, /`sleep 60` lost \(daemon-shutdown\)/);
     assert.equal(presence(app2, B.principal, ['rs']), undefined, 'a private session says nothing to others');
+    // An `await` returned the lost Run's history to A: the cursor moves as it does for `read` (G22),
+    // and the session has nothing new to say (the house's read of 1cabc6a, #22).
+    const got = await app2.awaitRun(A, { runId: r.runId! });
+    assert.equal(got.state, 'lost');
+    assert.equal(presence(app2, A.principal, ['rs']), undefined, 'after await, nothing ended that A has not seen');
   } finally {
     await (reg2 ?? reg1).closeAll();
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('late output of a process Run’s background child is news, not a prompt redraw', async () => {
+  await app.sessionOpen(A, { id: 'late' });
+  const r = await app.run(A, { session: 'late', command: "sh -c '(sleep 0.4; echo late-line) & exit 0'", target: 'process' });
+  assert.equal(r.state, 'exited');
+  assert.equal(r.exit, 0);
+  // The result moved A's read cursor to the Run's end; the child's line lands after it, journaled
+  // without the Run's id (ss-10).
+  const s = live('late');
+  await until(() => s.journal.tail(50).some((e) => e.type === 'output' && e.runId === undefined && e.stream === 'stdout' && e.data.includes('late-line')), 4000, 'the late line');
+  const text = P(A, ['late']);
+  assert.doesNotMatch(text, /idle, nothing new/);
+  assert.match(text, /late: idle \(cwd .*\) · \d+ B new since your last read \(read since=\d+\)/);
+});
+
+test('a human typing is news; the reader’s own typing and protocol replies are not', async () => {
+  const H: Caller = { principal: 'human:test:1', connectionId: 'ph' };
+  await app.sessionOpen(A, { id: 'typed', visibility: 'shared' });
+  await app.run(A, { session: 'typed', command: 'true' });
+  const s = live('typed');
+  await app.read(A, { session: 'typed', since: 0 });
+  await app.read(H, { session: 'typed', since: 0 });
+  assert.match(P(A, ['typed']), /idle, nothing new: typed/);
+  s.journal.append({ type: 'input', data: 'ls', principal: H.principal, kind: 'text' });
+  assert.match(P(A, ['typed']), /typed: idle \(cwd .*\) · a human typed here/);
+  assert.match(P(H, ['typed']), /idle, nothing new: typed/, 'one’s own typing is not news to oneself');
+  await app.read(A, { session: 'typed', since: 0 });
+  s.journal.append({ type: 'input', data: 'x', principal: A.principal, kind: 'text' });
+  s.journal.append({ type: 'input', data: 'y', principal: 'human:test:2', kind: 'protocol-reply' });
+  assert.match(P(A, ['typed']), /idle, nothing new: typed/, 'an agent’s typing and a protocol reply are not a human typing');
+});
+
+test('G28: a Run whose outcome a result already carried is not news again', async () => {
+  await app.sessionOpen(A, { id: 'g28' });
+  const r = await app.run(A, { session: 'g28', command: 'sleep 0.3; echo done-g28', wait: 0 });
+  assert.notEqual(r.state, 'exited');
+  const s = live('g28');
+  await until(() => s.run(r.runId!).state === 'exited', 4000, 'ended');
+  assert.match(P(A, ['g28']), /`sleep 0\.3; echo done-g28` → 0/);
+  app.outcomeSent(A, { session: 'g28', runId: r.runId!, state: 'exited' });
+  assert.doesNotMatch(P(A, ['g28']), /done-g28/);
+});
+
+test('services: shown to their owner or the session’s, and an ended one the reader has read past is not news', async () => {
+  const Cc: Caller = { principal: 'agent:c@test', connectionId: 'pc' };
+  await app.sessionOpen(A, { id: 'svc', visibility: 'shared' });
+  await app.read(A, { session: 'svc', since: 0 });
+  const st = await app.start(A, { session: 'svc', name: 'job', command: 'sleep 0.5', target: 'process', wait: 100 });
+  assert.equal(st.service, 'starting');
+  assert.match(P(A, ['svc']), /service job starting/);
+  assert.doesNotMatch(P(Cc, ['svc']), /service job/, 'another principal’s service is not theirs to see');
+  const mon = app.extras(live('svc')).services.get(st.runId!)!;
+  await until(() => mon.status === 'exited', 4000, 'exited');
+  assert.match(P(A, ['svc']), /service job exited/);
+  await app.read(A, { session: 'svc', since: 0 });
+  assert.doesNotMatch(P(A, ['svc']), /service job/, 'an ended service the reader has read past');
 });
