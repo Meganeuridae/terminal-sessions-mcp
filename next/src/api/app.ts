@@ -13,13 +13,13 @@ import { inputBytes } from '../core/keys.js';
 import { validateServiceSpec, type ServiceSpec } from '../core/probes.js';
 import { journalRunText, promptLine, Segmenter, type SegmenterOptions } from '../core/segmenter.js';
 import { ServiceManager, type ServiceInfo } from '../core/services.js';
-import { isTerminal, type Session } from '../core/session.js';
+import { isTerminal, serviceOutcomeKey, type Session } from '../core/session.js';
 import { cutTail } from '../core/text.js';
 import { DEFAULT_GEOMETRY, type Attribution, type EnvBasis, type JournalEvent, type Principal, type RunInfo, type RunTarget, type ScreenSnapshot, type Seq, type ServiceStatus, type Visibility } from '../core/types.js';
 import { SYSTEM } from '../core/types.js';
 import { WatchManager, type WaitResult, type WatchInfo, type WatchSpec } from '../core/watches.js';
 import { guiActsFor } from './principals.js';
-import type { AnySession, CreateOptions, SessionRegistry } from './registry.js';
+import { endedMessage, type AnySession, type CreateOptions, type SessionRegistry } from './registry.js';
 import { readJournal, searchJournal, type ReadOptions, type ReadResult, type ReadSource, type SearchOptions, type SearchResult } from './reader.js';
 
 export type Verb = 'observe' | 'type' | 'run' | 'signal' | 'resize' | 'destroy';
@@ -372,11 +372,8 @@ export class App {
 
   private liveFor(caller: Caller, id: string, verb: Verb): Session {
     const s = this.find(caller, id, verb);
-    if (s.kind !== 'live') {
-      // Only the owner starts a new life (G30): an observer is not sent to a tool that refuses them (the house's read of 1cabc6a, #22).
-      const again = this.can(caller.principal, s, 'run') ? 'session_open starts a new shell under this name' : `only its owner (${s.owner}) can start a new shell under this name`;
-      throw err('session_exited', `session ${id} has ended; its history is readable with read, and ${again}`, { session: id });
-    }
+    // Only the owner starts a new life (G30): an observer is not sent to a tool that refuses them (the house's read of 1cabc6a, #22).
+    if (s.kind !== 'live') throw err('session_exited', endedMessage(s, this.can(caller.principal, s, 'run')), { session: id });
     return s.session;
   }
 
@@ -418,7 +415,8 @@ export class App {
 
   // ───────────── sessions ─────────────
 
-  private summary(s: AnySession): SessionSummary {
+  /** What a session looks like from outside (session_list, session_open, a channel's descriptor): one rendering of an entry. */
+  summary(s: AnySession): SessionSummary {
     if (s.kind === 'live') {
       const i = s.session.info();
       const out: SessionSummary = {
@@ -592,7 +590,7 @@ export class App {
     const owner = existing.kind === 'live' ? existing.session.owner : existing.owner;
     if (caller.principal === owner || guiActsFor(caller.principal, owner)) return owner;
     if (!this.can(caller.principal, existing, 'observe')) throw err('session_exists', `the name ${id} belongs to another principal; choose another name`, { session: id });
-    throw err('forbidden', `session ${id} has ended; only its owner (${owner}) may start it again — its history stays readable with read`, { session: id, owner });
+    throw err('forbidden', endedMessage(existing, false), { session: id, owner });
   }
 
   private busyResult(session: Session, target: RunTarget, reason: string, occupant: RunInfo | null | undefined, created: boolean): RunResult {
@@ -802,16 +800,28 @@ export class App {
       res.integration = session.integration;
       const waiting = this.waitingEvidence(session, run);
       if (waiting) res.waiting = waiting;
-      const target = this.readCursorAfterRun(s, caller.principal, run.runId, out.nextCursor);
-      this.advanceRead(res, caller, () => session.markRead(caller.principal, target));
-      // The outcome counts as delivered (G28) only once the transport wrote it: see outcomeSent.
-    } else {
-      // This result returned the history to the caller: the cursor moves as it does for `read` (G22),
-      // so presence stops reporting what the caller has now seen (the house's read of 1cabc6a, #22).
-      const sink = s.kind === 'live' ? s.session : s;
-      this.advanceRead(res, caller, () => sink.markRead(caller.principal, out.nextCursor));
     }
-    return res;
+    // This result showed the Run's output: the caller's read cursor moves by the one rule (G22), for a
+    // Run of an earlier life or of history as for one of the live shell, so presence stops reporting
+    // what the caller has seen and keeps reporting what it has not (the house's read of 1cabc6a, #22).
+    // The outcome counts as delivered (G28) only once the transport wrote it: see outcomeSent.
+    return this.advanceReadAfterRun(res, caller, s, run.runId, out.nextCursor);
+  }
+
+  /**
+   * Stage the caller's `read`-cursor advance for a result that showed one Run's output (run, await,
+   * read with a runId), on a live session or history: where it lands is readCursorAfterRun's rule.
+   */
+  private advanceReadAfterRun<T extends object>(result: T, caller: Caller, s: AnySession, runId: string, to: Seq): T {
+    const at = this.readCursorAfterRun(s, caller.principal, runId, to);
+    return this.advanceRead(result, caller, () => this.markRead(s, caller.principal, at));
+  }
+
+  /** Advance a principal's read cursor on an entry: a live session takes no cursor past its journal; history takes it as given. */
+  private markRead(s: AnySession, principal: Principal, at: Seq): void {
+    if (s.kind === 'live') {
+      if (at <= s.session.journal.lastSeq) s.session.markRead(principal, at);
+    } else s.markRead(principal, at);
   }
 
   /**
@@ -852,7 +862,7 @@ export class App {
     // of 2f357bd, #22). A status that moved on before the result was written is announced as usual.
     if (r.service !== undefined && r.service !== 'starting') {
       const info = this.extras(s.session).services.get(r.runId)?.info();
-      if (info?.status === r.service && info.seq !== undefined) s.session.markOutcomeDelivered(`${r.runId}:service=${r.service}@${info.seq}`, caller.principal);
+      if (info?.status === r.service && info.seq !== undefined) s.session.markOutcomeDelivered(serviceOutcomeKey(r.runId, r.service, info.seq), caller.principal);
     }
   }
 
@@ -1162,13 +1172,9 @@ export class App {
     const { session: _, ...opts } = o;
     if (o.runId !== undefined) opts.runId = this.findRun(caller, o.runId, sessionId(s)).run.runId;
     const r = await readJournal(readSource(s), opts, { resultBytes: this.resultBytes });
-    // A page of one Run leaves other Runs' unread output unread (see readCursorAfterRun).
-    const at = opts.runId !== undefined ? this.readCursorAfterRun(s, caller.principal, opts.runId, r.nextCursor) : r.nextCursor;
-    this.advanceRead(r, caller, () => {
-      if (s.kind === 'live' && at <= s.session.journal.lastSeq) s.session.markRead(caller.principal, at);
-      else if (s.kind === 'history') s.markRead(caller.principal, at);
-    });
-    return r;
+    // A page of one Run leaves other Runs' unread output unread (see readCursorAfterRun); a page of the session reads to its cursor.
+    if (opts.runId !== undefined) return this.advanceReadAfterRun(r, caller, s, opts.runId, r.nextCursor);
+    return this.advanceRead(r, caller, () => this.markRead(s, caller.principal, r.nextCursor));
   }
 
   /** Regex over output lines with seq anchors and context (§11 `search`). */

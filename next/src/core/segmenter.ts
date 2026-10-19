@@ -547,9 +547,10 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
   };
 
   let gone: LifecycleScan['lost'];
-  for (let cursor = since; cursor < end; ) {
-    const page = src.journal.since(cursor, SCAN_PAGE);
-    if (cursor === since && page.gap) gone = { from: page.gap.from, to: page.gap.to };
+  let first = true;
+  for (const page of src.journal.pages(since, SCAN_PAGE)) {
+    if (first && page.gap) gone = { from: page.gap.from, to: page.gap.to };
+    first = false;
     const events = page.events;
     if (!events.length) break;
     for (const ev of events) {
@@ -577,8 +578,8 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
         lost = { principals: [], count: 0 };
       }
     }
-    cursor = events[events.length - 1]!.seq;
-    if (!page.more) break;
+    // Nothing past `end` (what the journal held when the scan began) is this scan's; the pages yield between.
+    if (events[events.length - 1]!.seq >= end || !page.more) break;
     await yieldTurn();
   }
   for (const t of tentative) commit(t);

@@ -44,7 +44,8 @@ import {
   type Segment,
   type Segmenter,
 } from '../core/segmenter.js';
-import type { Session } from '../core/session.js';
+import { serviceOutcomeKey, type Session } from '../core/session.js';
+import { lineBytes } from '../core/stores.js';
 import type { JournalEvent, Principal, RunInfo, Seq } from '../core/types.js';
 import { CAPABILITY_DENIED, CHANNEL_NOT_PERMITTED, INVALID_PARAMS, OVERLOADED, RpcError, UNKNOWN_CHANNEL, type Outbound } from './jsonrpc.js';
 
@@ -448,29 +449,21 @@ export class McplLane {
 
   // ───────────── channels ─────────────
 
-  /** A session's channel descriptor, read from the session itself, so listing the channels costs one look per session (the house's read of 2f357bd, #22). */
+  /** A session's channel descriptor: its metadata is the App's own summary of the entry (one look per session, not a list per session — the house's read of 2f357bd, #22). */
   private descriptorFor(entry: AnySession): ChannelDescriptor {
-    const sessionId = entry.kind === 'live' ? entry.session.id : entry.id;
+    const s = this.app.summary(entry);
     // `speech: 'none'` asks hosts not to route an agent's ordinary replies here (UPSTREAM-CHANGES A6).
-    const metadata: Record<string, unknown> = { node: NODE_NAME, speech: 'none' };
-    if (entry.kind === 'live') {
-      const i = entry.session.info();
-      metadata.owner = i.owner;
-      if (i.controller !== null) metadata.controller = i.controller;
-      metadata.state = i.state;
-      metadata.cwd = i.cwd;
-      metadata.integration = i.integration;
-    } else {
-      metadata.owner = entry.owner;
-      metadata.state = 'exited';
-      if (!entry.closed) metadata.recovered = entry.recovered;
-    }
+    const metadata: Record<string, unknown> = { node: NODE_NAME, speech: 'none', owner: s.owner, state: s.state };
+    if (s.controller !== null) metadata.controller = s.controller;
+    if (s.cwd !== undefined) metadata.cwd = s.cwd;
+    if (s.integration !== undefined) metadata.integration = s.integration;
+    if (s.recovered !== undefined) metadata.recovered = s.recovered;
     return {
-      id: channelId(sessionId),
+      id: channelId(s.id),
       type: 'terminal',
-      label: `${sessionId} (node: ${NODE_NAME})`,
+      label: `${s.id} (node: ${NODE_NAME})`,
       direction: 'bidirectional',
-      address: { node: NODE_NAME, session: sessionId },
+      address: { node: NODE_NAME, session: s.id },
       metadata,
       initiallyOpen: false,
       // History pages backwards from `beforeMessageId` (mcpl-18).
@@ -635,8 +628,8 @@ export class McplLane {
     if (s.kind === 'live' && !s.session.journal.closed) {
       const journal = s.session.journal;
       const retention = s.retention.maxBytes ?? Infinity;
-      // What the store will write for it: the event line, with the seq it is about to get (its digits may differ by one).
-      stored = storedBytes({ type: 'note', text, principal: this.me, channel: params.channelId, seq: journal.lastSeq + 1, ts: Date.now() });
+      // What the store will write for it, by the journal's own count (the seq's digits may differ by one).
+      stored = journal.sizeOf({ type: 'note', text, principal: this.me, channel: params.channelId });
       const share = NoteBudget.share(retention);
       if (stored > share) {
         const max = Math.max(0, share - (stored - bytes));
@@ -754,21 +747,21 @@ export class McplLane {
    * alone withheld every later return to `ready` after an unhealthy spell (the house's read of
    * 2f357bd, #22).
    */
-  private returned(t: Target, runId: string, service?: string, seq?: Seq): boolean {
+  private returned(t: Target, runId: string, service?: { status: string; seq: Seq }): boolean {
     const to = (key: string) => liveOf(t)?.outcomeDeliveredTo(key, this.me) ?? false;
-    return service === undefined ? to(runId) : to(`${runId}:service=${service}@${seq}`) || (service === 'exited' && to(runId));
+    return service === undefined ? to(runId) : to(serviceOutcomeKey(runId, service.status, service.seq)) || (service.status === 'exited' && to(runId));
   }
 
   private returnedSeg(t: Target, seg: Segment): boolean {
     if (seg.runId === undefined || (seg.kind !== 'run' && seg.kind !== 'service')) return false;
-    return seg.kind === 'service' ? this.returned(t, seg.runId, String(seg.metadata.service), seg.seq) : this.returned(t, seg.runId);
+    return seg.kind === 'service' ? this.returned(t, seg.runId, { status: String(seg.metadata.service), seq: seg.seq }) : this.returned(t, seg.runId);
   }
 
   /** The key a withheld message is held under: its Run, or one service status event (two returns to a status are two messages). */
   private heldKey(seg: Segment): string | undefined {
     if (seg.runId === undefined) return undefined;
     if (seg.kind === 'run') return seg.runId;
-    return seg.kind === 'service' ? `${seg.runId}:service=${String(seg.metadata.service)}@${seg.seq}` : undefined;
+    return seg.kind === 'service' ? serviceOutcomeKey(seg.runId, String(seg.metadata.service), seg.seq) : undefined;
   }
 
   /** The hold is over: the message was returned, sent, or is no longer wanted. */
@@ -1163,7 +1156,7 @@ export class McplLane {
   private owedOnCatchUp(t: Target, st: LaneState, src: ReplaySource, { ev, lost }: Picked, open: boolean): boolean {
     // A held completion is the live path's to decide; what a synchronous call returned is settled.
     if (ev.type === 'run.end' && (st.held.has(ev.runId) || this.returned(t, ev.runId))) return false;
-    if (ev.type === 'service' && this.returned(t, ev.runId, ev.status, ev.seq)) return false;
+    if (ev.type === 'service' && this.returned(t, ev.runId, { status: ev.status, seq: ev.seq })) return false;
     return this.owed(t, ev, open, src, lost?.principals);
   }
 
@@ -1232,9 +1225,6 @@ export class McplLane {
   }
 }
 
-/** What the disk store writes for an event: its JSON line. */
-const storedBytes = (event: JournalEvent): number => Buffer.byteLength(JSON.stringify(event)) + 1;
-
 /**
  * Notes a session holds (mcpl-5): per principal a token bucket (a few a second) and a
  * per-minute cap; per lineage, notes still retained never exceed 1/16 of the session's
@@ -1259,12 +1249,9 @@ class NoteBudget {
   seed(journal: Journal): Promise<void> {
     if (!this.seeded) {
       this.seeded = (async () => {
-        let cursor = (journal.oldestSeq ?? 1) - 1;
-        for (;;) {
-          const page = journal.since(cursor, NOTE_SCAN_PAGE);
-          for (const ev of page.events) if (ev.type === 'note') this.record(ev.seq, storedBytes(ev));
-          if (!page.more || !page.events.length) return;
-          cursor = page.events[page.events.length - 1]!.seq;
+        for (const page of journal.pages((journal.oldestSeq ?? 1) - 1, NOTE_SCAN_PAGE)) {
+          for (const ev of page.events) if (ev.type === 'note') this.record(ev.seq, lineBytes(ev));
+          if (!page.more) return;
           await new Promise((r) => setImmediate(r));
         }
       })();

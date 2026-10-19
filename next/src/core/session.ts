@@ -2812,7 +2812,7 @@ export class Session {
     return Object.fromEntries([...this.cursors].map(([p, c]) => [p, { ...c }]));
   }
 
-  /** Record that a synchronous call returned this Run's final outcome to `principal` (G28). */
+  /** Record that a synchronous call returned this Run's final outcome to `principal` (G28); for a service status a start result carried, the key is `serviceOutcomeKey`. */
   markOutcomeDelivered(runId: string, principal: Principal): void {
     let s = this.outcomeDelivered.get(runId);
     if (!s) this.outcomeDelivered.set(runId, (s = new Set()));
@@ -2892,3 +2892,10 @@ export function trustedDir(d: string, uid: number): boolean {
 export function isTerminal(state: RunState): boolean {
   return state === 'exited' || state === 'cancelled' || state === 'lost';
 }
+
+/**
+ * The key under which the service status event (`seq`) a start result carried counts as delivered
+ * (G28, mcpl-13): that one event, so a later return to the same status is announced as usual (the
+ * house's read of 2f357bd, #22). Spelled here, once, for the App that marks it and the lane that asks.
+ */
+export const serviceOutcomeKey = (runId: string, status: string, seq: Seq): string => `${runId}:service=${status}@${seq}`;

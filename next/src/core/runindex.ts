@@ -8,6 +8,7 @@
  */
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
+import { lineBytes } from './stores.js';
 import type { EventOf, JournalEvent, RunInfo, Seq } from './types.js';
 
 type OutputEvent = EventOf<'output'>;
@@ -35,8 +36,9 @@ const shorten = (s: string) => (s.length > HEADER_LINE_MAX ? `${s.slice(0, HEADE
  * that remains; one with neither is forgotten once its admission is pruned.
  */
 export function boundHeader(h: RotationHeader, maxBytes = Number.POSITIVE_INFINITY): RotationHeader {
-  const size = (r: RunInfo) => Buffer.byteLength(JSON.stringify(r)) + 1;
-  const base = Buffer.byteLength(JSON.stringify({ header: { v: 1, openRuns: [] } })) + 1;
+  // The header's line as the store writes it, and each Run's JSON with its separator: the store's own count.
+  const size = (r: RunInfo) => lineBytes(r);
+  const base = lineBytes({ header: { v: 1, openRuns: [] } });
   let runs = h.openRuns;
   let total = base + runs.reduce((a, r) => a + size(r), 0);
   if (total <= maxBytes) return h;

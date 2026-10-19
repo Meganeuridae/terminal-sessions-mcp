@@ -973,6 +973,7 @@ test('listing channels reads the sessions once, not once per session, and the co
     registry: { list: () => (reads++, entries), get: (id: string) => entries.find((e) => e.id === id) },
     can: () => true,
     sessionList: () => (reads++, entries.map((e) => ({ id: e.id, owner: e.owner, state: 'exited' }))),
+    summary: (e: { id: string; owner: string }) => ({ id: e.id, owner: e.owner, visibility: 'private', state: 'exited', controller: null, lastSeq: 1, recovered: 'history-only' }),
   } as unknown as App;
   const lane = new McplLane(app, { principal: A, connectionId: 'c-list' }, new Outbound(() => undefined), () => undefined);
   try {

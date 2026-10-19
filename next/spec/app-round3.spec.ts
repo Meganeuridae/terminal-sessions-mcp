@@ -195,6 +195,35 @@ test('texts: session and run errors name a next step, and no guarantee label lea
   assert.doesNotMatch(obsWatch.text, /session_open starts a new shell/);
 });
 
+test('a Run of an earlier life, awaited on the new life, moves the read cursor by the one rule run and read follow: not past another Run’s unread output', async () => {
+  const s = 'oldlife';
+  const r1 = await app.run(A, { session: s, command: 'echo one', wait: 5000 });
+  assert.equal(r1.state, 'exited');
+  // r2's output comes after its own result returned, and no transport ever marks its outcome delivered: unread by A.
+  const r2 = await app.run(A, { session: s, command: 'sleep 0.3; echo two', wait: 0 });
+  assert.ok(r2.runId !== undefined && (r2.state === 'starting' || r2.state === 'running'), r2.state);
+  const r3 = await app.run(A, { session: s, command: 'echo three', wait: 5000, queue: true });
+  assert.equal(r3.state, 'exited');
+  const life1 = registry.get(s);
+  assert.ok(life1?.kind === 'live');
+  const twoAt = life1.session.runOutput(r2.runId).events.find((e) => e.type === 'output')!.seq;
+  const cursor = life1.session.cursorsOf(A.principal).read;
+  assert.equal(cursor, twoAt - 1, 'the live rule: r3’s result left the cursor before r2’s unread output');
+  // The shell ends and the name starts a new life: r3 is a Run of the earlier life now, answered from the journal.
+  await app.sessionClose(A, { session: s });
+  await app.sessionOpen(A, { id: s });
+  const life2 = registry.get(s);
+  assert.ok(life2?.kind === 'live' && life2.session !== life1.session);
+  assert.equal(life2.session.cursorsOf(A.principal).read, cursor, 'the cursor came over to the new life');
+  const again = await app.awaitRun(A, { session: s, runId: r3.runId!, wait: 1000 });
+  assert.equal(again.state, 'exited');
+  assert.match(again.output.text, /three/);
+  assert.equal(life2.session.cursorsOf(A.principal).read, cursor, 'r2’s output is still unread: the earlier life’s Run did not move the cursor past it');
+  // Reading r2 itself does: nothing unread lies before its end any more.
+  const rd = await app.read(A, { session: s, runId: r2.runId });
+  assert.equal(life2.session.cursorsOf(A.principal).read, rd.nextCursor);
+});
+
 test('a read whose result is never delivered leaves the read cursor where it was (G22): the advance waits for the write', async () => {
   // A connection that drops before the result is written must count nothing read; the cursor advances
   // only when the transport runs the result's onSent (the house's read of 1cabc6a, #22, comment 6263057673).

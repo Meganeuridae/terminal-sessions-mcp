@@ -505,19 +505,14 @@ export class WatchManager {
       this.waits.add(abort);
       if (kind === 'pattern') {
         if (since !== undefined) {
-          // Page by page to the end: a read that stops at a hole left by a cold-store failure says
-          // `more`, and what follows the hole is still to be checked (the house's read of 3eade8a, #22).
+          // Output already printed after `since` counts, read to the end.
           const lastBy = new Map<string, JournalEvent>();
-          let cursor = since;
-          for (;;) {
-            const page = this.host.journal.since(cursor);
+          for (const page of this.host.journal.pages(since)) {
             for (const ev of page.events) {
               predicate.feed(ev);
               if (done) return;
               if (ev.type === 'output') lastBy.set(streamKey(ev), ev);
             }
-            if (!page.more || !page.events.length) break;
-            cursor = page.nextCursor;
           }
           // A stream whose replayed last line has no newline and has been quiet for the partial
           // delay already (a prompt sitting there) is matched now, not after the delay restarts.

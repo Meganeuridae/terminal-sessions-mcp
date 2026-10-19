@@ -125,17 +125,9 @@ export class ServiceMonitor {
     this.off = host.journal.subscribe((ev) => this.onEvent(ev));
     this.statusSeq = this.journal('starting');
 
-    // Output that arrived before the monitor existed (a process Run starts at admission), read
-    // page by page to the end: a read that stops at a hole left by a cold-store failure says
-    // `more` (the house's read of 3eade8a, #22).
+    // Output that arrived before the monitor existed (a process Run starts at admission), read to the end.
     const run = host.run(runId);
-    let cursor = run.seq.admit - 1;
-    for (;;) {
-      const page = host.journal.since(cursor);
-      for (const ev of page.events) this.onEvent(ev);
-      if (!page.more || !page.events.length) break;
-      cursor = page.nextCursor;
-    }
+    for (const page of host.journal.pages(run.seq.admit - 1)) for (const ev of page.events) this.onEvent(ev);
     if (this.disposed || ended(this.statusValue)) return;
     if (run.state === 'running') this.onStarted();
 

@@ -17,7 +17,7 @@
  * recorded as it is lost and written as a `store-error` gap at the catch-up.
  */
 import { RunIndex } from './runindex.js';
-import { MemoryStore, newEpoch, type JournalStore } from './stores.js';
+import { lineBytes, MemoryStore, newEpoch, type JournalStore } from './stores.js';
 import type { EventInput, GapReason, JournalEvent, Seq } from './types.js';
 
 export type JournalListener = (event: JournalEvent) => void;
@@ -173,14 +173,24 @@ export class Journal {
       // reach the store: a new life of the name may be numbering the same file.
       // The returned event is not part of the journal.
       this.dropped++;
-      return { ...input, seq: this.seq + 1, ts: this.now() } as JournalEvent;
+      return this.stamp(input, this.seq + 1);
     }
     return this.issue(input);
   }
 
+  /** The event `input` becomes at `seq`: the journal's decoration is its seq and its clock's time. */
+  private stamp(input: EventInput, seq: Seq): JournalEvent {
+    return { ...input, seq, ts: this.now() } as JournalEvent;
+  }
+
+  /** What the store would write for `input` appended now: its line's bytes, decoration included (a note's share of retention is counted so). */
+  sizeOf(input: EventInput): number {
+    return lineBytes(this.stamp(input, this.seq + 1));
+  }
+
   /** Number, index, keep and deliver an event, sealed or not. */
   private issue(input: EventInput): JournalEvent {
-    const event = { ...input, seq: ++this.seq, ts: this.now() } as JournalEvent;
+    const event = this.stamp(input, ++this.seq);
     this.hot.append(event);
     this.pending.push(event);
     // Persist before the run index sees the event: a run.end that makes the store rotate then
@@ -347,6 +357,23 @@ export class Journal {
   /** Events with `from <= seq <= to`. */
   range(from: Seq, to?: Seq, limit = Number.POSITIVE_INFINITY): ReadResult {
     return this.readRange(from, to, limit, from - 1);
+  }
+
+  /**
+   * Every retained event after `cursor`, oldest first, in pages of at most `pageSize` (`since`
+   * repeated to the end): a read that stops at a hole left by a cold-store failure says `more`,
+   * and the next page starts inside the hole and reports the gap, so what follows it is still
+   * read (the house's read of 3eade8a, #22). The one loop for the readers that go to the end;
+   * a first page that holds only a gap is yielded for it.
+   */
+  *pages(cursor: Seq, pageSize = Number.POSITIVE_INFINITY): Generator<ReadResult, void, undefined> {
+    for (;;) {
+      const page = this.since(cursor, pageSize);
+      if (!page.events.length && !page.gap) return;
+      yield page;
+      if (!page.more || !page.events.length) return;
+      cursor = page.nextCursor;
+    }
   }
 
   /**

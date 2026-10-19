@@ -336,6 +336,20 @@ type Recovering = Omit<Slot, 'cursors' | 'view'> & { retention: SessionRetention
 /** A name whose record cannot be read has no known owner: nobody may reopen it until the record is repaired or the session removed. */
 const UNOWNED: Principal = 'unknown';
 
+/**
+ * The one text for a name whose shell is gone (G19, G30): why — closed by its owner, left by a daemon
+ * that stopped, or a shell that exited — that its history still reads, and who starts a new life of
+ * the name: the caller (`canReopen`), only its owner (false), or its owner, when the caller is not
+ * known (undefined). The App and the registry both say it.
+ */
+export function endedMessage(s: AnySession, canReopen: boolean | undefined): string {
+  const id = s.kind === 'live' ? s.session.id : s.id;
+  const owner = s.kind === 'live' ? s.session.owner : s.owner;
+  const why = s.kind === 'live' ? 'has ended (its shell exited)' : s.closed ? 'was closed' : 'has no shell (its daemon stopped; the history was recovered)';
+  const again = canReopen ? 'session_open starts a new shell under this name' : `${canReopen === false ? 'only ' : ''}its owner (${owner}) can start a new shell under this name`;
+  return `session ${id} ${why}; its history is readable with read, and ${again}`;
+}
+
 export class SessionRegistry {
   private readonly slots = new Map<string, Slot>();
   /** Per folded name: the tail of the chain of operations on it. */
@@ -793,10 +807,7 @@ export class SessionRegistry {
   live(id: string): Session {
     const s = this.slots.get(id)?.view;
     if (!s) throw err('session_not_found', `session ${id} not found`, { id });
-    if (s.kind !== 'live') {
-      const why = s.closed ? 'was closed' : 'has no shell (its daemon stopped; the history was recovered)';
-      throw err('session_exited', `session ${id} ${why}; its journal is readable, and its owner can open it again, which starts a new life of the name`, { id });
-    }
+    if (s.kind !== 'live') throw err('session_exited', endedMessage(s, undefined), { id });
     return s.session;
   }
 

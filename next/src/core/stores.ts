@@ -56,15 +56,15 @@ export interface JournalStore {
  * Approximate serialized size: every string, number and nested value counts, so
  * an `env.snapshot` or a long `run.admit` line weighs what it holds (jr-21).
  */
-/** The line the file store writes for an event: its JSON and a newline. */
-const lineOf = (event: JournalEvent): string => JSON.stringify(event) + '\n';
+/** The line the file store writes for a record (an event, a rotation header): its JSON and a newline. */
+const lineOf = (record: object): string => JSON.stringify(record) + '\n';
 
 /**
- * The stored size of an event, UTF-8 bytes of its line: the one count for what a retention budget
+ * The stored size of a record, UTF-8 bytes of its line: the one count for what a retention budget
  * holds and what a page of events weighs, wherever it is estimated (the reader's events pages, a
- * note's share of retention, a rotation header's bound).
+ * note's share of retention, the run index's header bound).
  */
-export const lineBytes = (event: JournalEvent): number => Buffer.byteLength(lineOf(event));
+export const lineBytes = (record: object): number => Buffer.byteLength(lineOf(record));
 
 export function approxBytes(v: unknown): number {
   switch (typeof v) {
@@ -769,7 +769,7 @@ export class FileStore implements JournalStore {
     // append rotate. Past the budget, long command lines are shortened and the oldest Runs left out.
     const header = this.header?.(Math.floor(this.maxFileBytes / 4));
     if (header && header.openRuns.length) {
-      const buf = Buffer.from(JSON.stringify({ header }) + '\n');
+      const buf = Buffer.from(lineOf({ header }));
       try {
         this.write(buf);
       } catch (e) {
