@@ -671,12 +671,18 @@ test("tg-19: the wait for a connection is on a monotonic clock: a wall-clock ste
   }
 });
 
-test("tg-19: a profile that is none of core, full, compat and a connect timeout that is not a count of milliseconds are mistakes: said, exit 2 (the house's read of 4e37a11, #22)", async () => {
+test("tg-19: a profile that is none of core, full, compat, a --profile without its value, and a connect timeout that is not a duration are mistakes: said, exit 2 (the house's read of 4e37a11, #22; of the shim, #22 comment 6269721389)", async () => {
   const typo = shim({ TSM_PROFILE: 'comapt' });
   assert.equal(await exitWithin(typo), 2);
   assert.match(typo.err.join(''), /profile must be one of core, full, compat, not "comapt"/);
   const flag = shim({}, [SHIM, '--profile=comapt']);
   assert.equal(await exitWithin(flag), 2);
+  // A trailing --profile is not a fallback to TSM_PROFILE or the invoked name: it is a mistake like the others.
+  for (const env of [{}, { TSM_PROFILE: 'compat' }]) {
+    const trailing = shim(env, [SHIM, '--profile']);
+    assert.equal(await exitWithin(trailing), 2, JSON.stringify(env));
+    assert.match(trailing.err.join(''), /--profile needs a value: one of core, full, compat/);
+  }
   for (const bad of ['abc', 'Infinity', '-1', '1e3']) {
     const s = shim({ TSM_CONNECT_TIMEOUT_MS: bad });
     assert.equal(await exitWithin(s), 2, bad);

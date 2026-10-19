@@ -142,7 +142,16 @@ function target1x(): { base: string; token: string | undefined; from: string | u
 function chooseProfile(argv: string[]): string | undefined {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
-    if (a === '--profile' && argv[i + 1] !== undefined) return argv[i + 1];
+    if (a === '--profile') {
+      // A flag without its value is a mistake, as `--profile=` and an unknown name are: falling back to
+      // TSM_PROFILE or the invoked name served a profile the command line did not ask for (the house's
+      // read of the shim, #22 comment 6269721389).
+      if (argv[i + 1] === undefined) {
+        log(`--profile needs a value: one of ${[...PROFILES].join(', ')}`);
+        process.exit(2);
+      }
+      return argv[i + 1];
+    }
     if (a.startsWith('--profile=')) return a.slice('--profile='.length);
   }
   const fromEnv = setting('TSM_PROFILE');
@@ -728,7 +737,11 @@ async function startDaemon(): Promise<void> {
       }
       log(`${sup.by} serves port ${sup.port} out of ${sup.dataDir}, not ${port}: a termd for ${port} is started here with ${dataDir}`);
     }
-    if (!roomToStart()) return; // another start finished while the supervisor was asked
+    // While the supervisor was asked, a reconnect may have found a daemon (one started by a hand, a
+    // unit, or another shim): then there is nothing to start, and a termd started now would only exit
+    // with the port in use. `starting` admits one start at a time, so nothing else can have changed
+    // `roomToStart()` meanwhile (the house's read of the shim, #22 comment 6269721389).
+    if (open) return;
     notStarted = undefined;
     spawnDaemon();
   } finally {
