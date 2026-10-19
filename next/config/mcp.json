@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "terminal": {
+      "command": "tsm-shim",
+      "env": { "TSM_URL": "ws://127.0.0.1:3101", "TSM_PROFILE": "core", "TSM_RESULT_TEXT": "transcript" }
+    }
+  }
+}

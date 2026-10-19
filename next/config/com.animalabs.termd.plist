@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd: cp to ~/Library/LaunchAgents/, then replace the two paths below:
+       PACKAGE  the installed package: "$(npm root -g)/term-sessions-mcp", or with Volta
+                ~/.volta/tools/image/packages/term-sessions-mcp/lib/node_modules/term-sessions-mcp
+       YOU      your home directory's name (launchd does not expand ~ or $HOME)
+     and start it:  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.animalabs.termd.plist
+     termd-launch.sh finds node (Volta, Homebrew, /usr/local, nvm; or TSM_NODE in
+     EnvironmentVariables), puts those directories on PATH for process Runs, starts in $HOME,
+     and logs to ~/Library/Logs/termd/termd.log (0600). The stderr file below only catches what
+     happens before termd starts logging (a node that cannot be found). No Umask: termd creates
+     its own files owner-only by mode, and the sessions' shells inherit the mask, so files a
+     session creates keep the usual permissions. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.animalabs.termd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>PACKAGE/next/config/termd-launch.sh</string>
+    <string>--port</string><string>3101</string>
+  </array>
+  <!-- launchd starts agents with a soft limit of 256 open files; a session costs about five
+       (pty, journal, key file), so new sessions would fail near 45. -->
+  <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>65536</integer></dict>
+  <key>HardResourceLimits</key><dict><key>NumberOfFiles</key><integer>65536</integer></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/termd.stderr.log</string>
+</dict>
+</plist>

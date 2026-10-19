@@ -1,0 +1,38 @@
+# systemd user unit: cp to ~/.config/systemd/user/termd.service, replace PACKAGE with the
+# installed package ("$(npm root -g)/term-sessions-mcp"), then
+#   systemctl --user daemon-reload && systemctl --user enable --now termd
+# termd-launch.sh finds node (nvm, Volta, /usr/local, ~/.local; or Environment=TSM_NODE=…),
+# puts those directories on PATH for process Runs and starts in $HOME. Logs go to the
+# journal: journalctl --user -u termd.
+[Unit]
+Description=terminal sessions daemon (termd)
+
+[Service]
+ExecStart=/bin/sh PACKAGE/next/config/termd-launch.sh --port 3101
+WorkingDirectory=%h
+# No UMask= here: termd creates its own files owner-only by mode, and the sessions' shells
+# inherit this mask, so files a session creates keep the usual permissions (0644).
+Restart=on-failure
+# Each session costs about five file descriptors (pty, journal, key file); the default
+# soft limit of 1024 would end new sessions near 200.
+LimitNOFILE=65536
+# The sessions' shells and everything they run (builds, test suites) are in this service's
+# cgroup. When the kernel kills one of them for memory, systemd's default (OOMPolicy=stop)
+# stops the whole service: every live session is lost for one build's peak. With continue,
+# termd keeps serving and that one Run reports its process killed. The shells and process
+# Runs start with a raised oom_score_adj (--session-oom-score-adj, default 200), so the kernel
+# takes one of them before termd; on a shared host, where that preference counts against other
+# users' work too, pass a lower value or 0.
+OOMPolicy=continue
+# History on disk is kept forever by default. For a long-lived deployment, cap it:
+#   ExecStart=... --retention-days 30          (or --retention-bytes 200000000 per session)
+# Whatever the caps, termd stops writing history to disk while the data dir's filesystem has
+# less than 200 MiB free (--disk-floor-bytes; 0 turns it off) and resumes when space returns.
+# SIGTERM to termd alone: it drains its sessions (Runs end with reason daemon-shutdown) and
+# kills what they left; only what survives that is killed when the stop times out.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
