@@ -5,6 +5,7 @@
  */
 import { err } from './errors.js';
 import { compileUserRegex, execBounded } from './regex.js';
+import { sequenceEnd } from './text.js';
 
 // CSI, OSC (BEL or ST terminated), DCS/SOS/PM/APC strings, and escape sequences
 // proper: ESC, any intermediates (0x20–0x2f), one final byte (0x30–0x7e). The
@@ -19,25 +20,33 @@ export function stripAnsi(s: string): string {
   return s.replace(SEQ, '').replace(CTRL, '');
 }
 
-/** A backspace stands in for itself through stripAnsi, which drops C0 controls. */
-const BS_MARK = '\uE000';
-
 /**
  * One line of output as a reader sees it: control sequences gone, carriage returns and backspaces
  * applied as overwrites, the way the transcript renders them, so `ABCDE\rXY` reads `XYCDE` and a
  * spinner's `|\b/\b-\b\\` reads its last frame. Trailing blanks stay (a pattern may anchor on them);
  * a display trims them. Search and the segmenter read lines through this one function (the house's
- * read of 3eade8a, #22).
+ * read of 3eade8a, #22). The overwrites are applied on the raw text, sequences skipped by
+ * `sequenceEnd`, so no character stands in for a backspace: a U+E000 in the output is text (the
+ * house's read of 39787b3, #22, found it taken for one).
  */
 export function cleanLine(raw: string): string {
-  const s = stripAnsi(raw.replace(/\x08/g, BS_MARK));
-  if (!s.includes('\r') && !s.includes(BS_MARK)) return s;
   const cells: string[] = [];
   let col = 0;
-  for (const ch of s) {
-    if (ch === '\r') col = 0;
-    else if (ch === BS_MARK) col = Math.max(0, col - 1);
-    else cells[col++] = ch;
+  for (let i = 0; i < raw.length; ) {
+    const c = raw.charCodeAt(i);
+    if (c === 0x1b || c === 0x9b) {
+      i = sequenceEnd(raw, i) ?? raw.length; // an unfinished sequence takes the rest with it
+      continue;
+    }
+    if (c === 0x0d) col = 0;
+    else if (c === 0x08) col = Math.max(0, col - 1);
+    else if ((c >= 0x20 && c !== 0x7f) || c === 0x09 || c === 0x0a) {
+      const ch = String.fromCodePoint(raw.codePointAt(i)!);
+      cells[col++] = ch;
+      i += ch.length;
+      continue;
+    }
+    i++;
   }
   return cells.join('');
 }

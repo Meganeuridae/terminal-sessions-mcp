@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { compileLinePattern, LineSplitter, MAX_LINE, StreamMatcher, stripAnsi, type LineMatch } from '../src/core/ansi.js';
+import { cleanLine, compileLinePattern, LineSplitter, MAX_LINE, StreamMatcher, stripAnsi, type LineMatch } from '../src/core/ansi.js';
 import { LINEAR_REGEX, MIN_WINDOW, matchWindow } from '../src/core/regex.js';
 import { TermError } from '../src/core/errors.js';
 import { sleep } from './testhost.js';
@@ -49,6 +49,17 @@ test('m2-10: patterns that match the empty string are refused (they would fire o
   assert.throws(() => compileLinePattern('x*'), /matches the empty string, so it would match every line/);
   assert.throws(() => compileLinePattern('^$'), /matches only an empty line, which is never offered/);
   assert.throws(() => compileLinePattern('^\\s*$'), /matches only an empty line/);
+});
+
+test('cleanLine applies overwrites on the raw text: a U+E000 in the output is text, not a backspace', () => {
+  assert.equal(cleanLine('ab\uE000c'), 'ab\uE000c');
+  assert.equal(cleanLine('\uE000x'), '\uE000x', 'a leading one stays too');
+  assert.equal(cleanLine('ABCDE\rXY'), 'XYCDE');
+  assert.equal(cleanLine('|\b/\b-\b\\'), '\\', 'a spinner reads its last frame');
+  assert.equal(cleanLine('\x1b[31mred\x1b[0m\rX\x1b(B'), 'Xed', 'sequences are skipped, charset designations whole');
+  assert.equal(cleanLine('a\x00b\x7fc\td'), 'abc\td', 'other controls go, a tab stays');
+  assert.equal(cleanLine('😀\bx'), 'x', 'a backspace steps over a whole code point');
+  assert.equal(cleanLine('text\r\r'), 'text');
 });
 
 test('stripAnsi removes every escape sequence proper, including charset designations (`tput sgr0` is ESC ( B ESC [ m)', () => {
