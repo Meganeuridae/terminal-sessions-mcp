@@ -31,7 +31,9 @@ export const exitMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<EXIT:$
  */
 export const probeMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<PROBE:${nonce}(?::(\\d+)(?::(${NONCE}|))?)?>>>`);
 /** The echo of a typed line that runs a Run: the wrapper's end marker or the inline start marker, split. */
-const wrapperEcho = (nonce: string): RegExp => new RegExp(`<<<(?:EXI(?:""|'')T|STAR(?:""|'')T):${nonce}:`, 'g');
+/** A known nonce as the echo may show it: a line editor redrawing a long typed line can break it anywhere, so whitespace may fall between its characters. */
+const redrawn = (nonce: string): string => (nonce === NONCE ? NONCE : nonce.split('').map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s*'));
+const wrapperEcho = (nonce: string): RegExp => new RegExp(`<<<(?:EXI(?:""|'')T|STAR(?:""|'')T):${redrawn(nonce)}:`, 'g');
 /** The echo of a probe line typed after a ^C, split. */
 const probeEcho = (nonce: string): RegExp => new RegExp(`<<<PRO(?:""|'')BE:${nonce}`, 'g');
 /** A probe answer with its nonce (1), pid (2) and token (3). */
@@ -72,8 +74,11 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   const nonce = of.nonce ?? NONCE;
   const { text, map } = stripEscapes(raw);
   let from = 0;
+  // The end of the last echo of the typed line; the echo of a line longer than the terminal can
+  // show its nonce split by the editor's redraw, which the pattern allows for, so the newline
+  // looked for is the one after the match's end.
   let lastEcho = -1;
-  for (const m of text.matchAll(wrapperEcho(nonce))) lastEcho = m.index;
+  for (const m of text.matchAll(wrapperEcho(nonce))) lastEcho = m.index + m[0].length;
   if (lastEcho !== -1) {
     const nl = text.indexOf('\n', lastEcho);
     if (nl === -1) return '';

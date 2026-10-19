@@ -92,3 +92,11 @@ test('a declared shell’s Run: its output begins after the start marker’s lin
   // The marker strategy's probe names no pid: always the session's own shell.
   assert.equal(cutPlumbing(`${typed(N)}A\n echo "<<<PRO""BE:${N}>>>"\n<<<PROBE:${N}>>>\n$ `, { strategy: 'marker', nonce: N }), 'A\n');
 });
+
+test('a typed line the editor redrew in pieces, its nonce split, is still cut whole', () => {
+  // bash 3.2 as /bin/sh at 80 columns: the typed line is longer than the terminal, readline shows its
+  // tail first, then the line again, and the nonce never appears whole in the echo (a real session's
+  // output, which the cut by nonce alone left in the result).
+  const raw = `sh$  . '/tmp/t/tsm-cmd-2'; echo "<<<EXI""T:f3e7c64\r\nc:$?>>>" . '/tmp/t/tsm-cmd-2'; echo "<<<EXI""T:f3e7c64\nafter\n<<<EXIT:f3e7c64c:0>>>\nsh$ `;
+  assert.equal(cutPlumbing(raw, { strategy: 'marker', nonce: 'f3e7c64c' }), 'after\n');
+});
