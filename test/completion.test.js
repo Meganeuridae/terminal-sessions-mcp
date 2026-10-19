@@ -671,7 +671,7 @@ test("input sent before a command typed in for a shell that can't read the temp 
   }
 });
 
-test("a SIGINT while a command is still being typed in over a link gives it up: its waiting caller is answered at once, its body never runs, and input and the next command go in at once", async () => {
+test("a SIGINT while a command is still being typed in over a link gives it up: its waiting caller is answered at once, its body never runs, ^U and Enter follow its ^C, and input and the next command go in at once", async () => {
   const { cleanTerminalOutput } = require('../dist/src/utils/ansi-clean.js');
   const rc = path.join(os.tmpdir(), `tsm-test-rc5-${process.pid}`);
   fs.writeFileSync(rc, '.() { echo "bash: $1: No such file or directory" >&2; return 1; }\n' +
@@ -682,8 +682,11 @@ test("a SIGINT while a command is still being typed in over a link gives it up: 
     assert.strictEqual((await server.execCommand('t-sigint', `bash --rcfile '${rc}'`, 500)).exitCode, -1);
     await nested;
     // Every write reaches the shell 50 ms after the server makes it, in order,
-    // as over a link: the shell then waits at its prompt for most of each
-    // line's round trip, where a ^C takes nothing with it.
+    // as over a link. The SIGINT goes as soon as the body's first line is
+    // written, so its ^C reaches the shell right behind that line, often while
+    // readline is still reading it, and the next command is typed right behind
+    // the ^C: without the ^U and Enter, it can join what readline kept of the
+    // line, or fail on the interrupt bash acts on late (see CLEAR_HELD_LINE).
     const s = server.sessions.get('t-sigint');
     const writes = [];
     const write = s.shell.write.bind(s.shell);
@@ -700,16 +703,17 @@ test("a SIGINT while a command is still being typed in over a link gives it up: 
       /^Error: Input not sent: a command is still on its way into session t-sigint,/, 'input is refused meanwhile');
     const atSigint = writes.length;
     server.sendSignal('t-sigint', 'SIGINT');
+    assert.strictEqual(writes[atSigint]?.text, '\x03\x15\r', 'the ^C, with ^U and Enter behind it in the same write');
     const long = await longRun;
     assert.deepStrictEqual([long.exitCode, long.output], [-1, '[command not run: interrupted before its body was all typed in]'],
       'its waiting caller is answered at once, with the reason');
-    server.sendInput('t-sigint', '', true); // not refused now: an empty line
-    const nextAt = Date.now();
-    const next = await server.execCommand('t-sigint', 'echo NEXT', 8000);
-    assert.strictEqual(next.exitCode, 0);
+    server.sendInput('t-sigint', '', false); // not refused now (and writes nothing)
+    const asked = writes.length;
+    const nextRun = server.execCommand('t-sigint', 'echo NEXT', 20000);
+    assert.ok(writes.slice(asked).some((w) => /^if \[ -r '/.test(w.text)), "the next command's probe line was written as soon as it was asked for");
+    const next = await nextRun;
+    assert.strictEqual(next.exitCode, 0, `echo NEXT didn't end with 0; the session's last lines: ${JSON.stringify(out().slice(-12))}`);
     assert.strictEqual(cleanTerminalOutput(next.output).trim(), 'NEXT');
-    const nextProbe = writes.find((w) => w.at >= nextAt && /^if \[ -r '/.test(w.text));
-    assert.ok(nextProbe && nextProbe.at - nextAt < 1000, `the next command's probe line was written ${nextProbe ? nextProbe.at - nextAt : '?'} ms after it was asked for`);
     assert.ok(!writes.slice(atSigint).some((w) => w.text.includes(`; then __tsm_${nonce}_b=`)),
       "none of the body's lines was written after the SIGINT, so its last one, which runs it, never went in");
     assert.ok(!out().includes('STARTED'), 'the interrupted body never ran');
