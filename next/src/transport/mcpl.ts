@@ -575,6 +575,15 @@ export class McplLane {
     if (boundary !== undefined && before === undefined) {
       throw new RpcError(INVALID_PARAMS, 'history.beforeMessageId is not a message id of this server; ids look like <node>/<session>~<epoch>:<kind>:<seq>, as channels/incoming and channels/open history give them', { beforeMessageId: String(boundary).slice(0, 200) });
     }
+    // The history is read before anything changes: a read that fails (a store error) refuses the
+    // open with nothing opened, as a refused parameter does.
+    const res: { channel: ChannelDescriptor; history?: IncomingMessage[]; historyTruncated?: boolean } = { channel: this.descriptorFor(s) };
+    if (limit > 0) {
+      const r = await replayNewest(this.sourceOf(s), before !== undefined ? { limit, before } : { limit });
+      const t = targetOf(s);
+      res.history = r.segments.map((seg) => this.message(t, seg));
+      if (r.truncated) res.historyTruncated = true;
+    }
     this.registered.add(id);
     if (s.kind === 'live') {
       // §9: the owner's connection takes a free seat; everyone else observes. Opening never starts a
@@ -585,13 +594,6 @@ export class McplLane {
     const wasOpen = this.open.has(id);
     this.open.add(id);
     if (!wasOpen) this.carryNow(targetOf(s));
-    const res: { channel: ChannelDescriptor; history?: IncomingMessage[]; historyTruncated?: boolean } = { channel: this.descriptorFor(s) };
-    if (limit > 0) {
-      const r = await replayNewest(this.sourceOf(s), before !== undefined ? { limit, before } : { limit });
-      const t = targetOf(s);
-      res.history = r.segments.map((seg) => this.message(t, seg));
-      if (r.truncated) res.historyTruncated = true;
-    }
     return res;
   }
 

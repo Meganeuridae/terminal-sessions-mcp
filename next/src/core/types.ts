@@ -124,7 +124,7 @@ export interface RunInfo {
    * recorded: its history is cut by shape (the house's read of 39787b3, #22).
    */
   strategy?: RunStrategy;
-  /** The nonce in a `marker` or `inline` Run's marks, from its run.start: what its plumbing is cut by. */
+  /** The nonce in a `marker` or `inline` Run's marks, from its run.start: what its plumbing is cut by. For the readers of history; the App's results never carry it. */
   nonce?: string;
   /** A declared shell Run (§8.1): the caller's name for the shell in front (`bash`, `sh`, `fish`…). */
   shell?: string;

@@ -1879,14 +1879,18 @@ export class Session {
       // marker named, printing the token the Run's line set in it. A nested shell the Run started,
       // or a second ssh hop, prints its own pid and no token: the Run's program is still in front
       // and the Run goes on (the house's read of a6d0c35, #22: the Run ended `cancelled` and the
-      // next Run, meant for the declared shell, ran in the nested bash). The same pid without the
-      // token is a shell in another PID namespace (the house's read of 39787b3, #22). The start
-      // marker precedes `eval`, so a Run answered before it never ran (G3).
-      if (run.shellPid !== undefined && (hit.value !== run.shellPid || hit.token !== run.markerNonce)) {
-        const who = hit.value !== run.shellPid ? `pid ${hit.value}; the declared shell's is ${run.shellPid}` : `pid ${hit.value} like the declared shell's, but without the variable the Run's line set: a shell in another PID namespace`;
+      // next Run, meant for the declared shell, ran in the nested bash). The same pid with no token
+      // is the declared shell replaced in place — a Run of `exec zsh` keeps the pid and loses the
+      // unexported variable — and that shell answers for it, as it did before the token; a shell in
+      // another PID namespace with the same pid is told apart from it by nothing printable, so it is
+      // taken for the exec (the house's read of 39787b3, #22). A token that is another Run's is a
+      // stranger's. The start marker precedes `eval`, so a Run answered before it never ran (G3).
+      if (run.shellPid !== undefined && (hit.value !== run.shellPid || (hit.token !== run.markerNonce && hit.token !== '' && hit.token !== undefined))) {
+        const who = hit.value !== run.shellPid ? `pid ${hit.value}; the declared shell's is ${run.shellPid}` : `pid ${hit.value} like the declared shell's, but with another Run's token`;
         this.note(`the end-marker probe for ${run.runId} was answered by another shell (${who}): what ${run.runId} started is still in front`);
         return;
       }
+      if (run.shellPid !== undefined && hit.token === '') this.note(`the end-marker probe for ${run.runId} was answered by the shell now in place of the declared one (pid ${hit.value}, without the variable the Run's line set: the Run replaced it, as exec does)`);
       this.learnDeclaredForeground(run.within ?? null);
       this.endRun(run, { state: run.cancelRequested ? 'cancelled' : 'lost', reason: run.state === 'starting' ? 'cancelled-before-start' : 'exit-unobserved' });
     } else {
@@ -2466,7 +2470,7 @@ export class Session {
     // The plumbing the launch strategy left in the output — the typed line's echo, the markers,
     // the probes a cancel typed — goes, by the Run's nonce, by the one rule history uses too
     // (core/plumbing.ts; the house's reads of 39787b3, #22).
-    if (run.target === 'shell' && run.strategy !== undefined) chunks = [cutPlumbing(chunks.join(''), { strategy: run.strategy, nonce: run.markerNonce, truncated: out.truncated })];
+    if (run.target === 'shell' && run.strategy !== undefined) chunks = [cutPlumbing(chunks.join(''), { strategy: run.strategy, nonce: run.markerNonce, truncated: out.truncated, pid: run.shellPid !== undefined ? String(run.shellPid) : undefined })];
     // Process output comes from pipes (LF → CRLF, rule 6).
     const input: ProjectChunk[] = run.target === 'process' ? events.map((e) => ({ data: e.data, stream: e.stream })) : chunks;
     const p = await project(input, { cols: run.cols ?? this.screen.cols, rows: run.rows ?? this.screen.rows, maxInputBytes: TRANSCRIPT_INPUT_CHARS, keep: 'tail' });

@@ -58,6 +58,7 @@
  * this process's working directory), TSM_CONNECT_TIMEOUT_MS (how long a request
  * may wait for a connection, default 15000; a whole number of milliseconds, empty = default).
  */
+import { clocks, MAX_TIMER_MS } from '../core/clock.js';
 import { setting } from '../core/env.js';
 import { execFile, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
@@ -78,9 +79,6 @@ interface Parsed {
 
 const CONNECTION_CLOSED = -32000;
 const log = (m: string) => process.stderr.write(`[tsm-shim] ${m}\n`);
-/** Milliseconds on a clock that never steps: a wall-clock step would make a wait never end, or end at once (the house's read of 4e37a11, #22). */
-const mono = () => performance.now();
-const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /** `tsm-shim --help`: the settings and what the shim does, before anything is read or started. */
 const HELP = `tsm-shim: stdio MCP server for hosts without a WebSocket client; relays to termd (2.0).
@@ -245,7 +243,7 @@ function unitPort(text: string): string {
  * that is due, at most once per SUPERVISOR_CACHE_MS.
  */
 async function supervisedTermd(): Promise<Supervisor> {
-  const now = mono();
+  const now = clocks.monotonic();
   if (supervisorCache && now - supervisorCache.at < SUPERVISOR_CACHE_MS) return supervisorCache.result;
   const result = await checkSupervisor();
   supervisorCache = { at: now, result };
@@ -459,7 +457,7 @@ function maybeFinish(): void {
 
 /** Requests that waited too long for a connection get an error; notifications are dropped. The queue is in arrival order. */
 function expireQueue(): void {
-  const now = mono();
+  const now = clocks.monotonic();
   if (!queue.length || now - queue[0]!.at < connectTimeoutMs) return;
   while (queue.length && now - queue[0]!.at >= connectTimeoutMs) {
     const q = queue.shift()!;
@@ -486,7 +484,7 @@ function unreachableHint(): string {
   return '';
 }
 
-const seconds = (since: number) => (Math.round((mono() - since) / 100) / 10).toFixed(1);
+const seconds = (since: number) => (Math.round((clocks.monotonic() - since) / 100) / 10).toFixed(1);
 
 /** Say what a refused upgrade means (the ws library reports only the status). */
 function explain(message: string): string {
@@ -529,7 +527,7 @@ const RETRY_START_MS = 30_000;
 function roomToStart(): boolean {
   if (!spawned) return true;
   if (spawned.exit === undefined) return false;
-  return mono() - spawned.at >= (spawned.reached ? RESTART_AFTER_MS : RETRY_START_MS);
+  return clocks.monotonic() - spawned.at >= (spawned.reached ? RESTART_AFTER_MS : RETRY_START_MS);
 }
 
 function noteNotStarted(why: string): void {
@@ -542,8 +540,10 @@ function saidOnStderr(file: string, from: number): string {
   try {
     const fd = fs.openSync(file, 'r');
     try {
+      // The last lines, so a long stack before the exit is quoted from its end, not its start.
       const buf = Buffer.alloc(8192);
-      const n = fs.readSync(fd, buf, 0, buf.length, from);
+      const size = fs.fstatSync(fd).size;
+      const n = fs.readSync(fd, buf, 0, buf.length, Math.max(from, size - buf.length));
       const lines = buf
         .toString('utf8', 0, n)
         .split('\n')
@@ -610,7 +610,7 @@ function spawnDaemon(): void {
       env: Object.fromEntries(Object.entries(process.env).filter(([k]) => SPAWN_ENV.test(k))),
       cwd: os.homedir(),
     });
-    const me: Spawned = { pid: child.pid ?? 0, at: mono(), reached: false };
+    const me: Spawned = { pid: child.pid ?? 0, at: clocks.monotonic(), reached: false };
     spawned = me;
     child.on('error', (e) => {
       me.exit = `could not be started: ${e.message}`;
@@ -764,7 +764,7 @@ const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on('line', (line) => {
   if (!line.trim()) return;
   const m = parse(line);
-  const entry: Line = { line, seq: ++seq, at: mono() };
+  const entry: Line = { line, seq: ++seq, at: clocks.monotonic() };
   if (m) {
     entry.m = m;
     if (typeof m.method === 'string') {

@@ -35,7 +35,7 @@ export function cleanLine(raw: string): string {
   for (let i = 0; i < raw.length; ) {
     const c = raw.charCodeAt(i);
     if (c === 0x1b || c === 0x9b) {
-      i = sequenceEnd(raw, i) ?? raw.length; // an unfinished sequence takes the rest with it
+      i = sequenceEnd(raw, i) ?? i + 1; // an unfinished sequence loses its ESC alone, as stripAnsi drops it: the text after a stray ESC stays matchable
       continue;
     }
     if (c === 0x0d) col = 0;

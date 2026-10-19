@@ -47,6 +47,8 @@ export interface PlumbingOf {
   nonce?: string | undefined;
   /** The output was read from after the Run's start (a byte cap): its first line is not the typed line's echo. */
   truncated?: boolean | undefined;
+  /** The pid the start marker named, when the caller knows it and the output does not begin with the marker (the live transcript). */
+  pid?: string | undefined;
 }
 
 /**
@@ -84,7 +86,7 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     if (nl === -1) return '';
     from = nl + 1;
   }
-  let pid: string | undefined;
+  let pid: string | undefined = of.pid;
   const start = startMark(nonce).exec(text.slice(from));
   if (start?.index === 0) {
     pid = start[1];
@@ -105,9 +107,11 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     if (m.index >= to) break;
     answers.push(m.index);
     // Accepted as the session accepts it (applyInlineMarker): the marker strategy's answer names
-    // no pid; an inline answer must carry the Run's token, or, from before tokens, the pid the
-    // start marker named when the output holds it.
-    if (m[2] === undefined || (m[3] !== undefined ? m[3] === m[1] : pid === undefined || m[2] === pid)) {
+    // no pid; an inline answer must carry the Run's token, or no token with the very pid the start
+    // marker named (the declared shell replaced in place by an exec); from before tokens, that pid,
+    // or any when the output does not say which.
+    const ok = m[2] === undefined || (m[3] !== undefined ? m[3] === m[1] || (m[3] === '' && pid !== undefined && m[2] === pid) : pid === undefined || m[2] === pid);
+    if (ok) {
       accepted = to = m.index;
       break;
     }

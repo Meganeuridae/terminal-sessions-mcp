@@ -77,8 +77,11 @@ test('a declared shell’s Run: its output begins after the start marker’s lin
   // there, it exited, and the declared shell printed the Run's end marker.
   const nested = `\r\n$ ^C\r\n$ ${echo}\r\n<<<PROBE:${N}:2000:>>>\r\n$ ^\\\r\n$ ${echo}\r\n<<<PROBE:${N}:2000:>>>\r\n$ echo after-probe-$((7*6))\r\nafter-probe-42\r\n$ exit\r\n<<<EXIT:${N}:0>>>`;
   assert.equal(cutPlumbing(nested, inline), `$ ^C\r\n$ ^\\\r\n$ echo after-probe-$((7*6))\r\nafter-probe-42\r\n$ exit\r\n`);
-  // The same pid in another PID namespace, still no token: struck too.
+  // No token and a pid the output does not vouch for (no start marker here): struck.
   assert.equal(cutPlumbing(`\r\nA\r\n$ ${echo}\r\n<<<PROBE:${N}:1000:>>>\r\nB\r\n`, inline), 'A\r\nB\r\n');
+  // No token with the very pid the start marker named: the declared shell was replaced in place (an exec), and that shell answers for the Run.
+  assert.equal(cutPlumbing(`<<<START:${N}:1000>>>\r\nA\r\n$ ${echo}\r\n<<<PROBE:${N}:1000:>>>\r\nB\r\n`, inline), 'A\r\n');
+  assert.equal(cutPlumbing(`\r\nA\r\n$ ${echo}\r\n<<<PROBE:${N}:1000:>>>\r\nB\r\n`, { ...inline, pid: '1000' }), 'A\r\n', 'the live transcript knows the pid without the marker');
   // The declared shell's own answer carries the token: the output ends at its echo line.
   assert.equal(cutPlumbing(`\r\nA\r\n$ ${echo}\r\n<<<PROBE:${N}:2000:>>>\r\nB\r\n$ ${echo}\r\n<<<PROBE:${N}:1000:${N}>>>\r\n$ `, inline), 'A\r\nB\r\n');
   // An accepted answer whose echo was not shown (echo off), after a rejected probe: the cut is at the answer, the rejected lines struck.

@@ -599,7 +599,7 @@ test('a cancel is answered only by the shell the Run was typed into: a nested sh
         // token: pid alone would have accepted it (the old bug), the missing variable the Run's
         // line set rejects it (a shell in another PID namespace). A later probe (after ^\) goes
         // unanswered, as the nested bash at its own prompt would leave it.
-        if (probes === 1) h.pty.emit(`<<<PROBE:${nonce}:1000:>>>\r\n`);
+        if (probes === 1) h.pty.emit(`<<<PROBE:${nonce}:2000:>>>\r\n`); // a nested shell: its own pid, no token
         return;
       }
       write(data);
@@ -610,7 +610,7 @@ test('a cancel is answered only by the shell the Run was typed into: a nested sh
     assert.equal(result.escalation, `cancel ${opener}`, 'cancel names the enclosing Run as the next thing to cancel');
     const rejected = notes(h).filter((n) => /answered by another shell/.test(n));
     assert.equal(rejected.length, 1, 'the answered probe was rejected');
-    assert.match(rejected[0]!, /pid 1000 like the declared shell's, but without the variable the Run's line set: a shell in another PID namespace/);
+    assert.match(rejected[0]!, /pid 2000; the declared shell's is 1000/);
     // The nested bash exits and the declared shell prints the Run's own end marker: reported as itself (core-14).
     h.pty.write = write;
     h.pty.emit(`<<<EXIT:${nonce}:42>>>\r\n`);

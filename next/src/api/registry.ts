@@ -646,7 +646,9 @@ export class SessionRegistry {
     slot.meta = meta;
     if (recordRefusal(slot.id, meta) || slot.view.kind !== 'history') return;
     const v = slot.view;
-    slot.view = new HistoryEntry(slot.id, v.journal, meta.owner ?? SYSTEM, meta.visibility ?? 'private', meta.closedAt !== undefined, v.retention, recordedOptions(meta, v.retention), slot.cursors);
+    // The retention is the record's now, not the default chosen while the record was unreadable.
+    const retention = this.retentionFor(undefined, meta.retention);
+    slot.view = new HistoryEntry(slot.id, v.journal, meta.owner ?? SYSTEM, meta.visibility ?? 'private', meta.closedAt !== undefined, retention, recordedOptions(meta, retention), slot.cursors);
     this.opts.log?.('info', 'session record reads again; its owner may start a new life for the session', { session: slot.id, owner: slot.view.owner });
   }
 
