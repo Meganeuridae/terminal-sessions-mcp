@@ -7,11 +7,14 @@
  * reported by `stats()`, never an exception out of `append` — the append runs
  * inside a PTY's data callback, where a throw would take the daemon and every
  * session down (G19). The hot ring carries on, and the cold store catches up
- * from it once the disk accepts writes again. What the disk never took is
- * never silently renumbered: while the cold store fails, a high-water seq is
- * reserved beside it, and the next journal over that store (a new life, or the
- * daemon after a restart) numbers above it and records the hole as a
- * `store-failed` gap (G10, G11).
+ * from it once the disk accepts writes again. What the disk never took is not
+ * silently renumbered: while the cold store fails, a high-water seq is reserved
+ * beside it, and the next journal over that store (a new life, or the daemon
+ * after a restart) numbers above it and records the hole as a `store-failed`
+ * gap (G10, G11). The reservation is best effort — it is a write to the same
+ * disk, retried while it is refused — so a daemon that dies with the reservation
+ * itself refused can reissue seqs. What the ring drops while the disk refuses is
+ * recorded as it is lost and written as a `store-error` gap at the catch-up.
  */
 import { RunIndex } from './runindex.js';
 import { MemoryStore, newEpoch, type JournalStore } from './stores.js';
@@ -90,6 +93,15 @@ export class Journal {
   private dropped = 0;
   /** The seq reserved beside the cold store while it fails (0: none); numbering after a restart resumes above it. */
   private reserved = 0;
+  /** When a refused reservation is tried again (one meta write a second while the disk refuses). */
+  private reserveRetryAt = 0;
+  /**
+   * Events the ring dropped that the cold store never took, recorded as they are lost (not computed
+   * at the catch-up from `persisted` and the ring's oldest seq: an empty ring or a catch-up that
+   * failed partway hid them — the house's read of b047b92, points 2 and 3). Written as a gap once the
+   * store catches up.
+   */
+  private lost: { from: Seq; to: Seq } | undefined;
   /** Every Run the journal holds, reconstructed from its lifecycle events (G1, G20). */
   readonly runs: RunIndex;
   /**
@@ -171,12 +183,24 @@ export class Journal {
   /** Number, index, keep and deliver an event, sealed or not. */
   private issue(input: EventInput): JournalEvent {
     const event = { ...input, seq: ++this.seq, ts: this.now() } as JournalEvent;
-    this.runs.feed(event);
     this.hot.append(event);
     this.pending.push(event);
+    // Persist before the run index sees the event: a run.end that makes the store rotate then
+    // gets a header naming its Run, still open, in the new file (the house's read of b047b92).
     if (this.cold) this.persist(event);
+    if (this.coldError !== null) this.noteRingDrops();
+    this.runs.feed(event);
     if (!this.dispatching) this.dispatch();
     return event;
+  }
+
+  /** Whatever the ring has dropped beyond `persisted` is lost for good: remember it (see `lost`). */
+  private noteRingDrops(): void {
+    if (this.persisted >= this.seq) return;
+    const oldest = this.hot.oldestSeq();
+    const droppedTo = oldest === undefined ? this.seq : oldest - 1;
+    if (droppedTo <= this.persisted) return;
+    this.lost = { from: this.lost?.from ?? this.persisted + 1, to: Math.max(this.lost?.to ?? 0, droppedTo) };
   }
 
   private persist(event: JournalEvent): void {
@@ -189,7 +213,8 @@ export class Journal {
       }
     } else if (!this.catchingUp && Date.now() >= this.retryAt) {
       this.catchUp();
-    } else if (this.reserved > 0 && this.seq >= this.reserved) {
+    } else if (this.reserved === 0 ? Date.now() >= this.reserveRetryAt : this.seq >= this.reserved) {
+      // A refused reservation is tried again, throttled; a block used up is extended.
       this.reserve();
     }
   }
@@ -224,6 +249,7 @@ export class Journal {
     if (!this.cold?.setHighWater || this.reserved > this.seq) return;
     const target = this.seq + HIGH_WATER_BLOCK;
     if (this.cold.setHighWater(target, true)) this.reserved = target;
+    else this.reserveRetryAt = Date.now() + 1000;
   }
 
   /** The store holds every seq issued again: the reservation is released. */
@@ -240,8 +266,8 @@ export class Journal {
   private catchUp(): boolean {
     this.catchingUp = true;
     try {
-      const hotOldest = this.hot.oldestSeq();
-      const lost = hotOldest !== undefined && hotOldest > this.persisted + 1 ? { from: this.persisted + 1, to: hotOldest - 1 } : undefined;
+      this.noteRingDrops();
+      const lost = this.lost;
       let caught = 0;
       try {
         for (const ev of this.hot.read(this.persisted + 1)) {
@@ -259,8 +285,11 @@ export class Journal {
       this.retryTimer = undefined;
       this.log?.('info', `history is being written to disk again: ${caught} events caught up${lost ? `, ${lost.to - lost.from + 1} lost from memory meanwhile (a gap records them)` : ''}`);
       // Even a sealed journal records what its ring lost, under the next seq (the next life numbers after it).
-      if (lost) this.issue(gapEvent(lost.from, lost.to, 'store-error'));
-      if (this.coldError === null) this.healed();
+      if (lost) {
+        this.lost = undefined;
+        this.issue(gapEvent(lost.from, lost.to, 'store-error'));
+      }
+      if (this.coldError === null && this.persisted >= this.seq) this.healed();
       return this.coldError === null;
     } finally {
       this.catchingUp = false;
@@ -349,12 +378,29 @@ export class Journal {
     const oldest = this.oldestSeq;
     if (oldest === undefined) return from <= Math.min(to ?? this.seq, this.seq);
     if (from < oldest) return true;
-    if (hotOldest === undefined || (to !== undefined && to < hotOldest)) return false;
+    if (hotOldest === undefined) return false;
     const first = this.cold?.oldestSeq();
     const last = this.cold?.lastSeq();
-    if (first !== undefined && last !== undefined && last >= from && first <= Math.min(to ?? Number.POSITIVE_INFINITY, hotOldest - 1)) return false;
     const meets = this.cold !== undefined && Math.min(this.persisted, last ?? 0) >= hotOldest - 1;
+    // A range that lies wholly in the hole between the stores begins with a gap too (the house's read of b047b92).
+    if (to !== undefined && to < hotOldest) return !meets && from > (last ?? 0);
+    if (first !== undefined && last !== undefined && last >= from && first <= Math.min(to ?? Number.POSITIVE_INFINITY, hotOldest - 1)) return false;
     return !meets && hotOldest - 1 >= from;
+  }
+
+  /**
+   * Does [from, to] touch the hole between the stores — the seqs the disk refused and the ring has
+   * since dropped — wherever in the range it lies? `gapAt` answers for the range's start; a Run's
+   * output that lost a middle stretch is `truncated` by this (the house's read of b047b92).
+   */
+  holeWithin(from: Seq, to: Seq): boolean {
+    const hotOldest = this.hot.oldestSeq();
+    if (hotOldest === undefined || this.cold === undefined) return false;
+    const last = this.cold.lastSeq() ?? 0;
+    if (Math.min(this.persisted, last) >= hotOldest - 1) return false;
+    const holeFrom = last + 1;
+    const holeTo = hotOldest - 1;
+    return to >= holeFrom && from <= holeTo;
   }
 
   /**
@@ -380,16 +426,28 @@ export class Journal {
       else if (oldest === undefined && from <= this.seq) gap = { from, to: Math.min(to ?? this.seq, this.seq), reason: 'retention' };
       const coldEnd = hotOldest === undefined ? to : Math.min(to ?? Number.POSITIVE_INFINITY, hotOldest - 1);
       if (this.cold && this.cold.oldestSeq() !== undefined) events = this.cold.read(from, coldEnd, want);
-      if (hotOldest !== undefined && events.length < want && (to === undefined || to >= hotOldest)) {
-        const meets = this.cold !== undefined && Math.min(this.persisted, this.cold.lastSeq() ?? 0) >= hotOldest - 1;
-        if (meets) events = events.concat(this.hot.read(hotOldest, to, want - events.length));
-        else if (events.length) more = true;
-        else {
-          gap = { from, to: hotOldest - 1, reason: 'retention' };
-          events = this.hot.read(hotOldest, to, want);
+      if (hotOldest !== undefined && events.length < want) {
+        const coldLast = this.cold?.lastSeq() ?? 0;
+        const meets = this.cold !== undefined && Math.min(this.persisted, coldLast) >= hotOldest - 1;
+        if (to === undefined || to >= hotOldest) {
+          if (meets) events = events.concat(this.hot.read(hotOldest, to, want - events.length));
+          else if (events.length) more = true;
+          else {
+            gap = { from, to: hotOldest - 1, reason: 'retention' };
+            events = this.hot.read(hotOldest, to, want);
+          }
+        } else if (!meets && !events.length && gap === undefined && from > coldLast) {
+          // The whole range lies in the hole between the stores: say so (the house's read of b047b92).
+          gap = { from, to: Math.min(to, hotOldest - 1), reason: 'retention' };
         }
       }
     }
+    // Seqs are dense: a non-empty range within the journal's span that holds no event at all is a
+    // hole, whatever made it (the ring dropped what the disk refused), and the read says so rather
+    // than returning nothing (the house's read of b047b92: `range(2, 6)` inside a hole was silent).
+    const end = Math.min(to ?? this.seq, this.seq);
+    const oldest = this.oldestSeq;
+    if (!events.length && gap === undefined && from <= end && oldest !== undefined && from >= oldest) gap = { from, to: end, reason: 'retention' };
     if (events.length > limit) {
       more = true;
       events = events.slice(0, limit);
@@ -426,6 +484,7 @@ export class Journal {
    */
   expire(now?: number): void {
     this.hot.expire?.(now);
+    if (this.coldError !== null) this.noteRingDrops();
     this.cold?.expire?.(now);
   }
 

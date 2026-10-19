@@ -6,6 +6,8 @@ import * as path from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { Journal } from '../src/core/journal.js';
 import { FileStore, MemoryStore } from '../src/core/stores.js';
+import { pageOutput } from '../src/core/runindex.js';
+import type { JournalEvent } from '../src/core/types.js';
 
 const out = (data: string) => ({ type: 'output', data, stream: 'pty' }) as const;
 
@@ -485,6 +487,204 @@ test('jr-2/jr-9: a write cut short by a full disk never leaves a torn line, even
     assert.deepEqual(seqsOnDisk(dir), [1, 2, 3, 4, 5], 'every event once, no torn line');
   } finally {
     restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ───────────── the house's read of b047b92 (#22) ─────────────
+
+test('a refused high-water write changes nothing: the prune keeps the file whose newest seq it was to keep, and the next journal continues the numbering', () => {
+  const dir = tmpDir();
+  try {
+    let now = 1_000_000;
+    const store = new FileStore(dir, { maxAgeMs: 1000, now: () => now });
+    const j = new Journal({ cold: store, now: () => now });
+    for (let i = 0; i < 3; i++) j.append(out(`e${i}`));
+    // The meta file's temp path is taken by a directory: its next write fails.
+    const blocker = path.join(dir, `journal.meta.json.${process.pid}.tmp`);
+    fs.mkdirSync(blocker);
+    now += 5000;
+    j.expire(now);
+    assert.deepEqual(seqsOnDisk(dir), [1, 2, 3], 'the aged file stays: dropping it would lose the numbering');
+    assert.equal((JSON.parse(fs.readFileSync(path.join(dir, 'journal.meta.json'), 'utf8')) as { highWater?: number }).highWater, undefined, 'nothing claimed on disk');
+    fs.rmdirSync(blocker);
+    j.close();
+    const j2 = new Journal({ cold: new FileStore(dir) });
+    assert.equal(j2.append(out('next')).seq, 4);
+    j2.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a catch-up after the ring aged out entirely records the hole as a gap and numbers above it, in this journal and the next', () => {
+  const dir = tmpDir();
+  try {
+    let now = 1_000_000;
+    let allowed = true;
+    const j = new Journal({ hot: new MemoryStore(1 << 20, { maxAgeMs: 1000, now: () => now }), cold: new FileStore(dir, { floor: { allow: () => allowed } }), now: () => now });
+    const seen: number[] = [];
+    j.subscribe((e) => seen.push(e.seq));
+    j.append(out('kept'));
+    allowed = false;
+    for (let i = 0; i < 5; i++) j.append(out(`lost-${i}`));
+    assert.deepEqual(seen, [1, 2, 3, 4, 5, 6], 'the listener had them');
+    now += 5000;
+    j.expire(now); // the ring drops every unwritten event
+    allowed = true;
+    assert.equal(j.retryCold(), true);
+    const gaps = j.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap');
+    assert.deepEqual(gaps.map((g) => [g.seq, g.from, g.to, g.reason]), [[7, 2, 6, 'store-error']]);
+    assert.equal(j.append(out('after')).seq, 8);
+    assert.deepEqual(j.range(2, 6).events, [], 'the hole holds nothing');
+    assert.deepEqual(j.range(2, 6).gap, { from: 2, to: 6, reason: 'retention' }, 'and a read inside it says so');
+    j.close();
+    const j2 = new Journal({ cold: new FileStore(dir) });
+    assert.equal(j2.append(out('next life')).seq, 9, 'seqs the listener saw are never issued again');
+    j2.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a catch-up that fails partway keeps what the ring had dropped; the gap is written when it succeeds', () => {
+  const dir = tmpDir();
+  try {
+    let allowed = true;
+    let budget = Number.POSITIVE_INFINITY;
+    const j = new Journal({ hot: new MemoryStore(700), cold: new FileStore(dir, { floor: { allow: () => allowed && budget-- > 0 } }) });
+    j.append(out('kept'));
+    allowed = false;
+    for (let i = 0; i < 30; i++) j.append(out(`z${i}-${'z'.repeat(40)}`)); // the small ring drops most of them
+    const oldestHeld = j.since(1).events[0]!.seq;
+    assert.ok(oldestHeld > 2, `the ring dropped seqs 2..${oldestHeld - 1}`);
+    // The first catch-up writes two events and is refused again.
+    allowed = true;
+    budget = 2;
+    assert.equal(j.retryCold(), false);
+    assert.equal(seqsOnDisk(dir).length, 3, 'two caught up before the refusal');
+    budget = Number.POSITIVE_INFINITY;
+    assert.equal(j.retryCold(), true);
+    const onDisk = seqsOnDisk(dir);
+    const gaps = j.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap');
+    assert.deepEqual(gaps.map((g) => [g.from, g.to, g.reason]), [[2, oldestHeld - 1, 'store-error']], 'the hole the first attempt saw is still recorded');
+    assert.deepEqual(onDisk, [1, ...Array.from({ length: 31 - oldestHeld + 1 }, (_, i) => oldestHeld + i), 32], 'the kept event, what the ring held, the gap');
+    j.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a rotation header the disk refused is written before the new file’s first event, so the open Run survives retention', () => {
+  const dir = tmpDir();
+  const cjs = createRequire(import.meta.url)('node:fs') as typeof fs;
+  const realWrite = cjs.writeSync;
+  const restore = () => {
+    cjs.writeSync = realWrite;
+    syncBuiltinESMExports();
+  };
+  try {
+    const j = new Journal({ cold: new FileStore(dir, { maxFileBytes: 4096 }) });
+    j.append({ type: 'run.admit', runId: 'r1', target: 'process', principal: 'agent:a@t', origin: 'self', queued: false, argv: ['/bin/sh'] });
+    j.append({ type: 'run.start', runId: 'r1', cwd: '/w', pid: 424242, pgid: 424242 });
+    // Refuse exactly the header's write at the rotation.
+    let refused = 0;
+    cjs.writeSync = ((fd: number, buf: Buffer | string, ...rest: unknown[]) => {
+      if (Buffer.isBuffer(buf) && buf.subarray(0, 10).toString() === '{"header":') {
+        refused++;
+        throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+      }
+      return (realWrite as unknown as (...a: unknown[]) => number)(fd, buf, ...rest);
+    }) as typeof fs.writeSync;
+    syncBuiltinESMExports();
+    for (let i = 0; i < 60; i++) j.append({ type: 'output', data: 'x'.repeat(100), stream: 'stdout', runId: 'r1' });
+    assert.equal(refused, 1, 'the header write was refused once');
+    restore();
+    assert.equal(j.retryCold(), true);
+    j.append(out('after'));
+    const first = fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8').split('\n')[0]!;
+    assert.ok(first.startsWith('{"header":'), `the new file begins with the header: ${first.slice(0, 40)}`);
+    assert.match(first, /"r1"/);
+    j.close();
+    // Retention takes the rotated file: the Run is still known, with its group.
+    for (const f of fs.readdirSync(dir)) if (/^journal\.\d+\.jsonl$/.test(f)) fs.rmSync(path.join(dir, f));
+    const j2 = new Journal({ cold: new FileStore(dir) });
+    const r1 = j2.runs.get('r1');
+    assert.deepEqual([r1?.target, r1?.pgid, r1?.state], ['process', 424242, 'running']);
+    j2.close();
+  } finally {
+    restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a run.end that rotates the store leaves a header naming its Run in the new file (the index is fed after the write)', () => {
+  const dir = tmpDir();
+  try {
+    const j = new Journal({ cold: new FileStore(dir, { maxFileBytes: 4096 }) });
+    j.append({ type: 'run.admit', runId: 'r1', target: 'process', principal: 'agent:a@t', origin: 'self', queued: false, argv: ['/bin/sh'] });
+    j.append({ type: 'run.start', runId: 'r1', cwd: '/w', pid: 4242, pgid: 4242 });
+    const files = () => fs.readdirSync(dir).filter((f) => /^journal\.\d+\.jsonl$/.test(f)).length;
+    while (files() === 0) j.append({ type: 'output', data: 'x'.repeat(100), stream: 'stdout', runId: 'r1' });
+    // Fill the new active file to just under the limit, then end the Run with an event that rotates.
+    let size = fs.statSync(path.join(dir, 'journal.jsonl')).size;
+    while (size < 4096 - 150) {
+      j.append({ type: 'output', data: 'y'.repeat(100), stream: 'stdout', runId: 'r1' });
+      size = fs.statSync(path.join(dir, 'journal.jsonl')).size;
+    }
+    const before = files();
+    j.append({ type: 'run.end', runId: 'r1', state: 'exited', exit: 0, durationMs: 5 + 'z'.repeat(200).length, reason: 'z'.repeat(200) });
+    assert.equal(files(), before + 1, 'the run.end rotated the store');
+    const first = fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8').split('\n')[0]!;
+    assert.ok(first.startsWith('{"header":') && /"r1"/.test(first), `the new file names the Run it ends: ${first.slice(0, 60)}`);
+    j.close();
+    for (const f of fs.readdirSync(dir)) if (/^journal\.\d+\.jsonl$/.test(f)) fs.rmSync(path.join(dir, f));
+    const j2 = new Journal({ cold: new FileStore(dir) });
+    const r1 = j2.runs.get('r1');
+    assert.deepEqual([r1?.target, r1?.pgid, r1?.state, r1?.exit], ['process', 4242, 'exited', 0], 'known whole from the header and its end');
+    j2.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a Run whose output lost a middle stretch to the ring reads as truncated', () => {
+  const dir = tmpDir();
+  try {
+    let allowed = true;
+    const j = new Journal({ hot: new MemoryStore(1500), cold: new FileStore(dir, { floor: { allow: () => allowed } }) });
+    const admit = j.append({ type: 'run.admit', runId: 'r1', target: 'process', principal: 'agent:a@t', origin: 'self', queued: false, argv: ['/bin/sh'] });
+    j.append({ type: 'run.start', runId: 'r1', cwd: '/w' });
+    for (let i = 0; i < 5; i++) j.append({ type: 'output', data: `early-${i}`, stream: 'stdout', runId: 'r1' });
+    allowed = false;
+    for (let i = 0; i < 40; i++) j.append({ type: 'output', data: `middle-${i}-${'m'.repeat(40)}`, stream: 'stdout', runId: 'r1' });
+    allowed = true;
+    assert.equal(j.retryCold(), true, 'caught up, with a gap for what the ring dropped');
+    const end = j.append({ type: 'run.end', runId: 'r1', state: 'exited', exit: 0, durationMs: 1 });
+    assert.ok(j.since(0).events.some((e) => e.type === 'gap' && e.reason === 'store-error'));
+    const output = pageOutput(j, 'r1', admit.seq, end.seq);
+    assert.ok(output.events.length < 45 && output.events.length > 5, `some of the Run's output is gone: ${output.events.length} events`);
+    assert.equal(output.truncated, true, 'and the result says so');
+    j.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a header torn within its first bytes is a torn header, not a torn event: no gap, no seq skipped', () => {
+  const dir = tmpDir();
+  try {
+    const j = new Journal({ cold: new FileStore(dir) });
+    j.append(out('a'));
+    j.append(out('b'));
+    j.close();
+    fs.appendFileSync(path.join(dir, 'journal.jsonl'), '{"hea');
+    const j2 = new Journal({ cold: new FileStore(dir) });
+    assert.equal(j2.lastSeq, 2);
+    assert.equal(j2.append(out('c')).seq, 3);
+    assert.deepEqual(j2.since(0).events.filter((e) => e.type === 'gap'), []);
+    j2.close();
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

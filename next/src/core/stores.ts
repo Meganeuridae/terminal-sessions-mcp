@@ -361,8 +361,10 @@ export class FileStore implements JournalStore {
   private dirty = false;
   private tornEvent = false;
   private meta: StoreMeta;
-  /** The meta file could not be written yet (a disk refusing writes): retried after the next successful append. */
+  /** The epoch's first write was refused (a disk refusing writes): retried after the next successful append. */
   private metaPending = false;
+  /** A rotation header the disk refused: written before the new file's first event (the house's read of b047b92, point 4). */
+  private headerPending: Buffer | undefined;
   /** Bytes read from disk by reads and scans (observability; the tests bound it). */
   bytesRead = 0;
   private readonly floor: DiskFloor | undefined;
@@ -439,11 +441,13 @@ export class FileStore implements JournalStore {
     const meta: StoreMeta = { v: 1, epoch: this.meta.epoch };
     if (seq > 0) meta.highWater = seq;
     if (failed && seq > 0) meta.failed = true;
-    if (meta.highWater === this.meta.highWater && meta.failed === this.meta.failed && !this.metaPending) return true;
+    if (meta.highWater === this.meta.highWater && meta.failed === this.meta.failed) return true;
+    // Confirmed only once it is on disk (the house's read of b047b92, point 1): a refused write
+    // changes nothing here, so a prune cannot delete the file whose newest seq the high water was
+    // to keep, and a refused reservation is never written later as if its seqs had been issued.
+    if (!this.writeMeta(meta)) return false;
     this.meta = meta;
-    const ok = this.writeMeta(meta);
-    this.metaPending = !ok;
-    return ok;
+    return true;
   }
 
   // ───────────── retention (G21) ─────────────
@@ -612,8 +616,9 @@ export class FileStore implements JournalStore {
       if (atOpen) {
         const head = Buffer.alloc(Math.min(HEADER_PREFIX.length, bytes - cut));
         fs.readSync(fd, head, 0, head.length, cut);
-        // A torn rotation header lost no event; anything else was the event after the last complete line.
-        this.tornEvent = head.toString('utf8') !== HEADER_PREFIX;
+        // A torn rotation header lost no event — torn even within its first bytes (the house's read
+        // of b047b92); anything else was the event after the last complete line.
+        this.tornEvent = !HEADER_PREFIX.startsWith(head.toString('utf8'));
       }
       fs.ftruncateSync(fd, cut);
       return cut;
@@ -648,8 +653,9 @@ export class FileStore implements JournalStore {
   /**
    * Throws when the disk refuses (ENOSPC, EACCES, EIO), leaving the store
    * consistent and usable for a retry: no partial line survives, a failed
-   * rotation leaves the active file in place. The journal decides what a
-   * failure means (it never crashes the daemon, G19).
+   * rename leaves the active file in place, and a rotation header the disk
+   * refused is written before the new file's first event. The journal decides
+   * what a failure means (it never crashes the daemon, G19).
    */
   append(event: JournalEvent): void {
     const buf = Buffer.from(JSON.stringify(event) + '\n');
@@ -664,6 +670,10 @@ export class FileStore implements JournalStore {
     // A file holding only a rotation header is never rotated (jr2-8): it would carry no event.
     if (act.last !== undefined && act.bytes + buf.length > this.maxFileBytes) this.rotate();
     else this.rotateAged(this.now());
+    if (this.headerPending && this.activeSegment().bytes === 0) {
+      this.write(this.headerPending);
+      this.headerPending = undefined;
+    }
     this.write(buf);
     const seg = this.activeSegment();
     seg.first ??= event.seq;
@@ -722,7 +732,15 @@ export class FileStore implements JournalStore {
     // The open Runs, within a quarter of a file (jr2-8): a header near the file size would make every
     // append rotate. Past the budget, long command lines are shortened and the oldest Runs left out.
     const header = this.header?.(Math.floor(this.maxFileBytes / 4));
-    if (header && header.openRuns.length) this.write(Buffer.from(JSON.stringify({ header }) + '\n'));
+    if (header && header.openRuns.length) {
+      const buf = Buffer.from(JSON.stringify({ header }) + '\n');
+      try {
+        this.write(buf);
+      } catch (e) {
+        this.headerPending = buf; // the new file must not begin without it: before its first event
+        throw e;
+      }
+    }
   }
 
   private closeFd(): void {

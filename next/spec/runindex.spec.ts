@@ -169,3 +169,12 @@ test('jr2-9: a range of a large Run reads only what it asks for — not the Run\
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('maxBytes counts UTF-8 bytes, as every cap does: box-drawing output is narrowed by its bytes, not its code units', () => {
+  const events: JournalEvent[] = Array.from({ length: 4 }, (_, i) => ({ type: 'output', data: '─'.repeat(20), stream: 'stdout', runId: 'r1', seq: i + 2, ts: 0 }));
+  // 20 code units but 60 bytes each: a 100-byte cap keeps one event (plus none that would exceed it), where code units would have kept all four.
+  const narrowed = narrowOutput({ events, from: 1, to: 5, truncated: false }, { maxBytes: 100 });
+  assert.equal(narrowed.events.length, 1);
+  assert.equal(narrowed.truncated, true);
+  assert.equal(narrowOutput({ events, from: 1, to: 5, truncated: false }, { maxBytes: 240 }).events.length, 4);
+});

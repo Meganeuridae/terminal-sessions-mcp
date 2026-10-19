@@ -90,7 +90,7 @@ test('jr2-6/G10/G11: a journal sealed while the disk still refuses leaves a high
   }
 });
 
-test('jr2-6/G10: a daemon that dies while the disk refuses writes never has its seqs reissued (a reserved high water)', () => {
+test('jr2-6/G10: a daemon that dies while the disk refuses writes does not have its seqs reissued when the reserved high water was written (best effort: the reservation is a write to the same disk)', () => {
   const dir = tmpDir();
   try {
     const cold = new FullDisk(dir);

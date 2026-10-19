@@ -98,7 +98,7 @@ export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
     let bytes = 0;
     let k = events.length;
     while (k > 0) {
-      const b = (events[k - 1] as OutputEvent).data.length;
+      const b = Buffer.byteLength((events[k - 1] as OutputEvent).data, 'utf8'); // caps are UTF-8 bytes (text.ts)
       if (k < events.length && bytes + b > range.maxBytes) break;
       bytes += b;
       k--;
@@ -125,6 +125,12 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
   const hi = range.until !== undefined ? Math.min(to, range.until) : to;
   const mine = (e: JournalEvent): e is OutputEvent => e.type === 'output' && e.runId === runId;
   const events: OutputEvent[] = [];
+  // A gap recorded inside the Run's range (the ring dropped what the disk refused) cuts its output
+  // as retention does: `truncated` says so (the house's read of b047b92).
+  let holed = journal.holeWithin(lo, hi);
+  const seeGap = (e: JournalEvent): void => {
+    if (e.type === 'gap' && e.to >= lo && e.from <= hi) holed = true;
+  };
   if (range.maxBytes !== undefined && range.limit === undefined) {
     let bytes = 0;
     walk: for (let cursor = hi; cursor >= lo; ) {
@@ -132,9 +138,10 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
       for (let i = page.length - 1; i >= 0; i--) {
         const e = page[i]!;
         if (e.seq < lo) break walk;
+        seeGap(e);
         if (!mine(e)) continue;
         events.push(e);
-        bytes += e.data.length;
+        bytes += Buffer.byteLength(e.data, 'utf8');
         if (events.length > 1 && bytes > range.maxBytes) break walk;
       }
       if (!page.length) break;
@@ -145,13 +152,16 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
     const want = range.limit !== undefined ? Math.max(0, range.limit) + 1 : Number.POSITIVE_INFINITY;
     for (let cursor = lo; cursor <= hi && events.length < want; ) {
       const res = journal.range(cursor, hi, want === Number.POSITIVE_INFINITY ? want : OUTPUT_PAGE);
-      for (const e of res.events) if (mine(e) && events.length < want) events.push(e);
+      for (const e of res.events) {
+        seeGap(e);
+        if (mine(e) && events.length < want) events.push(e);
+      }
       const last = res.events[res.events.length - 1];
       if (!res.more || !last) break;
       cursor = last.seq + 1;
     }
   }
-  return narrowOutput({ events, from, to: hi, truncated: journal.gapAt(from, to) }, range);
+  return narrowOutput({ events, from, to: hi, truncated: journal.gapAt(from, to) || holed }, range);
 }
 
 const terminal = (s: RunInfo['state']) => s === 'exited' || s === 'cancelled' || s === 'lost';
