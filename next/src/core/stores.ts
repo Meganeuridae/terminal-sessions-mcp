@@ -115,18 +115,33 @@ export function writeDurably(file: string, text: string): void {
     fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, file);
   } catch (e) {
-    fs.rmSync(tmp, { force: true }); // a failed write leaves no stray beside the file
+    // A failed write leaves no stray beside the file; the cleanup is guarded so its own error (EIO,
+    // EACCES) never replaces the write's, which is what the caller must see (the house's read of the
+    // 36 commits, #22, comment 6269992150).
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // the original error below is what matters
+    }
     throw e;
   }
   let dir: number | undefined;
   try {
     dir = fs.openSync(path.dirname(file), 'r');
     fs.fsyncSync(dir);
-  } catch {
-    // a filesystem that cannot sync a directory: the rename is still atomic
+  } catch (e) {
+    // Only a filesystem that cannot sync a directory is ignored (the rename is still atomic); a real
+    // I/O error means the rename may not survive a crash and the numbering could come back lower (G10),
+    // so it is not swallowed (comment 6269992150).
+    if (!cannotSyncDir((e as NodeJS.ErrnoException).code)) throw e;
   } finally {
     if (dir !== undefined) fs.closeSync(dir);
   }
+}
+
+/** Error codes that mean the filesystem cannot fsync a directory, as opposed to a real I/O failure (EIO) that must propagate. */
+export function cannotSyncDir(code: string | undefined): boolean {
+  return code === 'EINVAL' || code === 'ENOTSUP' || code === 'EOPNOTSUPP' || code === 'EPERM' || code === 'EISDIR';
 }
 
 /**

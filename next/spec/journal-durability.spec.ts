@@ -11,7 +11,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { Journal } from '../src/core/journal.js';
-import { FileStore, MemoryStore } from '../src/core/stores.js';
+import { cannotSyncDir, FileStore, MemoryStore, writeDurably } from '../src/core/stores.js';
 import type { JournalEvent } from '../src/core/types.js';
 
 const out = (data: string, runId?: string) => ({ type: 'output', data, stream: 'pty', ...(runId ? { runId, attribution: 'temporal' as const } : {}) }) as const;
@@ -288,4 +288,24 @@ test('jr2-9/G11: gapAt agrees with a read across a cold-store hole, without read
   for (let from = 0; from <= j.lastSeq + 1; from++) {
     for (const to of [undefined, from, from + 3, j.lastSeq]) assert.equal(j.gapAt(from, to), j.range(from, to).gap !== undefined, `gapAt(${from}, ${to})`);
   }
+});
+
+test('writeDurably surfaces a write failure and its guarded cleanup leaves no temp file beside the target (the house\'s read of the 36 commits, #22)', () => {
+  const dir = tmpDir();
+  try {
+    // A non-empty directory in the target's place makes the rename fail; the catch cleans the temp and
+    // rethrows the write error (the cleanup is guarded so it can never replace that error).
+    const target = path.join(dir, 'target');
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'keep'), 'x');
+    assert.throws(() => writeDurably(target, 'data'));
+    assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes('.tmp')), [], 'no stray temp file is left behind');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('writeDurably swallows only the directory-fsync codes that mean a filesystem cannot sync a directory — a real I/O error propagates (the house\'s read of the 36 commits, #22)', () => {
+  for (const code of ['EINVAL', 'ENOTSUP', 'EOPNOTSUPP', 'EPERM', 'EISDIR']) assert.equal(cannotSyncDir(code), true, code);
+  for (const code of ['EIO', 'ENOSPC', 'EACCES', undefined]) assert.equal(cannotSyncDir(code), false, String(code));
 });

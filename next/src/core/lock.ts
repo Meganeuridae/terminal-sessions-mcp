@@ -18,7 +18,6 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { err } from './errors.js';
-import { writeDurably } from './stores.js';
 
 export const LOCK_FILE = 'termd.lock';
 
@@ -30,6 +29,14 @@ export interface LockHolder {
   hostname: string;
   /** Distinguishes two takes by one process (a pid alone cannot). */
   nonce?: string;
+  /**
+   * The holder's start in clock ticks after boot, and the boot id (Linux): a wall-clock step (NTP)
+   * does not move these, so a second start compares them frame-free instead of trusting `startedAt`,
+   * which a forward step could make a live daemon's lock look stale (the house's read of the 36
+   * commits, #22, comment 6269992150). Absent on macOS and older builds: the wall clock decides there.
+   */
+  startTicks?: number;
+  bootId?: string;
 }
 
 export interface DataDirLock {
@@ -161,6 +168,34 @@ export function livingGroups(pgids: number[]): number[] {
 /** This process's own start (ms): a lock naming our pid but written before we started is a predecessor's. */
 const selfStartMs = Date.now() - process.uptime() * 1000;
 
+/** This process's own start in clock ticks after boot (Linux): recorded in the lock so a second start can compare frame-free. */
+function selfStartTicks(): number | undefined {
+  if (process.platform !== 'linux') return undefined;
+  return procStartTicks(process.pid);
+}
+
+/** A pid's start in clock ticks after boot (Linux): /proc/<pid>/stat field 22. Undefined off Linux or when gone. */
+function procStartTicks(pid: number): number | undefined {
+  if (process.platform !== 'linux') return undefined;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const start = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]);
+    return Number.isFinite(start) ? start : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether a live pid's command names termd: a wall-clock step must not take the lock from a running daemon (macOS, where there are no ticks). */
+function commandNamesTermd(pid: number): boolean {
+  try {
+    if (process.platform === 'linux') return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('termd');
+    return execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).includes('termd');
+  } catch {
+    return false;
+  }
+}
+
 // ───────────── the lock ─────────────
 
 /** The locks this process took, by file, with the content it wrote: we remove only our own lock. */
@@ -198,18 +233,34 @@ function parseHolder(raw: string): LockHolder | undefined {
 }
 
 /**
- * Whether the holder named in a lock file still holds it: its pid lives, and that process is old
- * enough to have written it. `self`: this very process wrote it (another registry in this process).
- * The lock is host-local, like the data dir it guards; `hostname` is only reported (a laptop's
- * hostname changes with its network, and a stale lock must not outlive that).
+ * Whether the holder named in a lock file still holds it: its pid lives, and that process is the one
+ * that wrote it. `self`: this very process wrote it (another registry in this process). The lock is
+ * host-local, like the data dir it guards; `hostname` is only reported (a laptop's hostname changes
+ * with its network, and a stale lock must not outlive that).
+ *
+ * On Linux the holder's boot id and start ticks decide, frame-free: a different boot id, or a pid now
+ * holding different ticks, is a new process (the lock is stale); matching ticks are the holder, however
+ * the wall clock has stepped since. Off Linux (no ticks) the wall clock decides — a process that
+ * started after the lock was written is a pid reuse — but a wall-clock step must not take the lock from
+ * a running daemon, so a live pid whose command names termd is never read as stale (the house's read of
+ * the 36 commits, #22, comment 6269992150).
  */
 function holderLive(h: LockHolder): 'live' | 'stale' | 'self' {
   if (h.pid === process.pid) return h.startedAt >= selfStartMs - 1000 ? 'self' : 'stale';
-  const info = h.pid > 0 && exists(h.pid) ? processInfo(h.pid) : null;
+  if (!(h.pid > 0) || !exists(h.pid)) return 'stale';
+  if (h.bootId !== undefined && process.platform === 'linux') {
+    const bootId = readBootId();
+    if (bootId !== undefined && bootId !== h.bootId) return 'stale'; // a different boot: the pid is a new process
+    const ticks = procStartTicks(h.pid);
+    if (h.startTicks !== undefined && ticks !== undefined) return ticks === h.startTicks ? 'live' : 'stale';
+  }
+  const info = processInfo(h.pid);
   if (info === null) return 'stale';
   // Unknown start time: assume the holder is who it says (refusing is recoverable; sharing journals is not).
-  // A process that started after the lock was written cannot have written it: the pid was reused.
-  return info === undefined || info.startMs <= h.startedAt + 1000 ? 'live' : 'stale';
+  // A process that started after the lock was written cannot have written it — the pid was reused — unless
+  // its command names termd, which a wall-clock step (not a reuse) can make look so: never take that over.
+  if (info === undefined || info.startMs <= h.startedAt + 1000) return 'live';
+  return commandNamesTermd(h.pid) ? 'live' : 'stale';
 }
 
 const lockedError = (dataDir: string, file: string, h: LockHolder | undefined, why: string) =>
@@ -219,13 +270,48 @@ const lockedError = (dataDir: string, file: string, h: LockHolder | undefined, w
     ...(h ? { pid: h.pid, hostname: h.hostname, startedAt: h.startedAt } : {}),
   });
 
+/** Write `raw` to `tmp`, fsynced and owner-only, before `tmp` is linked or renamed into place: the lock is never seen empty or torn. */
+function writeSyncedTemp(tmp: string, raw: string): void {
+  const data = Buffer.from(raw);
+  const fd = fs.openSync(tmp, 'wx', 0o600);
+  try {
+    for (let off = 0; off < data.length; ) off += fs.writeSync(fd, data, off);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.chmodSync(tmp, 0o600);
+}
+
+/** fsync the directory so a create or rename survives a crash; a filesystem that cannot is left (the rename/link is still atomic). */
+function syncDir(file: string): void {
+  let dir: number | undefined;
+  try {
+    dir = fs.openSync(path.dirname(file), 'r');
+    fs.fsyncSync(dir);
+  } catch {
+    // a filesystem that cannot sync a directory
+  } finally {
+    if (dir !== undefined) fs.closeSync(dir);
+  }
+}
+
+const rmTemp = (tmp: string) => {
+  try {
+    fs.rmSync(tmp, { force: true });
+  } catch {
+    // best effort
+  }
+};
+
 /**
- * Replace a stale lock, atomically: under a short-lived guard (an exclusive
- * mkdir), confirm the file still holds what was judged stale, then rename our
- * own record over it. Returns false when the file changed meanwhile (the
- * caller starts over and judges again).
+ * Replace a stale lock, atomically: under a short-lived guard (an exclusive mkdir), confirm the file
+ * still holds what was judged stale, then rename `tmp` — already written and synced before the guard
+ * was taken — over it, so only the compare and the rename run inside the guard, never a slow write
+ * (the house's read of the 36 commits, #22, comment 6269992150). Returns false when the file changed
+ * meanwhile (the caller starts over and judges again); `tmp` is then left for the caller to remove.
  */
-function takeOver(file: string, staleRaw: string, raw: string): boolean {
+function takeOver(file: string, staleRaw: string, tmp: string): boolean {
   const guard = `${file}.takeover`;
   try {
     fs.mkdirSync(guard, { mode: 0o700 });
@@ -241,17 +327,20 @@ function takeOver(file: string, staleRaw: string, raw: string): boolean {
   }
   try {
     if (readRaw(file) !== staleRaw) return false;
-    writeDurably(file, raw);
-    return readRaw(file) === raw;
+    fs.renameSync(tmp, file);
+    syncDir(file);
+    return true;
   } finally {
     fs.rmSync(guard, { recursive: true, force: true });
   }
 }
 
 /**
- * Take `<dataDir>/termd.lock` or throw `data_dir_locked` naming the live
- * holder. A lock left by a dead process (or by a pid reused since) is taken
- * over. Within one process the lock is shared: its taker releases it.
+ * Take `<dataDir>/termd.lock` or throw `data_dir_locked` naming the live holder. The complete lock is
+ * written and synced to a temp file first, then `link()`ed to `termd.lock` (EEXIST means taken, as `wx`
+ * did), so no starter ever reads an empty or half-written lock (comment 6269992150). A lock left by a
+ * dead process (or by a pid reused since) is taken over. Within one process the lock is shared: its
+ * taker releases it.
  */
 export function acquireDataDirLock(dataDir: string): DataDirLock {
   const dir = path.resolve(dataDir);
@@ -269,36 +358,63 @@ export function acquireDataDirLock(dataDir: string): DataDirLock {
       },
     };
   };
+  const bootId = readBootId();
+  const startTicks = selfStartTicks();
   for (let attempt = 0; attempt < 50; attempt++) {
-    const me: LockHolder = { pid: process.pid, startedAt: Date.now(), hostname: os.hostname(), nonce: randomBytes(8).toString('hex') };
+    const me: LockHolder = { pid: process.pid, startedAt: Date.now(), hostname: os.hostname(), nonce: randomBytes(8).toString('hex'), ...(startTicks !== undefined && { startTicks }), ...(bootId !== undefined && { bootId }) };
     const raw = JSON.stringify(me) + '\n';
+    const tmp = `${file}.${process.pid}.${me.nonce}.tmp`;
     try {
-      fs.writeFileSync(file, raw, { flag: 'wx', mode: 0o600 });
+      writeSyncedTemp(tmp, raw);
+    } catch (e) {
+      rmTemp(tmp);
+      throw e;
+    }
+    try {
+      fs.linkSync(tmp, file);
+      rmTemp(tmp);
+      syncDir(file);
       return take(raw);
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+        rmTemp(tmp);
+        throw e;
+      }
     }
     const current = readRaw(file);
-    if (current === undefined) continue; // released meanwhile: try again
+    if (current === undefined) {
+      rmTemp(tmp);
+      continue; // released meanwhile: try again
+    }
     const holder = parseHolder(current);
     if (!holder) {
-      // Empty or torn: a taker between its create and its write, or one that crashed there.
+      // Empty or torn: a taker that crashed there, or an older build between its create and its write
+      // (link() of a synced temp no longer leaves such a window). Take it over only when it is old.
       let age = 0;
       try {
         age = Date.now() - fs.statSync(file).mtimeMs;
       } catch {
+        rmTemp(tmp);
         continue;
       }
       if (age < 2000) {
+        rmTemp(tmp);
         sleepSync(20);
         continue;
       }
     } else {
       const state = holderLive(holder);
-      if (state === 'self') return { file, release: () => undefined }; // another registry in this process took it; its taker releases it
-      if (state === 'live') throw lockedError(dataDir, file, holder, `termd pid ${holder.pid}${holder.hostname !== os.hostname() ? ` (written on host ${holder.hostname})` : ''}`);
+      if (state === 'self') {
+        rmTemp(tmp);
+        return { file, release: () => undefined }; // another registry in this process took it; its taker releases it
+      }
+      if (state === 'live') {
+        rmTemp(tmp);
+        throw lockedError(dataDir, file, holder, `termd pid ${holder.pid}${holder.hostname !== os.hostname() ? ` (written on host ${holder.hostname})` : ''}`);
+      }
     }
-    if (takeOver(file, current, raw)) return take(raw, holder ?? {});
+    if (takeOver(file, current, tmp)) return take(raw, holder ?? {});
+    rmTemp(tmp);
     sleepSync(10);
   }
   throw lockedError(dataDir, file, parseHolder(readRaw(file) ?? ''), 'another termd starting at the same time');

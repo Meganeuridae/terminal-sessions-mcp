@@ -240,3 +240,41 @@ test('jr2-2/tsg-1/G10/G20: a second termd on the same data dir — same port or 
     live.proc.kill('SIGKILL');
   }
 });
+
+test('jr2-2: a wall-clock step back does not take the lock from a live daemon (the house\'s read of the 36 commits, #22)', async () => {
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  // A live holder whose command names termd: on Linux its boot id and start ticks identify it
+  // frame-free, and off Linux the fallback never reads a running termd as stale.
+  const holder = spawn(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import { acquireDataDirLock } from ${JSON.stringify(LOCK_JS)}; acquireDataDirLock(${JSON.stringify(dir)}); console.log('held'); setInterval(() => {}, 1000);`,
+      'termd',
+    ],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let buf = '';
+      holder.stdout!.on('data', (d: Buffer) => {
+        buf += d.toString();
+        if (buf.includes('held')) resolve();
+      });
+      holder.once('exit', () => reject(new Error('holder exited before holding the lock')));
+      setTimeout(() => reject(new Error('holder timed out')), 15_000).unref();
+    });
+    const lockFile = path.join(dir, LOCK_FILE);
+    const h = JSON.parse(fs.readFileSync(lockFile, 'utf8')) as { pid: number; startedAt: number };
+    assert.equal(h.pid, holder.pid);
+    // The wall clock steps forward 3 s after the daemon took its lock (an NTP correction), so its
+    // recorded startedAt now sits 3 s in the past. The daemon is alive; its lock must not be taken over.
+    fs.writeFileSync(lockFile, JSON.stringify({ ...h, startedAt: h.startedAt - 3000 }) + '\n');
+    assert.throws(() => acquireDataDirLock(dir), (e: unknown) => code(e) === 'data_dir_locked');
+    assert.equal((JSON.parse(fs.readFileSync(lockFile, 'utf8')) as { pid: number }).pid, holder.pid, 'the live holder still holds it');
+  } finally {
+    holder.kill('SIGKILL');
+  }
+});
