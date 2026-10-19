@@ -11,6 +11,7 @@
  * with invalid_argument when the watch or wait is created.
  */
 import { randomBytes } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { compileLinePattern, StreamMatcher } from './ansi.js';
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
@@ -94,12 +95,17 @@ const endText = (r: { runId: string; state: string; exit?: number; signal?: stri
 type Hit = { match?: string; line?: string; seq: Seq };
 
 /** Evaluates one predicate against journal events; shared by watches and waits. */
+/** The clock the quiet interval is measured on; a test may replace it. */
+export const clocks = { monotonic: (): number => performance.now() };
+
 class Predicate {
   private readonly re: RegExp | undefined;
   private readonly matchers = new Map<string, { m: StreamMatcher; seq: Seq }>();
   private silenceTimer: NodeJS.Timeout | undefined;
-  /** When the current quiet stretch began (the last output, or when the silence clock was started). */
+  /** When the current quiet stretch began (the last output, or when the silence clock was started): wall clock, for the record. */
   private quietFrom = 0;
+  /** The same instant on the monotonic clock, which measures the quiet: a wall-clock step (NTP, a manual change) neither delays nor hastens silence (the house's read of 0891472). */
+  private quietSince = 0;
   private idleArmed = false;
   private idleCheck = false;
   private runEnded = false;
@@ -119,15 +125,24 @@ class Predicate {
   /** Start (or restart) the silence clock: fire after `ms` unless output arrives; the quiet began at `from`. */
   armSilence(ms = this.spec.silenceMs!, from = Date.now()): void {
     if (this.kind !== 'silence' || this.disposed || this.runEnded) return;
-    if (this.silenceTimer) clearTimeout(this.silenceTimer);
     this.quietFrom = from;
+    this.quietSince = clocks.monotonic() - Math.max(0, Date.now() - from);
+    this.schedule(ms);
+  }
+
+  /** The quiet so far, on the monotonic clock. */
+  private quietMs(): number {
+    return Math.max(0, Math.round(clocks.monotonic() - this.quietSince));
+  }
+
+  private schedule(ms: number): void {
+    if (this.silenceTimer) clearTimeout(this.silenceTimer);
     this.silenceTimer = setTimeout(() => {
       this.silenceTimer = undefined;
-      const quiet = Math.max(0, Date.now() - this.quietFrom);
+      const quiet = this.quietMs();
       if (quiet < this.spec.silenceMs!) {
-        // Timers can wake a millisecond early, and the clock behind journal
-        // timestamps can move. The elapsed quiet time is the predicate's evidence.
-        this.armSilence(this.spec.silenceMs! - quiet, this.quietFrom);
+        // A timer can wake a millisecond early: the elapsed quiet time is the predicate's evidence.
+        this.schedule(this.spec.silenceMs! - quiet);
         return;
       }
       this.fire({ match: `no output for ${quiet}ms`, seq: this.host.journal.lastSeq });
@@ -158,7 +173,7 @@ class Predicate {
           if (this.silenceTimer) clearTimeout(this.silenceTimer);
           this.silenceTimer = undefined;
           this.runEnded = true;
-          const quiet = this.quietFrom ? ` no output for ${Math.max(0, Date.now() - this.quietFrom)}ms` : ' no output';
+          const quiet = this.quietFrom ? ` no output for ${this.quietMs()}ms` : ' no output';
           this.fire({ match: `${endText(ev)};${quiet}`, seq: ev.seq });
           this.onRunEnd?.(ev);
         }
