@@ -1,6 +1,6 @@
 {
   "name": "term-sessions-mcp",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Persistent terminal session management with MCP integration for AI assistants",
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",
