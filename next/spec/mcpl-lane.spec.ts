@@ -1288,3 +1288,150 @@ test('the hold for a synchronous call is measured on the monotonic clock: a wall
     await d.stop();
   }
 });
+
+// ───────────── a reviewer's read of the fixes for #22 comment 6270045466 ─────────────
+
+/**
+ * A lane over a real App with no endpoint, as the reviewer's probe drives it: the host accepts every
+ * request until `refuse.value` is set. Registry changes reach the lane as the endpoint would send them
+ * (`announce`), except a close, which the test orders itself (`closed` records them).
+ */
+async function bareLane(connection: string, o: { announce?: boolean } = {}) {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-lane-'));
+  const registry = new SessionRegistry({ dataDir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
+  const app = new App({ registry, segmenter: { runSettleMs: 10 } });
+  const sent: Msg[] = [];
+  const refuse = { value: false };
+  const refusal = (req: Msg): unknown => {
+    if (req.method === 'channels/incoming') return { results: (req.params as { messages: Array<{ messageId: string }> }).messages.map((x) => ({ messageId: x.messageId, accepted: false, reason: 'queue_full' })) };
+    if (req.method === 'push/event') return { accepted: false, reason: 'queue_full' };
+    return TestHost.accept(req);
+  };
+  const out: Outbound = new Outbound((m) => {
+    const req = m as Msg;
+    sent.push(req);
+    if (req.method === undefined || req.id === undefined) return;
+    const result = refuse.value ? refusal(req) : TestHost.accept(req);
+    setImmediate(() => out.handleResponse({ jsonrpc: '2.0', id: req.id!, result } as never));
+  });
+  const caller = { principal: A, connectionId: connection };
+  const lane = new McplLane(app, caller, out, () => undefined);
+  const closed: string[] = [];
+  if (o.announce !== false) {
+    registry.onChange((c) => {
+      if (c.type === 'created') lane.sessionCreated(c.id);
+      else if (c.type === 'closed') closed.push(c.id);
+      else void lane.sessionRemoved(c.id);
+    });
+  }
+  const ctx = { isRequest: true, after: (fn: () => void) => fn() };
+  await lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, ctx);
+  const inside = lane as unknown as {
+    opening: Map<string, unknown>;
+    open: Set<string>;
+    registered: Set<string>;
+    watched: Map<string, unknown>;
+    states: Map<string, { owed: Set<number> }>;
+    startCatchUp(sessions: string[]): Promise<void>;
+  };
+  /** A Run whose outcome counts as returned by its call: once settled, nothing of it is held or owed. */
+  const settledRun = async (session: string, command: string): Promise<string> => {
+    const r = await app.run(caller, { session, command, wait: 5000 });
+    const s = live(registry, session);
+    s.markOutcomeDelivered(r.runId!, A);
+    await until(() => s.cursorsOf(A).delivered >= s.run(r.runId!).seq.end!, 4000, `the completion of ${command} to settle`);
+    return r.runId!;
+  };
+  const close = async () => {
+    lane.dispose();
+    await registry.closeAll();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  };
+  return { registry, app, lane, caller, ctx, sent, refuse, closed, inside, settledRun, close };
+}
+
+test("a message held for an open in flight keeps its debt when the session closes during the read, and the host's later refusal keeps it owed", { timeout: 20_000 }, async () => {
+  // The reviewer's probe: the exit journaled during the read was owed and held; a catch-up lifted clearTo past
+  // it; sessionClosed released its debt as a message that would never come, so `delivered` passed it before
+  // any host received it, and the host's later refusal was settled as accepted.
+  const f = await bareLane('c-release');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'oc', visibility: 'shared' });
+    const one = await f.settledRun('oc', 'echo one');
+    const s = live(f.registry, 'oc');
+    const hold = holdTranscripts(s, one);
+    const opening = f.lane.handle('channels/open', { channelId: 'terminal:oc', history: { limit: 5 } }, f.ctx);
+    await hold.reached;
+    await f.app.sessionClose(f.caller, { session: 'oc' });
+    await until(() => f.closed.includes('oc'), 3000, 'the close to be announced');
+    await sleep(200); // the exit's message is rendered and held for the opening channel
+    const exit = s.journal.since(0).events.find((e) => e.type === 'session.exit');
+    assert.ok(exit, 'the exit is journaled');
+    const st = f.inside.states.get('oc')!;
+    assert.ok(st.owed.has(exit.seq), 'the exit is owed: the channel is opening');
+    // A catch-up during the open (a grant widening does this) scans past the exit and lifts clearTo to the end.
+    await f.inside.startCatchUp(['oc']);
+    // The endpoint's sessionClosed releases what the closed life's segmenter will never send, not what the opening holds.
+    await f.lane.sessionClosed('oc');
+    assert.ok(s.cursorsOf(A).delivered < exit.seq, `delivered stays below the held exit (${s.cursorsOf(A).delivered} vs ${exit.seq})`);
+    f.refuse.value = true;
+    hold.release();
+    // Closed during the read, the session is no longer the one the open began on: the open is refused, and the
+    // held exit goes the closed channel's way, a push the host refuses.
+    await assert.rejects(opening, (e: Error & { code?: number }) => e.code === -32023);
+    hold.restore();
+    await until(() => f.sent.some((m) => m.method === 'push/event' && /session-exit/.test(String((m.params as { eventId: string }).eventId))), 3000, 'the exit pushed');
+    await sleep(200);
+    assert.ok(st.owed.has(exit.seq), 'refused, the exit stays owed');
+    assert.ok(s.cursorsOf(A).delivered < exit.seq);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a session forgotten while its channel's history is read opens nothing: the open is refused and the channel is neither registered, open nor opening", { timeout: 20_000 }, async () => {
+  const f = await bareLane('c-forget');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'fg', visibility: 'shared' });
+    const one = await f.settledRun('fg', 'echo one');
+    const s = live(f.registry, 'fg');
+    const hold = holdTranscripts(s, one);
+    const opening = f.lane.handle('channels/open', { channelId: 'terminal:fg', history: { limit: 5 } }, f.ctx);
+    await hold.reached;
+    await f.app.sessionClose(f.caller, { session: 'fg', forget: true });
+    await until(() => f.registry.get('fg') === undefined, 3000, 'the name to be forgotten');
+    hold.release();
+    await assert.rejects(opening, (e: Error & { code?: number }) => e.code === -32023 && /nothing was opened/.test(e.message));
+    hold.restore();
+    assert.equal(f.inside.opening.size, 0, 'nothing left opening');
+    assert.equal(f.inside.open.has('terminal:fg'), false, 'not open');
+    assert.equal(f.inside.registered.has('terminal:fg'), false, 'not registered');
+    assert.equal(f.inside.watched.size, 0, 'not followed');
+  } finally {
+    await f.close();
+  }
+});
+
+test('an open whose follow fails leaves no channel opening, nothing registered and nothing owed', async () => {
+  // Only the read and the disposal check had an abandon: a throw after them left the channel opening for good.
+  const f = await bareLane('c-follow', { announce: false }); // nothing follows the session until a channel opens
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'ff', visibility: 'shared' });
+    await f.app.run(f.caller, { session: 'ff', command: 'echo one', wait: 5000 });
+    const app = f.app as unknown as { segmenter?: () => never };
+    app.segmenter = () => {
+      throw new Error('segmenter unavailable');
+    };
+    try {
+      await assert.rejects(f.lane.handle('channels/open', { channelId: 'terminal:ff', history: { limit: 5 } }, f.ctx), /segmenter unavailable/);
+    } finally {
+      delete app.segmenter;
+    }
+    assert.equal(f.inside.opening.size, 0, 'nothing left opening');
+    assert.equal(f.inside.open.size, 0, 'nothing open');
+    assert.equal(f.inside.registered.has('terminal:ff'), false, 'nothing registered');
+    assert.equal(f.inside.states.get('ff')?.owed.size ?? 0, 0, 'nothing owed');
+  } finally {
+    await f.close();
+  }
+});

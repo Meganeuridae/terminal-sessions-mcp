@@ -238,9 +238,9 @@ interface LaneState {
 /** A session as delivery sees it: the live Session of one life, or history; either keeps the principal's cursors (G22). */
 type Target = Session | HistorySession;
 
-/** An open of a channel reading its history (see `McplLane.opening`): the messages held for it, and how many such reads are under way. */
+/** An open of a channel reading its history (see `McplLane.opening`): the messages held for it, by id (the catch-up and the live path can both bring one), and how many such reads are under way. */
 interface Opening {
-  held: Array<{ t: Target; seg: Segment }>;
+  held: Map<string, { t: Target; seg: Segment }>;
   opens: number;
 }
 const targetOf = (entry: AnySession): Target => (entry.kind === 'live' ? entry.session : entry);
@@ -600,32 +600,34 @@ export class McplLane {
     // open with nothing opened, as a refused parameter does. While it is read, the channel is
     // opening (see `opening`), and what the session delivers meanwhile waits for the outcome.
     const res: { channel: ChannelDescriptor; history?: IncomingMessage[]; historyTruncated?: boolean } = { channel: this.descriptorFor(s) };
+    // From here the channel is opening until `finishOpening`, the one way out that opens it; every
+    // other way out abandons the opening, or the channel stayed opening for good, with every message
+    // for it held and its owed seqs pinning the cursor (a reviewer's read of the fixes for #22 comment 6270045466).
     const pending = limit > 0 ? this.beginOpening(id) : undefined;
-    if (limit > 0) {
-      let r: Awaited<ReturnType<typeof replayNewest>>;
-      try {
-        r = await replayNewest(this.sourceOf(s), before !== undefined ? { limit, before } : { limit });
-      } catch (e) {
-        this.abandonOpening(id, pending);
-        throw e;
-      }
-      if (this.disposed) {
+    try {
+      if (limit > 0) {
+        const r = await replayNewest(this.sourceOf(s), before !== undefined ? { limit, before } : { limit });
         // The connection closed during the read: nothing is registered or followed (a subscription
         // nothing would remove), and the open is answered with an error, should anything still carry
         // it (the house's read of 78c4d6e, #22).
-        this.abandonOpening(id, pending);
-        throw new RpcError(INTERNAL, 'the connection closed while the channel history was read; nothing was opened');
+        if (this.disposed) throw new RpcError(INTERNAL, 'the connection closed while the channel history was read; nothing was opened');
+        // The session the open began on is gone or replaced: a forgotten name's channel was opened
+        // for nobody, and a name re-created meanwhile found its channel open (the reviewer's read above).
+        if (this.app.registry.get(sid) !== s) throw new RpcError(UNKNOWN_CHANNEL, `session ${sid} was closed or replaced while its history was read; nothing was opened`, { channelId: id });
+        res.history = r.segments.map((seg) => this.message(t, seg));
+        if (r.truncated) res.historyTruncated = true;
       }
-      res.history = r.segments.map((seg) => this.message(t, seg));
-      if (r.truncated) res.historyTruncated = true;
+      if (s.kind === 'live') {
+        // §9: the owner's connection takes a free seat; everyone else observes. Opening never starts a
+        // shell (mcpl-9): a session whose shell ended is followed read-only, its history served.
+        if (s.session.exit === undefined) this.attach(s.session);
+        if (!s.session.journal.closed) this.follow(s.session);
+      }
+    } catch (e) {
+      this.abandonOpening(id, pending);
+      throw e;
     }
     this.registered.add(id);
-    if (s.kind === 'live') {
-      // §9: the owner's connection takes a free seat; everyone else observes. Opening never starts a
-      // shell (mcpl-9): a session whose shell ended is followed read-only, its history served.
-      if (s.session.exit === undefined) this.attach(s.session);
-      if (!s.session.journal.closed) this.follow(s.session);
-    }
     const wasOpen = this.open.has(id);
     this.open.add(id);
     this.finishOpening(id, pending);
@@ -642,7 +644,7 @@ export class McplLane {
   private beginOpening(id: string): Opening | undefined {
     if (this.open.has(id)) return undefined;
     let p = this.opening.get(id);
-    if (!p) this.opening.set(id, (p = { held: [], opens: 0 }));
+    if (!p) this.opening.set(id, (p = { held: new Map(), opens: 0 }));
     p.opens++;
     return p;
   }
@@ -655,7 +657,7 @@ export class McplLane {
   private finishOpening(id: string, p: Opening | undefined): void {
     if (!p || this.opening.get(id) !== p) return;
     this.opening.delete(id);
-    for (const h of p.held) this.deliver(h.t, h.seg, { released: true });
+    for (const h of p.held.values()) this.deliver(h.t, h.seg, { released: true });
   }
 
   /**
@@ -666,7 +668,7 @@ export class McplLane {
   private abandonOpening(id: string, p: Opening | undefined): void {
     if (!p || this.opening.get(id) !== p || --p.opens > 0) return;
     this.opening.delete(id);
-    if (!this.disposed) for (const h of p.held) this.deliver(h.t, h.seg, { released: true });
+    if (!this.disposed) for (const h of p.held.values()) this.deliver(h.t, h.seg, { released: true });
   }
 
   closeChannel(id: string): { closed: boolean } {
@@ -923,7 +925,11 @@ export class McplLane {
   private releaseUnsettled(t: Target, upTo: Seq): void {
     const st = this.stateOf(t);
     const held = new Set([...st.held.values()].map((h) => h.seq));
-    const pending = new Set([...st.inflight.values(), ...[...st.retries.values()].map((r) => r.seq)]);
+    // A message held for an open of the channel still in flight goes out when the open completes, so
+    // its debt stays: released, a catch-up lifting clearTo let `delivered` pass it before any host
+    // received it, and the host's later refusal was settled as accepted (a reviewer's read of the fixes for #22 comment 6270045466).
+    const opening = [...(this.opening.get(channelId(t.id))?.held.values() ?? [])].map((h) => h.seg.seq);
+    const pending = new Set([...st.inflight.values(), ...[...st.retries.values()].map((r) => r.seq), ...opening]);
     for (const seq of st.owed) if (seq <= upTo && !pending.has(seq) && !held.has(seq)) st.owed.delete(seq);
     this.advance(t, st);
   }
@@ -1026,7 +1032,7 @@ export class McplLane {
     // An open of the channel is reading its history: held until the open completes or fails (see `opening`).
     const opening = this.open.has(cid) ? undefined : this.opening.get(cid);
     if (opening) {
-      opening.held.push({ t, seg });
+      if (!opening.held.has(id)) opening.held.set(id, { t, seg });
       return;
     }
     if (this.open.has(cid) && this.enabled('terminal.channels', 'channels.incoming')) {
