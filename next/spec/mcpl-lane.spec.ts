@@ -746,7 +746,11 @@ test('a catch-up that begins inside a retention gap tells the host the range it 
     assert.match(missed.text, /^\[terminal\] rg: seq 1–\d+ gone past retention, with whatever happened then · read session=rg since=\d+ as=events$/);
     const { lostFrom, lostTo } = missed.metadata as { lostFrom: number; lostTo: number };
     assert.equal(lostFrom, 1);
-    assert.ok(lostTo >= 1 && lostTo < oldest, JSON.stringify(missed.metadata));
+    // Retention moves on between the first look and the scan (the new host's own attach events evict
+    // older ones under the byte cap), so the gone range ends at or past the first look and before
+    // whatever is oldest now; a slow runner saw it reach the whole journal.
+    const oldestNow = s.journal.oldestSeq ?? Number.POSITIVE_INFINITY;
+    assert.ok(lostTo >= oldest - 1 && lostTo < oldestNow, `${JSON.stringify(missed.metadata)} (oldest ${oldest} at the first look, ${oldestNow} now)`);
     assert.equal(missed.metadata.count, 0, 'nothing was omitted: the summary is about the gap alone');
     await a.delivery(aboutRun(bg.structured?.runId), 6000);
     await a.close();
