@@ -20,7 +20,7 @@ import { TOOLS } from '../src/api/tools.js';
 import type { UsageRecord } from '../src/api/usage.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermServer } from '../src/transport/server.js';
-import { FakeShell } from './fake-shell.js';
+import { fakeShellBackend, type FakeShell } from './fake-shell.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const TSM = path.resolve(here, '../src/cli/tsm.js');
@@ -49,18 +49,11 @@ function tsm(argv: string[], env: NodeJS.ProcessEnv, opts: { readAfterMs?: numbe
 }
 
 test('tsm exit codes: the Run exit code, 124 while running, 75 when busy, 1 on error', async () => {
-  const backend = new ScriptedBackend();
-  backend.onSpawnShell = (p) => {
-    const sh = new FakeShell(p);
+  const backend = fakeShellBackend((sh) => {
     sh.on(/^exit (\d+)$/, (l) => ({ exit: Number(l.split(' ')[1]) }));
     sh.on(/^sleep/, () => ({ hang: true }));
     sh.on('echo hi', () => ({ output: 'hi\r\n', exit: 0 }));
-    const kill = p.kill.bind(p);
-    p.kill = (sig) => {
-      kill(sig);
-      if (sig === 'SIGHUP' || sig === 'SIGKILL') p.exit({ exitCode: null, signal: sig });
-    };
-  };
+  });
   const registry = new SessionRegistry({ dataDir: path.join(tmp, 'd'), backend, defaultShell: '/bin/bash', noUserRc: true });
   const usage: UsageRecord[] = [];
   const server = new TermServer({
@@ -135,18 +128,11 @@ test('tsm gui prints the GUI URL, with the token when one is configured, as JSON
 });
 
 test('atc-5/tsg-2/atc-25/ux-18: a signal exits 128+N; await <runId>; durations; -- ends option parsing', async () => {
-  const backend = new ScriptedBackend();
-  backend.onSpawnShell = (p) => {
-    const sh = new FakeShell(p);
+  const backend = fakeShellBackend((sh) => {
     sh.on(/^sleep/, () => ({ hang: true }));
     sh.on(/^echo /, (l) => ({ output: `${l.slice(5)}\r\n`, exit: 0 }));
     sh.on(/^git /, (l) => ({ output: `ran: ${l}\r\n`, exit: 0 }));
-    const kill = p.kill.bind(p);
-    p.kill = (sig) => {
-      kill(sig);
-      if (sig === 'SIGHUP' || sig === 'SIGKILL') p.exit({ exitCode: null, signal: sig });
-    };
-  };
+  });
   // Process Runs: `die SIG` is killed by that signal.
   backend.onSpawnProcess = (p) => {
     const line = p.opts.line ?? p.opts.argv.join(' ');
@@ -409,17 +395,11 @@ test('tsg-12/ux-18: a Host the daemon does not serve is explained, naming --allo
 });
 
 test('--until-done keeps awaiting past the per-call wait until the Run has ended, and exits with its code', async () => {
-  const backend = new ScriptedBackend();
   let sh!: FakeShell;
-  backend.onSpawnShell = (p) => {
-    sh = new FakeShell(p);
+  const backend = fakeShellBackend((shell) => {
+    sh = shell;
     sh.on(/^sleep/, () => ({ hang: true }));
-    const kill = p.kill.bind(p);
-    p.kill = (sig) => {
-      kill(sig);
-      if (sig === 'SIGHUP' || sig === 'SIGKILL') p.exit({ exitCode: null, signal: sig });
-    };
-  };
+  });
   const registry = new SessionRegistry({ dataDir: path.join(tmp, 'd-until'), backend, defaultShell: '/bin/bash', noUserRc: true });
   const app = new App({ registry, defaultWaitMs: 2000 });
   const waits: Array<number | undefined> = [];

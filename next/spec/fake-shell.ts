@@ -16,6 +16,9 @@ import type { TermError } from '../src/core/errors.js';
 import { Session, type RunInfo } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { prepareIntegration } from '../src/shell/integration.js';
+import { until } from './testhost.js';
+
+export { until };
 
 export interface FakeCommandResult {
   output?: string;
@@ -315,7 +318,38 @@ export class FakeShell {
   }
 }
 
-// ───────────── a scripted session harness shared by the core specs ─────────────
+// ───────────── a scripted backend of fake shells, and a scripted session harness, shared by the specs ─────────────
+
+/**
+ * The scripted PTY only records kills; a real shell ends on SIGHUP and SIGKILL, so the fake does too:
+ * at once, or on a microtask (`deferred`), as a real PTY's exit arrives after the kill returned.
+ */
+export function endOnHangup(p: ScriptedPty, deferred = false): void {
+  const kill = p.kill.bind(p);
+  p.kill = (sig) => {
+    kill(sig);
+    if (sig !== 'SIGHUP' && sig !== 'SIGKILL') return;
+    const exit = () => p.exit({ exitCode: null, signal: sig });
+    if (deferred) queueMicrotask(exit);
+    else exit();
+  };
+}
+
+/**
+ * A scripted backend whose shells are FakeShells that end on hangup; `setup` scripts each shell's
+ * commands (and may keep it). The one wiring for the specs that drive a registry, a server or the
+ * CLI over the scripted backend; `scriptedSession` below adds the usual handlers for one Session.
+ */
+export function fakeShellBackend(setup?: (shell: FakeShell, pty: ScriptedPty) => void, opts: FakeShellOptions & { exitDeferred?: boolean } = {}): ScriptedBackend {
+  const { exitDeferred, ...shellOpts } = opts;
+  const backend = new ScriptedBackend();
+  backend.onSpawnShell = (p) => {
+    const shell = new FakeShell(p, shellOpts);
+    setup?.(shell, p);
+    endOnHangup(p, exitDeferred);
+  };
+  return backend;
+}
 
 export interface Harness {
   session: Session;
@@ -379,12 +413,7 @@ export async function scriptedSession(opts: HarnessOptions = {}): Promise<Harnes
       return { exit: 0 };
     });
     opts.setup?.(shell);
-    // The scripted PTY only records kills; a SIGHUP/SIGKILL ends the fake shell.
-    const origKill = p.kill.bind(p);
-    p.kill = (sig) => {
-      origKill(sig);
-      if (sig === 'SIGHUP' || sig === 'SIGKILL') p.exit({ exitCode: null, signal: sig });
-    };
+    endOnHangup(p);
   };
   const journal = new Journal();
   const so: Parameters<typeof Session.start>[0] = {
@@ -508,15 +537,6 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
       removeDir(tmp);
     },
   };
-}
-
-/** Poll until `fn` holds (real shells answer asynchronously). */
-export async function until(fn: () => boolean, ms = 3000, what = 'condition'): Promise<void> {
-  const end = Date.now() + ms;
-  while (!fn()) {
-    if (Date.now() > end) throw new Error(`${what} not met within ${ms} ms`);
-    await new Promise((r) => setTimeout(r, 20));
-  }
 }
 
 export const hasShell = (p: string): boolean => fs.existsSync(p);

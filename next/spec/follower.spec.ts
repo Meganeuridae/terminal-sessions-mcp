@@ -8,15 +8,7 @@ import assert from 'node:assert/strict';
 import { Journal } from '../src/core/journal.js';
 import { MemoryStore } from '../src/core/stores.js';
 import { Follower, MIN_PAGE, PAGE_SIZE, type FollowerSink } from '../src/transport/follower.js';
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-async function until(pred: () => boolean, ms = 2000, what = 'condition'): Promise<void> {
-  const end = Date.now() + ms;
-  while (!pred()) {
-    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
-    await sleep(5);
-  }
-}
+import { sleep, until } from './testhost.js';
 
 function filled(journal: Journal, n: number): Journal {
   for (let i = 0; i < n; i++) journal.append({ type: 'note', text: `n${i}`, principal: 'agent:a@test' });

@@ -17,15 +17,13 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import * as net from 'node:net';
 import WebSocket from 'ws';
 import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
-import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermServer } from '../src/transport/server.js';
-import { FakeShell } from './fake-shell.js';
-import { until } from './testhost.js';
+import { fakeShellBackend, type FakeShell } from './fake-shell.js';
+import { until, unusedPort } from './testhost.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG = path.resolve(here, '../../config');
@@ -35,17 +33,6 @@ const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-config-')
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 type Msg = { id?: number; method?: string; params?: unknown; result?: Record<string, unknown>; error?: { code: number; message: string } };
-
-/** A port nothing listens on right now, for a test that must name one. */
-function unusedPort(): Promise<number> {
-  return new Promise<number>((resolve) => {
-    const srv = net.createServer();
-    srv.listen(0, '127.0.0.1', () => {
-      const p = (srv.address() as net.AddressInfo).port;
-      srv.close(() => resolve(p));
-    });
-  });
-}
 
 // launchd's environment: this PATH has no node on it.
 const BARE_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
@@ -156,19 +143,12 @@ async function host(port: number): Promise<{ request(method: string, params?: un
 }
 
 async function scriptedDaemon(): Promise<{ port: number; registry: SessionRegistry; shell(): FakeShell; close(): Promise<void> }> {
-  const backend = new ScriptedBackend();
   let shell: FakeShell | undefined;
-  backend.onSpawnShell = (p) => {
-    const sh = new FakeShell(p);
+  const backend = fakeShellBackend((sh) => {
     shell = sh;
     sh.on('echo hi', () => ({ output: 'hi\r\n', exit: 0 }));
     sh.on(/^sleep/, () => ({ hang: true }));
-    const kill = p.kill.bind(p);
-    p.kill = (sig) => {
-      kill(sig);
-      if (sig === 'SIGHUP' || sig === 'SIGKILL') p.exit({ exitCode: null, signal: sig });
-    };
-  };
+  });
   const registry = new SessionRegistry({ dataDir: fs.mkdtempSync(path.join(tmp, 'd-')), backend, defaultShell: '/bin/bash', noUserRc: true });
   const server = new TermServer({ app: new App({ registry, defaultWaitMs: 2000 }), resolver: new TokenMapResolver({ tokens: { ta: 'agent:a@x' } }), host: '127.0.0.1', port: 0 });
   const { port } = await server.listen();

@@ -13,9 +13,9 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import type { JournalEvent } from '../src/core/types.js';
 import { AGENT, HUMAN, hasShell, pgrep, realSession, reap, until } from './fake-shell.js';
+import { sleep } from './testhost.js';
 
 const FISH = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find(hasShell);
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** The leftovers an armed exec could leave in the environment of the shell it became. */
 const LEAKS = 'echo "[${TSM_MARK_KEY-}][${TSM_MARK_PID-}][${TSM_BASH_RC-}][${TSM_USER_ZDOTDIR-}][${TSM_XDG_DATA_DIRS-}]"';

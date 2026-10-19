@@ -12,6 +12,7 @@ import * as path from 'node:path';
 import * as pty from 'node-pty';
 import { inputBytes } from '../src/core/keys.js';
 import { Screen } from '../src/core/screen.js';
+import { until } from './testhost.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-keys-'));
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
@@ -44,14 +45,6 @@ def main(w):
 curses.wrapper(main)
 `;
 
-async function until(fn: () => boolean, ms = 15_000): Promise<void> {
-  const end = Date.now() + ms;
-  while (!fn()) {
-    if (Date.now() > end) throw new Error('condition not met in time');
-    await new Promise((r) => setTimeout(r, 20));
-  }
-}
-
 /** Run the reader in a real PTY, feed its output to a Screen, send `keys`, return what curses read. */
 async function readKeys(keys: string[], useMode: boolean): Promise<{ read: string; appCursor: boolean }> {
   const script = path.join(tmp, 'reader.py');
@@ -70,7 +63,7 @@ async function readKeys(keys: string[], useMode: boolean): Promise<{ read: strin
   screen.onReply((r) => p.write(r)); // G25: the screen answers the program's queries
   const exited = new Promise<void>((r) => p.onExit(() => r()));
   try {
-    await until(() => screen.snapshot().lines.some((l) => l.includes('READY')));
+    await until(() => screen.snapshot().lines.some((l) => l.includes('READY')), 15_000, 'the curses program to be ready');
     await screen.settled();
     const appCursor = screen.applicationCursorKeys;
     p.write(inputBytes(undefined, keys, { appCursor: useMode && appCursor }));

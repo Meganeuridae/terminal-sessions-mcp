@@ -15,6 +15,7 @@ import { SessionRegistry } from '../src/api/registry.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { TermServer } from '../src/transport/server.js';
+import { sleep } from './testhost.js';
 
 const { Terminal } = xterm;
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-pty-attach-'));
@@ -62,7 +63,6 @@ async function client(token: string): Promise<{ request(method: string, params: 
   };
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 test('G13 (real bash): attaching during a flood gives snapshot + exactly the later events, which rebuild the screen', async () => {
   const owner = await client('ta');

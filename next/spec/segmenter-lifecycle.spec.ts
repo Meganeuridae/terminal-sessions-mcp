@@ -27,6 +27,7 @@ import {
   type SegmentSource,
 } from '../src/core/segmenter.js';
 import type { JournalEvent, RunInfo, ScreenSnapshot } from '../src/core/types.js';
+import { sleep } from './testhost.js';
 
 const A = 'agent:a@t';
 const B = 'agent:b@t';
@@ -79,7 +80,6 @@ const collect = (seg: Segmenter) => {
   seg.subscribe((s) => out.push(s));
   return out;
 };
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const snap = (lines: string[], x: number, y: number): ScreenSnapshot => ({ cols: 80, rows: lines.length, alt: false, cursor: { x, y }, lines, title: '', seq: 1 });
 /** Catch-up over a live session: every lifecycle message after seq 0. */
 const replay = async (src: Fake) => renderPicked(liveSource(src), (await scanLifecycle(liveSource(src), 0)).picked);

@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { SessionRegistry } from '../src/api/registry.js';
 import type { JournalEvent } from '../src/core/types.js';
+import { until } from './testhost.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON = path.resolve(here, '../src/daemon.js');
@@ -33,14 +34,6 @@ function runDaemon(argv: string[], env: NodeJS.ProcessEnv = {}): { child: ChildP
   });
   const exited = new Promise<number | null>((r) => child.on('exit', (code) => r(code)));
   return { child, lines, exited };
-}
-
-async function until(pred: () => boolean, ms: number, what: string): Promise<void> {
-  const end = Date.now() + ms;
-  while (!pred()) {
-    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((r) => setTimeout(r, 20));
-  }
 }
 
 const alive = (needle: string): string[] =>

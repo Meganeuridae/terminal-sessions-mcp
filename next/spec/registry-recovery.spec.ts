@@ -14,13 +14,14 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { orphanGroups, SessionRegistry, type AnySession, type HistorySession, type LiveSession, type OrphanCandidate } from '../src/api/registry.js';
-import { ScriptedBackend } from '../src/backends/scripted.js';
+import type { ScriptedBackend } from '../src/backends/scripted.js';
 import { Journal } from '../src/core/journal.js';
 import { groupAlive, type ProcessRow } from '../src/core/lock.js';
 import type { Session } from '../src/core/session.js';
 import { FileStore } from '../src/core/stores.js';
 import type { JournalEvent, RunInfo } from '../src/core/types.js';
-import { FakeShell } from './fake-shell.js';
+import { fakeShellBackend } from './fake-shell.js';
+import { until } from './testhost.js';
 
 const A = 'agent:a@test';
 const B = 'agent:b@test';
@@ -42,17 +43,13 @@ interface Rig {
 }
 
 function rig(dir = path.join(tmp, `d${++dirs}`), extra: Partial<ConstructorParameters<typeof SessionRegistry>[0]> = {}): Rig {
-  const backend = new ScriptedBackend();
-  backend.onSpawnShell = (p) => {
-    const sh = new FakeShell(p, { marks: 'rich' });
-    sh.on(/^echo (.*)$/, (l) => ({ output: `${l.slice(5)}\r\n`, exit: 0 }));
-    sh.on(/^sleep/, () => ({ hang: true }));
-    const kill = p.kill.bind(p);
-    p.kill = (sig) => {
-      kill(sig);
-      if (sig === 'SIGHUP' || sig === 'SIGKILL') queueMicrotask(() => p.exit({ exitCode: null, signal: sig }));
-    };
-  };
+  const backend = fakeShellBackend(
+    (sh) => {
+      sh.on(/^echo (.*)$/, (l) => ({ output: `${l.slice(5)}\r\n`, exit: 0 }));
+      sh.on(/^sleep/, () => ({ hang: true }));
+    },
+    { marks: 'rich', exitDeferred: true },
+  );
   const reg = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), ...extra });
   return { dir, backend, reg };
 }
@@ -73,13 +70,6 @@ const hist = (s: AnySession | undefined): HistorySession => {
 const live = (s: AnySession | undefined): LiveSession => {
   assert.ok(s && s.kind === 'live', `expected live, got ${s?.kind}`);
   return s;
-};
-const until = async (pred: () => boolean, ms = 3000) => {
-  const end = Date.now() + ms;
-  while (!pred()) {
-    if (Date.now() > end) throw new Error('timed out');
-    await new Promise((r) => setTimeout(r, 10));
-  }
 };
 const shellExits = async (r: Rig, s: Session, code = 0) => {
   r.backend.ptys[r.backend.ptys.length - 1]!.exit({ exitCode: code });

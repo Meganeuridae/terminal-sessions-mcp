@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { Journal } from '../src/core/journal.js';
 import { liveSource, renderPicked, scanLifecycle, Segmenter, type Segment, type SegmentSource } from '../src/core/segmenter.js';
 import type { RunInfo, ScreenSnapshot } from '../src/core/types.js';
+import { sleep } from './testhost.js';
 
 function fakeSource(): SegmentSource & { runs: Map<string, RunInfo>; screen: ScreenSnapshot } {
   const journal = new Journal();
@@ -37,7 +38,6 @@ const collect = (seg: Segmenter) => {
   seg.subscribe((s) => out.push(s));
   return out;
 };
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 test('a human typing into a program is a message; a human typing a command that runs is not (the Run is)', async () => {
   const src = fakeSource();

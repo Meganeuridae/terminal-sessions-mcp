@@ -15,6 +15,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { until, unusedPort } from './testhost.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON = path.resolve(here, '../src/daemon.js');
@@ -48,14 +49,6 @@ function termd(argv: string[], opts: { env?: NodeJS.ProcessEnv; cwd?: string; st
   });
   const exited = new Promise<number | null>((r) => child.on('exit', (code) => r(code)));
   return { child, lines, exited };
-}
-
-async function until(pred: () => boolean, ms: number, what: string): Promise<void> {
-  const end = Date.now() + ms;
-  while (!pred()) {
-    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((r) => setTimeout(r, 20));
-  }
 }
 
 /**
@@ -108,16 +101,6 @@ async function stop(d: Daemon): Promise<number | null> {
 
 const listening = (d: Daemon) => d.lines.find((l) => l.includes('"listening"'));
 const urlOf = (d: Daemon) => (JSON.parse(listening(d)!) as { url: string }).url;
-
-function unusedPort(): Promise<number> {
-  return new Promise<number>((resolve) => {
-    const srv = net.createServer();
-    srv.listen(0, '127.0.0.1', () => {
-      const p = (srv.address() as net.AddressInfo).port;
-      srv.close(() => resolve(p));
-    });
-  });
-}
 
 /** One tools/call over a fresh connection. */
 async function call(url: string, name: string, args: Record<string, unknown>, token?: string): Promise<Record<string, unknown>> {

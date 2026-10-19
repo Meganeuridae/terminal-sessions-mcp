@@ -5,6 +5,7 @@
  * keeps a log of everything the server sent.
  */
 import assert from 'node:assert/strict';
+import * as net from 'node:net';
 import WebSocket from 'ws';
 
 export type Msg = { jsonrpc: '2.0'; id?: number | string; method?: string; params?: unknown; result?: unknown; error?: { code: number; message: string; data?: unknown } };
@@ -187,12 +188,26 @@ export class TestHost {
   }
 }
 
-export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// ───────────── the helpers every spec shares (defined here once; fake-shell.ts re-exports `until`) ─────────────
 
+export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Poll until `pred` holds (shells, sockets and timers answer asynchronously), or fail naming what was waited for. */
 export async function until(pred: () => boolean, ms = 3000, what = 'condition'): Promise<void> {
   const end = Date.now() + ms;
   while (!pred()) {
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
     await sleep(20);
   }
+}
+
+/** A port nothing listens on right now, for a test that must name one before it starts a server. */
+export function unusedPort(): Promise<number> {
+  return new Promise<number>((resolve) => {
+    const srv = net.createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const p = (srv.address() as net.AddressInfo).port;
+      srv.close(() => resolve(p));
+    });
+  });
 }

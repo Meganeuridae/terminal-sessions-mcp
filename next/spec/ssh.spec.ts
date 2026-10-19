@@ -6,14 +6,13 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { createServer } from 'node:net';
 import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { TermServer } from '../src/transport/server.js';
 import { AGENT, realSession, until } from './fake-shell.js';
-import { TestHost, sleep } from './testhost.js';
+import { TestHost, sleep, unusedPort } from './testhost.js';
 
 const SSH = '/usr/bin/ssh', SSHD = '/usr/sbin/sshd', KEYGEN = '/usr/bin/ssh-keygen';
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
@@ -24,13 +23,6 @@ function renderTabs(s: string): string {
     for (const ch of line) out += ch === '\t' ? ' '.repeat(8 - (out.length % 8)) : ch;
     return out;
   }).join('\n');
-}
-async function freePort(): Promise<number> {
-  const server = createServer();
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-  const port = (server.address() as { port: number }).port;
-  await new Promise<void>((r) => server.close(() => r()));
-  return port;
 }
 async function stop(child: ChildProcess | undefined): Promise<void> {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
@@ -50,7 +42,7 @@ describe('SSH workflows', { skip: process.env.SSH_REQUIRED !== '1' && ![SSH, SSH
     remote = path.join(dir, 'remote');
     fs.mkdirSync(remote);
     for (const name of ['host', 'client']) execFileSync(KEYGEN, ['-q', '-t', 'ed25519', '-N', '', '-f', path.join(dir, name)]);
-    const port = await freePort();
+    const port = await unusedPort();
     const config = path.join(dir, 'sshd.conf');
     fs.writeFileSync(config, [
       `Port ${port}`, 'ListenAddress 127.0.0.1', `HostKey ${dir}/host`, `PidFile ${dir}/pid`,
@@ -137,7 +129,7 @@ describe('SSH workflows', { skip: process.env.SSH_REQUIRED !== '1' && ![SSH, SSH
     const app = new App({ registry, segmenter: { runSettleMs: 30 } });
     const server = new TermServer({ app, resolver: new TokenMapResolver({ tokens: { test: AGENT } }), host: '127.0.0.1', port: 0, version: 'ssh-test', log: () => undefined });
     const endpoint = (await server.listen()).port;
-    const forwarded = await freePort();
+    const forwarded = await unusedPort();
     const tunnel = () => spawn(SSH, [...args, '-N', '-o', 'ExitOnForwardFailure=yes', '-L', `127.0.0.1:${forwarded}:127.0.0.1:${endpoint}`, dest], { stdio: ['ignore', 'ignore', 'pipe'] });
     let connection: ChildProcess | undefined;
     let a: TestHost | undefined, b: TestHost | undefined;

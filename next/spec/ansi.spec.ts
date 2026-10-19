@@ -9,13 +9,13 @@ import assert from 'node:assert/strict';
 import { compileLinePattern, LineSplitter, MAX_LINE, StreamMatcher, stripAnsi, type LineMatch } from '../src/core/ansi.js';
 import { LINEAR_REGEX, MIN_WINDOW, matchWindow } from '../src/core/regex.js';
 import { TermError } from '../src/core/errors.js';
+import { sleep } from './testhost.js';
 
 const matcher = (pattern: string, opts?: ConstructorParameters<typeof StreamMatcher>[1]) => new StreamMatcher(compileLinePattern(pattern), opts);
 const matches = (pattern: string, chunks: string[]) => {
   const m = matcher(pattern);
   return chunks.flatMap((c) => m.feed(c)).map((h) => h.match);
 };
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const refused = (f: () => unknown) => assert.throws(f, (e: unknown) => e instanceof TermError && e.code === 'invalid_argument');
 
 test('m2-10: anchors mean the line’s start and end, however the output was chunked', () => {

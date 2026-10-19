@@ -12,13 +12,13 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { SessionRegistry, type AnySession, type HistorySession, type LiveSession, type RegistryChange } from '../src/api/registry.js';
-import { ScriptedBackend, type ScriptedProcess } from '../src/backends/scripted.js';
+import type { ScriptedBackend, ScriptedProcess } from '../src/backends/scripted.js';
 import { TermError } from '../src/core/errors.js';
 import { FileStore } from '../src/core/stores.js';
 import { Journal } from '../src/core/journal.js';
 import type { Session } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
-import { FakeShell } from './fake-shell.js';
+import { fakeShellBackend, type FakeShell } from './fake-shell.js';
 
 const A = 'agent:a@test';
 const B = 'agent:b@test';
@@ -32,21 +32,17 @@ interface Rig {
 }
 
 function scripted(): { backend: ScriptedBackend; shells: FakeShell[] } {
-  const backend = new ScriptedBackend();
   const shells: FakeShell[] = [];
-  backend.onSpawnShell = (p) => {
-    const sh = new FakeShell(p, { marks: 'rich' });
-    sh.on(/^echo (.*)$/, (l) => ({ output: `${l.slice(5)}\r\n`, exit: 0 }));
-    sh.on(/^fail$/, () => ({ output: 'nope\r\n', exit: 3 }));
-    sh.on(/^sleep/, () => ({ hang: true }));
-    sh.on(/^big (\d+)$/, (l) => ({ output: `${'x'.repeat(Number(l.split(' ')[1]))}\r\n`, exit: 0 }));
-    const kill = p.kill.bind(p);
-    p.kill = (sig) => {
-      kill(sig);
-      if (sig === 'SIGHUP' || sig === 'SIGKILL') queueMicrotask(() => p.exit({ exitCode: null, signal: sig }));
-    };
-    shells.push(sh);
-  };
+  const backend = fakeShellBackend(
+    (sh) => {
+      sh.on(/^echo (.*)$/, (l) => ({ output: `${l.slice(5)}\r\n`, exit: 0 }));
+      sh.on(/^fail$/, () => ({ output: 'nope\r\n', exit: 3 }));
+      sh.on(/^sleep/, () => ({ hang: true }));
+      sh.on(/^big (\d+)$/, (l) => ({ output: `${'x'.repeat(Number(l.split(' ')[1]))}\r\n`, exit: 0 }));
+      shells.push(sh);
+    },
+    { marks: 'rich', exitDeferred: true },
+  );
   return { backend, shells };
 }
 

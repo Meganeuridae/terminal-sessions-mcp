@@ -16,14 +16,15 @@ import xterm from '@xterm/headless';
 import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
-import { ScriptedBackend, type ScriptedPty } from '../src/backends/scripted.js';
+import type { ScriptedBackend, ScriptedPty } from '../src/backends/scripted.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { Journal } from '../src/core/journal.js';
 import { MemoryStore } from '../src/core/stores.js';
 import { Follower } from '../src/transport/follower.js';
 import { TermServer, type LogRecord, type ServerOptions, type UsageRecord } from '../src/transport/server.js';
 import { McplLane } from '../src/transport/mcpl.js';
-import { FakeShell } from './fake-shell.js';
+import { fakeShellBackend } from './fake-shell.js';
+import { sleep, until } from './testhost.js';
 
 const { Terminal } = xterm;
 const TOKENS = { ta: 'agent:a@test', tb: 'agent:b@test', th: 'human:test:9' };
@@ -49,17 +50,10 @@ async function start(opts: Partial<ServerOptions> & { prepare?: (dataDir: string
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-transport-'));
   roots.push(dataDir);
   opts.prepare?.(dataDir);
-  const backend = new ScriptedBackend();
-  backend.onSpawnShell = (p) => {
-    const sh = new FakeShell(p);
+  const backend = fakeShellBackend((sh) => {
     sh.on('echo hello', () => ({ output: 'hello\r\n', exit: 0 }));
     sh.on(/^sleep/, () => ({ hang: true }));
-    const kill = p.kill.bind(p);
-    p.kill = (sig) => {
-      kill(sig);
-      if (sig === 'SIGHUP' || sig === 'SIGKILL') p.exit({ exitCode: null, signal: sig });
-    };
-  };
+  });
   const registry = new SessionRegistry({ dataDir, backend, defaultShell: '/bin/bash', noUserRc: true });
   const app = new App({ registry, defaultWaitMs: 2000 });
   const logs: LogRecord[] = [];
@@ -223,15 +217,6 @@ function httpGet(port: number, pathname: string, headers: Record<string, string>
       resolve({ status: Number(statusLine.split(' ')[1]), headers: h, body });
     });
   });
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-async function until(pred: () => boolean, ms = 3000, what = 'condition'): Promise<void> {
-  const end = Date.now() + ms;
-  while (!pred()) {
-    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
-    await sleep(10);
-  }
 }
 
 /** A gate a test holds: the code under test awaits `reached()`, `entered` tells the test it got there, `release()` lets it go. */
