@@ -22,8 +22,8 @@ const AF = process.env.AGENT_FRAMEWORK ?? path.resolve(import.meta.dirname, '../
 const DIST = path.resolve(import.meta.dirname, '../dist');
 if (!fs.existsSync(path.join(AF, 'dist/src/index.js'))) {
   // In CI the host is checked out and built on purpose (ACCEPTANCE_REQUIRED=1): a missing one is a failure, not a skip.
-  console.log(`${process.env.ACCEPTANCE_REQUIRED ? 'FAIL' : 'skip'}: agent-framework dist not found at ${AF} (set AGENT_FRAMEWORK)`);
-  process.exit(process.env.ACCEPTANCE_REQUIRED ? 1 : 0);
+  console.log(`${process.env.ACCEPTANCE_REQUIRED === '1' ? 'FAIL' : 'skip'}: agent-framework dist not found at ${AF} (set AGENT_FRAMEWORK)`);
+  process.exit(process.env.ACCEPTANCE_REQUIRED === '1' ? 1 : 0);
 }
 const { AgentFramework } = await import(path.join(AF, 'dist/src/index.js'));
 const { MockMembrane, createMockResponse } = await import(path.join(AF, 'dist/test/helpers/mock-membrane.js'));

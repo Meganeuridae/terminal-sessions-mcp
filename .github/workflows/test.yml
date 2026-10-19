@@ -77,8 +77,10 @@ jobs:
       - run: npm ci
       - name: Build agent-framework
         working-directory: .hosts/agent-framework
-        # Its repository ships no lockfile, so this is `npm install`, not `npm ci`.
-        run: npm install --no-audit --no-fund && npm run build
+        # Its repository ships no lockfile; the one kept beside the checks pins its dependencies for
+        # this job, so a dependency release cannot change the result. When moving the pin: `npm
+        # install` in a checkout of the new commit, then copy its package-lock.json over ours.
+        run: cp "$GITHUB_WORKSPACE/next/acceptance/agent-framework.package-lock.json" package-lock.json && npm ci --no-audit --no-fund && npm run build
       - name: Install the bridge plugin
         working-directory: .hosts/mcpl-cc-bridge/plugins/mcpl-bridge
         run: bun install --frozen-lockfile

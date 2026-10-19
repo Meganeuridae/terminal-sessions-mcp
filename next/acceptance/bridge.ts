@@ -21,8 +21,8 @@ const BRIDGE_CANDIDATES = ['../../../mcpl-cc-bridge/plugins/mcpl-bridge/src', '.
 const BRIDGE = process.env.MCPL_BRIDGE ?? BRIDGE_CANDIDATES.find((p) => fs.existsSync(path.join(p, 'mcpl-host.ts'))) ?? BRIDGE_CANDIDATES[0]!
 if (!fs.existsSync(path.join(BRIDGE, 'mcpl-host.ts'))) {
   // In CI the host is checked out on purpose (ACCEPTANCE_REQUIRED=1): a missing one is a failure, not a skip.
-  console.log(`${process.env.ACCEPTANCE_REQUIRED ? 'FAIL' : 'skip'}: mcpl-cc-bridge not found at ${BRIDGE} (set MCPL_BRIDGE)`)
-  process.exit(process.env.ACCEPTANCE_REQUIRED ? 1 : 0)
+  console.log(`${process.env.ACCEPTANCE_REQUIRED === '1' ? 'FAIL' : 'skip'}: mcpl-cc-bridge not found at ${BRIDGE} (set MCPL_BRIDGE)`)
+  process.exit(process.env.ACCEPTANCE_REQUIRED === '1' ? 1 : 0)
 }
 const { McplServerHandle } = await import(path.join(BRIDGE, 'mcpl-host.ts'))
 const { WakeGate } = await import(path.join(BRIDGE, 'wake.ts'))
