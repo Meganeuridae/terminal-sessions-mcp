@@ -769,14 +769,29 @@
     trimOut(out);
   }
 
-  /** The pane holds OUT_MAX; what the front loses is counted and said in the summary, never passed off as whole. */
+  /**
+   * The pane holds the last OUT_MAX; what the front loses is counted and said in the summary, never passed
+   * off as whole. The span that straddles the cap is shortened rather than dropped: a pipe hands the page
+   * chunks of up to 64 KiB, and dropping one whole could leave the pane nearly empty.
+   */
   function trimOut(out) {
     while (out.bytes > OUT_MAX && out.pre.firstChild) {
       const first = out.pre.firstChild;
-      const n = first.classList.contains('cut') ? 0 : first.textContent.length;
-      out.bytes -= n;
-      out.cut += n;
-      first.remove();
+      if (first.classList.contains('cut')) {
+        first.remove();
+        continue;
+      }
+      const excess = out.bytes - OUT_MAX;
+      const n = first.textContent.length;
+      if (n <= excess) {
+        out.bytes -= n;
+        out.cut += n;
+        first.remove();
+      } else {
+        first.textContent = first.textContent.slice(excess);
+        out.bytes -= excess;
+        out.cut += excess;
+      }
     }
     const parts = [`output (${out.stderr ? 'stdout + stderr' : 'stdout'})`];
     if (out.cut) parts.push(`first ${kb(out.cut)} not shown`);
