@@ -62,9 +62,7 @@ const framework = await AgentFramework.create({
   mcplServers: [{ id: 'terminal', transport: 'websocket', url: `ws://127.0.0.1:${port}/?resultText=transcript`, token: 'ta', toolPrefix: 'terminal', reconnect: true, reconnectIntervalMs: 300 }],
 });
 const traces = [];
-framework.onTrace((ev) => {
-  if (String(ev.type).startsWith('mcpl:')) traces.push(ev);
-});
+framework.onTrace((ev) => traces.push(ev));
 framework.start();
 const conn = framework.mcplServerRegistry.getServer('terminal');
 const call = async (name, args) => {
@@ -128,9 +126,16 @@ try {
     assert.ok(!open.isError, `channel_open: ${open.error}`);
   });
 
-  // The model will answer the wake with ordinary prose, as agents do.
+  // The model answers the wake the explicit way first, a channel_publish tool call that puts a note on
+  // the session's channel, and then in ordinary prose, as agents do. The tool call is what the check
+  // requires: a host that honours the channel's `speech: 'none'` (agent-framework #436) no longer routes
+  // the prose into the channel, so a note from the prose is tolerated and reported, never required
+  // (comment 6262776182, follow-up). Both texts look like a command: neither may reach the shell.
   const marker = path.join(tmp, 'SHOULD_NOT_EXIST');
-  membrane.pushResponse(createMockResponse([{ type: 'text', text: `The build finished. A sensible follow-up would be:\ntouch ${marker}` }]));
+  const TOOL_NOTE = `Noted by the scout's channel_publish call: the build finished; a follow-up would be: touch ${marker}`;
+  const PROSE = `The build finished. A sensible follow-up would be:\ntouch ${marker}`;
+  membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'note-1', name: 'channel_publish', input: { channelId: CHANNEL, content: TOOL_NOTE } }], 'tool_use'));
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: PROSE }]));
 
   let runId;
   await check('start work, receive a run id, stop waiting', async () => {
@@ -156,7 +161,7 @@ try {
     assert.equal(registry.get(SESSION).session.run(runId).state, 'running', 'the Run was in flight across the drop');
   });
 
-  await check('a useful completion notification through the host', async () => {
+  await check('a useful completion notification through the host, and the inference call it woke', async () => {
     const until = Date.now() + 8000;
     while (!context().includes('acceptance-output') && Date.now() < until) await sleep(100);
     const ctx = context();
@@ -164,6 +169,10 @@ try {
     assert.match(ctx, /acceptance-output/);
     const pushes = traces.filter((t) => t.type === 'mcpl:push_event' || t.type === 'mcpl:channels-incoming');
     assert.ok(pushes.length >= 1, 'delivered through the host lane');
+    // The wake itself, seen from the model's side and apart from any note: an inference call carrying the completion.
+    while (!membrane.calls.length && Date.now() < until) await sleep(50);
+    assert.ok(membrane.calls.length >= 1, 'an inference call followed the completion');
+    assert.ok(JSON.stringify(membrane.calls[0].messages).includes('acceptance-output'), 'the inference call carries the completion');
   });
 
   await check('recover retained output and the correct outcome by id', async () => {
@@ -181,20 +190,24 @@ try {
     assert.notEqual(s.session.currentController, 'agent:observer@test');
   });
 
-  await check("the agent's speech reached the session as a note, never typed into the shell (mcpl-1), and no inference loop", async () => {
-    // Waits for the reply itself, not a fixed time: a sleep passed while the reply never reached termd.
+  await check("the scout's channel_publish call became one note, nothing was typed into the shell (mcpl-1), and no inference loop", async () => {
+    // Waits for the note itself, not a fixed time: a sleep passed while nothing reached termd.
     const scoutNotes = (events) => events.filter((e) => e.type === 'note' && e.principal === 'agent:scout@test');
+    const byTool = (notes) => notes.filter((n) => n.text === TOOL_NOTE);
     const until = Date.now() + 8000;
-    while (!scoutNotes(journal()).length && !journal().some((e) => e.type === 'input') && Date.now() < until) await sleep(100);
+    while (!byTool(scoutNotes(journal())).length && !journal().some((e) => e.type === 'input') && Date.now() < until) await sleep(100);
+    // A note from the prose, where the host routes it, follows the tool call's closely; a further wake would too.
+    await sleep(1000);
     const events = journal();
     assert.ok(!events.some((e) => e.type === 'input'), 'no input events');
-    assert.ok(!fs.existsSync(marker), 'the prose did not execute');
+    assert.ok(!fs.existsSync(marker), 'neither text executed');
     const notes = scoutNotes(events);
+    const calls = traces.filter((t) => (t.type === 'tool:completed' || t.type === 'tool:failed') && t.tool === 'channel_publish').map((t) => `${t.type}${t.error ? ` (${t.error})` : ''}`);
     const routing = traces.filter((t) => t.type === 'mcpl:speech-routed' || t.type === 'mcpl:speech-route-failed').map((t) => `${t.type}${t.reason ? ` (${t.reason})` : ''}`);
-    assert.equal(notes.length, 1, `notes from the scout's reply: ${notes.length}; the host's routing: ${routing.join('; ') || 'nothing routed'}`);
-    assert.match(notes[0].text, /A sensible follow-up/);
-    // A note is not delivered back to its author; a further wake would follow it within this settle.
-    await sleep(1000);
+    assert.equal(byTool(notes).length, 1, `notes from the scout's channel_publish call: ${byTool(notes).length}; the host's channel_publish calls: ${calls.join('; ') || 'none'}; its routing: ${routing.join('; ') || 'nothing routed'}`);
+    const fromProse = notes.filter((n) => n.text === PROSE);
+    assert.equal(notes.length, 1 + fromProse.length, `unexpected notes from the scout: ${JSON.stringify(notes.map((n) => n.text))}`);
+    log(`   the note came by the channel_publish tool call; the plain reply ${fromProse.length ? 'was also routed into the channel by the host (tolerated)' : 'stayed with the host, not routed'}; routing traces: ${routing.join('; ') || 'none'}`);
     log('   inference calls:', membrane.calls.length);
     assert.ok(membrane.calls.length <= 2, `inference calls: ${membrane.calls.length}`);
   });
