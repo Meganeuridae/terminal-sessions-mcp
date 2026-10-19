@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased — 2.0, the rearchitecture
+
+A new implementation, built to `docs/redesign/DESIGN.md` and its guarantees (G1–G30), ships
+beside the 1.x session server, MCP bridge, GUI and CLI. It lives in `next/`; its binaries are
+`termd`, `tsm` and `tsm-shim`, and the 1.x binaries are unchanged. The package needs Node 20.
+
+### Added
+
+- **One daemon, `termd`** (port 3101): sessions as persistent login shells with an append-only
+  journal per session (memory ring plus files, explicit retention), a headless emulator for the
+  current screen, and one WebSocket endpoint speaking MCP, MCPL and a native family. `tsm` (CLI,
+  `--json` everywhere) and `tsm-shim` (stdio MCP) are thin clients; the GUI is served by `termd`.
+- **Runs with identity**: every command has a `runId` from admission; shell and process
+  targets; exit codes from shell-integration marks (bash, zsh, fish; keyed so nested shells,
+  programs and other terminals' integrations cannot spoof them) or from the process itself; a
+  command still running when `wait` ends keeps running and can be awaited; nothing invents an
+  exit status (`lost` with a reason instead).
+- **Tools**: nine core tools (`run`, `await`, `read`, `screen`, `input`, `cancel`,
+  `session_list`, `session_open`, `session_close`) with transcript text plus a structured
+  envelope; opt-in tiers for control, services with readiness and health probes, watches and
+  `wait_for`, and `search`. Idempotency keys on every mutating tool.
+- **MCPL**: sessions as channels with dual delivery, completions and service/watch events as
+  push events to the principals they concern, catch-up after reconnect, a per-turn presence
+  line, a tag ontology with suggested treatment. Verified against agent-framework's and
+  mcpl-cc-bridge's real host code (`next/acceptance/`).
+- **Sharing**: several principals per session (per-agent tokens), one controller seat,
+  provenance on every input, observers that cannot act, private and shared sessions.
+- **Measure**: every tool call recorded (names and hashes only) to `usage.jsonl`; `tsm usage`
+  reports use, errors and confusion signatures.
+- Shipped host and supervisor configurations in `next/config/`.
+
+### Changed
+
+- `terminal-sessions-mcp` is now the stdio shim; with the compat profile it serves the 1.x
+  tool names (`runCommand`, `tailLogs`, `searchLogs`, `sendInput`, `sendSignal`, `listSessions`,
+  `killSession`, `killAll`, `launch`, `takeScreenshot`) for one release, and their results also
+  say whether a command is still running. `session-server` starts `termd`.
+- Node 20 or later.
+
+### Removed
+
+- The 1.x server, GUI (socket.io, express), puppeteer screenshots (the screen is text now;
+  images return later), the old CLI and `session-gui`, and dependencies nothing imports.
+
 ## v1.7.0 - 2026-10-18
 
 ### Fixed

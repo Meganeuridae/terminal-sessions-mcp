@@ -4,6 +4,16 @@
 
 ![Web GUI Demo](docs/screenshots/web-gui-demo.gif)
 
+## Terminal sessions 2.0, beside 1.x
+
+This package also ships **2.0**, a rearchitecture built for agents: one daemon (`termd`) that
+keeps shells alive, gives every command a run id with its exact exit status and separate stderr,
+keeps a journal of everything that happened that survives restarts, and tells an MCPL host when a
+command finishes instead of being polled. It is in [`next/`](next/README.md), with its design and
+guarantees in [`docs/redesign/DESIGN.md`](docs/redesign/DESIGN.md). Its binaries are `termd`,
+`tsm` and `tsm-shim`; everything below about 1.x (`terminal-sessions-mcp`, `session-server`,
+`session-gui`, `session-cli`) is unchanged.
+
 ## Why This Matters
 
 While many AI tools offer basic command execution, Terminal Sessions MCP provides unique capabilities:
