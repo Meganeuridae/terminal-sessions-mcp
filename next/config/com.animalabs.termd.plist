@@ -8,8 +8,9 @@
      termd-launch.sh finds node (Volta, Homebrew, /usr/local, nvm's default version; or
      TSM_NODE_BIN=/path/to/node in EnvironmentVariables; TSM_NODE is the daemon's MCPL node
      name, not a path), puts those directories on PATH for process Runs, starts in $HOME,
-     and logs to ~/Library/Logs/termd/termd.log (0600). The stderr file below only catches what
-     happens before termd starts logging (a node that cannot be found). No Umask: termd creates
+     and logs to ~/Library/Logs/termd/termd.log (0600). The stderr file below catches what
+     happens before termd starts logging (a node that cannot be found) and a startup failure
+     termd says on stderr as well (a port in use, a locked data dir). No Umask: termd creates
      its own files owner-only by mode, and the sessions' shells inherit the mask, so files a
      session creates keep the usual permissions. -->
 <plist version="1.0">

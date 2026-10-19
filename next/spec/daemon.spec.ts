@@ -297,6 +297,22 @@ test('--log-file: logs go to an owner-only file of termd\'s own, not stderr', as
   assert.match(fs.readFileSync(file, 'utf8'), /"stopped"/);
 });
 
+test("--log-file: a startup failure found after the log opened is said on stderr as well, so what started termd can quote it (the house's read of the shim, #22 comment 6269349177)", async () => {
+  const port = await unusedPort();
+  const holder = net.createServer();
+  await new Promise<void>((r) => holder.listen(port, '127.0.0.1', () => r()));
+  const file = path.join(tmp, 'logs-fail', 'termd.log');
+  const d = termd(['--port', String(port), '--data-dir', path.join(tmp, 'dfail'), '--no-usage-log', '--log-file', file]);
+  try {
+    assert.equal(await d.exited, 2);
+    assert.match(d.lines.join('\n'), /cannot listen on 127\.0\.0\.1:\d+: EADDRINUSE/, 'the cause is on stderr');
+    assert.equal(d.lines.filter(Boolean).length, 1, 'and nothing else is');
+    assert.match(fs.readFileSync(file, 'utf8'), /EADDRINUSE/, 'and in the log');
+  } finally {
+    holder.close();
+  }
+});
+
 test('readiness: SIGTERM at the listening announcement drains cleanly', async () => {
   const file = path.join(tmp, 'ready.log');
   // Act as a supervisor that signals at the instant readiness becomes visible.

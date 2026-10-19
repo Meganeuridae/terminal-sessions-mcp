@@ -324,8 +324,21 @@ class OwnedProcessGroups implements ExecutionBackend {
 const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T | undefined> =>
   Promise.race([p, new Promise<undefined>((r) => setTimeout(() => r(undefined), ms).unref())]);
 
+/**
+ * A startup failure: logged, and said on stderr even once the log file has taken over, since what
+ * started this termd reads stderr — the shim quotes it, a supervisor's journal keeps it — and a port
+ * in use or a locked data dir, found after the log opens, otherwise left them only an exit code (the
+ * house's read of the shim, #22 comment 6269349177).
+ */
 function fail(message: string, code = 2): never {
   log('error', message);
+  if (logFile && !stderrGone) {
+    try {
+      process.stderr.write(JSON.stringify({ ts: new Date().toISOString(), level: 'error', msg: message }) + '\n');
+    } catch {
+      // the reader is gone; the log file has it
+    }
+  }
   process.exit(code);
 }
 
@@ -386,7 +399,8 @@ const HELP = `termd — terminal sessions daemon
   --usage-log <file>     usage records, one JSON line per tool call, except the GUI's successful read-only
                          ones (default <data-dir>/usage.jsonl)
   --no-usage-log         do not record usage
-  --log-file <file>      write logs to this file (0600, rotated by size) instead of stderr
+  --log-file <file>      write logs to this file (0600, rotated by size) instead of stderr; a startup
+                         failure is said on stderr as well
   --log-level <level>    debug|info|warn|error (default info)
   --headless             accepted for a 1.x command line; changes nothing (the GUI is at the daemon's address)
   --session-oom-score-adj <n>  Linux: sessions' processes get this oom_score_adj (default 200), so the kernel

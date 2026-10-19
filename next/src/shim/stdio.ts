@@ -22,18 +22,21 @@
  *    and tried again) and replays the host's `initialize`, its MCPL grant with
  *    the reductions since, and its open channels, so the new connection is in
  *    the state the host believes it is in. The replay follows what the daemon
- *    accepted — a request counts when its answer says so, a notification when it
- *    arrives — goes in bounded windows, its answers are swallowed, and a refusal
- *    is logged.
+ *    did with what the host sent — a request counts when its answer says it took,
+ *    a notification when it arrives, and a grant the daemon refused by failing
+ *    closed is replayed to fail closed again — goes in bounded windows, its
+ *    answers are swallowed, and a refusal is logged. What expires in the queue
+ *    is logged once per pass, by count and method.
  *  - When the URL is a plain ws:// loopback address and nothing listens, it
  *    starts termd — detached, same port, logging to <data-dir>/termd.log
  *    (rotated), its stderr kept in <data-dir>/termd.stderr.log — unless
  *    TSM_NO_SPAWN=1, the address came from a 1.x setting, or a supervisor manages
- *    a termd for that port (launchd's job on macOS, systemd's user unit on Linux;
- *    a check that does not answer counts as a supervisor). A termd started here
- *    that exits is reported with what it said, and started again when the port is
- *    refused later: soon when it had served, 30 s after a start that never
- *    answered. The daemon gets a minimal environment (HOME, USER, LOGNAME, SHELL,
+ *    a termd for that port or out of the same data dir (launchd's job on macOS,
+ *    systemd's user unit on Linux; a check that does not answer, or fails, is not
+ *    taken as "no supervisor"). A termd started here that exits is reported with
+ *    what it said (its stderr, else the end of its log), and started again when
+ *    the port is refused later: soon when it had served, 30 s after a start that
+ *    never answered. The daemon gets a minimal environment (HOME, USER, LOGNAME, SHELL,
  *    PATH, LANG/LC_*, TMPDIR, TZ, TERM) and no credential: it outlives this host
  *    and serves every other one, so neither this host's variables (API keys,
  *    CLAUDECODE, NODE_OPTIONS…) nor its TSM_TOKEN may become the daemon's (tsg-3).
@@ -57,7 +60,8 @@
  * Env (an empty value is unset, as for termd): TSM_RESULT_TEXT (json|transcript),
  * TSM_NO_SPAWN, TSM_DATA_DIR (for a spawned termd; a relative path is taken from
  * this process's working directory), TSM_CONNECT_TIMEOUT_MS (how long a request
- * may wait for a connection, default 15000; a whole number of milliseconds, empty = default).
+ * may wait for a connection, default 15000; a duration — a number of milliseconds, or
+ * 500ms, 15s, 2m, 1h — empty = default).
  */
 import { clocks, MAX_TIMER_MS } from '../core/clock.js';
 import { parseDuration, setting } from '../core/env.js';
@@ -91,7 +95,7 @@ Settings (an empty value is unset):
   TSM_TOKEN               credential, sent as ?token=
   TSM_PROFILE             core (default) | full | compat (the 1.x tool names); --profile wins
   TSM_RESULT_TEXT         json (default) | transcript: the text form of tool results
-  TSM_CONNECT_TIMEOUT_MS  how long a request may wait for a connection, default 15000 (15s, 2m also read)
+  TSM_CONNECT_TIMEOUT_MS  how long a request may wait for a connection, default 15000 (a duration: 15s, 2m, 1h also read)
   TSM_DATA_DIR            data dir of a termd started here, default ~/.tsm (relative: from the cwd)
   TSM_NO_SPAWN=1          never start termd
   1.x names, read where the TSM_* name is unset: SESSION_SERVER_URL, or SESSION_SERVER_HOST +
@@ -99,8 +103,9 @@ Settings (an empty value is unset):
 
 When nothing listens on a plain ws:// loopback TSM_URL, the shim starts termd on that port
 (detached, log <data-dir>/termd.log, stderr <data-dir>/termd.stderr.log), unless TSM_NO_SPAWN=1
-or a launchd job / systemd user unit manages a termd for that port. A termd it started that
-exits is started again when the port is refused later. A request that waits longer than
+or a launchd job / systemd user unit manages a termd for that port or out of the same data dir
+(a check that fails or does not answer also stops the start). A termd it started that exits is
+started again when the port is refused later. A request that waits longer than
 TSM_CONNECT_TIMEOUT_MS for a connection fails with a JSON-RPC error (-32000).
 `;
 if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) {
@@ -213,37 +218,74 @@ function noStartReason(): string | undefined {
   return undefined;
 }
 
-type Supervisor = { kind: 'managed'; by: string; port: string } | { kind: 'none' } | { kind: 'unknown'; why: string };
+/** A supervised termd: who manages it, the port it serves and the data dir it uses (both from the unit's text). */
+type Supervisor = { kind: 'managed'; by: string; port: string; dataDir: string } | { kind: 'none' } | { kind: 'unknown'; why: string };
 const SUPERVISOR_CHECK_MS = 1500;
 const SUPERVISOR_CACHE_MS = 30_000;
 let supervisorCache: { at: number; result: Supervisor } | undefined;
+/** The launchd job's label; its plist, when installed, is `<label>.plist` in a LaunchAgents directory. */
+const LAUNCH_AGENT = 'com.animalabs.termd';
 
-/** Run a command for its output: its stdout when it exited 0, else why not. */
-function ask(cmd: string, args: string[]): Promise<{ out: string } | 'failed' | 'timeout' | 'missing'> {
+type Asked = { out: string } | { failed: string; status: number | null } | 'timeout' | 'missing';
+
+/** Run a command for its output: its stdout when it exited 0; else why not — a nonzero exit comes with its status and the last line it said. */
+function ask(cmd: string, args: string[]): Promise<Asked> {
   return new Promise((resolve) => {
-    execFile(cmd, args, { timeout: SUPERVISOR_CHECK_MS, encoding: 'utf8', maxBuffer: 1 << 20 }, (err, stdout) => {
+    execFile(cmd, args, { timeout: SUPERVISOR_CHECK_MS, encoding: 'utf8', maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
       if (!err) return resolve({ out: stdout });
-      const e = err as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+      const e = err as NodeJS.ErrnoException & { killed?: boolean; signal?: string; code?: string | number };
       if (e.code === 'ENOENT') return resolve('missing');
       if (e.killed || e.signal) return resolve('timeout');
-      resolve('failed');
+      const status = typeof e.code === 'number' ? e.code : null;
+      // The last line: launchctl says "Bad request." first and why on the line after.
+      const said = String(stderr).split('\n').map((l) => l.trim()).filter(Boolean).pop();
+      resolve({ failed: said ? said.slice(0, 200) : `exit ${status ?? '?'}`, status });
     });
   });
 }
 
-/** The port a unit's command line gives termd (`--port N`, `--port=N`, TSM_PORT or SESSION_SERVER_PORT in its environment), else termd's default. */
+/**
+ * The port a unit's text gives termd: `--port N` (`--port=N`), else TSM_PORT, else SESSION_SERVER_PORT
+ * in its environment — the order termd reads them in, so a unit that sets both is read as termd reads
+ * it (the house's read of the shim, #22 comment 6269349177) — else termd's default.
+ */
 function unitPort(text: string): string {
-  return /--port[=\s]+(\d+)/.exec(text)?.[1] ?? /(?:TSM_PORT|SESSION_SERVER_PORT)\W+(\d+)/.exec(text)?.[1] ?? '3101';
+  return /--port[=\s]+(\d+)/.exec(text)?.[1] ?? /\bTSM_PORT\W+(\d+)/.exec(text)?.[1] ?? /\bSESSION_SERVER_PORT\W+(\d+)/.exec(text)?.[1] ?? '3101';
 }
 
 /**
- * The supervisor that manages a termd for this user, if one does, and the port it serves: launchd's
- * job on macOS, systemd's user unit on Linux. A daemon started here while the supervised one was down
- * (its restart delay, an update) took its port, left the unit failing with EADDRINUSE, and ran on
- * with nothing to restart it (the house's review of #11). The question is whether the unit runs
- * termd or will — a running unit need not be enabled, an enabled one starts at login — and a check
- * that does not answer is not taken as "no" (the house's read of 4e37a11, #22). Asked at each start
- * that is due, at most once per SUPERVISOR_CACHE_MS.
+ * The data dir a unit's termd uses: `--data-dir`, else TSM_DATA_DIR in its environment, else termd's
+ * default. The unit runs as this user from $HOME (the launcher starts there), so `~`, `$HOME` and
+ * systemd's `%h` are this home, and a relative path is taken from it.
+ */
+function unitDataDir(text: string): string {
+  const named = /--data-dir[=\s]+(\S+)/.exec(text)?.[1] ?? /\bTSM_DATA_DIR(?:\s*=>\s*|=|\s+)(\S+)/.exec(text)?.[1];
+  const home = os.homedir();
+  if (named === undefined) return path.join(home, '.tsm');
+  return path.resolve(home, named.replace(/^["']|["';]+$/g, '').replace(/^(~|\$\{?HOME\}?|%h)(?=\/|$)/, home));
+}
+
+/** Whether two paths name one directory: by what they resolve to on disk where they exist, else by their spelling. */
+function sameDir(a: string, b: string): boolean {
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  return real(a) === real(b);
+}
+
+/**
+ * The supervisor that manages a termd for this user, if one does, with the port it serves and the
+ * data dir it uses: launchd's job on macOS, systemd's user unit on Linux. A daemon started here while
+ * the supervised one was down (its restart delay, an update) took its port, left the unit failing
+ * with EADDRINUSE, and ran on with nothing to restart it (the house's review of #11). The question
+ * is whether the unit runs termd or will — a running unit need not be enabled, an enabled one starts
+ * at login — and a check that does not answer, or fails, is not taken as "no" (the house's read of
+ * 4e37a11, #22, and of the shim, #22 comment 6269349177). Asked at each start that is due, at most
+ * once per SUPERVISOR_CACHE_MS.
  */
 async function supervisedTermd(): Promise<Supervisor> {
   const now = clocks.monotonic();
@@ -255,15 +297,37 @@ async function supervisedTermd(): Promise<Supervisor> {
 
 async function checkSupervisor(): Promise<Supervisor> {
   if (process.platform === 'darwin') {
-    const r = await ask('launchctl', ['print', `gui/${process.getuid?.() ?? 0}/com.animalabs.termd`]);
+    const r = await ask('launchctl', ['print', `gui/${process.getuid?.() ?? 0}/${LAUNCH_AGENT}`]);
     if (r === 'timeout') return { kind: 'unknown', why: `launchctl print did not answer within ${SUPERVISOR_CHECK_MS} ms` };
-    if (r === 'missing' || r === 'failed') return { kind: 'none' }; // not loaded (launchctl exits 113), or no launchd to ask
-    return { kind: 'managed', by: 'the launchd job com.animalabs.termd', port: unitPort(r.out) };
+    if (r === 'missing') return { kind: 'none' }; // no launchd to ask
+    if (typeof r === 'object' && 'failed' in r) {
+      const plist = launchAgentOnDisk();
+      // 113 is launchd's answer: the job is not loaded. With its plist on disk it loads at the next
+      // login (copied there after this login, or booted out until the next), so its port is still
+      // the agent's — as a systemd unit that is enabled but inactive is.
+      if (r.status === 113) {
+        if (!plist) return { kind: 'none' };
+        const text = plistText(plist);
+        return { kind: 'managed', by: `the LaunchAgent ${LAUNCH_AGENT} (${plist}; not loaded now, loaded at login)`, port: unitPort(text), dataDir: unitDataDir(text) };
+      }
+      // Any other failure is no answer: over ssh there is no gui domain to ask (exit 112), while the
+      // agent may well be running at the console. With its plist on disk that is unknown; with none,
+      // nothing of this user's is managed (the house's read of the shim, #22 comment 6269349177).
+      if (!plist) return { kind: 'none' };
+      return { kind: 'unknown', why: `launchctl print failed (${r.failed}) and the LaunchAgent ${LAUNCH_AGENT} is on disk (${plist}), so whether it runs termd is unknown` };
+    }
+    return { kind: 'managed', by: `the launchd job ${LAUNCH_AGENT}`, port: unitPort(r.out), dataDir: unitDataDir(r.out) };
   }
   if (process.platform === 'linux') {
     const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,ExecStart,Environment']);
     if (r === 'timeout') return { kind: 'unknown', why: `systemctl --user show termd did not answer within ${SUPERVISOR_CHECK_MS} ms` };
-    if (r === 'missing' || r === 'failed') return { kind: 'none' }; // no systemd, or no user manager: nothing of this user's is managed
+    if (r === 'missing') return { kind: 'none' }; // no systemd: nothing of this user's is managed
+    // A failure is no answer: under cron or `sudo -u` the user manager runs, with its units, but systemctl
+    // cannot reach its bus without XDG_RUNTIME_DIR (the house's read of the shim, #22 comment 6269349177).
+    if (typeof r === 'object' && 'failed' in r) {
+      const bus = /bus/i.test(r.failed) ? '; the user manager is reached through XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS, which this environment lacks' : '';
+      return { kind: 'unknown', why: `systemctl --user show termd failed (${r.failed}), so whether a unit manages termd is unknown${bus}` };
+    }
     const prop = (k: string) => new RegExp(`^${k}=(.*)$`, 'm').exec(r.out)?.[1]?.trim() ?? '';
     if (prop('LoadState') !== 'loaded') return { kind: 'none' };
     // Running or about to (whether or not enabled), or enabled to start at login: the unit's. Loaded,
@@ -271,9 +335,28 @@ async function checkSupervisor(): Promise<Supervisor> {
     const running = ['active', 'activating', 'reloading', 'deactivating'].includes(prop('ActiveState'));
     const enabled = /^(enabled|static|linked|indirect|generated|transient|alias)/.test(prop('UnitFileState'));
     if (!running && !enabled) return { kind: 'none' };
-    return { kind: 'managed', by: 'the systemd user unit termd', port: unitPort(`${prop('ExecStart')} ${prop('Environment')}`) };
+    const text = `${prop('ExecStart')} ${prop('Environment')}`;
+    return { kind: 'managed', by: 'the systemd user unit termd', port: unitPort(text), dataDir: unitDataDir(text) };
   }
   return { kind: 'none' };
+}
+
+/** The LaunchAgent's plist where launchd loads it from at login: this user's LaunchAgents, else the machine's; undefined when neither has it. */
+function launchAgentOnDisk(): string | undefined {
+  for (const dir of [path.join(os.homedir(), 'Library', 'LaunchAgents'), '/Library/LaunchAgents']) {
+    const file = path.join(dir, `${LAUNCH_AGENT}.plist`);
+    if (fs.existsSync(file)) return file;
+  }
+  return undefined;
+}
+
+/** A plist's arguments and environment as a unit's text: its tags become spaces, so the unit readers apply. */
+function plistText(file: string): string {
+  try {
+    return fs.readFileSync(file, 'utf8').replace(/<[^>]*>/g, ' ');
+  } catch {
+    return '';
+  }
 }
 
 const out = (m: unknown) => process.stdout.write(JSON.stringify(m) + '\n');
@@ -334,26 +417,39 @@ const ASKED_MAX = 4096;
  * What to replay on a new connection so it is in the host's state: its `initialize`; the MCPL grant
  * (the last request-form `featureSets/update` the daemon accepted) with every reduction since —
  * notification-form updates only ever add `disabled` feature sets (MCPL §6.7), so all of them since
- * the grant fold into one set, however many there were (the house's read of 4e37a11, #22); and the
- * channels the host has open (reopened without `history`: catch-up resumes from the principal's
- * `delivered` cursor, G22). A request's effect is recorded when its answer says it took, a
- * notification's when it arrives (it is never answered, and one that waits out the queue is never
- * forwarded), so what the daemon refused and what expired are both reflected (the house's read of
- * 4e37a11, #22).
+ * the grant fold into one set, however many there were (the house's read of 4e37a11, #22); a later
+ * request-form update the daemon refused after running it, replayed after the grant — the daemon
+ * fails closed on a malformed one, to an empty grant with no tools, and only its own handling of the
+ * same request puts the new connection where the host was told the old one was (the house's read of
+ * the shim, #22 comment 6269349177); a refusal the daemon did not run (`executed: false`) changed
+ * nothing and is not kept; and the channels the host has open (reopened without `history`: catch-up
+ * resumes from the principal's `delivered` cursor, G22). A request's effect is recorded when its
+ * answer arrives, a notification's when it does (it is never answered, and one that waits out the
+ * queue is never forwarded), so what expired is reflected too (the house's read of 4e37a11, #22).
  */
-const replay: { initialize?: Parsed; initialized?: Parsed; grant?: Parsed; reduced: Map<string, number>; channels: Map<string, Parsed> } = {
+interface Grant {
+  m: Parsed;
+  seq: number;
+}
+const replay: { initialize?: Parsed; initialized?: Parsed; grant?: Grant; refusedGrant?: Grant; reduced: Map<string, number>; channels: Map<string, Parsed> } = {
   reduced: new Map(),
   channels: new Map(),
 };
 const REDUCED_MAX = 10_000;
 /** Channels closed while an open was pending, with the close's seq: a later answer to an earlier open does not reopen them. */
 const closedAt = new Map<string, number>();
+/** What was replayed under an id, for the log: `refusedBefore` when the daemon refused it on the connection before, so a refusal now is the expected answer. */
+interface Replayed {
+  method: string;
+  channel?: string;
+  refusedBefore?: true;
+}
 /** Ids of replayed requests whose answers the host must not see, with what was replayed, for the log. */
-const swallow = new Map<string, { method: string; channel?: string }>();
+const swallow = new Map<string, Replayed>();
 let replayCounter = 0;
 /** A replay in progress: sent in windows below the daemon's bound on requests in flight per connection (128), which refuses requests and drops notifications past it. */
 interface Replaying {
-  items: Array<{ m: Parsed; request: boolean; channel?: string }>;
+  items: Array<Replayed & { m: Parsed; request: boolean }>;
   next: number;
   outstanding: number;
   sock: WebSocket;
@@ -387,16 +483,33 @@ function noteNotification(m: Parsed, seq: number): void {
   } else if (m.method === 'channels/close' && isObj(m.params) && typeof m.params.channelId === 'string') closed(m.params.channelId, seq);
 }
 
-/** The daemon accepted a host request: what that changes in the host's picture (see `replay`). */
+/** The daemon answered a host request: what that changes in the host's picture (see `replay`). */
 function answered(p: Pending, m: Parsed): void {
+  if (p.method === 'featureSets/update') return grantAnswered(p, m);
   if (m.error !== undefined) return; // the host saw the refusal; its picture is as before
   if (p.method === 'initialize') replay.initialize = p.m;
-  else if (p.method === 'featureSets/update') {
-    replay.grant = p.m;
+  else if (p.method === 'channels/open') opened(p, m);
+  else if (p.method === 'channels/close' && isObj(p.m.params) && typeof p.m.params.channelId === 'string') closed(p.m.params.channelId, p.seq);
+}
+
+/**
+ * The daemon answered a request-form featureSets/update. Accepted, it is the grant. Refused after
+ * running it, it is kept to be replayed after the grant: a malformed one failed the lane closed, and
+ * the daemon's own handling of it is what fails the new connection closed too — the shim does not
+ * read the refusal to tell a fail-closed from one that left the lane as it was (the house's read of
+ * the shim, #22 comment 6269349177). Refused without running (the in-flight bound), it changed nothing.
+ */
+function grantAnswered(p: Pending, m: Parsed): void {
+  if (m.error === undefined) {
+    replay.grant = { m: p.m, seq: p.seq };
+    if (replay.refusedGrant && replay.refusedGrant.seq < p.seq) delete replay.refusedGrant;
     // Reductions before this grant are its to carry (or not); those sent after it still bind.
     for (const [n, at] of replay.reduced) if (at < p.seq) replay.reduced.delete(n);
-  } else if (p.method === 'channels/open') opened(p, m);
-  else if (p.method === 'channels/close' && isObj(p.m.params) && typeof p.m.params.channelId === 'string') closed(p.m.params.channelId, p.seq);
+    return;
+  }
+  const notRun = isObj(m.error) && isObj(m.error.data) && m.error.data.executed === false;
+  if (notRun || (replay.grant?.seq ?? -1) > p.seq || (replay.refusedGrant?.seq ?? -1) > p.seq) return;
+  replay.refusedGrant = { m: p.m, seq: p.seq };
 }
 
 /** A channels/open the daemon accepted: remember the channel (by the id the daemon gave it) until the host closes it. */
@@ -458,14 +571,35 @@ function maybeFinish(): void {
   } else exit(0);
 }
 
-/** Requests that waited too long for a connection get an error; notifications are dropped. The queue is in arrival order. */
+/**
+ * Requests that waited too long for a connection get an error; notifications, and the host's answers
+ * to the daemon's requests, are dropped. The queue is in arrival order. One line per pass says what
+ * expired, by count and method: a dropped notification has no other trace (the house's read of the
+ * shim, #22 comment 6269349177).
+ */
 function expireQueue(): void {
   const now = clocks.monotonic();
   if (!queue.length || now - queue[0]!.at < connectTimeoutMs) return;
+  const gone = { requests: 0, notifications: 0, answers: 0, other: 0 };
+  const methods = new Set<string>();
   while (queue.length && now - queue[0]!.at >= connectTimeoutMs) {
     const q = queue.shift()!;
-    if (q.id !== undefined) failRequest(q.id, `cannot reach the terminal daemon at ${target}${lastError ? ` (${lastError})` : ''}${unreachableHint()}`);
+    if (q.method !== undefined) methods.add(q.method);
+    if (q.id !== undefined) {
+      gone.requests++;
+      failRequest(q.id, `cannot reach the terminal daemon at ${target}${lastError ? ` (${lastError})` : ''}${unreachableHint()}`);
+    } else if (q.method !== undefined) gone.notifications++;
+    else if (q.m && isId(q.m.id)) gone.answers++;
+    else gone.other++;
   }
+  const parts = [
+    gone.requests ? `${gone.requests} request${gone.requests === 1 ? '' : 's'} answered with -32000` : '',
+    gone.notifications ? `${gone.notifications} notification${gone.notifications === 1 ? '' : 's'} dropped` : '',
+    gone.answers ? `${gone.answers} answer${gone.answers === 1 ? '' : 's'} to the daemon's requests dropped` : '',
+    gone.other ? `${gone.other} other line${gone.other === 1 ? '' : 's'} dropped` : '',
+  ].filter(Boolean);
+  const named = [...methods].slice(0, 8).join(', ') + (methods.size > 8 ? `, and ${methods.size - 8} more` : '');
+  log(`waited ${connectTimeoutMs} ms for a connection to ${target}: ${parts.join(', ')}${named ? ` (${named})` : ''}`);
   pruneClosed();
   if (stdinClosed && !queue.length && !inflight.size) {
     finishing = true;
@@ -538,14 +672,18 @@ function noteNotStarted(why: string): void {
   notStarted = why;
 }
 
-/** What termd wrote to its stderr from `from` on: its last lines, a JSON record's `msg` where it is one. */
-function saidOnStderr(file: string, from: number): string {
+/**
+ * What a file of termd's gained from `from` on, by its last lines; a JSON record's `msg` (and `error`)
+ * where a line is one, as termd's log and the stderr it is given are both JSON lines.
+ */
+function lastLines(file: string, from: number): string {
   try {
     const fd = fs.openSync(file, 'r');
     try {
       // The last lines, so a long stack before the exit is quoted from its end, not its start.
       const buf = Buffer.alloc(8192);
       const size = fs.fstatSync(fd).size;
+      if (size <= from) return '';
       const n = fs.readSync(fd, buf, 0, buf.length, Math.max(from, size - buf.length));
       const lines = buf
         .toString('utf8', 0, n)
@@ -580,7 +718,16 @@ async function startDaemon(): Promise<void> {
       noteNotStarted(`termd on port ${port} is ${sup.by}'s to start: none is started here (TSM_NO_SPAWN=1 says so without the check)`);
       return;
     }
-    if (sup.kind === 'managed') log(`${sup.by} serves port ${sup.port}, not ${port}: a termd for ${port} is started here`);
+    if (sup.kind === 'managed') {
+      // One termd per data dir (the lock in core/lock.ts). A termd started here with the unit's data
+      // dir would either exit at once, locked out, or take the dir while the unit's was down and leave
+      // the unit failing on every restart (the house's read of the shim, #22 comment 6269349177).
+      if (sameDir(sup.dataDir, dataDir)) {
+        noteNotStarted(`${sup.by} serves port ${sup.port} out of the data dir ${dataDir}, which a termd for port ${port} started here would use too: none is started here (one termd per data dir; give this shim another TSM_DATA_DIR, or dial port ${sup.port})`);
+        return;
+      }
+      log(`${sup.by} serves port ${sup.port} out of ${sup.dataDir}, not ${port}: a termd for ${port} is started here with ${dataDir}`);
+    }
     if (!roomToStart()) return; // another start finished while the supervisor was asked
     notStarted = undefined;
     spawnDaemon();
@@ -606,6 +753,14 @@ function spawnDaemon(): void {
   } catch (e) {
     log(`termd's stderr cannot be kept in ${stderrPath} (${(e as NodeJS.ErrnoException).code ?? (e as Error).message}); it is started without it`);
   }
+  // Where termd's log stands now: a failure after the log opens is said there (and on stderr since
+  // the house's read of the shim, #22 comment 6269349177); its end is quoted when stderr has nothing.
+  let logFrom = 0;
+  try {
+    logFrom = fs.statSync(logPath).size;
+  } catch {
+    // no log yet
+  }
   try {
     const child = spawn(process.execPath, [daemon, '--host', host, '--port', port, '--data-dir', dataDir, '--log-file', logPath], {
       detached: true,
@@ -623,7 +778,7 @@ function spawnDaemon(): void {
     // startup is reported with what it said instead of leaving only ECONNREFUSED (the house's read of 4e37a11, #22).
     child.on('exit', (code, signal) => {
       me.exit = signal ? `signal ${signal}` : `code ${code}`;
-      me.said = typeof stderrFd === 'number' ? saidOnStderr(stderrPath, stderrFrom) : '';
+      me.said = (typeof stderrFd === 'number' ? lastLines(stderrPath, stderrFrom) : '') || lastLines(logPath, logFrom);
       log(`termd (pid ${me.pid}) exited (${me.exit}) ${seconds(me.at)} s after it was started${me.reached ? '' : ', before it answered'}${me.said ? `; it said: ${me.said}` : ''}`);
     });
     child.unref();
@@ -645,11 +800,12 @@ function scheduleReconnect(): void {
 
 function replayState(sock: WebSocket): void {
   const items: Replaying['items'] = [];
-  if (replay.initialize) items.push({ m: replay.initialize, request: true });
-  if (replay.initialized) items.push({ m: replay.initialized, request: false });
-  if (replay.grant) items.push({ m: replay.grant, request: true });
-  if (replay.reduced.size) items.push({ m: { jsonrpc: '2.0', method: 'featureSets/update', params: { disabled: [...replay.reduced.keys()] } } as Parsed, request: false });
-  for (const [channel, m] of replay.channels) items.push({ m, request: true, channel });
+  if (replay.initialize) items.push({ m: replay.initialize, request: true, method: 'initialize' });
+  if (replay.initialized) items.push({ m: replay.initialized, request: false, method: 'notifications/initialized' });
+  if (replay.grant) items.push({ m: replay.grant.m, request: true, method: 'featureSets/update' });
+  if (replay.refusedGrant) items.push({ m: replay.refusedGrant.m, request: true, method: 'featureSets/update', refusedBefore: true });
+  if (replay.reduced.size) items.push({ m: { jsonrpc: '2.0', method: 'featureSets/update', params: { disabled: [...replay.reduced.keys()] } } as Parsed, request: false, method: 'featureSets/update' });
+  for (const [channel, m] of replay.channels) items.push({ m, request: true, method: 'channels/open', channel });
   replaying = { items, next: 0, outstanding: 0, sock };
   pumpReplay();
 }
@@ -659,13 +815,13 @@ function pumpReplay(): void {
   const r = replaying;
   if (!r || r.sock !== ws) return;
   while (r.next < r.items.length && r.outstanding < REPLAY_WINDOW) {
-    const it = r.items[r.next++]!;
-    if (it.request) {
+    const { m, request, ...what } = r.items[r.next++]!;
+    if (request) {
       const id = `tsm-shim:replay:${++replayCounter}`;
-      swallow.set(key(id), { method: String(it.m.method), ...(it.channel !== undefined ? { channel: it.channel } : {}) });
+      swallow.set(key(id), what);
       r.outstanding++;
-      r.sock.send(JSON.stringify({ ...it.m, id }));
-    } else r.sock.send(JSON.stringify(it.m));
+      r.sock.send(JSON.stringify({ ...m, id }));
+    } else r.sock.send(JSON.stringify(m));
   }
   if (r.next >= r.items.length && r.outstanding === 0) {
     replaying = undefined;
@@ -673,13 +829,18 @@ function pumpReplay(): void {
   }
 }
 
-/** A replayed request was answered: a refusal is said, since the host is not told (the house's read of 4e37a11, #22). */
-function replayed(what: { method: string; channel?: string }, m: Parsed): void {
+/**
+ * A replayed request was answered: a refusal is said, since the host is not told (the house's read of
+ * 4e37a11, #22) — unless the daemon refused the same request on the connection before, when the
+ * refusal is the answer that leaves the new connection where the host was told it is.
+ */
+function replayed(what: Replayed, m: Parsed): void {
   if (replaying) replaying.outstanding--;
-  if (m.error !== undefined) {
-    const e = isObj(m.error) ? `${String(m.error.code)} ${String(m.error.message)}` : JSON.stringify(m.error);
-    log(`replay of ${what.method}${what.channel ? ` for ${what.channel}` : ''} refused (${e}): the host believes otherwise and was not told`);
-  }
+  const e = m.error === undefined ? '' : isObj(m.error) ? `${String(m.error.code)} ${String(m.error.message)}` : JSON.stringify(m.error);
+  if (what.refusedBefore) {
+    if (m.error !== undefined) log(`replay of ${what.method} refused (${e}), as it was on the connection before: the new connection is where the host was told it is`);
+    else log(`replay of ${what.method} accepted, where the connection before refused it: the host was told otherwise`);
+  } else if (m.error !== undefined) log(`replay of ${what.method}${what.channel ? ` for ${what.channel}` : ''} refused (${e}): the host believes otherwise and was not told`);
   pumpReplay();
 }
 

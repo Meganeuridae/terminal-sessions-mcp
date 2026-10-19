@@ -41,11 +41,17 @@ Then connect a host (configurations in [`next/config/`](config/)):
 - **Any MCP host** (Cursor, Claude Desktop, Claude Code without the bridge):
   `next/config/mcp.json` — the stdio shim starts `termd` if nothing is listening on its (plain
   `ws://`, loopback) address, unless a termd systemd user unit or launchd job manages a termd
-  for that port (then it is the supervisor's to start, and the shim waits for it; a check that
-  does not answer counts as a supervisor) or `TSM_NO_SPAWN=1` says never to. With a supervisor
-  unit of your own name, set `TSM_NO_SPAWN=1` in the shim's configuration. A termd the shim
-  started that exits is reported on the shim's stderr with what termd said (kept in
-  `<data-dir>/termd.stderr.log`), and started again when the port is refused later.
+  for that port (then it is the supervisor's to start, and the shim waits for it) or for another
+  port out of the same data dir (`~/.tsm` for both by default; one termd per data dir, so give
+  the shim its own `TSM_DATA_DIR` or dial the unit's port), or `TSM_NO_SPAWN=1` says never to.
+  A check that does not answer, or fails (under cron or `sudo -u`, `systemctl --user` cannot
+  reach the user manager without `XDG_RUNTIME_DIR`; over ssh, `launchctl` has no GUI domain to
+  ask while the LaunchAgent is on disk), starts nothing either: the shim says so and names
+  `TSM_NO_SPAWN=1`. With a supervisor unit of your own name, set `TSM_NO_SPAWN=1` in the shim's
+  configuration. A termd the shim started that exits is reported on the shim's stderr with what
+  termd said (its stderr, kept in `<data-dir>/termd.stderr.log`, where termd also says a startup
+  failure found after its log opened; else the end of its log), and started again when the port
+  is refused later.
 
 ## What an agent gets
 
