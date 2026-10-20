@@ -302,20 +302,28 @@ doesn't mean the command has started. Send refused input again in a moment. To
 interrupt a command, use `sendSignal` with SIGINT, its default, or send the
 `C-c` key alone (empty text, `keys: ["C-c"]`); neither is refused. When either
 gives up a body that a shell which can't read the temp file is partway through
-reading, the server follows the Ctrl-C with Ctrl-U and Enter, which drop what
-the shell had read of the body's line. The server takes the shell to be reading
-while the latest marker it printed isn't a command's start marker and no other
-input has been sent since. A body whose lines are all typed may be running, and
-gets the Ctrl-C alone. So does a body partway typed in after a command's start
-marker, since that command reads the terminal and may have read the body's
-first line, and after other input sent with `sendInput`, which may have started
-a command, until a marker other than a start marker comes. This is the one case
-in which `sendInput` writes more than its `input`, `keys` and `appendNewline`
-ask for. When it happens, the call's result says so: the MCP tools' results
-carry a `note`, and the session server's answer `clearedHeldLine: true`. The MCP
-tools report the answer to their last attempt: if the connection is lost after
-a call went in, they send it again, and the result doesn't report a Ctrl-U and
-Enter that the first attempt wrote.
+reading, while that shell is at its prompt and the body's line is the last the
+server typed, the server writes no Ctrl-C: the shell is reading only the
+server's own typing, which giving the body up stops, and a Ctrl-C reaching it
+partway through one of the body's lines can leave the shell holding part of that
+line. That line goes in whole, since each of a body's lines but its last only
+stores part of the body, and input and the next command wait until the shell has
+read it, as they wait between a body's lines; a Ctrl-C sent meanwhile isn't
+written either. Like the refusal, the wait ends after two seconds in which the
+server has typed no line and read no marker, and a Ctrl-C sent after that is
+written, since the line may have gone to something other than the shell. The
+server takes the shell to be at its prompt while the latest marker it printed
+isn't a command's start marker, unless other input has been sent since and no
+marker has come for a line the server typed after it. A shell that exits without
+a marker, as when an ssh connection drops, goes unseen, so a Ctrl-C sent within
+two seconds of the server's last line or marker may not be written, though a
+program run after ssh on the same command line may be reading: send it again two
+seconds later. A body whose lines are all typed may be running, and gets the
+Ctrl-C, as does a body partway typed in when the server has typed another
+command's line after the body's, since that line may run its command. So does a
+body partway typed in after a command's start marker, since that command reads
+the terminal and may have read the body's first line, and after other input sent
+with `sendInput`, which may have started a command.
 
 ### Log Operations
 - **tailLogs** - Get recent logs from a session

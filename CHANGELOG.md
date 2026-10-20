@@ -13,6 +13,45 @@
   left it, since on a pipe they can still be queued. A client that never
   reads them keeps it running until it sends a signal or closes its end.
   An answer to a call still running then is not sent.
+- **A lone Ctrl-C that gives up a body a shell is partway through reading
+  is no longer written, so the command sent next goes in whole.** 1.7.1
+  followed such a Ctrl-C with Ctrl-U and Enter, to drop what readline had
+  kept of the body's line. But readline puts the terminal back in
+  canonical mode while it handles the signal, and a Ctrl-U the terminal
+  takes in then is its own kill character, which readline never reads. The
+  Enter then handed bash the part readline had kept, and bash, which acts
+  on the interrupt only after taking that line's first character, parsed
+  the rest of it as the next command, which could leave it inside an open
+  quote that took in the command sent next. Now, when a lone Ctrl-C
+  (`sendSignal`'s SIGINT, the `C-c` key alone, or a terminal's Ctrl+C
+  keystroke) gives up a body that a shell which can't read the temp file
+  is partway through reading, while that shell is at its prompt and the
+  body's line is the last the server typed, the server writes nothing: the
+  shell is reading only the server's own typing, which giving the body up
+  stops. That line goes in whole, since it only stores part of the body,
+  and input and the next command wait until the shell has read it, as they
+  wait between a body's lines. A Ctrl-C sent in that wait isn't written
+  either. The wait ends after two seconds with no line typed and no marker
+  read, and a Ctrl-C after that is written, since the line may have gone
+  to something other than the shell. A Ctrl-C is still written when it
+  finds a body's lines all typed, since that body may be running, when the
+  server has typed another command's line after the body's, and after a
+  command's start marker, or after other input sent with `sendInput` until
+  a marker comes for a line the server typed after that input. A shell
+  that exits partway through a body without a marker, as when an ssh
+  connection drops, goes unseen: a Ctrl-C sent within two seconds of the
+  server's last line or marker isn't written, though a program run after
+  ssh may be reading. The next command's probe line, held while a body
+  goes in, is now typed once two seconds pass with no line typed and no
+  marker read, on the clock the refusal of input keeps. Its two seconds
+  used to run from when it was held or from the body's latest line, and a
+  marker didn't count. `sendInput`'s and `sendSignal`'s results no longer
+  carry 1.7.1's `note`, nor the session server's answers
+  `clearedHeldLine`. On Linux with bash 5.2, with bash's handling of the
+  signal slowed by 20 ms under strace, a Ctrl-U and Enter that reached the
+  shell 8 ms after the Ctrl-C left it in 3 of 10 runs at its continuation
+  prompt or with a syntax error, and in none of 10 when they came in the
+  Ctrl-C's own write or after the handling.
 
 ## v1.7.1 - 2026-10-19
 

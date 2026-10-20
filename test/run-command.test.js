@@ -134,39 +134,3 @@ test('two calls that lose one connection together both get through on one fresh 
     await new Promise((r)=>wss.close(r));
   }
 });
-
-test('sendInput and sendSignal add a note when the session server says Ctrl+U and Enter followed the Ctrl+C, and none otherwise',async()=>{
-  const calls=[
-    ['sendInput',m=>m.sendInput({session:'s',input:'',keys:['C-c']})],
-    ['sendSignal',m=>m.sendSignal({session:'s'})],
-  ];
-  for(const [method,call] of calls){
-    for(const [answer,note] of [
-      [{success:true,clearedHeldLine:true},/^Ctrl\+U and Enter followed the Ctrl\+C, to clear what the shell had read/],
-      [{success:true,clearedHeldLine:false},undefined],
-      [{success:true},undefined], // a session server from before the note, whose answer has no clearedHeldLine
-    ]){
-      const m=wrapper({[method]:async()=>answer});
-      const result=await call(m);
-      assert.equal(result.success,true,`${method}: succeeds`);
-      if(note){assert.match(result.note,note,`${method}: says the Ctrl+U and Enter followed`);assert.deepEqual(Object.keys(result).sort(),['note','success'],method);}
-      else assert.deepEqual(result,{success:true},`${method}: no note for ${JSON.stringify(answer)}`);
-    }
-  }
-});
-
-test('a call sent again after a lost connection reports the second attempt alone, so a Ctrl+U and Enter the first attempt wrote go unreported',async()=>{
-  for(const [method,call] of [
-    ['sendInput',m=>m.sendInput({session:'s',input:'',keys:['C-c']})],
-    ['sendSignal',m=>m.sendSignal({session:'s'})],
-  ]){
-    for(const second of [false,true]){
-      let attempts=0;
-      // The first attempt went in, and its answer was lost with the connection, as RobustSessionClient reports it.
-      const m=wrapper({[method]:async()=>{if(attempts++===0)throw new Error('Connection lost');return {success:true,clearedHeldLine:second};}});
-      const result=await call(m);
-      assert.equal(attempts,2,`${method}: sent again`);
-      assert.equal('note' in result,second,`${method}: the result is the second attempt's (${second})`);
-    }
-  }
-});
