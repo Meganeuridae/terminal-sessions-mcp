@@ -187,8 +187,13 @@ const TOOLS = {
   }
 };
 
+// Set once stdin has closed: no answer is written after that (see the close
+// handler at the end of this file).
+let closing = false;
+
 // Send response
 function sendResponse(id: string | number, result?: any, error?: any) {
+  if (closing) return;
   const response = {
     jsonrpc: '2.0',
     id,
@@ -357,17 +362,18 @@ if (process.env.MCP_DEBUG) {
 // Keep process alive
 process.stdin.resume();
 
-// Handle graceful shutdown
-process.on('SIGINT', () => {
-  if (mcp) {
-    // Close WebSocket connection if it exists
-    process.exit(0);
-  }
-});
-
-process.on('SIGTERM', () => {
-  if (mcp) {
-    // Close WebSocket connection if it exists
-    process.exit(0);
-  }
+// Exit on SIGINT or SIGTERM, and when the client closes stdin (MCP's stdio
+// shutdown), whether or not a tool call has opened the session server
+// connection. Installing a signal listener removes Node's default exit for
+// that signal, so the handler must exit in every state; and once a tool call
+// has opened the WebSocket, a closed stdin alone would not end the process.
+const shutdown = () => process.exit(0);
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+// On a closed stdin, write no more answers, and exit once those already
+// written have left: writes to a pipe are asynchronous on POSIX, and
+// process.exit() drops any still queued. A signal still exits at once.
+rl.on('close', () => {
+  closing = true;
+  process.stdout.write('', shutdown);
 });

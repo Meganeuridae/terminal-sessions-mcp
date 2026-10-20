@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **The stdio MCP server ends when its client ends it, before a tool call
+  or after one.** It ignored SIGINT and SIGTERM until a tool call had
+  opened its connection to the session server, and once one had, closing
+  its stdin didn't end it, since that connection kept the process alive.
+  It now exits at once on either signal. When stdin closes, it writes no
+  more answers, and it exits only once those it has already written have
+  left it, since on a pipe they can still be queued. A client that never
+  reads them keeps it running until it sends a signal or closes its end.
+  An answer to a call still running then is not sent.
+
 ## v1.7.1 - 2026-10-19
 
 ### Fixed
