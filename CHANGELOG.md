@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.7.2 - 2026-10-20
 
 ### Fixed
 
@@ -19,8 +19,9 @@
   kept of the body's line. But readline puts the terminal back in
   canonical mode while it handles the signal, and a Ctrl-U the terminal
   takes in then is its own kill character, which readline never reads. The
-  Enter then handed bash the part readline had kept, and bash, which acts
-  on the interrupt only after taking that line's first character, parsed
+  Enter then handed bash the part readline had kept, and bash, which by our
+  reading of its source acts on the interrupt only after taking that
+  line's first character, parsed
   the rest of it as the next command, which could leave it inside an open
   quote that took in the command sent next. Now, when a lone Ctrl-C
   (`sendSignal`'s SIGINT, the `C-c` key alone, or a terminal's Ctrl+C
