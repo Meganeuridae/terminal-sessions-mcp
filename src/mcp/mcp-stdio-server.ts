@@ -9,6 +9,18 @@
 import * as readline from 'readline';
 import { ConnectomeTestingMCP } from './mcp-server';
 
+// MCP revisions this server answers in. On initialize it replies with the
+// revision the client asked for when it is one of these, and with the latest
+// otherwise (MCP lifecycle: version negotiation). Replying with the latest
+// regardless turns away clients that speak only an earlier revision.
+const SUPPORTED_PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
+
+function negotiateProtocolVersion(requested: unknown): string {
+  return typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
+    ? requested
+    : SUPPORTED_PROTOCOL_VERSIONS[0];
+}
+
 // Create readline interface for stdio communication
 const rl = readline.createInterface({
   input: process.stdin,
@@ -234,7 +246,7 @@ rl.on('line', async (line) => {
     switch (method) {
       case 'initialize':
         sendResponse(id, {
-          protocolVersion: '2025-06-18',
+          protocolVersion: negotiateProtocolVersion(params?.protocolVersion),
           capabilities: {
             tools: {}
           },
