@@ -483,6 +483,11 @@ test('a trace a shell writes past the typed line’s redirect is named by the Ru
   const spaced = '/Users/x/Application Support/tsm/s1/tsm-cmd-1';
   const quoted = `${sourceLine(spaced, 'posix', N)}\r\n>> command . '${spaced}'\r\n${mark}>>> printf abc\r\nabc>> printf '%s:%s>>>\\n' '<<<EXIT:${N}' 0\r\n${end}`;
   assert.equal(cutPlumbing(quoted, marker), '>>> printf abc\r\nabc', 'the prefix of a trace that quotes the path');
+  // A path with an apostrophe, quoted as bash quotes it (`'\''`): the quoted branch took no apostrophe, so the prefix went
+  // unread and the last `abc` with it (a reviewer's read of the fixes for #22, by run in bash 5.2.37).
+  const apostrophe = "/home/o'brien/.local/state/tsm/s1/tsm-cmd-1";
+  const quotedApostrophe = `${sourceLine(apostrophe, 'posix', N)}\r\n>> command . '/home/o'\\''brien/.local/state/tsm/s1/tsm-cmd-1'\r\n${mark}>>> printf abc\r\nabc>> printf '%s:%s>>>\\n' '<<<EXIT:${N}' 0\r\n${end}`;
+  assert.equal(cutPlumbing(quotedApostrophe, marker), '>>> printf abc\r\nabc', 'the prefix of a trace that quotes a path with an apostrophe');
   assert.equal(cutPlumbing(`${echo}${mark}on\r\n[t] printf %s:%s>>>\\n <<<EXIT:${N} 0\r\n${end}`, marker), 'on\r\n', 'a PS4 of the body’s own, in dash’s shape');
   const probe = `^C\r\n$ ${markerProbe(N, 'fish').trimStart()}\r\n> printf '%s>>>\\\\n' '<<<PROBE:${N}'\r\n<<<PROBE:${N}>>>\r\n$ `;
   assert.equal(cutPlumbing(`${echo}${mark}out\r\n${probe}`, marker), 'out\r\n^C\r\n', 'the probe’s trace before its answer');

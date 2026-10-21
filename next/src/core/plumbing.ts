@@ -230,9 +230,11 @@ const MARKER_RESTS = [...new Set(MARKER_LINES.map((line) => line.split(AT_NONCE)
  * fish's `> source …`); group 1 is the trace's prefix, PS4 as the shell expanded it, with whatever the
  * line held before it (see tracePrefix). The trace quotes the path only where it holds a character the
  * shell would (a space, in a session's own directory under a data dir with one), where the typed line,
- * and so its echo, always does.
+ * and so its echo, always does; an apostrophe in it is quoted as `'\''`, as shellQuote writes it (a data
+ * dir with one left the prefix unread, and the cutter took an unterminated last line with the trace: a
+ * reviewer's read of the fixes for #22, by run in bash 5.2.37).
  */
-const RUN_TRACE = new RegExp(`(?:^|\\n)([^\\n]*?)(?:command \\.|\\.|source) (?:/[^\\s']*|'/[^'\\n]*)/${literal(COMMAND_FILE)}\\d+'?\\r?(?=\\n|$)`);
+const RUN_TRACE = new RegExp(`(?:^|\\n)([^\\n]*?)(?:command \\.|\\.|source) (?:/[^\\s']*|'/(?:[^'\\n]|'\\\\'')*)/${literal(COMMAND_FILE)}\\d+'?\\r?(?=\\n|$)`);
 /** A command file's path as a source line quotes it: any directory, then the file's name. */
 const QUOTED_FILE = `'(?:[^'\\n]|'\\\\'')*/${literal(COMMAND_FILE)}\\d+'`;
 /**
