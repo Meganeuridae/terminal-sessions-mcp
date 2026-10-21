@@ -503,7 +503,7 @@ test('a refused reservation, a refused extension of a used-up one and a refused 
   c.close();
 });
 
-test('an epoch whose first write is refused is retried at most once a second as appends land, and the store says so once (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 6)', (t) => {
+test('an epoch whose first write is refused is retried at most once a second as appends land, and the store says so once, then says at info when it is written after all, by its retry or by a reservation (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 6)', (t) => {
   const dir = tmpDir();
   let mono = 0;
   t.mock.method(clocks, 'monotonic', () => mono);
@@ -519,23 +519,44 @@ test('an epoch whose first write is refused is retried at most once a second as 
   }) as typeof fs.openSync;
   syncBuiltinESMExports();
   try {
-    const warnings: string[] = [];
-    const store = new FileStore(dir, { log: (_level, text) => void warnings.push(text) });
+    const logged: [string, string][] = [];
+    const log = (level: 'warn' | 'info', text: string) => void logged.push([level, text]);
+    const said = (level: string) => logged.filter(([l]) => l === level).map(([, text]) => text);
+    const warnings = said.bind(null, 'warn');
+    const store = new FileStore(path.join(dir, 'a'), { log });
     const ev = (seq: number) => ({ ...out(`x${seq}`), seq, ts: Date.now() }) as JournalEvent;
     for (let seq = 1; seq <= 200; seq++) store.append(ev(seq));
     assert.equal(store.lastSeq(), 200, 'the appends went through');
     assert.equal(attempts, 1, '200 appends within a second: the epoch was tried once, at open');
-    assert.equal(warnings.length, 1, JSON.stringify(warnings));
-    assert.match(warnings[0]!, /journal\.meta\.json\) could not be written: ENOSPC.*retried at most once a second.*new epoch/);
+    assert.equal(warnings().length, 1, JSON.stringify(logged));
+    assert.match(warnings()[0]!, /journal\.meta\.json\) could not be written: ENOSPC.*retried at most once a second.*new epoch/);
     mono += 1000;
     store.append(ev(201));
     assert.equal(attempts, 2, 'a second later: tried again');
-    assert.equal(warnings.length, 1, 'said once');
+    assert.equal(warnings().length, 1, 'said once');
+    assert.deepEqual(said('info'), [], 'not written yet');
     refuse = false;
     mono += 1000;
     store.append(ev(202));
     store.close();
-    assert.equal(new FileStore(dir).epoch(), store.epoch(), 'the epoch landed');
+    assert.equal(new FileStore(path.join(dir, 'a')).epoch(), store.epoch(), 'the epoch landed');
+    assert.equal(said('info').length, 1, JSON.stringify(logged));
+    assert.match(said('info')[0]!, /journal\.meta\.json\) is written now: this journal keeps its epoch/);
+    // Under a journal the epoch lands with its first reservation that the disk takes, and that is said too.
+    logged.length = 0;
+    refuse = true;
+    const jstore = new FileStore(path.join(dir, 'b'), { log });
+    const j = new Journal({ cold: jstore });
+    j.append(out('first'));
+    assert.equal(warnings().length, 1, 'the refused epoch is said');
+    refuse = false;
+    mono += 1000;
+    j.append(out('a second later'));
+    assert.ok(jstore.highWater()?.reservation, 'the reservation is written');
+    assert.equal(said('info').length, 1, JSON.stringify(logged));
+    j.close();
+    assert.equal(new FileStore(path.join(dir, 'b')).epoch(), j.epoch, 'and with it the epoch');
+    assert.equal(said('info').length, 1, 'said once');
   } finally {
     fsc.openSync = realOpen;
     syncBuiltinESMExports();

@@ -370,9 +370,9 @@ export interface FileStoreOptions {
   /**
    * Where the store says that its metadata could not be written, or is written but its directory could
    * not be synced: each once per store, and a store is one session's (the house's read of the 33
-   * commits, PR #22, comment 6307349700, item 10).
+   * commits, PR #22, comment 6307349700, item 10). At 'info', once a refused epoch is written after all.
    */
-  log?: ((level: 'warn', text: string) => void) | undefined;
+  log?: ((level: 'warn' | 'info', text: string) => void) | undefined;
   /**
    * Rotated files whose newest event is older than this are dropped (G21). Default: no limit.
    * Age applies per file: the active file is rotated once its oldest event is past the
@@ -602,6 +602,16 @@ export class FileStore implements JournalStore {
     return this.meta.epoch;
   }
 
+  /**
+   * The file holds the epoch now: by its own retry as appends land, or by any metadata write, which a
+   * journal's reservation makes before its first event. After a refusal that was said, its landing is
+   * said too, at 'info': the epoch is kept, so a restart no longer gives the journal a new one.
+   */
+  private epochWritten(): void {
+    if (this.metaPending && this.refusedWarned) this.log?.('info', `the journal's metadata (${META}) is written now: this journal keeps its epoch across a restart`);
+    this.metaPending = false;
+  }
+
   highWater(): HighWater | undefined {
     const m = this.meta;
     if (m.highWater === undefined && m.reserved === undefined) return undefined;
@@ -630,7 +640,7 @@ export class FileStore implements JournalStore {
     // to keep, and a refused reservation is never written later as if its seqs had been issued.
     const w = this.writeMeta(meta);
     if (w === 'failed') return false;
-    this.metaPending = false; // the file holds this epoch now, whatever becomes of the mark
+    this.epochWritten(); // the file holds this epoch now, whatever becomes of the mark
     // The file holds the new marks but its directory could not be synced, so a machine crash may bring the
     // old file back. For a lower reservation, or a flag cleared, that is done: the crash can only restore
     // the older, higher one, which is safe. For a raise (a higher floor or reservation, or a reservation
@@ -877,8 +887,8 @@ export class FileStore implements JournalStore {
     seg.last = event.seq;
     seg.lastTs = event.ts;
     if (this.metaPending && clocks.monotonic() >= this.metaRetryAt) {
-      this.metaPending = this.writeMeta(this.meta, true) === 'failed';
-      if (this.metaPending) this.metaRetryAt = clocks.monotonic() + 1000;
+      if (this.writeMeta(this.meta, true) === 'failed') this.metaRetryAt = clocks.monotonic() + 1000;
+      else this.epochWritten();
     }
   }
 
