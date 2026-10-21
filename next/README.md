@@ -235,7 +235,10 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   Runs; a group it cannot tell from a stranger's that reused the id is left running, with a note
   in the session's history. With no process listing (no `/proc`, no `ps`) it ends none and says
   so, in each of those Runs' histories and once in the log; a later recovery that can list
-  processes judges those groups.
+  processes judges those groups, and likewise a group it signalled that no listing answered for
+  after the signal. Until then, a session past its retention that holds such a group is kept,
+  neither aged nor removed. A group that survives SIGKILL (a process in uninterruptible sleep,
+  or one running as another user) is recorded as such and not signalled again.
 - **Supervision.** `next/config/com.animalabs.termd.plist` (launchd), `next/config/termd.service`
   (systemd). SIGTERM ends sessions cleanly.
 - **History on disk.** Kept whole by default; `--retention-bytes` and `--retention-days` cap it

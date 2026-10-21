@@ -711,7 +711,11 @@ export class SessionRegistry {
       const strayed = untied.get(g);
       // A group no listing answered for after its signal is not known to have ended: the Run stays a
       // candidate, as with no listing at all, so a later recovery that can list processes judges the group
-      // (the house's read of the 33 commits, PR #22, comment 6307350477, item 1).
+      // (the house's read of the 33 commits, PR #22, comment 6307350477, item 1). A group that survived
+      // SIGKILL is judged: a listing tied it to the Run, and what outlives the SIGKILL is a member the kernel
+      // cannot end yet (uninterruptible sleep, which the pending SIGKILL ends when it wakes) or one the daemon
+      // may not signal (another user's, as a command sudo runs as root is). A later recovery could send
+      // nothing more, only spend its grace on it at every restart; the end and the log say it survived.
       const outcome: GroupOutcome = survivors.has(g)
         ? { text: `process group ${g} survived SIGKILL`, left: false }
         : sent === 'SIGTERM'
