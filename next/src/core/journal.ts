@@ -180,8 +180,9 @@ export class Journal {
    * journal recorded, so a Run's reads know of a hole recorded after its end (see RunIndex.gapsWithin).
    */
   private index(): void {
-    if (this.cold?.scan) {
-      this.cold.scan(['"type":"run.', '"type":"gap"'], (ev) => this.runs.feed(ev), (h) => this.runs.absorbHeader(h));
+    const scan = this.cold?.scan?.bind(this.cold);
+    if (scan) {
+      this.runs.scanStore({ scan }); // the one place the scan's patterns live
       return;
     }
     for (const ev of (this.cold ?? this.hot).read()) this.runs.feed(ev);

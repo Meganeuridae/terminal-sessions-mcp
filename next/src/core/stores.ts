@@ -471,7 +471,12 @@ function sizeOf(file: string): number {
  * An in-memory index of each file's first and last seq lets a range read open
  * only the files that overlap it, bisect within the first by byte offset, and
  * stop at its end; a tail read walks the newest file backwards. Opening a store
- * reads only the head and tail of each file.
+ * reads only the head and tail of each file, and changes no content: a torn tail
+ * is cut, and a new epoch written, by the store's first write, so an open the
+ * caller refuses after looking at the store leaves it as it was (an independent
+ * read of the fix for the house's read of the 33 commits, PR #22, comment
+ * 6307349700). It does make an older build's files owner-only (G26), and drops a
+ * rotated file that holds nothing.
  */
 export class FileStore implements JournalStore {
   readonly kind = 'file';
@@ -499,7 +504,8 @@ export class FileStore implements JournalStore {
    */
   private onDisk: StoreMeta | undefined;
   /**
-   * The epoch's first write was refused (a disk refusing writes): retried as appends land, at most once
+   * The epoch is not on disk yet. A new one is written by the store's first write, an append or a
+   * metadata write, never by the open. A refused write is retried as appends land, at most once
    * a second on the monotonic clock (`metaRetryAt`), and said once. Retried after every append, 200
    * appends made 201 attempts and said nothing (the house's read of the 33 commits, PR #22, comment
    * 6307349700, item 6). Only a refused write: one the file holds while its directory could not be
@@ -566,10 +572,9 @@ export class FileStore implements JournalStore {
     } catch {
       // absent (a new journal, or one an older build wrote) or damaged: a new epoch
     }
-    const meta: StoreMeta = { v: 1, epoch: newEpoch() };
-    this.metaPending = this.writeMeta(meta, true) === 'failed';
-    if (this.metaPending) this.metaRetryAt = clocks.monotonic() + 1000;
-    return meta;
+    // Written by the store's first write, not here: an open writes nothing (see the class).
+    this.metaPending = true;
+    return { v: 1, epoch: newEpoch() };
   }
 
   /**
@@ -681,6 +686,8 @@ export class FileStore implements JournalStore {
   private rotateAged(now: number): void {
     const act = this.segments[this.segments.length - 1];
     if (!act || act.n !== 0 || act.last === undefined || act.firstTs === undefined || act.firstTs >= now - this.maxAgeMs) return;
+    if (this.dirty) this.repair(); // never rotate a fragment out with the file: rotated files are not cut
+    if (this.dirty) return;
     try {
       this.rotate();
     } catch {
@@ -765,7 +772,7 @@ export class FileStore implements JournalStore {
       // unreadable files read as empty below
     }
     let bytes = sizeOf(file);
-    if (n === 0 && bytes > 0) bytes = this.cutTornTail(file, bytes, true);
+    if (n === 0 && bytes > 0) bytes = this.tornAt(file, bytes);
     const seg: Segment = { file, n, bytes };
     if (bytes > 0) this.index(seg);
     return seg;
@@ -789,15 +796,29 @@ export class FileStore implements JournalStore {
   }
 
   /**
+   * At open, read only: where the active file's last complete line ends, when a crash (or a failed
+   * write) cut the line after it short, and whether that line was an event (`takeTornTail`). The
+   * store reads no further than that; the fragment is cut by its first write (`dirty`), so an open
+   * the caller then refuses leaves the file as it found it (an independent read of the fix for the
+   * house's read of the 33 commits, PR #22, comment 6307349700). Returns the size to read up to.
+   */
+  private tornAt(file: string, bytes: number): number {
+    const cut = this.cutTornTail(file, bytes, true);
+    if (cut !== bytes) this.dirty = true;
+    return cut;
+  }
+
+  /**
    * A file whose last byte is not a newline ends in a line a crash (or a failed
    * write) cut short. Truncate it to the last complete line so the next append
    * starts on a clean line instead of being swallowed into the fragment (jr-9).
-   * Returns the new size.
+   * Returns the new size. `atOpen`: only find the cut, and whether an event was
+   * cut, without truncating (see tornAt).
    */
   private cutTornTail(file: string, bytes: number, atOpen: boolean): number {
     let fd: number;
     try {
-      fd = fs.openSync(file, 'r+');
+      fd = fs.openSync(file, atOpen ? 'r' : 'r+');
     } catch {
       this.dirty = true; // cannot look now: check again before the next write
       return bytes;
@@ -825,6 +846,7 @@ export class FileStore implements JournalStore {
         // A torn rotation header lost no event — torn even within its first bytes (the house's read
         // of b047b92); anything else was the event after the last complete line.
         this.tornEvent = !HEADER_PREFIX.startsWith(head.toString('utf8'));
+        return cut;
       }
       fs.ftruncateSync(fd, cut);
       return cut;

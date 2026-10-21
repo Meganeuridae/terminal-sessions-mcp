@@ -12,6 +12,8 @@ import * as os from 'node:os';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { clocks } from '../src/core/clock.js';
+import { SessionRegistry } from '../src/api/registry.js';
+import { ScriptedBackend } from '../src/backends/scripted.js';
 import { HIGH_WATER_BLOCK, Journal } from '../src/core/journal.js';
 import { boots } from '../src/core/lock.js';
 import { cannotSyncDir, FileStore, MemoryStore, writeDurably, type JournalStore } from '../src/core/stores.js';
@@ -527,7 +529,7 @@ test('an epoch whose first write is refused is retried at most once a second as 
     const ev = (seq: number) => ({ ...out(`x${seq}`), seq, ts: Date.now() }) as JournalEvent;
     for (let seq = 1; seq <= 200; seq++) store.append(ev(seq));
     assert.equal(store.lastSeq(), 200, 'the appends went through');
-    assert.equal(attempts, 1, '200 appends within a second: the epoch was tried once, at open');
+    assert.equal(attempts, 1, '200 appends within a second: the epoch was tried once, at the first append');
     assert.equal(warnings().length, 1, JSON.stringify(logged));
     assert.match(warnings()[0]!, /journal\.meta\.json\) could not be written: ENOSPC.*retried at most once a second.*new epoch/);
     mono += 1000;
@@ -656,7 +658,7 @@ test('appends are never synced: a journal syncs one reservation write per block 
     for (let i = 0; i < n; i++) j.append(out(`e${i}`));
     const journalIno = String(fs.statSync(path.join(dir, 'a', 'journal.jsonl')).ino);
     assert.equal(synced.filter((ino) => ino === journalIno).length, 0, 'no append was synced');
-    assert.equal(synced.length, 1 + 3, `the epoch, then one reservation per block begun: ${n} events`);
+    assert.equal(synced.length, 3, `one reservation per block begun, the new epoch written with the first: ${n} events`);
     assert.equal(store.highWater()?.reservation?.to, 3 * HIGH_WATER_BLOCK);
     j.close();
     // The reservation's write refused: the journal goes on issuing and storing, and tries again a second later.
@@ -745,5 +747,55 @@ test('a sealed journal whose store heals at a retry goes back to a reservation a
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** A store as a crash leaves it under an older build: three events, the fourth cut short, and no metadata file. */
+function tornEpochless(dir: string): string {
+  const j = new Journal({ cold: new FileStore(dir) });
+  for (let i = 0; i < 3; i++) j.append(out(`e${i}`));
+  j.close();
+  fs.rmSync(path.join(dir, 'journal.meta.json'));
+  fs.appendFileSync(path.join(dir, 'journal.jsonl'), '{"type":"output","stream":"pty","data":"cut sh');
+  return fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8');
+}
+/** Every file under `dir` with its content: what an open must leave as it found it. */
+const snapshot = (dir: string) => Object.fromEntries(fs.readdirSync(dir).sort().map((n) => [n, fs.readFileSync(path.join(dir, n), 'utf8')]));
+
+test('opening a file store changes no content: a torn tail is cut, and a new epoch written, by its first write (an independent read of the fix for the house\'s read of the 33 commits, PR #22, comment 6307349700)', () => {
+  const dir = tmpDir();
+  try {
+    const before = tornEpochless(dir);
+    const store = new FileStore(dir);
+    assert.equal(fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8'), before, 'the fragment is still there');
+    assert.equal(fs.existsSync(path.join(dir, 'journal.meta.json')), false, 'no epoch written');
+    assert.deepEqual(seqs(store.read()), [1, 2, 3], 'reads stop at the last complete line');
+    assert.equal(store.lastSeq(), 3);
+    // A journal over it records the torn event: its first write, which cuts the fragment and writes the epoch.
+    const j = new Journal({ cold: store });
+    assert.deepEqual(gaps(j.since(0).events), [[4, 4, 'torn-write']]);
+    assert.deepEqual(seqs(onDisk(dir)), [1, 2, 3, 5], 'the fragment is gone: the gap for the torn event 4 is the next whole line');
+    assert.ok(lines(path.join(dir, 'journal.jsonl')).every((l) => JSON.parse(l)), 'every line whole');
+    assert.equal(new FileStore(dir).epoch(), j.epoch, 'the epoch is on disk');
+    j.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a refused open of another principal\'s torn, epoch-less journal leaves its files byte for byte as they were (an independent read of the fix for the house\'s read of the 33 commits, PR #22, comment 6307349700)', async () => {
+  const dataDir = tmpDir();
+  try {
+    const reg = new SessionRegistry({ dataDir, backend: new ScriptedBackend(), lock: false });
+    // Written after the registry started, so its recovery never surfaced it: the open goes the fallback way.
+    const sdir = path.join(dataDir, 'sessions', 'w');
+    tornEpochless(sdir);
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: 'agent:a@test', visibility: 'private' }), { mode: 0o600 });
+    const before = snapshot(sdir);
+    await assert.rejects(reg.ensure({ id: 'w', owner: 'agent:b@test' }), (e: Error & { code?: string }) => e.code === 'forbidden');
+    assert.deepEqual(snapshot(sdir), before, 'nothing cut, nothing written');
+    await reg.closeAll();
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
