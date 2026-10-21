@@ -588,6 +588,29 @@ test('a reviewer’s read: the logs drop the line that runs a command file for e
   }
 });
 
+test('the 33 commits 4, an independent read of its fix: the logs’ probe filter costs the same however many Runs’ nonces the text holds', async () => {
+  // A pattern listing every nonce a reader knew, rebuilt per call, took searchLogs 1.9 s on 200 short lines with 300 nonces and
+  // 39 s with 3,000. Here 200 lines hold a `<` and 3,000 marks of other Runs, and the reads stay quick.
+  const h = await markerHarness();
+  try {
+    const { journal } = await hungMarkerRun(h, 'manynonces');
+    const hex = (i: number) => (0x10000000 + i * 7919).toString(16).slice(-8);
+    let k = 0;
+    const line = (i: number) => `match-me ${i} <tag> a < b ${Array.from({ length: 15 }, () => `<<<EXIT:${hex(k++)}:0>>>`).join(' ')}`;
+    journal.append({ type: 'output', data: `${Array.from({ length: 200 }, (_, i) => line(i)).join('\r\n')}\r\n`, stream: 'pty' });
+    const t = performance.now();
+    const found = (await h.call('searchLogs', { session: 'manynonces', pattern: 'match-me' })) as unknown as unknown[];
+    const tail = lines(await h.call('tailLogs', { session: 'manynonces', lines: 200 }));
+    const ms = performance.now() - t;
+    assert.ok(found.length >= 100, `${found.length} matches`);
+    assert.equal(tail.filter((l) => l.startsWith('match-me')).length, 200);
+    // Seconds on the old filter; tens of milliseconds now, and the bound leaves room for a loaded machine.
+    assert.ok(ms < 1500, `${Math.round(ms)} ms`);
+  } finally {
+    await h.close();
+  }
+});
+
 test('the 33 commits 4: a probe line whose nonce a redraw broke over two lines leaves neither line in the logs, for a Run’s recorded nonce and for one a mark in the text carries', async () => {
   // The house's read of the 33 commits (#22, comment 6307351104): with no nonce the probe filter matched `<<<PRO''BE:a1b2` and
   // stopped at the break, so the next line, `c3d4:%s:%s>>>\n' "$$" "${__tsm_r-}"`, stayed in compat's logs.

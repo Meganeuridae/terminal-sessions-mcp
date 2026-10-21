@@ -11,7 +11,7 @@
 import { clocks } from '../core/clock.js';
 import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
-import { ackMark, exitMark, goneMark, inlineTypedLine, nonceOf, noncesIn, probeEcho, probeMark, shellQuote, sourceLineEcho, startMark } from '../core/plumbing.js';
+import { ackMark, exitMark, goneMark, inlineTypedLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLineEcho, startMark } from '../core/plumbing.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
 import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
 import { commitReadDelivery, takeReadCommit, type App, type ReadResult, type SessionSummary } from './app.js';
@@ -165,20 +165,19 @@ function withoutPlumbing(line: string, p: Plumbing): string | null {
 }
 
 const START = startMark();
+/** Any Run's probe line echo, built once (matchAll copies it, so its lastIndex is never shared). */
+const PROBE_ECHO = probeEcho();
 
 /**
  * The lines a probe line's echo spans, by index in `lines`: found by the cutter's own matcher
- * (plumbing.ts probeEcho), a redraw's breaks included, and struck whole as cutPlumbing strikes them,
- * whatever nonce the typed line carries, as any typed line is the daemon's. A break inside the nonce
- * is matched for the nonces known here, the Runs' recorded ones and those of the marks in the text
- * (with no nonce the match stopped at the break, and the next line stayed: the house's read of the 33
- * commits, #22, comment 6307351104). A prompt the shell printed on that line goes with it.
+ * (plumbing.ts probeEcho), a redraw's breaks included, a break inside the nonce among them, and
+ * struck whole as cutPlumbing strikes them, whatever nonce the typed line carries, as any typed line
+ * is the daemon's. A prompt the shell printed on that line goes with it.
  */
-function probeLines(lines: string[], p: Plumbing): Set<number> {
+function probeLines(lines: string[]): Set<number> {
   const struck = new Set<number>();
   const text = lines.join('\n');
   if (!text.includes('<')) return struck;
-  const nonces = [...new Set([...p.nonces, ...noncesIn(text)])];
   const starts: number[] = [];
   let at = 0;
   for (const l of lines) {
@@ -195,7 +194,7 @@ function probeLines(lines: string[], p: Plumbing): Set<number> {
     }
     return lo;
   };
-  for (const m of text.matchAll(probeEcho(nonces))) for (let i = lineAt(m.index); i <= lineAt(m.index + m[0].length - 1); i++) struck.add(i);
+  for (const m of text.matchAll(PROBE_ECHO)) for (let i = lineAt(m.index); i <= lineAt(m.index + m[0].length - 1); i++) struck.add(i);
   return struck;
 }
 
@@ -208,7 +207,7 @@ function probeLines(lines: string[], p: Plumbing): Set<number> {
  */
 function keptLines(lines: string[], p: Plumbing): Array<[string, number]> {
   const kept: Array<[string, number]> = [];
-  const probes = probeLines(lines, p);
+  const probes = probeLines(lines);
   let markEnd = -1;
   lines.forEach((l, i) => {
     if (i === markEnd || probes.has(i)) return;

@@ -178,21 +178,30 @@ for (const line of [markerProbe(AT_NONCE), inlineProbe(AT_NONCE, false), inlineP
   PROBE_LINES.set(head, [...(PROBE_LINES.get(head) ?? []), after]);
 }
 /**
- * The echo of a probe line typed after a ^C, split, through the end of the typed line when it is
- * there; with no nonce, any Run's. The rests that share a head are alternatives after it, so a line
- * that is not the first's still matches whole (one branch per line would stop sh's at the nonce of
- * fish's line). Global: a reader strikes every line each match spans, as cutPlumbing does, and the
- * compat pack's logs use it so they cut the same echo. Given several nonces (the Runs a reader of
- * the session's text knows), the echo of any of them, a redraw's break inside the nonce included,
- * and any other Run's unbroken: with no nonce the match stopped at a break inside the nonce, and the
- * line after it stayed in compat's logs (the house's read of the 33 commits, #22, comment 6307351104).
+ * A Run's nonce as the session makes it, eight hex digits (randomBytes(4)), as a redraw may show it:
+ * whitespace between any two digits, and a digit written again after a break (a line editor writes the
+ * margin character again after a carriage return). Taken only where the rest of the typed line follows
+ * (its `:` or `>`), so a line of hex printed after an echo is not taken in with it.
  */
-export const probeEcho = (nonce: string | readonly string[] = NONCE): RegExp => {
-  const nonces = typeof nonce === 'string' ? redrawn(nonce) : `(?:${[...nonce.map(redrawn), NONCE].join('|')})`;
-  return new RegExp([...PROBE_LINES].map(([head, rests]) => `${redrawn(head)}\\s*${nonces}(?:\\s*(?:${rests.map(redrawn).join('|')}))?`).join('|'), 'g');
-};
-/** The nonces of the marks `text` holds, whoever printed them. */
-export const noncesIn = (text: string): Set<string> => new Set([...text.matchAll(new RegExp(MARK_NONCE.source, 'g'))].map((m) => m[1]!));
+const BROKEN_NONCE = '[0-9a-f](?:\\s*[0-9a-f]){7,8}(?=\\s*[:>])';
+/** The probe lines' echo for a nonce pattern: each head, the nonce, then any of the rests that follow it. */
+const probeEchoSource = (nonce: string): string =>
+  [...PROBE_LINES].map(([head, rests]) => `${redrawn(head)}\\s*${nonce}(?:\\s*(?:${rests.map(redrawn).join('|')}))?`).join('|');
+/** Any Run's: a nonce a redraw broke, or any unbroken one. Built once (see probeEcho). */
+const PROBE_ECHO_ANY = probeEchoSource(`(?:${BROKEN_NONCE}|${NONCE})`);
+/**
+ * The echo of a probe line typed after a ^C, split, through the end of the typed line when it is
+ * there. The rests that share a head are alternatives after it, so a line that is not the first's
+ * still matches whole (one branch per line would stop sh's at the nonce of fish's line). With a
+ * nonce, that Run's, as it may be redrawn; without, any Run's, a redraw's break inside the nonce
+ * included: the unbroken nonce's class stopped at the break, and the line after it stayed in compat's
+ * logs (the house's read of the 33 commits, #22, comment 6307351104). Matching any nonce by its class
+ * keeps the pattern one size whatever the reader knows, built once: a pattern listing every nonce a
+ * reader of the session's text knew, rebuilt per call, took compat's searchLogs seconds on a few
+ * hundred lines (an independent read of that fix). Global: a reader strikes every line each match
+ * spans, as cutPlumbing does, and the compat pack's logs use it so they cut the same echo.
+ */
+export const probeEcho = (nonce?: string): RegExp => new RegExp(nonce === undefined ? PROBE_ECHO_ANY : probeEchoSource(redrawn(nonce)), 'g');
 /** A probe answer with its nonce (1), pid (2) and token (3). */
 const probeAnswer = (nonce: string): RegExp => new RegExp(`<<<PROBE:(${nonce})(?::(\\d+)(?::(${NONCE}|))?)?>>>`, 'g');
 
@@ -350,7 +359,7 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   // line of it: a redraw can break the typed line, its nonce included, over two lines, and striking
   // only the line where it began kept the rest (the house's read of the 38 commits, #22, comment
   // 6274773484). A probe nothing answered leaves only its echo, and what was printed after it stays.
-  for (const m of rest.matchAll(probeEcho(nonce))) if (m.index < to) struck.push([lineOf(m.index)[0], lineOf(m.index + m[0].length - 1)[1]]);
+  for (const m of rest.matchAll(probeEcho(of.nonce))) if (m.index < to) struck.push([lineOf(m.index)[0], lineOf(m.index + m[0].length - 1)[1]]);
   const kept: Array<[number, number]> = [];
   let pos = 0;
   for (const [s, e] of struck.sort((a, b) => a[0] - b[0])) {
