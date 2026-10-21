@@ -1384,3 +1384,11 @@ test('a removal the disk refuses leaves the name with a working cursor book: a l
   await r.reg.closeAll();
 });
 
+test('a Run the session does not hold, still open at a close that gives a reason, ends with that reason', async () => {
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'y', owner: A })).session;
+  s.journal.append({ type: 'run.admit', runId: 'unheld', target: 'process', line: 'unheld', principal: A, origin: 'self', queued: false });
+  await r.reg.closeAll({ reason: 'daemon-shutdown' });
+  const ends = onDisk(path.join(r.dir, 'sessions', 'y')).filter((e): e is Extract<JournalEvent, { type: 'run.end' }> => e.type === 'run.end');
+  assert.deepEqual(ends.map((e) => [e.runId, e.reason]), [['unheld', 'daemon-shutdown']]);
+});

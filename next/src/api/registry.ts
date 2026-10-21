@@ -1324,7 +1324,8 @@ export class SessionRegistry {
       const now = Date.now();
       for (const r of journal.runs.open()) {
         const durationMs = live.session.runDurationMs(r.runId) ?? Math.max(0, now - (r.startedAt ?? r.admittedAt));
-        journal.append({ type: 'run.end', runId: r.runId, state: 'lost', reason: 'session-closed', durationMs });
+        // With the close's own reason when it gave one (daemon-shutdown, replaced), as the session ends its own.
+        journal.append({ type: 'run.end', runId: r.runId, state: 'lost', reason: o.reason ?? 'session-closed', durationMs });
       }
       journal.seal();
       slot.cursors.merge(live.session.cursorsSnapshot());
