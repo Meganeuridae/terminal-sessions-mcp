@@ -343,9 +343,10 @@ interface Slot {
   view: LiveEntry | HistoryEntry;
   /**
    * Recovery left a Run's process group unjudged (no process listing answered): the name's history, and
-   * with it the Run's record of its group, is neither aged nor removed by `expire` — in this life or a new
-   * one — until the next recovery, which judges it when it can list processes (the house's read of the
-   * 33 commits, PR #22, comment 6307350477, item 3).
+   * with it the Run's record of its group, is neither aged nor removed by `expire`, and its store takes no
+   * retention, in this life or a new one and when its record is repaired, until the next recovery, which
+   * judges it when it can list processes (the house's read of the 33 commits, PR #22, comment 6307350477,
+   * item 3).
    */
   awaitsJudgement?: true;
 }
@@ -870,7 +871,9 @@ export class SessionRegistry {
     // record was unreadable, and it is applied to the store too — not only reported — so the history is
     // kept under what the record says (the house's read of the 36 commits, #22, comment 6269992150).
     const retention = this.retentionFor(undefined, meta.retention);
-    slot.store.setRetention(retention);
+    // Not while recovery owes the name a judgement: pruned now, the files that name its Runs' process groups
+    // would be gone before the recovery that can list processes reads them (see awaitsJudgement).
+    if (!slot.awaitsJudgement) slot.store.setRetention(retention);
     slot.view = new HistoryEntry(slot.id, v.journal, meta.owner ?? SYSTEM, meta.visibility ?? 'private', meta.closedAt !== undefined, retention, recordedOptions(meta, retention), slot.cursors);
     this.opts.log?.('info', 'session record reads again; its owner may start a new life for the session', { session: slot.id, owner: slot.view.owner });
   }
@@ -1046,7 +1049,9 @@ export class SessionRegistry {
         this.opts.log?.('warn', `history is live but its record could not be written: ${we instanceof Error ? we.message : String(we)}`, { session: id });
       }
     }
-    store.setRetention(retention);
+    // A name recovery owes a judgement keeps every file in this life too (see awaitsJudgement): its store
+    // takes the retention, age and bytes alike, from the recovery that judges its groups.
+    if (!prev?.awaitsJudgement) store.setRetention(retention);
     this.slots.set(id, { id, dir, store, meta, cursors, view: new LiveEntry(session, () => integ?.cleanup(), retention, options), ...(prev?.awaitsJudgement && { awaitsJudgement: true as const }) });
     this.emit({ type: 'created', id });
     return session;

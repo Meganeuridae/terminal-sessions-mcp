@@ -734,6 +734,54 @@ test('jr2-4/G21: a session past its age whose Runs\' groups no listing judged is
   }
 });
 
+test('jr2-4/G21: an unjudged session keeps every file through a new life its owner starts, and through its record being repaired, until a recovery that can list processes judges its groups (the house\'s read of the 40 commits, PR #22)', { timeout: 20_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const kids = detachedKids();
+  try {
+    // Two real leaderless groups, each a Run's in a session past its age of a second, with enough output after the
+    // Run's start that its run.start sits in a rotated file, which the record's retention would drop.
+    const T = Date.now() - 60_000;
+    const make = async (id: string, record: string) => {
+      const sdir = path.join(dir, 'sessions', id);
+      const g = kids.spawn('/bin/sh', ['-c', 'sleep 420 & exit 0']);
+      await kids.exited(g);
+      let ts = T;
+      const j = new Journal({ cold: new FileStore(sdir, { maxFileBytes: 4096 }), sessionId: id, now: () => ts });
+      journalProcess(j, `r1-${id}`, g);
+      ts = T + 5000;
+      for (let i = 0; i < 120; i++) j.append({ type: 'output', data: `line ${i} ${'x'.repeat(80)}\r\n`, stream: 'pty', runId: `r1-${id}`, attribution: 'temporal' });
+      j.close();
+      fs.writeFileSync(path.join(sdir, 'session.json'), record, { mode: 0o600 });
+      return { sdir, g };
+    };
+    const valid = JSON.stringify({ owner: A, visibility: 'private', retention: { maxAgeMs: 1000 } });
+    const reopened = await make('reopened', valid);
+    const repaired = await make('repaired', '{ not a record');
+    const files = (sdir: string) => fs.readdirSync(sdir).filter((n) => /^journal(\.\d+)?\.jsonl$/.test(n)).length;
+    const holdsStart = (sdir: string) => fs.readdirSync(sdir).some((n) => /^journal(\.\d+)?\.jsonl$/.test(n) && fs.readFileSync(path.join(sdir, n), 'utf8').includes('"type":"run.start"'));
+    const counts = [files(reopened.sdir), files(repaired.sdir)];
+    assert.ok(counts.every((n) => n > 1), `the run.start is in a rotated file (${counts})`);
+    const r = rig(dir, { terminateOrphans: true, listProcesses: () => undefined });
+    // The owner starts a new life; the other name's record is repaired and read again.
+    await r.reg.ensure({ id: 'reopened', owner: A });
+    fs.writeFileSync(path.join(repaired.sdir, 'session.json'), valid, { mode: 0o600 });
+    assert.equal(hist(r.reg.rereadIfRefused('repaired')).owner, A, 'the repaired record reads');
+    [reopened, repaired].forEach(({ sdir }, i) => {
+      assert.ok(holdsStart(sdir) && files(sdir) >= counts[i]!, `${sdir}: the files that name the group stay (${files(sdir)} of ${counts[i]})`);
+    });
+    await r.reg.closeAll();
+    // The next recovery can list processes: it judges both groups by the Runs' records and ends them.
+    const member = (g: number): ProcessRow => ({ pid: g + 100_000, pgid: g, startMs: T + 1000, zombie: false });
+    const r2 = rig(dir, { terminateOrphans: true, listProcesses: () => [member(reopened.g), member(repaired.g)] });
+    assert.equal(hist(r2.reg.get('reopened')).run('r1-reopened').groupJudged, true);
+    assert.equal(hist(r2.reg.get('repaired')).run('r1-repaired').groupJudged, true);
+    await until(() => !groupAlive(reopened.g) && !groupAlive(repaired.g), 3000, 'both groups to be ended');
+    await r2.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
 test('jr2-4: a group a working listing shows gone is judged — no note — so a later restart that finds a stranger in its pgid writes nothing and warns of nothing (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 4)', { timeout: 10_000 }, async () => {
   const dir = path.join(tmp, `d${++dirs}`);
   const sdir = path.join(dir, 'sessions', 'gj');
