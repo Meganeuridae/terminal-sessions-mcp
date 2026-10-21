@@ -60,11 +60,13 @@ export type EventInput =
    * the last line, or a power loss took the lines the disk had not yet written, G10), `store-error` (the ring dropped events the disk had refused), `store-failed` (the disk still
    * refused them when the journal sealed, or the daemon died first); their seqs are never reissued (G10).
    * `exact`: every seq of the range was issued, so it counts the events lost (what the ring dropped, the life
-   * before this one's unwritten events, a torn line's one), with one exception: a jump a start finds in the files
-   * after a stop while the disk refused is counted as issued, though it can hold a hole an earlier start opened
-   * above a reservation, whose gap the ring dropped too (Journal's constructor). Absent, the count is a bound: a
-   * reservation the journal numbered above may have skipped seqs never issued, and a gap an earlier build wrote says nothing
-   * (the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374, question 4).
+   * before this one's unwritten events, a torn line's one, a jump a start finds in the files after a stop while the
+   * disk refused). A jump is a bound when the failed mark says a hole whose count is a bound was among the
+   * unrecorded (Reservation.failedBound), since it can hold a hole an earlier start opened above a reservation,
+   * whose gap the ring dropped too; under an earlier build's failed mark, which says nothing of it, a jump is still
+   * counted as issued. Absent, the count is a bound: a reservation the journal numbered above may have skipped seqs
+   * never issued, and a gap an earlier build wrote says nothing (the house's review of the 40 commits through
+   * f3750e4, PR #22, comment 6310921374, question 4, and of 4f4c067..a8b6f28, comment 6323055715, question 5).
    */
   | { type: 'gap'; from: Seq; to: Seq; reason: 'retention' | 'keeper-overflow' | 'torn-write' | 'store-error' | 'store-failed'; exact?: true }
   | { type: 'recovered'; class: 'continuous' | 'reattached' | 'history-only' }

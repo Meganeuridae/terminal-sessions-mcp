@@ -13,7 +13,7 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { clocks } from '../src/core/clock.js';
 import { SessionRegistry } from '../src/api/registry.js';
-import { readJournal } from '../src/api/reader.js';
+import { gapNote, readJournal } from '../src/api/reader.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { HIGH_WATER_BLOCK, Journal } from '../src/core/journal.js';
 import { boots } from '../src/core/lock.js';
@@ -670,6 +670,75 @@ test('writeDurably tells "written, directory not synced" (a real EIO after the r
     assert.equal(w.synced, false, 'the directory could not be synced');
     assert.equal(w.error?.code, 'EIO');
     assert.equal(fs.readFileSync(file, 'utf8'), 'second', 'but the file holds the new content: it was written');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed mark says when a hole whose count is a bound is among the unrecorded, and a start after a stop records the jumps under it as bounds; an earlier build\'s mark, which says nothing of it, reads as before', () => {
+  // A start opened a hole above a reservation 10,000 seqs ahead while the disk refused, the ring dropped its gap, and a
+  // catch-up wrote what followed: the next start found one jump holding that hole and the stretch after it, and said
+  // "10017 journal events missing" where at most 17 were issued (the house's review of 4f4c067..a8b6f28, PR #22,
+  // comment 6323055715, question 5).
+  const dir = tmpDir();
+  try {
+    const live = path.join(dir, 'live');
+    const first = new Journal({ cold: new FileStore(live) });
+    for (let i = 0; i < 10; i++) first.append(out(`before ${i}`));
+    first.close();
+    const metaFile = (d: string) => path.join(d, 'journal.meta.json');
+    const meta = JSON.parse(fs.readFileSync(metaFile(live), 'utf8')) as Record<string, unknown>;
+    // A stop while the disk refused left a failed mark a block ahead of the files' last seq.
+    fs.writeFileSync(metaFile(live), JSON.stringify({ ...meta, reserved: 10 + HIGH_WATER_BLOCK, failed: true, failedFrom: 11 }) + '\n');
+    let budget = 0;
+    class Budgeted extends FileStore {
+      override append(event: JournalEvent): void {
+        if (budget-- <= 0) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+        super.append(event);
+      }
+    }
+    const cold = new Budgeted(live);
+    const j = new Journal({ hot: new MemoryStore(600), cold });
+    const opening = j.since(10).events.find((e) => e.type === 'gap')!;
+    assert.ok(opening.type === 'gap' && opening.exact === undefined, 'the start\'s hole above the reservation is a bound');
+    for (let i = 0; i < 20; i++) j.append(out(`ring ${i} ${'z'.repeat(40)}`)); // the ring drops the start's gap, unwritten
+    assert.ok(j.since(0).events.every((e) => e.seq !== opening.seq || e.type !== 'gap' || e.to >= e.seq), 'its gap event is gone from the ring');
+    assert.equal(cold.highWater()?.reservation?.failedBound, true, 'the failed mark says a bound hole is among the unrecorded');
+    budget = 2;
+    assert.equal(j.retryCold(), false, 'a catch-up writes two, then is refused; the daemon dies');
+    const holesAt = (d: string) => {
+      const k = new Journal({ cold: new FileStore(d) });
+      const holes = k.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap' && e.from === 11);
+      k.close();
+      return holes.map((g) => [g.from, g.to, g.reason, g.exact]);
+    };
+    // An earlier build's failed mark, the same but for the flag.
+    const older = path.join(dir, 'older');
+    fs.cpSync(live, older, { recursive: true });
+    const m = JSON.parse(fs.readFileSync(metaFile(older), 'utf8')) as Record<string, unknown>;
+    delete m.failedBound;
+    fs.writeFileSync(metaFile(older), JSON.stringify(m) + '\n');
+    const [bound] = holesAt(live);
+    assert.ok(bound && (bound[1] as number) > 10 + HIGH_WATER_BLOCK && bound[2] === 'store-error', JSON.stringify(bound));
+    assert.equal(bound![3], undefined, 'the jump holding the bound hole is a bound');
+    assert.match(gapNote({ from: bound![0] as number, to: bound![1] as number, reason: 'store-error' }), /^\[… up to \d+ journal events missing/);
+    assert.deepEqual(holesAt(older), [[bound![0], bound![1], 'store-error', true]], 'without the flag the jump is counted exactly, as before');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed mark\'s failedBound is read back, goes with the failed flag, and setting it is a raise a directory that cannot be synced refuses', () => {
+  const dir = tmpDir();
+  try {
+    const store = new FileStore(dir);
+    assert.equal(store.setHighWater({ reservation: { to: 80, failed: true, failedFrom: 5 } }), true);
+    assert.equal(withDirFsyncEIO(() => store.setHighWater({ reservation: { to: 80, failed: true, failedFrom: 5, failedBound: true } })), false, 'newly bound: the old file would count the hole as issued');
+    assert.deepEqual(store.highWater()?.reservation, { to: 80, failed: true, failedFrom: 5 }, 'memory keeps the old mark');
+    assert.equal(store.setHighWater({ reservation: { to: 80, failed: true, failedFrom: 5, failedBound: true } }), true);
+    assert.deepEqual(new FileStore(dir).highWater()?.reservation, { to: 80, failed: true, failedFrom: 5, failedBound: true }, 'read back after a restart');
+    assert.equal(withDirFsyncEIO(() => store.setHighWater({ reservation: { to: 80 } })), true, 'clearing the mark is a lowering');
+    assert.deepEqual(new FileStore(dir).highWater()?.reservation, { to: 80 }, 'and the flag goes with it');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

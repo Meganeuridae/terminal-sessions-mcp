@@ -193,6 +193,8 @@ export class Journal {
   private reservedFailed = false;
   /** With `reservedFailed`: the confirmed reservation's `failedFrom`, where a start after a stop looks for jumps from. */
   private reservedFrom = Number.POSITIVE_INFINITY;
+  /** With `reservedFailed`: the confirmed reservation says a hole whose count is a bound is among the unrecorded (`failedBound`). */
+  private reservedBound = false;
   /**
    * A failed mark may be on disk: the reservation this journal opened over, or one it wrote or tried to write since
    * its last clear landed. A clear waits for the appends' sync then (writeReservation). `reservedFailed` knows only
@@ -280,12 +282,14 @@ export class Journal {
     // which the hole this journal opens does not reach (an independent read of the fixes for the review of f3750e4, PR #22: after a catch-up
     // that failed partway, a new life read 3 then 19, and nothing ever recorded 4–18); and, after a stop while the
     // disk refused, a jump in the files' seqs that no recorded gap covers. Seqs are dense, so a jump is a stretch
-    // the ring dropped before a catch-up wrote what followed it, every seq of it issued. (One exception: a hole a
-    // start opened whose gap the ring dropped as well; its seqs are counted as if all were issued.)
+    // the ring dropped before a catch-up wrote what followed it, every seq of it issued, unless the failed mark says
+    // a hole whose count is a bound was among the unrecorded (`failedBound`): a hole a start opened above a
+    // reservation, whose gap the ring dropped as well. Each jump under such a mark is then a bound, since the mark
+    // cannot say which holds it (the house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715, question 5).
     for (const h of opts.lost ?? []) {
       if (h.from <= accounted) this.addLost({ from: h.from, to: Math.min(h.to, accounted), reason: h.reason, exact: h.exact === true, ts: this.now() });
     }
-    if (known === undefined && r?.failed === true) for (const j of this.jumps(r.failedFrom)) this.addLost(j);
+    if (known === undefined && r?.failed === true) for (const j of this.jumps(r.failedFrom, r.failedBound === true)) this.addLost(j);
     this.cold?.setRotationHeader?.((maxBytes) => this.runs.header(maxBytes));
     // Likewise a crash that cut the event after the last complete line (G11); a hole covers that event.
     const torn = this.cold?.takeTornTail?.() ?? false;
@@ -434,6 +438,11 @@ export class Journal {
     return this.coldError !== null || this.lost.length > 0 || this.unwritten.length > 0;
   }
 
+  /** A hole whose count is a bound is among those no file records: what a failed mark's `failedBound` says. */
+  private unrecordedBound(): boolean {
+    return this.lost.some((r) => !r.exact) || this.unwritten.some((g) => g.exact !== true);
+  }
+
   /**
    * The jumps in the cold store's seqs that neither a recorded gap nor a known lost stretch covers, read only at a
    * start that finds the reservation marked failed: a stop while the disk refused is the only one that can leave a
@@ -441,15 +450,16 @@ export class Journal {
    * (Reservation.failedFrom), so a jump that starts there is seen. Read through every file, it cost about 3 s a GB
    * before termd served, for every session a full disk had marked at once (a reviewer's read of the fixes for the
    * review of f3750e4, PR #22); only a failed mark an earlier build wrote, which names no `from`, is read so now.
+   * With `bound` (the mark's `failedBound`) every jump counts as a bound.
    */
-  private jumps(from: Seq | undefined): LostRange[] {
+  private jumps(from: Seq | undefined, bound: boolean): LostRange[] {
     const found: LostRange[] = [];
     let prev: Seq | undefined;
     const oldest = this.cold?.oldestSeq();
     for (let next = oldest === undefined || from === undefined ? oldest : Math.max(oldest, from - 1); next !== undefined; ) {
       const page = this.cold!.read(next, undefined, JUMP_PAGE);
       for (const e of page) {
-        if (prev !== undefined && e.seq > prev + 1) found.push({ from: prev + 1, to: e.seq - 1, reason: 'store-error', exact: true, ts: e.ts });
+        if (prev !== undefined && e.seq > prev + 1) found.push({ from: prev + 1, to: e.seq - 1, reason: 'store-error', exact: !bound, ts: e.ts });
         prev = e.seq;
       }
       next = page.length < JUMP_PAGE ? undefined : page[page.length - 1]!.seq + 1;
@@ -515,9 +525,11 @@ export class Journal {
     if (!this.cold?.setHighWater) return;
     const failed = this.holesUnrecorded();
     const ahead = this.reserved > this.seq;
-    // While failing, also when a hole the mark does not reach down to appeared (a refused gap's, below the files' last).
+    // While failing, also when a hole the mark does not reach down to appeared (a refused gap's, below the files' last),
+    // or a hole whose count is a bound joined those unrecorded (a start's refused gap the ring then dropped).
     const reach = failed ? this.unrecordedFrom() : Number.POSITIVE_INFINITY;
-    if (ahead && this.reservedFailed === failed && this.reservedFrom <= reach && !this.markUnsure) return;
+    const bound = failed && this.unrecordedBound();
+    if (ahead && this.reservedFailed === failed && this.reservedFrom <= reach && (this.reservedBound || !bound) && !this.markUnsure) return;
     if (clocks.monotonic() < this.markRetryAt) return;
     const to = ahead ? this.reserved : this.seq + (this.sealed ? 1 : HIGH_WATER_BLOCK);
     if (this.writeReservation(to, failed)) {
@@ -576,7 +588,8 @@ export class Journal {
 
   /**
    * Write the reservation `to`, marked `failed` (with the lowest seq a hole the refusal left can start at, never
-   * raised while the refusal lasts) or with this boot, and remember it once it is confirmed.
+   * raised while the refusal lasts, and `failedBound` once a hole whose count is a bound is among the unrecorded,
+   * never cleared while it lasts) or with this boot, and remember it once it is confirmed.
    */
   private writeReservation(to: Seq, failed: boolean): boolean {
     // Clearing a failed mark says the files now record every hole it stood for. Appends are not synced, so the
@@ -587,12 +600,16 @@ export class Journal {
     if (!failed && this.failedMayBeOnDisk && this.cold!.syncAppends?.() === false) return false;
     const boot = failed ? undefined : boots.current();
     const from = failed ? Math.min(this.unrecordedFrom(), this.reservedFailed ? this.reservedFrom : Number.POSITIVE_INFINITY) : undefined;
+    const bound = failed && (this.unrecordedBound() || (this.reservedFailed && this.reservedBound));
     if (failed) this.failedMayBeOnDisk = true; // refused or not: a refused write may still have reached the file
-    const ok = this.cold!.setHighWater!({ reservation: { to, ...(from !== undefined && { failed: true as const, failedFrom: from }), ...(boot !== undefined && { boot }) } });
+    const ok = this.cold!.setHighWater!({
+      reservation: { to, ...(from !== undefined && { failed: true as const, failedFrom: from }), ...(bound && { failedBound: true as const }), ...(boot !== undefined && { boot }) },
+    });
     if (ok) {
       this.reserved = to;
       this.reservedFailed = failed;
       this.reservedFrom = from ?? Number.POSITIVE_INFINITY;
+      this.reservedBound = bound;
       if (!failed) this.failedMayBeOnDisk = false;
     }
     this.markUnsure = !ok;

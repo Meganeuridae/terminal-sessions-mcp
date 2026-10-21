@@ -265,7 +265,9 @@ const FIT_ATTEMPTS = 6;
  * the 33 commits, #22, comment 6307350650). Worded by what the journal knows, not by the hole's reason: a new
  * life's hole of events every one of which was issued read "up to", and a reservation one seq ahead "1 journal
  * event" (the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374, question 4). A gap
- * an earlier build wrote carries no `exact`, and is counted as a bound.
+ * an earlier build wrote carries no `exact`, and is counted as a bound, as is a jump a start found under a failed
+ * mark that said a bound hole was among the unrecorded, so a jump holding one never reads as about 10,000 events
+ * lost where a handful were issued (comment 6323055715, question 5).
  */
 export function gapNote(g: GapInfo): string {
   const n = g.to - g.from + 1;

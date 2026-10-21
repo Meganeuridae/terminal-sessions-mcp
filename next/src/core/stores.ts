@@ -97,6 +97,14 @@ export interface Reservation {
    */
   failedFrom?: Seq;
   /**
+   * With `failed`: a hole whose count is a bound is among those the files do not record, one a start opened above a
+   * reservation whose gap the ring dropped before the disk took it. A start records the jumps it finds under such a
+   * mark as bounds: counted as issued, a jump holding that hole could say about 10,000 events were lost where a
+   * handful were (the house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715, question 5). A failed mark without it, or one an
+   * earlier build wrote, records them exactly.
+   */
+  failedBound?: true;
+  /**
    * The boot it was written under (Linux's boot id, macOS's boot session). On another boot, or with none
    * known, it is honoured. On the same boot an unclean stop lost nothing the page cache held, so it is
    * honoured only while the store accounts for less than the seq its block was reserved above: the one
@@ -460,8 +468,8 @@ interface Segment {
 }
 
 /**
- * `journal.meta.json`. `highWater` is the floor (HighWater.floor); `reserved`, `failed`, `failedFrom` and `boot`
- * are the reservation. A file an earlier build wrote with `failed` and no `reserved` held a failing reservation in
+ * `journal.meta.json`. `highWater` is the floor (HighWater.floor); `reserved`, `failed`, `failedFrom`, `failedBound`
+ * and `boot` are the reservation. A file an earlier build wrote with `failed` and no `reserved` held a failing reservation in
  * `highWater`, and is read so.
  */
 interface StoreMeta {
@@ -471,6 +479,7 @@ interface StoreMeta {
   reserved?: Seq;
   failed?: true;
   failedFrom?: Seq;
+  failedBound?: true;
   boot?: string;
 }
 
@@ -673,6 +682,7 @@ export class FileStore implements JournalStore {
             out.failed = true;
             const from = seq(m.failedFrom);
             if (from !== undefined) out.failedFrom = from;
+            if (m.failedBound === true) out.failedBound = true;
           }
           if (typeof m.boot === 'string' && m.boot) out.boot = m.boot;
         }
@@ -735,7 +745,13 @@ export class FileStore implements JournalStore {
     const hw: HighWater = {};
     if (m.highWater !== undefined) hw.floor = m.highWater;
     if (m.reserved !== undefined) {
-      hw.reservation = { to: m.reserved, ...(m.failed && { failed: true as const }), ...(m.failed && m.failedFrom !== undefined && { failedFrom: m.failedFrom }), ...(m.boot !== undefined && { boot: m.boot }) };
+      hw.reservation = {
+        to: m.reserved,
+        ...(m.failed && { failed: true as const }),
+        ...(m.failed && m.failedFrom !== undefined && { failedFrom: m.failedFrom }),
+        ...(m.failed && m.failedBound && { failedBound: true as const }),
+        ...(m.boot !== undefined && { boot: m.boot }),
+      };
     }
     return hw;
   }
@@ -750,11 +766,13 @@ export class FileStore implements JournalStore {
       else delete meta.failed;
       if (r.failed && r.failedFrom !== undefined) meta.failedFrom = r.failedFrom;
       else delete meta.failedFrom;
+      if (r.failed && r.failedBound) meta.failedBound = true;
+      else delete meta.failedBound;
       if (r.boot !== undefined) meta.boot = r.boot;
       else delete meta.boot;
     }
     // Nothing to do only when memory and the file both hold these marks already (item 3 of comment 6307349700).
-    const mark = (m: StoreMeta | undefined) => `${m?.highWater ?? 0}:${m?.reserved ?? 0}:${m?.failed === true}:${m?.failedFrom ?? ''}:${m?.boot ?? ''}`;
+    const mark = (m: StoreMeta | undefined) => `${m?.highWater ?? 0}:${m?.reserved ?? 0}:${m?.failed === true}:${m?.failedFrom ?? ''}:${m?.failedBound === true}:${m?.boot ?? ''}`;
     if (mark(meta) === mark(this.meta) && mark(meta) === mark(this.onDisk)) return true;
     // Confirmed only once it is on disk (the house's read of b047b92, point 1): a refused write
     // changes nothing here, so a prune cannot delete the file whose newest seq the high water was
@@ -769,10 +787,15 @@ export class FileStore implements JournalStore {
     // memory keeps the old marks and the caller retries (the house's read of the 38 commits, PR #22,
     // comment 6274603516). A new boot on the same reservation is not a raise: either file is honoured on a
     // later boot. Nor is a failed mark's `failedFrom` lowered, for the start that looks for jumps from it: the
-    // old file would send it past a hole.
+    // old file would send it past a hole. Nor its `failedBound` newly set: the old file would count a bound hole
+    // among the jumps as events every one of which was issued.
     const scanFrom = (m: StoreMeta) => (m.failed === true ? (m.failedFrom ?? 0) : Number.POSITIVE_INFINITY);
+    const bounded = (m: StoreMeta) => m.failed === true && m.failedBound === true;
     const raising =
-      (meta.highWater ?? 0) > (this.meta.highWater ?? 0) || (meta.reserved ?? 0) > (this.meta.reserved ?? 0) || scanFrom(meta) < scanFrom(this.meta);
+      (meta.highWater ?? 0) > (this.meta.highWater ?? 0) ||
+      (meta.reserved ?? 0) > (this.meta.reserved ?? 0) ||
+      scanFrom(meta) < scanFrom(this.meta) ||
+      (bounded(meta) && !bounded(this.meta));
     if (w === 'unsynced' && raising) return false;
     this.meta = meta;
     return true;

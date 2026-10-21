@@ -326,7 +326,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   again after the restart. So can a daemon crash on the same boot while the disk refuses the events
   as well as the mark that would flag the reservation failed: the reservation it leaves is not
   marked failed, a start on the same boot does not honour such a one, and numbering resumes at the
-  last line on disk. Three products derive from it and each states
+  last line on disk. A start after a stop while the disk refused records each jump in the files'
+  seqs that no gap covers as a hole: counted exactly, since seqs are dense, unless the failed mark
+  says a hole above a reservation was among those unrecorded, when each such jump is counted as up
+  to its range. Three products derive from it and each states
   what it is. **Raw output** is retained decoded UTF-8 text with provenance, a pure function of a
   range. **Transcript** is a documented line-oriented projection of a range, a pure
   function of that range and the width it is projected at, for reading and search — not a
@@ -1456,7 +1459,7 @@ type JournalEvent =
   | { seq; ts; type: 'integration'; level: 'unknown'|'rich'|'basic'|'none' }                  // G5
   | { seq; ts; type: 'watch.fired'; watchId; label; kind: 'pattern'|'silence'|'idle'; principal; at: seq; match?; line?; clipped?: boolean; stream?: 'stdout'|'stderr'; mixed?: boolean; suppressed?: number }
   | { seq; ts; type: 'gap';         from: seq; to: seq; reason: 'retention'|'keeper-overflow'|'torn-write'|'store-error'|'store-failed'; exact?: true }  // G11; the last three are G19's disk path; torn-write is also what a power loss took (G10)
-                                    // exact: every seq of the range was issued, so it counts the events lost (one exception: a jump in the files found after a stop while the disk refused is counted as issued, though it can hold an earlier start's hole above a reservation whose gap the ring dropped too); absent (and in a gap an earlier build wrote), the count is a bound, since numbering may have resumed above a reservation's never-issued seqs
+                                    // exact: every seq of the range was issued, so it counts the events lost (a jump in the files found after a stop while the disk refused is counted so unless the failed mark carried failedBound, which says a hole above a reservation was among the unrecorded; an earlier build's failed mark says nothing of it, and its jumps still count as issued); absent (and in a gap an earlier build wrote), the count is a bound, since numbering may have resumed above a reservation's never-issued seqs
   | { seq; ts; type: 'checkpoint';  screen: serialized }                                      // milestone 3; not in types.ts yet
   | { seq; ts; type: 'recovered';   class: 'continuous'|'reattached'|'history-only' }
   | { seq; ts; type: 'session.exit';code: number|null; signal?; reason? }                     // reason: why the daemon ended the shell (daemon-shutdown); absent when it ended on its own
