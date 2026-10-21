@@ -800,6 +800,30 @@ test('a temp file that cannot be removed at close is said and left, and close co
   fs.rmSync(probe, { force: true });
 });
 
+test('the replies kept since the prompt start go again after a SIGINT sent as a signal while the empty line is unanswered', async () => {
+  // signal('SIGINT') types a ^C as input() does, and its tty flush takes the replies the same way.
+  const DA1 = /\x1b\[\?[\d;]+c/g;
+  const h = await harness();
+  h.shell.stop();
+  h.pty.emit('\x1b[c'); // the query the prompt sent, unread when the shell stopped
+  await h.session.screen.settled();
+  const reply = h.pty.written.match(DA1)?.at(-1);
+  assert.ok(reply, 'the screen answered the query');
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.equal(c.steps.at(-1), 'an empty line, whose prompt says the shell is back', JSON.stringify(c));
+  try {
+    const n = h.pty.written.length;
+    h.session.signal('SIGINT', AGENT);
+    await until(() => h.pty.written.slice(n).match(DA1)?.length === 1, 2000, 'the reply again, once the checks pass');
+    assert.ok(h.pty.written.slice(n).indexOf('\x03') < h.pty.written.slice(n).indexOf(reply!), 'after the ^C');
+  } finally {
+    h.shell.cont();
+    await h.session.close();
+  }
+});
+
 test('a cancel whose empty line cannot be written types none, says so, and takes the shell’s next prompt as its answer', async () => {
   // askForPrompt's fallback when its file cannot be written: no line is typed, and the prompt the stopped
   // shell prints for the ^C when it runs again is the shell's answer.
