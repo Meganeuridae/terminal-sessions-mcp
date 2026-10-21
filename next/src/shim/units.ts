@@ -107,21 +107,19 @@ export function systemctlUnit(execStart: string, environment: string, more: { ma
   if (!execStart) return undefined;
   const m = /argv\[\]=(.*?)(?: ; |\s*\}\s*$|$)/.exec(execStart);
   if (!m) return undefined;
-  let env: Record<string, string> = {};
-  if (more.running) env = { ...more.running };
-  else {
-    for (const word of [...quotedWords(more.manager ?? ''), ...quotedWords(environment)]) {
-      const eq = word.indexOf('=');
-      if (eq > 0) env[word.slice(0, eq)] = word.slice(eq + 1);
-    }
-    for (const word of quotedWords(more.unset ?? '')) {
-      const eq = word.indexOf('=');
-      const name = eq < 0 ? word : word.slice(0, eq);
-      if (eq < 0 || env[name] === word.slice(eq + 1)) delete env[name];
-    }
+  if (more.running) return runningUnit(m[1]!.split(' '), more.running);
+  const env: Record<string, string> = {};
+  for (const word of [...quotedWords(more.manager ?? ''), ...quotedWords(environment)]) {
+    const eq = word.indexOf('=');
+    if (eq > 0) env[word.slice(0, eq)] = word.slice(eq + 1);
+  }
+  for (const word of quotedWords(more.unset ?? '')) {
+    const eq = word.indexOf('=');
+    const name = eq < 0 ? word : word.slice(0, eq);
+    if (eq < 0 || env[name] === word.slice(eq + 1)) delete env[name];
   }
   // systemctl prints each as `<path> (ignore_errors=yes|no)`, the `-` of an optional one as the flag.
-  const files = more.running ? [] : (more.files ?? []).map((f) => f.replace(/ \(ignore_errors=\w+\)$/, ''));
+  const files = (more.files ?? []).map((f) => f.replace(/ \(ignore_errors=\w+\)$/, ''));
   const unreadEnv = files.length ? `EnvironmentFile=${files.join(', ')}` : undefined;
   const words: string[] = [];
   for (const w of m[1]!.split(' ')) {
@@ -149,6 +147,31 @@ export function systemctlUnit(execStart: string, environment: string, more: { ma
   }
   u.argv = joinOptionValues(u.argv);
   return u;
+}
+
+/**
+ * A running unit's text read against its termd's own environment, which is what systemd and any `env` prefix
+ * made of it: the prefix is read only to find termd's arguments, never applied again, and a `${NAME}` in those
+ * arguments that the prefix sets or takes away (any, after `-i`) is unknown, since systemd expanded it before
+ * env ran, from a value the running environment no longer holds. Applied again, `env
+ * TSM_DATA_DIR=${TSM_DATA_DIR}/x` read as …/x/x (the house's read of the 17 commits over our fixes, #22).
+ */
+function runningUnit(text: string[], running: Record<string, string>): UnitText | undefined {
+  const env = { ...running };
+  const t = throughEnv({ argv: text, env: {} }, { program: 'path' });
+  if (t.unclear) return { argv: [], env, unclear: t.unclear };
+  const words: string[] = [];
+  for (const w of t.argv) {
+    let unknown = false;
+    const x = w.replace(/\$\{(\w+)\}|\$/g, (all, name: string | undefined) => {
+      const v = name === undefined || t.fixed === 'all' || t.fixed?.has(name) ? undefined : env[name];
+      if (v === undefined) unknown = true;
+      return v ?? all;
+    });
+    if (unknown) return undefined;
+    words.push(x);
+  }
+  return { argv: joinOptionValues(words), env };
 }
 
 /**

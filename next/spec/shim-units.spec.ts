@@ -257,6 +257,22 @@ test("a running termd's environment is the one read when Linux shows it: whole, 
   assert.deepEqual(procEnviron(child.pid!), { error: 'ENOENT' }, 'a process that has gone');
 });
 
+test("a running unit's env prefix is not applied again to the environment its termd has, and a ${NAME} it sets in termd's arguments is unknown (the house's read of the 17 commits over our fixes, #22)", () => {
+  // systemd expands every ${NAME} before env runs; the running termd's environment is what env then made. Applied
+  // again, `env TSM_DATA_DIR=${TSM_DATA_DIR}/x` read the data dir as …/x/x.
+  const running = { HOME: '/home/r', TSM_DATA_DIR: '/srv/b/x', BASE: '/srv/new' };
+  const self = systemctlUnit(execStart(['--port', '3101'], ['/usr/bin/env', 'TSM_DATA_DIR=${TSM_DATA_DIR}/x']), '', { running });
+  assert.ok(self, 'the ExecStart is read');
+  assert.equal(unitDataDir(self), '/srv/b/x', 'the data dir termd has, not the prefix applied twice');
+  // A ${NAME} in termd's own arguments that the prefix sets was expanded from the value before env ran.
+  assert.equal(systemctlUnit(execStart(['--data-dir', '${BASE}/d'], ['/usr/bin/env', 'BASE=/srv/new']), '', { running }), undefined);
+  assert.equal(systemctlUnit(execStart(['--data-dir', '${BASE}/d'], ['/usr/bin/env', '-i', 'HOME=/home/r']), '', { running }), undefined, 'any, after -i');
+  // One the prefix leaves alone is the same before env and after it.
+  const kept = systemctlUnit(execStart(['--data-dir', '${BASE}/d'], ['/usr/bin/env', 'TSM_PORT=4100']), '', { running });
+  assert.ok(kept);
+  assert.equal(unitDataDir(kept), '/srv/new/d');
+});
+
 test("a unit's environment starts from the user manager's, which Environment= overrides and UnsetEnvironment= takes from (systemd 257, probed with a user unit)", () => {
   const read = (argv: string[], environment: string, more: { manager?: string; unset?: string }) => {
     const u = systemctlUnit(execStart(argv), environment, more);
