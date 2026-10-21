@@ -14,7 +14,9 @@
  *    outside a control string (`lineEnds`, the one line-end rule: a LF inside a
  *    window title ends no line), so a line is the same whatever the chunking: a
  *    CRLF, an escape sequence or a long line split across events reads as if it
- *    came in one piece.
+ *    came in one piece. A LF that a CSI executes inside it ends a line too, and
+ *    the next line begins with the CSI's head, so its rest is no text (the
+ *    house's review of the 40 commits through f3750e4, #22, comment 6310921374).
  * 3. Cleaning. The line is read as the transcript displays it (`cleanLine`):
  *    control sequences are removed, and a carriage return, a backspace, erase in
  *    line and in-line cursor moves apply as overwrites, so `ABCDE\rXY` reads
@@ -50,7 +52,7 @@
  */
 import { cleanLine } from './ansi.js';
 import { testBounded } from './regex.js';
-import { indexAtByte, lineCarry, lineEnds, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
+import { headAt, indexAtByte, isStringStart, lineCarry, lineEnds, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
 import type { JournalEvent, Seq } from './types.js';
 
 export interface SearchMatch {
@@ -155,6 +157,9 @@ export class LineScanner {
     if (ev.type !== 'output') return;
     const key = ev.stream === 'pty' ? 'pty' : `${ev.stream}:${ev.runId ?? ''}`;
     const i = indexAtByte(ev.data, offset);
+    // A continuation that starts inside a CSI (a line begun after a LF the CSI executed) reads it on from its head.
+    const head = i > 0 && !this.scans.has(key) ? headAt(ev.data, i) : '';
+    if (head) this.scans.set(key, { open: head });
     this.take(key, ev.data.slice(i), ev.seq, utf8Length(ev.data.slice(0, i)));
   }
 
@@ -210,15 +215,19 @@ export class LineScanner {
     let carry = this.carries.get(key);
     let scan = this.scans.get(key);
     if (!scan) this.scans.set(key, (scan = lineCarry()));
+    // A line begun inside a CSI, after a LF it executed, begins with the CSI's head (rule 2): the one open
+    // where this data begins, or the one a line end inside this data names.
+    let head = isStringStart(scan.open, 0) ? '' : scan.open;
+    const heads = new Map<number, string>();
     // A LF inside a window title ends no line: search found the title's rest as a line of its own, and not
     // the line the tail showed (an independent read of the fix for the house's read of the 33 commits, #22,
     // comment 6307350650).
-    const ends = lineEnds(data, scan);
+    const ends = lineEnds(data, scan, Number.POSITIVE_INFINITY, false, heads);
     let e = 0;
     while (pos <= data.length && !this.full) {
       if (!carry) {
         if (pos === data.length) break;
-        carry = { raw: '', cut: false, start: { cursor: seq - 1, offset: bytes }, linesAt: this.lines };
+        carry = { raw: head, cut: false, start: { cursor: seq - 1, offset: bytes }, linesAt: this.lines };
         this.carries.set(key, carry);
       }
       const nl = e < ends.length ? ends[e++]! : -1;
@@ -235,6 +244,7 @@ export class LineScanner {
       if (nl === -1) break;
       bytes += bytesOf(piece, ascii) + 1;
       pos = nl + 1;
+      head = heads.get(nl) ?? '';
       this.complete(carry, seq);
       this.carries.delete(key);
       carry = undefined;

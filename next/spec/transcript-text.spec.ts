@@ -1,7 +1,7 @@
 /** api-20: UTF-8-safe cutting (src/core/text.ts) for byte-capped results (G11). */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cutTail, headIndex, indexAtByte, tailIndex, tailStart, utf8Length, safeCut, sequenceEnd, stripEscapes, unfinishedSequence } from '../src/core/text.js';
+import { cutTail, executedIn, headIndex, indexAtByte, isStringStart, lineCarry, lineEnds, tailIndex, tailStart, utf8Length, safeCut, sequenceEnd, stripEscapes, unfinishedSequence } from '../src/core/text.js';
 
 const bytes = (s: string) => Buffer.byteLength(s);
 const clean = (s: string) => !s.includes('�') && Buffer.from(s).toString() === s;
@@ -142,4 +142,65 @@ test('stripEscapes: the one grammar, with a map from each kept character to its 
   assert.deepEqual(ctl.map, [0, 2, 4, 5, 6, 7, 8]);
   // A U+FFFD or a private-use character is text.
   assert.equal(stripEscapes('\uE000\uFFFD').text, '\uE000\uFFFD');
+});
+
+test('an escape sequence or a CSI ends where the emulator ends it: the C0 controls inside execute and it goes on (the house’s review of the 40 commits through f3750e4, #22, comment 6310921374)', () => {
+  // The emulator shows `A ESC [ 3 LF C B` as `A`, then `    B`: the LF moves the cursor down, and `C` ends the CSI.
+  assert.equal(sequenceEnd('\x1b[3\nCB', 0), 5, 'the LF is inside the CSI, and C its final byte');
+  assert.deepEqual(executedIn('\x1b[3\nCB', 0, 5), [3]);
+  assert.equal(sequenceEnd('\x1b[3\x7fCB', 0), 5, 'DEL is ignored inside a CSI');
+  assert.equal(sequenceEnd('\x1b[3\x18CB', 0), 3, 'CAN aborts it, and is not part of it');
+  assert.equal(sequenceEnd('\x1b[3\x1b[31m', 0), 3, 'an ESC begins another');
+  assert.equal(sequenceEnd('\x1b[3éB', 0), 4, 'a code point from U+00A0 is an error that ends it, taken with it');
+  assert.equal(sequenceEnd('\x1b[3\u{1F600}B', 0), 5, 'both halves of a pair');
+  assert.equal(sequenceEnd('\x1b[1?éCB', 0), 6, 'once a misplaced byte set it to ignore the rest, the code point is ignored, and C ends it');
+  assert.equal(sequenceEnd('\x1b[3\n', 0), undefined, 'still open after its LF');
+  // An ESC: the C0 controls after it execute too, and the byte after them says what it begins.
+  assert.equal(sequenceEnd('\x1b\n[31mB', 0), 6, 'ESC LF [ opens a CSI');
+  assert.equal(sequenceEnd('\x1b(\nBx', 0), 4, 'an intermediate, a LF, the final byte');
+  assert.equal(sequenceEnd('\x1b\x7f7B', 0), 3, 'DEL is ignored after ESC');
+  assert.equal(sequenceEnd('\x1b\x1b[31m', 0), 1, 'an ESC after ESC begins another: the first is alone');
+  assert.equal(sequenceEnd('\x1b\x9b31m', 0), 1, 'a C1 control after ESC acts');
+  assert.equal(sequenceEnd('\x1béB', 0), 2, 'a code point from U+00A0 after ESC is an error, taken with it');
+  assert.equal(sequenceEnd('\x1b\n', 0), undefined);
+  assert.equal(isStringStart('\x1b\n]0;t\x07', 0), true, 'ESC LF ] opens an OSC');
+  assert.equal(sequenceEnd('\x1b\n]0;t\x07B', 0), 7);
+  assert.deepEqual(executedIn('\x1b\n]0;a\nb\x07', 0, 9), [1], 'a string executes only what comes before the byte that says what it is');
+  // stripEscapes keeps the tabs and newlines a sequence executes, where they stand, and the CSI's rest is no text.
+  assert.deepEqual(stripEscapes('A\x1b[3\nCB'), { text: 'A\nB', map: [0, 4, 6] });
+  assert.equal(stripEscapes('A\x1b[\t2CB').text, 'A\tB');
+  assert.equal(stripEscapes('A\x1b[3\n').text, 'A\n', 'what an unfinished CSI executed so far stays');
+  assert.equal(stripEscapes('A\x1b\n]0;t\x07B').text, 'A\nB');
+  // safeCut and unfinishedSequence follow: the CSI is one sequence across its LF.
+  assert.equal(safeCut('A\x1b[3\nCB', 5), 1, 'a cut after the LF is inside the CSI: before it');
+  assert.equal(unfinishedSequence('A\x1b[3\n'), 1);
+});
+
+test('a LF a CSI executes ends a line: lineEnds reports it with the head the next line begins with only when asked, and a tail never begins inside the CSI', () => {
+  const data = 'A\x1b[3\nCB\nnext\n';
+  assert.deepEqual(lineEnds(data), [7, 12], 'a reader that cuts gets only the ends outside every sequence');
+  const inside = new Map<number, string>();
+  assert.deepEqual(lineEnds(data, lineCarry(), Number.POSITIVE_INFINITY, false, inside), [4, 7, 12]);
+  assert.deepEqual([...inside], [[4, '\x1b[3']], 'the line after it begins with the CSI so far');
+  // Across events: the CSI open at the end of the first is carried without its LF, which is reported once.
+  const carry = lineCarry();
+  const first = new Map<number, string>();
+  assert.deepEqual(lineEnds('A\x1b[3\n', carry, Number.POSITIVE_INFINITY, false, first), [4]);
+  assert.equal(carry.open, '\x1b[3');
+  const second = new Map<number, string>();
+  assert.deepEqual(lineEnds('\n1mB\n', carry, Number.POSITIVE_INFINITY, false, second), [0, 4]);
+  assert.deepEqual([...second], [[0, '\x1b[3']], 'a second LF inside the same CSI');
+  // The executed controls before an ESC's string end lines too; the payload's do not.
+  const osc = new Map<number, string>();
+  assert.deepEqual(lineEnds('A\x1b\n]0;a\nb\x07B\n', lineCarry(), Number.POSITIVE_INFINITY, false, osc), [2, 11]);
+  assert.deepEqual([...osc], [[2, '\x1b']]);
+  // A long malformed head is kept short, in the state it leaves the parser in.
+  const long = `\x1b[${'1;'.repeat(100)}`;
+  const c = lineCarry();
+  lineEnds(`${long}\n`, c);
+  assert.equal(c.open, '\x1b[0', 'a CSI in its parameters, without them');
+  // A tail cut takes a CSI holding a LF whole or moves past it, and takes no line boundary inside it: it began with `CB`.
+  const t = `${'x'.repeat(100)}\x1b[3\nCB\nend`;
+  assert.equal(t.slice(tailStart(t, 10)), '\x1b[3\nCB\nend');
+  assert.equal(t.slice(tailStart(t, 9)), 'end');
 });

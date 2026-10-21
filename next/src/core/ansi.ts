@@ -7,7 +7,7 @@
  */
 import { err } from './errors.js';
 import { compileUserRegex, execBounded } from './regex.js';
-import { isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, type LineCarry } from './text.js';
+import { executedIn, isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, sequenceText, type LineCarry } from './text.js';
 
 /**
  * The longest line a StreamMatcher holds: a longer one is matched on its first MAX_LINE, the hit says
@@ -57,7 +57,11 @@ export function cellWidth(ch: string): 0 | 1 | 2 {
  * text, sequences skipped by `sequenceEnd`, so no character stands in for a backspace: a U+E000 in
  * the output is text (the house's read of 39787b3, #22, found it taken for one). A sequence left
  * unfinished at the end takes the rest of the text with it: its payload is not text (the same
- * read: `ready\x1b]0;title` read `ready]0;title`).
+ * read: `ready\x1b]0;title` read `ready]0;title`). The controls a CSI or an escape sequence executes
+ * inside it apply where they stand, and the sequence then acts without them (executedIn), as the
+ * emulator reads it: `ABC ESC [ BS D X` reads `AXC`, a backspace and then a move one cell left, where
+ * ending the CSI at the backspace read `ABDX` (the house's review of the 40 commits through f3750e4,
+ * #22, comment 6310921374).
  *
  * Where it differs from the emulator's row (the house's read of the 33 commits, #22, comment
  * 6307351104): tab stops are xterm's defaults, every eight columns, always. A line that sets or
@@ -102,12 +106,45 @@ export function cleanLine(raw: string): string {
     cells.length = Math.min(cells.length, n);
     written.length = Math.min(written.length, n);
   };
+  /** A character written at the cursor; a combining mark or a joiner composes with the one before it. */
+  const print = (ch: string) => {
+    const w = cellWidth(ch);
+    if (w === 0 && col > 0) {
+      // A combining mark or a joiner composes with the character before the cursor; at column 0
+      // there is none, and the emulator gives the mark a cell of its own.
+      let k = Math.max(0, col - 1);
+      if (at(k) === '' && k > 0) k--;
+      while (cells.length < k) cells.push(' '); // after a move past the end: the cells it crossed are blanks
+      set(k, (at(k) ?? ' ') + ch);
+      return;
+    }
+    while (cells.length < col) cells.push(' ');
+    // Overwriting either half of a wide character blanks the other half.
+    if (at(col) === '' && col > 0) set(col - 1, ' ');
+    if (at(col + 1) === '') set(col + 1, ' ');
+    set(col++, ch);
+    if (w === 2) {
+      if (at(col + 1) === '') set(col + 1, ' ');
+      set(col++, '');
+    }
+  };
+  /** A control character, inside a sequence or not: CR, BS and TAB move the cursor, a LF is written as a character, the rest do nothing. */
+  const control = (c: number) => {
+    if (c === 0x0d) col = 0;
+    else if (c === 0x08) col = Math.max(0, col - 1);
+    else if (c === 0x09) moveTo(((col >> 3) + 1) << 3);
+    else if (c === 0x0a) print('\n');
+  };
   for (let i = 0; i < raw.length; ) {
     const c = raw.charCodeAt(i);
     if (isIntroducer(c)) {
       const end = sequenceEnd(raw, i);
+      // The controls a sequence executes apply where they stand, before what it does (see above).
+      const executed = executedIn(raw, i, end ?? raw.length);
+      for (const k of executed) control(raw.charCodeAt(k));
       if (end === undefined) break;
-      const m = LINE_CONTROL.exec(raw.slice(i, end));
+      const text = raw.slice(i, end);
+      const m = LINE_CONTROL.exec(executed.length || text.includes('\x7f') ? sequenceText(raw, i, end) : text);
       if (m) {
         const n = Number(m[1]!.split(';')[0]);
         const arg = Number.isFinite(n) ? n : 0;
@@ -134,33 +171,13 @@ export function cleanLine(raw: string): string {
       i = end;
       continue;
     }
-    if (c === 0x0d) col = 0;
-    else if (c === 0x08) col = Math.max(0, col - 1);
-    else if (c === 0x09) moveTo(((col >> 3) + 1) << 3);
-    else if ((c >= 0x20 && c !== 0x7f && !(c >= 0x80 && c <= 0x9f)) || c === 0x0a) {
+    if (c >= 0x20 && c !== 0x7f && !(c >= 0x80 && c <= 0x9f)) {
       const ch = String.fromCodePoint(raw.codePointAt(i)!);
       i += ch.length;
-      const w = cellWidth(ch);
-      if (w === 0 && col > 0) {
-        // A combining mark or a joiner composes with the character before the cursor; at column 0
-        // there is none, and the emulator gives the mark a cell of its own.
-        let k = Math.max(0, col - 1);
-        if (at(k) === '' && k > 0) k--;
-        while (cells.length < k) cells.push(' '); // after a move past the end: the cells it crossed are blanks
-        set(k, (at(k) ?? ' ') + ch);
-        continue;
-      }
-      while (cells.length < col) cells.push(' ');
-      // Overwriting either half of a wide character blanks the other half.
-      if (at(col) === '' && col > 0) set(col - 1, ' ');
-      if (at(col + 1) === '') set(col + 1, ' ');
-      set(col++, ch);
-      if (w === 2) {
-        if (at(col + 1) === '') set(col + 1, ' ');
-        set(col++, '');
-      }
+      print(ch);
       continue;
     }
+    control(c);
     i++;
   }
   if (!erased.length) return cells.join('');
@@ -265,18 +282,23 @@ export class LineSplitter {
     if (this.pendingCr && text.startsWith('\n')) text = text.slice(1);
     // Lines and frames end by the one rule (lineEnds, with CRs): a LF or CR inside a window title ends
     // neither (an independent read of the fix for the house's read of the 33 commits, #22, comment 6307350650).
-    const breaks = lineEnds(text, this.scan, Number.POSITIVE_INFINITY, true);
+    // One a CSI executes ends one, and the next begins with the CSI's head, so the CSI's rest is not text
+    // (the house's review of the 40 commits through f3750e4, #22, comment 6310921374).
+    const heads = new Map<number, string>();
+    const breaks = lineEnds(text, this.scan, Number.POSITIVE_INFINITY, true, heads);
     this.pendingCr = text.endsWith('\r') && breaks[breaks.length - 1] === text.length - 1;
     const parts: string[] = [];
     let from = 0;
+    let head = '';
     for (let k = 0; k < breaks.length; k++) {
       const b = breaks[k]!;
-      parts.push(text.slice(from, b));
+      parts.push(head + text.slice(from, b));
       // A CRLF is one break.
       if (text[b] === '\r' && text[b + 1] === '\n' && breaks[k + 1] === b + 1) k++;
       from = breaks[k]! + 1;
+      head = heads.get(breaks[k]!) ?? '';
     }
-    parts.push(text.slice(from));
+    parts.push(head + text.slice(from));
     const last = parts.pop()!;
     for (const part of parts) {
       this.add(part);

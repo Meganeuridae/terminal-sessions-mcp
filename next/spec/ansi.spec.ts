@@ -257,3 +257,40 @@ test('m2-10: lines are bounded — a line longer than MAX_LINE is matched on its
   assert.equal(pair.text, 'x'.repeat(MAX_LINE - 1), 'the pair that would be split is dropped whole');
   assert.ok(!/[\ud800-\udfff]$/.test(pair.text));
 });
+
+/**
+ * Output whose escape sequences and CSIs hold C0 controls, which the emulator executes inside them and goes on:
+ * `A ESC [ 3 LF C B` shows `A`, then `    B` (the house's review of the 40 commits through f3750e4, #22, comment
+ * 6310921374). CR LF throughout, so a line of the splitter and a row of the transcript both begin at column 0.
+ */
+const INSIDE = [
+  'A\x1b[3\r\nCB\r\n',
+  'A\x1b[3\r\n1mB\r\n',
+  'A\x1b[\r\n\r\nmB\r\n',
+  'ABC\r\nXYZ\x1b[\r\nKQ\r\n',
+  'A\x1b\r\n[31mB\r\n',
+  'A\x1b(\r\nBx\r\n',
+  'A\x1b\x1b[31mB\r\n',
+  'A\x1b\r\n]0;title\x07B\r\n',
+];
+
+test('cleanLine applies the controls a sequence executes where they stand, then what the sequence does, as the transcript does', async () => {
+  const rows = ['ABC\x1b[\bDX', 'A\x1b[3\x7fCB', 'A\x1b[\t2CB', 'AB\x1b[\b\bKz', 'A\x1b\x7f7B', 'A\x1b\x9b31mB'];
+  for (const row of rows) {
+    const shown = (await transcript([{ data: `${row}\r\n`, stream: 'pty' }], { cols: 200 })).replace(/\n$/, '');
+    assert.equal(cleanLine(row).trimEnd(), shown, JSON.stringify(row));
+  }
+  assert.equal(cleanLine('ABC\x1b[\bDX'), 'AXC', 'a backspace, then a move one cell left');
+});
+
+test('a LF a CSI or an escape sequence executes ends a line for a watch, and the next line reads the sequence on: as the transcript shows it, however the output is split', async () => {
+  for (const data of INSIDE) {
+    const rows = (await transcript([{ data, stream: 'pty' }], { cols: 80 })).split('\n').filter((l) => l !== '');
+    for (let cut = 0; cut < data.length; cut++) {
+      const s = new LineSplitter();
+      const lines = [...(cut ? s.feed(data.slice(0, cut)) : []), ...s.feed(data.slice(cut)), ...s.flush()].map((l) => l.text.trimEnd());
+      assert.deepEqual(lines, rows, `${JSON.stringify(data)} split at ${cut}`);
+    }
+  }
+  assert.deepEqual(matches('^B', ['A\x1b[3\r\n', '1mB\r\n']), ['B'], 'the CSI’s rest is no text: `1mB` was the line');
+});

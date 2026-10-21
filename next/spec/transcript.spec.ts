@@ -615,3 +615,31 @@ test('a string ends where the emulator ends it: BEL ends an OSC only, any C1 con
   assert.deepEqual(lineEnds('A\x1bXpay\u00e9B\r\nC\r\n'), [9, 12], 'U+00E9 ended the SOS');
   assert.deepEqual(lineEnds('A\x1b]0;t\u00e9t\r\nB\x07\r\n'), [13], 'an OSC holds U+00E9 as payload');
 });
+
+test('a LF a CSI executes is a line end the interleave may cut at: the source’s next output reads the CSI on, so its rest is no text (the house’s review of the 40 commits through f3750e4, #22, comment 6310921374)', async () => {
+  // `A ESC [ 3 LF`, a Run's `r1`, then `1mB`: the CAN at the source switch ended the CSI, and `1mB` read as text where
+  // alone it reads ` B`. A bare LF leaves the cursor short of column 0, so the switch leaves a blank line, as for any.
+  const run = (data: string): ProjectChunk => ({ data, stream: 'stdout', runId: 'r1' });
+  assert.deepEqual((await project(['A\x1b[3\n', run('r1\n'), '1mB'], { cols: 40 })).text.split('\n'), ['A', '', 'r1', 'B']);
+  assert.deepEqual((await project(['A\x1b[3\r\n', run('r1\n'), '1mB'], { cols: 40 })).text.split('\n'), ['A', 'r1', 'B']);
+  assert.deepEqual((await project(['A\x1b[3\r\n', run('r1\n'), 'CB'], { cols: 40, label: sourceLabel })).text.split('\n'), ['[terminal]', 'A', '[run r1]', 'r1', '[terminal]', '   B']);
+  // Every byte budget and both ends: no cut leaves the CSI's rest as text.
+  const chunks: ProjectChunk[] = ['A\x1b[3\r\n', run('r1\n'), '1mB\r\n', run('r2\n'), 'p3\r\n'];
+  for (let max = 0; max <= 40; max++) {
+    for (const keep of ['head', 'tail'] as const) {
+      const p = await project(chunks, { cols: 40, maxInputBytes: max, keep });
+      assert.ok(!/1m|\[3/.test(p.text), `budget ${max}, ${keep}: ${JSON.stringify(p.text)}`);
+    }
+  }
+  for (let maxLines = 1; maxLines <= 5; maxLines++) assert.ok(!/1m/.test((await project(chunks, { cols: 40, maxLines })).text), `maxLines ${maxLines}`);
+});
+
+test('a CSI holding many line feeds is taken whole by a batch: the projection reads as the emulator does, its rest no text', async () => {
+  // A batch was cut at a LF inside the CSI, which the ED 3 between batches then ended: its final `m` showed.
+  const inside = `${'l\r\n'.repeat(3000)}\x1b[${'\r\n'.repeat(2000)}mend\r\n`;
+  const before = `${'l\r\n'.repeat(3000)}${'\r\n'.repeat(2000)}\x1b[mend\r\n`;
+  const a = await project([inside], { cols: 80 });
+  assert.equal(a.text, (await project([before], { cols: 80 })).text);
+  assert.equal(a.truncated, false);
+  assert.ok(a.text.endsWith('\nend'));
+});

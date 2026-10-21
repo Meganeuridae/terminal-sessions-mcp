@@ -110,6 +110,32 @@ test('er-6 / ux-20: read since=match.cursor (offset=match.offset) starts at the 
   assert.equal(r2.text!.split('\n')[0], 'ERROR: disk full at step 1000');
 });
 
+test('a LF a CSI executes ends a line, and the next line reads the CSI on: its rest is no text, wherever the events split it or a continuation starts (the house’s review of the 40 commits through f3750e4, #22, comment 6310921374)', async () => {
+  const data = 'A\x1b[3\r\n1mB here\r\nnext\r\n';
+  for (let cut = 0; cut < data.length; cut++) {
+    const src = source();
+    if (cut) out(src.journal, data.slice(0, cut));
+    out(src.journal, data.slice(cut));
+    const all = await search(src, { pattern: '.', since: 0, context: 0 });
+    assert.deepEqual(lines(all), ['A', 'B here', 'next'], `split at ${cut}`);
+  }
+  // A continuation from the line's start, which lies inside the CSI, reads it as the scan did.
+  const src = source();
+  out(src.journal, data);
+  const m = (await search(src, { pattern: '^B', since: 0 })).matches[0]!;
+  assert.equal(m.offset, 6, 'the line begins after the LF, inside the CSI');
+  const again = await search(src, { pattern: '.', since: m.cursor, offset: m.offset!, context: 0 });
+  assert.deepEqual(lines(again), ['B here', 'next']);
+  // A tail across another source's line, which the interleave puts after the LF inside the CSI, reads it as search does.
+  const two = source();
+  out(two.journal, 'A\x1b[3\r\n');
+  startRun(two.journal, 'r1');
+  out(two.journal, 'r1\n', 'stdout', 'r1');
+  out(two.journal, '1mB here\r\n');
+  for (const tail of [1, 2, 3]) assert.ok(!/1m/.test((await readJournal(two, { tail }, { resultBytes: 16384 })).text!), `tail ${tail}`);
+  assert.deepEqual((await readJournal(two, { tail: 3 }, { resultBytes: 16384 })).text!.split('\n'), ['[terminal]', 'A', '[run r1]', 'r1', '[terminal]', 'B here']);
+});
+
 // ───────────── jr2-10 / m2-25: a scan pages, and says so ─────────────
 
 test('jr2-10 / m2-25: a scan that hits its budget says more, and continuing from nextCursor finds what lies beyond', async () => {

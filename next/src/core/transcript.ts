@@ -53,6 +53,12 @@
  *    began. When the source changes, the next source starts on a fresh line,
  *    under a header line when `label` gives one. A `note` chunk is a line of its
  *    own (a reader's `[… events missing …]` marker), never part of any source.
+ *    A LF that a CSI executes inside it ends a line (`lineEnds`), so the interleave
+ *    can cut a source inside that CSI: the source's next output then begins with
+ *    the CSI's head, as its own parser would still hold it, so the CSI's rest
+ *    reads as the CSI, not as text (the house's review of the 40 commits through
+ *    f3750e4, #22, comment 6310921374: `A ESC [ 3 LF`, a Run's `r1`, then `1mB`
+ *    read `1mB`).
  * 7. Budgets, all visible (G11). `maxInputBytes` caps the UTF-8 bytes projected:
  *    the head or tail (`keep`, default `tail`) is kept, cut on a line boundary
  *    when one lies in the half of the budget nearest the cut and never inside a
@@ -86,7 +92,7 @@ import xterm from '@xterm/headless';
 import type { IBuffer, Terminal as TerminalType } from '@xterm/headless';
 import { persistentState } from './screen.js';
 import { DEFAULT_GEOMETRY } from './types.js';
-import { headIndex, isIntroducer, lineCarry, lineEnds, sequenceEnd, tailStart, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
+import { executedIn, headIndex, isIntroducer, lineCarry, lineEnds, sequenceEnd, tailStart, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
 
 const { Terminal } = xterm;
 
@@ -145,6 +151,25 @@ interface Segment {
   header?: true;
   /** The header that names this segment's source, emitted just before it. */
   named?: Segment;
+  /**
+   * The head of a CSI the data begins inside (rule 6: the interleave cut its source at a LF the CSI
+   * executed), fed just before the data and counted as no input.
+   */
+  head?: string;
+  /** UTF-16 units at the start of `data` that are no input: the head, once it is put before the data to be fed. */
+  lead?: number;
+}
+
+/**
+ * `x`'s data from `at` on. A head it began inside (Segment.head) goes once the cut passes the end of that
+ * CSI, where the data no longer begins inside it.
+ */
+function cutFront(x: { data: string; head?: string }, at: number): void {
+  if (x.head !== undefined && at > 0) {
+    const e = sequenceEnd(x.head + x.data, 0);
+    if (e !== undefined && at >= e - x.head.length) delete x.head;
+  }
+  x.data = x.data.slice(at);
 }
 
 /**
@@ -154,11 +179,15 @@ interface Segment {
  * window title splits nothing: an event cut there let a header land inside the title, and the title's
  * rest showed as text (an independent read of the fix for the house's read of the 33 commits, #22,
  * comment 6307350650). One answer for the projection and for where a tail's lines begin (the reader's
- * Display).
+ * Display). A LF that a CSI executes is a line end too, and `head` is that CSI's head when the last end
+ * is one: what the data after `through` begins inside (rule 6).
  */
-export function interleaveCut(data: string, carry: LineCarry): { ends: number[]; through: number } {
-  const ends = lineEnds(data, carry);
-  return { ends, through: ends.length ? ends[ends.length - 1]! + 1 : 0 };
+export function interleaveCut(data: string, carry: LineCarry): { ends: number[]; through: number; head?: string } {
+  const heads = new Map<number, string>();
+  const ends = lineEnds(data, carry, Number.POSITIVE_INFINITY, false, heads);
+  const last = ends[ends.length - 1];
+  const head = last === undefined ? undefined : heads.get(last);
+  return head === undefined ? { ends, through: last === undefined ? 0 : last + 1 } : { ends, through: last! + 1, head };
 }
 
 /** The byte budget applied while the chunks are gathered (rule 7, Cost): what it dropped, and the lasting state of a dropped head. */
@@ -404,7 +433,12 @@ function lastNonEmpty(buf: IBuffer, from = 0): number {
  * house's read of ed4ecac, #22: a batch cut inside a long OSC let the ED 3 end it,
  * and the rest of its payload printed). Rows are bounded by line feeds (LF, VT,
  * FF, IND, NEL), two per sequence (it can reposition the cursor to force a wrap),
- * and printed cells over the width.
+ * and printed cells over the width. The line feeds a CSI executes inside it count
+ * too, so the batch ends before it when they would not fit (the house's review of
+ * the 40 commits through f3750e4, #22, comment 6310921374: a batch cut inside such
+ * a CSI, its LF read as ending it, and the ED 3 showed the CSI's rest as text); one
+ * CSI holding more of them than the scratch scrollback, which only a malformed one
+ * does, is fed whole, and rows it scrolls past unread are lost, visibly (`lost`).
  */
 function batchEnd(data: string, from: number, budget: number, cols: number): number {
   let feeds = 0;
@@ -421,6 +455,8 @@ function batchEnd(data: string, from: number, budget: number, cols: number): num
       if (e === undefined) return i > from ? i : data.length;
       if (i > from) safe = i;
       escapes++;
+      // The line feeds a CSI executes inside it move the cursor down as any do.
+      for (const k of executedIn(data, i, e)) if (data.charCodeAt(k) >= 0x0a && data.charCodeAt(k) <= 0x0c) feeds++;
       next = e;
     } else if (c === 0x0a || c === 0x0b || c === 0x0c || c === 0x84 || c === 0x85) {
       feeds++;
@@ -467,7 +503,13 @@ const pipeToTty = (s: string): string => s.replace(/\n/g, '\r\n');
 function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label'], budget?: Budget): Segment[] {
   const out: Segment[] = [];
   let outBytes = 0;
-  const held = new Map<string, { info: SourceInfo; pipe: boolean; data: string; bytes: number; full: boolean }>();
+  /** Each source's unfinished line; `head` that of a CSI it begins inside (Segment.head). */
+  const held = new Map<string, { info: SourceInfo; pipe: boolean; data: string; bytes: number; full: boolean; head?: string }>();
+  /**
+   * A source whose next line begins inside a CSI none of whose rest has come yet: the head it begins with.
+   * Held only once that rest comes, so the held ends keep the order the reader's Display gives them.
+   */
+  const pending = new Map<string, string>();
   /** Per source, what its data left unfinished for the line-end rule; a note ends it all, as its CAN does. */
   const carries = new Map<string, LineCarry>();
   let notes = 0;
@@ -505,7 +547,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     if (gone) drop(gone, utf8Length(gone));
     return data.slice(end - before.length);
   };
-  const emit = (key: string, pipe: boolean, info: SourceInfo | undefined, data: string) => {
+  const emit = (key: string, pipe: boolean, info: SourceInfo | undefined, data: string, head?: string) => {
     const bytes = utf8Length(data);
     if (budget?.keep === 'head' && outBytes >= budget.max) {
       drop(data, bytes);
@@ -514,6 +556,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     outBytes += bytes;
     const last = out[out.length - 1];
     if (last && last.key === key) {
+      // The data goes on from where the segment's ends: a head it began inside is in the segment already.
       last.data += data;
       last.bytes += bytes;
     } else {
@@ -525,7 +568,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
         out.push(named);
         outBytes += utf8Length(h);
       }
-      out.push({ key, pipe, data, bytes, ...(named ? { named } : {}) });
+      out.push({ key, pipe, data, bytes, ...(named ? { named } : {}), ...(head !== undefined ? { head } : {}) });
     }
     if (budget?.keep !== 'tail') return;
     // Kept tail: the segments after the first hold the budget, so the first cannot survive the cut.
@@ -540,7 +583,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       const cut = tailStart(end.data, budget.max);
       leaveOpen(end.key, end.data, cut);
       const gone = end.data.slice(0, cut);
-      end.data = end.data.slice(cut);
+      cutFront(end, cut);
       outBytes -= end.bytes;
       end.bytes = utf8Length(end.data);
       outBytes += end.bytes;
@@ -548,7 +591,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     }
   };
   const flush = () => {
-    for (const [key, h] of held) if (h.data) emit(key, h.pipe, h.info, h.data);
+    for (const [key, h] of held) if (h.data) emit(key, h.pipe, h.info, h.data, h.head);
     held.clear();
   };
   for (const ch of chunks) {
@@ -556,6 +599,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       flush();
       carries.clear();
       dropping.clear();
+      pending.clear();
       const n = `${ch.note}\n`;
       emit(`n:${notes++}`, true, undefined, n);
       continue;
@@ -568,7 +612,9 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     let carry = carries.get(key);
     if (!carry) carries.set(key, (carry = lineCarry()));
     const before = carry.open;
-    const { through } = interleaveCut(c.data, carry);
+    const { through, head } = interleaveCut(c.data, carry);
+    // A sequence a tail cut moved past is skipped as it comes, and what comes after it begins inside nothing.
+    if (dropping.has(key)) pending.delete(key);
     const data = skipOpen(key, c.data, before);
     if (!data) continue;
     let h = held.get(key);
@@ -576,7 +622,9 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       // A Run's pipes together are labelled `stdout`.
       const info: SourceInfo = { stream: pipe ? 'stdout' : 'pty' };
       if (pipe && c.runId !== undefined) info.runId = c.runId;
-      h = { info, pipe, data: '', bytes: 0, full: false };
+      const begun = pending.get(key);
+      pending.delete(key);
+      h = { info, pipe, data: '', bytes: 0, full: false, ...(begun !== undefined ? { head: begun } : {}) };
       held.set(key, h);
     }
     // Only the new data is read for a line end, so a long unfinished line costs its length once.
@@ -602,7 +650,8 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
           outBytes = 0;
         }
         const gone = budget.keep === 'tail' ? h.data.slice(0, cut) : h.data.slice(cut);
-        h.data = budget.keep === 'tail' ? h.data.slice(cut) : h.data.slice(0, cut);
+        if (budget.keep === 'tail') cutFront(h, cut);
+        else h.data = h.data.slice(0, cut);
         h.bytes = utf8Length(h.data);
         h.full = budget.keep === 'head';
         drop(gone, utf8Length(gone));
@@ -610,14 +659,18 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       continue;
     }
     if (h.full) drop(data.slice(0, nl + 1), utf8Length(data.slice(0, nl + 1)));
-    emit(key, pipe, h.info, h.full ? h.data : h.data + data.slice(0, nl + 1));
+    emit(key, pipe, h.info, h.full ? h.data : h.data + data.slice(0, nl + 1), h.head);
     // Re-inserted, so the held ends keep the order in which they began.
     held.delete(key);
-    // The line ends outside every sequence, so nothing a cut left open reaches past it.
+    // The line ends outside every control string, so nothing a cut left open reaches past it; one a CSI
+    // executed leaves the rest inside that CSI, which the rest begins with (rule 6), however little of it came.
     h.data = data.slice(nl + 1);
     h.bytes = utf8Length(h.data);
     h.full = false;
+    if (head !== undefined) h.head = head;
+    else delete h.head;
     if (h.data) held.set(key, h);
+    else if (head !== undefined) pending.set(key, head);
   }
   flush();
   return out;
@@ -627,7 +680,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
 function dropHead(segs: Segment[], k: number, at: number, dropped: string[]): void {
   for (let i = 0; i < k; i++) dropped.push(segs[i]!.data);
   dropped.push(segs[k]!.data.slice(0, at));
-  segs[k]!.data = segs[k]!.data.slice(at);
+  cutFront(segs[k]!, at);
   segs[k]!.bytes = utf8Length(segs[k]!.data);
   segs.splice(0, k);
   if (!segs[0]!.data) segs.shift();
@@ -710,7 +763,7 @@ function cutToLastNewlines(segs: Segment[], n: number, rows: number, dropped: st
     // A header is no line of output: `maxLines` does not count it.
     if (seg.header) continue;
     const d = seg.data;
-    const ends = lineEnds(d);
+    const ends = lineEnds(d, { open: seg.head ?? '' });
     let e = ends.length - 1;
     let i = d.length;
     let sw = k in lastSwitch ? lastSwitch[k] : seg.pipe ? undefined : altSwitchBefore(d, i);
@@ -760,6 +813,14 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
     segs.unshift(first.named);
     omitted -= first.named.bytes;
   }
+  // A segment that begins inside a CSI is fed that CSI's head first (rule 6), as no input.
+  for (const seg of segs) {
+    if (seg.head === undefined) continue;
+    seg.data = seg.head + seg.data;
+    seg.lead = seg.head.length;
+    delete seg.head;
+  }
+  const input = (seg: Segment, from = 0) => utf8Length(seg.data.slice(Math.max(from, seg.lead ?? 0)));
   // The omitted head still set lasting terminal state (rule 7): a scroll region, modes, character sets.
   // It applies before the first thing kept, a restored header too, as before a header a cut kept whole,
   // so a header lands in the state of the lines it names.
@@ -777,7 +838,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
       while (pos < seg.data.length) {
         if (keep === 'head' && pr.out.lines.length > maxLines + headersFed) {
           // The first maxLines lines are complete: the rest is not projected (rule 7).
-          omitted += utf8Length(seg.data.slice(pos)) + segs.slice(s + 1).reduce((a, x) => a + utf8Length(x.data), 0);
+          omitted += input(seg, pos) + segs.slice(s + 1).reduce((a, x) => a + input(x), 0);
           break outer;
         }
         const end = batchEnd(seg.data, pos, pr.budget, cols);

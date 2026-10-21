@@ -126,11 +126,93 @@ const C1_STRING = new Set([0x90, 0x98, 0x9d, 0x9e, 0x9f]);
 /** Whether `c` begins a control sequence: ESC, the C1 CSI, or a C1 control string's introducer. */
 export const isIntroducer = (c: number): boolean => c === 0x1b || c === 0x9b || C1_STRING.has(c);
 
-/** Whether a control string (OSC, DCS, SOS, PM, APC) begins at `data[i]`: ESC and its second byte, or the C1 form. */
+/**
+ * A C0 control the emulator executes inside an escape sequence or a CSI, leaving the sequence open
+ * (every C0 but CAN and SUB, which abort it, and ESC, which begins another), or DEL, which it ignores
+ * there: `A ESC [ 3 LF C B` shows `A`, then `    B`, the LF moving the cursor down and `C` then ending
+ * the CSI (the house's review of the 40 commits through f3750e4, #22, comment 6310921374).
+ */
+const executedInside = (c: number): boolean => (c < 0x20 && c !== 0x18 && c !== 0x1a && c !== 0x1b) || c === 0x7f;
+
+/** Where the byte that says what an ESC begins lies: the first after it that is not executed or ignored in the escape state (`ESC LF [` opens a CSI). */
+function escKind(data: string, e: number): number {
+  let i = e + 1;
+  while (i < data.length && executedInside(data.charCodeAt(i))) i++;
+  return i;
+}
+
+/** Whether a control string (OSC, DCS, SOS, PM, APC) begins at `data[i]`: ESC and the byte that says what it begins, or the C1 form. */
 export const isStringStart = (data: string, i: number): boolean => {
   const c = data.charCodeAt(i);
-  return C1_STRING.has(c) || (c === 0x1b && /[\]PX^_]/.test(data[i + 1] ?? ''));
+  return C1_STRING.has(c) || (c === 0x1b && /[\]PX^_]/.test(data[escKind(data, i)] ?? ''));
 };
+
+/**
+ * The C0 controls inside the sequence `data[start..end)` that the emulator executes as it reads it, by
+ * index: all of a CSI's or an escape sequence's, and of a control string's only those between its ESC
+ * and the byte that says what it is, since its payload's are payload. A reader takes them out of the
+ * sequence and applies them where they stand, as if written before it: no character of the sequence is
+ * shown, and a LF among them ends a line (the same review: `sequenceEnd` ended a CSI at its LF, and the
+ * CSI's rest read as text).
+ */
+export function executedIn(data: string, start: number, end: number): number[] {
+  const stop = !isStringStart(data, start) ? end : data.charCodeAt(start) === 0x1b ? escKind(data, start) : start + 1;
+  const out: number[] = [];
+  for (let k = start + 1; k < stop; k++) if (data.charCodeAt(k) < 0x20) out.push(k);
+  return out;
+}
+
+/** The CSI or escape sequence `data[start..end)` as the emulator parses it: without the C0 controls it executes and the DEL it ignores. */
+export function sequenceText(data: string, start: number, end: number): string {
+  let text = '';
+  for (let k = start; k < end; k++) if (!executedInside(data.charCodeAt(k))) text += data[k];
+  return text;
+}
+
+/**
+ * The longest head `sequenceHead` keeps as written: a longer one, which only a malformed sequence
+ * reaches, is kept in a short form that leaves the parser in the same state, so a carry stays small.
+ */
+const HEAD_MAX = 64;
+
+/**
+ * The part of the CSI or escape sequence beginning at `data[start]` that lies before `upto`, its
+ * executed C0 controls and DEL taken out: what a piece of text that begins at `upto`, inside the
+ * sequence, begins with to be read as the sequence goes on. A head longer than HEAD_MAX is shortened
+ * to its introducer and what keeps the parser's state (a parameter, an intermediate, or the state that
+ * ignores the rest), so only an in-line control's argument (cleanLine) can read differently.
+ */
+export function sequenceHead(data: string, start: number, upto: number): string {
+  const head = sequenceText(data, start, upto);
+  if (head.length <= HEAD_MAX) return head;
+  if (head.charCodeAt(0) === 0x1b && head[1] !== '[') return /[\x20-\x2f]/.test(head.slice(1)) ? '\x1b ' : '\x1b';
+  const intro = head.charCodeAt(0) === 0x9b ? '\x9b' : '\x1b[';
+  return intro + ['', '0', ' ', '0?'][csiState(head.slice(intro.length))]!;
+}
+
+/** The state a CSI's parameter bytes leave its parser in, as the emulator's table moves it: 0 entry, 1 parameter, 2 intermediate, 3 ignoring the rest. */
+function csiState(params: string): CsiState {
+  let st: CsiState = 0;
+  for (let k = 0; k < params.length; k++) st = csiStep(st, params.charCodeAt(k));
+  return st;
+}
+
+type CsiState = 0 | 1 | 2 | 3;
+
+/** Where one parameter or intermediate byte (0x20–0x3f) moves a CSI's parser from state `st` (see csiState). */
+function csiStep(st: CsiState, c: number): CsiState {
+  if (st === 3) return 3;
+  if (c <= 0x2f) return 2; // an intermediate
+  if (st === 2) return 3; // a parameter byte after an intermediate
+  if (st === 1 && c >= 0x3c) return 3; // a private marker after parameters
+  return 1;
+}
+
+/** The head of the CSI or escape sequence that `data[index]` lies inside (sequenceHead), '' when none does or it is a control string. */
+export function headAt(data: string, index: number): string {
+  const inside = enclosingSequence(data, index, SEQUENCE_LOOKBACK);
+  return inside && !isStringStart(data, inside.start) ? sequenceHead(data, inside.start, index) : '';
+}
 
 /** The introducers, for finding the next one. */
 const INTRODUCER = /[\x1b\x90\x98\x9b\x9d-\x9f]/g;
@@ -145,8 +227,15 @@ const INTRODUCER = /[\x1b\x90\x98\x9b\x9d-\x9f]/g;
  * and its cuts, `tailStart`, the segmenter's lines and the watches' (the house's read of the 33
  * commits, #22, comment 6307350650, item 2, and an independent read of the fix: only the tail kept it,
  * and a page, a search and the projection split a title in two).
+ *
+ * A LF inside a CSI or an escape sequence ends a line too: the emulator executes it there, and the
+ * sequence goes on into the next line (executedIn). Such an end is reported only when `inside` is given,
+ * with the head the line after it begins with (sequenceHead), since a cut there would split the
+ * sequence: a reader of lines passes it and starts the next line with that head; a reader that cuts at
+ * the ends it gets passes none, and only counts one line fewer for each, which keeps more input, never
+ * less (the house's review of the 40 commits through f3750e4, #22, comment 6310921374).
  */
-export function lineEnds(data: string, carry: LineCarry = lineCarry(), max = Number.POSITIVE_INFINITY, cr = false): number[] {
+export function lineEnds(data: string, carry: LineCarry = lineCarry(), max = Number.POSITIVE_INFINITY, cr = false, inside?: Map<number, string>): number[] {
   const t = carry.open + data;
   const skip = carry.open.length;
   carry.open = '';
@@ -165,18 +254,30 @@ export function lineEnds(data: string, carry: LineCarry = lineCarry(), max = Num
     if (lf !== -1 && lf < i) lf = t.indexOf('\n', i);
     if (ret !== -1 && ret < i) ret = t.indexOf('\r', i);
   };
+  const next = () => (lf === -1 ? ret : ret === -1 ? lf : Math.min(lf, ret));
   while (ends.length < max) {
-    const nl = lf === -1 ? ret : ret === -1 ? lf : Math.min(lf, ret);
+    const nl = next();
     if (at !== -1 && (nl === -1 || at < nl)) {
       const e = sequenceEnd(t, at);
+      const str = isStringStart(t, at);
+      // The line feeds the sequence executes end lines inside it (see above): a CSI's or an escape
+      // sequence's anywhere in it, a control string's only before the byte that says what it is.
+      const stop = !str ? (e ?? t.length) : t[at] === '\x1b' ? escKind(t, at) : at + 1;
+      for (i = at + 1, advance(); next() !== -1 && next() < stop && ends.length < max; i = next() + 1, advance()) {
+        if (!inside) continue;
+        ends.push(next() - skip);
+        inside.set(next() - skip, sequenceHead(t, at, next()));
+      }
       if (e === undefined) {
-        // Open to the end of the data: its introducer, and a last ESC that may begin a string's terminator.
-        const intro = t.slice(at, at + (t.charCodeAt(at) === 0x1b ? 2 : 1));
-        carry.open = intro + (isStringStart(t, at) && t.length > at + intro.length && t.endsWith('\x1b') ? '\x1b' : '');
+        if (str) {
+          // Open to the end of the data: its introducer, and a last ESC that may begin a string's terminator.
+          const body = t[at] === '\x1b' ? escKind(t, at) + 1 : at + 1;
+          carry.open = (t[at] === '\x1b' ? `\x1b${t[body - 1]}` : t[at]!) + (t.length > body && t.endsWith('\x1b') ? '\x1b' : '');
+        } else if (ends.length < max) carry.open = sequenceHead(t, at, t.length);
         break;
       }
-      // A string's payload is skipped whole; any other sequence's line feeds still execute.
-      i = isStringStart(t, at) ? e : at + 1;
+      // Past the sequence: a string's payload is skipped whole.
+      i = e;
       at = nextIntroducer(i);
       advance();
       continue;
@@ -200,8 +301,10 @@ export function countLines(s: string): number {
  * Output with its control sequences and control characters (other than tab and newline; DEL and
  * the C1 controls included) removed, and where each kept character came from, for cuts in the raw text. The sequences are read by
  * `sequenceEnd`, one grammar with `safeCut` and `unfinishedSequence`: a charset designation such as
- * `ESC ( B` goes whole (the house's read of ed4ecac, #22: a two-byte rule left its `B`). An
- * unfinished sequence takes the rest of the text with it.
+ * `ESC ( B` goes whole (the house's read of ed4ecac, #22: a two-byte rule left its `B`). The tabs
+ * and newlines a CSI or an escape sequence executes inside it stay, where they stand (executedIn):
+ * `A ESC [ 3 LF C B` reads `A`, a newline, `B`. An unfinished sequence takes the rest of the text with
+ * it, what it has executed so far excepted.
  */
 export function stripEscapes(s: string): { text: string; map: number[] } {
   const map: number[] = [];
@@ -210,6 +313,11 @@ export function stripEscapes(s: string): { text: string; map: number[] } {
     const c = s.charCodeAt(i);
     if (isIntroducer(c)) {
       const end = sequenceEnd(s, i);
+      for (const k of executedIn(s, i, end ?? s.length)) {
+        if (s[k] !== '\t' && s[k] !== '\n') continue;
+        map.push(k);
+        text += s[k];
+      }
       if (end === undefined) break;
       i = end;
       continue;
@@ -233,6 +341,12 @@ export function stripEscapes(s: string): { text: string; map: number[] } {
  */
 const SEQUENCE_LOOKBACK = 4096;
 
+/** CAN and SUB, which abort an escape sequence or a CSI, ESC, which begins another, and the C1 controls, which end it and act. */
+const endsEscape = (c: number): boolean => c === 0x18 || c === 0x1a || c === 0x1b || (c >= 0x80 && c <= 0x9f);
+
+/** The UTF-16 units of the character at `data[k]`: a surrogate pair goes whole. */
+const charUnits = (data: string, k: number): number => (isHigh(data.charCodeAt(k)) && k + 1 < data.length && isLow(data.charCodeAt(k + 1)) ? 2 : 1);
+
 /**
  * Index after the control sequence starting at `data[e]` (ESC, the C1 CSI, or a C1 string's
  * introducer), or undefined when it does not end within `data`. A string ends where the pinned
@@ -245,39 +359,60 @@ const SEQUENCE_LOOKBACK = 4096;
  * the emulator ended `ESC ] 0 ; my CAN` at the CAN, and opened an OSC at U+009D, where this read
  * on; and a reviewer's read of the fixes for #22: a BEL inside an APC ended it here and not there,
  * so the APC's payload was text, and a U+009B inside a title opened a CSI there and was payload here).
+ *
+ * An escape sequence and a CSI end where the emulator's table ends them too (the house's review of
+ * the 40 commits through f3750e4, #22, comment 6310921374: `A ESC [ 3 LF C B` ended at the LF here,
+ * and `C B` read as text where the emulator shows `    B`). A C0 control inside one is executed and
+ * the sequence goes on (executedIn says which); DEL is ignored; CAN and SUB abort it, and ESC or any
+ * C1 control ends it and acts. A CSI ends at its final byte (0x40–0x7e); a code point from U+00A0 is
+ * an error that ends it, taken with it, except once a misplaced byte has set the CSI to ignore the rest,
+ * where it is ignored. An ESC is followed by intermediates (0x20–0x2f) and one final byte (0x30–0x7e,
+ * or a code point from U+00A0, taken as an error): ESC 7, ESC =, ESC M are two bytes, `ESC ( B` three
+ * (the house's read of b047b92), and the byte after ESC and its C0 controls says whether it opens a
+ * CSI or a string instead (`ESC LF [ 31 m` sets red).
  */
 export function sequenceEnd(data: string, e: number): number | undefined {
   let i = e + 1;
   const c0 = data.charCodeAt(e);
-  let kind: 'csi' | 'string' | 'esc';
+  let kind: 'csi' | 'string';
   // The string's own introducer, as its C1 form: OSC (U+009D), DCS (U+0090), SOS, PM, APC.
   let str = c0;
   if (c0 === 0x9b) kind = 'csi';
   else if (C1_STRING.has(c0)) kind = 'string';
   else {
-    const c1 = data[i];
-    if (c1 === undefined) return undefined;
-    if (c1 === '[') kind = 'csi';
-    else if (c1 === ']' || c1 === 'P' || c1 === 'X' || c1 === '^' || c1 === '_') {
+    i = escKind(data, e);
+    if (i >= data.length) return undefined;
+    const c1 = data.charCodeAt(i);
+    if (endsEscape(c1)) return i;
+    if (c1 === 0x5b) kind = 'csi';
+    else if (c1 === 0x5d || c1 === 0x50 || c1 === 0x58 || c1 === 0x5e || c1 === 0x5f) {
       kind = 'string';
-      str = c1.charCodeAt(0) + 0x40;
-    } else kind = 'esc';
-    i++;
-    if (kind === 'esc') {
-      // ESC, intermediates (0x20–0x2f), then one final byte (0x30–0x7e). With no intermediate the
-      // byte after ESC is the final one: ESC 7, ESC 8, ESC =, ESC >, ESC M are two bytes (the house's
-      // read of b047b92: xterm's keypad modes are ESC = and ESC >).
-      const first = data.charCodeAt(i - 1);
-      if (first < 0x20 || first > 0x2f) return i; // the final byte, or a malformed sequence ending here
-      while (i < data.length && data.charCodeAt(i) >= 0x20 && data.charCodeAt(i) <= 0x2f) i++;
-      return i < data.length ? i + 1 : undefined;
+      str = c1 + 0x40;
+    } else {
+      for (; i < data.length; i++) {
+        const c = data.charCodeAt(i);
+        if (executedInside(c) || (c >= 0x20 && c <= 0x2f)) continue;
+        return endsEscape(c) ? i : i + charUnits(data, i);
+      }
+      return undefined;
     }
+    i++;
   }
   if (kind === 'csi') {
+    let st: CsiState = 0;
     for (; i < data.length; i++) {
       const c = data.charCodeAt(i);
       if (c >= 0x40 && c <= 0x7e) return i + 1;
-      if (c < 0x20 || c > 0x7e) return i; // malformed: taken as ending here
+      if (endsEscape(c)) return i;
+      if (executedInside(c)) continue;
+      if (c >= 0xa0) {
+        if (st === 3) {
+          i += charUnits(data, i) - 1;
+          continue;
+        }
+        return i + charUnits(data, i);
+      }
+      st = csiStep(st, c);
     }
     return undefined;
   }

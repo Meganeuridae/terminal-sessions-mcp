@@ -994,3 +994,18 @@ test('a completion reads a negative journaled duration as no time, and a digest 
   assert.ok(elapsed >= 90_000, `the monotonic interval: ${elapsed} ms`);
   assert.match(digest.head, /running `cmd-long` \d+m\d\ds/, digest.head);
 });
+
+test('a digest reads a LF a CSI executes as a line end, and the line after it reads the CSI on: its rest is no text (the house’s review of the 40 commits through f3750e4, #22, comment 6310921374)', async () => {
+  const src = fakeSource();
+  startRun(src, 'r');
+  const seg = new Segmenter(src, { cadenceMs: 30 });
+  try {
+    const seen = collect(seg);
+    src.journal.append({ type: 'output', data: 'A\x1b[3\r\n', stream: 'pty', runId: 'r' });
+    src.journal.append({ type: 'output', data: '1mB here\r\n', stream: 'pty', runId: 'r' });
+    await until(() => seen.some((s) => s.kind === 'output'), 2000, 'a digest');
+    assert.deepEqual(seen.filter((s) => s.kind === 'output').at(-1)!.body?.split('\n'), ['A', 'B here']);
+  } finally {
+    await seg.dispose();
+  }
+});

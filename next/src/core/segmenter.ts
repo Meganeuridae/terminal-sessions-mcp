@@ -1122,9 +1122,13 @@ export class Segmenter {
    */
   private feedLines(w: RunWatch, data: string, _stream: OutputStream): void {
     let buf = w.carry + data;
+    const off = w.carry.length;
     // Lines end by the one rule (lineEnds): a LF inside a window title ends none (an independent read of
-    // the fix for the house's read of the 33 commits, #22, comment 6307350650).
-    const ends = lineEnds(data, w.scan).map((e) => e + w.carry.length);
+    // the fix for the house's read of the 33 commits, #22, comment 6307350650). One a CSI executes ends one,
+    // and the next begins with the CSI's head (the house's review of the 40 commits through f3750e4, #22).
+    const heads = new Map<number, string>();
+    const ends = lineEnds(data, w.scan, Number.POSITIVE_INFINITY, false, heads).map((e) => e + off);
+    const headAfter = (end: number) => heads.get(end - off) ?? '';
     const nl = ends.length ? ends[ends.length - 1]! : -1;
     if (nl !== -1) {
       const fresh: string[] = [];
@@ -1139,11 +1143,11 @@ export class Segmenter {
       // Only the newest lines can survive, so read back from the end until there are enough.
       for (let k = ends.length - 1; k >= first && fresh.length < DIGEST_LINES; k--) {
         const start = k > 0 ? ends[k - 1]! : -1;
-        const line = cleanLine(buf.slice(start + 1, ends[k])).trimEnd();
+        const line = cleanLine((k > 0 ? headAfter(start) : '') + buf.slice(start + 1, ends[k])).trimEnd();
         if (line && !w.preamble?.echo.test(line)) fresh.push(line);
       }
       this.pushLines(w, fresh.reverse());
-      buf = buf.slice(nl + 1);
+      buf = headAfter(nl) + buf.slice(nl + 1);
     }
     if (buf.length > CARRY_MAX) {
       // A line that never ends (a progress bar): what follows its last carriage return is what shows.
