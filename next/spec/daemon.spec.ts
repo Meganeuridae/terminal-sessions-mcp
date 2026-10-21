@@ -313,6 +313,42 @@ test("--log-file: a startup failure found after the log opened is said on stderr
   }
 });
 
+test("--log-file: a startup failure no check foresaw (a data dir under a regular file) is said on stderr as well as in the log (the house's read of the 38 commits, #22 comment 6274806357)", async () => {
+  const file = path.join(tmp, 'a-regular-file');
+  fs.writeFileSync(file, '');
+  const log = path.join(tmp, 'logs-notdir', 'termd.log');
+  const d = termd(['--port', '0', '--data-dir', path.join(file, 'sub'), '--no-usage-log', '--log-file', log]);
+  assert.equal(await d.exited, 1);
+  // The exit can be seen before the last of stderr is read.
+  await until(() => /"msg":"fatal"/.test(d.lines.join('\n')), 5000, 'the fatal line on stderr');
+  assert.match(d.lines.join('\n'), /"msg":"fatal".*ENOTDIR/, 'the cause is on stderr');
+  assert.match(fs.readFileSync(log, 'utf8'), /ENOTDIR/, 'and in the log');
+});
+
+test("a startup failure reaches a pipe whose reader is behind whole: termd exits from the write's callback, not straight after the write (the house's read of the 38 commits, #22 comment 6274806357)", async () => {
+  // A refusal of 70 KB, more than a pipe holds (64 KiB), on a stderr whose reader sleeps before it
+  // reads, as a supervisor or shim that is behind might. termd refuses within about 150 ms of its
+  // start; an exit straight after the write lost what the pipe could not hold (65,536 bytes arrived).
+  // A pipe to this process would not show it: Node reads a child's pipe into its own buffer at once.
+  const big = 'x'.repeat(70_000);
+  const reader = spawn('/bin/sh', ['-c', 'sleep 0.5; exec cat'], { stdio: ['pipe', 'pipe', 'ignore'] });
+  let out = '';
+  reader.stdout!.on('data', (b: Buffer) => (out += b.toString()));
+  const read = new Promise<void>((r) => reader.on('close', () => r()));
+  const child = spawn(process.execPath, [DAEMON, '--port', '0', '--data-dir', path.join(tmp, 'dbig'), '--allow-host', big], {
+    env: { ...process.env, HOME: path.join(tmp, 'home') },
+    cwd: tmp,
+    stdio: ['ignore', 'ignore', reader.stdin!],
+  });
+  // termd holds the pipe's write end now; cat sees the end of its input when termd exits.
+  reader.stdin!.destroy();
+  const exited = new Promise<number | null>((r) => child.on('exit', (code) => r(code)));
+  assert.equal(await exited, 2);
+  await read;
+  assert.ok(out.length > 70_000 && out.endsWith('\n'), `the line arrived whole: ${out.length} bytes, ending ${JSON.stringify(out.slice(-40))}`);
+  assert.match(out.slice(-200), /is not a host name/);
+});
+
 test('readiness: SIGTERM at the listening announcement drains cleanly', async () => {
   const file = path.join(tmp, 'ready.log');
   // Act as a supervisor that signals at the instant readiness becomes visible.

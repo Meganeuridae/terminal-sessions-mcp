@@ -456,9 +456,10 @@ test("tg-19: a featureSets/update the daemon refused without running it (the in-
     // A Run that never ends, and 128 waits on it: the daemon's bound on requests in flight is full.
     s.send(call(3, 'run', { session: 'ov', command: 'sleep 30', wait: 100 }));
     const run = structured(await s.next(byId(3)));
-    assert.equal(run.state, 'running', JSON.stringify(run));
+    // Running, or still starting under load after the call's 100 ms: either way it never ends, so every wait on it stays in flight.
+    assert.ok(['queued', 'starting', 'running'].includes(run.state as string), JSON.stringify(run));
     for (let i = 0; i < 128; i++) s.send(call(100 + i, 'await', { runId: run.runId, wait: 8000 }));
-    await until(() => [...conns(d.server)].some((c) => c.inFlight >= 128), 5000, 'the bound to be full');
+    await until(() => [...conns(d.server)].some((c) => c.inFlight >= 128), 10_000, 'the bound to be full');
     // A wider grant now is refused unrun — the daemon says so — and the lane is as it was.
     s.send({ jsonrpc: '2.0', id: 4, method: 'featureSets/update', params: { effectiveCapabilities: [...narrow, 'channels.lifecycle'] } });
     const refused = await s.next(byId(4));
@@ -467,8 +468,12 @@ test("tg-19: a featureSets/update the daemon refused without running it (the in-
     const first = laneOf(d)!;
     assert.equal(first.has('channels.lifecycle'), false);
     for (const c of conns(d.server)) c.ws.terminate();
-    // The waits fail with -32000 (their outcome is unknown); the replay is initialize and the grant,
-    // nothing else: the refused update, run afresh, would widen the lane past what the host was told.
+    // The waits fail with -32000 (their outcome is unknown). Once one has, the shim has seen the drop,
+    // so the ping goes over the new connection: sent at once, it could reach the shim before the close
+    // did and fail with the waits. The replay is initialize and the grant, nothing else: the refused
+    // update, run afresh, would widen the lane past what the host was told.
+    const dropped = await s.next(byId(100), 8000);
+    assert.equal(dropped.error?.code, -32000, JSON.stringify(dropped));
     s.send({ jsonrpc: '2.0', id: 5, method: 'ping' });
     assert.deepEqual((await s.next(byId(5), 8000)).result, {});
     const second = laneOf(d)!;
@@ -631,19 +636,24 @@ test("tg-19: a handshake the peer accepts but never answers is given up and trie
   }
 });
 
-test("tg-19: reconnects back off (the house's read of 4e37a11, #22)", async () => {
-  let accepted = 0;
+test("tg-19: reconnects back off: each attempt waits at least half its delay after the one before, so attempts are bounded by the time elapsed (the house's read of 4e37a11, #22; of the 38 commits, #22 comment 6274935728)", async () => {
+  // When each attempt reached the listener. A count after a fixed 1.5 s read a slow start or late
+  // timers under load as a defect; load only lengthens the gaps.
+  const at: number[] = [];
   const srv = net.createServer((sock) => {
-    accepted++;
+    at.push(performance.now());
     sock.destroy();
   });
   await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
   const s = shim({ TSM_URL: `ws://127.0.0.1:${(srv.address() as net.AddressInfo).port}`, TSM_CONNECT_TIMEOUT_MS: '5000' });
   try {
     s.send(init(1));
-    await new Promise((r) => setTimeout(r, 1500));
-    // Attempts 100, 200, 400 and 800 ms apart: a handful in the first 1.5 s, not hundreds.
-    assert.ok(accepted >= 2 && accepted <= 6, `${accepted} connection attempts in 1.5 s`);
+    await until(() => at.length >= 4, 20_000, () => `four connection attempts (${at.length} so far)`);
+    // The delays are 100, 200, 400 ms …, doubling to 5 s; without them attempts come a few ms apart.
+    // Half the delay is the bound, since this process may see an attempt late and the next one on time.
+    const gaps = at.slice(1).map((t, i) => t - at[i]!);
+    const shown = gaps.map((g) => g.toFixed(0)).join(', ');
+    gaps.forEach((g, i) => assert.ok(g >= Math.min(5000, 100 * 2 ** i) / 2, `attempt ${i + 2} came ${g.toFixed(0)} ms after the one before (gaps: ${shown} ms)`));
   } finally {
     s.child.kill();
     srv.close();

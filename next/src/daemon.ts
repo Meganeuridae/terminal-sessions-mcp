@@ -193,14 +193,17 @@ class RotatingFile {
   }
 }
 
-/** One record to where log lines go; with `toStderr`, to stderr as well when a log file has it (a startup failure, see `fail`). */
-function write(rec: LogRecord, toStderr = false): void {
-  if (LEVELS[rec.level] < LEVELS[minLevel]) return;
+/**
+ * One record to where log lines go; with `toStderr`, to stderr as well when a log file has it (a
+ * startup failure, see `fail`). `done` is called once the record is out, or once it is clear it cannot be.
+ */
+function write(rec: LogRecord, toStderr = false, done?: () => void): void {
+  if (LEVELS[rec.level] < LEVELS[minLevel]) return done?.();
   const line = JSON.stringify(rec) + '\n';
   if (logFile) {
     try {
       logFile.write(line);
-      if (!toStderr) return;
+      if (!toStderr) return done?.();
     } catch (e) {
       // Once: the file is given up and stderr takes over, starting with why (the house's read of 59f660b, #22).
       const file = logFile.file;
@@ -209,11 +212,12 @@ function write(rec: LogRecord, toStderr = false): void {
       log('warn', 'log file given up after a write error; logging to stderr', { file, error: errText(e) });
     }
   }
-  if (stderrGone) return;
+  if (stderrGone) return done?.();
   try {
-    process.stderr.write(line);
+    process.stderr.write(line, () => done?.());
   } catch {
     stderrGone = true;
+    done?.();
   }
 }
 
@@ -330,15 +334,27 @@ class OwnedProcessGroups implements ExecutionBackend {
 const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T | undefined> =>
   Promise.race([p, new Promise<undefined>((r) => setTimeout(() => r(undefined), ms).unref())]);
 
+/** Thrown by `fail` so the startup code stops where it is while the process ends; main's catch lets it pass. */
+class StartupExit extends Error {}
+
 /**
  * A startup failure: logged, and said on stderr even once the log file has taken over, since what
  * started this termd reads stderr — the shim quotes it, a supervisor's journal keeps it — and a port
  * in use or a locked data dir, found after the log opens, otherwise left them only an exit code (the
- * house's read of the shim, #22 comment 6269349177).
+ * house's read of the shim, #22 comment 6269349177). The process ends once the line is out, a second
+ * at most: an exit straight after the write cut the line at the pipe's buffer when the reader was
+ * behind, as tsm's end() already knew (the house's read of the 38 commits, #22 comment 6274806357).
  */
+function exiting(message: string, code: number, fields: Record<string, unknown> = {}): void {
+  process.exitCode = code;
+  write(record('error', message, fields), true, () => process.exit(code));
+  setTimeout(() => process.exit(code), 1000).unref();
+}
+
+/** `exiting`, and no return: nothing past the failing check may run while the line goes out. */
 function fail(message: string, code = 2): never {
-  write(record('error', message), true);
-  process.exit(code);
+  exiting(message, code);
+  throw new StartupExit(message);
 }
 
 /**
@@ -726,6 +742,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  log('error', 'fatal', { error: errText(e) });
-  process.exit(1);
+  // A failure no check foresaw is said the same way as one `fail` did, on stderr as well as in the
+  // log, as the help text promises (the house's read of the 38 commits, #22 comment 6274806357).
+  if (!(e instanceof StartupExit)) exiting('fatal', 1, { error: errText(e) });
 });
