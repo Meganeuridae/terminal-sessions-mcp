@@ -239,7 +239,8 @@ function holdsForInput(pid: number, tty: string, proc: ProcFs): boolean | undefi
   try {
     fds = proc.readdir(`/proc/${pid}/fd`);
   } catch (e) {
-    return errCode(e) === 'ENOENT' ? false : undefined; // gone meanwhile: it reads nothing
+    // Gone meanwhile, it reads nothing; but ENOENT alone is not "gone", as for its stat (procStatOf).
+    return errCode(e) === 'ENOENT' && proc.exists(pid) === false ? false : undefined;
   }
   for (const n of fds) {
     if (n === '1' || n === '2') continue;

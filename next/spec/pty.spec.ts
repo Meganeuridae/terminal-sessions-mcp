@@ -550,6 +550,8 @@ test('the Linux reader walk answers unknown for a process it cannot read, in the
     ['a descendant whose stat cannot be read (hidepid=1)', { 100: shell('101'), 101: { stat: fault('EACCES') } }, undefined],
     ['a descendant hidden as missing that still exists (hidepid=2)', { 100: shell('101'), 101: { exists: true } }, undefined],
     ['a descendant that exited meanwhile', { 100: shell('101') }, false],
+    ['a member whose descriptors read as missing while it still exists (hidepid=2)', { 100: shell('101'), 101: { stat: statLine(101, 100), fds: fault('ENOENT'), exists: true } }, undefined],
+    ['a member that exited between its stat and its descriptors', { 100: shell('101'), 101: { stat: statLine(101, 100), fds: fault('ENOENT'), exists: false } }, false],
     ['a descendant in its own group whose children cannot be read', { 100: shell('101'), 101: { stat: statLine(101, 101), children: fault('EACCES') } }, undefined],
     ['a grandchild in the group, under a child in its own', { 100: shell('101'), 101: { stat: statLine(101, 101), children: '102' }, 102: { stat: statLine(102, 100), fds: { '0': TTY } } }, true],
     ['no children files: every process, a member reading', { 100: shell(fault('ENOENT')), 200: { stat: statLine(200, 100), fds: { '0': TTY } } }, true],
