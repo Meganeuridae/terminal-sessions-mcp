@@ -705,14 +705,16 @@ at a prompt the line does not follow within 300 ms of the prompt's end mark (the
 Until that end mark comes it waits up to 3 s from the prompt's start, so a prompt that has
 stopped carrying one is still given up; a shell whose prompts have shown no end mark gets the
 300 ms from the start. It types the line only when the terminal's mode is a line editor's
-(ICANON and ECHO off, on four reads 50 ms apart) and no process other than the shell can read
-the terminal; otherwise it types nothing, the shell's next prompt is the answer, and until then
-the shell is busy as `cancel-unanswered`, with no bound. The gate's limit is a readline-mode
-`read -e` in the shell itself, as a DEBUG trap of the user's may run: it sets the editor's mode
-and is the shell, so it passes, takes the empty line as its answer, and the session recovers
-through the grace at the shell's next prompt. Under the marker strategy the end-marker probe's
-answer shows the shell reads lines again: the Run ends `lost` (`exit-unobserved`) unless a
-cancel in progress ended it, and the shell is available.
+(ICANON and ECHO off, on four reads 50 ms apart), no member of the terminal's foreground group
+but the shell holds it on descriptor 0 or one above 2 (`PtyHandle.otherReader` names what that
+check cannot see), and no input was sent to the shell since the last `^C`; otherwise it types
+nothing, the shell's next prompt is the answer, and until then the shell is busy as
+`cancel-unanswered`, with no bound. The gate's limit is a readline-mode `read -e` in the shell
+itself, as a DEBUG trap of the user's may run: it sets the editor's mode and is the shell, so it
+passes, takes the empty line as its answer, and the session recovers through the grace at the
+shell's next prompt. Under the marker strategy the end-marker probe's answer shows the shell
+reads lines again: the Run ends `lost` (`exit-unobserved`) unless a cancel in progress ended it,
+and the shell is available.
 
 ---
 
