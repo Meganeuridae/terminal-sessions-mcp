@@ -599,17 +599,18 @@ program that needs a terminal. A human typing at the prompt produces the same ma
 same Run, with `origin: human`.
 
 *Fallback strategy* (`integration: none`): PR #7's mechanism — the command file plus
-`; echo "<<<EXI""T:<nonce>:$?>>>"` on the same line, resolved by nonce, buffer cut at the
-marker (`$status` under fish). A `^C` that aborts the marker's echo is followed, once the
-shell's own group holds the terminal again, by the marker alone as a probe, so a cancelled
+`; { printf '%s:%s>>>\n' "<<<EXI""T:<nonce>" "$?"; } 2>/dev/null` on the same line, resolved by
+nonce, buffer cut at the marker (`$status` and no group under fish), so a trace of the line never
+holds a whole mark. A `^C` that aborts the end mark's printf is followed, once the
+shell's own group holds the terminal again, by the mark alone as a printf-built probe, so a cancelled
 marker Run still ends. The command file's first line prints `<<<START:<nonce>:<pid>>>>`,
 keeping the shell's status for the body, and the Run's output is cut at that mark, so
 whatever the shell printed before it ran the file (the typed line's echo, a still-starting
 shell's banner and second echo) goes, and a line in the echo's shape after it is the
 program's; a file that never ran prints no mark, and its echo is cut by the echo rule. The
 extra first line means a shell's own error messages name a line of the body one later than
-written. dash and bash trace none of that line under `set -x`; zsh and fish write their
-traces of it to their own stderr, after the mark. Both strategies produce identical result
+written. No shell traces any of the start line after the mark; dash, bash and zsh trace neither
+the end mark nor the probe, and fish's traces of them are cut by the nonce. Both strategies produce identical result
 shapes.
 
 *Declared shell* (inline strategy). After `ssh host`, `sudo -i`, `docker exec -it … bash`, a
