@@ -1005,8 +1005,10 @@ test('a Run the close cut short is lost, though the shell reports its job’s en
     }
   }
   // A Run that finished before the close, its end mark unread when the close began, keeps its own end:
-  // 0, or a status the program chose. Only the status of a job the close's signals killed is the close's.
-  for (const exit of [0, 2]) {
+  // 0, or a status the program chose. Only the status of a job a signal the close had sent killed is the
+  // close's: read after the hangup, 137 and 143 are the Run's own, since the close sends SIGTERM only once
+  // the shell is gone and SIGKILL with the shell (the house's review of 4f4c067..a8b6f28, PR #22).
+  for (const exit of [0, 1, 2, 137, 143]) {
     const h = await harness();
     const a = await h.session.admitWhenAvailable({ target: 'shell', line: 'sleep 30', principal: AGENT });
     assert.ok(a.admitted);

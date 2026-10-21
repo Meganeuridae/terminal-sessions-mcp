@@ -230,9 +230,6 @@ const PROMPT_DRAWN_WAIT_MS = 3000;
  */
 const EDITOR_SETTLE_READS = 4;
 const EDITOR_SETTLE_STEP_MS = 50;
-/** The signals a close sends a shell's job (doClose's hangups and kill, reapJob's TERM), and the statuses a shell reports for a job they killed. */
-const CLOSE_SIGNALS = new Set(['SIGHUP', 'SIGTERM', 'SIGKILL']);
-const CLOSE_STATUSES = new Set([...CLOSE_SIGNALS].map((s) => 128 + os.constants.signals[s as 'SIGHUP']));
 /** The newest replies to the shell's terminal queries kept for resendReplies. */
 const REPLIES_KEPT = 8;
 /** What a note says when the reinit gate after `exec bash` gives up: the recovery that loads the integration with the session's key. */
@@ -638,6 +635,11 @@ export class Session {
   private closing: Promise<void> | undefined;
   /** Set when close() begins, before its first hangup: an end read from then on is the close's (endRun). */
   private closeBegun = false;
+  /**
+   * The signals the close has sent the shell or its job so far, recorded just before each is sent: a status
+   * read after the close began is the close's only when it is 128 plus one of these (endRun).
+   */
+  private readonly closeSignalsSent = new Set<NodeJS.Signals>();
   /** Set when close() resolves: nothing is journaled after that. */
   private closed = false;
 
@@ -1435,6 +1437,7 @@ export class Session {
       // nothing when the shell exits, so the job's group is signalled here, never the shell's.
       const foregroundJob = (sig: NodeJS.Signals) => {
         const fg = this.pty.foreground?.();
+        this.closeSignalsSent.add(sig);
         if (fg && fg.foregroundPgid !== fg.shellPgid) this.pty.signalGroup?.(fg.foregroundPgid, sig);
       };
       // The job is known now; once the shell is gone nothing can ask the terminal for it.
@@ -1493,6 +1496,7 @@ export class Session {
     const steps: string[] = [];
     for (const sig of ['SIGTERM', 'SIGKILL'] as const) {
       if (!alive()) break;
+      this.closeSignalsSent.add(sig);
       if (this.pty.signalGroup?.(pgid, sig)) steps.push(sig);
       if (sig === 'SIGTERM' && (await waitGone(clocks.monotonic() + Math.max(100, Math.min(1000, left()))))) break;
     }
@@ -1611,15 +1615,19 @@ export class Session {
 
   private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; leftovers?: boolean; pipeStatus?: number[]; shellBack?: boolean }): void {
     if (isTerminal(run.state)) return;
-    const killedByClose = (outcome.exit !== undefined && CLOSE_STATUSES.has(outcome.exit)) || (outcome.signal !== undefined && CLOSE_SIGNALS.has(outcome.signal));
-    if (outcome.state === 'exited' && run.target === 'shell' && this.closeBegun && killedByClose) {
-      // An end read after the close began, with the status of a job one of the close's signals killed, is
-      // the close's doing: its hangup ended the job, and bash can print the 129 the job left before it
-      // exits itself. Taken as the Run's own end, a Run the close cut short read as a command that failed
+    // A signal the close has already sent: a status of 128 plus it, or the signal itself. Only those: the close
+    // sends SIGTERM to a job (reapJob) only once the shell is gone, and SIGKILL to the job, the shell's group
+    // and the shell at once, so no shell reports a job either killed, and a 137 or 143 read during a close is
+    // the Run's own (the house's review of 4f4c067..a8b6f28, PR #22).
+    const sentByClose = [...this.closeSignalsSent].find((s) => (outcome.exit !== undefined && outcome.exit === 128 + os.constants.signals[s]) || outcome.signal === s);
+    if (outcome.state === 'exited' && run.target === 'shell' && this.closeBegun && sentByClose !== undefined) {
+      // An end read after the close began, with the status of a job a signal the close had sent killed, is
+      // taken as the close's doing: its hangup ended the job, and bash can print the 129 the job left before
+      // it exits itself. Taken as the Run's own end, a Run the close cut short read as a command that failed
       // (CI on #22: mcpl-6 at a93da10, mcpl-2/m2-4 at 9f2952d). It ends lost, as it does when the shell's
       // exit comes first, and the status the shell printed is noted. Any other status is the Run's own:
       // an end mark still unread when the close began says how a command that finished first ended.
-      this.note(`${run.runId}: its end (exit ${outcome.exit ?? outcome.signal}) was read after the session began to close, with the status of a job the close's signals killed; the close cut it short`);
+      this.note(`${run.runId}: its end (exit ${outcome.exit ?? outcome.signal}) was read after the session began to close, with the status of the ${sentByClose} the close had sent; taken as the close's doing`);
       outcome = { state: 'lost', reason: this.closeReason ?? 'session-closed' };
     }
     const endedAt = this.now();
