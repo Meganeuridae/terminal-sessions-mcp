@@ -184,13 +184,14 @@ try {
     assert.ok(ctx.includes(`${SESSION}: \`${COMMAND}\` → exit 0`), `agent context:\n${ctx.slice(-800)}`);
     assert.match(ctx, /acceptance-output/);
     // On the session's channel, as the open above intends, not as a push event with no channel to answer
-    // into. Any push or batch counted before, so this passed with the channel closed. The traces carry no
-    // Run, only the channels a batch named.
-    const lane = traces.filter((t) => t.type === 'mcpl:push_event' || t.type === 'mcpl:channels-incoming');
-    assert.ok(
-      lane.some((t) => t.type === 'mcpl:channels-incoming' && t.channelIds?.includes(CHANNEL)),
-      `delivered on the session's channel through the host lane: ${lane.map((t) => `${t.type}${t.channelIds ? ` ${t.channelIds.join(',')}` : ''}`).join('; ') || 'nothing through the lane'}`,
-    );
+    // into. Any push or batch counted before, so this passed with the channel closed; and the host's traces
+    // carry no Run, so a batch naming the channel passed beside a completion pushed. The completion's own
+    // message says how it came: one from the channel carries its message id, a push its event id and
+    // feature set (the house's read of the 40 commits over our fixes, #22).
+    const mine = framework.agents.get('scout').getContextManager().getAllMessages().filter((m) => m.metadata?.runId === runId && m.metadata?.tags?.includes('terminal:run-finished'));
+    const route = mine.map((m) => JSON.stringify({ channelId: m.metadata.channelId, messageId: m.metadata.messageId, eventId: m.metadata.eventId, featureSet: m.metadata.featureSet })).join('; ') || 'no message for the Run';
+    assert.equal(mine.length, 1, `the completion's messages in the agent context: ${route}`);
+    assert.ok(mine[0].metadata.channelId === CHANNEL && mine[0].metadata.messageId !== undefined && mine[0].metadata.eventId === undefined, `delivered on the session's channel, not pushed: ${route}`);
     // The wake itself, seen from the model's side and apart from any note: an inference call carrying the
     // completion, with a bound of its own, so a delivery that took most of its wait leaves this one its time.
     for (const inferenceUntil = now() + 8000; !membrane.calls.length && now() < inferenceUntil; ) await sleep(50);
