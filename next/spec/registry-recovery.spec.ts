@@ -690,10 +690,14 @@ test('jr2-4: a group whose processes recovery tied to the Run are gone, while it
     assert.ok(ended, JSON.stringify(book.lines));
     assert.deepEqual([ended.fields!['groups'], ended.fields!['leftRunning']], [[], [g]], 'the log lists it as left running, not among the groups recovery ended');
     // The leader is this test's own child: until the loop reaps it, a killed leader is a zombie that keeps the
-    // pgid, so groupAlive alone cannot tell. Reaped or not, its own exit says whether a signal took it.
-    await new Promise((res) => setTimeout(res, 200));
+    // pgid, so groupAlive alone cannot tell, and a fixed wait for its exit proves nothing under load (the house's
+    // review of the 77 commits through 4f4c067, PR #22). So the test ends it itself, with a signal its trap does
+    // not ignore, and waits for its exit: the signal it died of says whether recovery's came first.
     const leader1 = kids.kids.find((c) => c.pid === g)!;
-    assert.deepEqual([leader1.exitCode, leader1.signalCode], [null, null], 'and nothing was sent after the SIGTERM: the leader still runs');
+    const died = new Promise<NodeJS.Signals | null>((res) => leader1.once('exit', (_code, signal) => res(signal)));
+    const exited = leader1.exitCode !== null || leader1.signalCode !== null;
+    if (!exited) process.kill(g, 'SIGHUP');
+    assert.equal(exited ? leader1.signalCode : await died, 'SIGHUP', 'and nothing was sent after the SIGTERM: the leader ran until the test ended it');
     await r.reg.closeAll();
   } finally {
     kids.end();
