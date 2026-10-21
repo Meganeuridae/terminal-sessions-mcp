@@ -416,7 +416,7 @@ export class WatchManager {
       if (!run) rec.predicate.armSilence();
       else {
         // Quiet is measured from the Run's last output; a Run that has printed nothing yet arms on its first (m2-12).
-        const last = this.lastRunOutput(run.runId);
+        const { last } = this.lastRunOutput(run.runId);
         if (last) {
           const age = this.ageOf(last);
           rec.predicate.armSilence(spec.silenceMs! - age, clocks.monotonic() - age);
@@ -456,11 +456,20 @@ export class WatchManager {
     return run;
   }
 
-  private lastRunOutput(runId: string): JournalEvent | undefined {
+  /**
+   * A Run's newest output, or, where there is none to age, what can be said of it: `no output` only when the
+   * Run's whole range was read, `no output retained` when retention or a hole took part of it, and that the
+   * read failed when it did. Read as `no output`, a Run whose output had aged out, or could not be read, was
+   * said to have printed nothing (the house's read of the 40 commits over our fixes, #22).
+   */
+  private lastRunOutput(runId: string): { last?: JournalEvent; none?: string } {
     try {
-      return this.host.journal.runs.output(this.host.journal, runId, { maxBytes: 1 }).events.at(-1);
+      const out = this.host.journal.runs.output(this.host.journal, runId, { maxBytes: 1 });
+      const last = out.events.at(-1);
+      if (last) return { last };
+      return { none: out.truncated ? 'no output retained' : 'no output' };
     } catch {
-      return undefined;
+      return { none: 'its output could not be read' };
     }
   }
 
@@ -610,12 +619,12 @@ export class WatchManager {
         const gone = run ? undefined : exited();
         if (gone) return abort(gone);
         const cur = run && (this.host.journal.runs.get(run.runId) ?? run);
-        const last = run ? this.lastRunOutput(run.runId) : lastOutput(this.host.journal);
+        const { last, none } = run ? this.lastRunOutput(run.runId) : { last: lastOutput(this.host.journal), none: undefined };
         if (cur && isTerminal(cur.state)) {
           // A Run that printed nothing has no output to age, and says so as a watch on it does: its quiet was
           // taken from the journal's wall-clock end, so a clock step put any figure there (the house's read
-          // of the 40 commits, #22).
-          const quiet = last ? ` no output for ${this.ageOf(last)}ms` : ' no output';
+          // of the 40 commits, #22). One whose output is gone, or could not be read, says that instead.
+          const quiet = last ? ` no output for ${this.ageOf(last)}ms` : ` ${none ?? 'no output'}`;
           return finish(result({ matched: true, match: `${endText(cur)};${quiet}`, seq: cur.seq.end ?? this.host.journal.lastSeq }));
         }
         const age = last ? this.ageOf(last) : 0;

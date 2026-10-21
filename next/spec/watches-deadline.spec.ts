@@ -452,6 +452,26 @@ test('a silence wait answering for an ended Run that printed nothing says "no ou
   }
 });
 
+test('a silence wait answering for an ended Run says "no output" only when its whole output was read: one whose output is gone, or could not be read, says so (the house’s read of the 40 commits over our fixes, #22)', async (t) => {
+  // Read as "no output", a Run that printed and whose output retention took was said to have printed nothing.
+  const f = bare();
+  try {
+    f.startRun('q');
+    f.out('printed\n', 'q');
+    f.journal.append({ type: 'run.end', runId: 'q', state: 'exited', exit: 0, durationMs: 1 });
+    const output = f.journal.runs.output.bind(f.journal.runs);
+    // What the Run's output read gives once retention or a hole took its output: nothing, and cut.
+    t.mock.method(f.journal.runs, 'output', (...a: Parameters<typeof output>) => ({ ...output(...a), events: [], truncated: true }));
+    assert.equal((await f.manager.waitFor({ silenceMs: 200, runId: 'q' }, 5000)).match, 'run q ended (exited 0); no output retained');
+    t.mock.method(f.journal.runs, 'output', () => {
+      throw new Error('the store could not be read');
+    });
+    assert.equal((await f.manager.waitFor({ silenceMs: 200, runId: 'q' }, 5000)).match, 'run q ended (exited 0); its output could not be read');
+  } finally {
+    f.close();
+  }
+});
+
 test('the newest 1,024 ended Runs keep their last output’s stamp, and an older one’s output is aged on the wall clock (the house’s read of the 40 commits, #22)', async (t) => {
   // The stamps of ended Runs are bounded: each Run's end past the newest 1,024 lets the oldest go.
   const f = bare();
