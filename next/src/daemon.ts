@@ -671,6 +671,7 @@ async function main(): Promise<void> {
     version: version(),
     logger: write,
     allowHosts,
+    dataDir,
   };
   if (usage) {
     serverOpts.usage = {

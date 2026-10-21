@@ -116,7 +116,12 @@ export interface ServerOptions {
   shutdownGraceMs?: number;
   /** Called for every tools/call except the GUI's successful read-only calls, which are its own bookkeeping (§16 Measure, tsg-16). */
   usage?: { record(r: UsageRecord): void };
+  /** The daemon's data dir, which /health tells a loopback caller that may see sessions (see health). */
+  dataDir?: string;
 }
+
+/** A peer address on this machine: the IPv4 loopback range or ::1, as a dual-stack socket also shows them. */
+const loopbackPeer = (address: string | undefined): boolean => address !== undefined && (address === '::1' || /^(::ffff:)?127\./.test(address));
 
 /** An attach of one session waiting on its snapshot or transcript; `gen` moves when terminal/detach arrives meanwhile (tsg-4). */
 interface AttachWait {
@@ -570,7 +575,8 @@ export class TermServer {
    * tokens). A daemon that requires a credential tells an unauthenticated caller
    * only that it is alive, with counts — never another agent's private sessions
    * (tsg-17). History sessions report `closed` or `recovered`, their retention and
-   * oldest seq (G20, G21; jr2-14).
+   * oldest seq (G20, G21; jr2-14). A caller on this machine that may see sessions is
+   * also told the data dir.
    */
   private health(req: IncomingMessage, res: ServerResponse, url: URL): void {
     const token = tokenOf(req, url);
@@ -606,6 +612,10 @@ export class TermServer {
       body.sessions = all.filter((s) => app.can(who, s, 'observe')).map((s) => this.healthOf(s));
       // Recovery errors name sessions whose owner is unknown: details only where no credential separates anyone.
       body.recoveryErrors = this.opts.resolver.open ? recoveryErrors.map((e) => ({ session: e.id, error: clip(e.error) })) : recoveryErrors.length;
+      // A supervisor's shim asks a running termd which data dir it uses, since the unit's text may have
+      // changed since it started (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715, question
+      // 1). A local path, so told only on this machine, to a caller that may see sessions here.
+      if (this.opts.dataDir !== undefined && loopbackPeer(req.socket.remoteAddress)) body.dataDir = this.opts.dataDir;
     } else body.detail = 'present a token (?token= or Authorization: Bearer) for sessions';
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
     res.end(req.method === 'HEAD' ? undefined : JSON.stringify(body));

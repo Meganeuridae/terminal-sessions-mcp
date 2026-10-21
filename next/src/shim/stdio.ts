@@ -68,6 +68,7 @@
  */
 import { clocks, MAX_TIMER_MS } from '../core/clock.js';
 import { parseDuration, setting } from '../core/env.js';
+import { processInfo } from '../core/lock.js';
 import { execFile, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -75,6 +76,7 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
+import { askDataDir, titlePort } from './running.js';
 import { launchctlUnit, plistUnit, procEnviron, systemctlUnit, unitDataDir, unitPort, type UnitText, type Unknown } from './units.js';
 
 type Id = string | number;
@@ -325,7 +327,7 @@ async function checkSupervisor(): Promise<Supervisor> {
     return managed(`the launchd job ${LAUNCH_AGENT}`, unit);
   }
   if (process.platform === 'linux') {
-    const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,MainPID,ExecStart,Environment,EnvironmentFiles,UnsetEnvironment']);
+    const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,MainPID,ExecStart,Environment,EnvironmentFiles,UnsetEnvironment,NeedDaemonReload,FragmentPath,DropInPaths']);
     if (r === 'timeout') return { kind: 'unknown', why: `systemctl --user show termd did not answer within ${SUPERVISOR_CHECK_MS} ms` };
     if (r === 'missing') return { kind: 'none' }; // no systemd: nothing of this user's is managed
     // A failure is no answer: under cron or `sudo -u` the user manager runs, with its units, but systemctl
@@ -346,24 +348,58 @@ async function checkSupervisor(): Promise<Supervisor> {
     // manager's environment, which every unit it starts inherits (see systemctlUnit), is read only where it
     // cannot be, or no termd of the unit runs, and the note says which was read.
     const pid = running ? Number(prop('MainPID')) || 0 : 0;
+    // The running termd itself says its port and data dir, which the unit's text may no longer give (see
+    // running.ts); only when it cannot be asked is the text read, and the note says whether it may have
+    // changed since that termd started.
+    let notAsked = '';
+    if (pid > 0) {
+      const port = titlePort(pid);
+      const told = typeof port === 'number' ? await askDataDir(port, pid, SUPERVISOR_CHECK_MS) : port;
+      if ('dataDir' in told) return { kind: 'managed', by: `the systemd user unit termd (its port and data dir told by its running termd, pid ${pid})`, port: String(port), dataDir: told.dataDir };
+      notAsked = `; its running termd could not be asked: ${told.error}${unitChanged(pid, prop)}`;
+    }
     const proc = pid > 0 ? procEnviron(pid) : undefined;
     let more: Parameters<typeof systemctlUnit>[2];
     let from: string;
     if (proc && 'env' in proc) {
       more = { running: proc.env };
-      from = `its environment read from its running termd, pid ${pid}`;
+      from = `its environment read from its running termd, pid ${pid}${notAsked}`;
     } else {
       const m = await ask('systemctl', ['--user', 'show', '--property=Environment']);
       if (m === 'timeout' || m === 'missing' || 'failed' in m) return { kind: 'unknown', why: `systemctl --user show (the user manager's environment, which the unit's termd inherits) ${m === 'timeout' ? `did not answer within ${SUPERVISOR_CHECK_MS} ms` : `failed (${m === 'missing' ? 'not found' : m.failed})`}, so the unit's port and data dir are unknown` };
       const files = [...r.out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim());
       more = { manager: /^Environment=(.*)$/m.exec(m.out)?.[1]?.trim() ?? '', files, unset: prop('UnsetEnvironment') };
-      from = proc ? `its environment read from the user manager's, as its running termd's, pid ${pid}, could not be: ${proc.error}` : "its environment read from the user manager's, as no termd of it runs";
+      from = proc ? `its environment read from the user manager's, as its running termd's, pid ${pid}, could not be: ${proc.error}${notAsked}` : "its environment read from the user manager's, as no termd of it runs";
     }
     const unit = systemctlUnit(prop('ExecStart'), prop('Environment'), more);
     if (!unit) return { kind: 'unknown', why: prop('ExecStart') ? `the systemd user unit termd's ExecStart is not in the shape read here, or names a variable not known here (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown (${from})` : "the systemd user unit termd has no ExecStart, so its port and data dir are unknown" };
     return managed(`the systemd user unit termd (${from})`, unit);
   }
   return { kind: 'none' };
+}
+
+/**
+ * Why the unit's text may not be what its running termd was started with, worded to follow a note: systemd
+ * says it needs a daemon-reload (an edit not yet read), or its file or a drop-in is newer than the termd's
+ * start (an edit read since); empty when neither. A start that cannot be read is said too.
+ */
+function unitChanged(pid: number, prop: (k: string) => string): string {
+  const said = "; the unit's text may have changed since that termd started";
+  if (prop('NeedDaemonReload') === 'yes') return `${said}: systemd says the unit needs a daemon-reload`;
+  const files = [prop('FragmentPath'), ...prop('DropInPaths').split(' ')].filter(Boolean);
+  if (!files.length) return '';
+  const started = processInfo(pid);
+  if (!started) return `${said}: when it started cannot be read`;
+  for (const file of files) {
+    let mtime: number;
+    try {
+      mtime = fs.statSync(file).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (mtime > started.startMs + (started.startSlackMs ?? 1000)) return `${said}: ${file} is newer than its start`;
+  }
+  return '';
 }
 
 /** The LaunchAgent's plist where launchd loads it from at login: this user's LaunchAgents, else the machine's; undefined when neither has it. */

@@ -818,6 +818,9 @@ interface Unit {
   mainPid?: number;
   /** Arguments before the launcher, as an `env VAR=value` prefix is. */
   prefix?: string[];
+  /** systemd only: whether systemd says the unit needs a daemon-reload, and the unit's file. */
+  needReload?: boolean;
+  fragment?: string;
 }
 
 /** The two supervisors' answers for a loaded unit: a launchd job's `print` and a systemd unit's `show`, with the same command line and environment. */
@@ -837,6 +840,9 @@ function unitStub(u: Unit): Stub {
     `Environment=${words(env)}`,
     ...(u.envFiles ?? []).map((f) => `EnvironmentFiles=${f}`),
     `UnsetEnvironment=${(u.unset ?? []).join(' ')}`,
+    `NeedDaemonReload=${u.needReload ? 'yes' : 'no'}`,
+    `FragmentPath=${u.fragment ?? ''}`,
+    'DropInPaths=',
   ];
   // `systemctl --user show termd …` asks about the unit; `systemctl --user show --property=Environment`, the manager.
   const manager = u.managerFails ? "echo 'Failed to connect to bus: No medium found' >&2; exit 1" : `printf '%s\\n' ${q(`Environment=${words(Object.entries(u.managerEnv ?? {}))}`)}`;
@@ -1018,6 +1024,25 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     stand.push(child);
     return child.pid!;
   };
+  /** A real termd, as a unit runs it: its pid and the port its title names, once it listens. */
+  const liveTermd = async (dataDir: string): Promise<{ pid: number; port: number }> => {
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: tmp };
+    for (const k of ['TSM_PORT', 'TSM_HOST', 'TSM_TOKEN', 'TSM_DATA_DIR', 'SESSION_SERVER_PORT', 'SESSION_SERVER_HOST', 'SESSION_SERVER_TOKEN']) delete env[k];
+    const child = spawn(process.execPath, [path.resolve(here, '../src/daemon.js'), '--port', '0', '--data-dir', dataDir, '--no-usage-log', '--shell', '/bin/bash'], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+    stand.push(child);
+    let stderr = '';
+    child.stderr!.on('data', (b: Buffer) => (stderr += b.toString()));
+    await until(() => stderr.includes('"listening"') || child.exitCode !== null, 15_000, 'the stand-in termd to listen');
+    const listening = stderr.split('\n').find((l) => l.includes('"listening"'));
+    assert.ok(listening, `the stand-in termd did not start: ${stderr}`);
+    return { pid: child.pid!, port: Number(new URL((JSON.parse(listening) as { url: string }).url).port) };
+  };
+  const toldDir = path.join(tmp, 'sup-data-dir-told-by-the-running-termd');
+  const told = linux ? await liveTermd(toldDir) : undefined;
+  const edited = path.join(tmp, 'edited-termd.service');
+  fs.writeFileSync(edited, '[Service]\n');
+  // Edited after its termd started, and read since by a daemon-reload: newer than any process here.
+  fs.utimesSync(edited, new Date(Date.now() + 600_000), new Date(Date.now() + 600_000));
   const cases: Case[] = [
     { name: 'shared-data-dir-with-spaces-in-argv', when: true, stub: (dataDir) => unitStub({ port: 3101, dataDir }), dataDir: spaced('argv'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup argv with spaces, which a termd for port \d+ started here would use too/ },
     { name: 'shared-data-dir-with-spaces-in-environment', when: true, stub: (dataDir) => unitStub({ port: 3101, env: { TSM_DATA_DIR: dataDir } }), dataDir: spaced('env'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup env with spaces, which a termd/ },
@@ -1062,13 +1087,20 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     { name: 'manager-environment-query-fails', when: linux, stub: () => unitStub({ port: 3101, managerFails: true }), expect: 'unknown', says: /systemctl --user show \(the user manager's environment, which the unit's termd inherits\) failed \(Failed to connect to bus: No medium found\), so the unit's port and data dir are unknown/ },
     // The house's review of f3750e4..4f4c067 (#22 comment 6315636412). A running unit's termd has the environment it
     // started with: read from the manager's as it is now, a data dir imported into it since was taken for termd's.
-    { name: 'data-dir-in-the-running-termd-environment', when: linux, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: path.join(tmp, 'imported-since') }, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /the systemd user unit termd \(its environment read from its running termd, pid \d+\) serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
+    { name: 'data-dir-in-the-running-termd-environment', when: linux, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: path.join(tmp, 'imported-since') }, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /the systemd user unit termd \(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"\) serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
     // An env prefix that refers to the variable it sets ran once, before termd started: applied again to the
     // environment the running termd has, it was read as another data dir, and a termd was started (the house's
     // read of the 17 commits over our fixes, #22).
-    { name: 'self-referring-env-prefix-in-a-running-unit', when: linux, stub: (dataDir) => unitStub({ port: 3101, prefix: ['/usr/bin/env', 'TSM_DATA_DIR=${TSM_DATA_DIR}/x'], managerEnv: { HOME: tmp, TSM_DATA_DIR: path.dirname(dataDir) }, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /the systemd user unit termd \(its environment read from its running termd, pid \d+\) serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
+    { name: 'self-referring-env-prefix-in-a-running-unit', when: linux, stub: (dataDir) => unitStub({ port: 3101, prefix: ['/usr/bin/env', 'TSM_DATA_DIR=${TSM_DATA_DIR}/x'], managerEnv: { HOME: tmp, TSM_DATA_DIR: path.dirname(dataDir) }, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /the systemd user unit termd \(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"\) serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
     // One the shim may not read (another user's, pid 1) leaves the manager's, and the note says so.
-    { name: 'running-termd-environment-unreadable', when: linux && process.getuid?.() !== 0, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir }, mainPid: 1 }), expect: 'shared', says: /the systemd user unit termd \(its environment read from the user manager's, as its running termd's, pid 1, could not be: it is another user's process\) serves port 3101 out of the data dir/ },
+    { name: 'running-termd-environment-unreadable', when: linux && process.getuid?.() !== 0, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir }, mainPid: 1 }), expect: 'shared', says: /the systemd user unit termd \(its environment read from the user manager's, as its running termd's, pid 1, could not be: it is another user's process; its running termd could not be asked: its title is not a termd's with a port: [^)]*\) serves port 3101 out of the data dir/ },
+    // The house's review of 4f4c067..a8b6f28 (#22 comment 6323055715), question 1: a unit's text names what its next
+    // start runs, and after an edit and a daemon-reload not what its running termd was started with. The running
+    // termd says its port and data dir itself; read from the edited text, they were port 3101 and /srv/edited-since.
+    { name: 'data-dir-told-by-the-running-termd', when: told !== undefined, stub: () => unitStub({ port: 3101, dataDir: '/srv/edited-since', mainPid: told!.pid }), dataDir: toldDir, expect: 'shared', says: /the systemd user unit termd \(its port and data dir told by its running termd, pid \d+\) serves port \d+ out of the data dir \S+sup-data-dir-told-by-the-running-termd, which a termd for port \d+ started here would use too/ },
+    // One that cannot be asked leaves the text, and the note says when the text may have changed since it started.
+    { name: 'running-unit-needs-a-daemon-reload', when: linux, stub: (dataDir) => unitStub({ port: 3101, needReload: true, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /\(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"; the unit's text may have changed since that termd started: systemd says the unit needs a daemon-reload\) serves port 3101 out of the data dir/ },
+    { name: 'running-unit-file-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: edited, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+edited-termd\.service is newer than its start\) serves port 3101 out of the data dir/ },
     // An env prefix is environment, as env applies it: read as arguments, these units were $HOME/.tsm.
     { name: 'data-dir-in-an-env-prefix', when: true, stub: (dataDir) => unitStub({ port: 3101, prefix: ['/usr/bin/env', `TSM_DATA_DIR=${dataDir}`] }), expect: 'shared', says: /serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
     // Under an EnvironmentFile=, a ${NAME} in another option left --port and --data-dir unknown too.

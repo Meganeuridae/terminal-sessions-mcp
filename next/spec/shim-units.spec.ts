@@ -10,6 +10,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
+import * as http from 'node:http';
+import { askDataDir, titlePort } from '../src/shim/running.js';
 import { launchctlUnit, plistUnit, procEnviron, systemctlUnit, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
 
 /** ExecStart as systemd 255 prints it: the argv joined by one space each, unquoted; `prefix` goes before the launcher (an `env …`). */
@@ -255,6 +257,38 @@ test("a running termd's environment is the one read when Linux shows it: whole, 
   }
   await new Promise((r) => child.once('exit', r));
   assert.deepEqual(procEnviron(child.pid!), { error: 'ENOENT' }, 'a process that has gone');
+});
+
+test("a running termd is asked for its data dir on the port its title names, and only the pid asked about counts as its answer (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715, question 1)", async () => {
+  // /health as termd answers it, from a stand-in whose answer the test sets.
+  let answer: Record<string, unknown> = {};
+  const server = http.createServer((req, res) => {
+    res.writeHead(req.url === '/health' ? 200 : 404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(answer));
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as { port: number }).port;
+  try {
+    answer = { status: 'ok', pid: 4242, dataDir: '/srv/running' };
+    assert.deepEqual(await askDataDir(port, 4242, 1500), { dataDir: '/srv/running' });
+    assert.deepEqual(await askDataDir(port, 4343, 1500), { error: `port ${port} is served by pid 4242, not by it` }, 'another process on the port');
+    answer = { status: 'ok', pid: 4242, detail: 'present a token (?token= or Authorization: Bearer) for sessions' };
+    assert.match(JSON.stringify(await askDataDir(port, 4242, 1500)), /its \/health names no data dir/);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+  assert.deepEqual(await askDataDir(port, 4242, 1500), { error: `nothing listens on port ${port}` });
+  // Linux shows a process's title in its cmdline, as termd sets it; elsewhere `ps` shows the start arguments.
+  if (process.platform === 'linux') {
+    const child = spawn(process.execPath, ['-e', "process.title = 'termd --port 4321'; console.log('ready'); setTimeout(() => {}, 30_000)"], { stdio: ['ignore', 'pipe', 'ignore'] });
+    try {
+      await new Promise((r) => child.stdout!.once('data', r));
+      assert.equal(titlePort(child.pid!), 4321);
+    } finally {
+      child.kill();
+    }
+  }
+  assert.match(JSON.stringify(titlePort(process.pid)), /its title is not a termd's with a port/);
 });
 
 test("a running unit's env prefix is not applied again to the environment its termd has, and a ${NAME} it sets in termd's arguments is unknown (the house's read of the 17 commits over our fixes, #22)", () => {

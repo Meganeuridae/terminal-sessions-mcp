@@ -21,6 +21,7 @@ import WebSocket from 'ws';
 import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
+import { askDataDir, titlePort } from '../src/shim/running.js';
 import { TermServer } from '../src/transport/server.js';
 import { fakeShellBackend, type FakeShell } from './fake-shell.js';
 import { until, unusedPort } from './testhost.js';
@@ -322,6 +323,49 @@ test("a daemon command written for 1.x starts termd: --headless is accepted, SES
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
     await Promise.race([exited, new Promise((r) => setTimeout(r, 8000))]);
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+});
+
+test("termd tells its data dir on /health to a caller on this machine that may see sessions, and the shim asks a running termd for it on the port its title names (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715, question 1)", async () => {
+  /** A termd of its own; its port, from the listening record. */
+  const start = async (name: string, extra: string[]) => {
+    const dataDir = path.join(tmp, name);
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of ['TSM_PORT', 'TSM_HOST', 'TSM_TOKEN', 'TSM_DATA_DIR', 'SESSION_SERVER_PORT', 'SESSION_SERVER_HOST', 'SESSION_SERVER_TOKEN']) delete env[k];
+    const child = spawn(process.execPath, [path.resolve(here, '../src/daemon.js'), '--port', '0', '--data-dir', dataDir, '--no-usage-log', '--shell', '/bin/bash', ...extra], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr!.on('data', (b: Buffer) => (stderr += b.toString()));
+    await until(() => stderr.includes('"listening"') || child.exitCode !== null, 15_000, 'termd to listen');
+    const listening = stderr.split('\n').find((l) => l.includes('"listening"'));
+    assert.ok(listening, `termd did not start: ${stderr}`);
+    const port = Number(new URL((JSON.parse(listening) as { url: string }).url).port);
+    const health = async (token?: string) => (await (await fetch(`http://127.0.0.1:${port}/health`, token ? { headers: { authorization: `Bearer ${token}` } } : {})).json()) as Record<string, unknown>;
+    const stop = async () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = new Promise((r) => child.once('exit', r));
+      child.kill('SIGTERM');
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 8000))]);
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    };
+    return { child, dataDir, port, health, stop };
+  };
+  const open = await start('health-open', []);
+  try {
+    // Loopback-open, as a supervisor's termd runs: this caller is the anonymous principal, which may see sessions.
+    assert.equal((await open.health()).dataDir, open.dataDir);
+    assert.deepEqual(await askDataDir(open.port, open.child.pid!, 3000), { dataDir: open.dataDir });
+    if (process.platform === 'linux') assert.equal(titlePort(open.child.pid!), open.port, "the port in termd's own title");
+  } finally {
+    await open.stop();
+  }
+  const closed = await start('health-token', ['--token', 'health-secret']);
+  try {
+    const anonymous = await closed.health();
+    assert.equal(anonymous.dataDir, undefined, 'a caller without a credential is told only that it is alive');
+    assert.equal((await closed.health('health-secret')).dataDir, closed.dataDir);
+    assert.match(JSON.stringify(await askDataDir(closed.port, closed.child.pid!, 3000)), /its \/health names no data dir/, 'the shim presents no credential');
+  } finally {
+    await closed.stop();
   }
 });
 
