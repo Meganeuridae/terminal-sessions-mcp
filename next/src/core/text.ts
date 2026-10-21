@@ -518,16 +518,19 @@ const lastOf = (s: string, ch: string): number => (s.indexOf(ch) === -1 ? -1 : s
 /**
  * The last introducer (ESC, or a C1 one: isIntroducer) in `data[from..i]` (-1 when none), by native
  * searches over that window alone: a tail cut may look back through megabytes of plain text, and a
- * cut with a bounded lookback must not pay for the whole text. The C1 forms are looked for only after
- * the nearest ESC.
+ * cut with a bounded lookback must not pay for the whole text. `firstEsc` is the window's first ESC
+ * (-1 when it has none), found once by its caller, so a walk back over many introducers searches
+ * backward from each only as far as the one before it: found by a forward search of the whole window
+ * at each step, a walk over 50,000 STs after 1 MB of text took 496 ms (our review of the 40 commits
+ * through 4f4c067, PR #22). The C1 forms are looked for only after the nearest ESC.
  */
-function introducerBefore(data: string, i: number, from: number): number {
+function introducerBefore(data: string, i: number, from: number, firstEsc: number): number {
   if (i < from) return -1;
-  const window = data.slice(from, i + 1);
-  const esc = lastOf(window, '\x1b');
-  const after = esc === -1 ? window : window.slice(esc + 1);
+  const esc = firstEsc === -1 || firstEsc > i ? -1 : data.lastIndexOf('\x1b', i);
+  const lo = esc === -1 ? from : esc + 1;
+  const after = data.slice(lo, i + 1);
   const c1 = Math.max(...['\x9b', '\x90', '\x98', '\x9d', '\x9e', '\x9f'].map((ch) => lastOf(after, ch)));
-  return c1 !== -1 ? from + esc + 1 + c1 : esc === -1 ? -1 : from + esc;
+  return c1 !== -1 ? lo + c1 : esc;
 }
 
 /**
@@ -536,8 +539,10 @@ function introducerBefore(data: string, i: number, from: number): number {
  */
 function enclosingSequence(data: string, index: number, lookback: number): { start: number; end: number | undefined } | undefined {
   const from = Math.max(0, index - lookback);
+  const f = data.slice(from, index).indexOf('\x1b');
+  const firstEsc = f === -1 ? -1 : from + f;
   let st: number | undefined;
-  for (let e = introducerBefore(data, index - 1, from); e !== -1; e = introducerBefore(data, e - 1, from)) {
+  for (let e = introducerBefore(data, index - 1, from, firstEsc); e !== -1; e = introducerBefore(data, e - 1, from, firstEsc)) {
     const ch = data.charCodeAt(e);
     if (ch === 0x1b && data[e + 1] === '\\') {
       // A string terminator (ST): the string it ends began earlier, and is judged there; a point

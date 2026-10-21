@@ -226,6 +226,17 @@ test('a DCS before its final byte ends at a code point from U+00A0, taken with i
   }
 });
 
+test('a tail cut steps back over a run of STs in time linear in the text (our review of the 40 commits through 4f4c067, PR #22)', () => {
+  // Each ST stepped over searched the window again from its start for an ESC: 50,000 STs after 1 MB of text took 496 ms
+  // in one tailStart, and the time grew with the text before them times the STs.
+  const text = `${'x'.repeat(4_000_000)}${'\x1b\\'.repeat(50_000)}tail`;
+  const t0 = performance.now();
+  const start = tailStart(text, 3);
+  const ms = performance.now() - t0;
+  assert.equal(text.slice(start), 'ail');
+  assert.ok(ms < 500, `${ms.toFixed(0)} ms`);
+});
+
 test('the heads of a CSI holding many line feeds cost its length, not its square, and each is the head read from its start (an independent read of the house’s fixes for #22)', () => {
   // A head asked at each LF was read from the CSI's start: 64 KiB of `ESC [` and LFs held lineEnds for 5.7 s, 43.5 s with
   // 32 Ki `1;` parameters before them.
