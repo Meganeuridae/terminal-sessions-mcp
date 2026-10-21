@@ -75,7 +75,7 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
-import { launchctlUnit, plistUnit, systemctlUnit, unitDataDir, unitPort, type UnitText } from './units.js';
+import { launchctlUnit, plistUnit, systemctlUnit, unitDataDir, unitPort, type UnitText, type Unknown } from './units.js';
 
 type Id = string | number;
 interface Parsed {
@@ -231,8 +231,8 @@ function noStartReason(): string | undefined {
   return undefined;
 }
 
-/** A supervised termd: who manages it, the port it serves and the data dir it uses (both from the unit's text; the data dir undefined where the text does not tell it). */
-type Supervisor = { kind: 'managed'; by: string; port: string; dataDir: string | undefined } | { kind: 'none' } | { kind: 'unknown'; why: string };
+/** A supervised termd: who manages it, the port it serves and the data dir it uses (both from the unit's text; the data dir unknown, with why, where the text does not tell it). */
+type Supervisor = { kind: 'managed'; by: string; port: string; dataDir: string | Unknown } | { kind: 'none' } | { kind: 'unknown'; why: string };
 const SUPERVISOR_CHECK_MS = 1500;
 const SUPERVISOR_CACHE_MS = 30_000;
 let supervisorCache: { at: number; result: Supervisor } | undefined;
@@ -259,8 +259,9 @@ function ask(cmd: string, args: string[]): Promise<Asked> {
 
 const managed = (by: string, u: UnitText): Supervisor => {
   const port = unitPort(u);
-  // A port the unit names without a value is one termd refuses: which port the unit means is unknown.
-  if (port === undefined) return { kind: 'unknown', why: `${by} names --port without a value, so its port is unknown` };
+  // A port the unit names without a value is one termd refuses, and one its environment gives from a
+  // file is not read here: which port the unit means is unknown.
+  if (typeof port !== 'string') return { kind: 'unknown', why: `${by} ${port.unknown}, so its port is unknown` };
   return { kind: 'managed', by, port, dataDir: unitDataDir(u) };
 };
 
@@ -324,7 +325,7 @@ async function checkSupervisor(): Promise<Supervisor> {
     return managed(`the launchd job ${LAUNCH_AGENT}`, unit);
   }
   if (process.platform === 'linux') {
-    const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,ExecStart,Environment']);
+    const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,ExecStart,Environment,EnvironmentFiles,UnsetEnvironment']);
     if (r === 'timeout') return { kind: 'unknown', why: `systemctl --user show termd did not answer within ${SUPERVISOR_CHECK_MS} ms` };
     if (r === 'missing') return { kind: 'none' }; // no systemd: nothing of this user's is managed
     // A failure is no answer: under cron or `sudo -u` the user manager runs, with its units, but systemctl
@@ -340,8 +341,12 @@ async function checkSupervisor(): Promise<Supervisor> {
     const running = ['active', 'activating', 'reloading', 'deactivating'].includes(prop('ActiveState'));
     const enabled = /^(enabled|static|linked|indirect|generated|transient|alias)/.test(prop('UnitFileState'));
     if (!running && !enabled) return { kind: 'none' };
-    const unit = systemctlUnit(prop('ExecStart'), prop('Environment'));
-    if (!unit) return { kind: 'unknown', why: prop('ExecStart') ? `the systemd user unit termd's ExecStart is not in the shape read here, or names a variable not known here (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown` : "the systemd user unit termd has no ExecStart, so its port and data dir are unknown" };
+    // The user manager's environment reaches every unit it starts (see systemctlUnit): asked only of a unit that is the manager's to run.
+    const m = await ask('systemctl', ['--user', 'show', '--property=Environment']);
+    if (m === 'timeout' || m === 'missing' || 'failed' in m) return { kind: 'unknown', why: `systemctl --user show (the user manager's environment, which the unit's termd inherits) ${m === 'timeout' ? `did not answer within ${SUPERVISOR_CHECK_MS} ms` : `failed (${m === 'missing' ? 'not found' : m.failed})`}, so the unit's port and data dir are unknown` };
+    const files = [...r.out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim());
+    const unit = systemctlUnit(prop('ExecStart'), prop('Environment'), { manager: /^Environment=(.*)$/m.exec(m.out)?.[1]?.trim() ?? '', files, unset: prop('UnsetEnvironment') });
+    if (!unit) return { kind: 'unknown', why: prop('ExecStart') ? `the systemd user unit termd's ExecStart is not in the shape read here, or names a variable not known here${files.length ? ' or one its EnvironmentFile= may set' : ''} (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown` : "the systemd user unit termd has no ExecStart, so its port and data dir are unknown" };
     return managed('the systemd user unit termd', unit);
   }
   return { kind: 'none' };
@@ -733,8 +738,8 @@ async function startDaemon(): Promise<void> {
       // One termd per data dir (the lock in core/lock.ts). A termd started here with the unit's data
       // dir would either exit at once, locked out, or take the dir while the unit's was down and leave
       // the unit failing on every restart (the house's read of the shim, #22 comment 6269349177).
-      if (sup.dataDir === undefined) {
-        noteNotStarted(`${sup.by} serves port ${sup.port}, and its unit names --data-dir without a value, so the data dir its termd uses is unknown: none is started here, as it may be ${dataDir} (TSM_NO_SPAWN=1 skips the check)`);
+      if (typeof sup.dataDir !== 'string') {
+        noteNotStarted(`${sup.by} serves port ${sup.port}, and its unit ${sup.dataDir.unknown}, so the data dir its termd uses is unknown: none is started here, as it may be ${dataDir} (TSM_NO_SPAWN=1 skips the check)`);
         return;
       }
       if (sameDir(sup.dataDir, dataDir)) {

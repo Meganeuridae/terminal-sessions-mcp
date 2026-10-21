@@ -15,6 +15,16 @@ import { setting } from '../core/env.js';
 export interface UnitText {
   argv: string[];
   env: Record<string, string>;
+  /**
+   * A source of the environment termd is given that is not read here (systemd's EnvironmentFile=):
+   * a value termd would take from its environment is then unknown, neither `env`'s nor termd's default.
+   */
+  unreadEnv?: string;
+}
+
+/** Why a value a unit gives termd cannot be told from its text, worded to follow the unit's name. */
+export interface Unknown {
+  unknown: string;
 }
 
 /**
@@ -41,10 +51,25 @@ export function launchctlUnit(out: string): UnitText | undefined {
 }
 
 /**
- * A `systemctl show` answer: `argv[]=` inside ExecStart and Environment's words. Undefined when
- * ExecStart is empty or has text in a shape not read here, since its port and data dir are then
- * unknown: read as no arguments, an empty ExecStart was termd's defaults (the house's read of the 40
- * commits, #22).
+ * A `systemctl show` answer: `argv[]=` inside ExecStart and the environment systemd gives the unit's
+ * process. Undefined when ExecStart is empty or has text in a shape not read here, since its port and
+ * data dir are then unknown: read as no arguments, an empty ExecStart was termd's defaults (the house's
+ * read of the 40 commits, #22).
+ *
+ * The environment is built as systemd builds it (systemd 257, probed with a user unit): the user
+ * manager's own environment (`more.manager`, its Environment property), then the unit's
+ * Environment=, whose values win over it, then its EnvironmentFile=s, whose win again, less what
+ * UnsetEnvironment= names (a variable, or one assignment of it). So a TSM_DATA_DIR a login imported
+ * into the manager (`systemctl --user import-environment`, as desktop sessions do) is termd's, where
+ * read from Environment= alone it was taken for unset. The files are not read: systemd
+ * reads them when the unit starts, not when the shim asks (an ExecStartPre= may write one, and a
+ * running termd has what they said at its start), through a grammar of quotes, escapes and continued
+ * lines, skipping a missing `-` file and taking every file a glob names; read wrong, the port or data
+ * dir compared would be another than termd's, and the shim would start a termd where the unit's runs,
+ * which the check is there to prevent. So a unit naming one has every value termd takes from its
+ * environment unknown (`unreadEnv`), an argument with `${NAME}` included, while an option on its command
+ * line stays known, since termd reads that first (the house's read of the 40 commits through f3750e4,
+ * #22 comment 6310921374).
  *
  * The argv is what systemd runs, as it runs it (systemd 255, probed with a user unit): `systemctl
  * show` prints a unit file's specifiers (`%h`) already expanded, while `${NAME}` in an argument is
@@ -61,27 +86,38 @@ export function launchctlUnit(out: string): UnitText | undefined {
  * misread leave the shim starting a termd out of the unit's own data dir, termd's lock on the data dir
  * refuses it, and the shim reports what termd said.
  */
-export function systemctlUnit(execStart: string, environment: string): UnitText | undefined {
+export function systemctlUnit(execStart: string, environment: string, more: { manager?: string; files?: readonly string[]; unset?: string } = {}): UnitText | undefined {
   if (!execStart) return undefined;
   const m = /argv\[\]=(.*?)(?: ; |\s*\}\s*$|$)/.exec(execStart);
   if (!m) return undefined;
   const env: Record<string, string> = {};
-  for (const word of quotedWords(environment)) {
+  for (const word of [...quotedWords(more.manager ?? ''), ...quotedWords(environment)]) {
     const eq = word.indexOf('=');
     if (eq > 0) env[word.slice(0, eq)] = word.slice(eq + 1);
   }
+  for (const word of quotedWords(more.unset ?? '')) {
+    const eq = word.indexOf('=');
+    const name = eq < 0 ? word : word.slice(0, eq);
+    if (eq < 0 || env[name] === word.slice(eq + 1)) delete env[name];
+  }
+  // systemctl prints each as `<path> (ignore_errors=yes|no)`, the `-` of an optional one as the flag.
+  const files = (more.files ?? []).map((f) => f.replace(/ \(ignore_errors=\w+\)$/, ''));
+  const unreadEnv = files.length ? `EnvironmentFile=${files.join(', ')}` : undefined;
   const words: string[] = [];
   for (const w of m[1]!.split(' ')) {
     let unknown = false;
     const x = w.replace(/\$\{(\w+)\}|\$/g, (all, name: string | undefined) => {
-      const v = name === undefined ? undefined : (env[name] ?? (name === 'HOME' ? os.homedir() : undefined));
+      // A file may set any variable, HOME too.
+      const v = name === undefined || unreadEnv ? undefined : (env[name] ?? (name === 'HOME' ? os.homedir() : undefined));
       if (v === undefined) unknown = true;
       return v ?? all;
     });
     if (unknown) return undefined;
     words.push(x);
   }
-  return { argv: joinOptionValues(words), env };
+  const u: UnitText = { argv: joinOptionValues(words), env };
+  if (unreadEnv) u.unreadEnv = unreadEnv;
+  return u;
 }
 
 /** Words of a list systemd prints, double-quoted where a word has spaces (`\"` and `\\` inside stand for the characters). */
@@ -138,28 +174,33 @@ export function unitArg(u: UnitText, flag: string): string | undefined | null {
  * its environment — the order termd reads them in, so a unit that sets both is read as termd reads it
  * (the house's read of the shim, #22 comment 6269349177) — else termd's default. An empty variable is
  * unset, as for termd: read as the port, `TSM_PORT= SESSION_SERVER_PORT=4100` was port "" where termd
- * listens on 4100 (the house's read of the 33 commits, #22 comment 6307350861). Undefined when the
+ * listens on 4100 (the house's read of the 33 commits, #22 comment 6307350861). Unknown when the
  * unit names the flag without a value, which termd refuses: read on, `--port` with TSM_PORT=4100 was
- * port 4100 and `--port=` port 3101 (the house's read of the 40 commits, #22).
+ * port 4100 and `--port=` port 3101 (the house's read of the 40 commits, #22); and without the flag
+ * when the environment has a source not read here (see `systemctlUnit`).
  */
-export function unitPort(u: UnitText): string | undefined {
+export function unitPort(u: UnitText): string | Unknown {
   const arg = unitArg(u, '--port');
-  if (arg === null) return undefined;
-  return arg ?? setting('TSM_PORT', u.env) ?? setting('SESSION_SERVER_PORT', u.env) ?? '3101';
+  if (arg === null) return { unknown: 'names --port without a value' };
+  if (arg !== undefined) return arg;
+  if (u.unreadEnv) return { unknown: `names no --port and reads ${u.unreadEnv}, which may set TSM_PORT or SESSION_SERVER_PORT` };
+  return setting('TSM_PORT', u.env) ?? setting('SESSION_SERVER_PORT', u.env) ?? '3101';
 }
 
 /**
  * The data dir a unit's termd uses: `--data-dir`, else TSM_DATA_DIR in its environment (empty is
- * unset, as for termd), else termd's default; undefined when the unit names the flag without a
- * value, since nothing then says which dir it is. termd resolves the value from its working
+ * unset, as for termd), else termd's default; unknown when the unit names the flag without a value,
+ * since nothing then says which dir it is, or names no flag and has an environment source not read
+ * here (see `systemctlUnit`). termd resolves the value from its working
  * directory, this user's $HOME (the launcher starts there), and expands nothing, so neither does
  * this: a supervisor's own expansions are made where its text is read (systemctlUnit). Expanded
  * here, a unit's `--data-dir ~/x` read as $HOME/x while termd used $HOME/~/x, since neither systemd
  * nor launchd expands `~` (the house's read of the 40 commits, #22).
  */
-export function unitDataDir(u: UnitText): string | undefined {
+export function unitDataDir(u: UnitText): string | Unknown {
   const arg = unitArg(u, '--data-dir');
-  if (arg === null) return undefined;
+  if (arg === null) return { unknown: 'names --data-dir without a value' };
+  if (arg === undefined && u.unreadEnv) return { unknown: `names no --data-dir and reads ${u.unreadEnv}, which may set TSM_DATA_DIR` };
   const named = arg ?? setting('TSM_DATA_DIR', u.env);
   const home = os.homedir();
   if (named === undefined) return path.join(home, '.tsm');

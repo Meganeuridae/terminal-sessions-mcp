@@ -49,8 +49,8 @@ test('a data dir with a run of spaces, or a space at either end, reads back whol
   assert.equal(unitArg(systemd(['--port', '3101', '--data-dir', '/srv/trail ']), '--data-dir'), '/srv/trail ');
   assert.equal(unitArg(systemd(['--data-dir=/srv/a   b']), '--data-dir'), '/srv/a   b');
   // An empty value is no value, as termd refuses it: the data dir is unknown, not $HOME.
-  assert.equal(unitDataDir(systemd(['--port', '3101', '--data-dir', ''])), undefined);
-  assert.equal(unitDataDir(systemd(['--data-dir='])), undefined);
+  assert.deepEqual(unitDataDir(systemd(['--port', '3101', '--data-dir', ''])), { unknown: 'names --data-dir without a value' });
+  assert.deepEqual(unitDataDir(systemd(['--data-dir='])), { unknown: 'names --data-dir without a value' });
 });
 
 test('an empty TSM_PORT or TSM_DATA_DIR in a unit is unset, as for termd: the next setting decides', () => {
@@ -86,12 +86,13 @@ test('an option given twice is read as termd reads it, by its last value (the ho
 
 test('a --port with no value is an unknown port, not the environment\'s or termd\'s default (the house\'s read of the 40 commits, #22)', () => {
   // termd refuses it, as it refuses a --data-dir with none: read on, it was TSM_PORT's 4100, and with no environment 3101.
-  assert.equal(unitPort(systemd(['--port'], 'TSM_PORT=4100')), undefined);
-  assert.equal(unitPort(systemd(['--port='])), undefined);
-  assert.equal(unitPort(systemd(['--port', '', '--data-dir', '/srv/d'])), undefined);
+  const valueless = { unknown: 'names --port without a value' };
+  assert.deepEqual(unitPort(systemd(['--port'], 'TSM_PORT=4100')), valueless);
+  assert.deepEqual(unitPort(systemd(['--port='])), valueless);
+  assert.deepEqual(unitPort(systemd(['--port', '', '--data-dir', '/srv/d'])), valueless);
   const launchd = launchctlUnit(launchctlPrint({ argv: ['--port'], env: { SESSION_SERVER_PORT: '4100' } }));
   assert.ok(launchd);
-  assert.equal(unitPort(launchd), undefined);
+  assert.deepEqual(unitPort(launchd), valueless);
 });
 
 test('an empty ExecStart is unknown, not termd with no arguments (the house\'s read of the 40 commits, #22)', () => {
@@ -133,4 +134,45 @@ test('a LaunchAgent plist\'s environment keeps every key past an empty <string/>
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a unit naming an EnvironmentFile= has every value termd takes from its environment unknown, and its command line's options known (the house's read of the 40 commits through f3750e4, #22 comment 6310921374)", () => {
+  // As systemctl 257 prints them: one line each, an optional (`-`) file as ignore_errors=yes.
+  const files = ['/home/a/.config/termd.env (ignore_errors=yes)', '/etc/termd/env (ignore_errors=no)'];
+  const read = (argv: string[], environment = '') => {
+    const u = systemctlUnit(execStart(argv), environment, { files });
+    assert.ok(u, 'the ExecStart is read');
+    return u;
+  };
+  // Read from Environment= alone, a file's TSM_PORT=4100 or TSM_DATA_DIR was taken for port 3101 and $HOME/.tsm.
+  const which = 'EnvironmentFile=/home/a/.config/termd.env, /etc/termd/env';
+  assert.deepEqual(unitPort(read([])), { unknown: `names no --port and reads ${which}, which may set TSM_PORT or SESSION_SERVER_PORT` });
+  assert.deepEqual(unitPort(read([], 'TSM_PORT=4200')), { unknown: `names no --port and reads ${which}, which may set TSM_PORT or SESSION_SERVER_PORT` }, "a file's value wins over Environment='s");
+  assert.deepEqual(unitDataDir(read(['--port', '3101'], 'TSM_DATA_DIR=/srv/d')), { unknown: `names no --data-dir and reads ${which}, which may set TSM_DATA_DIR` });
+  // termd reads its options before its environment: what the command line says stands.
+  const flags = read(['--port', '4100', '--data-dir', '/srv/unit']);
+  assert.equal(unitPort(flags), '4100');
+  assert.equal(unitDataDir(flags), '/srv/unit');
+  // systemd expands ${NAME} from the environment the files are part of, so an argument naming one is unknown, HOME too.
+  assert.equal(systemctlUnit(execStart(['--data-dir', '${HOME}/d']), '', { files }), undefined);
+  assert.equal(systemctlUnit(execStart(['--data-dir', '${BASE}/d']), 'BASE=/srv', { files }), undefined);
+  // No file named: as before.
+  assert.equal(unitPort(systemd([], 'TSM_PORT=4200')), '4200');
+});
+
+test("a unit's environment starts from the user manager's, which Environment= overrides and UnsetEnvironment= takes from (systemd 257, probed with a user unit)", () => {
+  const read = (argv: string[], environment: string, more: { manager?: string; unset?: string }) => {
+    const u = systemctlUnit(execStart(argv), environment, more);
+    assert.ok(u, 'the ExecStart is read');
+    return u;
+  };
+  // A TSM_DATA_DIR a login imported into the manager reaches termd: read from Environment= alone, it was $HOME/.tsm.
+  assert.equal(unitDataDir(read(['--port', '3101'], '', { manager: 'HOME=/home/a "TSM_DATA_DIR=/srv/my data"' })), '/srv/my data');
+  assert.equal(unitPort(read([], '', { manager: 'TSM_PORT=4100' })), '4100');
+  assert.equal(unitPort(read([], 'TSM_PORT=4200', { manager: 'TSM_PORT=4100' })), '4200', "the unit's own value wins");
+  assert.equal(unitDataDir(read(['--data-dir', '${BASE}/d'], '', { manager: 'BASE=/srv/base' })), '/srv/base/d', '${NAME} expands from it too');
+  // UnsetEnvironment= takes a variable by name, or one assignment of it only when the value matches.
+  assert.equal(unitDataDir(read([], '', { manager: 'TSM_DATA_DIR=/srv/x', unset: 'TSM_DATA_DIR' })), path.join(os.homedir(), '.tsm'));
+  assert.equal(unitPort(read([], 'TSM_PORT=4200', { manager: 'TSM_PORT=4100', unset: 'TSM_PORT=4100' })), '4200');
+  assert.equal(unitPort(read([], '', { manager: 'TSM_PORT=4100', unset: 'TSM_PORT=4100' })), '3101');
 });

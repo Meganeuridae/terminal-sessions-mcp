@@ -808,6 +808,10 @@ interface Unit {
   env?: Record<string, string>;
   active?: boolean;
   enabled?: boolean;
+  /** systemd only: the unit's EnvironmentFile=s as `systemctl show` prints them, the user manager's environment, and whether asking for it fails. */
+  envFiles?: string[];
+  managerEnv?: Record<string, string>;
+  managerFails?: boolean;
 }
 
 /** The two supervisors' answers for a loaded unit: a launchd job's `print` and a systemd unit's `show`, with the same command line and environment. */
@@ -815,14 +819,20 @@ function unitStub(u: Unit): Stub {
   const args = u.argv ?? [...(u.port === 'none' ? [] : ['--port', String(u.port ?? 3101)]), ...(u.dataDir ? ['--data-dir', u.dataDir] : [])];
   const env = Object.entries(u.env ?? {});
   const q = (s: string) => `'${s}'`;
+  // As systemd 255 prints them: an assignment with spaces in double quotes.
+  const words = (vars: Array<[string, string]>) => vars.map(([k, v]) => (/\s/.test(v) ? `"${k}=${v}"` : `${k}=${v}`)).join(' ');
   const systemctl = [
     'LoadState=loaded',
     `ActiveState=${u.active === false ? 'inactive' : 'active'}`,
     `UnitFileState=${u.enabled ? 'enabled' : 'disabled'}`,
-    // As systemd 255 prints them: the argv unquoted, an assignment with spaces in double quotes.
+    // The argv unquoted.
     `ExecStart={ path=/bin/sh ; argv[]=/bin/sh /pkg/next/config/termd-launch.sh ${args.join(' ')} ; ignore_errors=no }`,
-    `Environment=${env.map(([k, v]) => (/\s/.test(v) ? `"${k}=${v}"` : `${k}=${v}`)).join(' ')}`,
+    `Environment=${words(env)}`,
+    ...(u.envFiles ?? []).map((f) => `EnvironmentFiles=${f}`),
+    'UnsetEnvironment=',
   ];
+  // `systemctl --user show termd …` asks about the unit; `systemctl --user show --property=Environment`, the manager.
+  const manager = u.managerFails ? "echo 'Failed to connect to bus: No medium found' >&2; exit 1" : `printf '%s\\n' ${q(`Environment=${words(Object.entries(u.managerEnv ?? {}))}`)}`;
   const launchctl = [
     'com.animalabs.termd = {',
     '\targuments = {',
@@ -835,7 +845,7 @@ function unitStub(u: Unit): Stub {
     '\t}',
     '}',
   ];
-  return { launchctl: `printf '%s\\n' ${launchctl.map(q).join(' ')}`, systemctl: `printf '%s\\n' ${systemctl.map(q).join(' ')}` };
+  return { launchctl: `printf '%s\\n' ${launchctl.map(q).join(' ')}`, systemctl: `case " $* " in *" termd "*) printf '%s\\n' ${systemctl.map(q).join(' ')} ;; *) ${manager} ;; esac` };
 }
 
 /** The answers that are not a loaded unit: nothing managed; a check that does not answer in time; a check that fails (systemctl without the user manager's bus, launchctl without a GUI domain, as over ssh). */
@@ -1019,6 +1029,15 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // kept, an empty TSM_PORT is unset as termd has it, and a launchd job with no arguments block is unknown.
     { name: 'shared-data-dir-with-a-run-of-spaces', when: true, stub: (dataDir) => unitStub({ port: 3101, dataDir }), dataDir: path.join(tmp, 'sup run  of   spaces'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup run {2}of {3}spaces, which a termd/ },
     { name: 'empty-tsm-port-in-environment', when: true, stub: () => unitStub({ port: 'none', env: { TSM_PORT: '', SESSION_SERVER_PORT: String(port) } }), expect: 'managed', says: /is the (launchd job com\.animalabs\.termd|systemd user unit termd)'s to start/ },
+    // An EnvironmentFile= can set what the shim reads from Environment=: read from that alone, these units
+    // were port 3101 and $HOME/.tsm, and a termd was started (the house's read of the 40 commits through
+    // f3750e4, #22 comment 6310921374). Options on the command line stay known.
+    { name: 'environment-file-and-no-port-flag', when: linux, stub: () => unitStub({ port: 'none', envFiles: ['/etc/termd.env (ignore_errors=no)'] }), expect: 'unknown', says: /the systemd user unit termd names no --port and reads EnvironmentFile=\/etc\/termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so its port is unknown/ },
+    { name: 'environment-file-and-no-data-dir-flag', when: linux, stub: () => unitStub({ port: 3101, envFiles: [`${tmp}/termd.env (ignore_errors=yes)`] }), expect: 'dangling', says: /serves port 3101, and its unit names no --data-dir and reads EnvironmentFile=\S+\/termd\.env, which may set TSM_DATA_DIR, so the data dir its termd uses is unknown: none is started here/ },
+    { name: 'environment-file-and-both-flags', when: linux, stub: () => unitStub({ port: 3101, dataDir: path.join(tmp, 'unit-data'), envFiles: ['/etc/termd.env (ignore_errors=no)'] }), expect: 'start', says: /serves port 3101 out of \S+unit-data, not \d+: a termd for \d+ is started here/ },
+    // The user manager's environment reaches the unit's termd: read from Environment= alone, its data dir was $HOME/.tsm.
+    { name: 'data-dir-in-the-manager-environment', when: linux, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir } }), expect: 'shared', says: /serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
+    { name: 'manager-environment-query-fails', when: linux, stub: () => unitStub({ port: 3101, managerFails: true }), expect: 'unknown', says: /systemctl --user show \(the user manager's environment, which the unit's termd inherits\) failed \(Failed to connect to bus: No medium found\), so the unit's port and data dir are unknown/ },
     { name: 'launchctl-no-arguments-block', when: darwin, stub: () => ({ launchctl: `printf '%s\\n' 'com.animalabs.termd = {' '\tprogram = /usr/local/bin/termd' '\tenvironment = {' '\t\tTSM_PORT => ${port}' '\t}' '}'`, systemctl: 'exit 1' }), expect: 'unknown', says: /launchctl print shows no arguments for the launchd job com\.animalabs\.termd \(a job naming Program alone, whose program's own arguments are not shown\), so its port and data dir are unknown/ },
   ];
   const run = async (c: Case): Promise<void> => {
