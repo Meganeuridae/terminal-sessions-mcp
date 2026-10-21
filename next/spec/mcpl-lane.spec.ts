@@ -1369,7 +1369,7 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     open: Set<string>;
     registered: Set<string>;
     watched: Map<string, unknown>;
-    states: Map<string, { owed: Set<number>; inflight: Map<string, number>; retries: Map<string, { kind: string }>; summaries: Map<string, { folded?: { count: number } }> }>;
+    states: Map<string, { owed: Set<number>; inflight: Map<string, number>; retries: Map<string, { kind: string }>; summaries: Map<string, { folded?: { count: number }; owes?: number }> }>;
     closes: Map<string, number>;
     batch: unknown[];
     flush(): Promise<void>;
@@ -2012,3 +2012,80 @@ test("a note budget whose first count failed counts again at the next note, and 
     await g.close();
   }
 });
+
+// ───────────── the house's read of 4f4c067 (PR #22) ─────────────
+
+test("a catch-up retires a refused fold summary that nothing carried, so the completions it stood for are sent and the cursor passes them", { timeout: 60_000 }, async () => {
+  // A fold made while push events were off kept its summary with no retry entry: with push back on and the host
+  // accepting, the cursor stayed below three completions that were never sent, for the life of the connection.
+  const was = McplLane.retryMax;
+  McplLane.retryMax = 4;
+  const f = await bareLane('c-retire-fold');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'rf' });
+    const s = live(f.registry, 'rf');
+    const st = () => f.inside.states.get('rf')!;
+    f.refuse.value = true;
+    f.late.value = true;
+    const ends: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      const r = await f.app.run(f.caller, { session: 'rf', command: `echo rf-${i}`, target: 'process', wait: 0 });
+      await until(() => s.run(r.runId!).seq.end !== undefined, 5000, `Run ${i} to end`);
+      ends.push(s.run(r.runId!).seq.end!);
+    }
+    await until(() => f.pending.length >= 6, 5000, 'six completions pushed and held');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'pushEvents') }, f.ctx);
+    for (const p of f.pending.splice(0)) p.answer();
+    await until(() => [...st().summaries.values()].some((x) => x.folded), 5000, 'the refusals to fold');
+    assert.equal(f.lane.carries('rf'), false);
+    const folded = [...st().summaries.values()].find((x) => x.folded)!.folded!.count;
+    assert.ok(folded >= 1, 'some completions were folded while nothing carried the session');
+    const from = f.sent.length;
+    f.refuse.value = false;
+    f.late.value = false;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => s.cursorsOf(A).delivered >= Math.max(...ends), 10_000, 'the cursor to pass every completion');
+    assert.equal(st().summaries.size, 0, 'the fold summary is retired, not left pinning the cursor');
+    const pushedAfter = f.sent.slice(from).filter((m) => m.method === 'push/event').map((m) => (m.params as { eventId: string }).eventId);
+    for (const end of ends) assert.ok(pushedAfter.some((id) => id.endsWith(`:run:${end}`)), `the completion at ${end} is sent once push events are back`);
+    assert.ok(!pushedAfter.some((id) => /:summary~refused-/.test(id)), 'the retired summary is not sent beside the completions it counted');
+  } finally {
+    McplLane.retryMax = was;
+    await f.close();
+  }
+});
+
+test("a catch-up that retires a refused catch-up summary retires the seq it owed, so a gap's end that retention moved past doesn't pin the cursor", { timeout: 90_000 }, async () => {
+  // A catch-up's summary owes its own seq, here the end of the gone range. Retired without it, that seq stayed
+  // owed once retention moved past it: the next scan's gap ended later, nothing had the old seq, and the cursor
+  // stayed below it for the life of the connection (Ambrose-2449's read of the retirement).
+  const f = await bareLane('c-retire-owes');
+  try {
+    const st = () => f.inside.states.get('ro')!;
+    const noPush = FULL_GRANT.filter((c) => c !== 'pushEvents');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: noPush }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'ro', retention: { maxBytes: 16 * 1024 } });
+    const s = live(f.registry, 'ro');
+    const flood = async () => {
+      for (let i = 0; i < 4; i++) await f.app.run(f.caller, { session: 'ro', command: 'seq 1 2000', target: 'process', wait: 10_000 });
+    };
+    await flood();
+    assert.ok((s.journal.oldestSeq ?? 1) > 1, 'retention took the start of the journal');
+    f.refuse.value = true;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => [...st().summaries.values()].some((x) => !x.folded), 10_000, "the catch-up's summary of the gone range");
+    const owed = [...st().summaries.values()].find((x) => !x.folded)!.owes!;
+    assert.ok(st().owed.has(owed), 'the summary owes its own seq');
+    await flood();
+    assert.ok((s.journal.oldestSeq ?? 1) > owed + 1, `retention moved past the seq the summary owes (${owed}; oldest now ${s.journal.oldestSeq})`);
+    const last = await f.app.run(f.caller, { session: 'ro', command: 'echo ro-last', target: 'process', wait: 5000 });
+    const lastEnd = s.run(last.runId!).seq.end!;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: noPush }, f.ctx);
+    f.refuse.value = false;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => s.cursorsOf(A).delivered >= lastEnd, 15_000, `the cursor to pass the last completion (owed ${JSON.stringify([...st().owed])}, delivered ${s.cursorsOf(A).delivered})`);
+  } finally {
+    await f.close();
+  }
+});
+

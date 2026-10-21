@@ -426,7 +426,9 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   elapsed time is not acceptance. A catch-up summary pins the cursor before its oldest
   covered event until accepted, then settles the individual debts it represents. A session's
   refused lifecycle messages are retried one by one up to 32; past that the oldest fold into
-  one summary, retried in their place, which pins the cursor below them until accepted.
+  one summary, retried in their place, which pins the cursor below them until accepted (a message
+  whose resend still waits for the host's answer stays alone). A catch-up retires the summaries not
+  in flight, since it scans from the cursor they pin and finds what they stood for again.
   Cursors are keyed by principal, so they survive connection replacement. Delivery is
   at-least-once; duplicates are detectable by `seq` and `messageId`.
 - **G23.** Tags describe and never authorize. Treatment is the host's. Suggested treatment

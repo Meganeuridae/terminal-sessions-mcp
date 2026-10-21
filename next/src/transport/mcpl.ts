@@ -230,9 +230,10 @@ interface LaneState {
   retries: Map<string, { seq: Seq; kind: SegmentKind; attempt: number; timer?: NodeJS.Timeout | undefined }>;
   /**
    * A summary pins at its oldest event until accepted, then settles the individual debts it covers. One
-   * that `folded` refused messages stands for them: they are no longer owed one by one.
+   * that `folded` refused messages stands for them: they are no longer owed one by one. A catch-up's
+   * summary owes its own seq (`owes`), its last omitted event or the end of its last gap.
    */
-  summaries: Map<string, { from: Seq; covered: Set<Seq>; folded?: Omitted }>;
+  summaries: Map<string, { from: Seq; covered: Set<Seq>; folded?: Omitted; owes?: Seq }>;
   /** Messages withheld while a synchronous call may still return them (G28): key (runId, or `runId:service=status@seq`) → since, on the monotonic clock. */
   held: Map<string, { since: number; seq?: Seq; timer?: NodeJS.Timeout | undefined }>;
   /** Everything up to here is settled for this principal except what is owed: `delivered` may advance to it. */
@@ -1386,6 +1387,7 @@ export class McplLane {
       if (from >= t.journal.lastSeq || !this.carries(t.id)) continue;
       const st = this.stateOf(t);
       st.scanningFrom = from;
+      this.retireSummaries(st);
       plans.push({ t, st, src: this.sourceOf(entry), from, open: this.openOrOpening(channelId(t.id)), covered: new Set() });
     }
     try {
@@ -1429,7 +1431,7 @@ export class McplLane {
         const to = omitted?.to ?? gaps[gaps.length - 1]!.to;
         this.owe(p.st, to);
         w.summary = this.summary(p.t, omitted, scan.lost);
-        p.st.summaries.set(qualify(w.summary.messageId), { from, covered: p.covered });
+        p.st.summaries.set(qualify(w.summary.messageId), { from, covered: p.covered, owes: to });
       }
       if (scan.end > p.st.clearTo) p.st.clearTo = scan.end;
       p.st.scanningFrom = undefined;
@@ -1446,6 +1448,30 @@ export class McplLane {
         if (this.disposed) return;
         this.deliver(w.t, seg);
       }
+    }
+  }
+
+  /**
+   * A catch-up scans from the delivered cursor, and every pending summary pins that cursor below what it
+   * stands for, so the scan finds all of it again: it replays what it can and names the rest in its own
+   * summary. Each summary not in flight goes, with its retry. Kept, a fold made while nothing carried the
+   * session had no retry and pinned the cursor for the life of the connection, its messages never sent; a
+   * fold the catch-up replayed counted them a second time once accepted; and refused catch-up summaries,
+   * which never fold, piled up one per catch-up (the house's read of 4f4c067, #22). One in flight settles
+   * by its answer. One whose answer was lost after its request timed out may still reach the host, which
+   * then hears of its messages twice, as G22's at-least-once allows.
+   */
+  private retireSummaries(st: LaneState): void {
+    for (const [id, summary] of [...st.summaries]) {
+      if (st.inflight.has(id)) continue;
+      st.summaries.delete(id);
+      // Its own seq goes too, or it stays owed when retention has taken it, or it was a gap's end the new scan
+      // finds grown: nothing then has its seq to settle it (Ambrose-2449's read). The scan re-owes an event still there.
+      if (summary.owes !== undefined) st.owed.delete(summary.owes);
+      const r = st.retries.get(id);
+      if (r?.timer) clearTimeout(r.timer);
+      st.retries.delete(id);
+      this.sent.delete(id);
     }
   }
 
