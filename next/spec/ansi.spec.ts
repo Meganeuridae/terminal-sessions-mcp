@@ -311,3 +311,10 @@ test('a watch reads a CSI holding many line feeds in time linear in it (an indep
   assert.deepEqual(lines.map((h) => h.line), ['ready']);
   assert.ok(ms < 1000, `${ms.toFixed(0)} ms`);
 });
+
+test('a line says where its first character came from, and that it holds output from elsewhere too, for a stream whose writers take turns (a process Run’s pipes)', () => {
+  const s = new LineSplitter();
+  const lines = [...s.feed('abc', 'stdout'), ...s.feed('def\nerr only\n', 'stderr'), ...s.feed('\x1b[3', 'stdout'), ...s.feed('\n1mx\n', 'stdout'), ...s.feed('tail', 'stdout'), ...s.flush()];
+  assert.deepEqual(lines, [{ text: 'abcdef', from: 'stdout', mixed: true }, { text: 'err only', from: 'stderr' }, { text: 'x', from: 'stdout' }, { text: 'tail', from: 'stdout' }]);
+  assert.deepEqual(new LineSplitter().feed('plain\n'), [{ text: 'plain' }], 'with no source given, none is said');
+});

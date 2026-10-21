@@ -508,7 +508,9 @@ substantially more work than a reliable current screen; deferred until a workflo
    its final frame follows; a range ending inside a program ends with its current frame.
    Intermediate frames are not kept.
 6. *Streams.* Process stdout/stderr come from pipes: a bare LF projects as CRLF; a change of
-   source starts on a fresh line.
+   source starts on a fresh line. A process Run's two pipes are one source, for search and
+   watches too: a hit names the pipe of its line's first character, and says when the line
+   holds both.
 7. *Budgets, all visible.* `maxInputBytes` keeps the head or tail (never splitting a
    character, preferring a line boundary) and reports `omittedInputBytes`; `maxLines`
    caps logical lines; any omission sets `truncated`.
@@ -1443,7 +1445,7 @@ type JournalEvent =
   | { seq; ts; type: 'attach';      attachmentId; principal; role: 'observer'|'controller' }
   | { seq; ts; type: 'detach';      attachmentId; principal }
   | { seq; ts; type: 'integration'; level: 'unknown'|'rich'|'basic'|'none' }                  // G5
-  | { seq; ts; type: 'watch.fired'; watchId; label; kind: 'pattern'|'silence'|'idle'; principal; at: seq; match?; line?; clipped?: boolean; suppressed?: number }
+  | { seq; ts; type: 'watch.fired'; watchId; label; kind: 'pattern'|'silence'|'idle'; principal; at: seq; match?; line?; clipped?: boolean; stream?: 'stdout'|'stderr'; mixed?: boolean; suppressed?: number }
   | { seq; ts; type: 'gap';         from: seq; to: seq; reason: 'retention'|'keeper-overflow'|'torn-write'|'store-error'|'store-failed'; exact?: true }  // G11; the last three are G19's disk path; torn-write is also what a power loss took (G10)
                                     // exact: every seq of the range was issued, so it counts the events lost (one exception: a jump in the files found after a stop while the disk refused is counted as issued, though it can hold an earlier start's hole above a reservation whose gap the ring dropped too); absent (and in a gap an earlier build wrote), the count is a bound, since numbering may have resumed above a reservation's never-issued seqs
   | { seq; ts; type: 'checkpoint';  screen: serialized }                                      // milestone 3; not in types.ts yet

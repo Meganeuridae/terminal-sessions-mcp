@@ -404,12 +404,15 @@ class Render {
   }
 
   watch(ev: EventOf<'watch.fired'>): Segment {
-    const what = ev.kind === 'pattern' ? `matched: ${oneLine(ev.line ?? ev.match ?? '', 160)}` : ev.kind === 'silence' ? (ev.match ?? 'output went quiet') : 'the shell is available';
+    // A process Run's line names its first character's pipe, and `mixed` when it holds both: a watch reads the
+    // two as one source (the house's review of f3750e4..4f4c067, #22, comment 6315636412, question 4).
+    const pipe = ev.stream ? ` (${ev.stream}${ev.mixed ? ', mixed' : ''})` : '';
+    const what = ev.kind === 'pattern' ? `matched: ${oneLine(ev.line ?? ev.match ?? '', 160)}${pipe}` : ev.kind === 'silence' ? (ev.match ?? 'output went quiet') : 'the shell is available';
     // `clipped`: the line was longer than the pattern's match window and matched on its head; carried
     // to the reader, as the hit and waitFor's result carry it (the house's read of the 36 commits, #22).
     const clip = ev.clipped ? ` (${headOnlyText()})` : '';
     return {
-      ...this.base('watch', ev.seq, { watchId: ev.watchId, label: ev.label, watchKind: ev.kind, match: ev.match, at: ev.at, ...(ev.clipped ? { clipped: true } : {}) }, ev.ts),
+      ...this.base('watch', ev.seq, { watchId: ev.watchId, label: ev.label, watchKind: ev.kind, match: ev.match, at: ev.at, ...(ev.clipped ? { clipped: true } : {}), ...(ev.stream ? { stream: ev.stream } : {}), ...(ev.mixed ? { mixed: true } : {}) }, ev.ts),
       lifecycle: true,
       tags: [`terminal:watch=${ev.label}`, 'terminal:watch', `terminal:${ev.kind}`],
       head: `[terminal] ${this.src.id}: watch "${oneLine(ev.label, 60)}" fired · ${what}${clip}${ev.suppressed ? ` (+${ev.suppressed} more)` : ''} · read since=${Math.max(0, ev.at - 1)}`,

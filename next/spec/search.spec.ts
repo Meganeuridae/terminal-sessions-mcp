@@ -51,7 +51,7 @@ test('m2-9: a program\'s CRLF through a PTY (CR CR LF) is searchable, and a prog
   assert.deepEqual(lines(await search(src, { pattern: 'Doneress', since: 0 })), [], 'the overwritten tail is gone');
 });
 
-test('er-5: stdout and stderr of a process Run are separate streams whose lines never mix, nor with the terminal\'s', async () => {
+test('er-5: stdout and stderr of a process Run are one source, as a read shows them, and its lines never mix with the terminal\'s; a match names its first character\'s pipe (the house\'s review of f3750e4..4f4c067, #22, comment 6315636412, question 4)', async () => {
   const src = source();
   startRun(src.journal, 'r1');
   out(src.journal, 'out-a ', 'stdout', 'r1');
@@ -61,7 +61,15 @@ test('er-5: stdout and stderr of a process Run are separate streams whose lines 
   out(src.journal, 'err-b\n', 'stderr', 'r1');
   endRun(src.journal, 'r1');
   const r = await search(src, { pattern: '.', since: 0, context: 0 });
-  assert.deepEqual(lines(r).sort(), ['err-a err-b', 'out-a out-b', 'shell line']);
+  assert.deepEqual(lines(r).sort(), ['err-b', 'out-a err-a out-b', 'shell line'], 'they were the lines `out-a out-b` and `err-a err-b`');
+  const read = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
+  for (const l of lines(r)) assert.ok(read.text!.split('\n').includes(l), `${l} is a line of the read: ${JSON.stringify(read.text)}`);
+  const by = (line: string) => r.matches.find((m) => m.line === line)!;
+  assert.equal(by('out-a err-a out-b').stream, 'stdout');
+  assert.equal(by('out-a err-a out-b').mixed, true);
+  assert.equal(by('err-b').stream, 'stderr');
+  assert.equal(by('err-b').mixed, undefined);
+  assert.equal(by('shell line').stream, undefined, 'the terminal\'s lines name no pipe');
 });
 
 test('er-5: a real PTY `cat` of 5000 lines: every line is found, whatever the read boundaries', async () => {

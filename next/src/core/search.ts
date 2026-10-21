@@ -8,8 +8,13 @@
  * built from raw output and the transcript; this is the part that runs over
  * every retained line, so it is kept line-oriented and cheap):
  *
- * 1. Streams. The pty is one stream, and each process Run's stdout and stderr
- *    are one stream each; their lines never mix.
+ * 1. Sources. The sources are the transcript's (§6 rule 6): the pty, and each
+ *    process Run's stdout and stderr together, so `abc` on stdout then `def` and
+ *    a LF on stderr is the line `abcdef`, as a read and the digests show it, and
+ *    the lines of different sources never mix. A match on a Run's line names the
+ *    pipe its first character came from (`stream`), and says `mixed` when the
+ *    line holds output from both (the house's review of f3750e4..4f4c067, #22,
+ *    comment 6315636412, question 4: they were two sources here and one there).
  * 2. Lines. A stream's raw bytes are joined across events and cut at each LF
  *    outside a control string (`lineEnds`, the one line-end rule: a LF inside a
  *    window title ends no line), so a line is the same whatever the chunking: a
@@ -53,7 +58,7 @@
 import { cleanLine } from './ansi.js';
 import { testBounded } from './regex.js';
 import { headAt, indexAtByte, isStringStart, lineCarry, lineEnds, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
-import type { JournalEvent, Seq } from './types.js';
+import type { JournalEvent, OutputStream, Seq } from './types.js';
 
 export interface SearchMatch {
   /** The event that completed the line. */
@@ -69,6 +74,10 @@ export interface SearchMatch {
   offset?: number;
   /** The line (or a context line) is longer than shown, or than the part matched. */
   clipped?: true;
+  /** A process Run's line: the pipe its first character came from (rule 1). */
+  stream?: 'stdout' | 'stderr';
+  /** The line holds output from both of the Run's pipes. */
+  mixed?: true;
 }
 
 export interface SearchOptions {
@@ -91,6 +100,9 @@ interface Carry {
   raw: string;
   /** The line's raw bytes passed MAX_LINE_RAW: only its head is kept. */
   cut: boolean;
+  /** The stream of the event the line began in, and whether a later piece of it came from the other pipe (rule 1). */
+  stream: OutputStream;
+  mixed: boolean;
   start: Resume;
   /** Lines completed when this one began (rule 6: more since means other lines came between). */
   linesAt: number;
@@ -155,12 +167,12 @@ export class LineScanner {
       return;
     }
     if (ev.type !== 'output') return;
-    const key = ev.stream === 'pty' ? 'pty' : `${ev.stream}:${ev.runId ?? ''}`;
+    const key = ev.stream === 'pty' ? 'pty' : `p:${ev.runId ?? ''}`;
     const i = indexAtByte(ev.data, offset);
     // A continuation that starts inside a CSI (a line begun after a LF the CSI executed) reads it on from its head.
     const head = i > 0 && !this.scans.has(key) ? headAt(ev.data, i) : '';
     if (head) this.scans.set(key, { open: head });
-    this.take(key, ev.data.slice(i), ev.seq, utf8Length(ev.data.slice(0, i)));
+    this.take(key, ev.data.slice(i), ev.seq, utf8Length(ev.data.slice(0, i)), ev.stream);
   }
 
   /**
@@ -208,7 +220,7 @@ export class LineScanner {
     return first;
   }
 
-  private take(key: string, data: string, seq: Seq, base: number): void {
+  private take(key: string, data: string, seq: Seq, base: number, stream: OutputStream): void {
     const ascii = data.length === Buffer.byteLength(data);
     let pos = 0;
     let bytes = base;
@@ -227,11 +239,12 @@ export class LineScanner {
     while (pos <= data.length && !this.full) {
       if (!carry) {
         if (pos === data.length) break;
-        carry = { raw: head, cut: false, start: { cursor: seq - 1, offset: bytes }, linesAt: this.lines };
+        carry = { raw: head, cut: false, stream, mixed: false, start: { cursor: seq - 1, offset: bytes }, linesAt: this.lines };
         this.carries.set(key, carry);
       }
       const nl = e < ends.length ? ends[e++]! : -1;
       const piece = data.slice(pos, nl === -1 ? undefined : nl);
+      if (piece && stream !== carry.stream) carry.mixed = true;
       if (!carry.cut) {
         const room = MAX_LINE_RAW - carry.raw.length;
         if (piece.length > room) {
@@ -279,6 +292,8 @@ export class LineScanner {
       const m: SearchMatch = { seq, lineNumber: this.lines, line: view.text, before: this.recent.map((r) => r.text), after: [], cursor: c.start.cursor };
       if (c.start.offset > 0) m.offset = c.start.offset;
       if (view.cut || t.clipped || this.recent.some((r) => r.cut)) m.clipped = true;
+      if (c.stream !== 'pty') m.stream = c.stream;
+      if (c.mixed) m.mixed = true;
       this.matches.push(m);
       if (this.context > 0) this.waiting.push(m);
     }

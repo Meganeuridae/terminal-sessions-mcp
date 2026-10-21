@@ -5,8 +5,14 @@
  * block up to a deadline for the same predicates, without leaving a watch behind.
  *
  * Patterns match whole lines, as `search` does (see StreamMatcher): each line of
- * each stream is tested once, `^` and `$` are the line's ends, and a line with no
- * newline yet (a prompt) is tested once its stream has been quiet for a moment.
+ * each source is tested once, `^` and `$` are the line's ends, and a line with no
+ * newline yet (a prompt) is tested once its source has been quiet for a moment.
+ * The sources are the transcript's (§6 rule 6): the pty, and each process Run's
+ * stdout and stderr together, so `abc` on stdout then `def` and a LF on stderr is
+ * the line `abcdef`, as the transcript and the digests show it; a hit on a Run's
+ * line names the pipe its first character came from (`stream`), and says `mixed`
+ * when the line holds output from both (the house's review of f3750e4..4f4c067,
+ * #22, comment 6315636412, question 4).
  * A line is read as it displays (`cleanLine`: backspaces, erases and in-line
  * cursor moves applied), with one difference from search: a lone carriage return
  * ends a *frame* here, tested as a line of its own, so a progress bar matches as
@@ -30,7 +36,7 @@
  * Run's stamp go once other Runs printed 8,192 events, and cost about 1.6 µs per event).
  */
 import { randomBytes } from 'node:crypto';
-import { compileLinePattern, PARTIAL_QUIET_MS, StreamMatcher } from './ansi.js';
+import { compileLinePattern, PARTIAL_QUIET_MS, StreamMatcher, type LineMatch } from './ansi.js';
 import { clocks, MAX_TIMER_MS, timerMs } from './clock.js';
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
@@ -71,6 +77,10 @@ export interface WaitResult {
   line?: string;
   /** The line was longer than the pattern's match window and matched on its head only (the house's read of the 36 commits, #22). */
   clipped?: boolean;
+  /** A process Run's line: the pipe its first character came from. */
+  stream?: 'stdout' | 'stderr';
+  /** The line holds output from both of the Run's pipes. */
+  mixed?: boolean;
   /** Journal position of the event that satisfied the wait. */
   seq?: Seq;
   elapsedMs: number;
@@ -111,11 +121,20 @@ export function kindOf(spec: WatchSpec): WatchKind {
   return kinds[0]!;
 }
 
-/** Which matcher stream an output event belongs to: the PTY is one stream; each process pipe is its own. */
-const streamKey = (ev: EventOf<'output'>) => (ev.stream === 'pty' ? 'pty' : `${ev.stream}:${ev.runId ?? ''}`);
+/** Which matcher an output event belongs to: the transcript's source (§6 rule 6), the PTY or a process Run's two pipes together. */
+const sourceKey = (ev: EventOf<'output'>) => (ev.stream === 'pty' ? 'pty' : `p:${ev.runId ?? ''}`);
 
-/** A matcher's hit as the predicate fires it; `clipped` travels only when set (the house's read of ed4ecac, #22: the flag was produced and dropped). */
-const hitOf = (hit: { match: string; line: string; clipped?: boolean }, seq: Seq): Hit => (hit.clipped ? { match: hit.match, line: hit.line.trim(), seq, clipped: true } : { match: hit.match, line: hit.line.trim(), seq });
+/**
+ * A matcher's hit as the predicate fires it; `clipped`, `stream` and `mixed` travel only when set (the house's read of
+ * ed4ecac, #22: the flag was produced and dropped).
+ */
+const hitOf = (hit: LineMatch, seq: Seq): Hit => {
+  const h: Hit = { match: hit.match, line: hit.line.trim(), seq };
+  if (hit.clipped) h.clipped = true;
+  if (hit.from === 'stdout' || hit.from === 'stderr') h.stream = hit.from;
+  if (hit.mixed) h.mixed = true;
+  return h;
+};
 
 const isTerminal = (s: RunInfo['state']) => s === 'exited' || s === 'cancelled' || s === 'lost';
 
@@ -124,8 +143,12 @@ const exitText = (x: { exitCode: number | null; signal?: string }) => `session e
 const endText = (r: { runId: string; state: string; exit?: number; signal?: string }) =>
   `run ${r.runId} ended (${r.state}${r.signal ? ` ${r.signal}` : r.exit !== undefined ? ` ${r.exit}` : ''})`;
 
-/** What a predicate fires with: the match and its line, where in the journal, and whether the line was matched on its head only (longer than the pattern's match window). */
-type Hit = { match?: string; line?: string; seq: Seq; clipped?: boolean };
+/**
+ * What a predicate fires with: the match and its line, where in the journal, whether the line was matched on its head
+ * only (longer than the pattern's match window), and for a process Run's line its first character's pipe and whether
+ * it holds both.
+ */
+type Hit = { match?: string; line?: string; seq: Seq; clipped?: boolean; stream?: 'stdout' | 'stderr'; mixed?: boolean };
 
 /** Evaluates one predicate against journal events; shared by watches and waits. */
 class Predicate {
@@ -186,9 +209,9 @@ class Predicate {
       case 'pattern':
         if (ev.type === 'output') {
           if (this.spec.runId !== undefined && ev.runId !== this.spec.runId) return;
-          const s = this.matcher(streamKey(ev));
+          const s = this.matcher(sourceKey(ev));
           s.seq = ev.seq;
-          for (const hit of s.m.feed(ev.data)) this.fire(hitOf(hit, ev.seq));
+          for (const hit of s.m.feed(ev.data, ev.stream)) this.fire(hitOf(hit, ev.seq));
         } else if (ev.type === 'run.end') {
           if (ev.runId === this.spec.runId) {
             // The Run's streams are over: its unterminated last line is complete.
@@ -197,7 +220,7 @@ class Predicate {
           } else {
             // Another Run's pipes are over too: their last line is complete now, not after the
             // partial delay, and their matchers are not kept for the rest of the watch's life.
-            this.endStreams(`stdout:${ev.runId}`, `stderr:${ev.runId}`);
+            this.endStreams(`p:${ev.runId}`);
           }
         } else if (ev.type === 'session.exit') {
           this.flush();
@@ -516,6 +539,8 @@ export class WatchManager {
     if (hit.match !== undefined) ev.match = hit.match;
     if (hit.line !== undefined) ev.line = hit.line;
     if (hit.clipped) ev.clipped = true;
+    if (hit.stream !== undefined) ev.stream = hit.stream;
+    if (hit.mixed) ev.mixed = true;
     if (more > 0) ev.suppressed = more;
     this.host.journal.append(ev);
     if (w.spec.once) this.remove(w.watchId);
@@ -568,6 +593,8 @@ export class WatchManager {
           if (hit.match !== undefined) r.match = hit.match;
           if (hit.line !== undefined) r.line = hit.line;
           if (hit.clipped) r.clipped = true;
+          if (hit.stream !== undefined) r.stream = hit.stream;
+          if (hit.mixed) r.mixed = true;
           finish(result(r));
         },
         (ev) => abort(endText(ev)),
@@ -593,7 +620,7 @@ export class WatchManager {
               if (done) return;
               predicate.feed(ev);
               if (done) return;
-              if (ev.type === 'output') lastBy.set(streamKey(ev), ev);
+              if (ev.type === 'output') lastBy.set(sourceKey(ev), ev);
             }
           }
           // A stream whose replayed last line has no newline and has been quiet for the partial

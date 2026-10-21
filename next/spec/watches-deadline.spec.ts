@@ -97,12 +97,13 @@ test('an ended Run’s last output and a stream’s quiet partial line keep thei
     assert.equal(w.matched, true);
     const quiet = Number(/no output for ([\d.]+)ms/.exec(String(w.match))?.[1]);
     assert.ok(quiet < 5000, `the ended Run's last output is aged on the monotonic clock: ${w.match}`);
-    // A process Run's stderr left a prompt without a newline, then stdout printed: a wait replaying the
+    // A process Run's stderr left a prompt without a newline, then the terminal printed: a wait replaying the
     // output must age the stderr line by its arrival, not by the stepped wall clock, so it is not flushed
-    // as already quiet; it is matched once the partial delay has really passed.
+    // as already quiet; it is matched once the partial delay has really passed. (The Run's stdout would
+    // go on the prompt's line: a Run's pipes are one source, as the transcript reads them.)
     f.startRun('p', 'process');
     f.journal.append({ type: 'output', runId: 'p', data: 'password: ', stream: 'stderr' });
-    f.out('progress\n', 'p', 'stdout');
+    f.out('progress\n');
     t.mock.method(Date, 'now', () => wall + 20_000);
     const t0 = performance.now();
     const hit = await f.manager.waitFor({ pattern: 'password:', runId: 'p' }, 5000, 0);
@@ -538,6 +539,36 @@ test('a gap recorded after its hole splits no line the replay reads past it (the
     f.journal.append({ type: 'gap', from: 1, to: 1, reason: 'store-failed' });
     f.out('def\n', 'r');
     assert.equal((await f.manager.waitFor({ pattern: 'abcdef' }, 300, 0)).matched, true);
+  } finally {
+    f.close();
+  }
+});
+
+test('a pattern reads a process Run’s stdout and stderr as one source, as the transcript does, and a hit names its first character’s pipe (the house’s review of f3750e4..4f4c067, #22, comment 6315636412, question 4)', async () => {
+  // `abc` on stdout then `def` and a LF on stderr is the line `abcdef` to a read and a digest; a watch read two lines.
+  const f = bare();
+  try {
+    const w = f.manager.add({ pattern: '^abcdef$' }, A);
+    f.startRun('p', 'process');
+    f.out('abc', 'p', 'stdout');
+    f.journal.append({ type: 'output', runId: 'p', data: 'def\n', stream: 'stderr' });
+    for (const t0 = performance.now(); !f.firings(w.watchId).length && performance.now() - t0 < 2000; ) await sleep(10);
+    const fired = f.firings(w.watchId)[0];
+    assert.ok(fired, 'the watch fired on the line the transcript shows');
+    assert.deepEqual([fired.line, fired.stream, fired.mixed], ['abcdef', 'stdout', true]);
+    const replay = await f.manager.waitFor({ pattern: '^abcdef$' }, 300, 0);
+    assert.deepEqual([replay.matched, replay.line, replay.stream, replay.mixed], [true, 'abcdef', 'stdout', true]);
+    f.journal.append({ type: 'output', runId: 'p', data: 'only err\n', stream: 'stderr' });
+    const err = await f.manager.waitFor({ pattern: '^only err$' }, 300, 0);
+    assert.deepEqual([err.matched, err.stream, err.mixed], [true, 'stderr', undefined]);
+    // Another Run's pipes and the terminal are sources of their own: their output never joins this Run's line.
+    f.startRun('q', 'process');
+    f.out('q-out ', 'q', 'stdout');
+    f.out('terminal line\n');
+    f.out('q-rest\n', 'q', 'stdout');
+    assert.equal((await f.manager.waitFor({ pattern: '^q-out q-rest$' }, 300, 0)).matched, true);
+    const pty = await f.manager.waitFor({ pattern: '^terminal line$' }, 300, 0);
+    assert.deepEqual([pty.matched, pty.stream], [true, undefined], 'the terminal’s line names no pipe');
   } finally {
     f.close();
   }

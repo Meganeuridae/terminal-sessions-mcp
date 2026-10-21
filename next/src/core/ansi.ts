@@ -216,6 +216,10 @@ export interface SplitLine {
   text: string;
   /** The line was longer than MAX_LINE: this is its head, and the rest was dropped. */
   cut?: true;
+  /** The `source` `feed` was given with the chunk holding the line's first character (a process Run's pipe). */
+  from?: string;
+  /** The line holds output from chunks of different sources: both of a process Run's pipes. */
+  mixed?: true;
 }
 
 export interface LineMatch {
@@ -225,6 +229,9 @@ export interface LineMatch {
   line: string;
   /** Only the line's head was searched: it is longer than the pattern's match window (`$` meant the window's end), or longer than MAX_LINE (the rest was dropped). */
   clipped?: true;
+  /** As SplitLine's: where the line's first character came from, and whether the line holds output from elsewhere too. */
+  from?: string;
+  mixed?: true;
 }
 
 export interface LineSplitterOptions {
@@ -265,6 +272,9 @@ export class LineSplitter {
   private readonly scan: LineCarry = lineCarry();
   /** The unterminated line was consumed as a prompt. */
   private spent = false;
+  /** Where the unterminated line's first character came from, and whether the line holds output from elsewhere too (SplitLine). */
+  private from: string | undefined;
+  private mixed = false;
   private timer: NodeJS.Timeout | undefined;
   private readonly quietMs: number;
   private readonly onPartial: ((line: SplitLine) => boolean) | undefined;
@@ -274,8 +284,12 @@ export class LineSplitter {
     this.onPartial = opts.onPartial;
   }
 
-  /** Feed a chunk; returns the lines it completed, in order. */
-  feed(chunk: string): SplitLine[] {
+  /**
+   * Feed a chunk; returns the lines it completed, in order. `source` says where the chunk came from, for a
+   * stream whose writers take turns (a process Run's two pipes, one source as the transcript reads them):
+   * each line says where its first character came from, and whether it holds output from elsewhere too.
+   */
+  feed(chunk: string, source?: string): SplitLine[] {
     const out: SplitLine[] = [];
     if (!chunk) return out;
     let text = chunk;
@@ -301,10 +315,10 @@ export class LineSplitter {
     parts.push(head + text.slice(from));
     const last = parts.pop()!;
     for (const part of parts) {
-      this.add(part);
+      this.add(part, source);
       this.complete(out);
     }
-    this.add(last);
+    this.add(last, source);
     this.schedulePartial();
     return out;
   }
@@ -314,8 +328,11 @@ export class LineSplitter {
    * boundary: never inside a control sequence or a surrogate pair (the house's read of the 38
    * commits, #22, comment 6274773484: a head ended in a lone high surrogate).
    */
-  private add(part: string): void {
-    if (this.cut || !part) return;
+  private add(part: string, source: string | undefined): void {
+    if (!part) return;
+    if (!this.raw) this.from = source;
+    else if (source !== this.from) this.mixed = true;
+    if (this.cut) return;
     if (this.raw.length + part.length <= MAX_LINE) {
       this.raw += part;
       return;
@@ -344,7 +361,10 @@ export class LineSplitter {
   private current(): SplitLine | undefined {
     const text = cleanLine(this.raw);
     if (!text) return undefined;
-    return this.cut ? { text, cut: true } : { text };
+    const line: SplitLine = this.cut ? { text, cut: true } : { text };
+    if (this.from !== undefined) line.from = this.from;
+    if (this.mixed) line.mixed = true;
+    return line;
   }
 
   private complete(out: SplitLine[]): void {
@@ -352,6 +372,8 @@ export class LineSplitter {
     this.raw = '';
     this.cut = false;
     this.spent = false;
+    this.from = undefined;
+    this.mixed = false;
     if (line) out.push(line);
   }
 
@@ -422,9 +444,9 @@ export class StreamMatcher {
     this.lines = new LineSplitter(split);
   }
 
-  /** Feed a chunk; returns the matches of the lines it completed. */
-  feed(chunk: string): LineMatch[] {
-    return this.collect(this.lines.feed(chunk));
+  /** Feed a chunk (`source`: see LineSplitter.feed); returns the matches of the lines it completed. */
+  feed(chunk: string, source?: string): LineMatch[] {
+    return this.collect(this.lines.feed(chunk, source));
   }
 
   /** The stream ended: match its unterminated line now. */
@@ -450,6 +472,8 @@ export class StreamMatcher {
     if (!r.match) return undefined;
     const hit: LineMatch = { match: r.match[0], line: line.text };
     if (r.clipped || line.cut) hit.clipped = true;
+    if (line.from !== undefined) hit.from = line.from;
+    if (line.mixed) hit.mixed = true;
     return hit;
   }
 }

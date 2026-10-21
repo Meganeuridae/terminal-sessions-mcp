@@ -228,13 +228,15 @@ function tailMarks(l: NonNullable<ReadResult['lines']>, runId: string | undefine
 
 /** The holes a read or a search spanned, as a status-line item (the reader words them). */
 const gapsBit = (r: { gap?: GapInfo; gaps?: GapInfo[] }): string => item(gapsText(r));
+/** A process Run's line, as a hit names it: its first character's pipe, and `mixed` when it holds both (search and watches read the two as one source); '' for the terminal's. */
+const pipeOf = (h: { stream?: string; mixed?: boolean }): string => (h.stream ? `${h.stream}${h.mixed ? ' · mixed' : ''}` : '');
 const item = (text: string | undefined): string => (text ? ` · ${text}` : '');
 
 export function renderSearch(r: SearchResult, mode: ResultText): ToolResult {
   const structured = env(r);
   if (mode === 'json') return { text: JSON.stringify(r, null, 2), structured };
   const at = (c: number, o?: number) => `since=${c}${o ? ` offset=${o}` : ''}`;
-  const body = r.matches.map((m) => [...m.before.map((l) => `  ${l}`), `> ${m.line}   [read ${at(m.cursor, m.offset)}]`, ...m.after.map((l) => `  ${l}`)].join('\n')).join('\n--\n');
+  const body = r.matches.map((m) => [...m.before.map((l) => `  ${l}`), `> ${m.line}   [${m.stream ? `${pipeOf(m)} · ` : ''}read ${at(m.cursor, m.offset)}]`, ...m.after.map((l) => `  ${l}`)].join('\n')).join('\n--\n');
   const more = r.more ? ` · more (${r.stoppedBy ?? 'limit'}): search ${at(r.nextCursor ?? r.scanned[1], r.nextOffset)}` : '';
   // What the scan did not see, as the envelope says it and as read's status line does: the holes it
   // spanned, and the lines longer than the match window, searched on their head only; without
@@ -399,6 +401,10 @@ const SUMMARY: Schema = {
   required: ['id', 'owner', 'visibility', 'state', 'lastSeq'],
 };
 
+/** A hit's pipe and whether its line holds both (search and watches read a process Run's stdout and stderr as one source). */
+const STREAM: Schema = { type: 'string', enum: ['stdout', 'stderr'], description: "A process Run's line: the pipe its first character came from." };
+const MIXED: Schema = { type: 'boolean', description: "The line holds output from both of the Run's pipes." };
+
 const WAIT_OUTPUT: Schema = {
   type: 'object',
   properties: {
@@ -408,6 +414,8 @@ const WAIT_OUTPUT: Schema = {
     match: { type: 'string' },
     line: { type: 'string' },
     clipped: { type: 'boolean', description: 'The line was longer than the match window and matched on its head only; `line` is that head.' },
+    stream: STREAM,
+    mixed: MIXED,
     seq: { type: 'integer' },
     elapsedMs: { type: 'number' },
     nextCursor: { type: 'integer' },
@@ -429,6 +437,8 @@ const SEARCH_OUTPUT: Schema = {
           cursor: { type: 'integer', description: 'Pass as read `since` (with `offset`) to read from the matching line.' },
           offset: { type: 'integer' },
           clipped: { type: 'boolean' },
+          stream: STREAM,
+          mixed: MIXED,
           lineNumber: { type: 'integer' },
           line: { type: 'string' },
           before: { type: 'array', items: { type: 'string' } },
@@ -841,7 +851,9 @@ export const TOOLS: ToolDef[] = [
       'Set a standing watch on a session that notifies you when it fires: `pattern` (a regex matched per output line as the terminal shows it, a tab as the spaces to the next tab stop — `^`/`$` are line ends, and a ' +
       'prompt with no newline counts after 0.5 s of quiet), `silenceMs` (output stopped for ' +
       'that long), or `idle` (the shell became free after running something). Give exactly one. `label` names it in notifications; `once` removes ' +
-      'it after the first firing. Notifications need an MCPL connection; on plain MCP a watch only counts its firings (see `watches`) — use ' +
+      'it after the first firing. A process Run\'s stdout and stderr are one source, as `read` shows them: a line can hold both, and a firing names ' +
+      'the pipe its line\'s first character came from and says when the line holds both. ' +
+      'Notifications need an MCPL connection; on plain MCP a watch only counts its firings (see `watches`) — use ' +
       '`wait_for` to block on the same conditions instead.',
     inputSchema: {
       type: 'object',
@@ -893,7 +905,8 @@ export const TOOLS: ToolDef[] = [
     description:
       'Block up to `wait` ms until a session shows `pattern` in its output, goes quiet for `silenceMs`, or becomes `idle`. With `since`, output ' +
       'already printed after that cursor counts, so a line printed before the call is not missed. Patterns match per output line, as the terminal shows it: ' +
-      'a tab is the spaces up to the next tab stop, so match it with ` +` or `\\s+`, not `\\t`. Returns ' +
+      'a tab is the spaces up to the next tab stop, so match it with ` +` or `\\s+`, not `\\t`. A process Run\'s stdout and stderr are one source, as ' +
+      '`read` shows them: a line can hold both, and a match names the pipe its first character came from (`stream`) and says `mixed` when it holds both. Returns ' +
       'matched: false when the wait ends first, and at once with a `reason` when it can no longer be met (the shell exited, the Run ended). ' +
       '`nextCursor` is the position of the match (or the journal’s end when nothing matched): pass it as the next wait’s `since` to go on from there.',
     inputSchema: {
@@ -915,7 +928,7 @@ export const TOOLS: ToolDef[] = [
       const r = await ctx.app.waitFor(ctx.caller, pick(a, ['session', 'pattern', 'silenceMs', 'idle', 'runId', 'since', 'wait']));
       // A match on a clipped line is said in the text, in the words search's status and the watch notice use (headOnlyText); only `--json` showed `clipped` (the house's read of the 38 commits, #22 comment 6274806357).
       const clipped = r.clipped ? ` · ${headOnlyText()}` : '';
-      const text = r.matched ? `[${r.kind} matched after ${fmt(r.elapsedMs)}${r.line ? `: ${r.line}` : r.match ? `: ${r.match}` : ''} · seq ${r.seq ?? '?'}${clipped}]` : `[no ${r.kind} match${r.reason ? ` · ${r.reason}` : ` within ${fmt(r.elapsedMs)}`} · next=${r.nextCursor}]`;
+      const text = r.matched ? `[${r.kind} matched after ${fmt(r.elapsedMs)}${r.line ? `: ${r.line}` : r.match ? `: ${r.match}` : ''}${item(pipeOf(r))} · seq ${r.seq ?? '?'}${clipped}]` : `[no ${r.kind} match${r.reason ? ` · ${r.reason}` : ` within ${fmt(r.elapsedMs)}`} · next=${r.nextCursor}]`;
       return render(ctx, text, env(r));
     },
   },
@@ -926,7 +939,8 @@ export const TOOLS: ToolDef[] = [
       "Search a session's output history with a regex, line by line: each match comes with lines of context and a `cursor`, plus an `offset` when the line " +
       'lies inside a long output event — `read since=<cursor> offset=<offset>` reads on from the matching line (each match’s own `[read …]` hint spells it out). ' +
       'Patterns run on a linear-time engine: no back-references or lookahead. A line reads as the terminal shows it: a tab is the spaces up to the next ' +
-      'tab stop, so match it with ` +` or `\\s+`, not `\\t`. Without `since`, the recent past is ' +
+      'tab stop, so match it with ` +` or `\\s+`, not `\\t`. A process Run\'s stdout and stderr are one source, as `read` shows them: a line can hold ' +
+      'both, and a match names the pipe its first character came from (`stream`) and says `mixed` when it holds both. Without `since`, the recent past is ' +
       'scanned and the result says if older history was left out, as it says what it skipped (gaps, over-long lines). Use `read` to page through output.',
     inputSchema: {
       type: 'object',
