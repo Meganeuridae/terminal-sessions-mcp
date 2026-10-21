@@ -902,6 +902,33 @@ test('the replies kept since the prompt start go again after a SIGINT sent as a 
   }
 });
 
+test('input sent while the cancel waits after its last ^C is not erased: no empty line is typed after it', async () => {
+  // Counted only from the settle, input sent during the ^C's own wait was in the editor when the empty
+  // line's clear keys came (the house's review of 4f4c067..a8b6f28).
+  const h = await harness();
+  h.shell.stop();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const write = h.pty.write.bind(h.pty);
+  let interrupts = 0;
+  h.pty.write = (data: string) => {
+    write(data);
+    // Once the second ^C is typed, the input comes during the wait that follows it.
+    if (data.includes('\x03') && ++interrupts === 2) setImmediate(() => h.session.input('echo hello\r', { principal: AGENT }));
+  };
+  try {
+    const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+    assert.equal(interrupts, 2, JSON.stringify(c.steps));
+    assert.match(c.steps.at(-1) ?? '', /^no empty line typed, since input was sent to the shell meanwhile/, JSON.stringify(c));
+    assert.ok(!h.pty.written.slice(h.pty.written.lastIndexOf('echo hello')).includes(CLEAR_LINE_KEYS), 'nothing erases it');
+    h.shell.cont(); // the prompt for the ^C is the shell's answer, and the command typed after it runs
+    await until(() => /echo hello\r\nhello\r\n/.test(ofType(h.journal.since(0).events, 'output').map((e) => e.data).join('')), 2000, 'the typed command ran');
+  } finally {
+    h.shell.cont();
+    await h.session.close();
+  }
+});
+
 test('a cancel whose empty line cannot be written types none, says so, and takes the shell’s next prompt as its answer', async () => {
   // askForPrompt's fallback when its file cannot be written: no line is typed, and the prompt the stopped
   // shell prints for the ^C when it runs again is the shell's answer.

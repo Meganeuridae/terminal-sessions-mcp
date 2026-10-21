@@ -2548,12 +2548,15 @@ export class Session {
     const sentWhile = run.state;
     this.typeSignal(run, 'SIGINT', principal);
     steps.push('^C');
+    // Input sent after the last ^C is in the editor, or on its way, when askForPrompt types its empty line.
+    let inputsAfterInterrupt = this.inputsSent;
     await this.awaitRun(runId, grace);
     if (run.state === 'starting' || (sentWhile === 'starting' && run.state === 'running')) {
       // The first ^C raced the line (dropped, or spent before the job started): one
       // more, at the line editor or to the job.
       this.typeSignal(run, 'SIGINT', principal);
       steps.push('^C');
+      inputsAfterInterrupt = this.inputsSent;
       await this.awaitRun(runId, grace);
     }
     if (run.state === 'starting' && this.pendingShellRun === run) {
@@ -2571,7 +2574,7 @@ export class Session {
       // 6307351617, item 1). It stays busy until the shell shows it is back, which askForPrompt asks.
       this.discardPending(run, { state: 'cancelled', reason: 'cancelled-before-start' });
       steps.push('the line was discarded before it started');
-      const asked = await this.askForPrompt();
+      const asked = await this.askForPrompt(inputsAfterInterrupt);
       const discarded = `${runId}: no mark followed two ^C; the line was discarded before it started`;
       if (asked === 'typed') {
         steps.push('an empty line, whose prompt says the shell is back');
@@ -2640,17 +2643,18 @@ export class Session {
    * was typed; `answered` when a prompt came while the terminal was read (the shell is back); `gone` when
    * the shell exited or was replaced, or the session is closing, meanwhile.
    */
-  private async askForPrompt(): Promise<'typed' | 'answered' | 'gone' | { why: string }> {
+  private async askForPrompt(inputsAfterInterrupt: number): Promise<'typed' | 'answered' | 'gone' | { why: string }> {
     const waiting = { path: undefined, started: false, prompted: false };
     this.promptProbe = waiting;
-    const sent = this.inputsSent;
     const why = await this.whyNotEditor();
     if (this.shellState === 'exited' || this.shellState === 'unavailable' || this.closing) return 'gone';
     if (this.promptProbe !== waiting) return 'answered';
     if (why !== undefined) return { why };
-    // Input someone sent during the settle is in the editor, or on its way: the empty line's clear keys
-    // would erase it (the house's review of the 40 commits through 4f4c067, by run).
-    if (this.inputsSent !== sent) return { why: 'input was sent to the shell meanwhile, which the empty line would erase' };
+    // Input someone sent since the cancel's last ^C, during its wait or the settle, is in the editor, or on
+    // its way: the empty line's clear keys would erase it (the house's review of the 40 commits through
+    // 4f4c067, by run; counted only from the settle, the ^C's own wait was left out: the house's review of
+    // 4f4c067..a8b6f28).
+    if (this.inputsSent !== inputsAfterInterrupt) return { why: 'input was sent to the shell meanwhile, which the empty line would erase' };
     this.resendReplies();
     let file: string;
     try {
