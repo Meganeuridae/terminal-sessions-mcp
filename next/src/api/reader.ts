@@ -409,7 +409,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // A control sequence left open where collecting would stop is collected to its end (within
   // OPEN_SEQUENCE_BYTES), so no page has to end inside it. A control string (an OSC carrying a
   // clipboard) can be long: once one is found open, only an event that could end it (BEL, ST,
-  // ESC) or a hole makes the check run again (the house's read of 1cabc6a, #22).
+  // ESC, CAN, SUB) or a hole makes the check run again (the house's read of 1cabc6a, #22).
   let openString: number | undefined; // pieces checked so far, while a control string is open
   const closer = /[\x07\x18\x1a\x1b\x9c]/;
   /** Per source, what its pieces left unfinished for the line-end rule (lineEnds). */
