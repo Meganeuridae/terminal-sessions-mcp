@@ -294,3 +294,19 @@ test('an inline Run’s progress digest shows its partial line: its output begin
   await until(() => out.some((s) => s.kind === 'output' && s.metadata.bytes === data.length), 5000, 'a digest of all the output');
   assert.equal(out.filter((s) => s.kind === 'output').at(-1)!.body, 'connecting\nPassword:');
 });
+
+test('a marker Run whose command file never ran shows its partial line once the preamble’s hold has passed: a program read the typed line', async (t) => {
+  // The house's review of f3750e4..4f4c067 (PR #22, comment 6315636412): with no start mark ever, the preamble held the digests'
+  // partial line back for the whole Run, so a program's `Password: ` never showed.
+  const src = fakeSource();
+  const seg = new Segmenter(src, { runSettleMs: 5, cadenceMs: 40, screenQuietMs: 20, preambleHoldMs: 200 });
+  t.after(() => seg.dispose());
+  const out = collect(seg);
+  const nonce = 'a1b2c3d4';
+  src.runs.set('r1', { runId: 'r1', sessionId: 's1', target: 'shell', origin: 'agent', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'exact', line: 'deploy', strategy: 'marker', nonce });
+  src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/w', strategy: 'marker', nonce });
+  src.journal.append({ type: 'output', data: `${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce)}\r\nlogin as: deploy\r\nPassword: `, stream: 'pty', runId: 'r1' });
+  await until(() => out.some((s) => s.kind === 'output' && /Password:$/.test(s.body ?? '')), 5000, 'the partial line, after the hold');
+  const shown = out.filter((s) => s.kind === 'output' && s.body).at(-1)!.body!;
+  assert.equal(shown, 'login as: deploy\nPassword:', 'the echo still dropped');
+});
