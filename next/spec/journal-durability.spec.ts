@@ -1495,6 +1495,17 @@ test('a stretch gap the disk refused, then the ring dropped, is one hole to gaps
   }
 });
 
+// ───────────── the house's review of 4f4c067..a8b6f28, PR #22 ─────────────
+
+test('a read that returns none of the events while more remain covers nothing: a limit of 0 reads no holes and throws nothing', () => {
+  const j = new Journal({ sessionId: 's' });
+  for (let i = 0; i < 5; i++) j.append(out(`e${i}`));
+  for (const r of [j.since(0, 0), j.range(1, 5, 0)]) {
+    assert.deepEqual([r.events.length, r.more, r.gaps], [0, true, undefined]);
+  }
+  j.close();
+});
+
 test('a catch-up that writes a refused gap and then fails again leaves the gap off unwritten: a new life does not record its hole a second time', () => {
   const dir = tmpDir();
   try {

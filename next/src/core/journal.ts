@@ -879,7 +879,9 @@ export class Journal {
     const last = events[events.length - 1];
     const result: ReadResult = { events, nextCursor: last ? last.seq : cursor, more };
     if (gap && gap.to >= gap.from) result.gap = gap;
-    const holes = this.holesIn(from, more ? last!.seq : end, events);
+    // What the result covers: to its last event when there are more, nothing when it returned none of them (a
+    // `limit` of 0 dereferenced no event: the house's review of 4f4c067..a8b6f28, PR #22), else its end.
+    const holes = this.holesIn(from, more ? (last ? last.seq : from - 1) : end, events);
     if (holes.length) result.gaps = holes;
     return result;
   }
