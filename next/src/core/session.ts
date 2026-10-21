@@ -215,6 +215,14 @@ const MAX_ORPHAN_LINES = 32;
  */
 const PROMPT_PROBE_GRACE_MS = 300;
 /**
+ * For a shell whose prompts carry an end mark, the empty line's grace runs from that mark, once PS1 is
+ * drawn; from the start mark it waits this long for it. A prompt that has stopped carrying the end mark
+ * (bash's `shopt -u promptvars` after the first prompts leaves PS1's mark unexpanded) is still given up,
+ * and a PS1 slower than this to draw is given up at this bound, as at the start mark before (the house's
+ * review of the 40 commits through 4f4c067).
+ */
+const PROMPT_DRAWN_WAIT_MS = 3000;
+/**
  * How often, and how far apart, the terminal's mode is read before a cancel types its empty line: one
  * read just after the ^C varied in the same case, raw once and canonical once (question 1).
  */
@@ -511,6 +519,8 @@ export class Session {
   private helloCommand: string | undefined;
   private sawPromptStart = false;
   private sawPromptEnd = false;
+  /** This shell's prompts carry an end mark (a B was seen): the empty line's grace then runs from it. */
+  private promptsCarryEnd = false;
   /** An `exec` in the Run in flight may replace the shell: its command line is watched (ss-4). */
   private execWatch: { run: RunRecord; timer: NodeJS.Timeout } | undefined;
   /** Order of everything typed into the terminal: principals' lines and the daemon's (ss-1). */
@@ -910,8 +920,9 @@ export class Session {
         // alone, with the hooks broken, is not the integration's first prompt).
         if (this.sawPromptStart) this.markReady();
         // The editor reads a queued line only once the prompt is drawn (a PS1 with a command
-        // substitution takes its time): the empty line's grace runs from here.
-        if (this.promptProbeTimer) this.armPromptProbeGrace();
+        // substitution takes its time): the empty line's grace runs from here (onPromptStart).
+        if (this.sawPromptStart) this.promptsCarryEnd = true;
+        if (this.promptProbe?.prompted && !this.promptProbe.started) this.armPromptProbeGrace();
         return;
       case 'C':
         return this.onPreExec();
@@ -1138,12 +1149,15 @@ export class Session {
     // the editor reads as soon as the prompt is drawn; without the mark within the grace the line was lost,
     // and the shell is back at this prompt (onPromptProbeLost). Counting prompts kept the shell busy for good
     // when no other came (the house's review of the 40 commits through f3750e4, #22 comment 6310921374,
-    // question 1).
+    // question 1). The grace runs from the prompt's end mark, once PS1 is expanded, when this shell's prompts
+    // carry one: from here, a PS1 with a second's command substitution gave the line up at 300 ms, and it ran
+    // at 1 s (the house's review of the 40 commits through 4f4c067). Until the end mark comes, the wait is
+    // PROMPT_DRAWN_WAIT_MS. A shell whose prompts have shown no end mark gets the grace from here.
     const probe = this.promptProbe;
     if (probe && (probe.started || probe.path === undefined)) this.dropPromptProbe();
     else if (probe) {
       probe.prompted = true;
-      this.armPromptProbeGrace();
+      this.armPromptProbeGrace(this.promptsCarryEnd ? PROMPT_DRAWN_WAIT_MS : PROMPT_PROBE_GRACE_MS);
     }
     if (this.shellState !== 'exited') this.shellState = this.currentShellRun || this.pendingShellRun || this.promptProbe ? 'busy' : 'idle';
     if (!this.ready && !this.readyTimer) {
@@ -1179,9 +1193,9 @@ export class Session {
   }
 
   /** (Re)start the empty line's grace at a prompt that came before its pre-execution mark (see onPromptStart). */
-  private armPromptProbeGrace(): void {
+  private armPromptProbeGrace(ms = PROMPT_PROBE_GRACE_MS): void {
     clearTimeout(this.promptProbeTimer);
-    this.promptProbeTimer = setTimeout(() => this.onPromptProbeLost(), PROMPT_PROBE_GRACE_MS);
+    this.promptProbeTimer = setTimeout(() => this.onPromptProbeLost(ms), ms);
     this.promptProbeTimer.unref();
   }
 
@@ -1190,11 +1204,11 @@ export class Session {
    * typed after it flushed it, or a program read it), and the shell is back at that prompt. Were the
    * line read later still, its mark names its file (onPreExec), and a Run written meanwhile waits for it.
    */
-  private onPromptProbeLost(): void {
+  private onPromptProbeLost(ms: number): void {
     this.promptProbeTimer = undefined;
     const probe = this.promptProbe;
     if (!probe || probe.started || this.closed) return;
-    this.note(`the empty line typed after a cancel's ^C did not start within ${PROMPT_PROBE_GRACE_MS} ms of the shell's prompt: it was lost (a ^C after it flushed it, or a program read it), and the shell counts as available again at that prompt`);
+    this.note(`the empty line typed after a cancel's ^C did not start within ${ms} ms of the shell's prompt: it was lost (a ^C after it flushed it, or a program read it), and the shell counts as available again at that prompt`);
     this.dropPromptProbe();
     if (this.shellState === 'busy' && !this.currentShellRun && !this.pendingShellRun) this.shellState = 'idle';
     this.drainQueue();

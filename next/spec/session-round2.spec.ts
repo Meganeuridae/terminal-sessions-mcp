@@ -698,6 +698,54 @@ test('an empty line whose file cannot be removed at its prompt still frees the s
   assert.ok(!fs.existsSync(probe), 'and goes with the session’s other files');
 });
 
+test('the empty line’s grace runs from the prompt’s end mark: a prompt slow to draw does not give the line up before it is drawn', async () => {
+  // By run with bash 5.2.37 and a PS1 holding a second's command substitution: the grace ran from the
+  // prompt's start mark, gave the line up at 300 ms and wrote the queued Run's line, and the empty line ran
+  // at 1 s, once the prompt was drawn (the house's review of the 40 commits through 4f4c067).
+  const h = await harness({ quietEmptyInterrupt: true });
+  h.shell.pause(); // nothing typed is read until resume()
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.equal(c.steps.at(-1), 'an empty line, whose prompt says the shell is back', JSON.stringify(c));
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  h.pty.emit(h.shell.mark('133;A') + '$ '); // the prompt starts; its PS1 takes its time
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal(h.session.run(b.run.runId).state, 'queued', 'nothing written while the prompt is drawn');
+  assert.ok(!ofType(h.journal.since(0).events, 'note').some((e) => /did not start within/.test(e.text)), 'the line is not given up before its prompt is drawn');
+  h.pty.emit(h.shell.mark('133;B')); // drawn: the grace runs from here
+  await until(() => h.session.run(b.run.runId).state === 'starting', 2000, 'the Run’s line written after the grace');
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /did not start within \d+ ms of the shell's prompt: it was lost/.test(e.text)), 'the give-up is said');
+  h.shell.resume();
+  const rb = await h.session.awaitRun(b.run.runId, 2000);
+  assert.deepEqual([rb.state, rb.exit], ['exited', 0], JSON.stringify(rb));
+  await h.session.close();
+});
+
+test('a prompt that stops carrying its end mark still gives the empty line up, at the bound on drawing it', async () => {
+  // bash's `shopt -u promptvars` after the first prompts leaves PS1's end mark unexpanded, so the prompts
+  // carry the start mark alone: the grace, waiting for an end mark, must still end (Gladys-2413's read).
+  const h = await harness({ quietEmptyInterrupt: true });
+  h.shell.pause();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.equal(c.steps.at(-1), 'an empty line, whose prompt says the shell is back', JSON.stringify(c));
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  const t0 = performance.now(); // not Date.now, which an earlier test in this file leaves mocked
+  h.pty.emit(h.shell.mark('133;A') + '$ '); // no end mark follows
+  await until(() => h.session.run(b.run.runId).state === 'starting', 6000, 'the Run’s line written once the wait ends');
+  const waited = performance.now() - t0;
+  assert.ok(waited >= 2500, `not before the bound (${Math.round(waited)} ms)`);
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /did not start within 3000 ms of the shell's prompt: it was lost/.test(e.text)), 'the give-up is said, with its wait');
+  h.shell.resume();
+  const rb = await h.session.awaitRun(b.run.runId, 2000);
+  assert.deepEqual([rb.state, rb.exit], ['exited', 0], JSON.stringify(rb));
+  await h.session.close();
+});
+
 test('a cancel whose empty line cannot be written types none, says so, and takes the shell’s next prompt as its answer', async () => {
   // askForPrompt's fallback when its file cannot be written: no line is typed, and the prompt the stopped
   // shell prints for the ^C when it runs again is the shell's answer.
