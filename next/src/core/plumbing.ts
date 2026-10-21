@@ -50,25 +50,34 @@ export const nonceOf = (mark: string): string | undefined => MARK_NONCE.exec(mar
  * narrow width writes the character at the margin again after a carriage return (`a1b2c\rc3d4`
  * inside a nonce: the house's read of 78c4d6e, #22, found such a probe line kept in a cancelled
  * Run's output), so any character may be followed by whitespace and itself again (the carriage
- * return is whitespace to the regex, and gone from stripEscapes's text). The unknown nonce keeps its class.
+ * return is whitespace to the regex, and gone from stripEscapes's text). fish 4 and 3.7 wrap at the
+ * margin by writing a line end and moving back up, and write the two cells before the margin again on
+ * both sides of it (`'%s>>>>` then `>>\n'` for `'%s>>>\n'`, or `"<` then `"<<<`), so a character may also
+ * be followed by the one typed before it and itself again; striking from the line where the mark began
+ * kept the typed line's head (a cancel's probe on CI's fish, behind a long prompt). `before` is what
+ * the line typed before `s`, for the first character's. The unknown nonce keeps its class.
  * A run of whitespace in the typed text has one way to match, one `\s+` with no joins around it: as a
  * space between joins, each able to take any share of a run of spaces, it let a line of spaces after a
  * probe line's head backtrack polynomially, 9 s on one 3.2 kB line (the house's read of the 33 commits,
  * #22, comment 6307351104), on output any program prints, which the compat pack's logs read.
  */
-const redrawn = (s: string): string => {
+const redrawn = (s: string, before = ''): string => {
   if (s === NONCE) return NONCE;
   let out = '';
   let joined = false;
+  // The typed character before this one, when it is no whitespace: a cell a line editor may write again.
+  let prev = /\S$/.test(before) ? literal(before.at(-1)!) : undefined;
   for (const ch of s) {
     if (/\s/.test(ch)) {
-      if (joined || !out) out += '\\s+';
+      if (joined || !out) out += `\\s+${prev ? `(?:${prev}\\s+)?` : ''}`;
       joined = false;
+      prev = undefined;
       continue;
     }
     const c = literal(ch);
-    out += `${joined ? '\\s*' : ''}${c}(?:\\s*${c})?`;
+    out += `${joined ? '\\s*' : ''}${c}(?:\\s*${c}${prev ? `|\\s*${prev}\\s*${c}` : ''})?`;
     joined = true;
+    prev = c;
   }
   return out;
 };
@@ -81,7 +90,7 @@ const splitWord = (a: string, b: string): string => `${redrawn(a)}\\s*(?:${redra
  * marker, split.
  */
 const wrapperEcho = (nonce: string): RegExp =>
-  new RegExp(`${redrawn('<<<')}\\s*(?:${splitWord('EXI', 'T')}\\s*:\\s*${redrawn(nonce)}(?:\\s*(?:${MARKER_RESTS.map(redrawn).join('|')}))?|${splitWord('STAR', 'T')}\\s*:\\s*${redrawn(nonce)}\\s*:)`, 'g');
+  new RegExp(`${redrawn('<<<')}\\s*(?:${splitWord('EXI', 'T')}\\s*:\\s*${redrawn(nonce)}(?:\\s*(?:${MARKER_RESTS.map((r) => redrawn(r)).join('|')}))?|${splitWord('STAR', 'T')}\\s*:\\s*${redrawn(nonce)}\\s*:)`, 'g');
 /**
  * The echo of the line typed to run the Run with this nonce, as the cut finds it, for a reader that sees
  * a marker or inline Run's output a line at a time and drops what the cut drops (the segmenter's
@@ -228,30 +237,47 @@ export const sourceLineEcho = (): RegExp => {
 };
 /**
  * The typed probe lines around their nonce, taken from the builders above: each head, from its
- * mark's `<<<` up to the nonce, with the rests of the lines that follow the nonce after it. The
- * cutter's copy of the rests was written by hand beside the builders, so a change to one could
- * leave the echo of the line it types in a Run's output (a reviewer's read of the fixes for #22).
+ * mark's `<<<` up to the nonce, with the leads of the lines that come before it and the rests that
+ * follow the nonce after it. The cutter's copy of the rests was written by hand beside the builders,
+ * so a change to one could leave the echo of the line it types in a Run's output (a reviewer's read
+ * of the fixes for #22). The leads are matched when they are there, so a line editor that broke the
+ * typed line before its mark leaves no piece of it on the line before (see redrawn).
  */
-const PROBE_LINES = new Map<string, string[]>();
+const PROBE_LINES = new Map<string, { leads: string[]; rests: string[] }>();
 /** The marker strategy's probe as builds before it was printf-built typed it, which journals keep. */
 const LEGACY_PROBE = ` echo "<<<PRO""BE:${AT_NONCE}>>>"`;
 for (const line of [...FLAVORS.map((f) => markerProbe(AT_NONCE, f)), LEGACY_PROBE, inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true)]) {
   const [before, after] = line.split(AT_NONCE) as [string, string];
-  const head = before.slice(before.indexOf('<<<'));
-  PROBE_LINES.set(head, [...(PROBE_LINES.get(head) ?? []), after]);
+  const at = before.indexOf('<<<');
+  const lines = PROBE_LINES.get(before.slice(at)) ?? { leads: [], rests: [] };
+  const lead = before.slice(0, at).trim();
+  if (!lines.leads.includes(lead)) lines.leads.push(lead);
+  lines.rests.push(after);
+  PROBE_LINES.set(before.slice(at), lines);
 }
 /**
  * A Run's nonce as the session makes it, eight hex digits (randomBytes(4)), as a redraw may show it:
  * whitespace between any two digits, and a digit written again after a break (a line editor writes the
- * margin character again after a carriage return). Taken only where the rest of the typed line follows
- * (its `:`, `>` or closing quote), so a line of hex printed after an echo is not taken in with it.
+ * margin character again after a carriage return, fish the two before the margin). Taken only where
+ * the rest of the typed line follows (its `:`, `>` or closing quote), so a line of hex printed after an
+ * echo is not taken in with it.
  */
-const BROKEN_NONCE = '[0-9a-f](?:\\s*[0-9a-f]){7,8}(?=\\s*[:>"])';
-/** The probe lines' echo for a nonce pattern: each head, the nonce, then any of the rests that follow it. */
-const probeEchoSource = (nonce: string): string =>
-  [...PROBE_LINES].map(([head, rests]) => `${redrawn(head)}\\s*${nonce}(?:\\s*(?:${rests.map(redrawn).join('|')}))?`).join('|');
+const BROKEN_NONCE = '[0-9a-f](?:\\s*[0-9a-f]){7,10}(?=\\s*[:>"])';
+/**
+ * The probe lines' echo, for a Run's nonce or, without one, any nonce: each head, after any of its
+ * leads, the nonce, then any of the rests that follow it. A known nonce is redrawn with the head's
+ * last character before it, and the rests with the nonce's.
+ */
+const probeEchoSource = (nonce?: string): string =>
+  [...PROBE_LINES]
+    .map(([head, { leads, rests }]) => {
+      const lead = `(?:(?:${[...leads].sort((a, b) => b.length - a.length).map((l) => redrawn(l)).join('|')})\\s*)?`;
+      const n = nonce === undefined ? `(?:${BROKEN_NONCE}|${NONCE})` : redrawn(nonce, head);
+      return `${lead}${redrawn(head, leads[0])}\\s*${n}(?:\\s*(?:${rests.map((r) => redrawn(r, nonce)).join('|')}))?`;
+    })
+    .join('|');
 /** Any Run's: a nonce a redraw broke, or any unbroken one. Built once (see probeEcho). */
-const PROBE_ECHO_ANY = probeEchoSource(`(?:${BROKEN_NONCE}|${NONCE})`);
+const PROBE_ECHO_ANY = probeEchoSource();
 /**
  * The echo of a probe line typed after a ^C, split, through the end of the typed line when it is
  * there. The rests that share a head are alternatives after it, so a line that is not the first's
@@ -264,7 +290,7 @@ const PROBE_ECHO_ANY = probeEchoSource(`(?:${BROKEN_NONCE}|${NONCE})`);
  * hundred lines (an independent read of that fix). Global: a reader strikes every line each match
  * spans, as cutPlumbing does, and the compat pack's logs use it so they cut the same echo.
  */
-export const probeEcho = (nonce?: string): RegExp => new RegExp(nonce === undefined ? PROBE_ECHO_ANY : probeEchoSource(redrawn(nonce)), 'g');
+export const probeEcho = (nonce?: string): RegExp => new RegExp(nonce === undefined ? PROBE_ECHO_ANY : probeEchoSource(nonce), 'g');
 /** A probe answer with its nonce (1), pid (2) and token (3). */
 const probeAnswer = (nonce: string): RegExp => new RegExp(`<<<PROBE:(${nonce})(?::(\\d+)(?::(${NONCE}|))?)?>>>`, 'g');
 

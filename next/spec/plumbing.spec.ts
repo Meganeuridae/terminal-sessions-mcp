@@ -263,6 +263,7 @@ test('the probe lines the session types are the ones the grammar parses and the 
   const fish = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find((p) => fs.existsSync(p));
   const lines = [
     { name: 'marker', line: markerProbe(nonce), of: { strategy: 'marker' as const, nonce }, shell: '/bin/sh', set: '' },
+    { name: 'marker fish', line: markerProbe(nonce, 'fish'), of: { strategy: 'marker' as const, nonce }, shell: fish, set: '' },
     { name: 'inline sh', line: inlineProbe(nonce, false), of: { strategy: 'inline' as const, nonce }, shell: '/bin/sh', set: `__tsm_r=${nonce};` },
     { name: 'inline fish', line: inlineProbe(nonce, true), of: { strategy: 'inline' as const, nonce }, shell: fish, set: `set -g __tsm_r ${nonce};` },
   ];
@@ -277,12 +278,17 @@ test('the probe lines the session types are the ones the grammar parses and the 
     const head = of.strategy === 'marker' ? `${typed(nonce)}out\n` : '\r\nout\r\n';
     const tail = of.strategy === 'marker' ? `\nmore\n<<<EXIT:${nonce}:0>>>\n` : `\r\nmore\r\n<<<EXIT:${nonce}:0>>>`;
     const want = of.strategy === 'marker' ? 'out\nmore\n' : 'out\r\nmore\r\n';
-    for (let i = line.indexOf('<<<') + 1; i < line.length; i++) {
+    const first = line.length - line.trimStart().length;
+    for (let i = first + 1; i < line.length; i++) {
       const broken = `${line.slice(0, i)}\r\n${line.slice(i)}`;
       assert.equal(cutPlumbing(`${head}${broken}${tail}`, of), want, `${name}: broken at ${i}: ${JSON.stringify(broken)}`);
+      // fish wraps at the margin with a line end and a move back up, and writes the two cells before the margin again
+      // on both sides of it, here with the margin at `i` (CI's fish behind a long prompt left `printf '%s>>` behind).
+      const wrapped = `${line.slice(0, i)}\r\x1b[119C\b${line.slice(i - 1, i + 1)}\r\r\n\x1b[A\x1b[118C${line.slice(i - 1)}`;
+      assert.equal(cutPlumbing(`${head}${wrapped}${tail}`, of), want, `${name}: wrapped as fish wraps at ${i}: ${JSON.stringify(wrapped)}`);
     }
     // The matcher a reader without the nonce uses (the compat pack's logs) takes the whole line for any Run's.
-    assert.equal([...line.matchAll(probeEcho())][0]?.[0], line.slice(line.indexOf('<<<')), `${name}: with no nonce, the line from its mark to its end`);
+    assert.equal([...line.matchAll(probeEcho())][0]?.[0], line.trimStart(), `${name}: with no nonce, the whole line`);
   }
 });
 

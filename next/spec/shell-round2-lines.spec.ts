@@ -13,6 +13,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { AGENT, hasShell, realSession, until, type Real } from './fake-shell.js';
+import { DEFAULT_GEOMETRY } from '../src/core/types.js';
 import { sleep } from './testhost.js';
 
 const FISH = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find(hasShell);
@@ -262,3 +263,26 @@ for (const { name, shell, fish } of MARKER) {
     }
   });
 }
+
+test('fish without its integration: a cancel’s probe that a long prompt wraps before its mark leaves no piece of its echo, wherever the margin falls', { skip: FISH === undefined ? 'fish is not installed' : false }, async () => {
+  // CI's macOS runners (a long host name in fish's prompt): fish wraps the typed probe at the margin with a line end and a move
+  // back up, writing the two cells before the margin again, and the cut, striking from the line where the mark began, kept
+  // `[SIGINT]>  printf '%s>>>`. The prompt's length puts the margin inside `printf`, inside `'%s>>>`, and inside `"<<<`.
+  for (const into of [4, 12, 19]) {
+    const prompt = `${'p'.repeat(DEFAULT_GEOMETRY.cols - 11 - into)} [SIGINT]> `;
+    const x = await realSession(FISH!, { integration: false, cols: DEFAULT_GEOMETRY.cols, rc: { '.config/fish/config.fish': `function fish_prompt; echo -n '${prompt}'; end\n` } });
+    try {
+      const a = await x.session.admitWhenAvailable({ target: 'shell', line: 'sleep 5', principal: AGENT }, 3000);
+      assert.ok(a.admitted);
+      const nonce = x.session.listRuns().find((r) => r.runId === a.run.runId)!.nonce!;
+      const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
+      await until(() => output().includes(`<<<START:${nonce}:`), 3000, 'the command file ran');
+      const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 1500 });
+      assert.equal(c.state, 'cancelled', JSON.stringify(c));
+      const text = (await x.session.runTranscript(a.run.runId)).text;
+      assert.doesNotMatch(text, /printf|%s|<<<|PRO/, `margin ${into} cells into the typed line: ${JSON.stringify(text)}`);
+    } finally {
+      await x.close();
+    }
+  }
+});
