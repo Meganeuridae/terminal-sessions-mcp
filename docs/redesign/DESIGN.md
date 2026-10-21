@@ -1457,7 +1457,7 @@ type JournalEvent =
   | { seq; ts; type: 'attach';      attachmentId; principal; role: 'observer'|'controller' }
   | { seq; ts; type: 'detach';      attachmentId; principal }
   | { seq; ts; type: 'integration'; level: 'unknown'|'rich'|'basic'|'none' }                  // G5
-  | { seq; ts; type: 'watch.fired'; watchId; label; kind: 'pattern'|'silence'|'idle'; principal; at: seq; match?; line?; clipped?: boolean; stream?: 'stdout'|'stderr'; mixed?: boolean; suppressed?: number }
+  | { seq; ts; type: 'watch.fired'; watchId; label; kind: 'pattern'|'silence'|'idle'; principal; at: seq; match?; line?; cursor?: seq; offset?: number; clipped?: boolean; stream?: 'stdout'|'stderr'; mixed?: boolean; suppressed?: number }  // at: the event that completed a pattern's line; cursor/offset: where the line began, as a search match's
   | { seq; ts; type: 'gap';         from: seq; to: seq; reason: 'retention'|'keeper-overflow'|'torn-write'|'store-error'|'store-failed'; exact?: true }  // G11; the last three are G19's disk path; torn-write is also what a power loss took (G10)
                                     // exact: every seq of the range was issued, so it counts the events lost (a jump in the files found after a stop while the disk refused is counted so unless the failed mark carried failedBound, which says a hole above a reservation was among the unrecorded; an earlier build's failed mark says nothing of it, and its jumps still count as issued); absent (and in a gap an earlier build wrote), the count is a bound, since numbering may have resumed above a reservation's never-issued seqs
   | { seq; ts; type: 'checkpoint';  screen: serialized }                                      // milestone 3; not in types.ts yet

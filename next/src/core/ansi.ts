@@ -7,7 +7,7 @@
  */
 import { err } from './errors.js';
 import { compileUserRegex, execBounded } from './regex.js';
-import { executedIn, isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, sequenceText, showsCharacter, type LineCarry } from './text.js';
+import { executedIn, isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, sequenceText, showsCharacter, utf8Length, type LineCarry } from './text.js';
 
 /**
  * The longest line a StreamMatcher holds: a longer one is matched on its first MAX_LINE, the hit says
@@ -220,6 +220,14 @@ export interface SplitLine {
   from?: string;
   /** The line shows characters from chunks of different sources: both of a process Run's pipes. */
   mixed?: true;
+  /** Where the line began: the `at` `feed` was given with its first chunk, and UTF-8 bytes into that chunk. */
+  begun?: Begun;
+}
+
+/** Where a line began in what was fed: the chunk's `at` (a journal seq), and UTF-8 bytes into the chunk. */
+export interface Begun {
+  at: number;
+  offset: number;
 }
 
 export interface LineMatch {
@@ -232,6 +240,8 @@ export interface LineMatch {
   /** As SplitLine's: where the line's first character came from, and whether the line holds output from elsewhere too. */
   from?: string;
   mixed?: true;
+  /** As SplitLine's: where the line began. */
+  begun?: Begun;
 }
 
 export interface LineSplitterOptions {
@@ -278,6 +288,8 @@ export class LineSplitter {
   private mixed = false;
   /** The unterminated line shows a character: `from` is decided. */
   private shown = false;
+  /** Where the unterminated line began, once any of it (its line end included) has come. */
+  private begun: Begun | undefined;
   private timer: NodeJS.Timeout | undefined;
   private readonly quietMs: number;
   private readonly onPartial: ((line: SplitLine) => boolean) | undefined;
@@ -291,12 +303,25 @@ export class LineSplitter {
    * Feed a chunk; returns the lines it completed, in order. `source` says where the chunk came from, for a
    * stream whose writers take turns (a process Run's two pipes, one source as the transcript reads them):
    * each line says where its first character came from, and whether it holds output from elsewhere too.
+   * `at` names the chunk (a journal seq): each line says where it began, the `at` of its first chunk and
+   * the UTF-8 bytes into it, as search's cursor and offset name a line's start.
    */
-  feed(chunk: string, source?: string): SplitLine[] {
+  feed(chunk: string, source?: string, at?: number): SplitLine[] {
     const out: SplitLine[] = [];
     if (!chunk) return out;
     let text = chunk;
     if (this.pendingCr && text.startsWith('\n')) text = text.slice(1);
+    // Where in the chunk a line begins, in UTF-8 bytes, counted on from the last line begun in it: once
+    // per chunk, however many lines it holds.
+    const skipped = chunk.length - text.length;
+    let mark = 0;
+    let markBytes = 0;
+    const begin = (i: number) => {
+      if (at === undefined || this.begun) return;
+      markBytes += utf8Length(chunk.slice(mark, i + skipped));
+      mark = i + skipped;
+      this.begun = { at, offset: markBytes };
+    };
     // Lines and frames end by the one rule (lineEnds, with CRs): a LF or CR inside a window title ends
     // neither (an independent read of the fix for the house's read of the 33 commits, #22, comment 6307350650).
     // One a CSI executes ends one, and the next begins with the CSI's head, so the CSI's rest is not text
@@ -310,8 +335,11 @@ export class LineSplitter {
     const parts: string[] = [];
     let from = 0;
     let head = '';
+    /** Where each part begins in `text`. */
+    const starts: number[] = [];
     for (let k = 0; k < breaks.length; k++) {
       const b = breaks[k]!;
+      starts.push(from);
       parts.push(head + text.slice(from, b));
       // A CRLF is one break.
       if (text[b] === '\r' && text[b + 1] === '\n' && breaks[k + 1] === b + 1) k++;
@@ -319,11 +347,15 @@ export class LineSplitter {
       head = heads.get(breaks[k]!) ?? '';
     }
     parts.push(head + text.slice(from));
+    starts.push(from);
     const last = parts.pop()!;
+    // A line begins where its first part does, that part ended by a line end here or holding something.
     parts.forEach((part, k) => {
+      begin(starts[k]!);
       this.add(part, source, k === 0 ? open : '');
       this.complete(out);
     });
+    if (from < text.length) begin(from);
     this.add(last, source, parts.length === 0 ? open : '');
     this.schedulePartial();
     return out;
@@ -377,6 +409,7 @@ export class LineSplitter {
     const line: SplitLine = this.cut ? { text, cut: true } : { text };
     if (this.from !== undefined) line.from = this.from;
     if (this.mixed) line.mixed = true;
+    if (this.begun) line.begun = this.begun;
     return line;
   }
 
@@ -388,6 +421,7 @@ export class LineSplitter {
     this.from = undefined;
     this.mixed = false;
     this.shown = false;
+    this.begun = undefined;
     if (line) out.push(line);
   }
 
@@ -458,9 +492,9 @@ export class StreamMatcher {
     this.lines = new LineSplitter(split);
   }
 
-  /** Feed a chunk (`source`: see LineSplitter.feed); returns the matches of the lines it completed. */
-  feed(chunk: string, source?: string): LineMatch[] {
-    return this.collect(this.lines.feed(chunk, source));
+  /** Feed a chunk (`source` and `at`: see LineSplitter.feed); returns the matches of the lines it completed. */
+  feed(chunk: string, source?: string, at?: number): LineMatch[] {
+    return this.collect(this.lines.feed(chunk, source, at));
   }
 
   /** The stream ended: match its unterminated line now. */
@@ -488,6 +522,7 @@ export class StreamMatcher {
     if (r.clipped || line.cut) hit.clipped = true;
     if (line.from !== undefined) hit.from = line.from;
     if (line.mixed) hit.mixed = true;
+    if (line.begun) hit.begun = line.begun;
     return hit;
   }
 }

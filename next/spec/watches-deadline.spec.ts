@@ -634,3 +634,35 @@ test('a wait replaying output starts its lines afresh at every hole a page repor
   }
 });
 
+
+test('a pattern hit says where its line began, as a search match does, and the event that completed it stays `at` (the house’s review of 4f4c067..a8b6f28, #22, comment 6323055715, question 2)', async () => {
+  // `at` and a wait's `seq` are the event that completed the line, and the notice's `since=at-1` skipped the line's head.
+  const f = bare();
+  try {
+    const w = f.manager.add({ pattern: 'abcdef' }, A);
+    f.startRun('p', 'process');
+    const head = f.out('x\nab', 'p', 'stdout').seq;
+    f.journal.append({ type: 'output', runId: 'p', data: 'c', stream: 'stderr' });
+    const end = f.out('def\n', 'p', 'stdout').seq;
+    for (const t0 = performance.now(); !f.firings(w.watchId).length && performance.now() - t0 < 2000; ) await sleep(10);
+    const fired = f.firings(w.watchId)[0]!;
+    assert.deepEqual([fired.at, fired.cursor, fired.offset], [end, head - 1, 2], 'the line begins 2 bytes into the first event');
+    const first = f.journal.since(fired.cursor!).events[0]!;
+    assert.ok(first.type === 'output' && first.data.slice(fired.offset!).startsWith('ab'), 'reading from the cursor and offset starts at the line');
+    const wait = await f.manager.waitFor({ pattern: 'abcdef' }, 300, 0);
+    assert.deepEqual([wait.seq, wait.cursor, wait.offset], [end, head - 1, 2], 'a replaying wait says the same');
+    // A line that begins at an event's start has no offset; a line whose start a multi-byte character precedes counts bytes.
+    f.out('é\nline begun at é\n', 'p', 'stdout');
+    const later = await f.manager.waitFor({ pattern: '^line begun' }, 300, end);
+    assert.equal(later.offset, 3, 'UTF-8 bytes, as read takes them');
+    const own = f.out('whole line\n', 'p', 'stdout').seq;
+    const whole = await f.manager.waitFor({ pattern: '^whole line$' }, 300, own - 1);
+    assert.deepEqual([whole.cursor, whole.offset], [own - 1, undefined]);
+    // A prompt matched once its source went quiet says where it began too.
+    const prompt = f.out('Password: ', 'p', 'stdout').seq;
+    const quiet = await f.manager.waitFor({ pattern: '^Password:' }, 2000, own);
+    assert.deepEqual([quiet.matched, quiet.cursor], [true, prompt - 1]);
+  } finally {
+    f.close();
+  }
+});

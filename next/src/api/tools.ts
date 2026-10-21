@@ -416,7 +416,9 @@ const WAIT_OUTPUT: Schema = {
     clipped: { type: 'boolean', description: 'The line was longer than the match window and matched on its head only; `line` is that head.' },
     stream: STREAM,
     mixed: MIXED,
-    seq: { type: 'integer' },
+    seq: { type: 'integer', description: 'The event that satisfied the wait: for a pattern, the one that completed the line.' },
+    cursor: { type: 'integer', description: "A pattern's line: pass as read `since` (with `offset`) to read from its start, as a search match's cursor." },
+    offset: { type: 'integer' },
     elapsedMs: { type: 'number' },
     nextCursor: { type: 'integer' },
     reason: { type: 'string', description: 'Why the wait ended early without a match (the session exited, the Run ended).' },
@@ -928,7 +930,8 @@ export const TOOLS: ToolDef[] = [
       const r = await ctx.app.waitFor(ctx.caller, pick(a, ['session', 'pattern', 'silenceMs', 'idle', 'runId', 'since', 'wait']));
       // A match on a clipped line is said in the text, in the words search's status and the watch notice use (headOnlyText); only `--json` showed `clipped` (the house's read of the 38 commits, #22 comment 6274806357).
       const clipped = r.clipped ? ` · ${headOnlyText()}` : '';
-      const text = r.matched ? `[${r.kind} matched after ${fmt(r.elapsedMs)}${r.line ? `: ${r.line}` : r.match ? `: ${r.match}` : ''}${item(pipeOf(r))} · seq ${r.seq ?? '?'}${clipped}]` : `[no ${r.kind} match${r.reason ? ` · ${r.reason}` : ` within ${fmt(r.elapsedMs)}`} · next=${r.nextCursor}]`;
+      const from = r.cursor !== undefined ? ` · read since=${r.cursor}${r.offset ? ` offset=${r.offset}` : ''}` : '';
+      const text = r.matched ? `[${r.kind} matched after ${fmt(r.elapsedMs)}${r.line ? `: ${r.line}` : r.match ? `: ${r.match}` : ''}${item(pipeOf(r))} · seq ${r.seq ?? '?'}${from}${clipped}]` : `[no ${r.kind} match${r.reason ? ` · ${r.reason}` : ` within ${fmt(r.elapsedMs)}`} · next=${r.nextCursor}]`;
       return render(ctx, text, env(r));
     },
   },

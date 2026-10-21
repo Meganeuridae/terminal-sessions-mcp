@@ -415,11 +415,15 @@ class Render {
     // `clipped`: the line was longer than the pattern's match window and matched on its head; carried
     // to the reader, as the hit and waitFor's result carry it (the house's read of the 36 commits, #22).
     const clip = ev.clipped ? ` (${headOnlyText()})` : '';
+    // A pattern's read starts where its line began, which earlier events than `at` may hold (the house's review of
+    // 4f4c067..a8b6f28, #22, comment 6323055715, question 2: `since=at-1` skipped the line's head).
+    const from = ev.cursor !== undefined ? `since=${ev.cursor}${ev.offset ? ` offset=${ev.offset}` : ''}` : `since=${Math.max(0, ev.at - 1)}`;
+    const begun = { ...(ev.cursor !== undefined ? { cursor: ev.cursor } : {}), ...(ev.offset ? { offset: ev.offset } : {}) };
     return {
-      ...this.base('watch', ev.seq, { watchId: ev.watchId, label: ev.label, watchKind: ev.kind, match: ev.match, at: ev.at, ...(ev.clipped ? { clipped: true } : {}), ...(ev.stream ? { stream: ev.stream } : {}), ...(ev.mixed ? { mixed: true } : {}) }, ev.ts),
+      ...this.base('watch', ev.seq, { watchId: ev.watchId, label: ev.label, watchKind: ev.kind, match: ev.match, at: ev.at, ...begun, ...(ev.clipped ? { clipped: true } : {}), ...(ev.stream ? { stream: ev.stream } : {}), ...(ev.mixed ? { mixed: true } : {}) }, ev.ts),
       lifecycle: true,
       tags: [`terminal:watch=${ev.label}`, 'terminal:watch', `terminal:${ev.kind}`],
-      head: `[terminal] ${this.src.id}: watch "${oneLine(ev.label, 60)}" fired · ${what}${clip}${ev.suppressed ? ` (+${ev.suppressed} more)` : ''} · read since=${Math.max(0, ev.at - 1)}`,
+      head: `[terminal] ${this.src.id}: watch "${oneLine(ev.label, 60)}" fired · ${what}${clip}${ev.suppressed ? ` (+${ev.suppressed} more)` : ''} · read ${from}`,
       interested: [ev.principal],
     };
   }

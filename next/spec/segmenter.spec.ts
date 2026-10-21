@@ -324,3 +324,18 @@ test("a watch segment names a process Run line's pipe, and `mixed` when it holds
   assert.ok(out[2]!.head.includes('matched: ERROR: pty · read since=6'), out[2]!.head);
   seg.dispose();
 });
+
+test('a watch segment reads from where its line began, which an event before `at` may hold (the house’s review of 4f4c067..a8b6f28, #22, comment 6323055715, question 2)', () => {
+  const src = fakeSource();
+  const seg = new Segmenter(src);
+  const out = collect(seg);
+  src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 9, match: 'ERROR', line: 'ERROR: split', cursor: 4, offset: 7 });
+  src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 12, match: 'ERROR', line: 'ERROR: whole', cursor: 11 });
+  src.journal.append({ type: 'watch.fired', watchId: 'w2', label: 'quiet', kind: 'silence', principal: 'agent:b@t', at: 12, match: 'no output for 500ms' });
+  assert.equal(out.length, 3);
+  assert.ok(out[0]!.head.endsWith('· read since=4 offset=7'), `not since=8, past the line's head: ${out[0]!.head}`);
+  assert.deepEqual([out[0]!.metadata.cursor, out[0]!.metadata.offset, out[0]!.metadata.at], [4, 7, 9]);
+  assert.ok(out[1]!.head.endsWith('· read since=11'), out[1]!.head);
+  assert.ok(out[2]!.head.endsWith('· read since=11'), `a silence has no line: ${out[2]!.head}`);
+  seg.dispose();
+});

@@ -75,9 +75,13 @@ export type EventInput =
   | { type: 'note'; text: string; principal: Principal; channel?: string }
   /** A Service's status changed (§8.3); `principal` started it. */
   | { type: 'service'; runId: string; status: ServiceStatus; probe: string; principal: Principal; name?: string; evidence?: string; exit?: number }
-  /** A Watch fired (§4); `principal` set it; `at` is the event that satisfied it. */
+  /**
+   * A Watch fired (§4); `principal` set it; `at` is the event that satisfied it, for a pattern the event that completed
+   * the line. A pattern's `cursor` and `offset` say where the line began, as search's match does: read `since=cursor`,
+   * `offset`, to read it whole, its head in earlier events included.
+   */
   /** `clipped`: the line was longer than the pattern's match window and matched on its head. */
-  | { type: 'watch.fired'; watchId: string; label: string; kind: 'pattern' | 'silence' | 'idle'; principal: Principal; at: Seq; match?: string; line?: string; clipped?: boolean; stream?: 'stdout' | 'stderr'; mixed?: boolean; suppressed?: number }
+  | { type: 'watch.fired'; watchId: string; label: string; kind: 'pattern' | 'silence' | 'idle'; principal: Principal; at: Seq; match?: string; line?: string; cursor?: Seq; offset?: number; clipped?: boolean; stream?: 'stdout' | 'stderr'; mixed?: boolean; suppressed?: number }
   /**
    * A running Run may be waiting for input (G15: a heuristic, journaled with its evidence) —
    * the last line, how long output has been silent, the session state — so catch-up and

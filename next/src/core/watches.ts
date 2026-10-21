@@ -81,8 +81,16 @@ export interface WaitResult {
   stream?: 'stdout' | 'stderr';
   /** The line holds output from both of the Run's pipes. */
   mixed?: boolean;
-  /** Journal position of the event that satisfied the wait. */
+  /** Journal position of the event that satisfied the wait: for a pattern, the event that completed the line. */
   seq?: Seq;
+  /**
+   * A pattern's line: where it began, as search's match names its line, so `read since=<cursor> offset=<offset>`
+   * reads from the line's start, though earlier events than `seq` hold its head (the house's review of
+   * 4f4c067..a8b6f28, #22, comment 6323055715, question 2).
+   */
+  cursor?: Seq;
+  /** UTF-8 bytes into the first output event after `cursor` where the line begins; absent when 0. */
+  offset?: number;
   elapsedMs: number;
   /** Why the wait ended early without a match: the session exited or closed, or the Run it names ended. */
   reason?: string;
@@ -135,6 +143,10 @@ const hitOf = (hit: LineMatch, seq: Seq): Hit => {
   if (hit.clipped) h.clipped = true;
   if (hit.from === 'stdout' || hit.from === 'stderr') h.stream = hit.from;
   if (hit.mixed) h.mixed = true;
+  if (hit.begun) {
+    h.cursor = hit.begun.at - 1;
+    if (hit.begun.offset > 0) h.offset = hit.begun.offset;
+  }
   return h;
 };
 
@@ -146,11 +158,12 @@ const endText = (r: { runId: string; state: string; exit?: number; signal?: stri
   `run ${r.runId} ended (${r.state}${r.signal ? ` ${r.signal}` : r.exit !== undefined ? ` ${r.exit}` : ''})`;
 
 /**
- * What a predicate fires with: the match and its line, where in the journal, whether the line was matched on its head
- * only (longer than the pattern's match window), and for a process Run's line its first character's pipe and whether
- * it holds both.
+ * What a predicate fires with: the match and its line, where in the journal (`seq` the event that completed the line,
+ * `cursor` and `offset` where it began, as search's match names it), whether the line was matched on its head only
+ * (longer than the pattern's match window), and for a process Run's line its first character's pipe and whether it
+ * holds both.
  */
-type Hit = { match?: string; line?: string; seq: Seq; clipped?: boolean; stream?: 'stdout' | 'stderr'; mixed?: boolean };
+type Hit = { match?: string; line?: string; seq: Seq; cursor?: Seq; offset?: number; clipped?: boolean; stream?: 'stdout' | 'stderr'; mixed?: boolean };
 
 /** Evaluates one predicate against journal events; shared by watches and waits. */
 class Predicate {
@@ -213,7 +226,7 @@ class Predicate {
           if (this.spec.runId !== undefined && ev.runId !== this.spec.runId) return;
           const s = this.matcher(sourceKey(ev));
           s.seq = ev.seq;
-          for (const hit of s.m.feed(ev.data, ev.stream)) this.fire(hitOf(hit, ev.seq));
+          for (const hit of s.m.feed(ev.data, ev.stream, ev.seq)) this.fire(hitOf(hit, ev.seq));
         } else if (ev.type === 'run.end') {
           if (ev.runId === this.spec.runId) {
             // The Run's streams are over: its unterminated last line is complete.
@@ -557,6 +570,8 @@ export class WatchManager {
     const ev: Parameters<Journal['append']>[0] = { type: 'watch.fired', watchId: w.watchId, label: w.label, kind: w.kind, principal: w.owner, at: hit.seq };
     if (hit.match !== undefined) ev.match = hit.match;
     if (hit.line !== undefined) ev.line = hit.line;
+    if (hit.cursor !== undefined) ev.cursor = hit.cursor;
+    if (hit.offset !== undefined) ev.offset = hit.offset;
     if (hit.clipped) ev.clipped = true;
     if (hit.stream !== undefined) ev.stream = hit.stream;
     if (hit.mixed) ev.mixed = true;
@@ -611,6 +626,8 @@ export class WatchManager {
           const r: Omit<WaitResult, 'elapsedMs' | 'kind'> = { matched: true, seq: hit.seq };
           if (hit.match !== undefined) r.match = hit.match;
           if (hit.line !== undefined) r.line = hit.line;
+          if (hit.cursor !== undefined) r.cursor = hit.cursor;
+          if (hit.offset !== undefined) r.offset = hit.offset;
           if (hit.clipped) r.clipped = true;
           if (hit.stream !== undefined) r.stream = hit.stream;
           if (hit.mixed) r.mixed = true;
