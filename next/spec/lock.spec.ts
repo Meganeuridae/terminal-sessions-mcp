@@ -1193,6 +1193,6 @@ test('a registry syncs each directory it makes into its parent before recovery: 
   await reg.closeAll();
   const warnings: string[] = [];
   const refused = withDirFsyncEIO(() => new SessionRegistry({ dataDir: path.join(base, 'b'), backend: new ScriptedBackend(), log: (level, text) => void (level === 'warn' && warnings.push(text)) }));
-  assert.equal(warnings.filter((w) => /a directory the daemon made could not be synced into its parent/.test(w)).length, 1, JSON.stringify(warnings));
+  assert.equal(warnings.filter((w) => /a directory on the data dir's path could not be synced into its parent/.test(w)).length, 1, JSON.stringify(warnings));
   await refused.closeAll();
 });

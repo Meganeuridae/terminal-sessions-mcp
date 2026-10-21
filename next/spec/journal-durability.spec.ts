@@ -1653,13 +1653,14 @@ test('a store syncs its own directory into its parent at its first metadata writ
   }
 });
 
-test('a start syncs the data dir and sessions/ into their parents, though an earlier start made them and died before syncing them', async () => {
+test('a start syncs every directory on the data dir\'s path, and sessions/, into their parents, though an earlier start made them and died before syncing them', async () => {
   const root = tmpDir();
   try {
-    const dataDir = path.join(root, 'data');
+    const dataDir = path.join(root, 'a', 'data');
     fs.mkdirSync(path.join(dataDir, 'sessions'), { recursive: true }); // what a start that died before its syncs leaves
     const { result: reg, synced } = dirsSyncedDuring(() => new SessionRegistry({ dataDir, backend: new ScriptedBackend(), lock: false }));
-    assert.ok(synced.has(inode(root)), "the data dir's entry in its parent was synced");
+    assert.ok(synced.has(inode(root)), "a/'s entry in its parent, a parent of the data dir that start made, was synced (the house's review of a8b6f28..4860d4c, PR #22)");
+    assert.ok(synced.has(inode(path.join(root, 'a'))), "the data dir's entry in its parent was synced");
     assert.ok(synced.has(inode(dataDir)), "sessions/' entry in the data dir was synced");
     await reg.closeAll();
   } finally {

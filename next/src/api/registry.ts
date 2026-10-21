@@ -30,7 +30,7 @@ import { Journal, reservationHonoured, type JournalOptions } from '../core/journ
 import { acquireDataDirLock, groupAlive, listProcesses, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
 import { RunIndex, type RunOutput, type RunOutputRange } from '../core/runindex.js';
 import { Session, trustedDir, type SessionOptions } from '../core/session.js';
-import { FileStore, FreeSpaceFloor, makeDirs, MemoryStore, syncMadeDirs, type DiskFloor, type DurableWrite, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
+import { FileStore, FreeSpaceFloor, MemoryStore, syncDir, type DiskFloor, type DurableWrite, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
 import { DEFAULT_GEOMETRY, SYSTEM, type ControlPolicy, type Cursors, type JournalEvent, type Principal, type RunInfo, type Seq, type Visibility } from '../core/types.js';
 import { prepareIntegration } from '../shell/integration.js';
 
@@ -440,10 +440,10 @@ export class SessionRegistry {
     // Journals hold whatever programs printed: private to the daemon's user (G26). The
     // sessions root is ours and always 0700; the data dir only when we create it (it
     // may be a directory the user chose, whose mode is theirs).
-    const made = makeDirs(opts.dataDir, 0o700);
+    fs.mkdirSync(opts.dataDir, { recursive: true, mode: 0o700 });
     // Before recovery writes a byte: a second daemon on this data dir stops here (G10, G20).
     this.ensureLock();
-    made.push(...makeDirs(this.root, 0o700));
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     try {
       fs.chmodSync(this.root, 0o700);
     } catch {
@@ -451,13 +451,22 @@ export class SessionRegistry {
     }
     // A directory made here is in its parent durably only once that parent is synced: on a first start, a
     // power loss soon after could take sessions/ with every reservation its stores had synced. A store
-    // syncs the directories it makes itself (makeDirs); the data dir and sessions/ are made here, before any
-    // store opens. Both are synced at every start, not only the one that made them: a start that made them and
-    // died before this left them unsynced, and the next took them as old (the house's review of
-    // 4f4c067..a8b6f28, PR #22). Two directory syncs a start; any parent made on the way first.
-    const dirs = [...new Set([...made, path.resolve(opts.dataDir), path.resolve(this.root)])].sort((a, b) => a.length - b.length);
-    const unsynced = syncMadeDirs(dirs);
-    if (unsynced) this.opts.log?.('warn', `a directory the daemon made could not be synced into its parent (${dirs[0]}): ${unsynced.message}; a power loss soon after this start can take the sessions made since`, { dataDir: opts.dataDir });
+    // syncs the directories it makes itself (makeDirs); the data dir, any parent of it, and sessions/ are made
+    // here, before any store opens. Each directory on that path is synced into its parent at every start, not
+    // only by the start that made it: a start that made some and died before this (one that lost the lock to a
+    // start racing it onto a new data dir, say) left them unsynced, and nothing on disk says which they are
+    // (the house's reviews of 4f4c067..a8b6f28 and a8b6f28..4860d4c, PR #22). One directory sync for each level
+    // of the data dir's path, and one for sessions/. A parent this user cannot read (a root-owned /home at 0751,
+    // say) cannot be opened to sync, and termd never makes one, since its own are 0700: its EACCES is passed
+    // over, though the entry in it may be one termd made, which then stays unsynced without a warning.
+    const dirs: string[] = [path.resolve(this.root)];
+    for (let d = path.resolve(opts.dataDir); path.dirname(d) !== d; d = path.dirname(d)) dirs.unshift(d);
+    let unsynced: [string, NodeJS.ErrnoException] | undefined;
+    for (const d of dirs) {
+      const error = syncDir(d);
+      if (error && error.code !== 'EACCES') unsynced ??= [d, error];
+    }
+    if (unsynced) this.opts.log?.('warn', `a directory on the data dir's path could not be synced into its parent (${unsynced[0]}): ${unsynced[1].message}; a power loss soon after this start can take it, with everything under it`, { dataDir: opts.dataDir });
     this.recover();
   }
 
