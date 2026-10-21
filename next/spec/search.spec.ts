@@ -146,6 +146,22 @@ test('Cyrillic read as Latin-1 and written again is searchable: the DCS its `А`
   }
 });
 
+test('one event holding a CSI with many line feeds is read back in time linear in it: a tail, a search and a page (an independent read of the house’s fixes for #22)', async () => {
+  // Every reader asked each LF's head, read from the CSI's start: an 80 KB event took 15.5 s to tail, 7.8 s to search.
+  const src = source();
+  out(src.journal, `x\r\n\x1b[${'\n'.repeat(80 * 1024)}mdone\r\n`);
+  const timed = async <T>(name: string, f: () => Promise<T>): Promise<T> => {
+    const t0 = performance.now();
+    const r = await f();
+    assert.ok(performance.now() - t0 < 2000, `${name}: ${(performance.now() - t0).toFixed(0)} ms`);
+    return r;
+  };
+  const tail = await timed('tail', () => readJournal(src, { tail: 5 }, { resultBytes: 16384 }));
+  assert.ok(tail.text!.endsWith('done'));
+  assert.equal((await timed('search', () => search(src, { pattern: '^done$', since: 0 }))).matches.length, 1);
+  await timed('page', () => readJournal(src, { since: 0 }, { resultBytes: 16384 }));
+});
+
 // ───────────── jr2-10 / m2-25: a scan pages, and says so ─────────────
 
 test('jr2-10 / m2-25: a scan that hits its budget says more, and continuing from nextCursor finds what lies beyond', async () => {

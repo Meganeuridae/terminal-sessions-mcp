@@ -1,7 +1,7 @@
 /** api-20: UTF-8-safe cutting (src/core/text.ts) for byte-capped results (G11). */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cutTail, executedIn, headIndex, indexAtByte, isStringStart, lineCarry, lineEnds, tailIndex, tailStart, utf8Length, safeCut, sequenceEnd, stripEscapes, unfinishedSequence } from '../src/core/text.js';
+import { cutTail, executedIn, headIndex, indexAtByte, isStringStart, lineCarry, lineEnds, tailIndex, tailStart, utf8Length, safeCut, sequenceEnd, sequenceHead, stripEscapes, unfinishedSequence } from '../src/core/text.js';
 
 const bytes = (s: string) => Buffer.byteLength(s);
 const clean = (s: string) => !s.includes('�') && Buffer.from(s).toString() === s;
@@ -224,4 +224,32 @@ test('a DCS before its final byte ends at a code point from U+00A0, taken with i
     lineEnds(first, carry);
     assert.deepEqual(lineEnds(rest, carry), ends, JSON.stringify([first, rest]));
   }
+});
+
+test('the heads of a CSI holding many line feeds cost its length, not its square, and each is the head read from its start (an independent read of the house’s fixes for #22)', () => {
+  // A head asked at each LF was read from the CSI's start: 64 KiB of `ESC [` and LFs held lineEnds for 5.7 s, 43.5 s with
+  // 32 Ki `1;` parameters before them.
+  const lfs = `\x1b[${'\n'.repeat(64 * 1024 - 2)}`;
+  const params = `\x1b[${'1;'.repeat(32 * 1024)}${'\n'.repeat(64 * 1024)}`;
+  for (const [data, name] of [[lfs, 'line feeds'], [params, 'parameters, then line feeds']] as const) {
+    const t0 = performance.now();
+    const inside = new Map<number, string>();
+    const carry = lineCarry();
+    const ends = lineEnds(data, carry, Number.POSITIVE_INFINITY, false, inside);
+    const ms = performance.now() - t0;
+    assert.equal(ends.length, (data.match(/\n/g) ?? []).length, name);
+    assert.ok(ms < 1000, `${name}: ${ms.toFixed(0)} ms`);
+    assert.equal(carry.open, data === lfs ? '\x1b[' : '\x1b[0', `${name}: the carry`);
+  }
+  // Read on as the line feeds come, each head is the one read afresh from the CSI's start to that point.
+  for (const data of ['\x1b[1\n;2\n\n?\n m\n', `\x1b[?${'1;'.repeat(40)}\n${'2;'.repeat(10)}\n x\n`, `\x1b(${' '.repeat(70)}\nB\n`, `\x9b${'9'.repeat(70)}\n?\nm`]) {
+    const inside = new Map<number, string>();
+    lineEnds(data, lineCarry(), Number.POSITIVE_INFINITY, false, inside);
+    for (const [at, head] of inside) assert.equal(head, sequenceHead(data, 0, at), `${JSON.stringify(data)} at ${at}`);
+  }
+  // Past 64 bytes a head keeps its introducer, its private marker and its parser's state.
+  assert.equal(sequenceHead(`\x1b[?${'1;'.repeat(40)}1049`, 0, 89), '\x1b[?0', 'a private mode, not SM');
+  assert.equal(sequenceHead(`\x1b[${'1;'.repeat(40)} `, 0, 83), '\x1b[ ', 'an intermediate');
+  assert.equal(sequenceHead(`\x1b[${'1;'.repeat(40)}?`, 0, 83), '\x1b[0?', 'ignoring the rest');
+  assert.equal(sequenceHead(`\x1b(${' '.repeat(70)}`, 0, 72), '\x1b ', 'an escape sequence in its intermediates');
 });

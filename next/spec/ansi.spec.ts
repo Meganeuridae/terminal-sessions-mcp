@@ -300,3 +300,14 @@ test('a LF a CSI or an escape sequence executes ends a line for a watch, and the
   }
   assert.deepEqual(matches('^B', ['A\x1b[3\r\n', '1mB\r\n']), ['B'], 'the CSI’s rest is no text: `1mB` was the line');
 });
+
+test('a watch reads a CSI holding many line feeds in time linear in it (an independent read of the house’s fixes for #22)', () => {
+  // Each line after a LF the CSI executes began with the CSI's head, read from its start each time: one 64 KiB read held
+  // LineSplitter.feed for 5.2 s.
+  const data = `\x1b[${'\n'.repeat(64 * 1024 - 2)}mready\r\n`;
+  const t0 = performance.now();
+  const lines = matcher('^ready$').feed(data);
+  const ms = performance.now() - t0;
+  assert.deepEqual(lines.map((h) => h.line), ['ready']);
+  assert.ok(ms < 1000, `${ms.toFixed(0)} ms`);
+});

@@ -179,27 +179,64 @@ const HEAD_MAX = 64;
  * The part of the CSI or escape sequence beginning at `data[start]` that lies before `upto`, its
  * executed C0 controls and DEL taken out: what a piece of text that begins at `upto`, inside the
  * sequence, begins with to be read as the sequence goes on. A head longer than HEAD_MAX is shortened
- * to its introducer and what keeps the parser's state (a parameter, an intermediate, or the state that
- * ignores the rest), so only an in-line control's argument (cleanLine) can read differently.
+ * to its introducer, a CSI's private marker, and what keeps the parser's state (a parameter, an
+ * intermediate, or the state that ignores the rest), so it dispatches as the same family of control
+ * (`CSI ? … h` a private mode, not SM), and only its parameters can read differently.
  */
 export function sequenceHead(data: string, start: number, upto: number): string {
-  const head = sequenceText(data, start, upto);
-  if (head.length <= HEAD_MAX) return head;
-  if (head.charCodeAt(0) === 0x1b && head[1] !== '[') return /[\x20-\x2f]/.test(head.slice(1)) ? '\x1b ' : '\x1b';
-  const intro = head.charCodeAt(0) === 0x9b ? '\x9b' : '\x1b[';
-  return intro + ['', '0', ' ', '0?'][csiState(head.slice(intro.length))]!;
+  return new HeadReader(data, start).at(upto);
 }
 
-/** The state a CSI's parameter bytes leave its parser in, as the emulator's table moves it: 0 entry, 1 parameter, 2 intermediate, 3 ignoring the rest. */
-function csiState(params: string): CsiState {
-  let st: CsiState = 0;
-  for (let k = 0; k < params.length; k++) st = csiStep(st, params.charCodeAt(k));
-  return st;
+/**
+ * The heads of one CSI or escape sequence (sequenceHead) at points a reader comes to in order, each
+ * byte read once however many heads are asked for: a head asked at each LF the sequence executes was
+ * read from the sequence's start each time, and a 64 KiB read of `ESC [` and line feeds held the event
+ * loop for 5.7 s in lineEnds, 43.5 s with parameters before the line feeds (an independent read of the
+ * house's fixes for #22).
+ */
+class HeadReader {
+  /** The head as written, while it is no longer than HEAD_MAX. */
+  private text = '';
+  /** The head's length, its executed controls not counted. */
+  private n = 0;
+  private pos: number;
+  /** A CSI's introducer's length once read: 2 for ESC [, 1 for the C1 CSI; 0 for an escape sequence. */
+  private csi = 0;
+  /** A CSI's parameters' state (csiStep). */
+  private st: CsiState = 0;
+  /** A CSI's private marker: its first parameter byte, when that is one of `<=>?`. */
+  private priv = '';
+  /** An escape sequence has had an intermediate. */
+  private intermediate = false;
+
+  constructor(private readonly data: string, start: number) {
+    this.pos = start;
+  }
+
+  /** The head before `upto`, at or after the point asked for last. */
+  at(upto: number): string {
+    const d = this.data;
+    for (; this.pos < upto; this.pos++) {
+      const c = d.charCodeAt(this.pos);
+      if (executedInside(c)) continue;
+      const k = this.n++;
+      if (k < HEAD_MAX) this.text += d[this.pos];
+      if (k === 0) this.csi = c === 0x9b ? 1 : 0;
+      else if (k === 1 && this.csi === 0 && c === 0x5b) this.csi = 2;
+      else if (this.csi > 0) {
+        if (k === this.csi && c >= 0x3c && c <= 0x3f) this.priv = d[this.pos]!;
+        this.st = csiStep(this.st, c);
+      } else if (c >= 0x20 && c <= 0x2f) this.intermediate = true;
+    }
+    if (this.n <= HEAD_MAX) return this.text;
+    if (this.csi === 0) return this.intermediate ? '\x1b ' : '\x1b';
+    return (this.csi === 1 ? '\x9b' : '\x1b[') + this.priv + ['', '0', ' ', '0?'][this.st]!;
+  }
 }
 
 type CsiState = 0 | 1 | 2 | 3;
 
-/** Where one parameter or intermediate byte (0x20–0x3f) moves a CSI's parser from state `st` (see csiState). */
+/** Where one parameter or intermediate byte (0x20–0x3f) moves a CSI's parser from state `st`, as the emulator's table moves it: 0 entry, 1 parameter, 2 intermediate, 3 ignoring the rest. */
 function csiStep(st: CsiState, c: number): CsiState {
   if (st === 3) return 3;
   if (c <= 0x2f) return 2; // an intermediate
@@ -263,17 +300,18 @@ export function lineEnds(data: string, carry: LineCarry = lineCarry(), max = Num
       // The line feeds the sequence executes end lines inside it (see above): a CSI's or an escape
       // sequence's anywhere in it, a control string's only before the byte that says what it is.
       const stop = !str ? (e ?? t.length) : t[at] === '\x1b' ? escKind(t, at) : at + 1;
+      let heads: HeadReader | undefined;
       for (i = at + 1, advance(); next() !== -1 && next() < stop && ends.length < max; i = next() + 1, advance()) {
         if (!inside) continue;
         ends.push(next() - skip);
-        inside.set(next() - skip, sequenceHead(t, at, next()));
+        inside.set(next() - skip, (heads ??= new HeadReader(t, at)).at(next()));
       }
       if (e === undefined) {
         if (str) {
           // Open to the end of the data: its introducer, and a last ESC that may begin a string's terminator.
           const body = t[at] === '\x1b' ? escKind(t, at) + 1 : at + 1;
           carry.open = (t[at] === '\x1b' ? `\x1b${t[body - 1]}` : t[at]!) + stringState(t, at, body) + (t.length > body && t.endsWith('\x1b') ? '\x1b' : '');
-        } else if (ends.length < max) carry.open = sequenceHead(t, at, t.length);
+        } else if (ends.length < max) carry.open = (heads ?? new HeadReader(t, at)).at(t.length);
         break;
       }
       // Past the sequence: a string's payload is skipped whole.
