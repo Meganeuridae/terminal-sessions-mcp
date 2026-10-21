@@ -664,8 +664,10 @@ test('jr2-4: a group whose processes recovery tied to the Run are gone, while it
     // The group is real, so the signal and the probe reach it, and it ignores SIGTERM; the listings are the
     // test's: the first shows the Run's leader, every later one only a process recovery never saw — as when
     // a TERM trap starts a new member and the leader exits.
-    const g = kids.spawn('/bin/sh', ['-c', "trap '' TERM; exec sleep 415"]);
-    await until(() => groupAlive(g));
+    const ready = path.join(dir, 'tr-ready');
+    fs.mkdirSync(dir, { recursive: true });
+    const g = kids.spawn('/bin/sh', ['-c', "trap '' TERM; printf ready > \"$1\"; exec sleep 415", 'recovery-test', ready]);
+    await until(() => fs.existsSync(ready)); // the trap is set: a group that merely exists may not ignore SIGTERM yet
     const ts = Date.now();
     const j = new Journal({ cold: new FileStore(sdir), sessionId: 'tr', now: () => ts });
     journalProcess(j, 'r1-trap', g);
@@ -686,7 +688,11 @@ test('jr2-4: a group whose processes recovery tied to the Run are gone, while it
     const ended = book.lines.find((l) => l.text === 'recovery ended process groups a previous daemon left running');
     assert.ok(ended, JSON.stringify(book.lines));
     assert.deepEqual([ended.fields!['groups'], ended.fields!['leftRunning']], [[], [g]], 'the log lists it as left running, not among the groups recovery ended');
-    assert.ok(groupAlive(g), 'and nothing was sent after the SIGTERM');
+    // The leader is this test's own child: until the loop reaps it, a killed leader is a zombie that keeps the
+    // pgid, so groupAlive alone cannot tell. Reaped or not, its own exit says whether a signal took it.
+    await new Promise((res) => setTimeout(res, 200));
+    const leader1 = kids.kids.find((c) => c.pid === g)!;
+    assert.deepEqual([leader1.exitCode, leader1.signalCode], [null, null], 'and nothing was sent after the SIGTERM: the leader still runs');
     await r.reg.closeAll();
   } finally {
     kids.end();
@@ -820,9 +826,11 @@ test('jr2-4: a group set aside as untied whose last process goes while recovery 
     // Two real groups that ignore SIGTERM, so the signal and the probe reach them; the listings are the test's.
     // The first shows both leaders; the next, a process recovery never saw in the first group (untied) beside
     // the second's leader, which keeps the wait going; the one after, the untied process gone; then nothing.
-    const g1 = kids.spawn('/bin/sh', ['-c', "trap '' TERM; exec sleep 417"]);
-    const g2 = kids.spawn('/bin/sh', ['-c', "trap '' TERM; exec sleep 418"]);
-    await until(() => groupAlive(g1) && groupAlive(g2));
+    fs.mkdirSync(dir, { recursive: true });
+    const ready = (n: number) => path.join(dir, `ut-ready-${n}`);
+    const g1 = kids.spawn('/bin/sh', ['-c', "trap '' TERM; printf ready > \"$1\"; exec sleep 417", 'recovery-test', ready(1)]);
+    const g2 = kids.spawn('/bin/sh', ['-c', "trap '' TERM; printf ready > \"$1\"; exec sleep 418", 'recovery-test', ready(2)]);
+    await until(() => fs.existsSync(ready(1)) && fs.existsSync(ready(2))); // both traps set
     const ts = Date.now();
     const j = new Journal({ cold: new FileStore(sdir), sessionId: 'ut', now: () => ts });
     journalProcess(j, 'r1-untied', g1);
