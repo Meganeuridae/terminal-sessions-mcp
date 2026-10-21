@@ -2182,6 +2182,43 @@ test("a catch-up whose scan fails retires nothing: the refused fold summary stil
   }
 });
 
+test("a catch-up keeps a summary whose delivery is still in flight, which settles by its answer", { timeout: 60_000 }, async () => {
+  // Retired while its push awaited the host's answer, an accepted summary would settle nothing it covered.
+  const f = await bareLane('c-retire-inflight');
+  try {
+    const noPush = FULL_GRANT.filter((c) => c !== 'pushEvents');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: noPush }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'ri' });
+    const s = live(f.registry, 'ri');
+    const st = () => f.inside.states.get('ri')!;
+    const ends: number[] = [];
+    for (let i = 0; i < 25; i++) {
+      const r = await f.app.run(f.caller, { session: 'ri', command: `echo ri-${i}`, target: 'process', wait: 0 });
+      await until(() => s.run(r.runId!).seq.end !== undefined, 5000, `Run ${i} to end`);
+      ends.push(s.run(r.runId!).seq.end!);
+    }
+    // Past the catch-up's limit of 20, the oldest five are summarised; every push waits for the host's answer.
+    f.late.value = true;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    const summaryPushed = () => f.pending.find((p) => /:summary[:~]/.test((p.req.params as { eventId?: string }).eventId ?? ''));
+    await until(() => summaryPushed() !== undefined, 10_000, "the catch-up's summary pushed and held");
+    const id = [...st().summaries.keys()][0]!;
+    assert.ok(st().inflight.has(id), 'the summary is in flight');
+    // A catch-up of its own, not the first one's still running: that one planned before the summary existed.
+    await until(() => f.inside.catchingUp === undefined, 5000, 'the first catch-up to finish');
+    await f.inside.startCatchUp(['ri']);
+    assert.ok(st().summaries.has(id), 'a catch-up meanwhile keeps the summary in flight');
+    f.late.value = false;
+    for (const p of f.pending.splice(0)) p.answer();
+    await until(() => s.cursorsOf(A).delivered >= Math.max(...ends), 10_000, 'the cursor to pass every completion');
+    assert.equal(st().summaries.size, 0, 'the summary settled by its answer');
+    const pushes = f.sent.filter((m) => m.method === 'push/event' && /:summary[:~]/.test((m.params as { eventId?: string }).eventId ?? ''));
+    assert.equal(pushes.length, 1, 'the host heard of the summary once: the catch-up neither retired it nor sent it again');
+  } finally {
+    await f.close();
+  }
+});
+
 test("a catch-up retires a summary parked for an opening channel, so the open sends only what replaced it", { timeout: 60_000 }, async () => {
   // A summary parked while the channel's history was read had no in-flight, sent or retry entry: retired, it
   // still went out when the open finished, beside the summary that replaced it (the house's read of a8b6f28, #22).
@@ -2302,11 +2339,16 @@ test("a forgotten name's late settlement writes nothing into the cursors.json of
     const neu = live(f.registry, 'lf');
     assert.notEqual(neu, old);
     const file = path.join(f.registry['root' as never] as unknown as string, 'lf', 'cursors.json');
+    const onDisk = (): number | undefined => (fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, { delivered: number }>)[A]?.delivered : undefined);
+    // The new life's book has written the file, so a file the old book overwrote is told from one never written
+    // (read as 0, an absent file passed whether or not the stale write landed: the house's read of a8b6f28, #22).
+    await until(() => onDisk() !== undefined && onDisk() === neu.cursorsOf(A).delivered, 5000, "the new life's book to write its own cursors");
     for (const p of f.pending.splice(0)) p.answer();
     await until(() => old.cursorsOf(A).delivered > neu.journal.lastSeq, 5000, 'the late acceptance to reach the old life');
-    await sleep(1500); // past the book's write delay
-    const onDisk = fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, { delivered: number }>)[A]?.delivered ?? 0 : 0;
-    assert.ok(onDisk <= neu.journal.lastSeq, `the file holds the new life's cursors, not the old life's ${old.cursorsOf(A).delivered} (read ${onDisk}, new life at seq ${neu.journal.lastSeq})`);
+    // Past the old book's write delay: its timer was set before this one, so it fires first under any load.
+    await sleep(1500);
+    const now = onDisk();
+    assert.ok(now !== undefined && now <= neu.journal.lastSeq, `the file holds the new life's cursors, not the old life's ${old.cursorsOf(A).delivered} (read ${now}, new life at seq ${neu.journal.lastSeq})`);
   } finally {
     await f.close();
   }
