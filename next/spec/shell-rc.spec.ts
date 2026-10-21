@@ -309,8 +309,8 @@ test('/bin/zsh: a plugin that replaces the line-init widget after startup does n
 });
 
 for (const [how, line] of [
-  ['', 'PROMPT_COMMAND="history -a"; history -a; sleep 3'],
-  [', with install-shaped text quoted later in the line', `PROMPT_COMMAND="history -a"; history -a; sleep 3; echo 'PROMPT_COMMAND="history -a"' > /dev/null; echo typed-$((40+2))`],
+  ['', 'PROMPT_COMMAND="history -a"; history -a; echo ran-own-$((6*7)); sleep 6'],
+  [', with install-shaped text quoted later in the line', `PROMPT_COMMAND="history -a"; history -a; echo ran-own-$((6*7)); sleep 6; echo 'PROMPT_COMMAND="history -a"' > /dev/null; echo typed-$((40+2))`],
 ] as const) {
   test(`/bin/bash: a typed line that sets PROMPT_COMMAND and runs one of its commands stays busy while it runs${how}`, { skip: !hasShell('/bin/bash') }, async () => {
     // The line's own `history -a` matches the PROMPT_COMMAND it just set; the heal must not mistake it
@@ -319,13 +319,17 @@ for (const [how, line] of [
     // The quoted assignment after the run read as the line's last install, which hid the line's own
     // `history -a` before it: the Run closed at once (the house's read of the 38 commits, #22 comment
     // 6274841346).
+    // The line prints a marker after its own `history -a`: the check waits for it, then reads busy with
+    // `sleep 6` still ahead, where a fixed 1,200 ms wait failed falsely on a slow start and passed
+    // falsely before the line reached its `history -a` (the house's read of the 33 commits, #22
+    // comment 6307351617, item 9).
     const x = await realSession('/bin/bash', { login: false });
+    const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
     try {
       x.session.input(`${line}\n`, { principal: AGENT });
-      await until(() => x.session.listRuns().some((r) => r.origin === 'agent'), 3000, 'run started');
-      await new Promise((r) => setTimeout(r, 1200));
+      await until(() => output().includes('ran-own-42'), 5000, 'the line ran its own history -a');
       assert.equal(x.session.info().state, 'busy', 'busy while the typed command sleeps');
-      await until(() => x.session.listRuns().every((r) => r.state === 'exited' || r.state === 'lost'), 6000, 'ended');
+      await until(() => x.session.listRuns().every((r) => r.state === 'exited' || r.state === 'lost'), 12_000, 'ended');
       assert.ok(x.session.listRuns().some((r) => r.origin === 'agent' && r.state === 'exited'), 'the typed Run ended exited');
       assert.equal((await x.run('echo back')).text.trim(), 'back');
     } finally {
@@ -354,6 +358,37 @@ for (const line of ['PROMPT_COMMAND="history -a"', 'PROMPT_COMMAND="if true; the
     }
   });
 }
+
+test('/bin/bash: a typed line that runs a command and then installs it as PROMPT_COMMAND last ends at its prompt, with its status and cwd, and the session goes idle; one that then empties PROMPT_COMMAND ends lost, with no exit made up', { skip: !hasShell('/bin/bash') }, async () => {
+  // At the prompt, PROMPT_COMMAND's run of `true` reads by its text as the line's own (the line does run
+  // it), so the heal stood down, our hook did not run, and the Run stayed open at a prompt already shown
+  // until someone typed (the house's read of the 33 commits, #22 comment 6307351617, item 2). The start
+  // of PS1 now prints the end mark with the status and cwd the DEBUG trap kept. `$(exit 4)` gives the
+  // last assignment, and so the line, a status of 4. A line that empties PROMPT_COMMAND after its own
+  // run of `true` leaves a status kept from before its end: that prompt ends the Run lost (ss-3), never
+  // with the kept 0 for the line's 5.
+  const x = await realSession('/bin/bash', { login: false });
+  try {
+    fs.mkdirSync(path.join(x.tmp, 'sub'));
+    for (const [line, want] of [
+      ['cd sub; echo x-$((40+2)); PROMPT_COMMAND=true; true; PROMPT_COMMAND=true$(exit 4)', { state: 'exited', exit: 4 }],
+      ['echo y-$((40+2)); PROMPT_COMMAND=true; true; PROMPT_COMMAND=$(exit 5)', { state: 'lost', reason: 'prompt-without-end-mark' }],
+    ] as const) {
+      const before = x.session.listRuns().length;
+      x.session.input(`${line}\n`, { principal: AGENT });
+      await until(() => x.session.listRuns().slice(before).some((r) => r.origin === 'agent' && (r.state === 'exited' || r.state === 'lost')), 5000, `the typed Run ended at its prompt: ${line}`);
+      const typed = x.session.listRuns().slice(before).find((r) => r.origin === 'agent')!;
+      assert.deepEqual({ state: typed.state, ...(typed.exit !== undefined && { exit: typed.exit }), ...(typed.reason !== undefined && { reason: typed.reason }) }, want, line);
+      await until(() => x.session.shellAvailable().ok, 3000, `the session went idle: ${line}`);
+    }
+    assert.match(x.session.info().cwd, /\/sub$/, 'the cwd the first line left');
+    const back = await x.run('echo back', 4000);
+    assert.deepEqual([back.state, back.exit, back.text.trim()], ['exited', 0, 'back']);
+    assert.equal(x.session.listRuns().filter((r) => r.origin === 'agent').length, 2, 'one Run per typed line');
+  } finally {
+    await x.close();
+  }
+});
 
 test('/bin/bash: a typed line that runs a prompt command and then installs it ends at the next prompt, and the session goes idle', { skip: !hasShell('/bin/bash') }, async () => {
   // `history -a; PROMPT_COMMAND="history -a"` runs history -a now, then installs it. At the next

@@ -16,7 +16,6 @@ import { inlineProbe } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { journalRunText } from '../src/core/segmenter.js';
 import { AGENT, hasShell, realSession, scriptedSession, until, type Real } from './fake-shell.js';
-import { sleep } from './testhost.js';
 
 test('the result of a command that looks like it opened a shell points at the declaration; others do not', () => {
   const running = (line: string): RunResult => ({ runId: 'r1', session: 's', target: 'shell', state: 'running', cwd: '/', attribution: 'temporal', line, durationMs: 1500, output: { text: '', truncated: false, seq: [1, 2], nextCursor: 2 } });
@@ -312,19 +311,22 @@ test('a cancel answered by a nested shell leaves the Run running; its result, li
   try {
     const enclosing = await open(x.session, 'sh');
     declare(x.session, 'sh');
-    const nested = x.session.admit({ target: 'shell', line: 'sh', principal: AGENT });
+    // The nested shell's prompt is waited for in the output, not on a timer (the house's read of the 33
+    // commits, #22 comment 6307351617, item 8); its text is split in the line so the echo never holds it.
+    const nested = x.session.admit({ target: 'shell', line: "PS1='NEST''ED> ' sh", principal: AGENT });
     assert.ok(nested.admitted);
     const runId = nested.run.runId;
+    const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' && e.runId === runId ? [e.data] : [])).join('');
     await until(() => x.session.run(runId).state === 'running', 5000, 'the nested sh to start');
-    await sleep(300); // its prompt
+    await until(() => output().includes('NESTED> '), 5000, 'the nested sh’s prompt');
     // ^C and ^\ reach the nested shell's prompt; both probes are answered by it, with its pid and no token.
     const c = await x.session.cancel(runId, AGENT, { graceMs: 400 });
     assert.equal(c.state, 'running', JSON.stringify(c));
     assert.ok(c.steps.includes('end-marker probe') && c.steps.includes('end-marker probe after ^\\'), c.steps.join(', '));
     assert.equal(c.escalation, `cancel ${enclosing}`);
-    assert.ok(notes(x).some((t) => /answered by another shell/.test(t)));
-    const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' && e.runId === runId ? [e.data] : [])).join('');
-    assert.match(output(), new RegExp(`<<<PROBE:[0-9a-f]+:\\d+:>>>`), 'the journal holds the nested shell’s answers');
+    // A slow nested shell may answer after the cancel's grace: wait for the answers this test reads.
+    await until(() => new RegExp(`<<<PROBE:[0-9a-f]+:\\d+:>>>`).test(output()), 5000, 'the journal holds the nested shell’s answers');
+    await until(() => notes(x).some((t) => /answered by another shell/.test(t)), 5000, 'the session judged the answer');
     // The Run goes on in the nested shell: a typed line runs there, then it exits and the declared shell prints the end marker.
     x.session.input('echo after-probe-$((7*6))\n', { principal: AGENT });
     await until(() => output().includes('after-probe-42'), 5000, 'the typed line to run');
@@ -358,18 +360,20 @@ test('a nested shell that inherited the Run’s token answers the cancel on its 
     const exportAll = x.session.admit({ target: 'shell', line: 'set -a', principal: AGENT });
     assert.ok(exportAll.admitted);
     assert.equal((await x.session.awaitRun(exportAll.run.runId, 5000)).state, 'exited');
-    const nested = x.session.admit({ target: 'shell', line: 'sh', principal: AGENT });
+    const nested = x.session.admit({ target: 'shell', line: "PS1='NEST''ED> ' sh", principal: AGENT });
     assert.ok(nested.admitted);
     const runId = nested.run.runId;
+    const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' && e.runId === runId ? [e.data] : [])).join('');
     await until(() => x.session.run(runId).state === 'running', 5000, 'the nested sh to start');
     const shellPid = x.journal.runs.run(runId).shellPid;
     assert.ok(shellPid !== undefined && shellPid > 0, 'run.start records the pid the start marker named');
-    await sleep(300); // its prompt
+    await until(() => output().includes('NESTED> '), 5000, 'the nested sh’s prompt'); // not a timer (item 8)
     const c = await x.session.cancel(runId, AGENT, { graceMs: 400 });
     assert.equal(c.state, 'running', JSON.stringify(c));
-    const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' && e.runId === runId ? [e.data] : [])).join('');
     const nonce = x.journal.runs.run(runId).nonce!;
-    const stranger = new RegExp(`<<<PROBE:${nonce}:(\\d+):${nonce}>>>`).exec(output());
+    const answer = new RegExp(`<<<PROBE:${nonce}:(\\d+):${nonce}>>>`);
+    await until(() => answer.test(output()), 5000, 'the nested shell’s answer'); // it may come after the cancel's grace
+    const stranger = answer.exec(output());
     assert.ok(stranger && Number(stranger[1]) !== shellPid, `the nested shell answered with the token on its own pid: ${JSON.stringify(output())}`);
     x.session.input('echo after-probe-$((7*6))\n', { principal: AGENT });
     await until(() => output().includes('after-probe-42'), 5000, 'the typed line to run');

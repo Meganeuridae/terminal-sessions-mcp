@@ -185,7 +185,7 @@ __tsm_cmdline() {
 }
 # D for the command that just ended ($1: its status).
 __tsm_close() {
-  if [ -n "$__tsm_in_cmd" ]; then
+  if [ "$\{__tsm_in_cmd:-0}" != 0 ]; then
     # A daemon command file ends by capturing its pipeline's statuses into __tsm_ps (the
     # statuses of '.' itself are all the hook could see): they ride on D as p=1,0.
     if [ -n "$\{__tsm_ps+x}" ]; then __tsm_osc "133;D;$1;p=$\{__tsm_ps// /,}"; else __tsm_osc "133;D;$1"; fi
@@ -206,6 +206,7 @@ __tsm_open() {
   case $\{PS1-} in *"$__tsm_a"*) ;; *) PS1="$__tsm_a$\{PS1-}" ;; esac
   __tsm_osc '133;A'
   __tsm_opened=1
+  __tsm_unclosed=0
 }
 # What the accepted line runs, into __tsm_ret: for a daemon line (" . '<tmp>/tsm-cmd-…'")
 # the file's text. $1: the accepted line.
@@ -338,9 +339,26 @@ __tsm_debug() {
       # run is the prompt's own at the next prompt, healed as before: for a line that only assigned
       # PROMPT_COMMAND the heal is the only closer (the reviewer's read of 2f32e8a..a088780).
       __tsm_fold_pc
+      # Text alone cannot tell this firing from the prompt's own run of the same command when the line
+      # installs it last (echo x; PROMPT_COMMAND=true; true; PROMPT_COMMAND=true): then this is the
+      # prompt's, our hook does not run before PS1, and the Run stayed open at a prompt already shown
+      # (the house's read of the 33 commits, #22 comment 6307351617, item 2). So keep what the heal
+      # would have closed it with — the status and the cwd as they are now — and the start of PS1
+      # prints that end mark, the cwd and the prompt start (__tsm_a) unless our hook ran first. A
+      # firing that was the line's own after all is overtaken before PS1: the line ends at our hook
+      # (folded back here), at the next of these firings or at a heal at its prompt, or — when it then
+      # emptied PROMPT_COMMAND — lost at the prompt start PS1 prints for that (ss-3), which PS1 checks
+      # first, so no exit is ever made up from a status the line went on past.
+      if [ "$\{__tsm_in_cmd:-0}" != 0 ]; then
+        __tsm_unclosed=1
+        __tsm_ust=$__st
+        __tsm_escape "$PWD"
+        __tsm_ucwd=$__tsm_ret
+      fi
     else
       # A command of the prompt's own (it stands in PROMPT_COMMAND) is never a Run.
-      if __tsm_heal_pc "$__st"; then __tsm_prompt_active=; fi
+      # (Not one of the prompt's after all: a status kept above is not this prompt's to report.)
+      if __tsm_heal_pc "$__st"; then __tsm_prompt_active=; else __tsm_unclosed=0; fi
     fi
   fi
   if [ -n "$__tsm_prompt_active" ] && [ -z "$\{COMP_LINE-}" ] && [ -z "$\{READLINE_LINE+x}" ] && [ "$BASH_COMMAND" != __tsm_precmd ]; then
@@ -390,7 +408,7 @@ __tsm_heal_pc() {
   __tsm_user_now=$__tsm_user_pc
   __tsm_heal_at=$__tsm_prompt_no
   __tsm_fold_pc
-  if [ -n "$__own" ] && [ -n "$__tsm_in_cmd" ]; then
+  if [ -n "$__own" ] && [ "$\{__tsm_in_cmd:-0}" != 0 ]; then
     __tsm_close "$1"
     __tsm_open
   fi
@@ -419,8 +437,10 @@ __tsm_word_in() {
 # assignment from one inside quotes (echo 'PROMPT_COMMAND="cmd"'), and a quoted one after the line's
 # own run of cmd hid that run, so the heal closed the Run while the line went on (the house's read of
 # the 38 commits, #22 comment 6274841346). Of the two errors an ambiguous line can cause, a late close
-# only holds the next Run until a prompt; an early one types the next Run into a running command. The
-# late side remains for quoted install-shaped text before a real run-then-install.
+# costs nothing past the prompt, where PS1 closes the Run with the status the trap kept (see __tsm_a);
+# an early one types the next Run into a running command. The late side remains for quoted
+# install-shaped text before a real run-then-install, and for a line that installs last a command it
+# also runs (the house's read of the 33 commits, #22 comment 6307351617, item 2).
 __tsm_line_has() {
   local __t=$__tsm_line_text __h __v __q __val __inst= __suf= __dq=\\" __sq=\\'
   while :; do
@@ -582,6 +602,9 @@ __tsm_trap_suspect=
 __tsm_u=
 __tsm_user_now=
 __tsm_heal_at=
+__tsm_unclosed=0
+__tsm_ust=0
+__tsm_ucwd=
 __tsm_prompt_no=0
 __tsm_pc_lost=0
 __tsm_pc='__tsm_precmd; eval "$__tsm_top"'
@@ -613,14 +636,21 @@ fi
 # back: while PROMPT_COMMAND is empty, the start of PS1 prints the prompt-start mark (the
 # Run that did it ends lost, G5), and its end flags the loss and assigns the hook again —
 # all inside invisible \\[ \\] parts, empty otherwise. The end numbers the prompts, and
-# arms pre-execution detection.
+# arms pre-execution detection. The start of PS1 also closes a typed line's Run that the
+# DEBUG trap left open (__tsm_unclosed, see __tsm_debug): our hook did not run before this
+# prompt, so PS1 prints the end mark it would have printed, with the status and cwd the trap
+# kept, then the prompt start; the end of PS1 clears it. Not while PROMPT_COMMAND is empty:
+# that prompt's start mark ends the Run lost, as above. (With promptvars off, PS1 expands
+# nothing: that Run stays open until the next line or a cancel.)
 # (No variable holds a raw mark: bash 3.2's \`set\` prints values raw, and a printed keyed
-# mark is a mark. The start of PS1 picks the mark from its own text: element 0 is unset.)
+# mark is a mark. The start of PS1 picks the mark from its own text: element 0 of __tsm_sel,
+# and element 1 of __tsm_shut, are unset.)
 __tsm_sel=([10]='')
+__tsm_shut=([0]='')
 __tsm_one=([0]=1 [10]=0)
 __tsm_nz=$__tsm_pcv
-__tsm_a='\\[$\{__tsm_sel[$\{PROMPT_COMMAND:+1}0]-\\033]133;A;k=$\{__tsm_key}\\007}\\]'
-__tsm_b='\\[\\033]133;B;h=$((__tsm_pc_lost|=__tsm_one[$\{PROMPT_COMMAND:+1}0]))$\{__tsm_nz#$\{PROMPT_COMMAND:=$__tsm_pcv}};a=$((__tsm_reinit_pending=0,__tsm_prompt_active=1,__tsm_prompt_no+=1));k=$\{__tsm_key}\\007\\]'
+__tsm_a='\\[$\{__tsm_shut[0$\{PROMPT_COMMAND:+|__tsm_unclosed}]-\\033]133;D;$\{__tsm_ust};k=$\{__tsm_key}\\007\\033]633;P;Cwd=$\{__tsm_ucwd};k=$\{__tsm_key}\\007\\033]133;A;k=$\{__tsm_key}\\007}$\{__tsm_sel[$\{PROMPT_COMMAND:+1}0]-\\033]133;A;k=$\{__tsm_key}\\007}\\]'
+__tsm_b='\\[\\033]133;B;h=$((__tsm_pc_lost|=__tsm_one[$\{PROMPT_COMMAND:+1}0]))$\{__tsm_nz#$\{PROMPT_COMMAND:=$__tsm_pcv}};a=$((__tsm_reinit_pending=0,__tsm_in_cmd=__tsm_in_cmd&&!__tsm_unclosed,__tsm_unclosed=0,__tsm_prompt_active=1,__tsm_prompt_no+=1));k=$\{__tsm_key}\\007\\]'
 PS1="$__tsm_a$\{PS1-}$__tsm_b"
 # ss-1: the daemon types these two keys (ctrl-alt-shift-F12, -F11) before every line, so
 # nothing left in the editor merges with it, in any keymap: F12 empties the line (and in
