@@ -1234,8 +1234,8 @@ addition; nothing about them touches the live PTY.
 - Structured logs (JSON lines) with `session`, `principal`, `runId`; client strings are
   length-limited and JSON-encoded, tokens never appear. `/health` reports per-session
   state, backend, integration, controller, the current Run, journal stats (bytes, retention,
-  a failed store) and the emulator's backlog, plus connections by kind, and, to a caller on this
-  machine that may see sessions, the daemon's `dataDir`, which the shim asks a supervisor's running
+  a failed store) and the emulator's backlog, plus connections by kind, and, to a caller that has a
+  principal and a loopback peer address, the daemon's `dataDir`, which the shim asks a supervisor's running
   termd for, since the unit's text may have changed since it started; on a host without bash
   or a `/dev/fd` of the process's own, `status` is `degraded` and `unsupported` carries the
   reason sessions and process Runs are refused. Graceful drain on

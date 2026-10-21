@@ -4,7 +4,7 @@
  * text names another port or data dir than the termd it shows running, and the shim compared against the
  * edited one (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715, question 1). termd retitles
  * itself (`termd --port N`, tsg-20), so its start arguments no longer show, but the title gives the port
- * it listens on, and that port's /health gives its data dir to a loopback caller that may see sessions.
+ * it listens on, and that port's /health gives its data dir to a caller with a principal and a loopback peer address.
  *
  * The answer counts only from the termd itself: before a byte is sent, the connection's other end is
  * shown to be the pid's (Linux's /proc), since its pid is public and another process may listen on its

@@ -14,6 +14,8 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as http from 'node:http';
+import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -326,7 +328,7 @@ test("a daemon command written for 1.x starts termd: --headless is accepted, SES
   }
 });
 
-test("termd tells its data dir on /health to a caller on this machine that may see sessions, and the shim asks a running termd for it on the port its title names (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715, question 1)", async () => {
+test("termd tells its data dir on /health to a caller with a principal and a loopback peer address, and the shim asks a running termd for it on the port its title names (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715, question 1)", async () => {
   /** A termd of its own; its port, from the listening record. */
   const start = async (name: string, extra: string[]) => {
     const dataDir = path.join(tmp, name);
@@ -376,6 +378,80 @@ test("termd tells its data dir on /health to a caller on this machine that may s
   }
 });
 
+
+test("/health's data dir goes to a caller with a principal only from a loopback peer address: the same credential dialling from another address of this host is told the rest, and a ::ffff:127.0.0.1 peer is loopback (the house's read of the 17 commits over our fixes, #22)", async (t) => {
+  const registry = new SessionRegistry({ dataDir: fs.mkdtempSync(path.join(tmp, 'hg-')), backend: fakeShellBackend(() => {}), defaultShell: '/bin/bash', noUserRc: true });
+  /** A server bound to `host` that tells /health its data dir, the credential `tk` its principal. */
+  const serve = async (host: string) => {
+    const server = new TermServer({ app: new App({ registry }), resolver: new TokenMapResolver({ tokens: { tk: 'agent:health@test' } }), host, port: 0, dataDir: '/srv/told' });
+    return { server, port: (await server.listen()).port };
+  };
+  /** /health with the credential, dialled on 127.0.0.1 from `from` (a local address), else from loopback. */
+  const health = (port: number, from?: string) =>
+    new Promise<Record<string, unknown>>((resolve, reject) => {
+      http
+        .get({ host: '127.0.0.1', port, localAddress: from, path: '/health', headers: { authorization: 'Bearer tk' } }, (res) => {
+          let text = '';
+          res.on('data', (c: Buffer) => (text += c.toString()));
+          res.on('end', () => {
+            try {
+              resolve(JSON.parse(text) as Record<string, unknown>);
+            } catch {
+              reject(new Error(`/health answered ${res.statusCode}: ${text.slice(0, 200)}`));
+            }
+          });
+        })
+        .on('error', reject);
+    });
+  try {
+    await t.test('a peer address of this host that is not loopback', async (t) => {
+      // Bound to loopback, as termd ships, and dialled on it from another of this host's addresses: the peer the
+      // server sees is that address, and nothing listens beyond loopback.
+      const lan = Object.values(os.networkInterfaces()).flat().find((a) => a !== undefined && a.family === 'IPv4' && !a.internal)?.address;
+      if (!lan) return t.skip('this host has no non-loopback IPv4 address to dial from');
+      // What a listener on 127.0.0.1 sees as the peer of a connection from that address: a system that shows it as
+      // loopback can't put this case (the house's read of the 17 commits over our fixes, #22).
+      const seen = await new Promise<string | undefined>((resolve) => {
+        const probe = net.createServer((c) => {
+          resolve(c.remoteAddress);
+          c.destroy();
+        });
+        probe.listen(0, '127.0.0.1', () => {
+          const c = net.connect({ host: '127.0.0.1', port: (probe.address() as { port: number }).port, localAddress: lan });
+          c.once('error', () => resolve(undefined));
+          c.once('close', () => probe.close());
+          c.resume();
+        });
+      });
+      if (seen === undefined || seen === '127.0.0.1' || seen === '::ffff:127.0.0.1') return t.skip(`a connection from ${lan} to 127.0.0.1 shows its peer as ${seen ?? 'nothing (it failed)'} here`);
+      const { server, port } = await serve('127.0.0.1');
+      try {
+        assert.equal((await health(port)).dataDir, '/srv/told', 'the credential from 127.0.0.1 is told the data dir');
+        const remote = await health(port, lan);
+        assert.ok(Array.isArray(remote.sessions), `the same credential from ${lan} is a viewer`);
+        assert.equal(remote.dataDir, undefined, `from ${lan} it is not told the data dir`);
+      } finally {
+        await server.close();
+      }
+    });
+    await t.test('an IPv6 socket\'s ::ffff:127.0.0.1 peer', async (t) => {
+      // An IPv6 socket bound to the IPv4 loopback's mapped address: its peers show as ::ffff:127.0.0.1.
+      let bound: Awaited<ReturnType<typeof serve>>;
+      try {
+        bound = await serve('::ffff:127.0.0.1');
+      } catch (e) {
+        return t.skip(`no IPv6 socket on ::ffff:127.0.0.1 here: ${(e as Error).message}`);
+      }
+      try {
+        assert.equal((await health(bound.port)).dataDir, '/srv/told', 'a ::ffff:127.0.0.1 peer is loopback');
+      } finally {
+        await bound.server.close();
+      }
+    });
+  } finally {
+    await registry.closeAll();
+  }
+});
 test('tsg-21/ux-16: the supervisor launcher starts termd under a bare PATH, in $HOME, with the toolchain on PATH for process Runs and an owner-only log', async () => {
   const home = path.join(tmp, 'home');
   const volta = path.join(home, '.volta', 'bin');
