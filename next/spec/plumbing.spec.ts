@@ -465,3 +465,48 @@ test('the cut finds a Run’s marks where the live session finds them, whatever 
   const probe = `^C\r\n$${inlineProbe(N, false)}\r\n<<<PROBE:${N}:4242:${N}>>>\r\nremote$ `;
   assert.equal(cutPlumbing(`typed\r\n${mark}out\u009e left open\r\n${probe}`, inline), 'out\u009e left open\r\n^C\r\n');
 });
+
+test('the cut reads a long line of probe-shaped fragments in time linear in it, with no nonce recorded (a journal from before one was)', () => {
+  // An independent read of the fix for the house's read of the 33 commits (#22, comment 6307351104): every probe-echo match scanned
+  // to its line's ends, so 100,000 fragments on one line held the event loop for 37 s.
+  const n = 'a1b2c3d4';
+  const echo = sourceLine('/tmp/x/tsm-cmd-3', 'posix', n);
+  for (const fragment of ['<<<PRO""BE:zz ', "<<<PRO''BE:zz ", '<<<PROBE:zz:1:yy>>> ']) {
+    const raw = `${echo}\r\n<<<START:${n}:42>>>\r\nout ${fragment.repeat(100_000)}\r\nafter\r\n<<<EXIT:${n}:0>>>\r\n`;
+    for (const of of [{ strategy: 'marker' as const }, {}]) {
+      const t = performance.now();
+      const cut = cutPlumbing(raw, of);
+      const ms = performance.now() - t;
+      assert.equal(cut, 'after\r\n', `${fragment}: the line of fragments is struck`);
+      // Tens of seconds on the old pass; about 150 ms now, and the bound leaves room for a loaded machine.
+      assert.ok(ms < 2000, `${fragment} ${JSON.stringify(of)}: ${Math.round(ms)} ms`);
+    }
+  }
+});
+
+test('an escape before a struck probe echo stays with the output: a colour, a title, a link’s start set what follows as before', async () => {
+  // An independent read of the fix: ending every kept piece right after the line end before a struck line dropped them.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  for (const esc of ['\x1b[31m', '\x1b]0;title\x07', '\x1b]8;;http://x\x07']) {
+    const raw = `${typed(N)}<<<START:${N}:4242>>>\r\nout\r\n${esc}$${markerProbe(N)}\r\nmore\r\n<<<EXIT:${N}:0>>>\r\n`;
+    assert.equal(cutPlumbing(raw, marker), `out\r\n${esc}more\r\n`, JSON.stringify(esc));
+  }
+});
+
+test('with no nonce recorded, a program’s own split mark word inside a title or a DCS splits nothing: the payload stays hidden', async () => {
+  // An independent read of the fix: `<<<PRO''BE:` inside a title split it, the line was struck as a probe's echo, and the
+  // title's payload showed (`out1\nsecretafter`).
+  const n = 'a1b2c3d4';
+  const head = `${sourceLine('/tmp/x/tsm-cmd-3', 'posix', n)}\r\n<<<START:${n}:42>>>\r\n`;
+  const bodies = [
+    `out1\r\n\x1b]0;t <<<PRO''BE:zz:%s:%s>>>\\n' "$$"\nsecret\x07after\r\n`,
+    `out1\r\n\x1b]0;t <<<PRO""BE:zz secret\x07after\r\n`,
+    `out1\r\n\x1bPq ${markerProbe('ffffffff')}\nsecret\x1b\\after\r\n`,
+  ];
+  for (const body of bodies) {
+    for (const of of [{ strategy: 'marker' as const }, { strategy: 'marker' as const, nonce: n }]) {
+      const shown = await transcript([{ data: cutPlumbing(`${head}${body}<<<EXIT:${n}:0>>>\r\n`, of), stream: 'pty' }]);
+      assert.equal(shown, 'out1\nafter', `${JSON.stringify(of)}: ${JSON.stringify(body)}`);
+    }
+  }
+});

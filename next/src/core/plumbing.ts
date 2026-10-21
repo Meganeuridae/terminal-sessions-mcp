@@ -236,8 +236,8 @@ export interface PlumbingOf {
 /**
  * The text the cutter finds its marks in: `raw` without escape sequences, as stripEscapes reads it,
  * stripped in pieces that each begin where one of the marks the cutter looks for begins in the raw
- * (the Run's start, end and probe marks, and the typed lines' split mark words), so no control string
- * left open before a mark runs over it. The live session finds the marks in the raw output and starts
+ * (the Run's start, end and probe marks, and the typed lines' split mark words with the Run's
+ * nonce), so no control string left open before a mark runs over it. The live session finds the marks in the raw output and starts
  * and ends the Run by them; a banner's lone U+009E (CP1252's `ž` read as Latin-1, a C1 string
  * introducer to the emulator and to stripEscapes), or an OSC a banner never closed, opened a string
  * that hid the start mark from the cut, which then kept every line, plumbing included, and one
@@ -246,12 +246,17 @@ export interface PlumbingOf {
  * string is hidden as the emulator hides it, but its line ends stay in the text, so a line the cutter
  * strikes whole (a probe's echo) takes no line of output before it along; the cut through the mark
  * leaves the string's opening on the other side, so what comes after it shows as the emulator shows
- * the Run's output alone.
+ * the Run's output alone. `open` holds each text index whose raw gap before it lies in such a string.
+ * A split word counts only with the Run's nonce, and with none recorded (a journal from before it
+ * was) only the marks split: a program's own `<<<PRO""BE:` inside a title split the title, and its
+ * payload showed (an independent read of that fix).
  */
-function stripAtMarks(raw: string, nonce: string): { text: string; map: number[] } {
-  const marks = new RegExp(`<<<(?:(?:START|EXIT|PROBE):${nonce}[:>]|EXI""T:|STAR''T:|PRO""BE:|PRO''BE:)`, 'g');
+function stripAtMarks(raw: string, nonce: string | undefined): { text: string; map: number[]; open: Set<number> } {
+  const words = nonce === undefined ? '' : `|(?:EXI""T|STAR''T|PRO""BE|PRO''BE):${nonce}[:>]`;
+  const marks = new RegExp(`<<<(?:(?:START|EXIT|PROBE):${nonce ?? NONCE}[:>]${words})`, 'g');
   const at = [...raw.matchAll(marks)].map((m) => m.index).filter((i) => i > 0);
-  if (!at.length) return stripEscapes(raw);
+  const open = new Set<number>();
+  if (!at.length) return { ...stripEscapes(raw), open };
   let text = '';
   const map: number[] = [];
   const bounds = [0, ...at, raw.length];
@@ -262,21 +267,24 @@ function stripAtMarks(raw: string, nonce: string): { text: string; map: number[]
     for (const i of piece.map) map.push(i + bounds[k]!);
     if (k + 2 === bounds.length) break;
     // Where stripEscapes stopped: past what it kept, the first sequence that does not end in the piece.
-    let open = piece.map.length ? piece.map[piece.map.length - 1]! + 1 : 0;
-    while (open < slice.length) {
-      if (!isIntroducer(slice.charCodeAt(open))) open++;
+    let cut = piece.map.length ? piece.map[piece.map.length - 1]! + 1 : 0;
+    while (cut < slice.length) {
+      if (!isIntroducer(slice.charCodeAt(cut))) cut++;
       else {
-        const end = sequenceEnd(slice, open);
+        const end = sequenceEnd(slice, cut);
         if (end === undefined) break;
-        open = end;
+        cut = end;
       }
     }
-    for (let i = slice.indexOf('\n', open); i !== -1; i = slice.indexOf('\n', i + 1)) {
+    if (cut === slice.length) continue;
+    for (let i = slice.indexOf('\n', cut); i !== -1; i = slice.indexOf('\n', i + 1)) {
+      open.add(text.length);
       text += '\n';
       map.push(i + bounds[k]!);
     }
+    open.add(text.length); // the next piece's first character
   }
-  return { text, map };
+  return { text, map, open };
 }
 
 /**
@@ -317,7 +325,7 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     return nl === -1 ? '' : raw.slice(nl + 1);
   }
   const nonce = of.nonce ?? NONCE;
-  const { text, map } = stripAtMarks(raw, nonce);
+  const { text, map, open } = stripAtMarks(raw, of.nonce);
   let from = 0;
   let pid: string | undefined = of.pid;
   const echoes = [...text.matchAll(wrapperEcho(nonce))].map((m) => [m.index, m.index + m[0].length] as const);
@@ -357,10 +365,12 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     const headEnd = text.indexOf('\n') === -1 ? text.length : text.indexOf('\n');
     if (first && (anywhere || first[0] < headEnd)) {
       from = anywhere ? text.lastIndexOf('\n', first[0] - 1) + 1 : 0;
-      for (;;) {
+      // The echoes and the lines both go forward: an index into the echoes, not a search of them all per line.
+      for (let k = 0; ; ) {
         const nl = text.indexOf('\n', from);
         const lineEnd = nl === -1 ? text.length : nl;
-        if (!echoes.some(([s, e]) => s < lineEnd && e > from)) break;
+        while (k < echoes.length && echoes[k]![1] <= from) k++;
+        if (k === echoes.length || echoes[k]![0] >= lineEnd) break;
         if (nl === -1) return '';
         from = nl + 1;
       }
@@ -368,11 +378,6 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     if (of.strategy === 'inline' && text[from] === '\n') from++;
   }
   const rest = text.slice(from);
-  const lineOf = (i: number): [number, number] => {
-    const s = rest.lastIndexOf('\n', i - 1) + 1;
-    const e = rest.indexOf('\n', i);
-    return [s, e === -1 ? rest.length : e + 1];
-  };
   let to = exitMark(nonce).exec(rest)?.index ?? rest.length;
   if (trace !== undefined) {
     // Tracing, the shell prints the end mark's echo (`+ echo <<<EXIT:…:0>>>`, bash quoting the word)
@@ -384,6 +389,22 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     if (tail) to -= tail.length;
   }
   const struck: Array<[number, number]> = [];
+  // Strikes the lines from a match's first character to its last. Matches come in order, and one
+  // inside the lines struck last is passed over: scanning to its line's ends again for every match
+  // held the event loop for half a minute on a line of 100,000 probe-shaped fragments, which a
+  // journal recorded with no nonce reads by shape (an independent read of the fix for the house's
+  // read of the 33 commits, #22, comment 6307351104).
+  const striker = (): ((i: number, j: number) => void) => {
+    let end = 0;
+    return (i, j) => {
+      if (j < end) return;
+      const s = i < end ? end : rest.lastIndexOf('\n', i - 1) + 1;
+      const nl = rest.indexOf('\n', j);
+      end = nl === -1 ? rest.length : nl + 1;
+      struck.push([s, end]);
+    };
+  };
+  const strikeAnswer = striker();
   for (const m of rest.matchAll(probeAnswer(nonce))) {
     if (m.index >= to) break;
     // Accepted as the session accepts it (applyInlineMarker): the marker strategy's answer names
@@ -399,13 +420,17 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
       to = m.index;
       break;
     }
-    struck.push(lineOf(m.index));
+    strikeAnswer(m.index, m.index);
   }
   // Each probe's echo before the end is plumbing on its own, the accepted probe's included, every
   // line of it: a redraw can break the typed line, its nonce included, over two lines, and striking
   // only the line where it began kept the rest (the house's read of the 38 commits, #22, comment
   // 6274773484). A probe nothing answered leaves only its echo, and what was printed after it stays.
-  for (const m of rest.matchAll(probeEcho(of.nonce))) if (m.index < to) struck.push([lineOf(m.index)[0], lineOf(m.index + m[0].length - 1)[1]]);
+  const strikeEcho = striker();
+  for (const m of rest.matchAll(probeEcho(of.nonce))) {
+    if (m.index >= to) break;
+    strikeEcho(m.index, m.index + m[0].length - 1);
+  }
   // Each kept piece, and whether it ends where a struck line begins.
   const kept: Array<[number, number, boolean]> = [];
   let pos = 0;
@@ -416,9 +441,12 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   }
   if (pos < to) kept.push([pos, to, false]);
   // Each raw piece begins right after the last plumbing character before it, so an escape that
-  // opens the output (a colour set before its first character) stays with it. One that ends where a
-  // struck line begins ends right after the line end before it: a line struck whole begins there,
-  // and its head can lie in a string the output left open, which the text does not hold
-  // (stripAtMarks), where ending at the line's first character in the text kept that head.
-  return kept.map(([s, e, atLine]) => raw.slice(from + s === 0 ? 0 : map[from + s - 1]! + 1, atLine ? map[from + e - 1]! + 1 : (map[from + e] ?? raw.length))).join('');
+  // opens the output (a colour set before its first character) stays with it, and ends at the next
+  // one's first character, so an escape before a struck line (a colour, a title, a link's start)
+  // stays and sets what follows as it did. Where that gap lies in a string a piece left open
+  // (stripAtMarks), the struck line's head is in it, which the text does not hold, and the piece ends
+  // right after the line end before it instead: ending at the line's first character in the text
+  // kept that head; ending after the line end everywhere dropped those escapes (an independent read
+  // of the fix).
+  return kept.map(([s, e, atLine]) => raw.slice(from + s === 0 ? 0 : map[from + s - 1]! + 1, atLine && open.has(from + e) ? map[from + e - 1]! + 1 : (map[from + e] ?? raw.length))).join('');
 }
