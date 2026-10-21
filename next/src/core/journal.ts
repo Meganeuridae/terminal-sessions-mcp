@@ -149,6 +149,8 @@ export class Journal {
    * full write attempts in 3,000 events (comment 6307349700, item 4).
    */
   private markRetryAt = 0;
+  /** A refused reservation write has been said, and its landing is said once one lands. */
+  private markRefusedSaid = false;
   /**
    * Events the ring dropped that the cold store never took, recorded as they are lost (not computed
    * at the catch-up from `persisted` and the ring's oldest seq: an empty ring or a catch-up that
@@ -319,7 +321,11 @@ export class Journal {
    * (exactly at it once sealed: a sealed journal issues only what its catch-up records), and marked
    * `failed` exactly while the cold store refuses events. One comparison an event while nothing is due.
    * A refused write is retried at most once a second; the event is issued meanwhile, so a power loss
-   * while the disk refuses can reissue seqs (best effort, as the module says).
+   * while the disk refuses can reissue seqs (best effort, as the module says). A refusal that leaves
+   * numbering exposed is said, once until a write lands: a refused failed mark (a daemon crash on this
+   * boot would number from the files' last line, as the module says), or any refused write once the next
+   * seq is past the reservation on disk (a power loss would number from it). Appends may be landing, and
+   * nothing else would say so. The write that lands after it is said too.
    */
   private keepMark(): void {
     if (!this.cold?.setHighWater) return;
@@ -328,7 +334,23 @@ export class Journal {
     if (ahead && this.reservedFailed === failed && !this.markUnsure) return;
     if (clocks.monotonic() < this.markRetryAt) return;
     const to = ahead ? this.reserved : this.seq + (this.sealed ? 1 : HIGH_WATER_BLOCK);
-    if (!this.writeReservation(to, failed)) this.markRetryAt = clocks.monotonic() + 1000;
+    if (this.writeReservation(to, failed)) {
+      if (this.markRefusedSaid) {
+        this.markRefusedSaid = false;
+        this.log?.('info', `the journal's reservation is written again (seqs up to ${to}${failed ? ', marked failed' : ''}): its numbers are no longer at risk of being given twice`);
+      }
+      return;
+    }
+    this.markRetryAt = clocks.monotonic() + 1000;
+    // Any other refusal exposes nothing yet: the reservation on disk still covers the next seq, and one marked
+    // failed is honoured on any boot.
+    if (!this.markRefusedSaid && (failed || this.seq + 1 > this.reserved)) {
+      this.markRefusedSaid = true;
+      const what = failed
+        ? `the journal's reservation could not be marked failed while the disk refuses its events: until a write lands, a daemon crash on this boot, or a power loss${this.reserved ? ` for seqs past ${this.reserved}` : ''},`
+        : `the journal's reservation could not be written, and seq ${this.seq + 1} is past the one on disk${this.reserved ? ` (seqs up to ${this.reserved})` : ''}: until a write lands, a power loss`;
+      this.log?.('warn', `${what} can make this journal give numbers its readers have already seen; it is retried at most once a second`);
+    }
   }
 
   /**

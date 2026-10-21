@@ -700,6 +700,94 @@ test('numbering survives a power loss: a crash that takes the file\'s unsynced t
   }
 });
 
+test('a refused reservation write that leaves numbering exposed is said once until a write lands, and the write that lands is said too: a failed mark refused while the store refuses events, or any write once the next seq is past the reservation on disk', (t) => {
+  let mono = 0;
+  t.mock.method(clocks, 'monotonic', () => mono);
+  t.mock.method(boots, 'current', () => 'boot-A');
+  const dir = tmpDir();
+  const realRename = fsc.renameSync;
+  let refuseMeta = false;
+  fsc.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+    if (refuseMeta && String(to).endsWith('journal.meta.json')) throw Object.assign(new Error('EIO: i/o error, rename'), { code: 'EIO' });
+    return realRename(from, to);
+  }) as typeof fs.renameSync;
+  syncBuiltinESMExports();
+  const said: string[] = [];
+  try {
+    // A store whose events are refused while `refuseEvents` holds, and whose reservation writes get the answers
+    // given, in turn (then true).
+    const refusing = (answers: boolean[]) => {
+      const s = { refuseEvents: true, calls: 0 };
+      const store: JournalStore = {
+        kind: 'refusing',
+        append() {
+          if (s.refuseEvents) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+        },
+        read: () => [],
+        oldestSeq: () => undefined,
+        lastSeq: () => undefined,
+        close() {},
+        highWater: () => undefined,
+        setHighWater: () => answers[s.calls++] ?? true,
+      };
+      return { s, store };
+    };
+    const about = (lines: string[], level: string, words: string) => lines.filter((l) => l.startsWith(`${level}: `) && l.includes(words));
+    // The failed mark refused while the store refuses events: the reservation on disk still covers the next seq,
+    // but it is not marked failed, so a daemon crash on this boot would number from the files' last line.
+    const crash = refusing([true, false]);
+    const crashSaid: string[] = [];
+    const k = new Journal({ cold: crash.store, log: (level, text) => crashSaid.push(`${level}: ${text}`) });
+    k.append(out('k0'));
+    k.append(out('k1'));
+    assert.equal(crash.s.calls, 2, 'the reservation, then its failed mark refused');
+    const refusedMark = about(crashSaid, 'warn', 'could not be marked failed');
+    assert.equal(refusedMark.length, 1, crashSaid.join(' | '));
+    assert.match(refusedMark[0]!, /a daemon crash on this boot, or a power loss for seqs past 10000,/);
+    mono += 1000;
+    k.append(out('k2'));
+    assert.equal(about(crashSaid, 'info', 'reservation is written again (seqs up to 10000, marked failed)').length, 1, 'the mark landing is said');
+    k.close();
+    // Once the store takes events again, clearing the failed mark is refused: nothing is said, since a reservation
+    // marked failed is honoured on any boot and still covers the next seq.
+    const healing = refusing([true, true, false]);
+    const healingSaid: string[] = [];
+    const h = new Journal({ cold: healing.store, log: (level, text) => healingSaid.push(`${level}: ${text}`) });
+    h.append(out('h0'));
+    h.append(out('h1'));
+    healing.s.refuseEvents = false;
+    mono += 60_000;
+    h.append(out('h2'));
+    assert.equal(healing.s.calls, 3, 'the reservation, its failed mark, and the clear refused at the catch-up');
+    assert.deepEqual(about(healingSaid, 'warn', 'reservation could not be'), [], 'nothing said');
+    h.close();
+    // A healthy store whose extension is refused once its block is used up.
+    const store = new FileStore(path.join(dir, 'a'));
+    const j = new Journal({ cold: store, log: (level, text) => said.push(`${level}: ${text}`) });
+    j.append(out('first'));
+    assert.equal(store.highWater()?.reservation?.to, HIGH_WATER_BLOCK, 'the first reservation lands');
+    refuseMeta = true;
+    for (let i = 1; i < HIGH_WATER_BLOCK + 50; i++) {
+      j.append(out(`e${i}`));
+      if (i % 1000 === 0) mono += 1000; // retries come due as the seconds pass
+    }
+    assert.equal(store.lastSeq(), HIGH_WATER_BLOCK + 50, 'every event issued and stored meanwhile');
+    const refused = said.filter((s) => s.startsWith('warn: ') && s.includes('reservation could not be written'));
+    assert.equal(refused.length, 1, `said once: ${said.join(' | ')}`);
+    assert.match(refused[0]!, new RegExp(`seq ${HIGH_WATER_BLOCK + 1} is past the one on disk \\(seqs up to ${HIGH_WATER_BLOCK}\\)`));
+    refuseMeta = false;
+    mono += 1000;
+    j.append(out('landed'));
+    assert.equal(store.highWater()?.reservation?.to, 2 * HIGH_WATER_BLOCK + 50, 'written a block past the last seq');
+    assert.deepEqual(said.filter((s) => s.startsWith('info: ') && s.includes('reservation is written again')).length, 1, 'its landing said once');
+    j.close();
+  } finally {
+    fsc.renameSync = realRename;
+    syncBuiltinESMExports();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a store syncs a directory it created into its parent with its first metadata write, and counts a reservation only once that sync lands', (t) => {
   t.mock.method(boots, 'current', () => 'boot-A');
   const root = tmpDir();

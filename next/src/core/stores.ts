@@ -595,7 +595,7 @@ export class FileStore implements JournalStore {
    * Atomically and privately (G26): `written` (durable, with any directory this open created synced into
    * its parent), `unsynced` (the file holds it, a directory fsync failed: said once per store) or `failed`
    * (nothing changed on disk). A refused write of the `epoch` is said once per store too; a refused high
-   * water is the journal's to report, as the store failure it is part of.
+   * water is the journal's to report (keepMark).
    */
   private writeMeta(meta: StoreMeta, epoch = false): 'written' | 'unsynced' | 'failed' {
     let w: DurableWrite;
