@@ -816,11 +816,17 @@ export class SessionRegistry {
     } else {
       recorded = readMeta(dir);
       before = this.retentionFor(undefined, recorded.retention);
-      store = new FileStore(dir, this.storeOptions(before));
+      // A record that names no owner names no retention to trust either: the store opens without one, as
+      // recovery's does, so a refused open prunes nothing a repaired record would keep — the default the
+      // fallback opened with was applied at once, before the refusal (the house's read of the 38 commits,
+      // PR #22, comment 6274857431, item 7). With no history there is nothing to keep, and the default applies.
+      const refusal = recordRefusal(id, recorded);
+      store = new FileStore(dir, this.storeOptions(refusal ? {} : before));
       // A journal this registry did not surface (recovery could not read it): its owner stands (G18),
       // and a record that cannot be read, or is not there, names none.
-      if (store.lastSeq() !== undefined) {
-        const refusal = recordRefusal(id, recorded);
+      if (store.lastSeq() === undefined) {
+        if (refusal) store.setRetention(before);
+      } else {
         if (refusal) {
           store.close();
           throw refusal;
@@ -841,12 +847,30 @@ export class SessionRegistry {
     const cursors = prev?.cursors ?? new CursorBook(path.join(dir, 'cursors.json'), this.opts.log);
     let integ: ReturnType<typeof prepareIntegration> | undefined;
     let session: Session;
+    // A name with a record: while this life starts, the record is this life's (owner, visibility, options,
+    // no closedAt) with the retention the history is kept under until then; it takes the new retention once
+    // the start succeeds, and the old record goes back if it fails. Kept old until after the start, a daemon
+    // that died mid-start left the old life's record — its visibility and closedAt — beside the new life's
+    // journal, which recovery then read as the old life's; written whole before the start, a failed start
+    // overwrote the old retention (the house's read of the 38 commits, PR #22, comment 6274857431, item 6).
+    let starting: Meta | undefined;
     try {
       // A brand-new name is owned from its first byte: its record is written before the start, so a daemon
       // that dies mid-start leaves owned history, not a journal recovery refuses as owner-unknown (a
-      // reviewer's read of the fixes for #22 comment 6269992150). A name with a record keeps it until this
-      // life has started (below): a reopen must not overwrite the old retention before it succeeds.
+      // reviewer's read of the fixes for #22 comment 6269992150).
       if (recorded.owner === undefined) this.noteUnsynced(id, writeMeta(dir, meta));
+      else {
+        const { retention: _new, ...rest } = meta;
+        const pending: Meta = recorded.retention !== undefined ? { ...rest, retention: recorded.retention } : rest;
+        // A disk that refuses it does not keep the session from starting, as the write after the start
+        // never did; the log says what a crash before the next write would leave.
+        try {
+          this.noteUnsynced(id, writeMeta(dir, pending));
+          starting = pending;
+        } catch (we) {
+          this.opts.log?.('warn', `the new life's record could not be written before its start, so a crash before it is written leaves the old life's: ${we instanceof Error ? we.message : String(we)}`, { session: id });
+        }
+      }
       // The integration files live in the session's own directory: a daemon that dies leaves them for
       // the next life to overwrite, not in the system's temp dir. The user's environment the
       // integration preserves (zsh's ZDOTDIR, fish's XDG variables) is the one the shell starts
@@ -887,11 +911,17 @@ export class SessionRegistry {
       session = await Session.start(so);
     } catch (e) {
       integ?.cleanup();
-      // A start that failed is not a life: a name with a record writes this life's only once the start
-      // succeeds, so a reopen whose start failed never overwrote the old record — the history keeps the
-      // retention and the closedAt it had, on disk and in memory (the house's read of the 36 commits, #22,
-      // comment 6269992150). A brand-new name wrote the attempt's record before the start, so whatever it
-      // journaled stays owned and reopenable.
+      // A start that failed is not a life: a name with a record gets its old record back, so the history
+      // keeps the retention and the closedAt it had, on disk and in memory (the house's read of the 36
+      // commits, #22, comment 6269992150). A brand-new name wrote the attempt's record before the start, so
+      // whatever it journaled stays owned and reopenable.
+      if (starting) {
+        try {
+          this.noteUnsynced(id, writeMeta(dir, recorded));
+        } catch (we) {
+          this.opts.log?.('warn', `a new life failed to start and the old record could not be written back: ${we instanceof Error ? we.message : String(we)}`, { session: id });
+        }
+      }
       const kept = recorded.owner !== undefined ? recorded : meta;
       journal.seal();
       if (prev || journal.lastSeq > 0) {
@@ -902,9 +932,9 @@ export class SessionRegistry {
       }
       throw e;
     }
-    // Started: a name that had a record takes this life's now (with its retention), and the history is
-    // kept under it from here on; a brand-new name's was written before the start. A failed record write
-    // is logged, not swallowed; the session is live and the record is retried at its next change.
+    // Started: a name that had a record takes this life's retention now, and the history is kept under it
+    // from here on; a brand-new name's whole record was written before the start. A failed record write is
+    // logged, not swallowed; the session is live and the record is retried at its next change.
     if (recorded.owner !== undefined) {
       try {
         this.noteUnsynced(id, writeMeta(dir, meta));

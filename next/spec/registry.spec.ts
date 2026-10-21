@@ -306,7 +306,9 @@ test('jr-10: a closed session\'s late events never reach the journal, and a new 
   const outcome = h.run(a.run.runId);
   assert.ok(['exited', 'cancelled', 'lost'].includes(outcome.state), `the Run is terminal in history: ${outcome.state}`);
   await r.reg.ensure({ id: 'p', owner: A });
-  straggle?.(); // the old life's process speaks after the reopen
+  // Captured, or the test would pass with nothing emitted (the house's read of the 38 commits, PR #22, comment 6274857431).
+  assert.ok(straggle, 'the process took the SIGINT and armed its straggler');
+  straggle(); // the old life's process speaks after the reopen
   await new Promise((res) => setTimeout(res, 100));
   assert.equal(h.lastSeq, atClose, 'nothing appended to the closed journal');
   const seqs = seqsOnDisk(path.join(r.dir, 'sessions/p'));
@@ -698,5 +700,74 @@ test('item 8: cursors written while their directory cannot be synced are logged 
   });
   assert.equal(readOf(), 6, 'a later change is still written');
   assert.equal(said(), 1, 'but the failure is said once, and nothing is rewritten in a loop');
+  await cleanup(r2, r);
+});
+
+test('G18/G20: while a reopen starts, the record on disk is the new life\'s under the old retention; a failed start puts the old record back, and a start that succeeds takes the new retention (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 6)', async () => {
+  // The old record stayed on disk until the start succeeded: a daemon that died mid-start left the old
+  // life's visibility and closedAt beside the new life's journal, and recovery read the running life as the old.
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'mid', owner: A, visibility: 'shared', retention: { maxBytes: 256 * 1024 } })).session;
+  await run(s, A, 'echo old-life');
+  await r.reg.close('mid');
+  type Rec = { owner: string; visibility: string; closedAt?: number; retention?: unknown };
+  const file = path.join(r.dir, 'sessions', 'mid', 'session.json');
+  const read = () => JSON.parse(fs.readFileSync(file, 'utf8')) as Rec;
+  const old = read();
+  assert.deepEqual([old.visibility, typeof old.closedAt, old.retention], ['shared', 'number', { maxBytes: 262144 }]);
+  const spawn = r.backend.spawnShell.bind(r.backend);
+  const seen: Rec[] = []; // the record at each spawn: what a daemon that died there would leave
+  r.backend.spawnShell = () => {
+    seen.push(read());
+    throw new Error('spawn failed');
+  };
+  const reopen = { id: 'mid', owner: A, visibility: 'private' as const, retention: { maxBytes: 512 * 1024 } };
+  await rejectsWith(r.reg.ensure(reopen), 'Error: spawn failed');
+  assert.equal(seen.length, 1, 'the start reached the spawn');
+  assert.deepEqual([seen[0]!.owner, seen[0]!.visibility, seen[0]!.closedAt, seen[0]!.retention], [A, 'private', undefined, { maxBytes: 262144 }], 'mid-start: the new life\'s record, under the old retention');
+  assert.deepEqual(read(), old, 'the failed start put the old record back');
+  assert.deepEqual([hist(r.reg.get('mid')).visibility, hist(r.reg.get('mid')).closed], ['shared', true], 'and the entry is the old one');
+  r.backend.spawnShell = (...args: Parameters<typeof spawn>) => {
+    seen.push(read());
+    return spawn(...args);
+  };
+  await r.reg.ensure(reopen);
+  assert.deepEqual([seen[1]?.visibility, seen[1]?.closedAt, seen[1]?.retention], ['private', undefined, { maxBytes: 262144 }], 'mid-start again');
+  const now = read();
+  assert.deepEqual([now.visibility, now.closedAt, now.retention], ['private', undefined, { maxBytes: 524288 }], 'started: the new retention');
+  await cleanup(r);
+});
+
+test('G21: a refused open of a journal the registry did not surface prunes nothing — its store opens without retention until a record reads (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 7)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-registry-'));
+  const { backend, shells } = scripted();
+  const reg = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), retention: { maxAgeMs: 1000 } });
+  const r: Rig = { dir, backend, shells, reg, changes: [] };
+  // Written after the registry started, so recovery never surfaced it, with rotated files old enough for the
+  // daemon's default age to drop, and a record that cannot be read.
+  const sdir = path.join(dir, 'sessions', 'late');
+  const old = Date.now() - 60_000;
+  const j = new Journal({ cold: new FileStore(sdir, { maxFileBytes: 4096, now: () => old }), sessionId: 'late', now: () => old });
+  for (let i = 0; i < 60; i++) j.append({ type: 'output', data: 'x'.repeat(200), stream: 'pty' });
+  j.close();
+  fs.writeFileSync(path.join(sdir, 'session.json'), '{');
+  const rotated = () => fs.readdirSync(sdir).filter((n) => /^journal\.\d+\.jsonl$/.test(n)).sort();
+  const files = rotated();
+  assert.ok(files.length >= 2, `rotated files: ${JSON.stringify(files)}`);
+  await assert.rejects(reg.create({ id: 'late', owner: A }), /cannot be read/);
+  assert.deepEqual(rotated(), files, 'the refused open pruned nothing a repaired record would keep');
+  await cleanup(r);
+});
+
+test('G18: a record that is valid JSON but names no owner is refused as a damaged one is — for the system principal too (the house\'s read of the 38 commits, PR #22, comment 6274857431)', async () => {
+  // With that refusal removed no spec broke: `{"visibility":"private"}` made the system the owner.
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'noown', owner: A })).session;
+  await run(s, A, 'echo keep-me');
+  await r.reg.closeAll();
+  fs.writeFileSync(path.join(r.dir, 'sessions', 'noown', 'session.json'), JSON.stringify({ visibility: 'private' }));
+  const r2 = restart(r);
+  assert.equal(hist(r2.reg.get('noown')).owner, 'unknown');
+  for (const owner of [A, 'system']) await assert.rejects(r2.reg.ensure({ id: 'noown', owner }), /names no owner/, `refused for ${owner}`);
   await cleanup(r2, r);
 });

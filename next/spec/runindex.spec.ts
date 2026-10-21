@@ -264,3 +264,44 @@ test('the run index drops a gap line claiming seqs at or past its own seq — a 
   idx.feed({ type: 'gap', from: 70, to: 70, reason: 'store-error', seq: 70, ts: 0 } as JournalEvent);
   assert.equal(idx.gapsWithin(1, 100).length, 1, 'neither over-reaching gap was kept');
 });
+
+test('jr2-4: a run.start\'s start ticks and boot id reach the Run — as journaled, after a reopen\'s scan, and through a rotation header (the house\'s read of the 38 commits, PR #22, comment 6274857431)', () => {
+  // The recovery tests set the ticks on a Run's info by hand: with this propagation removed, none failed.
+  const dir = tmpDir();
+  try {
+    const j = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+    j.append({ type: 'run.admit', runId: 'r1-ticks', target: 'process', line: 'sleep 9', principal: 'agent:a@test', origin: 'self', queued: false });
+    j.append({ type: 'run.start', runId: 'r1-ticks', cwd: '/', envBasis: 'configured', pid: 4242, pgid: 4242, startTicks: 987_654, bootId: 'boot-A' });
+    const ticks = (r: RunInfo) => [r.startTicks, r.bootId, r.pgid];
+    assert.deepEqual(ticks(j.runs.run('r1-ticks')), [987_654, 'boot-A', 4242], 'as journaled');
+    j.close();
+    const again = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+    assert.deepEqual(ticks(again.runs.run('r1-ticks')), [987_654, 'boot-A', 4242], 'after a reopen, from the scan');
+    again.close();
+    const fromHeader = new RunIndex('s');
+    fromHeader.absorbHeader(again.runs.header());
+    assert.deepEqual(ticks(fromHeader.run('r1-ticks')), [987_654, 'boot-A', 4242], 'from a rotation header');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a gap recorded past the window is seated where its hole ends: a maxBytes page that begins after the hole reports none, one that begins at it does (the house\'s read of the 38 commits, PR #22, comment 6274857431)', () => {
+  // Seated at `until` whatever its hole, a hole wholly inside the window stayed with the page the maxBytes
+  // cut began after it, and the page reported a hole before its first event.
+  const out = (seq: number): JournalEvent => ({ type: 'output', data: 'xx', stream: 'stdout', runId: 'r', seq, ts: seq }) as JournalEvent;
+  const gap = (from: number, to: number): JournalEvent => ({ type: 'gap', from, to, reason: 'store-error', seq: 40, ts: 40 }) as JournalEvent;
+  const page = (events: JournalEvent[], g: JournalEvent) =>
+    narrowOutput({ events, from: 10, to: 30, truncated: true, gaps: [g as Extract<JournalEvent, { type: 'gap' }>] }, { until: 30, maxBytes: 4 });
+  // Outputs at 10, 11, 14..17; the hole [12, 13]; the page holds 16 and 17 alone.
+  const early = page([10, 11, 14, 15, 16, 17].map(out), gap(12, 13));
+  assert.deepEqual(early.events.map((e) => e.seq), [16, 17]);
+  assert.equal(early.gaps, undefined, 'the hole lies before the page\'s first event');
+  // Outputs at 10, 11, 14, 17, 18; the hole [15, 16] sits right before the page's first event, 17.
+  const at = page([10, 11, 14, 17, 18].map(out), gap(15, 16));
+  assert.deepEqual(at.events.map((e) => e.seq), [17, 18]);
+  assert.deepEqual(at.gaps?.map((g) => [g.seq, g.from, g.to]), [[16, 15, 16]], 'seated where the hole ends');
+  // A hole that runs past `until` is still seated at `until`, where the window ends inside it.
+  const past = narrowOutput({ events: [10, 11].map(out), from: 10, to: 30, truncated: true, gaps: [gap(20, 35) as Extract<JournalEvent, { type: 'gap' }>] }, { until: 30 });
+  assert.deepEqual(past.gaps?.map((g) => g.seq), [30]);
+});
