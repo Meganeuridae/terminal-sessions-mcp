@@ -166,7 +166,7 @@ test('a service reads a process Run’s pipes as one source, as a read shows the
   n.dispose();
 });
 
-test('a line both readings complete at one event, begun at one place, is one line: matched once, as its pipe wrote it, the journal and the service saying the same', () => {
+test('the two readings’ lines that one line end completes are one line: matched once, as its pipe wrote it, the journal and the service saying the same', () => {
   // `FATAL: db crashed` on stdout, a stderr `x`, then stdout's LF: read as `FATAL: db crashedx` and, by stdout, as
   // `FATAL: db crashed`. Told apart by their text, the line was counted twice: the read's journaled with its `x`, and
   // the pipe's held as the service's evidence (an independent read of the fixes for the house's review of
@@ -193,7 +193,8 @@ test('a line both readings complete at one event, begun at one place, is one lin
   g.out('\n', 'stdout');
   assert.equal(n.status, 'unhealthy', 'stdout wrote `ok listening`, and the line read `ok listening FATAL`');
   n.dispose();
-  // m2-21's two lines that begin at one place but end at different events stay two: the ready line as stdout wrote it passes.
+  // m2-21's ready line, broken by a stderr line: stdout's own line ends at stdout's LF, after the read ended its head at
+  // stderr's, so it is a line of its own, and passes.
   const h = fake('process');
   const o = h.monitor({ ready: { pattern: 'listening on \\d+' } });
   h.start();
@@ -201,7 +202,22 @@ test('a line both readings complete at one event, begun at one place, is one lin
   h.out('warn: deprecated\n', 'stderr');
   h.out('ing on 8080\n', 'stdout');
   assert.equal(o.status, 'ready');
+  assert.equal(o.info().evidence, 'Server listening on 8080');
   o.dispose();
+  // Lines that begin at different events: stdout's `ERROR a`, then `ERROR b` and a LF on stderr, then stdout's LF. The
+  // read's `ERROR aERROR b` and stderr's `ERROR b` end at one LF, one line; stdout's `ERROR a` at the other, a second
+  // line, counted. Paired by where they began, stderr's line was counted twice, once in the read's.
+  const k = fake('process');
+  const q = k.monitor({ fail: { pattern: 'ERROR' } });
+  k.start();
+  k.out('ERROR a', 'stdout');
+  k.out('ERROR b\n', 'stderr');
+  k.out('\n', 'stdout');
+  assert.equal(q.status, 'unhealthy');
+  assert.equal(q.info().repeats, 1, 'two lines, each once');
+  assert.deepEqual(k.journal.since(0).events.flatMap((e) => (e.type === 'service' && e.status === 'unhealthy' ? [e.evidence] : [])), ['ERROR b'], 'the first, as stderr wrote it');
+  assert.equal(q.info().evidence, 'ERROR a', 'the second, as stdout wrote it');
+  q.dispose();
 });
 
 test('a quiet prompt is offered by both readings and matched once: as a read shows it, or as its own pipe wrote it', async () => {

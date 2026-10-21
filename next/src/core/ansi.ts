@@ -222,6 +222,8 @@ export interface SplitLine {
   mixed?: true;
   /** Where the line began: the `at` `feed` was given with its first chunk, and UTF-8 bytes into that chunk. */
   begun?: Begun;
+  /** Where the line end that completed it lies, likewise; absent for a line completed by the stream's end or offered as a prompt. */
+  ended?: Begun;
 }
 
 /** Where a line began in what was fed: the chunk's `at` (a journal seq), and UTF-8 bytes into the chunk. */
@@ -311,16 +313,19 @@ export class LineSplitter {
     if (!chunk) return out;
     let text = chunk;
     if (this.pendingCr && text.startsWith('\n')) text = text.slice(1);
-    // Where in the chunk a line begins, in UTF-8 bytes, counted on from the last line begun in it: once
+    // Where in the chunk a line begins and ends, in UTF-8 bytes, counted on from the last place asked: once
     // per chunk, however many lines it holds.
     const skipped = chunk.length - text.length;
     let mark = 0;
     let markBytes = 0;
-    const begin = (i: number) => {
-      if (at === undefined || this.begun) return;
+    const place = (i: number): Begun | undefined => {
+      if (at === undefined) return undefined;
       markBytes += utf8Length(chunk.slice(mark, i + skipped));
       mark = i + skipped;
-      this.begun = { at, offset: markBytes };
+      return { at, offset: markBytes };
+    };
+    const begin = (i: number) => {
+      if (!this.begun) this.begun = place(i);
     };
     // Lines and frames end by the one rule (lineEnds, with CRs): a LF or CR inside a window title ends
     // neither (an independent read of the fix for the house's read of the 33 commits, #22, comment 6307350650).
@@ -335,11 +340,13 @@ export class LineSplitter {
     const parts: string[] = [];
     let from = 0;
     let head = '';
-    /** Where each part begins in `text`. */
+    /** Where each part begins in `text`, and where the line end after it lies. */
     const starts: number[] = [];
+    const stops: number[] = [];
     for (let k = 0; k < breaks.length; k++) {
       const b = breaks[k]!;
       starts.push(from);
+      stops.push(b);
       parts.push(head + text.slice(from, b));
       // A CRLF is one break.
       if (text[b] === '\r' && text[b + 1] === '\n' && breaks[k + 1] === b + 1) k++;
@@ -353,7 +360,7 @@ export class LineSplitter {
     parts.forEach((part, k) => {
       begin(starts[k]!);
       this.add(part, source, k === 0 ? open : '');
-      this.complete(out);
+      this.complete(out, place(stops[k]!));
     });
     if (from < text.length) begin(from);
     this.add(last, source, parts.length === 0 ? open : '');
@@ -413,8 +420,9 @@ export class LineSplitter {
     return line;
   }
 
-  private complete(out: SplitLine[]): void {
+  private complete(out: SplitLine[], ended?: Begun): void {
     const line = this.spent ? undefined : this.current();
+    if (line && ended) line.ended = ended;
     this.raw = '';
     this.cut = false;
     this.spent = false;

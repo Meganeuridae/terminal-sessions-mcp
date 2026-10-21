@@ -19,7 +19,7 @@
  * Further fail-pattern lines while already unhealthy for that reason update the
  * evidence and a repeat count on the monitor, not the journal (m2-16).
  */
-import { compileLinePattern, LineSplitter, type SplitLine } from './ansi.js';
+import { compileLinePattern, LineSplitter, type Begun, type SplitLine } from './ansi.js';
 import { headOnlyText, testBounded } from './regex.js';
 import type { Journal } from './journal.js';
 import { timerMs } from './clock.js';
@@ -68,8 +68,8 @@ export interface ServiceDeps {
 
 type Condition = 'pattern' | 'tcp' | 'alive';
 
-/** Where a line began (SplitLine.begun), as a key: the two readings' lines that began at one place are one line. */
-const startOf = (line: SplitLine): string => (line.begun ? `${line.begun.at}:${line.begun.offset}` : `?${line.text}`);
+/** A place in a Run's output (where a line began or ended: SplitLine.begun, .ended), as a key; the line's text when it has none. */
+const placeOf = (p: Begun | undefined, line: SplitLine): string => (p ? `${p.at}:${p.offset}` : `?${line.text}`);
 
 /** One reading of a service Run's output (ServiceMonitor.lines and .pipes): its splitter, the seq it was last fed, and the pipe it reads alone. */
 interface Reading {
@@ -210,18 +210,22 @@ export class ServiceMonitor {
       // After readiness the ready pattern matters only as the answer to a fail line.
       if (!this.failRe && (!this.readyRe || this.met.has('pattern'))) return;
       // A pattern matches a line as a read shows it, or as its own pipe wrote it (the house's review of
-      // 4f4c067..a8b6f28, #22, comment 6323055715, question 3). The two readings' lines that this event completes and
-      // that began at one place are one line, matched once, as its pipe wrote it first: by text, `FATAL: db crashed`
-      // on stdout, a stderr `x` and stdout's LF were two lines, counted twice, the read's `FATAL: db crashedx`
-      // journaled and the pipe's held as the evidence.
+      // 4f4c067..a8b6f28, #22, comment 6323055715, question 3). The two readings' lines that one line end completes
+      // are one line, matched once, as its pipe wrote it first: told apart by their text, `FATAL: db crashed` on
+      // stdout, a stderr `x` and stdout's LF were two lines, counted twice, the read's `FATAL: db crashedx` journaled
+      // and the pipe's held as the evidence; told apart by where they began, stdout's `ERROR a`, then `ERROR b` and a
+      // LF on stderr, counted stderr's line twice, once in the read's `ERROR aERROR b`. Every line end is one pipe's
+      // and the read's alike, so it completes at most one line of each reading, and lines that one end does not
+      // complete are other lines: m2-21's `Server listening on 8080`, stdout's own, ended by stdout's LF after the
+      // read ended `Server listenwarn: deprecated` at stderr's.
       const read = this.feed(this.source(), ev);
       const own = new Map<string, SplitLine>();
-      if (ev.stream !== 'pty') for (const line of this.feed(this.pipe(ev.stream), ev)) own.set(startOf(line), line);
+      if (ev.stream !== 'pty') for (const line of this.feed(this.pipe(ev.stream), ev)) own.set(placeOf(line.ended, line), line);
       for (const line of read) {
-        const twin = own.get(startOf(line));
+        const twin = own.get(placeOf(line.ended, line));
         if (!twin) this.onLine(line);
         else {
-          own.delete(startOf(line));
+          own.delete(placeOf(line.ended, line));
           this.onLine(twin, line);
         }
       }
@@ -250,7 +254,7 @@ export class ServiceMonitor {
   /** A quiet prompt one reading offered after event `seq`: matched unless the other's that began at the same place was, and then as that was. */
   private once(seq: Seq, line: SplitLine): boolean {
     if (seq !== this.offered.seq) this.offered = { seq, lines: new Map() };
-    const at = startOf(line);
+    const at = placeOf(line.begun, line);
     const had = this.offered.lines.get(at);
     if (had !== undefined) {
       this.offered.lines.delete(at);
