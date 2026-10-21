@@ -23,7 +23,7 @@ import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
 import { commandFile, cutPlumbing, exitMark, inlineProbe, markerCommandText, markerProbe, probeMark, shellQuote, sourceLine, startMark, type ShellFlavor } from './plumbing.js';
 import { stripEscapes } from './text.js';
-import { project, type ProjectChunk } from './transcript.js';
+import { project, runChunks } from './transcript.js';
 import { type AttachmentRole, type ControlPolicy, type Cursors, DEFAULT_GEOMETRY, type EnvBasis, type EventOf, type IntegrationLevel, type JournalEvent, type Principal, type RunInfo, type RunOrigin, type RunState, type RunTarget, type ScreenSnapshot, type Seq, type ShellState, SYSTEM, type Visibility } from './types.js';
 
 export type { RunInfo } from './types.js';
@@ -2800,20 +2800,24 @@ export class Session {
     return pageOutput(this.journal, runId, from, to, range);
   }
 
-  /** Transcript of a Run's output (§6), projected at the width the Run started at (er-4); the daemon's plumbing is cut out. */
+  /**
+   * Transcript of a Run's output (§6), projected at the width the Run started at (er-4); the daemon's plumbing
+   * is cut out. Where the Run's gaps say output was lost, the projection starts afresh (runChunks).
+   */
   async runTranscript(runId: string): Promise<{ text: string; truncated: boolean; seq: [Seq, Seq]; nextCursor: Seq }> {
     const run = this.getRun(runId);
     // Results show the tail: only the newest part is read and projected, so a flood renders
     // in bounded time (emu-3, tg-4, er-11), visibly cut.
     const out = this.runOutput(runId, { maxBytes: TRANSCRIPT_INPUT_CHARS });
     const events = out.events as OutputEvent[];
-    let chunks = events.map((e) => e.data);
     // The plumbing the launch strategy left in the output — the typed line's echo, the markers,
     // the probes a cancel typed — goes, by the Run's nonce, by the one rule history uses too
-    // (core/plumbing.ts; the house's reads of 39787b3, #22).
-    if (run.target === 'shell' && run.strategy !== undefined) chunks = [cutPlumbing(chunks.join(''), { strategy: run.strategy, nonce: run.markerNonce, truncated: out.truncated, pid: run.shellPid !== undefined ? String(run.shellPid) : undefined })];
-    // Process output comes from pipes (LF → CRLF, rule 6).
-    const input: ProjectChunk[] = run.target === 'process' ? events.map((e) => ({ data: e.data, stream: e.stream })) : chunks;
+    // (core/plumbing.ts; the house's reads of 39787b3, #22). Process output comes from pipes (LF → CRLF, rule 6).
+    const cut =
+      run.target === 'shell' && run.strategy !== undefined
+        ? (raw: string) => cutPlumbing(raw, { strategy: run.strategy, nonce: run.markerNonce, truncated: out.truncated, pid: run.shellPid !== undefined ? String(run.shellPid) : undefined })
+        : undefined;
+    const input = runChunks(events, out.gaps, cut);
     const p = await project(input, { cols: run.cols ?? this.screen.cols, rows: run.rows ?? this.screen.rows, maxInputBytes: TRANSCRIPT_INPUT_CHARS, keep: 'tail' });
     return { text: p.text, truncated: out.truncated || p.truncated, seq: [out.from, out.to], nextCursor: out.to };
   }

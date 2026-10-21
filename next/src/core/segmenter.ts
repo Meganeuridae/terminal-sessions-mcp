@@ -27,7 +27,7 @@ import { looksLikeSecretPrompt } from './session.js';
 import { lineCarry, lineEnds, safeCut, tailStart, unfinishedSequence, type LineCarry } from './text.js';
 import { headOnlyText } from './regex.js';
 import { minusRanges } from './ranges.js';
-import { project } from './transcript.js';
+import { project, runChunks } from './transcript.js';
 import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type JournalEvent, type OutputStream, type Principal, type RunInfo, type ScreenSnapshot, type Seq } from './types.js';
 
 export type SegmentKind =
@@ -263,14 +263,16 @@ export interface HistoryRender {
  * results): the newest part of its attributed output, a shell Run's plumbing cut as the live
  * transcript cuts it — by the strategy, nonce and shell pid its run.start recorded, by shape for a
  * Run journaled before those were (the house's read of 39787b3, #22) — projected (§6) at the size the
- * Run started at when the journal recorded one, else the caller's.
+ * Run started at when the journal recorded one, else the caller's. Where its gaps say output was lost,
+ * the projection starts afresh (runChunks).
  */
 export async function journalRunText(o: RunOutput, how: HistoryRender = {}, run?: RunInfo): Promise<RunText> {
   const events = o.events.filter((e): e is Output => e.type === 'output');
-  const chunks =
+  const cut =
     run?.target === 'shell' && events.every((e) => e.stream === 'pty')
-      ? [{ data: cutPlumbing(events.map((e) => e.data).join(''), { strategy: run.strategy, nonce: run.nonce, truncated: o.truncated, pid: run.shellPid !== undefined ? String(run.shellPid) : undefined }), stream: 'pty' as const }]
-      : events.map((e) => ({ data: e.data, stream: e.stream }));
+      ? (raw: string) => cutPlumbing(raw, { strategy: run.strategy, nonce: run.nonce, truncated: o.truncated, pid: run.shellPid !== undefined ? String(run.shellPid) : undefined })
+      : undefined;
+  const chunks = runChunks(events, o.gaps, cut);
   const p = await project(chunks, { cols: run?.cols ?? how.cols ?? DEFAULT_GEOMETRY.cols, rows: run?.rows ?? how.rows ?? DEFAULT_GEOMETRY.rows, maxInputBytes: how.maxInputBytes ?? HISTORY_RUN_INPUT_BYTES, keep: 'tail' });
   return { text: p.text, truncated: o.truncated || p.truncated, seq: [o.from, o.to], nextCursor: o.to };
 }
@@ -1079,14 +1081,28 @@ export class Segmenter {
     } catch {
       return; // nothing journaled for it yet
     }
+    const gaps = out.gaps ?? [];
+    let prev: Seq | undefined;
     for (const ev of out.events) {
       if (ev.type !== 'output') continue;
+      // Across a hole in what was journaled the lines start afresh, as search's do: a line or a string open
+      // before it took what followed (the house's review of the 40 commits through f3750e4, #22, comment
+      // 6310921374). Live output needs none: it saw every event a later gap names.
+      if (prev !== undefined && gaps.some((g) => g.from < ev.seq && g.to > prev!)) this.restartLines(w);
+      prev = ev.seq;
       w.bytes += Buffer.byteLength(ev.data);
       if (!this.alt || w.pipes) this.feedLines(w, ev.data, ev.stream);
     }
     w.bytesAtLeast = out.truncated;
     if (out.events.length) w.marks.push([out.events[out.events.length - 1]!.seq, w.bytes]);
     if (!w.pipes) w.silenceTimer = setTimeout(() => this.checkNeedsInput(w), this.o.needsInputMs);
+  }
+
+  /** The Run's unfinished line is a line of its own, as at the end of a stream, and the next starts afresh. */
+  private restartLines(w: RunWatch): void {
+    this.pushLines(w, [cleanLine(w.carry).trimEnd()]);
+    w.carry = '';
+    w.scan = lineCarry();
   }
 
   private untrack(runId: string): void {

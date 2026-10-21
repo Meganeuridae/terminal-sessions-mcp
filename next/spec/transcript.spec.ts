@@ -6,9 +6,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { persistentState } from '../src/core/screen.js';
-import { project, transcript } from '../src/core/transcript.js';
+import { project, runChunks, transcript } from '../src/core/transcript.js';
 import type { ProjectChunk } from '../src/core/transcript.js';
 import { lineEnds, stripEscapes, unfinishedSequence } from '../src/core/text.js';
+import { journalRunText } from '../src/core/segmenter.js';
+import { scriptedSession } from './fake-shell.js';
+import type { JournalEvent, RunInfo } from '../src/core/types.js';
 import xterm from '@xterm/headless';
 
 const MB = 1024 * 1024;
@@ -634,6 +637,34 @@ test('a LF a CSI executes is a line end the interleave may cut at: the source’
   for (let maxLines = 1; maxLines <= 5; maxLines++) assert.ok(!/1m/.test((await project(chunks, { cols: 40, maxLines })).text), `maxLines ${maxLines}`);
 });
 
+test('a hole starts the projection afresh: no line, and no string, open before it takes what follows', async () => {
+  // The Run renderers projected a Run's output without its gaps, so a title open before a hole took the lines after it.
+  assert.deepEqual((await project(['ready \x1b]0;my title', { hole: true }, 'ERROR: boom\r\n'], { cols: 40 })).text.split('\n'), ['ready', 'ERROR: boom']);
+  assert.deepEqual((await project(['abc', { hole: true }, 'def\r\n'], { cols: 40 })).text.split('\n'), ['abc', 'def']);
+  assert.deepEqual((await project(['A\x1b[3\r\n', { hole: true }, 'CB\r\n'], { cols: 40 })).text.split('\n'), ['A', 'CB'], 'a CSI open before it is not read on');
+  assert.equal((await project(['one\r\n', { hole: true }, 'two\r\n'], { cols: 40 })).text, 'one\ntwo', 'a line already ended: no blank line');
+  assert.equal((await project([{ data: 'x', stream: 'stdout', runId: 'p' }, { hole: true }, { data: 'y\n', stream: 'stdout', runId: 'p' }], { cols: 40, label: sourceLabel })).text, '[run p]\nx\n[run p]\ny');
+});
+
+test('runChunks puts a hole between two of a Run’s events wherever a gap says output was lost, and through a cutter that reads the text whole', async () => {
+  const ev = (seq: number, data: string) => ({ seq, data, stream: 'pty' as const });
+  const events = [ev(2, 'ready \x1b]0;tit'), ev(3, 'le-ish'), ev(9, 'ERROR\r\n'), ev(12, 'tail\r\n')];
+  const gaps = [{ from: 4, to: 8 }, { from: 20, to: 30 }];
+  assert.deepEqual(runChunks(events, gaps), [{ data: 'ready \x1b]0;tit', stream: 'pty' }, { data: 'le-ish', stream: 'pty' }, { hole: true }, { data: 'ERROR\r\n', stream: 'pty' }, { data: 'tail\r\n', stream: 'pty' }]);
+  // A gap seated after its hole (a store failure's, written when the disk takes writes again) still places it by its range.
+  assert.deepEqual(runChunks([ev(2, 'a'), ev(9, 'b')], [{ from: 3, to: 5 }]), [{ data: 'a', stream: 'pty' }, { hole: true }, { data: 'b', stream: 'pty' }]);
+  // Through a cutter: it sees one text, and the hole comes back where it was, whatever the cutter keeps around it.
+  const seen: string[] = [];
+  const cut = (raw: string) => (seen.push(raw), raw.replace(/^ECHO\r\n/, ''));
+  const chunks = runChunks([ev(2, 'ECHO\r\nready \x1b]0;tit'), ev(9, 'ERROR\r\n')], [{ from: 3, to: 8 }], cut);
+  assert.equal(seen.length, 1, 'the cutter reads the text once');
+  assert.deepEqual(chunks, [{ data: 'ready \x1b]0;tit', stream: 'pty' }, { hole: true }, { data: 'ERROR\r\n', stream: 'pty' }]);
+  assert.deepEqual((await project(chunks, { cols: 40 })).text.split('\n'), ['ready', 'ERROR']);
+  // The mark is one the output does not hold.
+  const own = runChunks([ev(2, 'x\x18﷐y'), ev(9, 'z')], [{ from: 3, to: 8 }], (raw) => raw);
+  assert.deepEqual(own, [{ data: 'x\x18﷐y', stream: 'pty' }, { hole: true }, { data: 'z', stream: 'pty' }]);
+});
+
 test('a CSI holding many line feeds is taken whole by a batch: the projection reads as the emulator does, its rest no text', async () => {
   // A batch was cut at a LF inside the CSI, which the ED 3 between batches then ended: its final `m` showed.
   const inside = `${'l\r\n'.repeat(3000)}\x1b[${'\r\n'.repeat(2000)}mend\r\n`;
@@ -642,4 +673,34 @@ test('a CSI holding many line feeds is taken whole by a batch: the projection re
   assert.equal(a.text, (await project([before], { cols: 80 })).text);
   assert.equal(a.truncated, false);
   assert.ok(a.text.endsWith('\nend'));
+});
+
+test('a Run of history renders its gaps as holes: a string or a line open before one takes nothing after it, its plumbing cut as before', async () => {
+  const out = (seq: number, data: string): JournalEvent => ({ seq, ts: 0, type: 'output', stream: 'pty', runId: 'r', data });
+  const gap: JournalEvent = { seq: 12, ts: 0, type: 'gap', from: 3, to: 8, reason: 'store-error' };
+  const run = { runId: 'r', sessionId: 's', target: 'shell', origin: 'self', principal: 'agent:a@t', state: 'exited', admittedAt: 0, seq: { admit: 1, start: 1, end: 11 }, attribution: 'temporal', strategy: 'marker', nonce: 'n0nce' } as RunInfo;
+  const events = [out(2, 'the typed line\r\n<<<START:n0nce:42>>>\r\nready \x1b]0;tit'), out(9, 'ERROR: boom\r\n'), out(10, 'abc'), out(11, 'def\r\n<<<EXIT:n0nce:0>>>\r\n')];
+  const o = { events, from: 1, to: 11, truncated: true, gaps: [gap as Extract<JournalEvent, { type: 'gap' }>] };
+  assert.deepEqual((await journalRunText(o, { cols: 40 }, run)).text.split('\n'), ['ready', 'ERROR: boom', 'abcdef'], 'the plumbing cut by the nonce; the title ended at the hole');
+  const proc = { ...run, target: 'process' } as RunInfo;
+  const pipes = { ...o, events: [out(2, 'ready \x1b]0;tit'), out(9, 'ERROR: boom\n'), out(10, 'abc'), out(11, 'def\n')].map((e) => ({ ...e, stream: 'stdout' }) as JournalEvent) };
+  assert.deepEqual((await journalRunText(pipes, { cols: 40 }, proc)).text.split('\n'), ['ready', 'ERROR: boom', 'abcdef']);
+});
+
+test('a live Run’s transcript renders its gaps as holes too', async () => {
+  const h = await scriptedSession();
+  try {
+    const a = h.session.admit({ target: 'shell', line: 'echo hello', principal: 'agent:a@test' });
+    assert.ok(a.admitted);
+    await h.session.awaitRun(a.run.runId, 1000);
+    // What the Run's read returns when the disk refused a stretch of its output: its events, and the gap.
+    const out = (seq: number, data: string): JournalEvent => ({ seq, ts: 0, type: 'output', stream: 'pty', runId: a.run.runId, data });
+    const gap = { seq: 20, ts: 0, type: 'gap', from: 11, to: 15, reason: 'store-error' } as Extract<JournalEvent, { type: 'gap' }>;
+    h.session.runOutput = () => ({ events: [out(10, 'ready \x1b]0;tit'), out(16, 'ERROR: boom\r\n')], from: 9, to: 17, truncated: true, gaps: [gap] });
+    const t = await h.session.runTranscript(a.run.runId);
+    assert.deepEqual(t.text.split('\n'), ['ready', 'ERROR: boom']);
+    assert.equal(t.truncated, true);
+  } finally {
+    await h.session.close();
+  }
 });

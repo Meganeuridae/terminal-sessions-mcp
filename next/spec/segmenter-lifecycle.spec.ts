@@ -1009,3 +1009,31 @@ test('a digest reads a LF a CSI executes as a line end, and the line after it re
     await seg.dispose();
   }
 });
+
+test('a Run already in flight reads its lines so far afresh across a hole in them: a title or a line open before it takes nothing after it (the house’s review of the 40 commits through f3750e4, #22, comment 6310921374)', async () => {
+  const src = fakeSource();
+  startRun(src, 'r');
+  const out = (data: string) => src.journal.append({ type: 'output', data, stream: 'pty', runId: 'r' }).seq;
+  out('ready \x1b]0;my title');
+  const lost = [out('the rest\x07\n')];
+  out('ERROR: boom\n');
+  out('abc');
+  lost.push(out('XYZ'));
+  out('def\n');
+  // What the disk refused: the Run's read has no events for those seqs, and its gaps say so.
+  const runs = src.journal.runs;
+  const read = runs.output.bind(runs);
+  runs.output = (journal, runId, range) => {
+    const o = read(journal, runId, range);
+    const gaps = lost.map((seq) => ({ seq: seq + 100, ts: 0, type: 'gap' as const, from: seq, to: seq, reason: 'store-error' as const }));
+    return { ...o, events: o.events.filter((e) => !lost.includes(e.seq)), truncated: true, gaps };
+  };
+  const seg = new Segmenter(src, { cadenceMs: 30 });
+  try {
+    const seen = collect(seg);
+    await until(() => seen.some((s) => s.kind === 'output'), 2000, 'a digest');
+    assert.deepEqual(seen.find((s) => s.kind === 'output')!.body?.split('\n'), ['ready', 'ERROR: boom', 'abc', 'def']);
+  } finally {
+    await seg.dispose();
+  }
+});

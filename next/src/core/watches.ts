@@ -265,6 +265,13 @@ class Predicate {
     });
   }
 
+  /** A hole in the output read: every stream's unterminated line is complete, and each starts afresh. */
+  restartLines(): void {
+    this.flush();
+    for (const s of this.matchers.values()) s.m.dispose();
+    this.matchers.clear();
+  }
+
   /** Complete every stream's unterminated line now (its stream ended). */
   flush(): void {
     for (const s of this.matchers.values()) for (const hit of s.m.flush()) this.fire(hitOf(hit, s.seq));
@@ -559,10 +566,18 @@ export class WatchManager {
       this.waits.add(abort);
       if (kind === 'pattern') {
         if (since !== undefined) {
-          // Output already printed after `since` counts, read to the end.
+          // Output already printed after `since` counts, read to the end. Across a hole in what was
+          // retained (seqs missing between two events, whatever made it: retention, a store failure, a
+          // torn write) the lines start afresh, as search's do (`lineEnds`): a line, or a string, open
+          // before the hole took what followed it (the house's review of the 40 commits through f3750e4,
+          // #22, comment 6310921374). The live feed below needs none: it saw every event a gap names.
           const lastBy = new Map<string, JournalEvent>();
+          let prev = since;
           for (const page of this.host.journal.pages(since)) {
             for (const ev of page.events) {
+              if (ev.seq > prev + 1) predicate.restartLines();
+              prev = ev.seq;
+              if (done) return;
               predicate.feed(ev);
               if (done) return;
               if (ev.type === 'output') lastBy.set(streamKey(ev), ev);

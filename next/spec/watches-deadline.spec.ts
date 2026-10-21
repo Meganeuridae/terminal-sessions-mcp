@@ -472,3 +472,29 @@ test('the newest 1,024 ended Runs keep their last output’s stamp, and an older
     f.close();
   }
 });
+
+test('a wait replaying output from `since` starts its lines afresh across a hole: a string or a line open before it takes nothing after it (the house’s review of the 40 commits through f3750e4, #22, comment 6310921374)', async () => {
+  const f = bare();
+  const since = f.journal.since.bind(f.journal);
+  try {
+    f.startRun('r');
+    f.out('ready \x1b]0;my title', 'r');
+    const lost = [f.out('the rest of it\x07\n', 'r').seq];
+    f.out('ERROR: boom\n', 'r');
+    f.out('abc', 'r');
+    lost.push(f.out('XYZ', 'r').seq);
+    f.out('def\n', 'r');
+    // What a store failure took: the read returns no events for those seqs.
+    f.journal.since = (cursor: number, limit?: number) => {
+      const r = since(cursor, limit);
+      return { ...r, events: r.events.filter((e) => !lost.includes(e.seq)) };
+    };
+    assert.equal((await f.manager.waitFor({ pattern: '^ERROR' }, 300, 0)).matched, true, 'the title open before the hole took the line after it');
+    assert.equal((await f.manager.waitFor({ pattern: 'abcdef' }, 150, 0)).matched, false, 'no line is joined across the hole');
+    assert.equal((await f.manager.waitFor({ pattern: '^def' }, 300, 0)).matched, true);
+    assert.equal((await f.manager.waitFor({ pattern: '^ready $' }, 300, 0)).matched, true, 'the line open before the hole is a line of its own');
+  } finally {
+    f.journal.since = since;
+    f.close();
+  }
+});

@@ -52,8 +52,11 @@
  *    follow at the end of the range (or before a note), in the order they
  *    began. When the source changes, the next source starts on a fresh line,
  *    under a header line when `label` gives one. A `note` chunk is a line of its
- *    own (a reader's `[… events missing …]` marker), never part of any source.
- *    A LF that a CSI executes inside it ends a line (`lineEnds`), so the interleave
+ *    own (a reader's `[… events missing …]` marker), never part of any source;
+ *    a `hole` chunk stands where output was lost (`runChunks`), and the
+ *    projection starts afresh there as at a note, with no line of its own, so
+ *    no line and no control sequence open before it takes what follows. A LF
+ *    that a CSI executes inside it ends a line (`lineEnds`), so the interleave
  *    can cut a source inside that CSI: the source's next output then begins with
  *    the CSI's head, as its own parser would still hold it, so the CSI's rest
  *    reads as the CSI, not as text (the house's review of the 40 commits through
@@ -96,7 +99,7 @@ import { executedIn, headIndex, isIntroducer, lineCarry, lineEnds, sequenceEnd, 
 
 const { Terminal } = xterm;
 
-export type ProjectChunk = string | { data: string; stream?: 'pty' | 'stdout' | 'stderr'; runId?: string } | { note: string };
+export type ProjectChunk = string | { data: string; stream?: 'pty' | 'stdout' | 'stderr'; runId?: string } | { note: string } | { hole: true };
 
 /** A source of output (rule 6): the pty, or a process Run's pipes (`stdout` stands for both). */
 export interface SourceInfo {
@@ -188,6 +191,50 @@ export function interleaveCut(data: string, carry: LineCarry): { ends: number[];
   const last = ends[ends.length - 1];
   const head = last === undefined ? undefined : heads.get(last);
   return head === undefined ? { ends, through: last === undefined ? 0 : last + 1 } : { ends, through: last! + 1, head };
+}
+
+/**
+ * Marks for a hole in the text a cutter reads whole (runChunks): a CAN, which ends a control sequence open
+ * before it to the grammar every reader shares, then a noncharacter, which no program prints as text; the
+ * first whose pair the output does not hold is used.
+ */
+const HOLE_MARKS = Array.from({ length: 32 }, (_, k) => `\x18${String.fromCharCode(0xfdd0 + k)}`);
+
+/**
+ * A Run's output events as chunks for `project`, with a `hole` (rule 6) between two of them wherever one of
+ * `gaps` says output was lost there: after it the Run's lines and control sequences start afresh, as
+ * search's do after a hole, where a line, or a string, left open before it took what followed (the house's
+ * review of the 40 commits through f3750e4, #22, comment 6310921374). `cut`, given for a shell Run's pty
+ * output, reads that output as one text (the plumbing cutter finds the Run's marks at its two ends); the
+ * holes are marked in it (HOLE_MARKS) and the cut text is split there.
+ */
+export function runChunks(events: ReadonlyArray<{ seq: number; data: string; stream: 'pty' | 'stdout' | 'stderr' }>, gaps: ReadonlyArray<{ from: number; to: number }> = [], cut?: (raw: string) => string): ProjectChunk[] {
+  const first = events[0]?.seq ?? 0;
+  const last = events[events.length - 1]?.seq ?? 0;
+  const within = gaps.filter((g) => g.from < last && g.to > first);
+  /** k: a hole lies between events k - 1 and k. */
+  const holes = new Set<number>();
+  for (let k = 1; k < events.length && within.length; k++) {
+    const a = events[k - 1]!.seq;
+    const b = events[k]!.seq;
+    if (within.some((g) => g.from < b && g.to > a)) holes.add(k);
+  }
+  const out: ProjectChunk[] = [];
+  if (!cut) {
+    events.forEach((e, k) => {
+      if (holes.has(k)) out.push({ hole: true });
+      out.push({ data: e.data, stream: e.stream });
+    });
+    return out;
+  }
+  const all = holes.size ? events.map((e) => e.data).join('') : '';
+  const mark = holes.size ? HOLE_MARKS.find((m) => !all.includes(m)) : undefined;
+  const text = cut(events.map((e, k) => (mark !== undefined && holes.has(k) ? mark : '') + e.data).join(''));
+  (mark === undefined ? [text] : text.split(mark)).forEach((piece, k) => {
+    if (k > 0) out.push({ hole: true });
+    if (piece) out.push({ data: piece, stream: 'pty' });
+  });
+  return out;
 }
 
 /** The byte budget applied while the chunks are gathered (rule 7, Cost): what it dropped, and the lasting state of a dropped head. */
@@ -510,6 +557,8 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
    * Held only once that rest comes, so the held ends keep the order the reader's Display gives them.
    */
   const pending = new Map<string, string>();
+  /** A hole came since the last segment: the next one starts afresh, never joined to the one before. */
+  let fresh = false;
   /** Per source, what its data left unfinished for the line-end rule; a note ends it all, as its CAN does. */
   const carries = new Map<string, LineCarry>();
   let notes = 0;
@@ -555,11 +604,12 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     }
     outBytes += bytes;
     const last = out[out.length - 1];
-    if (last && last.key === key) {
+    if (last && last.key === key && !fresh) {
       // The data goes on from where the segment's ends: a head it began inside is in the segment already.
       last.data += data;
       last.bytes += bytes;
     } else {
+      fresh = false;
       const header = info && label?.(info);
       let named: Segment | undefined;
       if (header) {
@@ -595,13 +645,13 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     held.clear();
   };
   for (const ch of chunks) {
-    if (typeof ch !== 'string' && 'note' in ch) {
+    if (typeof ch !== 'string' && ('note' in ch || 'hole' in ch)) {
       flush();
       carries.clear();
       dropping.clear();
       pending.clear();
-      const n = `${ch.note}\n`;
-      emit(`n:${notes++}`, true, undefined, n);
+      if ('hole' in ch) fresh = true;
+      else emit(`n:${notes++}`, true, undefined, `${ch.note}\n`);
       continue;
     }
     const c = typeof ch === 'string' ? { data: ch } : ch;
