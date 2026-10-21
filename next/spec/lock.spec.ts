@@ -962,6 +962,34 @@ function patching<K extends keyof typeof fsc, T>(name: K, replacement: (real: (t
     syncBuiltinESMExports();
   }
 }
+const temps = (dir: string) => fs.readdirSync(dir).filter((n) => n.startsWith(`${LOCK_FILE}.`) && n.endsWith('.tmp'));
+
+test('an owner file the disk refuses fails the start with that error and takes the attempt\'s temp and guard with it', () => {
+  const dir = dataDir();
+  staleLock(dir);
+  const guard = guardOf(dir);
+  let thrown: unknown;
+  patching(
+    'openSync',
+    (real) =>
+      ((p: fs.PathLike, ...rest: unknown[]) => {
+        if (String(p).startsWith(guard + path.sep)) throw Object.assign(new Error(`ENOSPC: no space left on device, open '${String(p)}'`), { code: 'ENOSPC' });
+        return (real as (...a: unknown[]) => number)(p, ...rest);
+      }) as typeof fs.openSync,
+    () => {
+      try {
+        acquireDataDirLock(dir);
+      } catch (e) {
+        thrown = e;
+      }
+    },
+  );
+  assert.equal((thrown as NodeJS.ErrnoException | undefined)?.code, 'ENOSPC', `the disk's error, not a refusal: ${String(thrown)}`);
+  assert.deepEqual(temps(dir), [], 'the attempt\'s temp went with the error');
+  assert.equal(fs.existsSync(guard), false, 'and its guard');
+  assert.equal(readLock(dir).pid, 999_999);
+});
+
 test('a registry syncs each directory it makes into its parent before recovery: the data dir and any parent made on the way, then sessions/; a sync the disk refuses is said once', async () => {
   const base = dataDir();
   fs.mkdirSync(base, { recursive: true });

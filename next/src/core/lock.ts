@@ -795,7 +795,16 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
         throw lockedError(dataDir, file, holder, `termd pid ${holder.pid}${holder.hostname !== os.hostname() ? ` (written on host ${holder.hostname})` : ''}`);
       }
     }
-    if (takeOver(file, current, tmp, owner, src, seen)) return publish(holder ?? {});
+    let took: boolean;
+    try {
+      took = takeOver(file, current, tmp, owner, src, seen);
+    } catch (e) {
+      // The guard's mkdir, this attempt's owner file, or the compare or rename inside refused: the temp goes
+      // with the error, as on the fallback's.
+      rmTemp(tmp);
+      throw e;
+    }
+    if (took) return publish(holder ?? {});
     rmTemp(tmp);
     sleepSync(10);
   }
