@@ -44,13 +44,43 @@ export interface JournalStore {
   expire?(now?: number): void;
   /** The journal's incarnation, persisted with the store: the same across lives and restarts, new after a forget (see Journal.epoch). */
   epoch?(): string;
+  /** What the store keeps beside its files for the numbering (G10); undefined when it keeps nothing. */
+  highWater?(): HighWater | undefined;
   /**
-   * The highest seq the journal may have issued, when that is above what the store holds (G10): numbering
-   * resumes above it. `failed`: the store refused the events above its last one (a gap `store-failed`).
+   * Change the parts given, keeping the others. False when the disk refused the write, or when a raise is
+   * written but could not be confirmed (its directory could not be synced): the caller retries.
    */
-  highWater?(): { seq: Seq; failed: boolean } | undefined;
-  /** Record the high-water mark (best effort: false when the disk refused it too). */
-  setHighWater?(seq: Seq, failed: boolean): boolean;
+  setHighWater?(change: HighWater): boolean;
+}
+
+/**
+ * The numbering a journal's store keeps beside its files, so that no seq is ever issued twice (G10), even
+ * when the files no longer hold it.
+ */
+export interface HighWater {
+  /** Numbering resumes above this, with nothing missing below it: retention dropped the files that held it. */
+  floor?: Seq;
+  /** The journal's reservation: no seq above `to` was issued. */
+  reservation?: Reservation;
+}
+
+/**
+ * A journal keeps its reservation written and synced a block ahead of the seqs it issues, while its
+ * appends are not synced, and lowers it to its last seq when it seals. After a power loss the files may
+ * have lost their unsynced tail, but not the reservation, so the next journal numbers above every seq
+ * issued before it and records the seqs between the files' last and `to` as a `torn-write` gap (the
+ * house's read of the 33 commits, PR #22, comment 6307349700, its question of intent).
+ */
+export interface Reservation {
+  to: Seq;
+  /** The disk refused the events between the files' last seq and `to`: a `store-failed` gap on any boot. */
+  failed?: true;
+  /**
+   * The boot it was written under (Linux's boot id, macOS's boot session). On the same boot an unclean
+   * stop lost nothing the page cache held, so the files hold every seq issued and the reservation is not
+   * honoured; on another boot, or with none known, it is.
+   */
+  boot?: string;
 }
 
 /** The line the file store writes for a record (an event, a rotation header): its JSON and a newline. */
@@ -379,13 +409,18 @@ interface Segment {
   lastTs?: number;
 }
 
+/**
+ * `journal.meta.json`. `highWater` is the floor (HighWater.floor); `reserved`, `failed` and `boot` are the
+ * reservation. A file an earlier build wrote with `failed` and no `reserved` held a failing reservation in
+ * `highWater`, and is read so.
+ */
 interface StoreMeta {
   v: 1;
   epoch: string;
-  /** Numbering resumes above this even when no file holds it any more (G10). */
   highWater?: Seq;
-  /** The events between the files' last seq and `highWater` were refused by the disk (a `store-failed` gap). */
-  failed?: boolean;
+  reserved?: Seq;
+  failed?: true;
+  boot?: string;
 }
 
 export const newEpoch = (): string => randomBytes(8).toString('hex');
@@ -458,7 +493,7 @@ export class FileStore implements JournalStore {
   /**
    * What `journal.meta.json` holds, as far as this store knows: what it read at open or last wrote there,
    * its directory synced or not; undefined while no write of it has landed. A raise the file holds but
-   * memory does not (its directory fsync failed) differs from `meta` until a write settles it: a clear
+   * memory does not (its directory fsync failed) differs from `meta` until a write settles it: a write
    * compared with memory alone found nothing to do and left that raise on disk, a false lost range
    * after the next restart (the house's read of the 33 commits, PR #22, comment 6307349700, item 3).
    */
@@ -514,9 +549,17 @@ export class FileStore implements JournalStore {
       fs.chmodSync(file, FILE_MODE);
       const m = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<StoreMeta>;
       if (typeof m.epoch === 'string' && /^[0-9a-f]{8,64}$/.test(m.epoch)) {
+        const seq = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : undefined);
         const out: StoreMeta = { v: 1, epoch: m.epoch };
-        if (typeof m.highWater === 'number' && Number.isFinite(m.highWater) && m.highWater > 0) out.highWater = Math.floor(m.highWater);
-        if (m.failed === true && out.highWater !== undefined) out.failed = true;
+        const floor = seq(m.highWater);
+        let reserved = seq(m.reserved);
+        if (reserved === undefined && m.failed === true) reserved = floor; // an earlier build's failing reservation
+        else if (floor !== undefined) out.highWater = floor;
+        if (reserved !== undefined) {
+          out.reserved = reserved;
+          if (m.failed === true) out.failed = true;
+          if (typeof m.boot === 'string' && m.boot) out.boot = m.boot;
+        }
         this.onDisk = out;
         return out;
       }
@@ -559,17 +602,28 @@ export class FileStore implements JournalStore {
     return this.meta.epoch;
   }
 
-  highWater(): { seq: Seq; failed: boolean } | undefined {
-    const hw = this.meta.highWater;
-    return hw === undefined ? undefined : { seq: hw, failed: this.meta.failed === true };
+  highWater(): HighWater | undefined {
+    const m = this.meta;
+    if (m.highWater === undefined && m.reserved === undefined) return undefined;
+    const hw: HighWater = {};
+    if (m.highWater !== undefined) hw.floor = m.highWater;
+    if (m.reserved !== undefined) hw.reservation = { to: m.reserved, ...(m.failed && { failed: true as const }), ...(m.boot !== undefined && { boot: m.boot }) };
+    return hw;
   }
 
-  setHighWater(seq: Seq, failed: boolean): boolean {
-    const meta: StoreMeta = { v: 1, epoch: this.meta.epoch };
-    if (seq > 0) meta.highWater = seq;
-    if (failed && seq > 0) meta.failed = true;
-    // Nothing to do only when memory and the file both hold this mark already (item 3 of comment 6307349700).
-    const mark = (m: StoreMeta | undefined) => `${m?.highWater ?? 0}:${m?.failed === true}`;
+  setHighWater(change: HighWater): boolean {
+    const meta: StoreMeta = { ...this.meta };
+    if (change.floor !== undefined) meta.highWater = change.floor;
+    if (change.reservation) {
+      const r = change.reservation;
+      meta.reserved = r.to;
+      if (r.failed) meta.failed = true;
+      else delete meta.failed;
+      if (r.boot !== undefined) meta.boot = r.boot;
+      else delete meta.boot;
+    }
+    // Nothing to do only when memory and the file both hold these marks already (item 3 of comment 6307349700).
+    const mark = (m: StoreMeta | undefined) => `${m?.highWater ?? 0}:${m?.reserved ?? 0}:${m?.failed === true}:${m?.boot ?? ''}`;
     if (mark(meta) === mark(this.meta) && mark(meta) === mark(this.onDisk)) return true;
     // Confirmed only once it is on disk (the house's read of b047b92, point 1): a refused write
     // changes nothing here, so a prune cannot delete the file whose newest seq the high water was
@@ -577,12 +631,15 @@ export class FileStore implements JournalStore {
     const w = this.writeMeta(meta);
     if (w === 'failed') return false;
     this.metaPending = false; // the file holds this epoch now, whatever becomes of the mark
-    // The file holds the new mark but its directory could not be synced, so a machine crash may bring the
-    // old file back. For a clear or a lower mark that is done: the crash can only restore the older,
-    // higher reservation, which is safe. For a raise (a higher mark, or a reservation newly marked failed)
-    // it is not done: the seqs it reserves could be reissued after a crash (G10), so memory keeps the old
-    // mark and the caller retries (the house's read of the 38 commits, PR #22, comment 6274603516).
-    const raising = (meta.highWater ?? 0) > (this.meta.highWater ?? 0) || (meta.failed === true && this.meta.failed !== true);
+    // The file holds the new marks but its directory could not be synced, so a machine crash may bring the
+    // old file back. For a lower reservation, or a flag cleared, that is done: the crash can only restore
+    // the older, higher one, which is safe. For a raise (a higher floor or reservation, or a reservation
+    // newly marked failed) it is not done: the seqs it covers could be reissued after a crash (G10), so
+    // memory keeps the old marks and the caller retries (the house's read of the 38 commits, PR #22,
+    // comment 6274603516). A new boot on the same reservation is not a raise: either file is honoured on a
+    // later boot.
+    const raising =
+      (meta.highWater ?? 0) > (this.meta.highWater ?? 0) || (meta.reserved ?? 0) > (this.meta.reserved ?? 0) || (meta.failed === true && this.meta.failed !== true);
     if (w === 'unsynced' && raising) return false;
     this.meta = meta;
     return true;
@@ -643,7 +700,8 @@ export class FileStore implements JournalStore {
    * exceed `maxBytes`, or while the oldest one's
    * newest event is past `maxAgeMs`. The active file is never dropped here; an aged
    * one is rotated first (`expire`). When a drop takes the store's newest event with
-   * it, its seq is kept as the high water, so numbering never restarts (G10).
+   * it, its seq is kept as the floor, so numbering never restarts (G10), whatever the
+   * journal's reservation says.
    */
   private prune(now = this.now()): void {
     const cutoff = now - this.maxAgeMs;
@@ -658,7 +716,7 @@ export class FileStore implements JournalStore {
       if (!drop) break;
       const newest = this.lastSeq();
       if (oldest.last !== undefined && oldest.last === newest && (this.meta.highWater ?? 0) < newest) {
-        if (!this.setHighWater(newest, this.meta.failed === true)) break; // cannot keep the numbering: keep the file
+        if (!this.setHighWater({ floor: newest })) break; // cannot keep the numbering: keep the file
       }
       try {
         fs.rmSync(oldest.file, { force: true });

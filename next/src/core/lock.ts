@@ -106,6 +106,30 @@ export function bootId(): string | undefined {
   return bootIdCache.value;
 }
 
+let machineBootCache: { value: string | undefined } | undefined;
+
+/**
+ * This boot, as the journal's reservation records it (G10): Linux's boot id, macOS's boot session UUID
+ * (`sysctl kern.bootsessionuuid`). Read once per daemon; undefined elsewhere or when it cannot be read,
+ * which the journal takes for possibly another boot. A spec replaces `boots.current`.
+ */
+export const boots = {
+  current: (): string | undefined => {
+    if (machineBootCache) return machineBootCache.value;
+    let id: string | undefined;
+    if (process.platform === 'linux') id = bootId();
+    else if (process.platform === 'darwin') {
+      try {
+        id = execFileSync('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'], { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim() || undefined;
+      } catch {
+        id = undefined;
+      }
+    }
+    machineBootCache = { value: id };
+    return id;
+  },
+};
+
 /** What the lock, recovery and the backend read from one /proc/<pid>/stat line. */
 export interface ProcStat {
   /** Field 3: R, S, D, … ; Z is exited and not yet reaped, which the lock and recovery count as gone (comment 6274603516). */

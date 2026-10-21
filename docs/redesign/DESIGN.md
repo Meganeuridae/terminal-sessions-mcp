@@ -307,7 +307,14 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 ### Observation
 
 - **G10.** The journal is the single source of truth: append-only, per-session monotonic
-  `seq`, timestamped, typed (Appendix A). Three products derive from it and each states
+  `seq`, timestamped, typed (Appendix A). No `seq` is issued twice, across a daemon crash or a
+  power loss. Appends are not synced, so a power loss can take the journal's last lines, the ones
+  the disk had not yet written. The numbering survives it: seqs are issued only below a
+  reservation kept a block of 10,000 ahead in a synced metadata write, and lowered to the last seq
+  when the journal closes. After a power loss the next start numbers above every seq issued
+  before it, and the seqs between the last line on disk and the reservation read as a
+  `torn-write` gap. After a daemon crash on the same boot, nothing the page cache held is lost, and
+  numbering continues from the last line. Three products derive from it and each states
   what it is. **Raw output** is retained decoded UTF-8 text with provenance, a pure function of a
   range. **Transcript** is a documented line-oriented projection of a range, a pure
   function of that range and the width it is projected at, for reading and search — not a
@@ -1398,7 +1405,7 @@ type JournalEvent =
   | { seq; ts; type: 'detach';      attachmentId; principal }
   | { seq; ts; type: 'integration'; level: 'unknown'|'rich'|'basic'|'none' }                  // G5
   | { seq; ts; type: 'watch.fired'; watchId; label; kind: 'pattern'|'silence'|'idle'; principal; at: seq; match?; line?; clipped?: boolean; suppressed?: number }
-  | { seq; ts; type: 'gap';         from: seq; to: seq; reason: 'retention'|'keeper-overflow'|'torn-write'|'store-error'|'store-failed' }  // G11; the last three are G19's disk path
+  | { seq; ts; type: 'gap';         from: seq; to: seq; reason: 'retention'|'keeper-overflow'|'torn-write'|'store-error'|'store-failed' }  // G11; the last three are G19's disk path; torn-write is also what a power loss took (G10)
   | { seq; ts; type: 'checkpoint';  screen: serialized }                                      // milestone 3; not in types.ts yet
   | { seq; ts; type: 'recovered';   class: 'continuous'|'reattached'|'history-only' }
   | { seq; ts; type: 'session.exit';code: number|null; signal?; reason? }                     // reason: why the daemon ended the shell (daemon-shutdown); absent when it ended on its own

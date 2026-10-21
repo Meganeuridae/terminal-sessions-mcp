@@ -57,7 +57,7 @@ export type EventInput =
   | { type: 'integration'; level: IntegrationLevel }
   /**
    * A range of seqs that is gone (G11, Appendix A): `retention`, `keeper-overflow`, `torn-write` (a crash cut
-   * the last line), `store-error` (the ring dropped events the disk had refused), `store-failed` (the disk still
+   * the last line, or a power loss took the lines the disk had not yet written, G10), `store-error` (the ring dropped events the disk had refused), `store-failed` (the disk still
    * refused them when the journal sealed, or the daemon died first); their seqs are never reissued (G10).
    */
   | { type: 'gap'; from: Seq; to: Seq; reason: 'retention' | 'keeper-overflow' | 'torn-write' | 'store-error' | 'store-failed' }

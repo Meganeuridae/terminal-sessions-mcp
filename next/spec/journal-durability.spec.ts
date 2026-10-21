@@ -12,7 +12,8 @@ import * as os from 'node:os';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { clocks } from '../src/core/clock.js';
-import { Journal } from '../src/core/journal.js';
+import { HIGH_WATER_BLOCK, Journal } from '../src/core/journal.js';
+import { boots } from '../src/core/lock.js';
 import { cannotSyncDir, FileStore, MemoryStore, writeDurably, type JournalStore } from '../src/core/stores.js';
 
 /** node:fs as stores.js sees it: a patch here plus syncBuiltinESMExports reaches its `import * as fs` bindings. */
@@ -96,13 +97,13 @@ test('jr2-6/G10/G11: a journal sealed while the disk still refuses leaves a high
     assert.deepEqual(seqs(j.since(0).events), [1, 2, 3, 4, 5, 6, 7, 8], 'the sealed journal still reads them from its ring');
     // The daemon restarts (or a new life opens the same store) once the disk is back.
     const store = new FileStore(dir);
-    assert.deepEqual(store.highWater(), { seq: 8, failed: true });
+    assert.deepEqual(store.highWater()?.reservation, { to: 8, failed: true }, 'sealed: exactly at its last seq, marked failed');
     const again = new Journal({ cold: store });
     assert.equal(again.lastSeq, 9, 'numbering continues above everything issued');
     assert.deepEqual(gaps(again.since(0).events), [[4, 8, 'store-failed']]);
     assert.equal(again.append(out('after')).seq, 10);
     assert.deepEqual(seqs(onDisk(dir)), [1, 2, 3, 9, 10], 'no seq a subscriber saw is reused');
-    assert.equal(store.highWater(), undefined, 'the flag goes once the gap is on disk');
+    assert.equal(store.highWater()?.reservation?.failed, undefined, 'the flag goes once the gap is on disk');
     const third = new Journal({ cold: new FileStore(dir) });
     assert.deepEqual(gaps(third.since(0).events), [[4, 8, 'store-failed']], 'the hole is recorded once');
   } finally {
@@ -129,10 +130,10 @@ test('jr2-6/G10: a daemon that dies while the disk refuses writes does not have 
     k.append(out('a'));
     kc.broken = true;
     k.append(out('b'));
-    assert.equal(kc.highWater()?.failed, true);
+    assert.equal(kc.highWater()?.reservation?.failed, true);
     kc.broken = false;
     assert.equal(k.retryCold(), true);
-    assert.equal(kc.highWater(), undefined);
+    assert.equal(kc.highWater()?.reservation?.failed, undefined, 'the reservation stands, no longer failed');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -185,7 +186,7 @@ test('jr2-7/G21/G10: expire() ages an idle journal — ring and files — withou
     assert.deepEqual(none.events, [], 'nothing retained');
     assert.deepEqual(none.gap && [none.gap.from, none.gap.to], [1, 6], 'and what was issued reads as gone (G11)');
     assert.equal(journalFiles(dir).length, 0);
-    assert.deepEqual(new FileStore(dir).highWater(), { seq: 6, failed: false });
+    assert.equal(new FileStore(dir).highWater()?.floor, 6, 'retention keeps the numbering as the floor');
     j.close();
     const again = new Journal({ cold: new FileStore(dir, { maxAgeMs: day, now: clock }), now: clock });
     assert.equal(again.lastSeq, 6, 'no seq is reissued after everything aged out');
@@ -344,20 +345,23 @@ test('writeDurably tells "written, directory not synced" (a real EIO after the r
   }
 });
 
-test('with the directory fsync failing, clearing the high water counts as done (a crash can only bring back the older, higher reservation) and raising it does not (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 7)', () => {
+test('with the directory fsync failing, lowering the reservation counts as done (a crash can only bring back the older, higher one) and raising it does not (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 7)', () => {
   const dir = tmpDir();
   try {
     const store = new FileStore(dir);
-    assert.equal(store.setHighWater(100, true), true);
-    // A clear while the directory cannot be synced: the file holds no mark, memory agrees, a reopened store reads none.
-    assert.equal(withDirFsyncEIO(() => store.setHighWater(0, false)), true, 'the clear is done');
-    assert.equal(store.highWater(), undefined, 'memory agrees with the disk');
-    assert.equal(new FileStore(dir).highWater(), undefined, 'a store opened after a restart reads none');
-    // A raise while the directory cannot be synced: not done, memory keeps the old mark, the caller retries.
-    assert.equal(withDirFsyncEIO(() => store.setHighWater(50, true)), false, 'the raise is not done');
-    assert.equal(store.highWater(), undefined, 'memory keeps the old mark');
-    assert.equal(store.setHighWater(50, true), true, 'the retry lands once the directory syncs again');
-    assert.deepEqual(store.highWater(), { seq: 50, failed: true });
+    assert.equal(store.setHighWater({ reservation: { to: 100, failed: true } }), true);
+    // A lower reservation, its flag cleared, while the directory cannot be synced: memory and the file agree.
+    assert.equal(withDirFsyncEIO(() => store.setHighWater({ reservation: { to: 50 } })), true, 'the lowering is done');
+    assert.deepEqual(store.highWater(), { reservation: { to: 50 } }, 'memory agrees with the disk');
+    assert.deepEqual(new FileStore(dir).highWater(), { reservation: { to: 50 } }, 'a store opened after a restart reads the same');
+    // A raise while the directory cannot be synced: not done, memory keeps the old one, the caller retries.
+    assert.equal(withDirFsyncEIO(() => store.setHighWater({ reservation: { to: 80, failed: true } })), false, 'the raise is not done');
+    assert.deepEqual(store.highWater(), { reservation: { to: 50 } }, 'memory keeps the old reservation');
+    assert.equal(store.setHighWater({ reservation: { to: 80, failed: true } }), true, 'the retry lands once the directory syncs again');
+    assert.deepEqual(store.highWater(), { reservation: { to: 80, failed: true } });
+    // The floor is kept beside the reservation, and changed apart from it.
+    assert.equal(store.setHighWater({ floor: 7 }), true);
+    assert.deepEqual(new FileStore(dir).highWater(), { floor: 7, reservation: { to: 80, failed: true } });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -411,74 +415,50 @@ test('a new epoch the file holds while its directory cannot be synced counts as 
 
 // ───────────── the house's read of the 33 commits (PR #22, comment 6307349700): the high water and the epoch ─────────────
 
-test('a raise the store wrote but could not confirm, then a clear: the clear writes, so a restart reads no lost range of seqs never issued (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 3)', () => {
+test('a raise the store wrote but could not confirm, then the mark memory already holds: it is written, so a restart reads no lost range of seqs never issued (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 3)', (t) => {
+  t.mock.method(boots, 'current', () => 'boot-A');
   const dir = tmpDir();
   try {
     const sdir = path.join(dir, 'store');
     const store = new FileStore(sdir);
-    assert.equal(withDirFsyncEIO(() => store.setHighWater(100, true)), false, 'the raise is not confirmed');
-    assert.equal(store.highWater(), undefined, 'memory holds no mark');
-    assert.equal(store.setHighWater(0, false), true);
-    assert.equal(new FileStore(sdir).highWater(), undefined, 'nor does the file: the clear was written, though memory already held none');
-    const j = new Journal({ cold: new FileStore(sdir) });
-    assert.equal(j.lastSeq, 0);
-    assert.deepEqual(gaps(j.since(0).events), [], 'no store-failed gap');
-    j.close();
-    // The journal's side: a reservation the store wrote but could not confirm is cleared once the store holds every seq again.
+    assert.equal(store.setHighWater({ reservation: { to: 100, boot: 'boot-A' } }), true);
+    assert.equal(withDirFsyncEIO(() => store.setHighWater({ reservation: { to: 100, failed: true } })), false, 'the raise is not confirmed');
+    assert.deepEqual(store.highWater(), { reservation: { to: 100, boot: 'boot-A' } }, 'memory holds the old reservation');
+    assert.equal(new FileStore(sdir).highWater()?.reservation?.failed, true, 'the file holds the raise');
+    assert.equal(store.setHighWater({ reservation: { to: 100, boot: 'boot-A' } }), true);
+    assert.deepEqual(new FileStore(sdir).highWater(), { reservation: { to: 100, boot: 'boot-A' } }, 'written, though memory already held it');
+    // The journal's side: its reservation is marked failed on disk but not confirmed when the store
+    // refuses an event; once the store holds every seq again, the unmarked reservation is written over it.
     const jdir = path.join(dir, 'journal');
     const kc = new FullDisk(jdir);
     const k = new Journal({ cold: kc });
     k.append(out('a'));
     kc.broken = true;
     withDirFsyncEIO(() => k.append(out('b')));
-    assert.equal(kc.highWater(), undefined, 'the reservation is not confirmed');
-    assert.equal(new FileStore(jdir).highWater()?.failed, true, 'but the file holds it');
+    assert.equal(kc.highWater()?.reservation?.failed, undefined, 'the failed mark is not confirmed');
+    assert.equal(new FileStore(jdir).highWater()?.reservation?.failed, true, 'but the file holds it');
     kc.broken = false;
     assert.equal(k.retryCold(), true);
-    k.close();
+    kc.close(); // the daemon dies here, on this boot: nothing is sealed
     const again = new Journal({ cold: new FileStore(jdir) });
     assert.equal(again.lastSeq, 2, 'after a restart the numbering continues where it was');
     assert.deepEqual(gaps(again.since(0).events), [], 'and no gap claims the reserved block');
     again.close();
-    // A clear the disk refuses is owed: retried as events land and, since none follows a seal, at the seal.
-    const odir = path.join(dir, 'owed');
-    const oc = new FullDisk(odir);
-    const o = new Journal({ cold: oc });
-    o.append(out('a'));
-    oc.broken = true;
-    o.append(out('b'));
-    assert.equal(oc.highWater()?.failed, true, 'a confirmed reservation');
-    oc.broken = false;
-    const realRename = fsc.renameSync;
-    fsc.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
-      if (String(to).endsWith('journal.meta.json')) throw Object.assign(new Error('EIO: i/o error, rename'), { code: 'EIO' });
-      return realRename(from, to);
-    }) as typeof fs.renameSync;
-    syncBuiltinESMExports();
-    try {
-      assert.equal(o.retryCold(), true, 'caught up');
-    } finally {
-      fsc.renameSync = realRename;
-      syncBuiltinESMExports();
-    }
-    assert.equal(new FileStore(odir).highWater()?.failed, true, 'but the clear was refused');
-    o.close();
-    assert.equal(new FileStore(odir).highWater(), undefined, 'the seal cleared it');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('a refused reservation of the high water, and a refused extension of a used-up one, are each tried at most once a second on the monotonic clock (the house\'s read of the 33 commits, PR #22, comment 6307349700, items 4 and 7)', (t) => {
+test('a refused reservation, a refused extension of a used-up one and a refused failed mark are each tried at most once a second on the monotonic clock (the house\'s read of the 33 commits, PR #22, comment 6307349700, items 4 and 7)', (t) => {
   let mono = 0;
   t.mock.method(clocks, 'monotonic', () => mono);
-  /** A cold store whose appends fail and which accepts only its first `accept` high-water writes. */
-  const refusing = (accept: number) => {
+  /** A cold store that takes its appends or refuses them all, and accepts only its first `accept` reservation writes. */
+  const store = (accept: number, appends: boolean) => {
     let calls = 0;
     const cold: JournalStore = {
-      kind: 'refusing',
+      kind: 'counting',
       append() {
-        throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+        if (!appends) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
       },
       read: () => [],
       oldestSeq: () => undefined,
@@ -489,25 +469,38 @@ test('a refused reservation of the high water, and a refused extension of a used
     };
     return { cold, calls: () => calls };
   };
-  // Every reservation refused: the first one is retried once a second, not at every event.
-  const none = refusing(0);
+  // Every reservation refused, every event refused: the first is retried once a second, not at every event.
+  const none = store(0, false);
   const a = new Journal({ cold: none.cold });
   for (let i = 0; i < 3000; i++) a.append(out(`a${i}`));
   assert.equal(none.calls(), 1, '3,000 events within a second: one attempt');
   mono += 1000;
   a.append(out('a-later'));
   assert.equal(none.calls(), 2, 'a second later: tried again');
-  // The first reservation written and every extension refused: once its 1,024-seq block is used up, the
-  // extension is tried once a second too. It was tried at every event: 1,977 writes in 3,000 events.
-  const first = refusing(1);
+  // The first reservation written, then the store refuses events and the failed mark is refused: retried
+  // once a second, as it was at every event.
+  const first = store(1, false);
   const b = new Journal({ cold: first.cold });
   for (let i = 0; i < 3000; i++) b.append(out(`b${i}`));
-  assert.equal(first.calls(), 2, 'the reservation, and one refused extension');
+  assert.equal(first.calls(), 2, 'the reservation, and one refused failed mark');
   mono += 1000;
   b.append(out('b-later'));
-  assert.equal(first.calls(), 3, 'a second later: the extension is tried again');
+  assert.equal(first.calls(), 3, 'a second later: tried again');
+  // A healthy store: one reservation write per block; the extension of a used-up block refused, it is
+  // retried once a second, while the events go on being issued and stored.
+  const healthy = store(1, true);
+  const c = new Journal({ cold: healthy.cold });
+  for (let i = 0; i < HIGH_WATER_BLOCK; i++) c.append(out(`c${i}`));
+  assert.equal(healthy.calls(), 1, 'one write for the first block');
+  for (let i = 0; i < 3000; i++) c.append(out(`c-past-${i}`));
+  assert.equal(healthy.calls(), 2, 'the extension, refused, and not tried again within the second');
+  assert.equal(c.lastSeq, HIGH_WATER_BLOCK + 3000, 'every event issued meanwhile');
+  mono += 1000;
+  c.append(out('c-later'));
+  assert.equal(healthy.calls(), 3);
   a.close();
   b.close();
+  c.close();
 });
 
 test('an epoch whose first write is refused is retried at most once a second as appends land, and the store says so once (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 6)', (t) => {
@@ -545,6 +538,123 @@ test('an epoch whose first write is refused is retried at most once a second as 
     assert.equal(new FileStore(dir).epoch(), store.epoch(), 'the epoch landed');
   } finally {
     fsc.openSync = realOpen;
+    syncBuiltinESMExports();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ───────────── the house's read of the 33 commits (PR #22, comment 6307349700): numbering across a power loss ─────────────
+
+test('numbering survives a power loss: a crash that takes the file\'s unsynced tail restarts numbering above every seq issued, the lost range a torn-write gap; on the same boot nothing was lost and numbering continues (the house\'s read of the 33 commits, PR #22, comment 6307349700, its question of intent)', (t) => {
+  let boot: string | undefined = 'boot-A';
+  t.mock.method(boots, 'current', () => boot);
+  const dir = tmpDir();
+  /** 50 events in a journal over `sub`, as its subscriber saw them; the journal is left as a crash leaves it unless `seal`. */
+  const run = (sub: string, seal = false) => {
+    const j = new Journal({ cold: new FileStore(path.join(dir, sub)) });
+    const seen: number[] = [];
+    j.subscribe((e) => seen.push(e.seq));
+    for (let i = 0; i < 50; i++) j.append(out(`${sub}-${i}`));
+    if (seal) j.close();
+    return seen;
+  };
+  /** A power loss: the synced reservation survives, the journal file keeps only its first `n` lines. */
+  const loseTail = (sub: string, n: number) => {
+    const file = path.join(dir, sub, 'journal.jsonl');
+    fs.writeFileSync(file, lines(file).slice(0, n).join('\n') + '\n');
+  };
+  const reopen = (sub: string) => new Journal({ cold: new FileStore(path.join(dir, sub)) });
+  try {
+    // A power loss on boot A; the machine comes back as boot B.
+    const seen = run('power');
+    loseTail('power', 20);
+    boot = 'boot-B';
+    const after = reopen('power');
+    assert.deepEqual(gaps(after.since(0).events), [[21, HIGH_WATER_BLOCK, 'torn-write']], 'what the file lost, and the seqs reserved past it');
+    const next = after.append(out('after the crash'));
+    assert.ok(next.seq > Math.max(...seen) && !seen.includes(next.seq), `no seq a subscriber saw is issued again (next ${next.seq})`);
+    after.close();
+    // A daemon crash on the same boot: the page cache kept every line, so nothing is missing.
+    boot = 'boot-C';
+    run('daemon');
+    const same = reopen('daemon');
+    assert.equal(same.lastSeq, 50, 'numbering continues from the last line');
+    assert.deepEqual(gaps(same.since(0).events), []);
+    same.close();
+    // Where no boot can be read, an unclean stop is taken for a power loss.
+    boot = undefined;
+    run('unknown');
+    const unknown = reopen('unknown');
+    assert.deepEqual(gaps(unknown.since(0).events), [[51, HIGH_WATER_BLOCK, 'torn-write']]);
+    unknown.close();
+    // A clean stop, then a reboot: the seal lowered the reservation to the last seq, so nothing reads as lost...
+    boot = 'boot-D';
+    run('clean', true);
+    boot = 'boot-E';
+    const clean = reopen('clean');
+    assert.equal(clean.lastSeq, 50);
+    assert.deepEqual(gaps(clean.since(0).events), []);
+    clean.close();
+    // ...unless the power went before the kernel wrote the tail: then exactly what the file lost is a gap.
+    boot = 'boot-F';
+    run('sealed-then-lost', true);
+    loseTail('sealed-then-lost', 20);
+    boot = 'boot-G';
+    const lost = reopen('sealed-then-lost');
+    assert.deepEqual(gaps(lost.since(0).events), [[21, 50, 'torn-write']]);
+    assert.equal(lost.lastSeq, 51);
+    lost.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('appends are never synced: a journal syncs one reservation write per block of seqs, and a refused reservation write leaves the events issued and stored, retried once a second (the house\'s read of the 33 commits, PR #22, comment 6307349700, its question of intent)', (t) => {
+  let mono = 0;
+  t.mock.method(clocks, 'monotonic', () => mono);
+  t.mock.method(boots, 'current', () => 'boot-A');
+  const dir = tmpDir();
+  const realFsync = fsc.fsyncSync;
+  const realRename = fsc.renameSync;
+  const synced: string[] = [];
+  let refuseMeta = false;
+  fsc.fsyncSync = ((fd: number) => {
+    const st = fsc.fstatSync(fd);
+    if (!st.isDirectory()) synced.push(String(st.ino));
+    return realFsync(fd);
+  }) as typeof fs.fsyncSync;
+  fsc.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+    if (refuseMeta && String(to).endsWith('journal.meta.json')) throw Object.assign(new Error('EIO: i/o error, rename'), { code: 'EIO' });
+    return realRename(from, to);
+  }) as typeof fs.renameSync;
+  syncBuiltinESMExports();
+  try {
+    const store = new FileStore(path.join(dir, 'a'));
+    const j = new Journal({ cold: store });
+    const n = 2 * HIGH_WATER_BLOCK + 500;
+    for (let i = 0; i < n; i++) j.append(out(`e${i}`));
+    const journalIno = String(fs.statSync(path.join(dir, 'a', 'journal.jsonl')).ino);
+    assert.equal(synced.filter((ino) => ino === journalIno).length, 0, 'no append was synced');
+    assert.equal(synced.length, 1 + 3, `the epoch, then one reservation per block begun: ${n} events`);
+    assert.equal(store.highWater()?.reservation?.to, 3 * HIGH_WATER_BLOCK);
+    j.close();
+    // The reservation's write refused: the journal goes on issuing and storing, and tries again a second later.
+    refuseMeta = true;
+    const bstore = new FileStore(path.join(dir, 'b'));
+    const b = new Journal({ cold: bstore });
+    for (let i = 0; i < 100; i++) b.append(out(`b${i}`));
+    assert.equal(bstore.lastSeq(), 100, 'issued and stored');
+    assert.equal(bstore.highWater(), undefined, 'no reservation yet');
+    refuseMeta = false;
+    b.append(out('within the second'));
+    assert.equal(bstore.highWater(), undefined, 'not tried again within the second');
+    mono += 1000;
+    b.append(out('a second later'));
+    assert.equal(bstore.highWater()?.reservation?.to, 101 + HIGH_WATER_BLOCK, 'written a second later, a block past the last seq');
+    b.close();
+  } finally {
+    fsc.fsyncSync = realFsync;
+    fsc.renameSync = realRename;
     syncBuiltinESMExports();
     fs.rmSync(dir, { recursive: true, force: true });
   }
