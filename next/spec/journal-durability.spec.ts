@@ -680,3 +680,70 @@ test('appends are never synced: a journal syncs one reservation write per block 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a cleanly sealed journal opened after a reboot seals again without a durable write: its exact reservation does not depend on the boot (an independent read of the fix for the house\'s read of the 33 commits, PR #22, comment 6307349700)', (t) => {
+  let boot = 'boot-A';
+  t.mock.method(boots, 'current', () => boot);
+  const dir = tmpDir();
+  const realRename = fsc.renameSync;
+  let metaWrites = 0;
+  fsc.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+    if (String(to).endsWith('journal.meta.json')) metaWrites++;
+    return realRename(from, to);
+  }) as typeof fs.renameSync;
+  syncBuiltinESMExports();
+  try {
+    const j = new Journal({ cold: new FileStore(dir) });
+    for (let i = 0; i < 5; i++) j.append(out(`e${i}`));
+    j.close();
+    assert.deepEqual(new FileStore(dir).highWater()?.reservation, { to: 5, boot: 'boot-A' });
+    // A reboot, then the restart's recovery opens and seals it, issuing nothing: one durable write each, before.
+    boot = 'boot-B';
+    metaWrites = 0;
+    const recovered = new Journal({ cold: new FileStore(dir) });
+    recovered.close();
+    assert.equal(metaWrites, 0, 'no durable write');
+    assert.deepEqual(new FileStore(dir).highWater()?.reservation, { to: 5, boot: 'boot-A' }, 'the reservation keeps the boot it was written under');
+    // Kept as it was, it still bounds a later power loss: the lines the file loses read as a gap, and nothing more.
+    const file = path.join(dir, 'journal.jsonl');
+    fs.writeFileSync(file, lines(file).slice(0, 3).join('\n') + '\n');
+    boot = 'boot-C';
+    const after = new Journal({ cold: new FileStore(dir) });
+    assert.deepEqual(gaps(after.since(0).events), [[4, 5, 'torn-write']]);
+    after.close();
+  } finally {
+    fsc.renameSync = realRename;
+    syncBuiltinESMExports();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a sealed journal whose store heals at a retry goes back to a reservation at its last seq, so the next boot reads no gap for a seq never issued (an independent read of the fix for the house\'s read of the 33 commits, PR #22, comment 6307349700)', (t) => {
+  let boot = 'boot-A';
+  t.mock.method(boots, 'current', () => boot);
+  const dir = tmpDir();
+  try {
+    for (const [sub, hot] of [['whole', undefined], ['ring-dropped', new MemoryStore(700)]] as const) {
+      const sdir = path.join(dir, sub);
+      const cold = new FullDisk(sdir);
+      const j = new Journal({ cold, ...(hot && { hot }) });
+      for (let i = 0; i < 5; i++) j.append(out(`kept-${i}`));
+      cold.broken = true;
+      for (let i = 0; i < 30; i++) j.append(out(`refused-${i}-${'r'.repeat(40)}`)); // the small ring drops most of these
+      j.seal(); // the last catch-up is refused too: the reservation stands at the last seq, failed
+      assert.equal(cold.highWater()?.reservation?.failed, true, `${sub}: sealed failing`);
+      cold.broken = false;
+      assert.equal(j.retryCold(), true, `${sub}: healed`);
+      assert.deepEqual(cold.highWater()?.reservation, { to: j.lastSeq, boot }, `${sub}: exactly at its last seq`);
+      boot = `${boot}+`;
+      const next = new Journal({ cold: new FileStore(sdir) });
+      const reasons = gaps(next.since(0).events).map((g) => g[2]);
+      assert.ok(!reasons.includes('torn-write'), `${sub}: no torn-write gap after the reboot: ${JSON.stringify(gaps(next.since(0).events))}`);
+      assert.equal(next.lastSeq, j.lastSeq, `${sub}: numbering continues from the sealed journal's last seq`);
+      if (hot) assert.deepEqual(reasons, ['store-error'], 'the ring\'s loss is the one gap, recorded at the heal');
+      next.close();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

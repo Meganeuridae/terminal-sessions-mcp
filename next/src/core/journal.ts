@@ -300,6 +300,20 @@ export class Journal {
     if (!this.writeReservation(to, failed)) this.markRetryAt = clocks.monotonic() + 1000;
   }
 
+  /**
+   * The store already holds the exact reservation a seal would write: at this journal's last seq, not
+   * failed, and nothing unconfirmed. Its boot does not matter then: whichever boot opens the store next,
+   * honoured or not, the reservation adds no seq above the files' last, so restamping it with this boot
+   * changed nothing but cost a durable write. Every journal a restart recovers seals without issuing, and
+   * after a reboot each restamped its boot: 500 closed sessions started in 4.6 s instead of 0.3 s (an
+   * independent read of the fix for the house's read of the 33 commits, PR #22, comment 6307349700).
+   */
+  private exactlyReserved(): boolean {
+    if (this.coldError !== null || this.markUnsure) return false;
+    const r = this.cold?.highWater?.()?.reservation;
+    return r !== undefined && r.to === this.seq && r.failed !== true;
+  }
+
   /** Write the reservation `to`, marked `failed` or with this boot, and remember it once it is confirmed. */
   private writeReservation(to: Seq, failed: boolean): boolean {
     const boot = failed ? undefined : boots.current();
@@ -345,7 +359,11 @@ export class Journal {
       }
       if (this.coldError === null && this.persisted >= this.seq) {
         this.markRetryAt = 0; // the disk takes writes again: the reservation's `failed` goes now, not at a throttle's deadline
-        this.keepMark();
+        // A sealed journal issues nothing after this: its reservation goes back to exactly its last seq. Left a
+        // seq ahead, for the next issue a sealed journal never makes, it read after the next reboot as a
+        // torn-write gap for a seq never issued (an independent read of the fix for comment 6307349700).
+        if (this.sealed) this.writeReservation(this.seq, false);
+        else this.keepMark();
       }
       return this.coldError === null;
     } finally {
@@ -579,7 +597,7 @@ export class Journal {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
     if (this.cold && this.coldError !== null) this.catchUp();
-    if (this.cold?.setHighWater) {
+    if (this.cold?.setHighWater && !this.exactlyReserved()) {
       // Exact now: a sealed journal issues no more seqs, so the next journal over the store numbers on from
       // this one's last, and after a power loss records as lost only what the files lost. If the disk
       // refuses this too, the reservation a block ahead stands, which is safe.
