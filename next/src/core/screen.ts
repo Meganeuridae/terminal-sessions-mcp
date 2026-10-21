@@ -30,7 +30,7 @@
 import xterm from '@xterm/headless';
 import type { Terminal as TerminalType } from '@xterm/headless';
 import serializeAddon from '@xterm/addon-serialize';
-import { sequenceEnd, unfinishedSequence } from './text.js';
+import { executedIn, isStringStart, sequenceEnd, sequenceText, unfinishedSequence } from './text.js';
 import type { ScreenSnapshot, Seq } from './types.js';
 
 const { Terminal } = xterm;
@@ -73,6 +73,74 @@ function deferred(): Deferred {
 const PERSISTENT_STATE =
   /\x1bc|\x1b\[!p|\x1b\[\??[0-9;:]*[hl]|\x1b[=>]|\x1b\[[0-9;]*r|\x1b[()*+][0-9A-Za-z<>=%"&'`]|\x1b\][012];[^\x07\x1b]*(?:\x07|\x1b\\)|[\x0e\x0f]/g;
 
+/** The C0 controls PERSISTENT_STATE keeps: SO and SI, the shifts. */
+const isShift = (c: number): boolean => c === 0x0e || c === 0x0f;
+
+/** Where the byte that says what the ESC at `data[e]` begins lies: past the C0 controls and DEL the escape state executes or ignores. */
+function kindAt(data: string, e: number): number {
+  let k = e + 1;
+  while (k < data.length && (data.charCodeAt(k) < 0x20 || data.charCodeAt(k) === 0x7f) && data.charCodeAt(k) !== 0x18 && data.charCodeAt(k) !== 0x1a && data.charCodeAt(k) !== 0x1b) k++;
+  return k;
+}
+
+/** An introducer (ESC, or a C1 CSI or string introducer) or a shift. */
+const NEXT = /[\x1b\x90\x98\x9b\x9d-\x9f\x0e\x0f]/g;
+
+/** A CSI in its ESC form with no control inside it: parameters, then intermediates, then its final byte. */
+const CLEAN_CSI = /\x1b\[[0-?]*[ -/]*[@-~]/y;
+
+/**
+ * `data`'s control sequences as the emulator reads them, and its shifts, for PERSISTENT_STATE to match: a CSI or an
+ * escape sequence without the C0 controls and DEL it executes or ignores (sequenceText), a shift among those before it,
+ * where it acts; a CSI's and an OSC's C1 introducer, and an OSC's ST, in their ESC forms; the other control strings,
+ * and text, left out, since no pattern is in them. Matched on the spellings, `ESC [ ? 10 CR 49 h` and `ESC [ BEL 4 h`
+ * set nothing, where the emulator switches to the alternate screen and sets insert mode, and a page or a budgeted
+ * projection that omitted them did not (our review of the 40 commits through 4f4c067, PR #22).
+ */
+function sequencesOf(data: string): string {
+  let out = '';
+  for (let i = 0; i < data.length; ) {
+    // The next introducer or shift, by a native search: the text between them matters to no pattern.
+    NEXT.lastIndex = i;
+    const m = NEXT.exec(data);
+    if (!m) break;
+    i = m.index;
+    const c = data.charCodeAt(i);
+    if (isShift(c)) {
+      out += data[i];
+      i++;
+      continue;
+    }
+    // A CSI with nothing inside it but parameters and intermediates, nearly every one, is read by a native match.
+    CLEAN_CSI.lastIndex = i;
+    if (CLEAN_CSI.test(data)) {
+      if (/[hlpr]/.test(data[CLEAN_CSI.lastIndex - 1]!)) out += data.slice(i, CLEAN_CSI.lastIndex);
+      i = CLEAN_CSI.lastIndex;
+      continue;
+    }
+    const end = sequenceEnd(data, i);
+    const executed = executedIn(data, i, end ?? data.length);
+    for (const k of executed) if (isShift(data.charCodeAt(k))) out += data[k];
+    if (end === undefined) break;
+    if (!isStringStart(data, i)) {
+      // Only a CSI ending in h, l, p or r, and an escape sequence, can be a pattern's: an SGR, say, is passed over.
+      const csi = c === 0x9b || data[kindAt(data, i)] === '[';
+      if (!csi || /[hlpr]/.test(data[end - 1]!)) {
+        const t = executed.length ? sequenceText(data, i, end) : data.slice(i, end);
+        out += t[0] === '\x9b' ? `\x1b[${t.slice(1)}` : t;
+      }
+    } else {
+      // A title (OSC 0, 1 or 2) is its introducer's ESC form and what follows the byte that names it, its ST as ESC \;
+      // the other strings set nothing kept here, and a shift in their payload is payload.
+      const kind = c === 0x1b ? kindAt(data, i) : i;
+      const body = data.slice(kind + 1, end);
+      if ((c === 0x9d || data[kind] === ']') && /^[012];/.test(body)) out += `\x1b]${body.endsWith('\x9c') ? `${body.slice(0, -1)}\x1b\\` : body}`;
+    }
+    i = end;
+  }
+  return out;
+}
+
 /**
  * The sequences in `data` that change lasting terminal state (see
  * PERSISTENT_STATE), reduced to the last setting of each thing set and kept in
@@ -108,7 +176,7 @@ export function persistentState(data: string): string {
       kept.forEach((e, i) => at.set(e!.key, i));
     }
   };
-  for (const m of data.matchAll(PERSISTENT_STATE)) {
+  for (const m of sequencesOf(data).matchAll(PERSISTENT_STATE)) {
     const s = m[0];
     if (s === '\x1bc') {
       at.clear();

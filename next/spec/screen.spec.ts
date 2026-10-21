@@ -206,6 +206,52 @@ test('persistentState: a title and an icon name are both kept; OSC 0 sets both',
   assert.equal(persistentState('\x1b]2;title\x07\x1b]0;both\x07\x1b]1;icon\x1b\\'), '\x1b]0;both\x07\x1b]1;icon\x1b\\');
 });
 
+test('persistentState keeps what the emulator applies of a sequence with C0 controls inside it, and of the C1 forms (our review of the 40 commits through 4f4c067, PR #22)', async () => {
+  // The filter matched spellings: `ESC [ ? 10 CR 49 h` and `ESC [ BEL 4 h` kept nothing, where the emulator executes the
+  // CR and the BEL inside the CSI and then switches to the alternate screen and sets insert mode.
+  const state = async (data: string) => {
+    const t = new xterm.Terminal({ cols: 20, rows: 3, allowProposedApi: true, logLevel: 'off' });
+    await new Promise<void>((r) => t.write(data, r));
+    const s = { alt: t.buffer.active.type === 'alternate', insert: t.modes.insertMode };
+    t.dispose();
+    return s;
+  };
+  for (const [data, kept] of [
+    ['x\x1b[?10\r49hy', '\x1b[?1049h'],
+    ['x\x1b[\x074hy', '\x1b[4h'],
+    ['x\x1b\n[4h', '\x1b[4h'],
+    ['x\x9b4hy', '\x1b[4h'],
+    ['\x1b[\x0e4h', '\x0e\x1b[4h'],
+    ['\x9d2;title\x9cz', '\x1b]2;title\x1b\\'],
+  ] as const) {
+    assert.equal(persistentState(data), kept, JSON.stringify(data));
+    const whole = await state(data);
+    const replayed = await state(persistentState(data));
+    assert.deepEqual([replayed.alt, replayed.insert], [whole.alt, whole.insert], `the replay reaches the emulator's state: ${JSON.stringify(data)}`);
+  }
+  // A shift inside a control string's payload is payload, and sets nothing, as the emulator shows: with G1 the DEC
+  // graphics set, `lqqk` after SO inside a title, a clipboard, a DCS or an APC is still `lqqk`. Before a string's
+  // kind, or inside a CSI, a shift acts.
+  const shown = async (data: string) => {
+    const t = new xterm.Terminal({ cols: 20, rows: 3, allowProposedApi: true, logLevel: 'off' });
+    await new Promise<void>((r) => t.write(`\x1b)0${data}lqqk`, r));
+    const text = t.buffer.active.getLine(0)!.translateToString(true);
+    t.dispose();
+    return text;
+  };
+  for (const [data, acts] of [
+    ['\x1b]2;a\x0eb\x07', false],
+    ['\x1b]52;c;\x0e\x07', false],
+    ['\x1bPq\x0e\x1b\\', false],
+    ['\x1b_x\x0e\x1b\\', false],
+    ['\x1b\x0e]2;t\x07', true],
+    ['\x1b[\x0e4h', true],
+  ] as const) {
+    assert.equal(await shown(data), acts ? '\u250c\u2500\u2500\u2510' : 'lqqk', `the emulator: ${JSON.stringify(data)}`);
+    assert.equal(await shown(persistentState(data)), await shown(data), `the replay: ${JSON.stringify(data)}`);
+  }
+});
+
 // ───────────── G13: serialize reproduces the screen ─────────────
 
 function cells(t: TerminalType, which: 'normal' | 'alternate') {
