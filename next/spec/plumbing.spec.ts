@@ -464,6 +464,29 @@ test('a trace a shell writes past the typed line’s redirect is named by the Ru
   assert.equal(cutPlumbing(`${echo}${mark}${other}${end}`, marker), other, 'another Run’s nonce');
 });
 
+test('a string a program opened on a probe echo’s line, running past it, keeps what it hides: the cut projects as the Run’s raw output does', async () => {
+  // The house's review of the 40 commits through f3750e4 (PR #22, comment 6310921374), the cutter's "left for later": a program
+  // that ignores ^C read the probe line, after it had opened an OSC on that line, and closed the OSC on a later line; the strike
+  // took the OSC's introducer, so `payload-rest` showed.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  const head = `${sourceLine('/tmp/tsm-501/abc/tsm-cmd-1', 'posix', N)}\r\n<<<START:${N}:4242>>>\r\nout\r\n`;
+  const end = `<<<EXIT:${N}:130>>>\r\n$ `;
+  const shown = async (raw: string) => transcript([{ data: raw, stream: 'pty' }]);
+  for (const probe of [markerProbe(N), markerProbe(N, 'fish')]) {
+    // The OSC opened before the probe's echo: the echo is inside it, and the line is the program's whole.
+    const before = `xx\x1b]0;tit^C${probe}\r\npayload-rest\x07after\r\n`;
+    assert.equal(await shown(cutPlumbing(`${head}${before}${end}`, marker)), await shown(`out\r\n${before}`), JSON.stringify(before));
+    assert.doesNotMatch(await shown(cutPlumbing(`${head}${before}${end}`, marker)), /payload/);
+    const ranges = keptRanges(`${head}${before}${end}`, marker);
+    ranges.forEach(([s, e], i) => assert.ok(s < e && (i === 0 || ranges[i - 1]![1] <= s), `kept ranges in order: ${JSON.stringify(ranges)}`));
+    // The OSC opened after the echo, on its line, and never closed before the Run's end: the echo goes, the string stays.
+    const after = `$${probe}\x1b]0;tit\r\npayload-rest\r\n`;
+    assert.equal(await shown(cutPlumbing(`${head}${after}${end}`, marker)), 'out', JSON.stringify(after));
+  }
+  // A string the echo's line opened and closed goes with the line, as before.
+  assert.equal(await shown(cutPlumbing(`${head}$${markerProbe(N)}\x1b]0;tit\x07\r\nafter\r\n${end}`, marker)), 'out\nafter');
+});
+
 test('the marker strategy’s start line prints the Run’s start mark with the shell’s pid, keeps the status the shell had for the body, leaves no temporary behind, ends no shell under set -e, and traces nothing after the mark', () => {
   // The house's answer 2 on the 33 commits (#22, comment 6307351985): `$?` after `false` is still 1 in the body. The house's review
   // of the 40 commits through f3750e4 (PR #22, comment 6310921374): `__tsm_q` stayed set in the user's shell, and after

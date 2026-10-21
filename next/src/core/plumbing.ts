@@ -303,16 +303,17 @@ export interface PlumbingOf {
  * string is hidden as the emulator hides it, but its line ends stay in the text, so a line the cutter
  * strikes whole (a probe's echo) takes no line of output before it along; the cut through the mark
  * leaves the string's opening on the other side, so what comes after it shows as the emulator shows
- * the Run's output alone. `open` holds each text index whose raw gap before it lies in such a string.
+ * the Run's output alone. `open` maps each text index whose raw gap before it lies in such a string
+ * to the raw index of the string's introducer.
  * A split word counts only with the Run's nonce, and with none recorded (a journal from before it
  * was) only the marks split: a program's own `<<<PRO""BE:` inside a title split the title, and its
  * payload showed (an independent read of that fix).
  */
-function stripAtMarks(raw: string, nonce: string | undefined): { text: string; map: number[]; open: Set<number> } {
+function stripAtMarks(raw: string, nonce: string | undefined): { text: string; map: number[]; open: Map<number, number> } {
   const words = nonce === undefined ? '' : `|(?:EXI""T|STAR''T|PRO""BE|PRO''BE):${nonce}[:>"]`;
   const marks = new RegExp(`<<<(?:(?:START|EXIT|PROBE):${nonce ?? NONCE}[:>]${words})`, 'g');
   const at = [...raw.matchAll(marks)].map((m) => m.index).filter((i) => i > 0);
-  const open = new Set<number>();
+  const open = new Map<number, number>();
   if (!at.length) return { ...stripEscapes(raw), open };
   let text = '';
   const map: number[] = [];
@@ -335,11 +336,11 @@ function stripAtMarks(raw: string, nonce: string | undefined): { text: string; m
     }
     if (cut === slice.length) continue;
     for (let i = slice.indexOf('\n', cut); i !== -1; i = slice.indexOf('\n', i + 1)) {
-      open.add(text.length);
+      open.set(text.length, cut + bounds[k]!);
       text += '\n';
       map.push(i + bounds[k]!);
     }
-    open.add(text.length); // the next piece's first character
+    open.set(text.length, cut + bounds[k]!); // the next piece's first character
   }
   return { text, map, open };
 }
@@ -369,9 +370,14 @@ function stripAtMarks(raw: string, nonce: string | undefined): { text: string; m
  * its token is not the Run's) is not an end (the house's read of 39787b3, #22), and a probe nothing
  * answered, because a program ignoring ^C read it, leaves only its echo behind, with what the
  * program printed after it still output (the house's read of 78c4d6e, #22: the cut moved back to
- * that echo and the output after it was gone). Without a recorded nonce the same shapes are found
- * with any nonce, which can take a program line in a mark's shape for one. The cut is found on the
- * text without escape sequences (stripAtMarks) and made in the raw (keptRanges).
+ * that echo and the output after it was gone).
+ * A struck line that opened a string running past its end keeps the string: from its introducer on,
+ * and the whole line when the echo is itself inside it (a probe a program read, typed after the
+ * program opened an OSC on that line), as the emulator hides it all; striking the introducer showed
+ * the payload's rest, where the Run's raw output projects without it (the house's review of the 40
+ * commits through f3750e4, PR #22, comment 6310921374). Without a recorded nonce the same shapes are
+ * found with any nonce, which can take a program line in a mark's shape for one. The cut is found on
+ * the text without escape sequences (stripAtMarks) and made in the raw (keptRanges).
  */
 export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   return keptRanges(raw, of)
@@ -447,12 +453,22 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
   }
   const rest = text.slice(from);
   let to = exitMark(nonce).exec(rest)?.index ?? rest.length;
-  const struck: Array<[number, number]> = [];
+  // Each struck line, and where in the raw the output resumes after it when a string it opened runs on.
+  const struck: Array<[number, number, number | undefined]> = [];
+  const opens = [...open.keys()]; // in increasing order, as stripAtMarks added them
+  const ends = new Map<number, number | undefined>();
+  // Whether the string introduced at raw index `o` is still open at `rawEnd`.
+  const runsPast = (o: number, rawEnd: number): boolean => {
+    if (!ends.has(o)) ends.set(o, sequenceEnd(raw, o));
+    const e = ends.get(o);
+    return e === undefined || e > rawEnd;
+  };
   // Strikes the lines from a match's first character to its last. Matches come in order, and one
   // inside the lines struck last is passed over: scanning to its line's ends again for every match
   // held the event loop for half a minute on a line of 100,000 probe-shaped fragments, which a
   // journal recorded with no nonce reads by shape (an independent read of the fix for the house's
-  // read of the 33 commits, #22, comment 6307351104).
+  // read of the 33 commits, #22, comment 6307351104). A string the line opened that runs past it
+  // keeps what it hides (see above).
   const striker = (): ((i: number, j: number) => void) => {
     let end = 0;
     return (i, j) => {
@@ -460,7 +476,19 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
       const s = i < end ? end : rest.lastIndexOf('\n', i - 1) + 1;
       const nl = rest.indexOf('\n', j);
       end = nl === -1 ? rest.length : nl + 1;
-      struck.push([s, end]);
+      const lineRaw = from + s === 0 ? 0 : map[from + s - 1]! + 1;
+      const lineRawEnd = map[from + end - 1]! + 1;
+      const inside = open.get(from + i);
+      if (inside !== undefined && inside >= lineRaw && runsPast(inside, lineRawEnd)) return;
+      let resume: number | undefined;
+      for (let k = firstAtOrAfter(opens, from + i + 1); k < opens.length && opens[k]! < from + end; k++) {
+        const o = open.get(opens[k]!)!;
+        if (o >= map[from + i]! && runsPast(o, lineRawEnd)) {
+          resume = o;
+          break;
+        }
+      }
+      struck.push([s, end, resume]);
     };
   };
   const strikeAnswer = striker();
@@ -491,15 +519,21 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
     if (m.index >= to) break;
     strikeEcho(m.index, m.index + m[0].length - 1);
   }
-  // Each kept piece, and whether it ends where a struck line begins.
-  const kept: Array<[number, number, boolean]> = [];
+  // Each kept piece, whether it ends where a struck line begins, and where in the raw it begins when a
+  // string the struck line before it opened runs on into it.
+  const kept: Array<[number, number, boolean, number | undefined]> = [];
   let pos = 0;
-  for (const [s, e] of struck.sort((a, b) => a[0] - b[0])) {
+  let resume: number | undefined;
+  for (const [s, e, r] of struck.sort((a, b) => a[0] - b[0])) {
     if (s >= to) break;
-    if (s > pos) kept.push([pos, s, true]);
-    pos = Math.max(pos, e);
+    if (s > pos) {
+      kept.push([pos, s, true, resume]);
+      resume = undefined;
+    }
+    if (e > pos) [pos, resume] = [e, r];
+    else if (e === pos) resume ??= r;
   }
-  if (pos < to) kept.push([pos, to, false]);
+  if (pos < to) kept.push([pos, to, false, resume]);
   // Each raw piece begins right after the last plumbing character before it, so an escape that
   // opens the output (a colour set before its first character) stays with it, and ends at the next
   // one's first character, so an escape before a struck line (a colour, a title, a link's start)
@@ -509,8 +543,20 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
   // kept that head; ending after the line end everywhere dropped those escapes (an independent read
   // of the fix).
   return kept
-    .map(([s, e, atLine]): [number, number] => [from + s === 0 ? 0 : map[from + s - 1]! + 1, atLine && open.has(from + e) ? map[from + e - 1]! + 1 : (map[from + e] ?? raw.length)])
+    .map(([s, e, atLine, r]): [number, number] => [r ?? (from + s === 0 ? 0 : map[from + s - 1]! + 1), atLine && open.has(from + e) ? map[from + e - 1]! + 1 : (map[from + e] ?? raw.length)])
     .filter(([s, e]) => s < e);
+}
+
+/** The index of the first of the increasing `xs` at or after `x`. */
+function firstAtOrAfter(xs: number[], x: number): number {
+  let lo = 0;
+  let hi = xs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (xs[mid]! < x) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 /**
