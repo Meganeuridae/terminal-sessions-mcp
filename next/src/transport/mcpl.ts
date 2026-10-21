@@ -1311,7 +1311,9 @@ export class McplLane {
     const to = o?.to ?? gaps[gaps.length - 1]!.to;
     const since = o ? Math.max(0, o.from - 1) : gaps[gaps.length - 1]!.to;
     const metadata: Record<string, unknown> = { session: t.id, state: liveOf(t)?.state ?? 'exited', count: o?.count ?? 0, from: o?.from ?? gaps[0]!.from, to, kinds: o?.kinds ?? {} };
-    // Two scalars, not a range object: a push event's origin carries scalar metadata only; they span the first gap's start to the last gap's end.
+    // Two scalars, not a range object or a list: a push event's origin carries scalar metadata only. They are one
+    // span, from the first gap's start to the last gap's end, so seqs delivered between two gaps lie inside it; the
+    // text names each gap, and DESIGN §10.2 says so for hosts (the house's read of the 38 commits, #22, comment 6274773484).
     if (gaps.length) Object.assign(metadata, { lostFrom: gaps[0]!.from, lostTo: gaps[gaps.length - 1]!.to });
     return {
       kind: 'summary',

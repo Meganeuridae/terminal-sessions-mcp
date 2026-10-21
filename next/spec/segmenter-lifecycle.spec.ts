@@ -26,11 +26,13 @@ import {
   Segmenter,
   seqOfMessageId,
   tailBytes,
+  type ReplaySource,
   type Segment,
   type SegmentSource,
 } from '../src/core/segmenter.js';
+import { clocks } from '../src/core/clock.js';
 import type { JournalEvent, RunInfo, ScreenSnapshot } from '../src/core/types.js';
-import { sleep } from './testhost.js';
+import { sleep, until } from './testhost.js';
 
 const A = 'agent:a@t';
 const B = 'agent:b@t';
@@ -773,14 +775,15 @@ test('a digest holds a partial line that ends inside a control sequence until th
   const seg = new Segmenter(src, { cadenceMs: 40 });
   t.after(() => seg.dispose());
   const out = collect(seg);
+  // Each step waits for the digest it asserts, with a deadline, not a fixed sleep a stalled event loop could outlast
+  // (the house's read of the 38 commits, #22, comment 6274773484). A digest goes only when bytes arrived since the last.
+  const digests = () => out.filter((s) => s.kind === 'output');
   src.journal.append({ type: 'output', data: 'done\r\nworking \x1b[3', stream: 'pty', runId: 'seq' });
-  await sleep(110);
-  const first = out.filter((s) => s.kind === 'output').at(-1);
-  assert.equal(first?.body, 'done', 'the partial line waits: what the sequence does to it is not known yet');
+  await until(() => digests().length === 1, 5000, 'the first digest');
+  assert.equal(digests()[0]!.body, 'done', 'the partial line waits: what the sequence does to it is not known yet');
   src.journal.append({ type: 'output', data: '2mon it', stream: 'pty', runId: 'seq' });
-  await sleep(110);
-  const second = out.filter((s) => s.kind === 'output').at(-1);
-  assert.equal(second?.body, 'done\nworking on it');
+  await until(() => digests().length === 2, 5000, 'the second digest');
+  assert.equal(digests()[1]!.body, 'done\nworking on it');
 });
 
 test('the carry is cut on a safe boundary: a digest never begins with half a surrogate pair or the tail of a control sequence', async (t) => {
@@ -795,7 +798,7 @@ test('the carry is cut on a safe boundary: a digest never begins with half a sur
   src.journal.append({ type: 'output', data: `${'a'.repeat(100)}${'😀'.repeat(2100)}z`, stream: 'pty', runId: 'pair' });
   // The last 4,096 units begin inside ESC [ 38 ; 5 ; 196 m.
   src.journal.append({ type: 'output', data: `${'b'.repeat(5000)}\x1b[38;5;196m${'z'.repeat(4090)}`, stream: 'pty', runId: 'csi' });
-  await sleep(110);
+  await until(() => ['pair', 'csi'].every((id) => out.some((s) => s.kind === 'output' && s.runId === id)), 5000, 'a digest of each');
   const pair = out.find((s) => s.kind === 'output' && s.runId === 'pair');
   assert.ok(pair?.body?.startsWith('😀'), `whole pairs only: ${JSON.stringify(pair?.body?.slice(0, 4))}`);
   assert.ok(!/[\ud800-\udfff]/.test(pair!.body!.replace(/😀/g, '')), 'no lone surrogate anywhere');
@@ -832,7 +835,66 @@ test('a hole a cold-store failure left on a later page of the scan is reported, 
     const scan = await scanLifecycle(liveSource(src), 0);
     assert.ok(scan.lost && scan.lost.length >= 1, `a gap is reported: ${JSON.stringify(scan.lost)}`);
     assert.ok(scan.lost!.some((g) => g.from > persisted), `the later-page hole is kept: ${JSON.stringify(scan.lost)} (persisted ${persisted})`);
+    // The disk comes back: the journal writes what the ring still held and records the hole as a gap event, and no page
+    // reports a gap any more. The scan reads the event; it reported no lost range (the house's read of the 38 commits,
+    // #22, comment 6274773484).
+    assert.ok(journal.retryCold(), 'the disk is back');
+    const recorded = journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap');
+    assert.ok(recorded.some((g) => g.from > persisted), `the journal recorded the hole: ${JSON.stringify(recorded)}`);
+    const healed = await scanLifecycle(liveSource(src), 0);
+    for (const g of recorded.filter((x) => x.from > persisted)) {
+      assert.ok(healed.lost?.some((x) => x.from <= g.from && x.to >= g.to), `the recorded hole ${g.from}–${g.to} is named: ${JSON.stringify(healed.lost)}`);
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a scan clips each gone range to the seqs it covers and names a hole reported twice once', async () => {
+  // The house's read of the 38 commits (#22, comment 6274773484): a page's gap was copied whole, and the lane pinned its
+  // summary at the last gap's end, which can lie past the scan's end when the ring drops events during a paged scan.
+  let page: { events: JournalEvent[]; gap?: { from: number; to: number; reason: 'retention' }; nextCursor: number; more: boolean } = { events: [], gap: { from: 1, to: 150, reason: 'retention' }, nextCursor: 0, more: false };
+  const journal = { lastSeq: 100, *pages() { yield page; } } as unknown as Journal;
+  const src = { id: 's', journal, owner: A, state: 'idle', cwd: undefined, controller: null, run: () => { throw new Error('run_not_found'); }, runText: async () => ({ text: '', truncated: false, seq: [0, 0], nextCursor: 0 }) } as unknown as ReplaySource;
+  assert.deepEqual((await scanLifecycle(src, 0)).lost, [{ from: 1, to: 100 }], 'clipped to the scan’s end');
+  assert.deepEqual((await scanLifecycle(src, 40)).lost, [{ from: 41, to: 100 }], 'and to its start');
+  // One hole as a page's gap and as the journal's gap event, with other bounds; a second hole apart; an old one before the scan.
+  const gap = (seq: number, from: number, to: number): JournalEvent => ({ type: 'gap', seq, ts: 0, from, to, reason: 'store-failed' });
+  page = { events: [gap(31, 10, 30), gap(91, 80, 90), gap(92, 1, 4), { type: 'note', seq: 95, ts: 0, text: 'x' } as JournalEvent], gap: { from: 6, to: 20, reason: 'retention' }, nextCursor: 95, more: false };
+  assert.deepEqual((await scanLifecycle(src, 5)).lost, [{ from: 6, to: 30 }, { from: 80, to: 90 }]);
+});
+
+test('a completion reads a negative journaled duration as no time, and a digest counts its elapsed time on the monotonic clock', async (t) => {
+  // The house's read of the 38 commits (#22, comment 6274773484): a run.end with durationMs -3000 read `→ exit 0 in -3.0s`,
+  // and a digest's elapsed time took a wall-clock step back as zero and a step forward as time.
+  const src = fakeSource();
+  startRun(src, 'neg');
+  src.journal.append({ type: 'run.end', runId: 'neg', state: 'exited', exit: 0, durationMs: -3000 });
+  src.runs.get('neg')!.state = 'exited';
+  const [done] = await replay(src);
+  assert.match(done!.head, /→ exit 0 in 0\.0s/, done!.head);
+  assert.equal(done!.metadata.durationMs, 0);
+  const realNow = Date.now;
+  const realMono = clocks.monotonic;
+  let wallStep = 0;
+  let monoStep = 0;
+  Date.now = () => realNow() + wallStep;
+  clocks.monotonic = () => realMono() + monoStep;
+  t.after(() => {
+    Date.now = realNow;
+    clocks.monotonic = realMono;
+  });
+  startRun(src, 'long');
+  const seg = new Segmenter(src, { cadenceMs: 40 });
+  t.after(() => seg.dispose());
+  const out = collect(seg);
+  // The wall clock steps back a minute while a minute and a half pass.
+  wallStep -= 60_000;
+  monoStep += 90_000;
+  src.journal.append({ type: 'output', data: 'tick\n', stream: 'pty', runId: 'long' });
+  await until(() => out.some((s) => s.kind === 'output'), 5000, 'a digest');
+  const digest = out.find((s) => s.kind === 'output')!;
+  const elapsed = digest.metadata.elapsedMs as number;
+  assert.ok(elapsed >= 90_000 && elapsed < 95_000, `the monotonic interval: ${elapsed} ms`);
+  assert.match(digest.head, /running `cmd-long` 1m3\ds/, digest.head);
 });

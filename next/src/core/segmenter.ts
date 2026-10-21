@@ -362,13 +362,15 @@ class Render {
     const who = run.origin === 'self' || run.origin === 'system' ? '' : ` · by ${run.principal}`;
     // A process Run that left its group behind says so (shell tools 5 of the house's review of #11).
     const left = ev.leftovers ? ' · left processes running (cancel the Run to end them)' : '';
-    const head = `[terminal] ${this.src.id}: \`${describeRun(run)}\` ${status} in ${fmtDuration(ev.durationMs)}${who}${left} · run ${ev.runId} · read since=${Math.max(0, t.seq[0] - 1)}`;
+    // A journal written before durations were measured on the monotonic clock can hold a negative one (a wall-clock step back).
+    const durationMs = Math.max(0, ev.durationMs);
+    const head = `[terminal] ${this.src.id}: \`${describeRun(run)}\` ${status} in ${fmtDuration(durationMs)}${who}${left} · run ${ev.runId} · read since=${Math.max(0, t.seq[0] - 1)}`;
     // The origin facet and the chat:from-* sender tag are relative to the reader; the lane adds them.
     const tags = [ev.state === 'lost' ? 'terminal:run-lost' : 'terminal:run-finished', `terminal:target=${run.target}`];
     if (ev.signal) tags.push('terminal:exit=signal');
     // An end mark without a status (`→ exit ?`) is neither ok nor nonzero: no exit tag.
     else if (ev.state === 'exited' && ev.exit !== undefined) tags.push(`terminal:exit=${ev.exit === 0 ? 'ok' : 'nonzero'}`);
-    const meta: Record<string, unknown> = { runId: ev.runId, runState: ev.state, target: run.target, principal: run.principal, durationMs: ev.durationMs, outputFrom: t.seq[0], outputTo: t.seq[1], nextCursor: t.nextCursor };
+    const meta: Record<string, unknown> = { runId: ev.runId, runState: ev.state, target: run.target, principal: run.principal, durationMs, outputFrom: t.seq[0], outputTo: t.seq[1], nextCursor: t.nextCursor };
     if (ev.exit !== undefined) meta.exit = ev.exit;
     if (ev.signal) meta.signal = ev.signal;
     if (ev.reason) meta.reason = ev.reason;
@@ -506,7 +508,9 @@ export interface LifecycleScan {
    * Seqs the scan found gone (retention, or a hole a cold-store failure left): a catch-up from an old
    * cursor over a small memory ring returned a handful of completions as if they were all (the house's
    * read of 3eade8a, #22). Every page's gap is kept, not only the first page's, so a hole in a later
-   * page is not silently skipped (the house's read of the 36 commits, #22, comment 6269992150).
+   * page is not silently skipped (the house's read of the 36 commits, #22, comment 6269992150), and so
+   * is every gap event the journal recorded; each range is clipped to the scan and merged with those it
+   * overlaps, in seq order.
    */
   lost?: Array<{ from: Seq; to: Seq }>;
 }
@@ -564,19 +568,38 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
   };
 
   const gones: Array<{ from: Seq; to: Seq }> = [];
+  // A range gone, clipped to what this scan covers (after `since`, through `end`: a page read while
+  // the ring dropped events can report a gap past the scan's end, where the lane would pin its
+  // summary), and merged with any range it overlaps or touches, so a hole reported both as a page's
+  // gap and as the journal's gap event is named once (the house's read of the 38 commits, #22,
+  // comment 6274773484).
+  const gone = (from: Seq, to: Seq) => {
+    let f = Math.max(from, since + 1);
+    let t = Math.min(to, end);
+    if (f > t) return;
+    for (let i = gones.length - 1; i >= 0; i--) {
+      const x = gones[i]!;
+      if (x.from > t + 1 || f > x.to + 1) continue;
+      f = Math.min(f, x.from);
+      t = Math.max(t, x.to);
+      gones.splice(i, 1);
+    }
+    gones.push({ from: f, to: t });
+    gones.sort((a, b) => a.from - b.from);
+  };
   for (const page of src.journal.pages(since, SCAN_PAGE)) {
     // Every page's gap, not only the first: a hole a cold-store failure left is reported as the gap of
     // the later page that starts inside it, and dropping it moved the catch-up past the hole with no
     // notice (the house's read of the 36 commits, #22, comment 6269992150).
-    if (page.gap) {
-      const g = { from: page.gap.from, to: page.gap.to };
-      if (!gones.some((x) => x.from === g.from && x.to === g.to)) gones.push(g);
-    }
+    if (page.gap) gone(page.gap.from, page.gap.to);
     const events = page.events;
     if (!events.length) break;
     for (const ev of events) {
       if (ev.seq > end) break;
-      if (LIFE_EVENTS.has(ev.type)) {
+      // A hole the journal recorded as an event: a failing store's, once it recovered, which no page
+      // reports as a gap then, since the events after it are on disk again.
+      if (ev.type === 'gap') gone(ev.from, ev.to);
+      else if (LIFE_EVENTS.has(ev.type)) {
         tentative = [];
         lost = { principals: [], count: 0 };
       } else if (ev.type === 'run.end') {
@@ -692,6 +715,8 @@ export async function replayNewest(src: ReplaySource, opts: { limit: number; bef
 
 interface RunWatch {
   runId: string;
+  /** The Run's start on the monotonic clock, which a digest's elapsed time is measured from. */
+  startMono: number;
   /** A process Run's output is its pipes, which the terminal never shows; a shell Run's is the pty. */
   pipes: boolean;
   bytes: number;
@@ -993,7 +1018,12 @@ export class Segmenter {
 
   private track(runId: string): RunWatch | undefined {
     if (this.running.has(runId) || this.disposing) return undefined;
-    const w: RunWatch = { runId, pipes: runOf(this.s, runId)?.target === 'process', bytes: 0, bytesAtLeast: false, bytesAtLastDigest: 0, lines: [], carry: '', marks: [] };
+    const run = runOf(this.s, runId);
+    // The start is journaled on the wall clock; its age is read once, here, and the digests count on from it on the
+    // monotonic clock, so a later step neither stops their elapsed time nor jumps it (comment 6274773484). A Run
+    // already in flight when the segmenter began has only that one reading, clamped at zero.
+    const startMono = clocks.monotonic() - Math.max(0, Date.now() - (run?.startedAt ?? run?.admittedAt ?? Date.now()));
+    const w: RunWatch = { runId, startMono, pipes: run?.target === 'process', bytes: 0, bytesAtLeast: false, bytesAtLastDigest: 0, lines: [], carry: '', marks: [] };
     this.running.set(runId, w);
     w.timer = setInterval(() => this.digest(w), this.o.cadenceMs);
     return w;
@@ -1087,14 +1117,15 @@ export class Segmenter {
   private digest(w: RunWatch): void {
     const run = runOf(this.s, w.runId);
     if (!run || w.bytes === w.bytesAtLastDigest || (this.alt && !w.pipes) || this.disposing) return;
-    // A carry that ends inside a control sequence is held until the sequence completes (or the Run
-    // ends): what it does to the line is not known yet, and its payload is not text (the house's
-    // read of 78c4d6e, #22: `working ESC [ 3` showed as `working [3` until the next read).
+    // A carry that ends inside a control sequence is held until the sequence completes: what it does
+    // to the line is not known yet, and its payload is not text (the house's read of 78c4d6e, #22:
+    // `working ESC [ 3` showed as `working [3` until the next read). A Run's end does not release it:
+    // the watch goes with the Run, and nothing is lost, since the completion renders the Run's text
+    // from the journal, not from these lines (the house's read of the 38 commits, #22, comment 6274773484).
     const partial = unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
     const tail = (partial ? [...w.lines, partial] : w.lines).slice(-DIGEST_LINES).join('\n');
     const seq = this.s.journal.lastSeq;
-    // The Run's start is a wall-clock stamp; a step back since then is not a negative age.
-    const elapsed = Math.max(0, Date.now() - (run.startedAt ?? run.admittedAt));
+    const elapsed = Math.max(0, Math.round(clocks.monotonic() - w.startMono));
     const seg: Segment = {
       ...this.render.base('output', seq, { runId: w.runId, bytes: w.bytes, ...(w.bytesAtLeast ? { bytesAtLeast: true } : {}), elapsedMs: elapsed, nextCursor: seq }, Date.now(), w.runId),
       lifecycle: false,

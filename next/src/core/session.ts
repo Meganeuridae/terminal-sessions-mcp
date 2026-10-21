@@ -165,6 +165,8 @@ interface RunRecord extends RunInfo {
   waiters: Array<(r: RunInfo) => void>;
   /** The monotonic clock at admission, for the ages this daemon life measures (see `runAgeMs`); never journaled, so a Run rebuilt from the journal has none. */
   admittedMono?: number;
+  /** The monotonic clock at the Run's start, which its journaled duration is measured from (likewise never journaled). */
+  startedMono?: number;
   /** Called on any state change (start or end). */
   changeWaiters?: Array<() => void>;
   process?: ProcessHandle;
@@ -206,7 +208,7 @@ const MAX_ORPHAN_LINES = 32;
  */
 const probeLine = (nonce: string) => ` echo "<<<PRO""BE:${nonce}>>>"`;
 const publicRun = (r: RunRecord): RunInfo => {
-  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, ...info } = r;
+  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, startedMono: _sm, ...info } = r;
   return { ...info, seq: { ...info.seq } };
 };
 
@@ -1455,6 +1457,7 @@ export class Session {
     const started = this.append(ev);
     run.state = 'running';
     run.startedAt = started?.ts ?? this.now();
+    run.startedMono = clocks.monotonic();
     run.seq.start = started?.seq ?? this.journal.lastSeq;
     run.cwd = info.cwd;
     run.cols = this.screen.cols;
@@ -1485,7 +1488,11 @@ export class Session {
   private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; leftovers?: boolean; pipeStatus?: number[] }): void {
     if (isTerminal(run.state)) return;
     const endedAt = this.now();
-    const durationMs = endedAt - (run.startedAt ?? run.admittedAt);
+    // An interval, so on the monotonic clock: from the wall clock a step back between start and end
+    // journaled a negative duration, and the completion read `exit 0 in -3.0s` (the house's read of
+    // the 38 commits, #22, comment 6274773484). A Run rebuilt from the journal has no monotonic stamp.
+    const mono = run.startedMono ?? run.admittedMono;
+    const durationMs = Math.max(0, Math.round(mono !== undefined ? clocks.monotonic() - mono : endedAt - (run.startedAt ?? run.admittedAt)));
     const reason = outcome.reason ?? (outcome.state !== 'exited' ? run.endReason : undefined);
     const ev: Parameters<Journal['append']>[0] = { type: 'run.end', runId: run.runId, state: outcome.state, durationMs };
     if (outcome.exit !== undefined) ev.exit = outcome.exit;

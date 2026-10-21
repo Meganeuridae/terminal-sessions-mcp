@@ -765,7 +765,11 @@ and the cursor that fetches more — because in some hosts the text is all a mod
 a held or summarized rendering keeps only its first few hundred characters. Every
 message's `metadata` is structured: `{node, session, state, cwd, controller, kind, seq,
 runId?, exit?, outputFrom?, outputTo?, nextCursor?, supersedes?}`, where `seq` is the journal
-event the message reports — what the `delivered` cursor advances to — and message and event
+event the message reports — what the `delivered` cursor advances to. A catch-up summary
+(`terminal:missed`) adds `count`, `from`, `to` and `kinds` for the messages it did not replay
+and, when ranges were gone, `lostFrom` and `lostTo`: two scalars, since a push event's origin
+carries only those, spanning from the first gone range's start to the last one's end, so seqs
+delivered between two ranges lie inside the span; the text names each range. Message and event
 ids are node-qualified (`<node>/<session>~<epoch>:<kind>:<seq>`, a digest's with `~<runId>`
 and a screen's with its ordinal after the kind; the epoch is the journal's, so a forgotten name's new journal never reuses an
 id), so two daemons never collide in a host's dedup window. A history boundary

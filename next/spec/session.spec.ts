@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import type { ScriptedProcess } from '../src/backends/scripted.js';
 import type { Journal } from '../src/core/journal.js';
 import type { JournalEvent } from '../src/core/types.js';
+import { clocks } from '../src/core/clock.js';
 import { AGENT, HUMAN, scriptedSession as harness, until } from './fake-shell.js';
 
 const types = (j: Journal, from = 0) => j.since(from).events.map((e) => e.type);
@@ -420,4 +421,34 @@ test('a session keeps at most 1,000 ended Runs in memory; older ones are read fr
   await new Promise((r) => setTimeout(r, 100));
   assert.throws(() => h.session.run(orphaned.run.runId), (e: { code?: string }) => e.code === 'run_not_found', 'gone once its group is');
   await h.session.close();
+});
+
+test('a Run’s duration is measured on the monotonic clock: a wall-clock step back between its start and end journals no negative duration', async (t) => {
+  // The house's read of the 38 commits (#22, comment 6274773484): endRun took durationMs from Date.now, so a step back made
+  // the completion read `exit 0 in -3.0s`. Here the wall clock steps back 3 s while the Run runs, and 2.5 s pass on the
+  // monotonic clock. The session reads Date.now as it was when it was built, so the stub goes in first.
+  const realNow = Date.now;
+  const realMono = clocks.monotonic;
+  let wallStep = 0;
+  let monoStep = 0;
+  Date.now = () => realNow() + wallStep;
+  clocks.monotonic = () => realMono() + monoStep;
+  t.after(() => {
+    Date.now = realNow;
+    clocks.monotonic = realMono;
+  });
+  const h = await harness();
+  try {
+    const a = h.session.admit({ target: 'shell', line: 'sleep 3', principal: AGENT });
+    assert.ok(a.admitted);
+    await until(() => h.session.run(a.run.runId).state === 'running', 5000, 'the Run to start');
+    wallStep -= 3000;
+    monoStep += 2500;
+    h.shell.finishHung(0, 'ok\r\n');
+    assert.equal((await h.session.awaitRun(a.run.runId, 5000)).state, 'exited');
+    const end = h.journal.since(0).events.find((e): e is Extract<JournalEvent, { type: 'run.end' }> => e.type === 'run.end')!;
+    assert.ok(end.durationMs >= 2500 && end.durationMs < 4500, `the monotonic interval, not the wall clock's: ${end.durationMs} ms`);
+  } finally {
+    await h.session.close();
+  }
 });
