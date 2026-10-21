@@ -298,7 +298,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   leader exits — and observes the exit. For a shell Run the daemon writes `^C` to the
   terminal, then `^\\`, then signals the terminal's foreground process group (`SIGTERM`,
   then `SIGKILL`) when that group is not the shell's own, and reports `cancelled` only when
-  the shell confirms the job ended (its end mark, or a prompt for a line it never started);
+  the shell confirms the job ended (its end mark, or a prompt for a line it never started),
+  or when two `^C` bring no mark of any kind: then the line never started, the Run ends
+  `cancelled` as `cancelled-before-start` with no confirmation, and the shell is busy until it
+  shows it is back (§8.4);
   if the job survives every step the Run stays `running` and the escalation is explicit:
   `session_close`. A queued Run is dropped without touching the terminal. The daemon never
   signals the shell to cancel a job. Closing a session hangs up its foreground job, as
