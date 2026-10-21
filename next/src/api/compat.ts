@@ -354,16 +354,20 @@ async function textTail(ctx: ToolContext, session: string, n: number, d: Drawn |
     // lines kept begin later (the plumbing took lines ahead of them, or more were read than are shown), the
     // same range is read again from the first line kept on, so the page before ends where that line begins,
     // not at the first line read (the lines between were in neither page; the house's read of the 38
-    // commits, #22, comment 6274935728).
-    const cut = async (why: string): Promise<TailCut> => {
-      const from = !kept.first ? r : await readFor(ctx, d, { session, tail: outputLinesFrom(all, kept.first), until: r.seq[1], commands: true, maxBytes: TAIL_BYTES });
+    // commits, #22, comment 6274935728). When that read reaches back to the line written last (more lines
+    // than it asked for: ReadResult.lines), its page before ends before that line, so its lines are the ones
+    // shown: the line written last was in neither tailLogs nor the page it advised.
+    const cut = async (why: string): Promise<{ lines: string[]; cut: TailCut }> => {
+      const want = kept.first ? outputLinesFrom(all, kept.first) : 0;
+      const from = !kept.first ? r : await readFor(ctx, d, { session, tail: want, until: r.seq[1], commands: true, maxBytes: TAIL_BYTES });
       const c: TailCut = { before: from.lines?.before ?? { until: from.seq[0] - 1 }, cutHead: from.lines?.cutHead === true, why };
       if (from.lines?.head) c.head = from.lines.head;
       if (from.lines?.begunBefore) c.begunBefore = true;
-      return c;
+      const reached = from !== r && (from.lines?.returned ?? 0) > want;
+      return { lines: reached ? withoutPlumbingLines(from.text ? from.text.split('\n') : [], plumbingIn(ctx, session, from.seq[0], from.seq[1])) : kept.lines, cut: c };
     };
-    if (r.truncated) return { lines: kept.lines, cut: await cut(gapsText(r) ?? 'the tail reached a bound, or a line longer than it') };
-    if (short && full) return { lines: kept.lines, cut: await cut(`the daemon's own lines took the rest of the ${asked} lines read`) };
+    if (r.truncated) return cut(gapsText(r) ?? 'the tail reached a bound, or a line longer than it');
+    if (short && full) return cut(`the daemon's own lines took the rest of the ${asked} lines read`);
     return { lines: kept.lines };
   }
 }

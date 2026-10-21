@@ -798,3 +798,30 @@ test('tailLogs counts lines of output across two sources, and the page its cut n
   assert.equal(numberOf(before.at(-1)!), 53, `the page before ends with the line just before the first shown: ${JSON.stringify(before.map((l) => l.slice(0, 8)))}`);
   await call('killSession', { session: 'twosources', graceful: false });
 });
+
+test('tailLogs over a line written last that another source holds back: the lines shown and the page they advise meet', async () => {
+  // A pty line a Run's unfinished line interrupts, then ends unfinished: the reader's tail of 1 reaches back to it.
+  // tailLogs re-read the line kept, took that read's page before, and showed only the Run's line, so the pty line
+  // was in neither. Over 1.2 MB the tail is cut, so tailLogs advises the page before.
+  const h = await markerHarness();
+  try {
+    await h.call('runCommand', { session: 'reach', command: 'echo hello' });
+    const live = h.registry.get('reach');
+    assert.ok(live?.kind === 'live');
+    const j = live.session.journal;
+    j.append({ type: 'output', data: `BIG-${'z'.repeat(1_200_000)}\r\nmid1\r\nmid2\r\n`, stream: 'pty' });
+    j.append({ type: 'output', data: 'P-start', stream: 'pty' });
+    j.append({ type: 'run.admit', runId: 'rx', target: 'process', principal: A.principal, origin: 'self', queued: false });
+    j.append({ type: 'run.start', runId: 'rx', cwd: '/' });
+    j.append({ type: 'output', data: 'R-unfin', stream: 'stdout', runId: 'rx' });
+    j.append({ type: 'output', data: '-P-more', stream: 'pty' });
+    const tail = lines(await h.call('tailLogs', { session: 'reach', lines: 1 }));
+    const m = /read (\{[^}]*\}) shows what came before/.exec(tail[0] ?? '');
+    assert.ok(m, JSON.stringify(tail));
+    const earlier = (await h.call('read', JSON.parse(m![1]!) as Obj)) as unknown as { text: string };
+    const seen = [...tail.slice(1), ...earlier.text.split('\n')];
+    for (const l of ['P-start-P-more', 'R-unfin']) assert.ok(seen.includes(l), `${l} in ${JSON.stringify({ tail: tail.slice(1), earlier: earlier.text.split('\n') })}`);
+  } finally {
+    await h.close();
+  }
+});
