@@ -2191,6 +2191,90 @@ test("a catch-up whose scan fails retires nothing: the refused fold summary stil
   }
 });
 
+/** A session with a refused fold summary standing over six completions, as the failed-scan spec makes one. */
+async function foldedSession(f: Awaited<ReturnType<typeof bareLane>>, id: string) {
+  await f.app.sessionOpen(f.caller, { id });
+  const s = live(f.registry, id);
+  const st = () => f.inside.states.get(id)!;
+  f.refuse.value = true;
+  f.late.value = true;
+  const ends: number[] = [];
+  for (let i = 0; i < 6; i++) {
+    const r = await f.app.run(f.caller, { session: id, command: `echo ${id}-${i}`, target: 'process', wait: 0 });
+    await until(() => s.run(r.runId!).seq.end !== undefined, 5000, `Run ${i} to end`);
+    ends.push(s.run(r.runId!).seq.end!);
+  }
+  await until(() => f.pending.length >= 6, 5000, 'six completions pushed and held');
+  await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'pushEvents') }, f.ctx);
+  for (const p of f.pending.splice(0)) p.answer();
+  await until(() => [...st().summaries.values()].some((x) => x.folded), 5000, 'the refusals to fold');
+  f.refuse.value = false;
+  f.late.value = false;
+  return { s, st, ends, folded: [...st().summaries.keys()] };
+}
+
+/** At a session's next scan's first page, runs `at` (or throws, with no `at`). */
+function onFirstPage(s: Session, at?: () => void): void {
+  const journal = s.journal as Journal & { pages: Journal['pages'] };
+  const pages = journal.pages.bind(journal);
+  let first = true;
+  journal.pages = function* (...a: Parameters<Journal['pages']>) {
+    if (first) {
+      first = false;
+      if (!at) throw new Error('EIO: the store could not be read');
+      at();
+    }
+    yield* pages(...a);
+  } as Journal['pages'];
+}
+
+test("a catch-up retires no session's summaries until every session's scan has returned", { timeout: 90_000 }, async () => {
+  // Retired as each session's own scan returned, the first session's summary was gone when the second's scan threw,
+  // with the floor lowered (the house's read of 4860d4c, #22).
+  const was = McplLane.retryMax;
+  McplLane.retryMax = 4;
+  const f = await bareLane('c-retire-two');
+  try {
+    const a = await foldedSession(f, 'ra');
+    await f.app.sessionOpen(f.caller, { id: 'rb' });
+    const b = live(f.registry, 'rb');
+    await f.app.run(f.caller, { session: 'rb', command: 'echo rb', target: 'process', wait: 0 });
+    onFirstPage(b);
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => f.logs.some((l) => /catch-up failed: EIO/.test(l)), 5000, 'the catch-up failure logged');
+    assert.deepEqual([...a.st().summaries.keys()].filter((k) => a.folded.includes(k)), a.folded, "the first session's fold summary still stands");
+    assert.ok(a.s.cursorsOf(A).delivered < Math.min(...a.ends), `its cursor stays below the folded completions (delivered ${a.s.cursorsOf(A).delivered})`);
+  } finally {
+    McplLane.retryMax = was;
+    await f.close();
+  }
+});
+
+test("a catch-up leaves a summary that went in flight during its scan, and one made during it", { timeout: 60_000 }, async () => {
+  // The plan-time list is rechecked at retirement, and holds only what stood at plan time (the house's read of 4860d4c, #22).
+  const was = McplLane.retryMax;
+  McplLane.retryMax = 4;
+  const f = await bareLane('c-retire-during');
+  try {
+    const a = await foldedSession(f, 'rd');
+    const planned = a.folded[0]!;
+    onFirstPage(a.s, () => {
+      a.st().inflight.set(planned, a.ends[0]!);
+      a.st().summaries.set('made-during-the-scan', { from: a.ends[0]!, covered: new Set() });
+    });
+    f.late.value = true;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => f.inside.catchingUp === undefined, 10_000, 'the catch-up to finish');
+    assert.ok(a.st().summaries.has(planned), 'the summary in flight by retirement still stands');
+    assert.ok(a.st().summaries.has('made-during-the-scan'), 'the summary made during the scan still stands');
+    f.late.value = false;
+    for (const p of f.pending.splice(0)) p.answer();
+  } finally {
+    McplLane.retryMax = was;
+    await f.close();
+  }
+});
+
 test("a summary's acceptance or retirement leaves its own seq owed while another message carries it, not its own retry or parked copy, and carried() reads only this lineage's opening", { timeout: 30_000 }, async () => {
   // Its own seq, a gap's end, can be a message still retried; settled with the summary, delivered could pass it and
   // its refusal was settled as accepted. Another lineage's opening holds another journal's seqs (the house's read of 4860d4c, #22).
