@@ -28,7 +28,7 @@
 import { clocks, timerMs } from './clock.js';
 import { boots } from './lock.js';
 import { RunIndex } from './runindex.js';
-import { lineBytes, MemoryStore, newEpoch, type JournalStore } from './stores.js';
+import { lineBytes, MemoryStore, newEpoch, type JournalStore, type Reservation } from './stores.js';
 import type { EventInput, GapReason, JournalEvent, Seq } from './types.js';
 
 export type JournalListener = (event: JournalEvent) => void;
@@ -84,6 +84,19 @@ const RETRY_MAX_MS = 30_000;
  * 6307349700, its question of intent).
  */
 export const HIGH_WATER_BLOCK = 10_000;
+
+/**
+ * Whether a journal opening over the store honours its reservation: numbers above it, and records the
+ * seqs between the files' last and it as a hole. A failed reservation always (the disk refused those
+ * seqs). A standing one unless it was written on this very boot: then the daemon stopped but the machine
+ * did not, the page cache kept every line, and no seq above the files' last was issued. With no boot
+ * known, on either side, it is honoured. The journal's constructor and the registry's expiry both read it.
+ */
+export function reservationHonoured(r: Reservation): boolean {
+  if (r.failed === true || r.boot === undefined) return true;
+  const boot = boots.current();
+  return boot === undefined || boot !== r.boot;
+}
 
 export class Journal {
   private seq: Seq;
@@ -153,13 +166,10 @@ export class Journal {
     // What the stores account for: their events, and retention's floor (every file up to it aged out).
     const accounted = Math.max(coldLast, hotLast, hw?.floor ?? 0);
     // Seqs above that, up to a reservation, may have been issued — by an earlier life, or before a
-    // restart — and reached subscribers: never reissue them, and record the hole (jr2-6, G10). A failed
-    // reservation's seqs were refused by the disk. A standing one's may have been lost by a power loss,
-    // unless it was written on this very boot: then the daemon stopped but the machine did not, the page
-    // cache kept every line, and no seq above the files' last was issued.
+    // restart — and reached subscribers: never reissue them, and record the hole (jr2-6, G10), when the
+    // reservation is honoured (reservationHonoured).
     const r = hw?.reservation;
-    const boot = r && !r.failed && r.boot !== undefined ? boots.current() : undefined;
-    const honoured = r !== undefined && (r.failed === true || r.boot === undefined || boot === undefined || boot !== r.boot);
+    const honoured = r !== undefined && reservationHonoured(r);
     this.seq = Math.max(opts.startSeq ?? 0, accounted, honoured ? r.to : 0);
     this.persisted = this.seq;
     this.runs = opts.runs ?? new RunIndex(opts.sessionId ?? '');

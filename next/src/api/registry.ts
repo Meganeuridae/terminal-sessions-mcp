@@ -26,7 +26,7 @@ import type { ExecutionBackend } from '../backends/types.js';
 import { configuredEnv } from '../core/env.js';
 import { clocks } from '../core/clock.js';
 import { err, TermError } from '../core/errors.js';
-import { Journal, type JournalOptions } from '../core/journal.js';
+import { Journal, reservationHonoured, type JournalOptions } from '../core/journal.js';
 import { acquireDataDirLock, groupAlive, listProcesses, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
 import { RunIndex, type RunOutput, type RunOutputRange } from '../core/runindex.js';
 import { Session, trustedDir, type SessionOptions } from '../core/session.js';
@@ -1484,8 +1484,15 @@ function expired(store: FileStore, retention: SessionRetention, now: number): bo
   // No event left: aged out only when retention dropped the files and left its floor. Any high water read
   // so before every store kept a reservation, which a power loss that took every line leaves behind too,
   // so such a session read as past its age (the house's read of the 33 commits, PR #22, comment
-  // 6307350477; an independent read of the fix).
-  if (newest === undefined) return store.highWater()?.floor !== undefined;
+  // 6307350477; an independent read of the fix). A reservation above the floor that the journal honours
+  // says seqs were issued after the files that aged out, and a power loss may have taken their lines: the
+  // session is not past its age by what is missing. One the journal does not honour (written on this
+  // boot) covers nothing issued, as the journal reads it.
+  if (newest === undefined) {
+    const hw = store.highWater();
+    const r = hw?.reservation;
+    return hw?.floor !== undefined && !(r !== undefined && r.to > hw.floor && reservationHonoured(r));
+  }
   return newest < now - retention.maxAgeMs;
 }
 

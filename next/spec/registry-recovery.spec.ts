@@ -16,7 +16,7 @@ import * as path from 'node:path';
 import { heldGroups, orphanGroups, SessionRegistry, type AnySession, type HistorySession, type LiveSession, type OrphanCandidate } from '../src/api/registry.js';
 import type { ScriptedBackend } from '../src/backends/scripted.js';
 import { Journal } from '../src/core/journal.js';
-import { groupAlive, listProcesses, procStart, PROC_START_SLACK_MS, type ProcessRow } from '../src/core/lock.js';
+import { boots, groupAlive, listProcesses, procStart, PROC_START_SLACK_MS, type ProcessRow } from '../src/core/lock.js';
 import type { Session } from '../src/core/session.js';
 import { FileStore } from '../src/core/stores.js';
 import type { JournalEvent, RunInfo } from '../src/core/types.js';
@@ -848,6 +848,37 @@ test('G10/G21: a session within its age whose power loss took every line is reco
   assert.deepEqual(gaps.map((g) => [g.from, g.to]), [[1, 10_000]], 'the lost seqs are a recorded hole');
   assert.equal(h.owner, A);
   await r.reg.closeAll();
+});
+
+test('G10/G21: a session whose oldest files aged out to a floor and whose newer lines a power loss took is recovered, since a reservation above the floor that the journal honours says seqs were issued after it (the house\'s read of the 40 commits, PR #22)', async (t) => {
+  t.mock.method(boots, 'current', () => 'this-boot');
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'pf');
+  fs.mkdirSync(sdir, { recursive: true, mode: 0o700 });
+  // Age retention dropped the files up to seq 100 and kept their floor; the journal went on to reserve a block
+  // above it on the boot before the power loss, which took every line written since.
+  fs.writeFileSync(path.join(sdir, 'journal.jsonl'), '', { mode: 0o600 });
+  fs.writeFileSync(path.join(sdir, 'journal.meta.json'), JSON.stringify({ v: 1, epoch: 'd'.repeat(16), highWater: 100, reserved: 10_100, boot: 'the-boot-before-the-power-loss' }) + '\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', createdAt: Date.now() - 86_400_000, retention: { maxAgeMs: 3_600_000 } }), { mode: 0o600 });
+  const r = rig(dir);
+  const h = hist(r.reg.get('pf'));
+  assert.ok(fs.existsSync(sdir), 'its files stay');
+  const gaps = h.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap');
+  assert.deepEqual(gaps.map((g) => [g.from, g.to]), [[101, 10_100]], 'the seqs above the floor are a recorded hole');
+  await r.reg.closeAll();
+  // A reservation above the floor written on this boot covers nothing issued, as the journal reads it after
+  // a daemon crash that lost nothing the page cache held; nor does one at the floor. Either way every file
+  // aged out, and the session goes.
+  for (const reservation of [{ reserved: 20_100, boot: 'this-boot' }, { reserved: 10_101 }]) {
+    fs.mkdirSync(sdir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(sdir, 'journal.meta.json'), JSON.stringify({ v: 1, epoch: 'd'.repeat(16), highWater: 10_101, ...reservation }) + '\n', { mode: 0o600 });
+    for (const f of fs.readdirSync(sdir).filter((n) => /^journal(\.\d+)?\.jsonl$/.test(n))) fs.writeFileSync(path.join(sdir, f), '', { mode: 0o600 });
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', createdAt: Date.now() - 86_400_000, retention: { maxAgeMs: 3_600_000 } }), { mode: 0o600 });
+    const r2 = rig(dir);
+    assert.equal(r2.reg.get('pf'), undefined, `past its age with nothing honoured above the floor, it is removed (${JSON.stringify(reservation)})`);
+    assert.equal(fs.existsSync(sdir), false);
+    await r2.reg.closeAll();
+  }
 });
 
 test('jr2-4: an end a recovery wrote is bounded by the evidence it recorded as the in-flight rule is — a member proven to have started before it, not one that may have started after (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 5)', () => {
