@@ -253,6 +253,26 @@ test('a marker Run’s progress digest shows neither the typed line’s echo nor
   assert.equal(out.filter((s) => s.kind === 'output').at(-1)!.body, 'building 1\nbuilding 2\nhalf');
 });
 
+test('a marker Run’s digest leaves out the typed line’s echo when it is the partial line, its line end still to come', async (t) => {
+  // A reviewer's read of the fixes for #22: bash's readline writes the echo and then its line end, which can reach the daemon
+  // in reads of their own (by run, 63 of 200 typed lines in bash 5). With no hold, a digest between them showed the echo.
+  const src = fakeSource();
+  const seg = new Segmenter(src, { runSettleMs: 5, cadenceMs: 40, screenQuietMs: 20 });
+  t.after(() => seg.dispose());
+  const out = collect(seg);
+  const nonce = 'a1b2c3d4';
+  src.runs.set('r1', { runId: 'r1', sessionId: 's1', target: 'shell', origin: 'agent', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'exact', line: 'make', strategy: 'marker', nonce });
+  src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/w', strategy: 'marker', nonce });
+  src.journal.append({ type: 'output', data: `Welcome\r\nsh$ ${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce)}`, stream: 'pty', runId: 'r1' });
+  await until(() => out.some((s) => s.kind === 'output'), 5000, 'a digest with the echo still unended');
+  const early = out.filter((s) => s.kind === 'output').at(-1)!;
+  assert.equal(early.body, 'Welcome', `the echo's line is the shell's: ${JSON.stringify(early.body)}`);
+  // A program's own partial line still shows, a password prompt included.
+  src.journal.append({ type: 'output', data: `\r\n<<<START:${nonce}:4242>>>\r\nPassword: `, stream: 'pty', runId: 'r1' });
+  await until(() => out.some((s) => s.kind === 'output' && /Password/.test(s.body ?? '')), 5000, 'the program\'s partial line');
+  assert.equal(out.filter((s) => s.kind === 'output').at(-1)!.body, 'Password:', 'after the mark: the lines before it go, the prompt shows');
+});
+
 test('a marker Run in flight when the segmenter begins: its digest drops the echo and the start mark when the read reaches them, and holds nothing back when it does not', async (t) => {
   // A reviewer's read of the fixes for #22: trackInflight gave a Run in flight no preamble, so a lane's first digest showed
   // the typed line's echo and `<<<START:…>>>`. A read the byte bound cut begins past the mark, which it must not wait for.

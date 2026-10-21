@@ -776,10 +776,13 @@ interface RunWatch {
    * 6310921374). An inline Run has none: the session journals the piece through its start mark to the
    * Run around it before the Run starts, so its output begins after the mark, and a preamble waiting
    * for a mark that never came held its partial line back for the whole Run (a reviewer's read of the
-   * fixes for #22). It holds no partial line back: at the digests' cadence the first digest comes after
-   * a shell has run its typed line, and a file that never ran, because a program read the line, would
-   * have held the program's partial line (a `Password: `) back for the whole Run (the house's review of
-   * 4f4c067..a8b6f28, PR #22, comment 6323055715, question 4).
+   * fixes for #22). It holds no partial line back, since a file that never ran, because a program read
+   * the line, would have held the program's partial line (a `Password: `) back for the whole Run (the
+   * house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715, question 4); but a partial line that
+   * is the echo is left out as a complete one is. bash's readline writes the echo and then its line end,
+   * and the two can reach the daemon in reads of their own (by run in bash 5, 63 of 200 typed lines;
+   * dash's tty echo came whole), so a digest between them showed the daemon's typed line as the Run's
+   * (a reviewer's read of the fixes for #22).
    */
   preamble?: { start: RegExp; echo: RegExp } | undefined;
   /**
@@ -1219,7 +1222,10 @@ export class Segmenter {
     // the watch goes with the Run, and nothing is lost, since the completion renders the Run's text
     // from the journal, not from these lines (the house's read of the 38 commits, #22, comment 6274773484).
     // The line-end rule's own record says so too, whatever a cut left of the sequence in the carry.
-    const partial = w.scan.open || unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
+    // A partial line that is the typed line's echo is the shell's, as a complete one is (feedLines): bash's readline writes
+    // the echo, then the line end, and a digest between the two showed the daemon's line as the Run's (RunWatch.preamble).
+    const line = w.scan.open || unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
+    const partial = line && w.preamble?.echo.test(line) ? '' : line;
     const tail = (partial ? [...w.lines, partial] : w.lines).slice(-DIGEST_LINES).join('\n');
     const seq = this.s.journal.lastSeq;
     const elapsed = Math.max(0, Math.round(clocks.monotonic() - w.startMono));
