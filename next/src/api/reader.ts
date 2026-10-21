@@ -1022,8 +1022,10 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const carries = new Map<string, LineCarry>();
   const note = (e: JournalEvent, text: string) => {
     chunks.push({ note: text });
-    notes.add(text);
-    items.push({ ev: e });
+    // A command's line can hold newlines: each of its lines is a line of the text, none with a head to cut.
+    const lines = text.split('\n');
+    for (const l of lines) notes.add(l);
+    items.push({ ev: e, lines: lines.length });
     carries.clear();
   };
   for (const e of events) {
@@ -1078,7 +1080,13 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   let cut: Cut | undefined;
   if (shown.kept.length > 0 && items.length > 0) {
     const display = new Display(items, multi);
-    cut = display.cutBefore(display.shownFrom(outputLines(shown.kept)));
+    const asked = outputLines(shown.kept);
+    const at = display.wholeNote(display.shownFrom(asked));
+    if (at.extra > 0) {
+      all = await projectTail(asked + at.extra);
+      shown = fit(all, asked + at.extra);
+    }
+    cut = display.cutBefore(at.at);
     if (cut && cmpCut(cut, display.end) >= 0) {
       // Every line the text leaves out must lie before where the page before ends, and that page must end
       // before this one does. Unfinished lines shown after a line another source wrote later (rule 6) can
@@ -1145,6 +1153,7 @@ function lastLinesBytes(items: TextItem[], n: number): number {
  * A piece of a tail's text in journal order: an output event's data (`key` its source; `ends` its line
  * ends, and `through` where the projection's interleave cuts it: interleaveCut), or a note (a hole, a
  * command). `clipped`: the data is the event's head only, the range ending inside it (`untilOffset`).
+ * `lines`: a note's lines in the text (a command's line can hold newlines).
  */
 interface TextItem {
   ev: JournalEvent;
@@ -1153,6 +1162,7 @@ interface TextItem {
   ends?: number[];
   through?: number;
   clipped?: true;
+  lines?: number;
 }
 
 /** A point in a tail's items: after item `i`'s first `c` characters of data (a note's `c` is 1: the note itself). */
@@ -1196,6 +1206,7 @@ function col0After(data: string, nl: number, before: string | undefined, start: 
  * Lines of a tail's text as the projection orders them (§6 rule 6), one unit per line or per event's
  * lines: `lines` in the text (a header's included), `shown` of them output, and where a page of what came
  * before must end to hold the unit's first `k` lines whole (`item`'s k-th line end, or `at`; none for a header).
+ * `note`: a note's lines, which no page ends inside (wholeNote).
  */
 interface Unit {
   lines: number;
@@ -1203,6 +1214,7 @@ interface Unit {
   at?: Cut;
   item?: TextItem;
   i?: number;
+  note?: true;
 }
 
 const unitCut = (u: Unit, k: number): Cut | undefined => (u.item ? { i: u.i!, c: u.item.ends![k - 1]! + 1 } : u.at);
@@ -1261,7 +1273,10 @@ class Display {
       if (it.data === undefined) {
         flush(true);
         segment(`n:${i}`, false);
-        units.push({ lines: 1, shown: 1, at: { i, c: 1 } });
+        // A note is as many lines as it shows, and the lines shown never begin inside it (wholeNote; a note longer
+        // than the byte cap is the limit there).
+        const k = it.lines ?? 1;
+        units.push({ lines: k, shown: k, at: { i, c: 1 }, note: true });
         lineEnded = col0 = true;
         lf = { i, c: 1 };
         return;
@@ -1305,6 +1320,19 @@ class Display {
     return { u: 0, keep: 0 };
   }
 
+  /**
+   * `at` moved to the start of a note it falls inside, and the note's lines that adds to the text (`extra`): a note
+   * has no place inside it for a page to end, so the lines shown begin at its first line, more than asked for, as a
+   * reach-back's do. Ending a page of what came before after the note showed its last lines again and again, and
+   * ending it before the note left its first lines in neither page. The one limit: a note whose lines together are
+   * longer than `maxBytes` loses its first ones to the cut, and no read shows them, since a head-first page shows
+   * no command notes.
+   */
+  wholeNote(at: { u: number; keep: number }): { at: { u: number; keep: number }; extra: number } {
+    const x = this.units[at.u];
+    return x?.note && at.keep > 0 ? { at: { u: at.u, keep: 0 }, extra: at.keep } : { at, extra: 0 };
+  }
+
   /** Where a page holding every line before `at` whole ends; undefined when none comes before. */
   cutBefore(at: { u: number; keep: number }): Cut | undefined {
     return maxCut(this.prefix[at.u], at.keep > 0 ? unitCut(this.units[at.u]!, at.keep) : undefined);
@@ -1317,9 +1345,11 @@ class Display {
       return c !== undefined && cmpCut(c, this.end) === 0;
     });
     if (u === -1) u = this.units.length - 1;
-    const keep = this.units[u]!.lines - 1;
-    let lines = 1;
-    let shown = 1;
+    // The last of a unit's lines; a note's all of them (wholeNote).
+    const x = this.units[u]!;
+    const keep = x.note ? 0 : x.lines - 1;
+    let lines = x.note ? x.lines : 1;
+    let shown = x.note ? x.shown : 1;
     for (let v = u + 1; v < this.units.length; v++) {
       lines += this.units[v]!.lines;
       shown += this.units[v]!.shown;

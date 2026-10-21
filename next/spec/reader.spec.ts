@@ -1181,3 +1181,23 @@ test('search reads a C1 OSC as a string and a CAN as its end, as the projection 
   out(can.journal, 'a\x1b]0;my\x18\nb\r\n');
   assert.deepEqual((await searchJournal(can, { pattern: '^b$', since: 0 })).matches.map((m) => m.line), ['b']);
 });
+
+test('paging back past a command of several lines reaches every line: its `$ <line>` note is as many lines as it shows, and no page begins inside it', async () => {
+  // A note was one line to the display, while the text shows a command's line of three as three: a tail of 5
+  // followed back never showed `$ echo one` or `echo two`, and one of 6 never `prompt$` or `$ echo one`. A page
+  // whose lines would begin inside the note shows it whole.
+  const src = source();
+  out(src.journal, 'prompt$ \r\n');
+  src.journal.append({ type: 'run.admit', runId: 'r1', target: 'shell', principal: 'agent:a@test', origin: 'self', queued: false });
+  src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/', line: 'echo one\necho two\necho three' });
+  out(src.journal, 'one\r\ntwo\r\nthree\r\n');
+  endRun(src.journal, 'r1');
+  out(src.journal, 'after\r\n');
+  const all = (await readJournal(src, { tail: 50, commands: true }, { resultBytes: 16384 })).text!.split('\n');
+  assert.deepEqual(all, ['prompt$', '$ echo one', 'echo two', 'echo three', 'one', 'two', 'three', 'after']);
+  for (const tail of [1, 2, 3, 4, 5, 6, 7]) {
+    const pages = await pagesBack(src, { tail, commands: true });
+    const seen = new Set(pages.flatMap((p) => p.text!.split('\n')));
+    for (const l of all) assert.ok(seen.has(l), `tail ${tail}: ${l} in ${JSON.stringify(pages.map((p) => p.text))}`);
+  }
+});
