@@ -154,6 +154,8 @@ class CursorBook {
   private dirty = false;
   /** This session's cursor directory could not be synced, and the log has said so: once per session for as long as the registry keeps its book (across its lives), since the file holds the cursors and rewriting changes nothing. */
   private syncWarned = false;
+  /** The name's files are being removed: nothing more is written, whatever a gone life still reports. */
+  private cancelled = false;
 
   constructor(
     private readonly file: string,
@@ -178,6 +180,7 @@ class CursorBook {
 
   /** Take a principal's cursors as the live Session reports them. */
   set(principal: Principal, c: Cursors): void {
+    if (this.cancelled) return;
     const cur = this.map.get(principal);
     if (cur && cur.delivered === c.delivered && cur.read === c.read) return;
     this.map.set(principal, { delivered: c.delivered, read: c.read });
@@ -228,8 +231,13 @@ class CursorBook {
     }
   }
 
-  /** Stop without writing (the session's files are being removed). */
+  /**
+   * Stop without writing (the session's files are being removed), for good: a forgotten life's Session can
+   * still settle a late delivery, and its book wrote the old cursors into the cursors.json a re-created name's
+   * new book owns, which a restart then read for the new journal (the house's read of 4f4c067, #22).
+   */
   cancel(): void {
+    this.cancelled = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.dirty = false;

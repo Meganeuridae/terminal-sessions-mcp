@@ -2089,3 +2089,30 @@ test("a catch-up that retires a refused catch-up summary retires the seq it owed
   }
 });
 
+test("a forgotten name's late settlement writes nothing into the cursors.json of the life re-created under it", { timeout: 60_000 }, async () => {
+  // The old life's book was cancelled but still took a late acceptance's cursors and wrote them over the
+  // re-created name's file: {delivered: 61} for a journal at seq 7, which a restart read for the new life.
+  const f = await bareLane('c-late-forgotten');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'lf' });
+    const old = live(f.registry, 'lf');
+    for (let i = 0; i < 8; i++) await f.app.run(f.caller, { session: 'lf', command: `echo old-${i}`, target: 'process', wait: 5000 });
+    f.late.value = true;
+    const r = await f.app.run(f.caller, { session: 'lf', command: 'echo old-last', target: 'process', wait: 0 });
+    await until(() => old.run(r.runId!).seq.end !== undefined, 5000, "the old life's last Run to end");
+    await until(() => f.pending.length >= 1, 5000, 'its completion pushed and held');
+    await f.app.sessionClose(f.caller, { session: 'lf', forget: true });
+    f.late.value = false;
+    await f.app.sessionOpen(f.caller, { id: 'lf' });
+    const neu = live(f.registry, 'lf');
+    assert.notEqual(neu, old);
+    const file = path.join(f.registry['root' as never] as unknown as string, 'lf', 'cursors.json');
+    for (const p of f.pending.splice(0)) p.answer();
+    await until(() => old.cursorsOf(A).delivered > neu.journal.lastSeq, 5000, 'the late acceptance to reach the old life');
+    await sleep(1500); // past the book's write delay
+    const onDisk = fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, { delivered: number }>)[A]?.delivered ?? 0 : 0;
+    assert.ok(onDisk <= neu.journal.lastSeq, `the file holds the new life's cursors, not the old life's ${old.cursorsOf(A).delivered} (read ${onDisk}, new life at seq ${neu.journal.lastSeq})`);
+  } finally {
+    await f.close();
+  }
+});
