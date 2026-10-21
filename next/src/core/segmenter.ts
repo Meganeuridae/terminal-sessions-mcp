@@ -26,7 +26,7 @@ import { cutPlumbing } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
 import { safeCut, tailStart, unfinishedSequence } from './text.js';
 import { project } from './transcript.js';
-import { DEFAULT_GEOMETRY, type EventOf, type JournalEvent, type OutputStream, type Principal, type RunInfo, type ScreenSnapshot, type Seq } from './types.js';
+import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type JournalEvent, type OutputStream, type Principal, type RunInfo, type ScreenSnapshot, type Seq } from './types.js';
 
 export type SegmentKind =
   | 'run'
@@ -511,10 +511,17 @@ export interface LifecycleScan {
    * cursor over a small memory ring returned a handful of completions as if they were all (the house's
    * read of 3eade8a, #22). Every page's gap is kept, not only the first page's, so a hole in a later
    * page is not silently skipped (the house's read of the 36 commits, #22, comment 6269992150), and so
-   * is every gap event the journal recorded; each range is clipped to the scan and merged with those it
-   * overlaps, in seq order.
+   * is every gap event the journal recorded; each range is clipped to the scan, in seq order, with its
+   * reason (see `goneRanges`).
    */
-  lost?: Array<{ from: Seq; to: Seq }>;
+  lost?: Gone[];
+}
+
+/** A range of seqs a scan found gone, and why. */
+export interface Gone {
+  from: Seq;
+  to: Seq;
+  reason: GapReason;
 }
 
 /** Events only a running shell journals: after an exit or recovery they mean a new life began, which supersedes it (a viewer attaching to an ended shell is not one). */
@@ -569,38 +576,21 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
     if (kept.length > Math.max(64, keep * 4)) trim();
   };
 
-  const gones: Array<{ from: Seq; to: Seq }> = [];
-  // A range gone, clipped to what this scan covers (after `since`, through `end`: a page read while
-  // the ring dropped events can report a gap past the scan's end, where the lane would pin its
-  // summary), and merged with any range it overlaps or touches, so a hole reported both as a page's
-  // gap and as the journal's gap event is named once (the house's read of the 38 commits, #22,
-  // comment 6274773484).
-  const gone = (from: Seq, to: Seq) => {
-    let f = Math.max(from, since + 1);
-    let t = Math.min(to, end);
-    if (f > t) return;
-    for (let i = gones.length - 1; i >= 0; i--) {
-      const x = gones[i]!;
-      if (x.from > t + 1 || f > x.to + 1) continue;
-      f = Math.min(f, x.from);
-      t = Math.max(t, x.to);
-      gones.splice(i, 1);
-    }
-    gones.push({ from: f, to: t });
-    gones.sort((a, b) => a.from - b.from);
-  };
+  // The holes the journal recorded as gap events, and those only a page's read reported.
+  const recorded: Gone[] = [];
+  const inferred: Gone[] = [];
   for (const page of src.journal.pages(since, SCAN_PAGE)) {
     // Every page's gap, not only the first: a hole a cold-store failure left is reported as the gap of
     // the later page that starts inside it, and dropping it moved the catch-up past the hole with no
     // notice (the house's read of the 36 commits, #22, comment 6269992150).
-    if (page.gap) gone(page.gap.from, page.gap.to);
+    if (page.gap) inferred.push({ from: page.gap.from, to: page.gap.to, reason: page.gap.reason });
     const events = page.events;
     if (!events.length) break;
     for (const ev of events) {
       if (ev.seq > end) break;
       // A hole the journal recorded as an event: a failing store's, once it recovered, which no page
       // reports as a gap then, since the events after it are on disk again.
-      if (ev.type === 'gap') gone(ev.from, ev.to);
+      if (ev.type === 'gap') recorded.push({ from: ev.from, to: ev.to, reason: ev.reason });
       else if (LIFE_EVENTS.has(ev.type)) {
         tentative = [];
         lost = { principals: [], count: 0 };
@@ -632,7 +622,36 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
   trim();
   const out: LifecycleScan = { picked: kept, end };
   if (omitted) out.omitted = omitted;
+  const gones = goneRanges(recorded, inferred, since + 1, end);
   if (gones.length) out.lost = gones;
+  return out;
+}
+
+/**
+ * The ranges a scan of [`from`, `to`] found gone, in seq order, each clipped to the scan: a page read
+ * while the ring dropped events can report a gap past the scan's end, where the lane would pin its
+ * summary (the house's read of the 38 commits, #22, comment 6274773484). Each keeps its reason: a gap
+ * event's own, and retention for what only a page reported (a page cannot tell why a hole is there)
+ * where no recorded gap covers it, as a read reports it (`uncovered` in the reader); the catch-up
+ * summary called every range past retention (a reviewer's read of the fixes for #22). Ranges of one
+ * reason that overlap or touch are one, so a hole reported both as a page's gap and as the journal's
+ * gap event is named once.
+ */
+function goneRanges(recorded: Gone[], inferred: Gone[], from: Seq, to: Seq): Gone[] {
+  const clip = (g: Gone): Gone[] => {
+    const f = Math.max(g.from, from);
+    const t = Math.min(g.to, to);
+    return f > t ? [] : [{ from: f, to: t, reason: g.reason }];
+  };
+  const known = recorded.flatMap(clip);
+  let rest = inferred.flatMap(clip);
+  for (const r of known) rest = rest.flatMap((p) => (r.to < p.from || r.from > p.to ? [p] : [...(r.from > p.from ? [{ ...p, to: r.from - 1 }] : []), ...(r.to < p.to ? [{ ...p, from: r.to + 1 }] : [])]));
+  const out: Gone[] = [];
+  for (const g of [...known, ...rest].sort((a, b) => a.from - b.from || a.to - b.to)) {
+    const last = out[out.length - 1];
+    if (last && last.reason === g.reason && g.from <= last.to + 1) last.to = Math.max(last.to, g.to);
+    else out.push({ ...g });
+  }
   return out;
 }
 

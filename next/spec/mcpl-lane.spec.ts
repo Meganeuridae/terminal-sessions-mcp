@@ -19,11 +19,12 @@ import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { CORE_TOOLS } from '../src/api/tools.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
+import type { Journal } from '../src/core/journal.js';
 import type { SegmenterOptions } from '../src/core/segmenter.js';
 import { seqOfMessageId } from '../src/core/segmenter.js';
 import type { Session } from '../src/core/session.js';
 import { Outbound, type Message } from '../src/transport/jsonrpc.js';
-import { FEATURE_SETS, manifest, McplLane, NODE_NAME, noteBudgets, summaryFloor } from '../src/transport/mcpl.js';
+import { FEATURE_SETS, manifest, McplLane, NODE_NAME, summaryFloor } from '../src/transport/mcpl.js';
 import { TermServer } from '../src/transport/server.js';
 import { FULL_GRANT, TestHost, sleep, until, type Delivery, type Msg } from './testhost.js';
 
@@ -750,7 +751,7 @@ test('a catch-up that begins inside a retention gap tells the host the range it 
     assert.ok(oldest > 1, `retention took the start of the journal (oldest seq ${oldest})`);
     const a = await d.host('ta', 'rg-a');
     const missed = await a.delivery((x) => x.tags.includes('terminal:missed'), 6000);
-    assert.match(missed.text, /^\[terminal\] rg: seq 1–\d+ gone past retention, with whatever happened then · read session=rg since=\d+ as=events$/);
+    assert.match(missed.text, /^\[terminal\] rg: seq 1–\d+ \(past retention\) gone, with whatever happened then · read session=rg since=\d+ as=events$/);
     const { lostFrom, lostTo } = missed.metadata as { lostFrom: number; lostTo: number };
     assert.equal(lostFrom, 1);
     // Retention moves on between the first look and the scan (the new host's own attach events evict
@@ -1258,24 +1259,29 @@ test('a catch-up summary of omitted messages and gone ranges names them apart, a
     const t = { kind: 'history', id: 'sm', journal: { epoch: 'e1' } };
     const summary = (lane as unknown as { summary: (t: unknown, o: unknown, lost: unknown) => { seq: number; messageId: string; head: string; metadata: Record<string, unknown> } }).summary.bind(lane);
     const omitted = { count: 4, from: 228, to: 240, kinds: { run: 4 } };
-    const both = summary(t, omitted, [{ from: 1, to: 226 }]);
+    const both = summary(t, omitted, [{ from: 1, to: 226, reason: 'retention' }]);
     assert.equal(both.seq, 240);
     assert.equal(both.messageId, 'sm~e1:summary:240');
-    assert.match(both.head, /^\[terminal\] sm: 4 earlier messages .*\(4 completions\) · seq 228–240 · seq 1–226 gone past retention, with whatever happened then · read session=sm since=227 as=events$/);
+    assert.match(both.head, /^\[terminal\] sm: 4 earlier messages .*\(4 completions\) · seq 228–240 · seq 1–226 \(past retention\) gone, with whatever happened then · read session=sm since=227 as=events$/);
     assert.deepEqual([both.metadata.count, both.metadata.from, both.metadata.to, both.metadata.lostFrom, both.metadata.lostTo], [4, 228, 240, 1, 226]);
     assert.equal(summaryFloor(omitted, [{ from: 1 }]), 1);
-    const two = summary(t, omitted, [{ from: 1, to: 100 }, { from: 150, to: 226 }]);
-    assert.match(two.head, / · seq 1–100, 150–226 gone past retention, with whatever happened then · read session=sm since=227 as=events$/);
+    const two = summary(t, omitted, [{ from: 1, to: 100, reason: 'retention' }, { from: 150, to: 226, reason: 'retention' }]);
+    assert.match(two.head, / · seq 1–100, 150–226 \(past retention\) gone, with whatever happened then · read session=sm since=227 as=events$/);
     assert.deepEqual([two.seq, two.metadata.lostFrom, two.metadata.lostTo], [240, 1, 226]);
     assert.equal(summaryFloor(omitted, [{ from: 1 }, { from: 150 }]), 1, 'the earliest of three starts');
-    const after = summary(t, omitted, [{ from: 300, to: 310 }]);
+    const after = summary(t, omitted, [{ from: 300, to: 310, reason: 'retention' }]);
     assert.deepEqual([after.seq, after.metadata.from, after.metadata.lostFrom, after.metadata.lostTo], [240, 228, 300, 310]);
     assert.equal(summaryFloor(omitted, [{ from: 300 }]), 228, 'a gone range past the omitted range: the omitted start pins');
     assert.equal(summaryFloor(undefined, [{ from: 5 }, { from: 2 }]), 2);
-    const gapOnly = summary(t, undefined, [{ from: 1, to: 226 }]);
+    const gapOnly = summary(t, undefined, [{ from: 1, to: 226, reason: 'retention' }]);
     assert.equal(gapOnly.seq, 226);
     assert.deepEqual([gapOnly.metadata.count, gapOnly.metadata.lostFrom, gapOnly.metadata.lostTo], [0, 1, 226]);
     assert.match(gapOnly.head, /since=226 as=events$/);
+    // Each range says why it is gone, in a read's words: every range was called past retention, a failed store's
+    // hole and a torn write's too (a reviewer's read of the fixes for #22). The metadata stays two scalars.
+    const mixed = summary(t, undefined, [{ from: 6, to: 9, reason: 'retention' }, { from: 10, to: 30, reason: 'store-failed' }, { from: 80, to: 90, reason: 'store-failed' }, { from: 95, to: 96, reason: 'torn-write' }]);
+    assert.match(mixed.head, /^\[terminal\] sm: seq 6–9 \(past retention\), 10–30, 80–90 \(the journal store never took them\), 95–96 \(a torn write\) gone, with whatever happened then · read session=sm since=96 as=events$/);
+    assert.deepEqual([mixed.metadata.lostFrom, mixed.metadata.lostTo], [6, 96]);
   } finally {
     lane.dispose();
   }
@@ -1359,6 +1365,7 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     watched: Map<string, unknown>;
     states: Map<string, { owed: Set<number>; retries: Map<string, unknown> }>;
     startCatchUp(sessions: string[]): Promise<void>;
+    budgetOf(journal: Journal): { retained: unknown[] };
     deliver(t: Session, seg: unknown, opts: { released: true }): void;
   };
   /** A Run whose outcome counts as returned by its call: once settled, nothing of it is held or owed. */
@@ -1650,11 +1657,13 @@ test('without a byte cap the note budget keeps no sizes, only the rates apply; u
   try {
     const publish = (channel: string, text: string) => f.lane.handle('channels/publish', { channelId: channel, content: [{ type: 'text', text }] }, f.ctx);
     await f.app.sessionOpen(f.caller, { id: 'nn', visibility: 'shared' });
+    // What the budget keeps is memory, which no reply shows: the spec reads its list through the lane, as it reads the lane's other state.
+    const kept = (session: string) => f.inside.budgetOf(live(f.registry, session).journal).retained.length;
     for (let i = 0; i < 4; i++) await publish('terminal:nn', `note ${i}`);
-    assert.equal(noteBudgets.get(live(f.registry, 'nn').journal.runs)?.retainedNotes ?? 0, 0, 'no cap: nothing to evict, nothing kept');
+    assert.equal(kept('nn'), 0, 'no cap: nothing to evict, nothing kept');
     await f.app.sessionOpen(f.caller, { id: 'nc', visibility: 'shared', retention: { maxBytes: 64 * 1024 } });
     for (let i = 0; i < 2; i++) await publish('terminal:nc', `note ${i}`);
-    assert.equal(noteBudgets.get(live(f.registry, 'nc').journal.runs)?.retainedNotes, 2, 'a cap: each retained note counts');
+    assert.equal(kept('nc'), 2, 'a cap: each retained note counts');
   } finally {
     await f.close();
   }

@@ -844,26 +844,34 @@ test('a hole a cold-store failure left on a later page of the scan is reported, 
     const recorded = journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap');
     assert.ok(recorded.some((g) => g.from > persisted), `the journal recorded the hole: ${JSON.stringify(recorded)}`);
     const healed = await scanLifecycle(liveSource(src), 0);
+    // Under the reason the journal recorded: every range was taken for retention (a reviewer's read of the fixes for #22).
     for (const g of recorded.filter((x) => x.from > persisted)) {
-      assert.ok(healed.lost?.some((x) => x.from <= g.from && x.to >= g.to), `the recorded hole ${g.from}–${g.to} is named: ${JSON.stringify(healed.lost)}`);
+      assert.ok(healed.lost?.some((x) => x.from <= g.from && x.to >= g.to && x.reason === g.reason), `the recorded hole ${g.from}–${g.to} (${g.reason}) is named: ${JSON.stringify(healed.lost)}`);
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('a scan clips each gone range to the seqs it covers and names a hole reported twice once', async () => {
+test('a scan clips each gone range to the seqs it covers, names a hole reported twice once, and keeps each range\'s reason', async () => {
   // The house's read of the 38 commits (#22, comment 6274773484): a page's gap was copied whole, and the lane pinned its
   // summary at the last gap's end, which can lie past the scan's end when the ring drops events during a paged scan.
   let page: { events: JournalEvent[]; gap?: { from: number; to: number; reason: 'retention' }; nextCursor: number; more: boolean } = { events: [], gap: { from: 1, to: 150, reason: 'retention' }, nextCursor: 0, more: false };
   const journal = { lastSeq: 100, *pages() { yield page; } } as unknown as Journal;
   const src = { id: 's', journal, owner: A, state: 'idle', cwd: undefined, controller: null, run: () => { throw new Error('run_not_found'); }, runText: async () => ({ text: '', truncated: false, seq: [0, 0], nextCursor: 0 }) } as unknown as ReplaySource;
-  assert.deepEqual((await scanLifecycle(src, 0)).lost, [{ from: 1, to: 100 }], 'clipped to the scan’s end');
-  assert.deepEqual((await scanLifecycle(src, 40)).lost, [{ from: 41, to: 100 }], 'and to its start');
+  assert.deepEqual((await scanLifecycle(src, 0)).lost, [{ from: 1, to: 100, reason: 'retention' }], 'clipped to the scan’s end');
+  assert.deepEqual((await scanLifecycle(src, 40)).lost, [{ from: 41, to: 100, reason: 'retention' }], 'and to its start');
   // One hole as a page's gap and as the journal's gap event, with other bounds; a second hole apart; an old one before the scan.
-  const gap = (seq: number, from: number, to: number): JournalEvent => ({ type: 'gap', seq, ts: 0, from, to, reason: 'store-failed' });
-  page = { events: [gap(31, 10, 30), gap(91, 80, 90), gap(92, 1, 4), { type: 'note', seq: 95, ts: 0, text: 'x' } as JournalEvent], gap: { from: 6, to: 20, reason: 'retention' }, nextCursor: 95, more: false };
-  assert.deepEqual((await scanLifecycle(src, 5)).lost, [{ from: 6, to: 30 }, { from: 80, to: 90 }]);
+  // The recorded reason holds where the journal recorded the hole, and a page, which cannot tell why, says retention only for
+  // the rest, as a read does: every range was called past retention (a reviewer's read of the fixes for #22).
+  const gap = (seq: number, from: number, to: number, reason: 'store-failed' | 'torn-write' = 'store-failed'): JournalEvent => ({ type: 'gap', seq, ts: 0, from, to, reason });
+  page = { events: [gap(31, 10, 30), gap(91, 80, 90), gap(92, 1, 4), gap(93, 91, 92, 'torn-write'), { type: 'note', seq: 95, ts: 0, text: 'x' } as JournalEvent], gap: { from: 6, to: 20, reason: 'retention' }, nextCursor: 95, more: false };
+  assert.deepEqual((await scanLifecycle(src, 5)).lost, [
+    { from: 6, to: 9, reason: 'retention' },
+    { from: 10, to: 30, reason: 'store-failed' },
+    { from: 80, to: 90, reason: 'store-failed' },
+    { from: 91, to: 92, reason: 'torn-write' },
+  ]);
 });
 
 test('a completion reads a negative journaled duration as no time, and a digest counts its elapsed time on the monotonic clock', async (t) => {

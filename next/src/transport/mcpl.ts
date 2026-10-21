@@ -20,6 +20,7 @@ import * as os from 'node:os';
 import { capabilityGranted, deriveFeatureSets, grantFromUpdate, withRevision, type CapabilityGrantState, type FeatureSetDeclaration, type FeatureSetsUpdateParams } from '@animalabs/mcpl-core';
 import type { App, Caller } from '../api/app.js';
 import { presence } from '../api/presence.js';
+import { describeGap } from '../api/reader.js';
 import type { AnySession, HistorySession } from '../api/registry.js';
 import { CORE_TOOLS, TOOLS, type Tier } from '../api/tools.js';
 import { clocks } from '../core/clock.js';
@@ -37,6 +38,7 @@ import {
   scanLifecycle,
   segmentId,
   seqOfMessageId,
+  type Gone,
   type LifecycleEvent,
   type LifecycleScan,
   type Omitted,
@@ -47,7 +49,7 @@ import {
 } from '../core/segmenter.js';
 import { serviceOutcomeKey, type Session } from '../core/session.js';
 import { lineBytes } from '../core/stores.js';
-import type { JournalEvent, Principal, RunInfo, Seq } from '../core/types.js';
+import type { GapReason, JournalEvent, Principal, RunInfo, Seq } from '../core/types.js';
 import { CAPABILITY_DENIED, CHANNEL_NOT_PERMITTED, INTERNAL, INVALID_PARAMS, OVERLOADED, RpcError, UNKNOWN_CHANNEL, type Outbound } from './jsonrpc.js';
 
 /**
@@ -259,8 +261,8 @@ export const summaryFloor = (o: Omitted | undefined, gaps: ReadonlyArray<{ from:
 const targetOf = (entry: AnySession): Target => (entry.kind === 'live' ? entry.session : entry);
 const liveOf = (t: Target): Session | undefined => ('kind' in t && t.kind === 'history' ? undefined : (t as Session));
 
-/** Note budgets by lineage (mcpl-5); exported for the spec that checks what a budget retains. */
-export const noteBudgets = new WeakMap<object, NoteBudget>();
+/** Note budgets by lineage (mcpl-5). */
+const noteBudgets = new WeakMap<object, NoteBudget>();
 
 /**
  * The lanes of one App, by principal. A principal's `delivered` cursor is one across its
@@ -763,9 +765,7 @@ export class McplLane {
         const max = Math.max(0, share - (stored - bytes));
         throw new RpcError(INVALID_PARAMS, `a note on this session is at most ${max} bytes (notes may use 1/${NOTE_SHARE} of its ${fmtBytes(retention)} retention, ${fmtBytes(share)} as the journal stores them); write longer text to a file and point to it`, { channelId: params.channelId, bytes, maxBytes: max });
       }
-      const lineage = journal.runs;
-      budget = noteBudgets.get(lineage);
-      if (!budget) noteBudgets.set(lineage, (budget = new NoteBudget()));
+      budget = this.budgetOf(journal);
       // After a daemon restart the budget starts empty while the journal still holds every note it kept.
       capped = Number.isFinite(retention);
       if (capped) await budget.seed(journal);
@@ -784,6 +784,13 @@ export class McplLane {
       if (e instanceof TermError) throw new RpcError(CHANNEL_NOT_PERMITTED, e.message, { channelId: params.channelId, ...e.data });
       throw e;
     }
+  }
+
+  /** The note budget of the session's lineage (mcpl-5), made at its first note. */
+  private budgetOf(journal: Journal): NoteBudget {
+    let budget = noteBudgets.get(journal.runs);
+    if (!budget) noteBudgets.set(journal.runs, (budget = new NoteBudget()));
+    return budget;
   }
 
   // ───────────── presence (§10.4) ─────────────
@@ -1339,17 +1346,18 @@ export class McplLane {
 
   /**
    * One message for what a catch-up did not replay (ux-25): how many of each and where to read them,
-   * and the ranges the scan found gone past retention (or a hole a cold-store failure left), with
-   * whatever they held, which no read brings back (the segmenter's read, comment 6265082050 on #22).
-   * Every gap the scan kept is named, not only the first (comment 6269992150); at least one of the two
-   * is given.
+   * and the ranges the scan found gone, with whatever they held, which no read brings back (the
+   * segmenter's read, comment 6265082050 on #22). Every gap the scan kept is named, not only the first
+   * (comment 6269992150), each with why in a read's words (`describeGap`): all were called past
+   * retention, a torn write's or a failed store's hole too (a reviewer's read of the fixes for #22). At
+   * least one of the two is given.
    */
   private summary(t: Target, o: Omitted | undefined, lost: LifecycleScan['lost']): Segment {
     const names: Record<string, string> = { run: 'completions', service: 'service changes', watch: 'watch firings', 'session-exit': 'shell exits', recovered: 'restarts', 'needs-input': 'input prompts' };
     const gaps = lost ?? [];
     const parts: string[] = [];
     if (o) parts.push(`${o.count} earlier message${o.count > 1 ? 's' : ''} while you were away not replayed (${Object.entries(o.kinds).map(([k, n]) => `${n} ${names[k] ?? k}`).join(', ')}) · seq ${o.from}–${o.to}`);
-    if (gaps.length) parts.push(`seq ${gaps.map((g) => `${g.from}–${g.to}`).join(', ')} gone past retention, with whatever happened then`);
+    if (gaps.length) parts.push(`seq ${goneText(gaps)} gone, with whatever happened then`);
     const to = o?.to ?? gaps[gaps.length - 1]!.to;
     const since = o ? Math.max(0, o.from - 1) : gaps[gaps.length - 1]!.to;
     const metadata: Record<string, unknown> = { session: t.id, state: liveOf(t)?.state ?? 'exited', count: o?.count ?? 0, from: o?.from ?? gaps[0]!.from, to, kinds: o?.kinds ?? {} };
@@ -1428,7 +1436,7 @@ export class McplLane {
  * house's read of 2f357bd, #22). Without a byte cap there is nothing to evict: the share is
  * unbounded and only the rates apply.
  */
-export class NoteBudget {
+class NoteBudget {
   private readonly buckets = new Map<Principal, { tokens: number; at: number; minute: number[] }>();
   private readonly retained: Array<[Seq, number]> = [];
   private bytes = 0;
@@ -1477,11 +1485,17 @@ export class NoteBudget {
     this.retained.push([seq, bytes]);
     this.bytes += bytes;
   }
+}
 
-  /** How many notes' sizes the budget keeps (those still retained under a byte cap). */
-  get retainedNotes(): number {
-    return this.retained.length;
+/** Gone ranges in seq order, each run of one reason named once in a read's words: `1–100, 150–226 (past retention), 300–310 (a torn write)`. */
+function goneText(gaps: ReadonlyArray<Gone>): string {
+  const runs: Array<{ reason: GapReason; ranges: string[] }> = [];
+  for (const g of gaps) {
+    const last = runs[runs.length - 1];
+    if (last?.reason === g.reason) last.ranges.push(`${g.from}–${g.to}`);
+    else runs.push({ reason: g.reason, ranges: [`${g.from}–${g.to}`] });
   }
+  return runs.map((r) => `${r.ranges.join(', ')} (${describeGap(r.reason)})`).join(', ');
 }
 
 function flat(meta: Record<string, unknown>): Record<string, string | number | boolean> {
