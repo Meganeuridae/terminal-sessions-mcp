@@ -1719,3 +1719,19 @@ test("a tail that ends at offset 0 of the journal's first event is empty (an ind
   const next = await readJournal(src, { tail: 5, until: first, untilOffset: 2 }, { resultBytes: 16384 });
   assert.equal(next.text, 'ab');
 });
+
+test('a read that ends inside what retention took reports the hole only as far as its own end (an independent read of the fixes for the review of the 40 commits, PR #22)', async () => {
+  const j = new Journal({ sessionId: 's', hot: new MemoryStore(600) });
+  const src = source({ journal: j });
+  for (let i = 0; i < 60; i++) out(j, `line ${i}\r\n`);
+  const oldest = j.oldestSeq!;
+  assert.ok(oldest > 10, `oldest ${oldest}`);
+  for (const until of [3, oldest - 2]) {
+    const r = await readJournal(src, { since: 0, until, maxBytes: 1 << 20 }, { resultBytes: 16384 });
+    assert.deepEqual(r.gap, { from: 1, to: until, reason: 'retention', exact: true }, `until ${until}`);
+    const s = await searchJournal(src, { pattern: 'line', since: 0, until });
+    assert.deepEqual(s.gap, { from: 1, to: until, reason: 'retention', exact: true }, `search until ${until}`);
+    const ev = await readJournal(src, { since: 0, until, as: 'events' }, { resultBytes: 16384 });
+    assert.deepEqual(ev.gap, { from: 1, to: until, reason: 'retention', exact: true }, `events until ${until}`);
+  }
+});

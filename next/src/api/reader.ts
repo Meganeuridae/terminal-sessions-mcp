@@ -396,6 +396,10 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
   } else if (first.gap) gap = { ...first.gap };
   // The hole is left whole here: each result takes from it what the recorded gaps it returns report (uncovered).
   if (o.until !== undefined) end = Math.min(end, o.until);
+  // The hole a read infers at its start reaches no further than the read: retention's runs to its floor, and a read
+  // that ends below the floor reported seqs past its own end, as no other hole it reports does (an independent read
+  // of the fixes for the review of the 40 commits, PR #22).
+  if (gap && gap.to > end) gap = gap.from <= end ? { ...gap, to: end } : undefined;
   /**
    * Holes have been reported through this seq. Not through the inferred one at the start: a hole the journal knows
    * there is reported, and the inferred one only for what that leaves (uncovered).
