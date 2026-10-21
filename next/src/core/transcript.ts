@@ -661,7 +661,8 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     while (out.length > 1 && outBytes - out[0]!.bytes >= budget.max) {
       const gone = out.shift()!;
       outBytes -= gone.bytes;
-      drop((gone.head ?? '') + gone.data, gone.bytes);
+      // A header is no input: what goes of it is no input omitted (inputBytes).
+      if (!gone.header) drop((gone.head ?? '') + gone.data, gone.bytes);
     }
     // One source's run past twice the budget: only its last budget's worth can survive.
     const end = out[out.length - 1]!;
@@ -733,7 +734,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
           // More than the budget goes from this line, which follows every segment emitted so far: none of
           // them can survive the cut. Kept, `head` before a title's payload held whole survived the
           // payload's 20 KB (a title's LFs end no line now, so the payload is a held line's).
-          for (const s of out.splice(0)) drop((s.head ?? '') + s.data, s.bytes);
+          for (const s of out.splice(0)) if (!s.header) drop((s.head ?? '') + s.data, s.bytes);
           outBytes = 0;
         }
         const gone = tail ? h.data.slice(0, cut) : h.data.slice(cut);
@@ -782,6 +783,7 @@ function cutInput(segs: Segment[], max: number, keep: 'head' | 'tail', dropped: 
   const sizes = segs.map((s) => utf8Length(s.data));
   const total = sizes.reduce((a, b) => a + b, 0);
   if (total <= max) return 0;
+  const input = inputBytes(segs);
   if (keep === 'tail') {
     let acc = 0;
     let k = segs.length - 1;
@@ -792,6 +794,11 @@ function cutInput(segs: Segment[], max: number, keep: 'head' | 'tail', dropped: 
     let acc = 0;
     let k = 0;
     while (k < segs.length && acc + sizes[k]! <= max) acc += sizes[k++]!;
+    // A cut inside a header names what it cut away: it goes whole, as the tail's cut puts it back whole.
+    if (segs[k]!.header) {
+      segs.splice(k);
+      return input - inputBytes(segs);
+    }
     const seg = segs[k]!;
     let end = headIndex(seg.data, max - acc);
     const ends = lineEnds(seg.data.slice(0, end));
@@ -802,8 +809,16 @@ function cutInput(segs: Segment[], max: number, keep: 'head' | 'tail', dropped: 
     segs.splice(k + 1);
     if (!seg.data) segs.pop();
   }
-  return total - segs.reduce((a, s) => a + utf8Length(s.data), 0);
+  return input - inputBytes(segs);
 }
+
+/**
+ * The UTF-8 bytes of input the segments hold: their data, a header's left out, since a header names a source and is
+ * no input (rule 6). A header still takes room in the bytes a budget projects, but what a cut takes of one is no input
+ * omitted: a 6-byte budget over the pty's two lines and a Run's two counted the dropped `[terminal]` header's 11 bytes
+ * beside the pty's 8 (the house's review of 4f4c067..a8b6f28, #22, comment 6323055715).
+ */
+const inputBytes = (segs: readonly Segment[]): number => segs.reduce((a, s) => a + (s.header ? 0 : utf8Length(s.data)), 0);
 
 /** A switch to or from the alternate screen (modes 47, 1047, 1049), matched at `lastIndex`. */
 const ALT_SWITCH = /\x1b\[\?([0-9;]*)([hl])/y;
@@ -830,7 +845,7 @@ function altSwitchBefore(d: string, i: number): { at: number; enter: boolean } |
  */
 function cutToLastNewlines(segs: Segment[], n: number, rows: number, dropped: string[]): number {
   const cut = (k: number, at: number): number => {
-    const omitted = segs.slice(0, k).reduce((a, s) => a + utf8Length(s.data), 0) + utf8Length(segs[k]!.data.slice(0, at));
+    const omitted = inputBytes(segs.slice(0, k)) + utf8Length(segs[k]!.data.slice(0, at));
     dropHead(segs, k, at, dropped);
     return omitted;
   };
@@ -900,11 +915,11 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
   // headers were gathered, so a tail of 2 counted it as a line of output and cut it again (our read of the
   // house's fixes for its review of f3750e4, PR #22).
   // A cut inside the header itself kept its tail, `n r1]`, as the first line, and it is put back whole too:
-  // what of it the cuts took is no input omitted either (a reviewer's read of the fixes for #22).
+  // what of it the cuts took is no input omitted either (a reviewer's read of the fixes for #22), as no cut
+  // counts what it takes of a header (inputBytes).
   const first = segs[0];
   const named = first?.named ?? (first?.whole !== undefined && first.data !== first.whole ? first : undefined);
   if (named?.whole !== undefined) {
-    omitted -= utf8Length(named.whole) - (named === first ? utf8Length(first.data) : 0);
     named.data = named.whole;
     named.bytes = utf8Length(named.whole);
     if (named !== first) segs.unshift(named);
@@ -917,7 +932,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
     seg.lead = seg.head.length;
     delete seg.head;
   }
-  const input = (seg: Segment, from = 0) => utf8Length(seg.data.slice(Math.max(from, seg.lead ?? 0)));
+  const input = (seg: Segment, from = 0) => (seg.header ? 0 : utf8Length(seg.data.slice(Math.max(from, seg.lead ?? 0))));
   // The omitted head still set lasting terminal state (rule 7): a scroll region, modes, character sets.
   // It applies before the first thing kept, a restored header too, as before a header a cut kept whole,
   // so a header lands in the state of the lines it names.

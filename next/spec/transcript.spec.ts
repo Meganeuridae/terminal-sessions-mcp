@@ -530,7 +530,7 @@ test('a tail names its first line’s source wherever the cut falls: past the so
   const long: ProjectChunk[] = [{ data: 'p1\r\n', stream: 'pty' }, { data: 'a1-long-long-long\na2-long-long-long\na3\n', stream: 'stdout', runId: 'r1' }, { data: 'p2\r\n', stream: 'pty' }];
   const cut = await project(long, { cols: 80, rows: 24, label: sourceLabel, maxLines: 10, maxInputBytes: 40 });
   assert.deepEqual(cut.text.split('\n'), ['[run r1]', 'a2-long-long-long', 'a3', '[terminal]', 'p2']);
-  assert.equal(cut.omittedInputBytes, 'p1\r\na1-long-long-long\n'.length + '[terminal]\n'.length, 'the restored header is no input omitted');
+  assert.equal(cut.omittedInputBytes, 'p1\r\na1-long-long-long\n'.length, 'the restored header is no input omitted, nor the dropped one');
   // A restored header is a header to the line count too: a tail of 2 counted it as a line of output and cut it
   // again (our read of the house's fixes for its review of f3750e4, PR #22).
   const two = await project(long, { cols: 80, rows: 24, label: sourceLabel, maxLines: 2, maxInputBytes: 40 });
@@ -539,14 +539,24 @@ test('a tail names its first line’s source wherever the cut falls: past the so
 
 test('a byte budget whose cut falls inside a header keeps the header whole, and counts none of it as input omitted', async () => {
   // A reviewer's read of the fixes for #22: the restore put back a header the cut dropped whole, and a cut inside the
-  // header kept its tail as the first line, `]` or `n r1]`.
+  // header kept its tail as the first line, `]` or `n r1]`. A header the cut dropped for good counted as input omitted:
+  // a 6-byte budget reported 19 bytes, the pty's 8 and its `[terminal]` header's 11 (the house's review of
+  // 4f4c067..a8b6f28, #22, comment 6323055715).
   const chunks: ProjectChunk[] = [{ data: 'p1\r\np2\r\n', stream: 'pty' }, { data: 'a1\na2\n', stream: 'stdout', runId: 'r1' }];
   const input = 'p1\r\np2\r\n'.length + 'a1\na2\n'.length;
-  for (const max of [8, 10, 12, 14]) {
+  for (const max of [6, 8, 10, 12, 14]) {
     const p = await project(chunks, { cols: 80, rows: 24, label: sourceLabel, maxLines: 10, maxInputBytes: max });
     assert.deepEqual(p.text.split('\n'), ['[run r1]', 'a1', 'a2'], `a budget of ${max}`);
-    assert.equal(p.omittedInputBytes, input - 'a1\na2\n'.length + '[terminal]\n'.length, `a budget of ${max}: the pty's lines and their header`);
+    assert.equal(p.omittedInputBytes, input - 'a1\na2\n'.length, `a budget of ${max}: the pty's lines, not their header`);
   }
+  // Every budget: what is omitted is input, never more than all of it.
+  for (let max = 0; max <= 30; max++) {
+    const p = await project(chunks, { cols: 80, rows: 24, label: sourceLabel, maxLines: 10, maxInputBytes: max });
+    assert.ok(p.omittedInputBytes <= input, `a budget of ${max}: ${p.omittedInputBytes} omitted of ${input}`);
+  }
+  // The head kept: a header past the cut is no input omitted either.
+  const head = await project(chunks, { cols: 80, rows: 24, label: sourceLabel, maxLines: 10, maxInputBytes: 20, keep: 'head' });
+  assert.deepEqual([head.text.split('\n'), head.omittedInputBytes], [['[terminal]', 'p1', 'p2'], 'a1\na2\n'.length]);
 });
 
 test('a held line cut for the byte budget drops what was emitted before it: a title’s payload after a whole line keeps only the tail', async () => {
