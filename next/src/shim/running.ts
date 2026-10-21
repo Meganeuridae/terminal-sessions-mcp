@@ -16,6 +16,7 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as net from 'node:net';
+import * as os from 'node:os';
 import { clocks } from '../core/clock.js';
 
 /** The port a running termd's title names, as Linux shows the title in /proc/<pid>/cmdline (else `ps`); or why there is none. */
@@ -120,32 +121,45 @@ function health(host: string, port: number, pid: number, o: AskOptions, ms: numb
 
 /**
  * Why `socket`'s other end, a connection to a local port, is not shown to be `pid`'s, or undefined when
- * it is: the server side of the connection in /proc/net/tcp or tcp6 (the port dialled as its local port,
- * this socket's as its remote one, established), its inode among /proc/<pid>/fd's sockets. The accepted
- * socket has an inode only once the termd accepts it, so the lookup is tried again, for at most a second.
- * Elsewhere whose a socket is cannot be shown, and the answer is not taken.
+ * it is: the server side of this very connection in /proc/net/tcp or tcp6, established, its inode among
+ * /proc/<pid>/fd's sockets. The server side is found by both its addresses whole, as /proc writes them:
+ * its local one the address and port dialled, its remote one this socket's. Matched by the ports alone, a
+ * second connection from the same port number to a termd on ::1 made an impostor's socket on 127.0.0.1
+ * read as termd's, and the shim sent it its credential (a reviewer's run of the fixes for #22, on Ubuntu
+ * 24.04). An IPv4 connection's server side is in tcp, or in tcp6 as a ::ffff: address when the listener is
+ * an IPv6 socket; more than one line for it is refused. The accepted socket has an inode only once termd
+ * accepts it, so the lookup is tried again, for at most a second. Elsewhere whose a socket is cannot be
+ * shown, and the answer is not taken.
  */
 export async function connectionOf(socket: net.Socket, pid: number): Promise<string | undefined> {
   if (process.platform !== 'linux') return 'this system does not show whose a socket is';
-  const port = socket.remotePort;
-  const local = socket.localPort;
-  if (port === undefined || local === undefined) return 'the connection has no ports';
-  const hex = (n: number) => n.toString(16).toUpperCase().padStart(4, '0');
+  const { remoteAddress, remotePort: port, localAddress, localPort } = socket;
+  if (remoteAddress === undefined || port === undefined || localAddress === undefined || localPort === undefined) return 'the connection has no addresses';
+  const v6 = socket.remoteFamily === 'IPv6';
+  const wanted: Array<{ table: string; local: string | undefined; remote: string | undefined }> = v6
+    ? [{ table: '/proc/net/tcp6', local: procAddress(remoteAddress, port, true), remote: procAddress(localAddress, localPort, true) }]
+    : [
+        { table: '/proc/net/tcp', local: procAddress(remoteAddress, port, false), remote: procAddress(localAddress, localPort, false) },
+        { table: '/proc/net/tcp6', local: procAddress(`::ffff:${remoteAddress}`, port, true), remote: procAddress(`::ffff:${localAddress}`, localPort, true) },
+      ];
+  if (wanted.some((w) => w.local === undefined || w.remote === undefined)) return `the connection's addresses are not read here (${remoteAddress}, ${localAddress})`;
   for (let tries = 0; tries < 100 && !socket.destroyed; tries++) {
-    let inode: string | undefined;
-    for (const table of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    const inodes: string[] = [];
+    for (const w of wanted) {
       let text: string;
       try {
-        text = fs.readFileSync(table, 'utf8');
+        text = fs.readFileSync(w.table, 'utf8');
       } catch {
         continue;
       }
       for (const line of text.split('\n').slice(1)) {
         const f = line.trim().split(/\s+/);
         // sl local_address rem_address st … uid timeout inode; 01 is ESTABLISHED.
-        if (f[1]?.endsWith(`:${hex(port)}`) && f[2]?.endsWith(`:${hex(local)}`) && f[3] === '01') inode = f[9];
+        if (f[1] === w.local && f[2] === w.remote && f[3] === '01') inodes.push(f[9] ?? '0');
       }
     }
+    if (inodes.length > 1) return `more than one socket is the other end of this connection on port ${port}`;
+    const inode = inodes[0];
     if (inode !== undefined && inode !== '0') {
       let fds: string[];
       try {
@@ -165,4 +179,49 @@ export async function connectionOf(socket: net.Socket, pid: number): Promise<str
     await new Promise((r) => setTimeout(r, 10));
   }
   return `the socket that answered on port ${port} was not found accepted`;
+}
+
+/**
+ * An address and port as /proc/net/tcp and tcp6 write them: the address's bytes in 32-bit words, each
+ * printed as the host reads it (little-endian on x86 and arm64, so 127.0.0.1 is 0100007F), then the port
+ * in hex. undefined for an address not read here.
+ */
+export function procAddress(ip: string, port: number, v6: boolean): string | undefined {
+  const bytes = v6 ? ipv6Bytes(ip) : ipv4Bytes(ip);
+  if (!bytes) return undefined;
+  const le = os.endianness() === 'LE';
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 4) out += (le ? bytes.readUInt32LE(i) : bytes.readUInt32BE(i)).toString(16).toUpperCase().padStart(8, '0');
+  return `${out}:${port.toString(16).toUpperCase().padStart(4, '0')}`;
+}
+
+function ipv4Bytes(ip: string): Buffer | undefined {
+  const parts = ip.split('.');
+  if (parts.length !== 4 || !parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255)) return undefined;
+  return Buffer.from(parts.map(Number));
+}
+
+/** An IPv6 address's 16 bytes: `::` and a dotted IPv4 tail (`::ffff:127.0.0.1`) read, a zone (`%lo`) dropped. */
+function ipv6Bytes(ip: string): Buffer | undefined {
+  let s = ip.replace(/%.*$/, '');
+  let tail: Buffer | undefined;
+  const dotted = /(?:^|:)(\d+\.\d+\.\d+\.\d+)$/.exec(s);
+  if (dotted) {
+    tail = ipv4Bytes(dotted[1]!);
+    if (!tail) return undefined;
+    s = `${s.slice(0, s.length - dotted[1]!.length)}0:0`;
+  }
+  const halves = s.split('::');
+  if (halves.length > 2) return undefined;
+  const words = (h: string) => (h ? h.split(':') : []);
+  const head = words(halves[0]!);
+  const rest = halves.length === 2 ? words(halves[1]!) : [];
+  const fill = 8 - head.length - rest.length;
+  if (halves.length === 1 ? head.length !== 8 : fill < 0) return undefined;
+  const groups = [...head, ...Array<string>(halves.length === 2 ? fill : 0).fill('0'), ...rest];
+  if (!groups.every((g) => /^[0-9a-fA-F]{1,4}$/.test(g))) return undefined;
+  const out = Buffer.alloc(16);
+  groups.forEach((g, i) => out.writeUInt16BE(parseInt(g, 16), i * 2));
+  if (tail) tail.copy(out, 12);
+  return out;
 }

@@ -11,8 +11,9 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as http from 'node:http';
+import * as net from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { askDataDir, connectionOf, titlePort } from '../src/shim/running.js';
+import { askDataDir, connectionOf, procAddress, titlePort } from '../src/shim/running.js';
 import { launchctlUnit, plistUnit, procEnviron, systemctlUnit, TERMD_BOOLEAN_FLAGS, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -398,6 +399,54 @@ test("an answer counts only from the termd's own socket: a listener of another p
     }
   } finally {
     impostor.kill();
+  }
+});
+
+test("the other end of a connection is found by both its addresses whole, so a connection from the same port number to a termd on ::1 does not make an impostor's socket on 127.0.0.1 read as termd's (a reviewer's run of the fixes for #22)", async (t) => {
+  // As /proc/net/tcp and tcp6 write them on a little-endian host: each 32-bit word of the address as the host reads it.
+  if (os.endianness() === 'LE') {
+    assert.equal(procAddress('127.0.0.1', 3101, false), '0100007F:0C1D');
+    assert.equal(procAddress('::1', 3101, true), '00000000000000000000000001000000:0C1D');
+    assert.equal(procAddress('::ffff:127.0.0.1', 80, true), '0000000000000000FFFF00000100007F:0050');
+  }
+  assert.equal(procAddress('not an address', 1, true), undefined);
+  if (process.platform !== 'linux') return;
+  // termd on ::1 only (this process), an impostor on 127.0.0.1 at the same port, claiming termd's pid.
+  const termd = http.createServer((_req, res) => res.end(JSON.stringify({ status: 'ok', pid: process.pid, dataDir: '/real' })));
+  const bound = await new Promise<boolean>((resolve) => {
+    termd.once('error', () => resolve(false));
+    termd.listen(0, '::1', () => resolve(true));
+  });
+  if (!bound) return t.skip('no ::1 here');
+  const port = (termd.address() as { port: number }).port;
+  const impostor = spawn(process.execPath, ['-e', `const http = require('node:http'); const s = http.createServer((req, res) => { process.stdout.write('asked ' + (req.headers.authorization || '-') + '\\n'); res.end(JSON.stringify({ status: 'ok', pid: ${process.pid}, dataDir: '/impostor' })); }); s.listen(${port}, '127.0.0.1', () => process.stdout.write('listening\\n'));`], { stdio: ['ignore', 'pipe', 'ignore'] });
+  let out = '';
+  impostor.stdout!.on('data', (b: Buffer) => (out += b.toString()));
+  const sockets: net.Socket[] = [];
+  try {
+    const deadline = Date.now() + 5000;
+    while (!out.includes('listening') && impostor.exitCode === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    if (!out.includes('listening')) return t.skip('the impostor did not start');
+    const connect = (o: net.NetConnectOpts) =>
+      new Promise<net.Socket>((resolve, reject) => {
+        const c = net.connect(o);
+        sockets.push(c);
+        c.once('connect', () => resolve(c));
+        c.once('error', reject);
+      });
+    const toImpostor = await connect({ host: '127.0.0.1', port });
+    // A second connection, to termd on ::1, from the same port number as the one to the impostor.
+    const toTermd = await connect({ host: '::1', port, localAddress: '::1', localPort: toImpostor.localPort! });
+    assert.equal(await connectionOf(toImpostor, process.pid), `the socket that answered on port ${port} is not its`, 'the impostor stays an impostor');
+    assert.equal(await connectionOf(toTermd, process.pid), undefined, "termd's own connection on ::1 is its");
+    // The ask itself goes to the impostor on 127.0.0.1 first: it is sent no request, so no credential.
+    assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 3000, token: 'shim-token' }), { error: `the socket that answered on port ${port} is not its` });
+    assert.doesNotMatch(out, /asked/);
+  } finally {
+    for (const c of sockets) c.destroy();
+    impostor.kill();
+    termd.closeAllConnections();
+    await new Promise((r) => termd.close(r));
   }
 });
 
