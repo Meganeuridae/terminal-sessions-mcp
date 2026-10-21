@@ -95,8 +95,6 @@ export interface SegmenterOptions {
   screenMaxWaitMs?: number;
   /** Silence before needs-input is considered (G15). */
   needsInputMs?: number;
-  /** How long after a marker Run's start its digests hold a partial line back while its start mark has not come (see RunWatch.preamble). */
-  preambleHoldMs?: number;
 }
 
 export interface RunText {
@@ -760,8 +758,6 @@ interface RunWatch {
   /** The count began when the segmenter did, after some output it could only read bounded (a Run already in flight). */
   bytesAtLeast: boolean;
   bytesAtLastDigest: number;
-  /** The last digest held a partial line back for the preamble: once the hold is over, the next shows it, new output or none. */
-  partialHeld?: boolean;
   lastDigestId?: string;
   timer?: NodeJS.Timeout | undefined;
   silenceTimer?: NodeJS.Timeout | undefined;
@@ -780,7 +776,10 @@ interface RunWatch {
    * 6310921374). An inline Run has none: the session journals the piece through its start mark to the
    * Run around it before the Run starts, so its output begins after the mark, and a preamble waiting
    * for a mark that never came held its partial line back for the whole Run (a reviewer's read of the
-   * fixes for #22). The partial line is held back for preambleHoldMs at most (digest).
+   * fixes for #22). It holds no partial line back: at the digests' cadence the first digest comes after
+   * a shell has run its typed line, and a file that never ran, because a program read the line, would
+   * have held the program's partial line (a `Password: `) back for the whole Run (the house's review of
+   * 4f4c067..a8b6f28, PR #22, comment 6323055715, question 4).
    */
   preamble?: { start: RegExp; echo: RegExp } | undefined;
   /**
@@ -898,7 +897,6 @@ export class Segmenter {
       screenQuietMs,
       screenMaxWaitMs: opts.screenMaxWaitMs ?? Math.max(2 * screenQuietMs, 1000),
       needsInputMs: opts.needsInputMs ?? 5_000,
-      preambleHoldMs: opts.preambleHoldMs ?? 2_000,
     };
     this.render = new Render(liveSource(s));
     // Runs already in flight when the segmenter starts get digests too, counting what they
@@ -1214,21 +1212,14 @@ export class Segmenter {
 
   private digest(w: RunWatch): void {
     const run = runOf(this.s, w.runId);
-    const held = w.preamble !== undefined && clocks.monotonic() - w.startMono < this.o.preambleHoldMs;
-    if (!run || (w.bytes === w.bytesAtLastDigest && !(w.partialHeld && !held)) || (this.alt && !w.pipes) || this.disposing) return;
+    if (!run || w.bytes === w.bytesAtLastDigest || (this.alt && !w.pipes) || this.disposing) return;
     // A carry that ends inside a control sequence is held until the sequence completes: what it does
     // to the line is not known yet, and its payload is not text (the house's read of 78c4d6e, #22:
     // `working ESC [ 3` showed as `working [3` until the next read). A Run's end does not release it:
     // the watch goes with the Run, and nothing is lost, since the completion renders the Run's text
     // from the journal, not from these lines (the house's read of the 38 commits, #22, comment 6274773484).
     // The line-end rule's own record says so too, whatever a cut left of the sequence in the carry.
-    // Before a marker Run's start mark, a partial line is the typed line's echo or the mark, as likely as not,
-    // but only for a while: a shell runs its typed line at once, and a still-starting one within seconds; a
-    // file that never ran, because a program read the typed line, would hold the program's partial line
-    // (a `Password: `) back for the whole Run (the house's review of f3750e4..4f4c067, PR #22, comment
-    // 6315636412). The preamble still drops the echo and, when the mark comes late, what came before it.
-    const partial = w.scan.open || held || unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
-    w.partialHeld = held && cleanLine(w.carry).trim() !== '';
+    const partial = w.scan.open || unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
     const tail = (partial ? [...w.lines, partial] : w.lines).slice(-DIGEST_LINES).join('\n');
     const seq = this.s.journal.lastSeq;
     const elapsed = Math.max(0, Math.round(clocks.monotonic() - w.startMono));

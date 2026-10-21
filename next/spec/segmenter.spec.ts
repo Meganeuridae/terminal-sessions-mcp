@@ -243,13 +243,12 @@ test('a marker Run’s progress digest shows neither the typed line’s echo nor
   const nonce = 'a1b2c3d4';
   src.runs.set('r1', { runId: 'r1', sessionId: 's1', target: 'shell', origin: 'agent', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'exact', line: 'make', strategy: 'marker', nonce });
   src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/w', strategy: 'marker', nonce });
-  // A slow shell: the echo first, a digest while the file has not run yet, then its banner and the start mark.
-  src.journal.append({ type: 'output', data: `sh$ ${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce)}\r\n`, stream: 'pty', runId: 'r1' });
-  src.journal.append({ type: 'output', data: `Welcome\r\nsh$ ${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce).slice(0, 30)}`, stream: 'pty', runId: 'r1' });
+  // A slow shell: the echo first, a digest while the file has not run yet, then its banner, its second echo and the start mark.
+  src.journal.append({ type: 'output', data: `sh$ ${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce)}\r\nWelcome\r\n`, stream: 'pty', runId: 'r1' });
   await until(() => out.some((s) => s.kind === 'output'), 5000, 'a digest before the start mark');
   const early = out.filter((s) => s.kind === 'output').at(-1)!;
-  assert.doesNotMatch(early.body ?? '', /EXI|tsm-cmd|command \./, `before the mark: ${JSON.stringify(early.body)}`);
-  src.journal.append({ type: 'output', data: `${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce).slice(30)}\r\n<<<START:${nonce}:4242>>>\r\nbuilding 1\r\nbuilding 2\r\nhalf`, stream: 'pty', runId: 'r1' });
+  assert.equal(early.body, 'Welcome', `before the mark, the echo dropped: ${JSON.stringify(early.body)}`);
+  src.journal.append({ type: 'output', data: `sh$ ${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce)}\r\n<<<START:${nonce}:4242>>>\r\nbuilding 1\r\nbuilding 2\r\nhalf`, stream: 'pty', runId: 'r1' });
   await until(() => out.some((s) => s.kind === 'output' && /building/.test(s.body ?? '')), 5000, 'a digest after the start mark');
   assert.equal(out.filter((s) => s.kind === 'output').at(-1)!.body, 'building 1\nbuilding 2\nhalf');
 });
@@ -295,20 +294,21 @@ test('an inline Run’s progress digest shows its partial line: its output begin
   assert.equal(out.filter((s) => s.kind === 'output').at(-1)!.body, 'connecting\nPassword:');
 });
 
-test('a marker Run whose command file never ran shows its partial line once the preamble’s hold has passed: a program read the typed line', async (t) => {
+test('a marker Run whose command file never ran shows its partial line in its first digest: a program read the typed line', async (t) => {
   // The house's review of f3750e4..4f4c067 (PR #22, comment 6315636412): with no start mark ever, the preamble held the digests'
-  // partial line back for the whole Run, so a program's `Password: ` never showed.
+  // partial line back for the whole Run, so a program's `Password: ` never showed. Its review of 4f4c067..a8b6f28 (PR #22, comment
+  // 6323055715), question 4: the bound on that hold never held at the digests' cadence, and its release reused the held digest's
+  // id; the preamble holds nothing back now.
   const src = fakeSource();
-  const seg = new Segmenter(src, { runSettleMs: 5, cadenceMs: 40, screenQuietMs: 20, preambleHoldMs: 200 });
+  const seg = new Segmenter(src, { runSettleMs: 5, cadenceMs: 40, screenQuietMs: 20 });
   t.after(() => seg.dispose());
   const out = collect(seg);
   const nonce = 'a1b2c3d4';
   src.runs.set('r1', { runId: 'r1', sessionId: 's1', target: 'shell', origin: 'agent', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'exact', line: 'deploy', strategy: 'marker', nonce });
   src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/w', strategy: 'marker', nonce });
   src.journal.append({ type: 'output', data: `${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce)}\r\nlogin as: deploy\r\nPassword: `, stream: 'pty', runId: 'r1' });
-  await until(() => out.some((s) => s.kind === 'output' && /Password:$/.test(s.body ?? '')), 5000, 'the partial line, after the hold');
-  const shown = out.filter((s) => s.kind === 'output' && s.body).at(-1)!.body!;
-  assert.equal(shown, 'login as: deploy\nPassword:', 'the echo still dropped');
+  await until(() => out.some((s) => s.kind === 'output' && s.body), 5000, 'a digest');
+  assert.equal(out.find((s) => s.kind === 'output' && s.body)!.body, 'login as: deploy\nPassword:', 'the first digest: the echo still dropped, the partial line shown');
 });
 
 test("a watch segment names a process Run line's pipe, and `mixed` when it holds both (an independent read of the fixes for the review of the 40 commits, PR #22)", () => {
