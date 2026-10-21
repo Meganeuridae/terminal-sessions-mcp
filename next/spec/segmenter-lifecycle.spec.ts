@@ -346,20 +346,32 @@ test('m2-2: an answer to a password prompt, or a line the program never echoed, 
   seg.dispose();
 });
 
-test('mcpl-15: several lines typed in a burst are one message', async () => {
+test('mcpl-15: several lines typed in a burst are one message', (t) => {
+  // Mock timers beside the mocked monotonic clock: the lines come 200 ms apart in the segmenter's time, so the last
+  // comes past the first's 300 ms and each must put the flush off, and nothing waits on the scheduler. Real sleeps
+  // against that flush split the burst under load (the house's read of 4860d4c, #22).
+  let vnow = 0;
+  t.mock.method(clocks, 'monotonic', () => vnow);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const src = fakeSource();
   const seg = new Segmenter(src);
   const out = collect(seg);
-  src.screen.lines = ['> one', '> two', '> three', '> ', ''];
-  src.screen.cursor = { x: 2, y: 3 };
-  for (const l of ['one\r', 'two\r', 'three\r']) {
-    src.journal.append({ type: 'input', data: l, principal: H, kind: 'text' });
-    await sleep(50);
+  try {
+    src.screen.lines = ['> one', '> two', '> three', '> ', ''];
+    src.screen.cursor = { x: 2, y: 3 };
+    for (const l of ['one\r', 'two\r', 'three\r']) {
+      src.journal.append({ type: 'input', data: l, principal: H, kind: 'text' });
+      vnow += 200;
+      t.mock.timers.tick(200);
+    }
+    assert.equal(out.length, 0, 'each line put the flush off');
+    vnow += 300;
+    t.mock.timers.tick(300);
+    assert.equal(out.length, 1);
+    assert.match(out[0]!.head, /typed 3 lines: one ⏎ two ⏎ three$/);
+  } finally {
+    seg.dispose();
   }
-  await sleep(450);
-  assert.equal(out.length, 1);
-  assert.match(out[0]!.head, /typed 3 lines: one ⏎ two ⏎ three$/);
-  seg.dispose();
 });
 
 test('m2-23: needs-input fires on prompts, not on stalled progress bars or labels', () => {
