@@ -1655,7 +1655,13 @@ export class Session {
     // missing file and never runs the command unawaited (ss-8). Close waits for the removal,
     // then removes the command directory.
     if (run.tempFile) {
-      const removed: Promise<void> = fs.promises.rm(run.tempFile, { force: true }).catch(() => undefined).finally(() => this.teardowns.delete(removed));
+      // A removal that fails leaves the file to close, which tries again and says so if it fails there too
+      // (cleanupTempFiles): dropped here, it stayed with no word (the house's review of 4f4c067..a8b6f28).
+      const file = run.tempFile;
+      const removed: Promise<void> = fs.promises
+        .rm(file, { force: true })
+        .catch(() => void this.extraTempFiles.add(file))
+        .finally(() => this.teardowns.delete(removed));
       this.teardowns.add(removed);
       delete run.tempFile;
     }

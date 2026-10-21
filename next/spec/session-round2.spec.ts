@@ -929,6 +929,34 @@ test('input sent while the cancel waits after its last ^C is not erased: no empt
   }
 });
 
+test('a Run’s command file whose removal fails when the Run ends is removed at close', async () => {
+  // Its name was dropped with the failure, so close neither tried again nor said so (the house's review of
+  // 4f4c067..a8b6f28).
+  const h = await harness();
+  const rm = fs.promises.rm;
+  const failed: string[] = [];
+  fs.promises.rm = (async (file: fs.PathLike, opts?: fs.RmOptions) => {
+    if (/tsm-cmd-/.test(String(file))) {
+      failed.push(String(file));
+      throw fault('EBUSY', `resource busy, rm '${String(file)}'`);
+    }
+    return rm(file, opts);
+  }) as typeof fs.promises.rm;
+  try {
+    const a = await h.session.admitWhenAvailable({ target: 'shell', line: 'echo hello', principal: AGENT });
+    assert.ok(a.admitted);
+    const r = await h.session.awaitRun(a.run.runId, 2000);
+    assert.equal(r.state, 'exited');
+    await until(() => failed.length === 1, 2000, 'the removal at the Run’s end failed');
+    await tick();
+    assert.ok(fs.existsSync(failed[0]!), 'the file is still there');
+  } finally {
+    fs.promises.rm = rm;
+  }
+  await h.session.close();
+  assert.ok(!fs.existsSync(failed[0]!), 'close removed it');
+});
+
 test('a cancel whose empty line cannot be written types none, says so, and takes the shell’s next prompt as its answer', async () => {
   // askForPrompt's fallback when its file cannot be written: no line is typed, and the prompt the stopped
   // shell prints for the ^C when it runs again is the shell's answer.
