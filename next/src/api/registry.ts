@@ -342,11 +342,11 @@ interface Slot {
   cursors: CursorBook;
   view: LiveEntry | HistoryEntry;
   /**
-   * Recovery left a Run's process group unjudged (no process listing answered): the name's history, and
-   * with it the Run's record of its group, is neither aged nor removed by `expire`, and its store takes no
-   * retention, in this life or a new one and when its record is repaired, until the next recovery, which
-   * judges it when it can list processes (the house's read of the 33 commits, PR #22, comment 6307350477,
-   * item 3).
+   * Recovery left a Run's process group unjudged (no process listing answered), or never read the name's
+   * journal (it opened later, for a new life): the name's history, and with it the Run's record of its
+   * group, is neither aged nor removed by `expire`, and its store takes no retention, in this life or a new
+   * one and when its record is repaired, until the next recovery, which judges it when it can list
+   * processes (the house's read of the 33 commits, PR #22, comment 6307350477, item 3).
    */
   awaitsJudgement?: true;
 }
@@ -630,6 +630,11 @@ export class SessionRegistry {
     this.slots.set(id, { id, dir, store, meta, cursors, view, ...(unjudged && { awaitsJudgement: true as const }) });
   }
 
+  /** Whether recovery judges the process groups a dead daemon left (G19c): not over a scripted backend unless asked, and not on Windows. */
+  private judgesGroups(): boolean {
+    return (this.opts.terminateOrphans ?? this.opts.backend.kind !== 'scripted') && process.platform !== 'win32';
+  }
+
   /**
    * The process groups a dead daemon left running (G19c: without the keeper, live processes do not
    * survive a restart) — of its Runs in flight, and of Runs that had ended leaving children in their
@@ -639,8 +644,7 @@ export class SessionRegistry {
    */
   private endOrphans(open: Recovering[]): Map<string, GroupOutcome> {
     const out = new Map<string, GroupOutcome>();
-    const enabled = this.opts.terminateOrphans ?? this.opts.backend.kind !== 'scripted';
-    if (!enabled || process.platform === 'win32') return out;
+    if (!this.judgesGroups()) return out;
     const candidates = open.flatMap((r) => r.journal.runs.list().filter(mayHoldGroup).map((run) => ({ key: `${r.id}\0${run.runId}`, run, lastTs: r.lastAliveTs })));
     if (!candidates.length) return out;
     const list = this.opts.listProcesses ?? listProcesses;
@@ -887,16 +891,26 @@ export class SessionRegistry {
     }
     const id = o.id;
     const dir = prev?.dir ?? path.join(this.root, id);
-    const retention = this.retentionFor(o.retention, prev?.meta.retention);
+    // The name's record: its slot's, or, for a name with no slot (a journal recovery could not read, or none),
+    // the one beside its files.
+    const recorded = prev?.meta ?? readMeta(dir);
+    // Another principal's leftovers are never reused.
+    const reusable = recorded.owner === undefined || recorded.owner === o.owner || o.owner === SYSTEM;
+    // Requested over recorded over daemon defaults (ux-4). A name with no slot took the defaults, and its new
+    // record dropped the retention the old one kept its history under (our read of the house's fixes for its
+    // review of f3750e4, PR #22).
+    const retention = this.retentionFor(o.retention, prev || reusable ? recorded.retention : undefined);
     const jo: JournalOptions = { hot: this.hotStore(retention), sessionId: id, log: this.journalLog(id) };
     let store: FileStore;
     let journal: Journal;
-    let recorded: Meta;
     // The retention the history is kept under until this life has started: the store takes the one
     // asked for only then. Applied before the start, a reopen asking for less pruned files the
     // record still kept when its start failed, and the entry reported the retention it never got
     // (the house's read of cc8c909..39787b3, #22).
     let before: SessionRetention;
+    // Recovery owes the name a judgement of its Runs' process groups (see awaitsJudgement): its store takes no
+    // retention in this life either.
+    let awaits = prev?.awaitsJudgement === true;
     if (prev) {
       // A new life for an old name: the same journal, numbering and run index continue (G10).
       const old = journalOf(prev);
@@ -907,11 +921,9 @@ export class SessionRegistry {
       before = prev.view.retention;
       jo.runs = old.runs;
       jo.startSeq = old.lastSeq;
-      recorded = prev.meta;
       jo.cold = store;
       journal = new Journal(jo);
     } else {
-      recorded = readMeta(dir);
       before = this.retentionFor(undefined, recorded.retention);
       // The store opens with no retention, as recovery's does, and takes the record's only once the open
       // is allowed: a store applies the retention it is given at once, so a refused open pruned what a
@@ -939,15 +951,21 @@ export class SessionRegistry {
           throw err('forbidden', `session ${id} belongs to another principal; only its owner may open it again`, { id });
         }
       }
+      // A journal recovery could not read had none of its Runs' process groups judged: a Run its index names
+      // that may hold one (in flight when its daemon died, or one that left children) awaits a recovery that
+      // can list processes, as recovery's own unjudged Runs do. Applied here, the retention pruned the files
+      // naming the group before any recovery read them, and the name was not kept for one (our read of the
+      // house's 2f7e9e7, PR #22).
+      awaits = this.judgesGroups() && runs.list().some(mayHoldGroup);
+      if (awaits) this.opts.log?.('warn', "a session recovery could not read is opened: its Runs' process groups were never judged, so its history takes no retention until a recovery that can list processes judges them", { session: id });
       // Allowed: until this life has started, the history is kept under its record's retention (with no
       // history and no record, the daemon's defaults; there is nothing to keep).
-      store.setRetention(before);
+      else store.setRetention(before);
       jo.runs = runs;
       jo.cold = store;
       journal = new Journal(jo);
     }
-    // Requested over recorded over daemon defaults (ux-4). Another principal's leftovers are never reused.
-    const reuse = recorded.owner === undefined || recorded.owner === o.owner || o.owner === SYSTEM ? recordedOptions(recorded, retention) : undefined;
+    const reuse = reusable ? recordedOptions(recorded, retention) : undefined;
     const options = this.resolveOptions(o, reuse, retention);
     const { retention: _r, ...persisted } = options;
     const meta: Meta = { owner: o.owner, visibility: options.visibility, createdAt: Date.now(), retention, options: persisted };
@@ -1033,7 +1051,7 @@ export class SessionRegistry {
       journal.seal();
       if (prev || journal.lastSeq > 0) {
         const view = new HistoryEntry(id, journal, kept.owner ?? o.owner, kept.visibility ?? options.visibility, kept.closedAt !== undefined, before, recordedOptions(kept, before), cursors);
-        this.slots.set(id, { id, dir, store, meta: kept, cursors, view, ...(prev?.awaitsJudgement && { awaitsJudgement: true as const }) });
+        this.slots.set(id, { id, dir, store, meta: kept, cursors, view, ...(awaits && { awaitsJudgement: true as const }) });
       } else {
         store.close();
       }
@@ -1051,8 +1069,8 @@ export class SessionRegistry {
     }
     // A name recovery owes a judgement keeps every file in this life too (see awaitsJudgement): its store
     // takes the retention, age and bytes alike, from the recovery that judges its groups.
-    if (!prev?.awaitsJudgement) store.setRetention(retention);
-    this.slots.set(id, { id, dir, store, meta, cursors, view: new LiveEntry(session, () => integ?.cleanup(), retention, options), ...(prev?.awaitsJudgement && { awaitsJudgement: true as const }) });
+    if (!awaits) store.setRetention(retention);
+    this.slots.set(id, { id, dir, store, meta, cursors, view: new LiveEntry(session, () => integ?.cleanup(), retention, options), ...(awaits && { awaitsJudgement: true as const }) });
     this.emit({ type: 'created', id });
     return session;
   }
@@ -1142,6 +1160,11 @@ export class SessionRegistry {
 
   list(): AnySession[] {
     return [...this.slots.values()].map((s) => s.view);
+  }
+
+  /** Whether recovery owes the name a judgement of its Runs' process groups, so its store applies no retention until one judges them (see awaitsJudgement). */
+  awaitsJudgement(id: string): boolean {
+    return this.slots.get(id)?.awaitsJudgement === true;
   }
 
   // ───────────── close and remove ─────────────

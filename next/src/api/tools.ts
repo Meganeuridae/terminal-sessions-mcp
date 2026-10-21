@@ -364,7 +364,12 @@ const SUMMARY: Schema = {
     currentRun: { description: 'runId occupying the shell, or null' },
     lastSeq: { type: 'integer' },
     oldestSeq: { type: 'integer' },
-    retention: { type: 'object', properties: { maxBytes: { type: 'integer' }, maxAgeMs: { type: 'integer' } } },
+    retention: { type: 'object', description: 'What the session keeps on disk: the retention its store applies now.', properties: { maxBytes: { type: 'integer' }, maxAgeMs: { type: 'integer' } } },
+    pendingRetention: {
+      type: 'object',
+      description: "The record's retention, not applied yet: recovery has not judged the process groups of the session's Runs, so every file is kept until a recovery that can list processes does.",
+      properties: { maxBytes: { type: 'integer' }, maxAgeMs: { type: 'integer' } },
+    },
     recovered: { type: 'string' },
     closed: { type: 'boolean' },
     createdAt: { type: 'number' },

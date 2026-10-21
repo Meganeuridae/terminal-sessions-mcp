@@ -107,8 +107,14 @@ export interface SessionSummary extends SessionHeader {
   currentRun?: string | null;
   lastSeq: Seq;
   oldestSeq?: Seq;
-  /** What the session keeps on disk (G21). */
+  /** What the session keeps on disk (G21): the retention its store applies now. */
   retention?: { maxBytes?: number; maxAgeMs?: number };
+  /**
+   * The retention the session's record gives it, not applied yet: recovery has not judged the process
+   * groups of its Runs (no process listing answered, or it never read the journal), so the store keeps
+   * every file naming them until a recovery that can list processes does (G19c), and `retention` is empty.
+   */
+  pendingRetention?: { maxBytes?: number; maxAgeMs?: number };
   closed?: boolean;
   createdAt?: number;
   lastActivity?: number;
@@ -505,7 +511,7 @@ export class App {
       if (i.declared) out.declared = i.declared;
       const oldest = s.session.journal.oldestSeq;
       if (oldest !== undefined) out.oldestSeq = oldest;
-      out.retention = { ...s.retention };
+      this.retentionOf(s, out);
       const x = this.extrasBySession.get(s.session);
       if (x) {
         // The list is bounded like `runs`: a life that starts many services does not grow this without
@@ -526,10 +532,24 @@ export class App {
     }
     const out: SessionSummary = { ...this.summaryHeader(s), visibility: s.visibility, lastSeq: s.journal.lastSeq };
     if (s.closed) out.closed = true;
-    out.retention = { ...s.retention };
+    this.retentionOf(s, out);
     const oldest = s.journal.oldestSeq;
     if (oldest !== undefined) out.oldestSeq = oldest;
     return out;
+  }
+
+  /**
+   * The entry's retention as its store applies it, and the record's while it waits for recovery's judgement
+   * (pendingRetention). The entry reported the record's whatever the store applied, so a session kept whole
+   * for that judgement read as held to its cap (our read of the house's 2f7e9e7, PR #22).
+   */
+  private retentionOf(s: AnySession, out: SessionSummary): void {
+    if (!this.registry.awaitsJudgement(sessionId(s))) {
+      out.retention = { ...s.retention };
+      return;
+    }
+    out.retention = {};
+    out.pendingRetention = { ...s.retention };
   }
 
   sessionList(caller: Caller): SessionSummary[] {

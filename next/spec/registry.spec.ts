@@ -935,6 +935,24 @@ test('G21: a refused open of a journal the registry did not surface prunes nothi
   await cleanup(r);
 });
 
+test('ux-4/G21: a journal recovery did not surface, reopened by its owner, keeps the retention its record gives it, and the new record says it (our read of the house\'s fixes for its review of f3750e4, PR #22)', async () => {
+  // The open of a name with no slot took the daemon's defaults, and the new record dropped the old one's retention.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-registry-'));
+  const { backend, shells } = scripted();
+  const reg = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir() });
+  const r: Rig = { dir, backend, shells, reg, changes: [] };
+  const sdir = path.join(dir, 'sessions', 'late');
+  const j = new Journal({ cold: new FileStore(sdir), sessionId: 'late' });
+  j.append({ type: 'output', data: 'kept\r\n', stream: 'pty' });
+  j.close();
+  fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', retention: { maxBytes: 262144 } }), { mode: 0o600 });
+  const s = (await reg.ensure({ id: 'late', owner: A })).session;
+  assert.deepEqual(live(reg.get('late')).retention, { maxBytes: 262144 });
+  assert.equal(s.journal.stats().retention.maxBytes, 262144, 'the store applies it');
+  assert.deepEqual((JSON.parse(fs.readFileSync(path.join(sdir, 'session.json'), 'utf8')) as { retention: unknown }).retention, { maxBytes: 262144 });
+  await cleanup(r);
+});
+
 test('G18: a record that is valid JSON but names no owner is refused as a damaged one is — for the system principal too (the house\'s read of the 38 commits, PR #22, comment 6274857431)', async () => {
   // With that refusal removed no spec broke: `{"visibility":"private"}` made the system the owner.
   const r = rig();

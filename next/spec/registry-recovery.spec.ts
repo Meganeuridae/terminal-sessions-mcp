@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { App } from '../src/api/app.js';
 import { heldGroups, orphanGroups, SessionRegistry, type AnySession, type HistorySession, type LiveSession, type OrphanCandidate } from '../src/api/registry.js';
 import type { ScriptedBackend } from '../src/backends/scripted.js';
 import { Journal } from '../src/core/journal.js';
@@ -782,6 +783,49 @@ test('jr2-4/G21: an unjudged session keeps every file through a new life its own
     assert.equal(hist(r2.reg.get('reopened')).run('r1-reopened').groupJudged, true);
     assert.equal(hist(r2.reg.get('repaired')).run('r1-repaired').groupJudged, true);
     await until(() => !groupAlive(reopened.g) && !groupAlive(repaired.g), 3000, 'both groups to be ended');
+    await r2.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
+test('jr2-4/G21: a journal recovery never read, opened for a new life, keeps every file naming a Run\'s process group until a recovery that can list processes judges it, and its entry says the retention waits (our read of the house\'s fixes for its review of f3750e4, PR #22: 2f7e9e7)', { timeout: 20_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const kids = detachedKids();
+  try {
+    const r = rig(dir, { terminateOrphans: true, listProcesses: () => undefined });
+    // Written after the registry started, so its recovery never read it: a Run in flight with a real leaderless
+    // group, and enough output after its start that its run.start sits in a rotated file the record's age drops.
+    const T = Date.now() - 60_000;
+    const sdir = path.join(dir, 'sessions', 'late');
+    const g = kids.spawn('/bin/sh', ['-c', 'sleep 420 & exit 0']);
+    await kids.exited(g);
+    let ts = T;
+    const j = new Journal({ cold: new FileStore(sdir, { maxFileBytes: 4096 }), sessionId: 'late', now: () => ts });
+    journalProcess(j, 'r1-late', g);
+    ts = T + 5000;
+    for (let i = 0; i < 120; i++) j.append({ type: 'output', data: `line ${i} ${'x'.repeat(80)}\r\n`, stream: 'pty', runId: 'r1-late', attribution: 'temporal' });
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', retention: { maxAgeMs: 1000 } }), { mode: 0o600 });
+    const files = () => fs.readdirSync(sdir).filter((n) => /^journal(\.\d+)?\.jsonl$/.test(n)).length;
+    const holdsStart = () => fs.readdirSync(sdir).some((n) => /^journal(\.\d+)?\.jsonl$/.test(n) && fs.readFileSync(path.join(sdir, n), 'utf8').includes('"type":"run.start"'));
+    const count = files();
+    assert.ok(count > 1 && holdsStart(), `the run.start is in a rotated file (${count})`);
+    await r.reg.ensure({ id: 'late', owner: A });
+    assert.ok(holdsStart() && files() >= count, `the files that name the group stay (${files()} of ${count})`);
+    assert.equal(r.reg.awaitsJudgement('late'), true, 'the name awaits a recovery that can judge its group');
+    assert.deepEqual(await r.reg.expire(), [], 'expire keeps it too');
+    // The entry reports what the store applies, and the record's retention as waiting.
+    const app = new App({ registry: r.reg });
+    const entry = app.sessionList({ principal: A, connectionId: 'c' }).find((s) => s.id === 'late');
+    assert.deepEqual([entry?.retention, entry?.pendingRetention], [{}, { maxAgeMs: 1000 }]);
+    await r.reg.closeAll();
+    // The next recovery can list processes: it judges the group by the Run's record and ends it.
+    const member: ProcessRow = { pid: g + 100_000, pgid: g, startMs: T + 1000, zombie: false };
+    const r2 = rig(dir, { terminateOrphans: true, listProcesses: () => [member] });
+    assert.equal(hist(r2.reg.get('late')).run('r1-late').groupJudged, true);
+    assert.equal(r2.reg.awaitsJudgement('late'), false);
+    await until(() => !groupAlive(g), 3000, 'the group to be ended');
     await r2.reg.closeAll();
   } finally {
     kids.end();
