@@ -245,7 +245,7 @@ const notesOf = (h: Awaited<ReturnType<typeof harness>>) => ofType(h.journal.sin
 test('the reinit is typed only in readline’s mode (ICANON and ECHO off) with no other reader', async () => {
   const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
   await armExecBash(h, READLINE, false);
-  await tick(500);
+  await until(() => h.pty.written.includes(' . "$TSM_BASH_RC" reinit typed\n'), 5000, 'the reinit typed');
   assert.ok(h.pty.written.includes(' . "$TSM_BASH_RC" reinit typed\n'), 'the reinit was typed at a readline prompt with no other reader');
   await h.session.close();
 });
@@ -256,7 +256,7 @@ test('the reinit is not typed while a program the rc started is reading, even in
   // #22 comment 6269901528).
   const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
   const runId = await armExecBash(h, READLINE, true);
-  await tick(600);
+  await until(() => h.session.run(runId).state === 'lost', 5000, 'the gate gave up');
   assert.ok(!h.pty.written.includes('reinit typed'), 'nothing was typed into the reader');
   assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
   assert.match(notesOf(h), /a process other than the shell, in the terminal’s foreground process group, holds the terminal for input/, 'the note says what the check knows, no more');
@@ -268,7 +268,7 @@ test('a reader check that cannot answer holds the reinit, and the note names tha
   // read of the 38 commits, #22 comment 6274841346, item 1).
   const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
   const runId = await armExecBash(h, READLINE, undefined);
-  await tick(600);
+  await until(() => h.session.run(runId).state === 'lost', 5000, 'the gate gave up');
   assert.ok(!h.pty.written.includes('reinit typed'), 'nothing typed while the reader check could not answer');
   assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
   assert.match(notesOf(h), /whether a process other than the shell is reading the terminal could not be checked/);
@@ -279,7 +279,7 @@ test('non-canonical with echo on (read -n) holds the reinit, and the reader chec
   // `read -n 1` leaves ECHO on where readline turns it off (the house's stty readings, item 3).
   const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
   const runId = await armExecBash(h, { canonical: false, echo: true }, false);
-  await tick(600);
+  await until(() => h.session.run(runId).state === 'lost', 5000, 'the gate gave up');
   assert.ok(!h.pty.written.includes('reinit typed'), 'nothing typed into a read -n');
   assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
   assert.match(notesOf(h), /non-canonical with echo on, as under `read -n`/);
@@ -290,7 +290,7 @@ test('non-canonical with echo on (read -n) holds the reinit, and the reader chec
 test('a canonical prompt gets the honest note (read -p and --noediting cannot be told apart), not a false canonical-mode give-up', async () => {
   const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
   const runId = await armExecBash(h, { canonical: true, echo: true }, false);
-  await tick(600);
+  await until(() => h.session.run(runId).state === 'lost', 5000, 'the gate gave up');
   assert.ok(!h.pty.written.includes('reinit typed'), 'nothing typed into a canonical reader or prompt');
   assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
   const note = notesOf(h);
@@ -304,7 +304,7 @@ test('a canonical prompt gets the honest note (read -p and --noediting cannot be
 test('an unreadable terminal mode (stty failed) gets its own note, and nothing is typed', async () => {
   const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
   const runId = await armExecBash(h, undefined, false);
-  await tick(600);
+  await until(() => h.session.run(runId).state === 'lost', 5000, 'the gate gave up');
   assert.ok(!h.pty.written.includes('reinit typed'));
   assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
   assert.match(notesOf(h), /terminal mode could not be read \(stty failed\)/, 'the note names the stty cause');
