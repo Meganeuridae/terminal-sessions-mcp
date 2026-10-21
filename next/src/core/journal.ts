@@ -9,7 +9,8 @@
  * session down (G19). The hot ring carries on, and the cold store catches up
  * from it once the disk accepts writes again.
  *
- * No seq is issued twice, across a restart or a power loss (G10). Appends are
+ * No seq is issued twice, across a restart or a power loss (G10), with the
+ * exceptions below, both while the disk refuses writes. Appends are
  * not synced: the page cache keeps them through a daemon crash, but a power
  * loss can take the files' unsynced tail. So a seq is issued only below a
  * reservation kept beside the cold store, written and synced a block ahead
@@ -22,8 +23,12 @@
  * cache held was lost, and numbering simply continues. The reservation is best
  * effort — a write to the same disk, retried at most once a second while it is
  * refused — so a journal whose reservation the disk refuses can reissue seqs
- * after a power loss. What the ring drops while the disk refuses is recorded as
- * it is lost and written as a `store-error` gap at the catch-up.
+ * after a power loss. So can a daemon crash on the same boot while the disk
+ * refuses the events and also the mark that would flag the reservation failed:
+ * the reservation left on disk is not marked failed, a start on the same boot
+ * does not honour such a one, and numbering resumes at the files' last seq.
+ * What the ring drops while the disk refuses is recorded as it is lost and
+ * written as a `store-error` gap at the catch-up.
  */
 import { clocks, timerMs } from './clock.js';
 import { boots } from './lock.js';

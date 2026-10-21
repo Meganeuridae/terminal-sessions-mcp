@@ -307,9 +307,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 ### Observation
 
 - **G10.** The journal is the single source of truth: append-only, per-session monotonic
-  `seq`, timestamped, typed (Appendix A). No `seq` is issued twice across a daemon crash. Nor is
-  one issued twice across a power loss, provided the disk took the journal's last reservation
-  write. Appends are not synced, so a power loss can take the journal's last lines, the ones the
+  `seq`, timestamped, typed (Appendix A). No `seq` is issued twice across a daemon crash, unless
+  the disk was refusing the journal's writes when it crashed (below). Nor is one issued twice across
+  a power loss, provided the disk took the journal's last reservation write. Appends are not
+  synced, so a power loss can take the journal's last lines, the ones the
   disk had not yet written. The numbering survives it: before issuing a block of 10,000 seqs, the
   journal reserves the block in a synced metadata write, and it lowers the reservation to its last
   seq when it closes. After a power loss the next start numbers above every seq issued before it,
@@ -318,7 +319,10 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   from the last line. The reservation is a write to the journal's own disk, so it is best effort.
   While the disk refuses it, seqs go on being issued past the last reservation the disk took, and
   the write is retried once a second. A power loss in that window can issue some of those seqs
-  again after the restart. Three products derive from it and each states
+  again after the restart. So can a daemon crash on the same boot while the disk refuses the events
+  as well as the mark that would flag the reservation failed: the reservation it leaves is not
+  marked failed, a start on the same boot does not honour such a one, and numbering resumes at the
+  last line on disk. Three products derive from it and each states
   what it is. **Raw output** is retained decoded UTF-8 text with provenance, a pure function of a
   range. **Transcript** is a documented line-oriented projection of a range, a pure
   function of that range and the width it is projected at, for reading and search — not a
