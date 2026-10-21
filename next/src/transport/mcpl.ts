@@ -1023,6 +1023,13 @@ export class McplLane {
       if (retry.timer) clearTimeout(retry.timer);
       st.retries.delete(key);
     }
+    // A summary's own seq, the last gap's end, can be a message that still carries it, which the summary left out of
+    // what it covers: settled here, `delivered` could pass that message before it went out, and its refusal was then
+    // settled as accepted (the house's read of 4860d4c, #22).
+    if (summary && this.carried(t, st).has(seg.seq)) {
+      if (seg.seq > st.clearTo) st.clearTo = seg.seq;
+      return this.advance(t, st);
+    }
     this.settle(t, seg.seq, how);
   }
 
@@ -1066,7 +1073,10 @@ export class McplLane {
    * #22 comment 6270045466).
    */
   private carried(t: Target, st: LaneState): Set<Seq> {
-    const opening = [...(this.opening.get(channelId(t.id))?.held.values() ?? [])].map((h) => h.seg.seq);
+    // Only this lineage's opening: another's, a forgotten name's still reading its history, holds another journal's
+    // seqs, which counted here pinned this lineage's debts (the house's read of 4860d4c, #22).
+    const o = this.opening.get(channelId(t.id));
+    const opening = o?.lineage === t.journal.runs ? [...o.held.values()].map((h) => h.seg.seq) : [];
     const held = [...st.held.values()].flatMap((h) => (h.seq === undefined ? [] : [h.seq]));
     return new Set([...st.inflight.values(), ...[...st.retries.values()].map((r) => r.seq), ...opening, ...held]);
   }
@@ -1501,13 +1511,15 @@ export class McplLane {
       const summary = st.summaries.get(id);
       if (!summary || st.inflight.has(id)) continue;
       st.summaries.delete(id);
-      if (summary.owes !== undefined) st.owed.delete(summary.owes);
       for (const seq of summary.covered) covered.add(seq);
       const r = st.retries.get(id);
       if (r?.timer) clearTimeout(r.timer);
       st.retries.delete(id);
       this.sent.delete(id);
       opening?.held.delete(id);
+      // Its owed seq goes with it, unless another message still carries that seq (see settleSegment): asked once its
+      // own retry and parked copy are gone, which carry it too.
+      if (summary.owes !== undefined && !this.carried(t, st).has(summary.owes)) st.owed.delete(summary.owes);
     }
     return covered;
   }
@@ -1547,8 +1559,11 @@ export class McplLane {
       lifecycle: true,
       seq: to,
       ts: Date.now(),
-      // Its own id: a catch-up's summary can end at the same seq, and so can a later fold, which may name more.
-      messageId: segmentId(t.id, t.journal, 'summary', to, how.refused ? `refused-${o!.from}` : undefined),
+      // Its own id, by its range: a catch-up's summary can end at the same seq as one still in flight that named
+      // less, which then took this one's entry and settled what its host never heard of (the house's read of
+      // 4860d4c, #22), and a later fold can end there too and name more. Two of the same range share one: the newer
+      // may cover more of it, but all inside the span the older's message already names (a reviewer's read).
+      messageId: segmentId(t.id, t.journal, 'summary', to, how.refused ? `refused-${o!.from}` : `${summaryFloor(o, gaps)}`),
       tags: ['terminal:missed'],
       // `as=events`: a plain read projects text, which has no exit statuses or service changes in it (the house's read of 2f357bd, #22).
       head: `[terminal] ${t.id}: ${parts.join(' · ')} · read session=${t.id} since=${since} as=events`,

@@ -1261,7 +1261,10 @@ test('a catch-up summary of omitted messages and gone ranges names them apart, a
     const omitted = { count: 4, from: 228, to: 240, kinds: { run: 4 } };
     const both = summary(t, omitted, [{ from: 1, to: 226, reason: 'retention' }]);
     assert.equal(both.seq, 240);
-    assert.equal(both.messageId, 'sm~e1:summary:240');
+    assert.equal(both.messageId, 'sm~e1:summary~1:240');
+    // Its id names its range's start: a summary ending at the same seq, of another range, is another message
+    // (the house's read of 4860d4c, #22: one in flight had its entry taken and settled what its host never heard of).
+    assert.equal(summary(t, omitted, undefined).messageId, 'sm~e1:summary~228:240');
     assert.match(both.head, /^\[terminal\] sm: 4 earlier messages .*\(4 completions\) · seq 228–240 · seq 1–226 \(past retention\) gone, with whatever happened then · read session=sm since=227 as=events$/);
     assert.deepEqual([both.metadata.count, both.metadata.from, both.metadata.to, both.metadata.lostFrom, both.metadata.lostTo], [4, 228, 240, 1, 226]);
     assert.equal(summaryFloor(omitted, [{ from: 1 }]), 1);
@@ -1376,6 +1379,9 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     flush(): Promise<void>;
     startCatchUp(sessions: string[]): Promise<void>;
     catchingUp: Promise<void> | undefined;
+    carried(t: Session, st: unknown): Set<number>;
+    settleSegment(t: Session, seg: unknown, how: 'accepted'): void;
+    retireSummaries(t: Session, st: unknown, ids: string[]): Set<number>;
     budgetOf(journal: Journal): { retained: unknown[]; seed(journal: Journal): Promise<void> };
     deliver(t: Session, seg: unknown, opts: { released: true }): void;
   };
@@ -2181,6 +2187,50 @@ test("a catch-up whose scan fails retires nothing: the refused fold summary stil
     await until(() => s.cursorsOf(A).delivered >= Math.max(...ends), 10_000, 'the cursor to pass every completion once a catch-up scans');
   } finally {
     McplLane.retryMax = was;
+    await f.close();
+  }
+});
+
+test("a summary's acceptance or retirement leaves its own seq owed while another message carries it, not its own retry or parked copy, and carried() reads only this lineage's opening", { timeout: 30_000 }, async () => {
+  // Its own seq, a gap's end, can be a message still retried; settled with the summary, delivered could pass it and
+  // its refusal was settled as accepted. Another lineage's opening holds another journal's seqs (the house's read of 4860d4c, #22).
+  const f = await bareLane('c-own-seq');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'pushEvents') }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'ro' });
+    const s = live(f.registry, 'ro');
+    const r = await f.app.run(f.caller, { session: 'ro', command: 'echo ro', target: 'process', wait: 0 });
+    await until(() => s.run(r.runId!).seq.end !== undefined, 5000, 'the Run to end');
+    const st = f.inside.states.get('ro')! as unknown as { owed: Set<number>; retries: Map<string, unknown>; summaries: Map<string, unknown> };
+    const x = s.run(r.runId!).seq.end!;
+    st.owed.add(x);
+    st.retries.set('a-retried-completion', { seq: x, kind: 'run', attempt: 0 });
+    st.summaries.set(`${NODE_NAME}/ro-gap-summary`, { from: 1, covered: new Set(), owes: x });
+    f.inside.settleSegment(s, { kind: 'summary', lifecycle: true, seq: x, messageId: 'ro-gap-summary' }, 'accepted');
+    assert.ok(st.owed.has(x), 'the retried completion is still owed after the summary is accepted');
+    // Retired by a catch-up, the same: its owed seq stays while the retried message carries it.
+    st.summaries.set(`${NODE_NAME}/ro-retired-summary`, { from: 1, covered: new Set(), owes: x });
+    f.inside.retireSummaries(s, st, [`${NODE_NAME}/ro-retired-summary`]);
+    assert.ok(st.owed.has(x), 'the retried completion is still owed after the summary is retired');
+    st.retries.delete('a-retried-completion');
+    // Its own retry and parked copy carry its seq too: retired, they go with it, and so does the debt (a reviewer's
+    // run: asked before they went, a summary ever refused or parked kept its seq owed whatever else carried it).
+    const own = `${NODE_NAME}/ro-own-summary`;
+    st.summaries.set(own, { from: 1, covered: new Set(), owes: x });
+    st.retries.set(own, { seq: x, kind: 'summary', attempt: 0 });
+    (f.inside.opening as unknown as Map<string, unknown>).set('terminal:ro', { lineage: (s.journal as unknown as { runs: unknown }).runs, held: new Map([[own, { t: s, seg: { seq: x } }]]) });
+    f.inside.retireSummaries(s, st, [own]);
+    (f.inside.opening as unknown as Map<string, unknown>).delete('terminal:ro');
+    assert.ok(!st.owed.has(x), 'retired with only its own retry and parked copy carrying its seq, the debt goes');
+    // An opening parks a message at the same seq number: counted when it is this lineage's, not when it is another's.
+    const openings = f.inside.opening as unknown as Map<string, unknown>;
+    const parked = new Map([['other', { t: s, seg: { seq: x } }]]);
+    openings.set('terminal:ro', { lineage: (s.journal as unknown as { runs: unknown }).runs, held: parked });
+    assert.ok(f.inside.carried(s, st).has(x), "this lineage's parked seq is carried");
+    openings.set('terminal:ro', { lineage: {}, held: parked });
+    assert.ok(!f.inside.carried(s, st).has(x), "another lineage's parked seq is not carried here");
+    openings.delete('terminal:ro');
+  } finally {
     await f.close();
   }
 });
