@@ -1,8 +1,10 @@
 /** One grammar for the marks a Run prints and the readers cut around (core/plumbing.ts). */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cutPlumbing, exitMark, nonceOf, probeMark, startMark } from '../src/core/plumbing.js';
-import { inlineLines, inlineProbe } from '../src/core/session.js';
+import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import { cutPlumbing, exitMark, inlineProbe, markerProbe, nonceOf, probeMark, startMark } from '../src/core/plumbing.js';
+import { inlineLines } from '../src/core/session.js';
 import { journalRunText } from '../src/core/segmenter.js';
 import type { RunOutput } from '../src/core/runindex.js';
 import type { RunInfo } from '../src/core/types.js';
@@ -247,4 +249,33 @@ test('a reviewer’s read (6270045466): nonceOf names the nonce a printed mark c
   assert.equal(nonceOf(`echo "<<<EXI""T:74ef5182:$?>>>"`), undefined, 'the typed echo is split so it is no mark');
   assert.equal(nonceOf('plain output'), undefined);
   assert.equal(nonceOf(`. '/tmp/x/tsm-cmd-1'`), undefined);
+});
+
+test('the probe lines the session types are the ones the grammar parses and the cutter strikes: what a shell prints for each is its mark, and its echo, broken anywhere, goes whole', () => {
+  // A reviewer's read of the fixes for #22: the cutter's copy of the probe lines' rests was written by hand beside the
+  // session's builders, and no spec tied them. The builders now live beside the grammar, the cutter's echo is taken from
+  // them, and this runs each line in a shell and breaks its echo at every point from its mark on.
+  const nonce = 'a1b2c3d4';
+  const fish = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find((p) => fs.existsSync(p));
+  const lines = [
+    { name: 'marker', line: markerProbe(nonce), of: { strategy: 'marker' as const, nonce }, shell: '/bin/sh', set: '' },
+    { name: 'inline sh', line: inlineProbe(nonce, false), of: { strategy: 'inline' as const, nonce }, shell: '/bin/sh', set: `__tsm_r=${nonce};` },
+    { name: 'inline fish', line: inlineProbe(nonce, true), of: { strategy: 'inline' as const, nonce }, shell: fish, set: `set -g __tsm_r ${nonce};` },
+  ];
+  for (const { name, line, of, shell, set } of lines) {
+    assert.equal(probeMark(nonce).test(line), false, `${name}: the typed line is no mark`);
+    if (shell) {
+      const m = probeMark(nonce).exec(execFileSync(shell, ['-c', `${set}${line}`], { encoding: 'utf8' }));
+      assert.ok(m, `${name}: what the shell prints is the mark`);
+      if (of.strategy === 'marker') assert.deepEqual([m[1], m[2]], [undefined, undefined], `${name}: no pid, no token`);
+      else assert.ok(/^\d+$/.test(m[1]!) && m[2] === nonce, `${name}: the shell's pid and the Run's token: ${m[0]}`);
+    }
+    const head = of.strategy === 'marker' ? `${typed(nonce)}out\n` : '\r\nout\r\n';
+    const tail = of.strategy === 'marker' ? `\nmore\n<<<EXIT:${nonce}:0>>>\n` : `\r\nmore\r\n<<<EXIT:${nonce}:0>>>`;
+    const want = of.strategy === 'marker' ? 'out\nmore\n' : 'out\r\nmore\r\n';
+    for (let i = line.indexOf('<<<') + 1; i < line.length; i++) {
+      const broken = `${line.slice(0, i)}\r\n${line.slice(i)}`;
+      assert.equal(cutPlumbing(`${head}${broken}${tail}`, of), want, `${name}: broken at ${i}: ${JSON.stringify(broken)}`);
+    }
+  }
 });

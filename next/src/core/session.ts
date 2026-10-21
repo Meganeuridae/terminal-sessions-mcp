@@ -21,7 +21,7 @@ import { clocks, timerMs } from './clock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
-import { cutPlumbing, exitMark, probeMark, startMark } from './plumbing.js';
+import { cutPlumbing, exitMark, inlineProbe, markerProbe, probeMark, startMark } from './plumbing.js';
 import { stripEscapes } from './text.js';
 import { project, type ProjectChunk } from './transcript.js';
 import { type AttachmentRole, type ControlPolicy, type Cursors, DEFAULT_GEOMETRY, type EnvBasis, type EventOf, type IntegrationLevel, type JournalEvent, type Principal, type RunInfo, type RunOrigin, type RunState, type RunTarget, type ScreenSnapshot, type Seq, type ShellState, SYSTEM, type Visibility } from './types.js';
@@ -200,13 +200,6 @@ interface RunRecord extends RunInfo {
 const TRANSCRIPT_INPUT_CHARS = 4 * 1024 * 1024;
 /** Daemon lines remembered after their Run was declared lost before it started. */
 const MAX_ORPHAN_LINES = 32;
-/**
- * The end-marker probe (marker strategy): a marker of its own, split so echoes never match. It
- * confirms the shell is back, never the command's status; and the command's own end marker,
- * arriving after a cancel that failed, still reads as the end it is (the house's read of a6d0c35, #22).
- * The shapes printed here and by inlineLines are the ones plumbing.ts parses.
- */
-const probeLine = (nonce: string) => ` echo "<<<PRO""BE:${nonce}>>>"`;
 const publicRun = (r: RunRecord): RunInfo => {
   const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, startedMono: _sm, ...info } = r;
   return { ...info, seq: { ...info.seq } };
@@ -348,7 +341,7 @@ export function inlineLines(body: string, nonce: string, fish: boolean): string[
     : (len: number, then: string) => `if [ "\${__tsm_b+set}" = set ] && [ "\${#__tsm_b}" = "${len}" ]; then ${then}; else ${gone}; fi`;
   const ack = (k: number) => `printf '<<<AC''K:${nonce}:${k}>>>\\n'`;
   // The shell that prints the start marker first sets the token the cancel probe prints (see
-  // inlineProbe): an unexported variable, so a nested shell has none of it.
+  // plumbing.ts's inlineProbe): an unexported variable, so a nested shell has none of it.
   const finish = fish
     ? `set -g __tsm_r ${nonce}; printf '<<<STAR''T:${nonce}:%s>>>\\n' $fish_pid; eval (printf '%b' "$__tsm_b" | string collect); printf '<<<EXI''T:${nonce}:%s>>>\\n' $status`
     : `__tsm_r=${nonce}; printf '<<<STAR''T:${nonce}:%s>>>\\n' "$$"; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:${nonce}:%s>>>\\n' "$?"`;
@@ -384,15 +377,6 @@ interface InlineHit {
   value?: number;
   token?: string;
 }
-
-/**
- * The probe typed after a ^C (which may have cut the line before its end marker): a marker of its
- * own, with the Run's nonce, the pid of the shell that runs it, and the token the Run's own line
- * set in that shell (its nonce again). A nested shell the Run started prints its own pid and an
- * empty token: pids alone repeat across PID namespaces (`docker run -it … sh` is pid 1), the
- * variable does not travel (the house's read of 39787b3, #22).
- */
-export const inlineProbe = (nonce: string, fish: boolean): string => ` printf '<<<PRO''BE:${nonce}:%s:%s>>>\\n' ${fish ? '$fish_pid "$__tsm_r"' : '"$$" "$\{__tsm_r-}"'}`;
 
 /** The caller's name for the shell in front → the syntax the inline strategy types. */
 function declaredFlavor(name: string): 'posix' | 'fish' {
@@ -989,10 +973,15 @@ export class Session {
                           : 'whether a process other than the shell is reading the terminal could not be checked (no process listing, or a process that cannot be inspected), and unknown is not none';
                 // The key stays: the bash in front still holds it in the file the exec left, so this
                 // recovery loads the integration with marks the daemon accepts (item 5; retiring the
-                // key here refused them, and the advised line left the session unavailable).
-                this.note(`the new bash did not load the shell integration within ${cap} ms, and the daemon did not type it in: ${why}. Once the shell shows its own prompt, send \` . "$TSM_BASH_RC" reinit typed\` with input to load it, or open a new session`);
+                // key here refused them, and the advised line left the session unavailable). This note
+                // is the replacement's one note: the generic one after it said the shell "reports no
+                // marks" and offered only input or a new session, beside a recovery that restores them
+                // (a reviewer's read of the fixes for #22).
                 this.stopExecWatch();
-                return this.onShellReplaced(now, { keepKey: true });
+                return this.onShellReplaced(now, {
+                  keepKey: true,
+                  note: `the new bash did not load the shell integration within ${cap} ms, and the daemon did not type it in: ${why}. Shell commands are unavailable until it loads: once the shell shows its own prompt, send \` . "$TSM_BASH_RC" reinit typed\` with input to load it, or open a new session`,
+                });
               }
             }
           } else {
@@ -1019,10 +1008,12 @@ export class Session {
    * the level drops to what the program provides — none (G5 as amended: the level is what
    * the terminal's current program reports, and it only rises within one program) — so the
    * replacement remains available for explicit input, but is not a verified shell command
-   * destination. Neither a process name nor elapsed time establishes prompt readiness.
+   * destination. Neither a process name nor elapsed time establishes prompt readiness. `note`
+   * replaces the generic note where the caller knows more (the reinit gate: the shell is ours,
+   * and a line it advises loads the integration again).
    */
-  private onShellReplaced(command: string, opts: { keepKey?: boolean } = {}): void {
-    this.note(`the shell was replaced by \`${command}\`, which reports no marks: shell commands are unavailable; use input to interact, or open a new session`);
+  private onShellReplaced(command: string, opts: { keepKey?: boolean; note?: string } = {}): void {
+    this.note(opts.note ?? `the shell was replaced by \`${command}\`, which reports no marks: shell commands are unavailable; use input to interact, or open a new session`);
     // A fresh key, so nothing the replacement inherited can speak for the session — except for a bash
     // of ours the reinit gate gave up on (keepKey): its key is in the file the exec left for it, and
     // the recovery the gate's note gives reads it from there.
@@ -2491,7 +2482,7 @@ export class Session {
     const fg = this.pty.foreground?.();
     if (!fg || fg.foregroundPgid !== fg.shellPgid) return;
     run.probed = true;
-    this.pty.write(`${probeLine(run.markerNonce)}\n`);
+    this.pty.write(`${markerProbe(run.markerNonce)}\n`);
     steps.push('end-marker probe');
     await this.awaitRun(run.runId, grace);
   }

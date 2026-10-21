@@ -270,6 +270,10 @@ test('/bin/bash: exec into `bash --noediting` gets the honest note, not a false 
     assert.match(note, /--noediting is unsupported for the handoff/);
     assert.match(note, /TSM_BASH_RC" reinit typed/, 'the note gives the manual recovery');
     assert.doesNotMatch(note, /while a program read its input/, 'not the old false give-up wording');
+    // One note for the give-up, the gate's: the generic replacement note after it said the shell "reports no marks" and
+    // offered only input or a new session, beside a recovery that restores them (a reviewer's read of the fixes for #22).
+    assert.doesNotMatch(note, /reports no marks/, note);
+    assert.match(note, /Shell commands are unavailable until it loads/);
   } finally {
     await x.close();
   }

@@ -13,7 +13,8 @@
  * variable the Run's own line set — a nested shell, with another pid or the same one in another
  * PID namespace, has no such variable and answers with an empty token (the house's read of
  * 39787b3, #22). The typed lines that print them spell each word split (`EXI""T`, `STAR''T`,
- * `PRO""BE`), so an echo of the typed line never matches a mark.
+ * `PRO""BE`), so an echo of the typed line never matches a mark. The probe lines are built here
+ * (markerProbe, inlineProbe), and the cutter matches their echo from the same text.
  */
 import { stripEscapes } from './text.js';
 import type { RunStrategy } from './types.js';
@@ -50,15 +51,43 @@ const redrawn = (s: string): string => {
 const splitWord = (a: string, b: string): string => `${redrawn(a)}\\s*(?:${redrawn('""')}|${redrawn("''")})\\s*${redrawn(b)}`;
 /** The echo of a typed line that runs a Run: the wrapper's end marker or the inline start marker, split. */
 const wrapperEcho = (nonce: string): RegExp => new RegExp(`${redrawn('<<<')}\\s*(?:${splitWord('EXI', 'T')}|${splitWord('STAR', 'T')})\\s*:\\s*${redrawn(nonce)}\\s*:`, 'g');
+
 /**
- * The rest of a typed probe line after its nonce, as each strategy types it (session.ts: the
- * marker strategy's probeLine, inlineProbe for sh and for fish), so a match covers the whole line
- * however the editor broke it.
+ * The end-marker probe the marker strategy types after a ^C: a marker of its own, split so echoes
+ * never match. It confirms the shell is back, never the command's status; and the command's own
+ * end marker, arriving after a cancel that failed, still reads as the end it is (the house's read of
+ * a6d0c35, #22).
  */
-const PROBE_TAILS = ['>>>"', `:%s:%s>>>\\n' "$$" "$\{__tsm_r-}"`, `:%s:%s>>>\\n' $fish_pid "$__tsm_r"`];
-/** The echo of a probe line typed after a ^C, split, through the end of the typed line when it is there. */
+export const markerProbe = (nonce: string): string => ` echo "<<<PRO""BE:${nonce}>>>"`;
+/**
+ * The probe the inline strategy types after a ^C (which may have cut the line before its end
+ * marker): a marker of its own, with the Run's nonce, the pid of the shell that runs it, and the
+ * token the Run's own line set in that shell (its nonce again). A nested shell the Run started
+ * prints its own pid and an empty token: pids alone repeat across PID namespaces (`docker run -it
+ * … sh` is pid 1), the variable does not travel (the house's read of 39787b3, #22).
+ */
+export const inlineProbe = (nonce: string, fish: boolean): string => ` printf '<<<PRO''BE:${nonce}:%s:%s>>>\\n' ${fish ? '$fish_pid "$__tsm_r"' : '"$$" "$\{__tsm_r-}"'}`;
+/** Where a builder's line holds the nonce, to split it there: no builder types this character. */
+const AT_NONCE = '\0';
+/**
+ * The typed probe lines around their nonce, taken from the builders above: each head, from its
+ * mark's `<<<` up to the nonce, with the rests of the lines that follow the nonce after it. The
+ * cutter's copy of the rests was written by hand beside the builders, so a change to one could
+ * leave the echo of the line it types in a Run's output (a reviewer's read of the fixes for #22).
+ */
+const PROBE_LINES = new Map<string, string[]>();
+for (const line of [markerProbe(AT_NONCE), inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true)]) {
+  const [before, after] = line.split(AT_NONCE) as [string, string];
+  const head = before.slice(before.indexOf('<<<'));
+  PROBE_LINES.set(head, [...(PROBE_LINES.get(head) ?? []), after]);
+}
+/**
+ * The echo of a probe line typed after a ^C, split, through the end of the typed line when it is
+ * there. The rests that share a head are alternatives after it, so a line that is not the first's
+ * still matches whole (one branch per line would stop sh's at the nonce of fish's line).
+ */
 const probeEcho = (nonce: string): RegExp =>
-  new RegExp(`${redrawn('<<<')}\\s*${splitWord('PRO', 'BE')}\\s*:\\s*${redrawn(nonce)}(?:\\s*(?:${PROBE_TAILS.map(redrawn).join('|')}))?`, 'g');
+  new RegExp([...PROBE_LINES].map(([head, rests]) => `${redrawn(head)}\\s*${redrawn(nonce)}(?:\\s*(?:${rests.map(redrawn).join('|')}))?`).join('|'), 'g');
 /** A probe answer with its nonce (1), pid (2) and token (3). */
 const probeAnswer = (nonce: string): RegExp => new RegExp(`<<<PROBE:(${nonce})(?::(\\d+)(?::(${NONCE}|))?)?>>>`, 'g');
 
