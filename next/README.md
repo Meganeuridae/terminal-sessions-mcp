@@ -2,7 +2,9 @@
 
 > 2.0 lives in `next/`, beside the 1.x code this package has shipped so far. Both are in the
 > package: `termd`, `tsm` and `tsm-shim` are 2.0; `terminal-sessions-mcp`, `session-server`,
-> `session-gui` and `session-cli` are 1.x, whose code 2.0 does not change. The design discussion is
+> `session-gui` and `session-cli` are 1.x. 2.0 changes none of their code; what reaches them is the
+> package manifest they share with 2.0: a narrower Node range (`engines`) and `ws` pinned at 8.21.3,
+> inside 1.x's `^8.16.0`. The design discussion is
 > [antra-tess/terminal-sessions-mcp#11](https://github.com/antra-tess/terminal-sessions-mcp/pull/11).
 
 Persistent terminal sessions for agents and humans: a daemon that keeps shells alive,
@@ -287,13 +289,15 @@ stderr with exit 1, `--json` or not. `TSM_URL` and `TSM_TOKEN` point it at a dae
 
 2.0 ships beside the 1.x session server, MCP bridge, GUI and CLI in this package: one daemon
 (`termd`, port 3101) and thin clients (`tsm`, `tsm-shim`). The 1.x binaries
-(`terminal-sessions-mcp`, `session-server`, `session-gui`, `session-cli`) are unchanged and run
-1.x. When 2.0 becomes the default, `terminal-sessions-mcp` will point at the shim that serves the
-1.x tool names (`runCommand`, `tailLogs`, `sendInput`, …; the entry `next/src/shim/compat.ts`, the
-tools `next/src/api/compat.ts`), where `runCommand`'s result also says when a command is still
-running or queued, and `session-server` at `termd`. Until then the shim serves those names with
-`--profile compat` (`TSM_PROFILE=compat`). The GUI is
-served by `termd` itself. Nothing reads the 1.x data, which lived only in memory.
+(`terminal-sessions-mcp`, `session-server`, `session-gui`, `session-cli`) run 1.x. 2.0 changes none
+of their code; what reaches them is the package manifest they share with 2.0: a narrower Node range
+(`engines`) and `ws` pinned at 8.21.3, inside 1.x's `^8.16.0`. When 2.0 becomes the default,
+`terminal-sessions-mcp` will point at the shim that serves the 1.x tool names (`runCommand`,
+`tailLogs`, `sendInput`, …; the entry `next/src/shim/compat.ts`, the tools
+`next/src/api/compat.ts`), where `runCommand`'s result also says when a command is still running or
+queued, and `session-server` at `termd`. Until then the shim serves those names with `--profile
+compat` (`TSM_PROFILE=compat`). The GUI is served by `termd` itself. Nothing reads the 1.x data,
+which lived only in memory.
 
 ## Development
 

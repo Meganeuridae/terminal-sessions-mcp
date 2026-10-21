@@ -388,13 +388,11 @@ function usageReport(argv: string[]): void {
 
 /** The daemon connection, when one is open: `end` closes it cleanly. */
 let socket: WebSocket | undefined;
-/** `--json` was given: a daemon's error answer then goes to stdout as JSON (see DaemonError). */
-let jsonOut = false;
 
 /**
- * An error the daemon answered a request with. Under `--json` it is printed as {"error": "..."} on
- * stdout, as a tool's error result is; the help said so while main's catch put it on stderr as text
- * (the house's read of the 33 commits, #22, comment 6307351372).
+ * An error the daemon answered a request with. Under `--json` main prints it as {"error": "..."} on
+ * stdout, as a tool's error result is; it went to stderr as text while the help said stdout (the
+ * house's read of the 33 commits, #22, comment 6307351372). A lost connection is not one.
  */
 class DaemonError extends Error {}
 
@@ -429,7 +427,17 @@ async function main(): Promise<void> {
   // generic hint and a missing value is a connection error (a reviewer's read of a088780
   // and the house's read, #22 comment 6269721389).
   const syntax = parse(argv, undefined, false);
-  jsonOut = syntax.json;
+  try {
+    await ask(argv, syntax);
+  } catch (e) {
+    if (e instanceof DaemonError && syntax.json) return end(1, JSON.stringify({ error: e.message }, null, 2));
+    throw e;
+  }
+}
+
+/** Connect, call the tool `argv` names, and print its result; a daemon's error answer rejects as a DaemonError. */
+async function ask(argv: string[], syntax: Parsed): Promise<void> {
+  const cmd = argv[0] ?? '';
   const url = new URL(setting('TSM_URL') ?? 'ws://127.0.0.1:3101');
   const token = setting('TSM_TOKEN');
   if (token) url.searchParams.set('token', token);
@@ -516,8 +524,4 @@ function connectError(url: URL, message: string): string {
   return `cannot reach ${at}: ${message}`;
 }
 
-main().catch((e: unknown) => {
-  const text = e instanceof Error ? e.message : String(e);
-  if (e instanceof DaemonError && jsonOut) end(1, JSON.stringify({ error: text }, null, 2));
-  else end(1, text, process.stderr);
-});
+main().catch((e: unknown) => end(1, e instanceof Error ? e.message : String(e), process.stderr));

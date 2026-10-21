@@ -13,9 +13,10 @@ disk of everything that happened, so history outlives the daemon, and tells an M
 command finishes instead of being polled. Commands run in the session's shell as one terminal
 stream, as in 1.x; a process Run keeps stdout and stderr apart. It is in [`next/`](next/README.md), with its design and
 guarantees in [`docs/redesign/DESIGN.md`](docs/redesign/DESIGN.md). Its binaries are `termd`,
-`tsm` and `tsm-shim`. 2.0 changes none of the 1.x code, so everything below about 1.x
-(`terminal-sessions-mcp`, `session-server`, `session-gui`, `session-cli`) holds as before, except
-the Node versions under Requirements, which follow the package's `engines` range.
+`tsm` and `tsm-shim`. Everything below is about the 1.x binaries (`terminal-sessions-mcp`,
+`session-server`, `session-gui`, `session-cli`), which run 1.x. 2.0 changes none of their code; what
+reaches them is the package manifest they share with 2.0: a narrower Node range (`engines`) and `ws`
+pinned at 8.21.3, inside 1.x's `^8.16.0`.
 
 ## Why This Matters
 
