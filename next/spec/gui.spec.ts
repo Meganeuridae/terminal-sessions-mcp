@@ -16,8 +16,10 @@ import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
+import type { PtyHandle } from '../src/backends/types.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { TermServer, type LogRecord } from '../src/transport/server.js';
+import { until } from './testhost.js';
 
 /** The slice of puppeteer this test uses (loaded dynamically so a machine without it skips). */
 interface Page {
@@ -300,9 +302,39 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
     await takeSeat(page, a, 'secret');
     await page.click('#term');
     // The prompt text is built at run time, so the echoed command line never contains it: waiting for it waits for the prompt.
-    await page.keyboard.type(`P=word; read -s -p "Pass$P: " PW; echo; echo "len=\${#PW}"`);
+    // Nor does the line hold `pass` while it is typed: the GUI took `…"Pass$P: ` at the cursor for a password prompt and sent
+    // the rest of the command as sensitive (a reviewer's read of the fixes for #22).
+    await page.keyboard.type(`A=Pa; P=word; read -s -p "\${A}ss$P: " PW; echo; echo "len=\${#PW}"`);
     await page.keyboard.press('Enter');
-    await page.waitForFunction(`${rows}.includes('Password:')`, { timeout: 8000 });
+    const live = registry.get('secret');
+    assert.ok(live && live.kind === 'live');
+    await page.waitForFunction(`${rows}.includes('Password:')`, { timeout: 8000 }).catch(async (e: Error) => {
+      // Twice on macOS CI the prompt never showed, and the log held nothing to tell why (a reviewer's read of the fixes for #22):
+      // the failure says what the screen and the journal held.
+      const shown = await page.evaluate<string>(rows).catch((r: Error) => `(the rows could not be read: ${r.message})`);
+      const events = live.session.journal.since(0).events;
+      const last = (type: 'output' | 'input') =>
+        events
+          .filter((ev): ev is Extract<JournalEvent, { type: 'output' | 'input' }> => ev.type === type)
+          .slice(-8)
+          .map((ev) => JSON.stringify(ev.data).slice(0, 240))
+          .join(' ');
+      throw new Error(`${e.message}. The screen's rows: ${JSON.stringify(shown.slice(-800))}. The journal's last output: ${last('output')}. Its last input: ${last('input')}`);
+    });
+    assert.deepEqual(inputsOf('secret').filter((ev) => ev.sensitive), [], 'nothing before the prompt was sent as sensitive');
+    // On screen is not yet in force: `read -s` prints its prompt and turns echo off after it, with a tcsetattr that waits for
+    // the prompt to drain. On Linux that returns at once; on macOS it waits for the daemon to read the prompt (by reading
+    // XNU's ttywait; we can't run macOS), so keys typed the moment the prompt shows could be echoed into the journal, as they
+    // were once on macOS CI (a reviewer's read of the fixes for #22). The password waits for the mode `read -s` reads in.
+    const pty = (live.session as unknown as { pty: PtyHandle }).pty;
+    let mode: ReturnType<NonNullable<PtyHandle['inputMode']>>;
+    await until(() => {
+      mode = pty.inputMode?.();
+      return mode !== undefined && mode.canonical && !mode.echo;
+    }, 5000, "the terminal in read -s's mode: canonical, echo off").catch((e: Error) => {
+      // Which of the two it was: a mode that never came, or one that could not be read here (stty, the pty's name).
+      throw new Error(`${e.message}; the last mode read: ${mode === undefined ? 'none (it could not be read)' : JSON.stringify(mode)}`);
+    });
     await page.keyboard.type('hunter2-s3cret');
     // Secret mode turns on at the first keystroke on a password line (the session also redacts input at a password prompt on its own, m2-2).
     await page.waitForFunction(`document.getElementById('secret').textContent === 'Secret: auto'`, { timeout: 3000 });
