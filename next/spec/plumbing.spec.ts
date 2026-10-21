@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { ackMark, commandFile, cutPlumbing, exitMark, goneMark, inlineProbe, inlineTypedLine, markerProbe, markerStartLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLine, sourceLineEcho, startMark } from '../src/core/plumbing.js';
+import { ackMark, commandFile, cutPlumbing, exitMark, goneMark, inlineProbe, inlineTypedLine, keptRanges, markerProbe, markerStartLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLine, sourceLineEcho, startMark } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { journalRunText } from '../src/core/segmenter.js';
 import { transcript } from '../src/core/transcript.js';
@@ -509,4 +509,40 @@ test('with no nonce recorded, a program’s own split mark word inside a title o
       assert.equal(shown, 'out1\nafter', `${JSON.stringify(of)}: ${JSON.stringify(body)}`);
     }
   }
+});
+
+test('keptRanges are the raw slices the cut keeps, in order and none empty: a reader can report where in the journal a Run’s output is', () => {
+  // For the reader's Run read, which reports journal positions (a request from the round fixing it).
+  const marker = { strategy: 'marker' as const, nonce: N };
+  const cases: Array<[string, Parameters<typeof cutPlumbing>[1]]> = [
+    [`${typed(N)}<<<START:${N}:4242>>>\r\nout\r\n<<<EXIT:${N}:0>>>\r\n$ `, marker],
+    [`${typed(N)}<<<START:${N}:4242>>>\r\nA\r\n\x1b[31m$${markerProbe(N)}\r\nB\r\n<<<PROBE:${N}>>>\r\n$ `, marker],
+    [`typed\r\n<<<START:${N}:4242>>>\r\nhello\r\n<<<EXIT:${N}:0>>>\r\nremote$ `, { strategy: 'inline', nonce: N }],
+    [`echo hi\r\nhi\r\n`, { strategy: 'basic' }],
+    [`hi\r\n`, { strategy: 'rich' }],
+    [`${typed(N)}`, marker],
+  ];
+  for (const [raw, of] of cases) {
+    const ranges = keptRanges(raw, of);
+    assert.equal(ranges.map(([s, e]) => raw.slice(s, e)).join(''), cutPlumbing(raw, of), JSON.stringify(raw));
+    ranges.forEach(([s, e], i) => assert.ok(s < e && (i === 0 || ranges[i - 1]![1] <= s), `in order, none empty: ${JSON.stringify(ranges)}`));
+  }
+  const [first] = keptRanges(cases[0]![0], marker);
+  assert.deepEqual(first, [cases[0]![0].indexOf('out'), cases[0]![0].indexOf('<<<EXIT')], 'the output’s own place in the raw');
+  assert.deepEqual(keptRanges(cases[1]![0], marker).map(([s, e]) => cases[1]![0].slice(s, e)), ['A\r\n\x1b[31m', 'B\r\n'], 'a struck probe echo splits the output in two');
+  assert.deepEqual(keptRanges(cases[5]![0], marker), [], 'nothing kept, no range');
+});
+
+test('a page or tail of a declared shell’s Run that begins with a blank line keeps it: only a whole read begins with the start mark’s line end', async () => {
+  // A request from the round fixing the reader's Run read: the inline strategy's rule that drops the line end the output begins
+  // with (its start mark's, journaled before the Run's output) dropped a window's own blank line too, in a page, a tail and
+  // journalRunText's tail windows.
+  const inline = { strategy: 'inline' as const, nonce: N };
+  const raw = `\r\n\r\nline\r\n<<<EXIT:${N}:0>>>\r\nremote$ `;
+  assert.equal(cutPlumbing(raw, inline), '\r\nline\r\n', 'a whole read: the start mark’s line end goes');
+  assert.equal(cutPlumbing(raw, { ...inline, truncated: true }), '\r\n\r\nline\r\n', 'a window: its blank line stays');
+  const run = { runId: 'r1', target: 'shell', strategy: 'inline', nonce: N } as unknown as RunInfo;
+  const window = (truncated: boolean) => ({ events: [{ type: 'output', seq: 5, ts: 0, stream: 'pty', data: raw, runId: 'r1' }], from: 5, to: 5, truncated }) as unknown as RunOutput;
+  assert.equal((await journalRunText(window(false), { cols: 80, rows: 24 }, run)).text, '\nline');
+  assert.equal((await journalRunText(window(true), { cols: 80, rows: 24 }, run)).text, '\n\nline', 'a tail window');
 });

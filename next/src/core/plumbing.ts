@@ -315,14 +315,25 @@ function stripAtMarks(raw: string, nonce: string | undefined): { text: string; m
  * read of 78c4d6e, #22: the cut moved back to that echo and the output after it was gone).
  * Without a recorded nonce the same shapes are found with any nonce, which can take a program
  * line in a mark's shape for one. The cut is found on the text without escape sequences
- * (stripAtMarks) and made in the raw.
+ * (stripAtMarks) and made in the raw (keptRanges).
  */
 export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
-  if (of.strategy === 'rich') return raw;
+  return keptRanges(raw, of)
+    .map(([s, e]) => raw.slice(s, e))
+    .join('');
+}
+
+/**
+ * The raw slices cutPlumbing keeps, `[start, end)` in order and none empty: for a reader that reports
+ * where in the journal a Run's output is (the reader's Run read), not only what it says.
+ */
+export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, number]> {
+  const whole = (s: number): Array<[number, number]> => (s < raw.length ? [[s, raw.length]] : []);
+  if (of.strategy === 'rich') return whole(0);
   if (of.strategy === 'basic') {
-    if (of.truncated) return raw;
+    if (of.truncated) return whole(0);
     const nl = raw.indexOf('\n');
-    return nl === -1 ? '' : raw.slice(nl + 1);
+    return nl === -1 ? [] : whole(nl + 1);
   }
   const nonce = of.nonce ?? NONCE;
   const { text, map, open } = stripAtMarks(raw, of.nonce);
@@ -371,11 +382,13 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
         const lineEnd = nl === -1 ? text.length : nl;
         while (k < echoes.length && echoes[k]![1] <= from) k++;
         if (k === echoes.length || echoes[k]![0] >= lineEnd) break;
-        if (nl === -1) return '';
+        if (nl === -1) return [];
         from = nl + 1;
       }
     }
-    if (of.strategy === 'inline' && text[from] === '\n') from++;
+    // The inline strategy's start mark is journaled before the Run's output, which begins with that
+    // line's end; a read that began later (a page, a tail) begins with the output's own blank line.
+    if (of.strategy === 'inline' && !of.truncated && text[from] === '\n') from++;
   }
   const rest = text.slice(from);
   let to = exitMark(nonce).exec(rest)?.index ?? rest.length;
@@ -448,5 +461,7 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   // right after the line end before it instead: ending at the line's first character in the text
   // kept that head; ending after the line end everywhere dropped those escapes (an independent read
   // of the fix).
-  return kept.map(([s, e, atLine]) => raw.slice(from + s === 0 ? 0 : map[from + s - 1]! + 1, atLine && open.has(from + e) ? map[from + e - 1]! + 1 : (map[from + e] ?? raw.length))).join('');
+  return kept
+    .map(([s, e, atLine]): [number, number] => [from + s === 0 ? 0 : map[from + s - 1]! + 1, atLine && open.has(from + e) ? map[from + e - 1]! + 1 : (map[from + e] ?? raw.length)])
+    .filter(([s, e]) => s < e);
 }
