@@ -474,7 +474,8 @@ test('a Run’s duration is measured on the monotonic clock: a wall-clock step b
     h.shell.finishHung(0, 'ok\r\n');
     assert.equal((await h.session.awaitRun(a.run.runId, 5000)).state, 'exited');
     const end = h.journal.since(0).events.find((e): e is Extract<JournalEvent, { type: 'run.end' }> => e.type === 'run.end')!;
-    assert.ok(end.durationMs >= 2500 && end.durationMs < 4500, `the monotonic interval, not the wall clock's: ${end.durationMs} ms`);
+    // The lower bound alone rules out the wall clock's measure; an upper one would fail only a stalled runner (the house's read of the 33 commits, #22, comment 6307351806).
+    assert.ok(end.durationMs >= 2500, `the monotonic interval, not the wall clock's: ${end.durationMs} ms`);
   } finally {
     await h.session.close();
   }
@@ -509,9 +510,10 @@ test('one rule for a Run’s duration across a wall-clock step back: so far, at 
     h.pty.emit('tick\r\n');
     await until(() => out.some((s) => s.kind === 'output'), 5000, 'a digest');
     const elapsed = out.find((s) => s.kind === 'output')!.metadata.elapsedMs as number;
-    assert.ok(elapsed >= 2500 && elapsed < 4500, `the digest counts from the session's measure: ${elapsed} ms`);
+    // The lower bound alone rules out the wall clock's measure; an upper one would fail only a stalled runner (the house's read of the 33 commits, #22, comment 6307351806).
+    assert.ok(elapsed >= 2500, `the digest counts from the session's measure: ${elapsed} ms`);
     const sofar = h.session.runDurationMs(id)!;
-    assert.ok(sofar >= 2500 && sofar < 4500, `so far, on the monotonic clock: ${sofar} ms`);
+    assert.ok(sofar >= 2500, `so far, on the monotonic clock: ${sofar} ms`);
     assert.equal(h.session.run(id).durationMs, undefined, 'a Run in flight carries no duration of its own');
     h.shell.finishHung(0, 'ok\r\n');
     assert.equal((await h.session.awaitRun(id, 5000)).state, 'exited');

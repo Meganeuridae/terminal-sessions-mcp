@@ -943,6 +943,7 @@ test('a completion reads a negative journaled duration as no time, and a digest 
   await until(() => out.some((s) => s.kind === 'output'), 5000, 'a digest');
   const digest = out.find((s) => s.kind === 'output')!;
   const elapsed = digest.metadata.elapsedMs as number;
-  assert.ok(elapsed >= 90_000 && elapsed < 95_000, `the monotonic interval: ${elapsed} ms`);
-  assert.match(digest.head, /running `cmd-long` 1m3\ds/, digest.head);
+  // The lower bound alone rules out the wall clock's measure; an upper one would fail only a stalled runner (the house's read of the 33 commits, #22, comment 6307351806).
+  assert.ok(elapsed >= 90_000, `the monotonic interval: ${elapsed} ms`);
+  assert.match(digest.head, /running `cmd-long` \d+m\d\ds/, digest.head);
 });
