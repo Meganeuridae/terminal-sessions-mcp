@@ -563,6 +563,15 @@ test('a tail cut’s open sequence stops dropping a source’s output at a hole:
   assert.equal((await project(chunks, { cols: 80, rows: 10 })).text, 'head\n[a hole]\nafter the gap\nnext line', 'without a budget');
 });
 
+test('a tail cut’s open string ended by a new sequence that begins with an ESC held back from the chunk before applies that sequence, not shows it', async () => {
+  // The ESC at a chunk's end may be the first half of the string's ST, so the line-end carry holds it back; when the next
+  // chunk shows it began a CSI instead, the string is over and the CSI applies. That branch of the cut's skip ran in no spec.
+  const pay = 'QUJD'.repeat(3000);
+  const chunks: ProjectChunk[] = [{ data: `head \x1b]52;c;${pay}\x1b`, stream: 'pty' }, { data: '[31mred\x1b[0m\r\nnext\r\n', stream: 'pty' }];
+  assert.equal((await project(chunks, { cols: 80, rows: 10, maxInputBytes: 4096 })).text, 'red\nnext');
+  assert.equal((await project(chunks, { cols: 80, rows: 10 })).text, 'head red\nnext', 'without the budget');
+});
+
 test('the line-end rule reads strings as the emulator does: CAN and SUB end one, and the C1 introducers open one', async () => {
   // text.ts read `ESC ] 0 ; my CAN` as still open, so the LF after it was no line end and the rest payload; and
   // knew no C1 string introducer, so the LF inside a U+009D OSC ended a line.
