@@ -1254,3 +1254,21 @@ test('a tail counts the line ends a string payload holds as none: its window goe
     }
   }
 });
+
+test('a head-first page over a string left open across thousands of small events reads in linear time', async () => {
+  // Each event that might have ended the string ran the collected output's open-sequence scan again: 20,000
+  // events holding a BEL inside a DCS (which a BEL does not end), or each opening a string of its own, held
+  // the event loop for about two minutes (an independent read of the house's fixes for #22).
+  for (const each of [(i: number) => `p${i}\x07`, (i: number) => `\x1b]0;p${i}`]) {
+    const s = source();
+    out(s.journal, 'x'.repeat(15000) + '\r\n\x1bPq');
+    for (let i = 0; i < 20000; i++) out(s.journal, each(i));
+    out(s.journal, '\x1b\\done\r\n');
+    const t0 = performance.now();
+    const r = await readJournal(s, { since: 0 }, { resultBytes: 16384 });
+    const ms = performance.now() - t0;
+    assert.ok(ms < 2000, `${Math.round(ms)} ms`);
+    assert.equal(r.more, true);
+    assert.equal(r.nextOffset, 15002, JSON.stringify({ next: r.nextCursor, off: r.nextOffset }));
+  }
+});

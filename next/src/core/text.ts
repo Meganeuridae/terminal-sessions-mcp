@@ -132,17 +132,6 @@ export const isStringStart = (data: string, i: number): boolean => {
   return C1_STRING.has(c) || (c === 0x1b && /[\]PX^_]/.test(data[i + 1] ?? ''));
 };
 
-/**
- * What could end the control string beginning at `data[i]` (isStringStart), as sequenceEnd ends it,
- * for a reader that looks only at new data for its end: ST, BEL, CAN, SUB, ESC and every other C1
- * control, and in an SOS, PM or APC any code point from U+00A0 too.
- */
-export const stringCloser = (data: string, i: number): RegExp => {
-  const c = data.charCodeAt(i);
-  const k = c === 0x1b ? data.charCodeAt(i + 1) + 0x40 : c;
-  return k === 0x98 || k === 0x9e || k === 0x9f ? /[\x07\x18\x1a\x1b\x80-\uffff]/ : /[\x07\x18\x1a\x1b\x80-\x9f]/;
-};
-
 /** The introducers, for finding the next one. */
 const INTRODUCER = /[\x1b\x90\x98\x9b\x9d-\x9f]/g;
 
