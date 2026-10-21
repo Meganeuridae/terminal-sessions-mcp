@@ -955,9 +955,10 @@ export class Journal {
       // Exact now: a sealed journal issues no more seqs, so the next journal over the store numbers on from
       // this one's last, and after a power loss records as lost only what the files lost. If the disk
       // refuses this too, the reservation a block ahead stands, which is safe: no seq is given twice. But the
-      // next start then counts seqs this journal never issued among those it may have lost, so that is said.
+      // next start then counts seqs this journal never issued among those it may have lost, so that is said,
+      // failed mark or not: one already on disk a block ahead is honoured on any boot.
       const failed = this.holesUnrecorded();
-      if (!this.writeReservation(this.seq, failed) && !failed) {
+      if (!this.writeReservation(this.seq, failed)) {
         this.log?.('warn', `the journal's reservation could not be lowered to its last seq (${this.seq}) as it closed: the next start may count seqs above ${this.seq} among those lost, though this journal never issued them`);
       }
     }
