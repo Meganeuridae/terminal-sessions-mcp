@@ -1078,6 +1078,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   let first = end;
   let before: Position | undefined;
   let cut: Cut | undefined;
+  /** The lines shown reach back to the line written last (below). */
+  let reached = false;
   if (shown.kept.length > 0 && items.length > 0) {
     const display = new Display(items, multi);
     const asked = outputLines(shown.kept);
@@ -1093,11 +1095,13 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       // leave the line written last out of the text, and then no such place exists: following `before`
       // returned this page again, or two pages in turn, and lines between were never reached (the house's
       // read of the 33 commits, #22, comment 6307350650, item 1). The text then reaches back to the line
-      // written last, more lines than asked for; the byte cap drops none of them whole, and a cut at their head is read on by `head`.
+      // written last, more lines than asked for. Dropping lines for the byte cap leaves all of them; the cut to the cap can still take
+      // the head of the first, or lines whole, and `head` reads on from where the page before ends, which shows them.
       const z = display.lastWritten();
       if (z.shown > n) all = await projectTail(z.shown);
       shown = fit(all, z.lines);
       cut = display.cutBefore(z.at);
+      reached = true;
     }
     // Where a tail of what came before ends: right where the lines shown begin, so that every line the text
     // leaves out is whole in it; at the window's start when they reach back to it, and nothing when that is
@@ -1108,7 +1112,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   }
   const { kept, drop, cutByBytes, tail } = shown;
   const text = tail.text;
-  const returned = outputLines(kept);
+  // The lines the text shows: a byte cut can drop lines ahead of the one it cuts.
+  const returned = outputLines(text === '' ? [] : text.split('\n'));
   const truncated = cutByBytes || (returned < n && older) || headCut;
   const counts: NonNullable<ReadResult['lines']> = { requested: n, returned };
   if (before) counts.before = before;
@@ -1117,11 +1122,13 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // set `truncated`, and said nothing of which line was cut (the house's read of the 38 commits, #22,
   // comment 6274935728, item 1). Its head is read head-first from where the page before ends. When the
   // lines shown reach back to the window's start and older output precedes it, that is where the
-  // window starts, not where the line does: the read goes on from there (`begunBefore`).
+  // window starts, not where the line does: the read goes on from there (`begunBefore`). So it does when
+  // the byte cap cuts lines reached back to: the page before ends before the line written last, and the
+  // line cut may have begun ahead of that, with its head in that page.
   if (kept.length > 0 && items.length > 0 && (tail.cut || (drop === 0 && headCut && !notes.has(kept[0]!)))) {
     const from = before ?? { until: endBefore(items[0]!.ev) };
     counts.cutHead = true;
-    if (!cut && older) counts.begunBefore = true;
+    if ((!cut && older) || (reached && tail.cut)) counts.begunBefore = true;
     counts.head = from.untilOffset !== undefined ? { since: from.until - 1, offset: from.untilOffset } : { since: from.until };
   }
   const r: Omit<ReadResult, 'session'> = { text, seq: [first, end], nextCursor: end, more: false, truncated, lines: counts };

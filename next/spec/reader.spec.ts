@@ -1201,3 +1201,26 @@ test('paging back past a command of several lines reaches every line: its `$ <li
     for (const l of all) assert.ok(seen.has(l), `tail ${tail}: ${l} in ${JSON.stringify(pages.map((p) => p.text))}`);
   }
 });
+
+test('a tail that reaches back to the line written last, cut by the byte cap, counts the lines it shows and reads on from where the page before ends', async () => {
+  // The pty's line, begun before a Run's and written last, is held behind it (rule 6), so a tail of 1 reaches back
+  // to it. At 1,024 bytes the cut dropped it whole while `returned` said 2, and at 2,048 it cut its head, which
+  // lies in the page before, while `head` promised it from its head.
+  const header = /^\[(terminal|run .+)\]$/;
+  for (const maxBytes of [1024, 2048]) {
+    const src = source({ cols: 4000 });
+    out(src.journal, 'p1\r\n' + 'P'.repeat(700));
+    startRun(src.journal, 'r1');
+    out(src.journal, 'r0\r\n' + 'R'.repeat(700), 'stdout', 'r1');
+    out(src.journal, 'S'.repeat(700));
+    const r = await readJournal(src, { tail: 1, maxBytes }, { resultBytes: 16384 });
+    const shown = r.text!.split('\n').filter((l) => !header.test(l));
+    assert.equal(r.lines!.returned, shown.length, `maxBytes ${maxBytes}: ${JSON.stringify(r.lines)}`);
+    assert.ok(r.lines!.cutHead && r.lines!.begunBefore && r.lines!.head && r.lines!.before, `maxBytes ${maxBytes}: ${JSON.stringify(r.lines)}`);
+    const earlier = await readJournal(src, { tail: 1, maxBytes: 1 << 20, ...r.lines!.before! }, { resultBytes: 1 << 20 });
+    const on = await readJournal(src, { ...r.lines!.head!, maxBytes: 1 << 20 }, { resultBytes: 1 << 20 });
+    const seen = [earlier.text, r.text, on.text].join('\n');
+    // The line written last (its part before the Run's line and its part after) and the Run's line: none is in neither read.
+    for (const part of ['P'.repeat(700), 'R'.repeat(700), 'S'.repeat(700)]) assert.ok(seen.includes(part), `maxBytes ${maxBytes}: ${part.slice(0, 4)}… in ${JSON.stringify([earlier.text, r.text, on.text].map((t) => t?.length))}`);
+  }
+});
