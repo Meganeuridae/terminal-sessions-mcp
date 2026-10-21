@@ -327,7 +327,11 @@ interface Stamp {
 /** The newest output of each stream of one Run, or of the session outside Runs. */
 type Newest = Partial<Record<OutputStream, Stamp>>;
 
-/** How many ended Runs keep their last output's stamp, for a silence wait answering for one: more than the 1,000 ended Runs a session holds in memory. */
+/**
+ * How many ended Runs keep their last output's stamp, for a silence wait answering for one: the newest
+ * 1,024, about the 1,000 a session keeps in memory (MAX_ENDED_RUNS; it keeps more while a process Run's
+ * group lives on, or someone waits on a Run). An older one's last output is aged on the wall clock (clock.ts).
+ */
 const ENDED_STAMPED = 1024;
 
 export class WatchManager {

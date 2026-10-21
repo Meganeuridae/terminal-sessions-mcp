@@ -449,3 +449,24 @@ test('a silence wait answering for an ended Run that printed nothing says "no ou
     f.close();
   }
 });
+
+test('the newest 1,024 ended Runs keep their last output’s stamp, and an older one’s output is aged on the wall clock (the house’s read of the 40 commits, #22)', async (t) => {
+  // The stamps of ended Runs are bounded: each Run's end past the newest 1,024 lets the oldest go.
+  const f = bare();
+  try {
+    for (let i = 0; i <= 1024; i++) {
+      f.startRun(`r${i}`);
+      f.out('x\n', `r${i}`);
+      f.journal.append({ type: 'run.end', runId: `r${i}`, state: 'exited', exit: 0, durationMs: 1 });
+    }
+    const wall = Date.now();
+    t.mock.method(Date, 'now', () => wall + 10_000);
+    const quietOf = (w: WaitResult) => Number(/no output for (\d+)ms/.exec(String(w.match))?.[1]);
+    const oldestKept = await f.manager.waitFor({ silenceMs: 200, runId: 'r1' }, 5000);
+    assert.ok(quietOf(oldestKept) < 10_000, `the 1,024th newest ended Run is aged on the monotonic clock: ${oldestKept.match}`);
+    const evicted = await f.manager.waitFor({ silenceMs: 200, runId: 'r0' }, 5000);
+    assert.ok(quietOf(evicted) >= 10_000, `the 1,025th newest is aged on the wall clock: ${evicted.match}`);
+  } finally {
+    f.close();
+  }
+});
