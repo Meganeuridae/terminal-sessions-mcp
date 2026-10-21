@@ -141,14 +141,15 @@ const PLUMBING = new RegExp([sourceLineEcho(), inlineTypedLine(), startMark(), e
  * carries no Run's nonce is a program's, and stays (the house's read of 78c4d6e, #22).
  */
 interface Plumbing {
-  nonces: Set<string>;
+  /** Each Run's nonce, with the lines its `$ <line>` heading takes in the text (its line's lines). */
+  nonces: Map<string, number>;
   byShape: boolean;
 }
 
 function plumbingIn(ctx: ToolContext, session: string, from: Seq, to: Seq): Plumbing {
   const runs = ctx.app.runPlumbing(ctx.caller, { session, from, to });
   return {
-    nonces: new Set(runs.flatMap((r) => (r.nonce === undefined ? [] : [r.nonce]))),
+    nonces: new Map(runs.flatMap((r) => (r.nonce === undefined ? [] : [[r.nonce, countLines(r.line ?? '') + 1] as const]))),
     byShape: runs.some((r) => r.nonce === undefined && r.strategy !== 'rich' && r.strategy !== 'basic'),
   };
 }
@@ -201,9 +202,11 @@ function probeLines(lines: string[]): Set<number> {
 /**
  * Log lines with the plumbing removed, each with its index in `lines`; a line that held nothing else
  * is dropped, and so is every line a probe's echo spans (probeLines). A start mark cut takes its
- * line's end with it: the Run starts at the mark (run.start follows it), so the `$ <command>` line
+ * line's end with it: the Run starts at the mark (run.start follows it), so the `$ <command>` heading
  * the reader puts there comes before the mark's line ends, and that end showed as an empty line
- * under the command line.
+ * under the heading, which takes as many lines as the Run's line holds: one was assumed, and under a
+ * command of two lines the empty line stayed (our read of the house's fixes for its review of
+ * f3750e4, PR #22: e8a8d52).
  */
 function keptLines(lines: string[], p: Plumbing): Array<[string, number]> {
   const kept: Array<[string, number]> = [];
@@ -213,7 +216,11 @@ function keptLines(lines: string[], p: Plumbing): Array<[string, number]> {
     if (i === markEnd || probes.has(i)) return;
     const k = withoutPlumbing(l, p);
     if (k !== null) kept.push([k, i]);
-    else if (START.test(l) && lines[i + 1]?.startsWith('$ ') && /^\s*$/.test(lines[i + 2] ?? '-')) markEnd = i + 2;
+    else if (lines[i + 1]?.startsWith('$ ')) {
+      const mark = START.exec(l);
+      const after = i + 1 + (p.nonces.get(nonceOf(mark?.[0] ?? '') ?? '') ?? 1);
+      if (mark && /^\s*$/.test(lines[after] ?? '-')) markEnd = after;
+    }
   });
   return kept;
 }

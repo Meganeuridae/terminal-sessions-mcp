@@ -446,6 +446,23 @@ test('a reviewer’s read: a declared shell’s typed body, its start mark and i
   await call('killSession', { session: 'declog', graceful: false });
 });
 
+test('a declared shell’s two-line command shows in the logs with no empty line under it: the start mark’s line end is struck after the heading’s every line (our read of the house’s fixes for its review of f3750e4, PR #22: e8a8d52)', async () => {
+  // The empty line a start mark's line end leaves was struck one line after a `$ <command>` heading, whatever the command's lines.
+  const opened = await call('runCommand', { session: 'declml', command: 'sh', timeout: -1 });
+  await until(() => summary('declml')?.runs?.some((x) => x.runId === opened.runId && x.state === 'running') === true, 5000, 'sh in front');
+  await call('session_declare_shell', { session: 'declml', shell: 'sh' });
+  assert.equal((await call('runCommand', { session: 'declml', command: 'echo first\necho second' })).exitCode, 0);
+  assert.equal((await call('runCommand', { session: 'declml', command: 'echo single' })).exitCode, 0);
+  for (const raw of [false, true]) {
+    const tail = lines(await call('tailLogs', { session: 'declml', lines: 20, raw }));
+    const at = tail.indexOf('$ echo first');
+    assert.deepEqual(tail.slice(at, at + 4), ['$ echo first', 'echo second', 'first', 'second'], `raw ${raw}: ${JSON.stringify(tail)}`);
+    const one = tail.indexOf('$ echo single');
+    assert.deepEqual(tail.slice(one, one + 2), ['$ echo single', 'single'], `raw ${raw}: ${JSON.stringify(tail)}`);
+  }
+  await call('killSession', { session: 'declml', graceful: false });
+});
+
 test('a reviewer’s read: the probe line a cancel types into a declared shell stays out of the logs, cut by the cutter’s own matcher', async () => {
   // The program ignores ^C, so the session types its end-marker probe (plumbing.ts inlineProbe) before it
   // escalates; compat struck that line's echo with a copy of the builders, now with probeEcho itself.

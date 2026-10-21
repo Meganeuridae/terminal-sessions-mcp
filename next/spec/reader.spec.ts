@@ -1202,6 +1202,33 @@ test('paging back past a command of several lines reaches every line: its `$ <li
   }
 });
 
+test('a head-cut first line that reads like a later line of a command note is still said to be cut: only a note’s first line can begin the lines shown (our read of the house’s fixes for its review of f3750e4, PR #22: fbadcf1)', async () => {
+  // One progress line longer than the tail's input cap, under a three-line command: its last part, `done`, is the
+  // first line shown, and it matched the note's third line, so the tail dropped cutHead and the read of its head.
+  for (const line of ['for i in 1 2; do\n  step $i\ndone', 'for i in 1 2; do step $i; done']) {
+    const src = source();
+    out(src.journal, 'p$ \r\n');
+    src.journal.append({ type: 'run.admit', runId: 'r1', target: 'shell', principal: 'agent:a@test', origin: 'self', queued: false });
+    src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/', line });
+    let progress = '';
+    for (let i = 0; i < 25_000; i++) progress += `\r${String(i).padStart(12)}`;
+    out(src.journal, progress);
+    out(src.journal, '\rdone        \r\n');
+    const r = await readJournal(src, { tail: 1, commands: true }, { resultBytes: 16384 });
+    assert.equal(r.text, 'done', JSON.stringify(line));
+    assert.equal(r.lines?.cutHead, true, `${JSON.stringify(line)}: ${JSON.stringify(r.lines)}`);
+    assert.ok(r.lines?.head, `${JSON.stringify(line)}: the read of its head`);
+  }
+  // A note's first line still begins the lines shown without a head to cut.
+  const src = source();
+  src.journal.append({ type: 'run.admit', runId: 'r1', target: 'shell', principal: 'agent:a@test', origin: 'self', queued: false });
+  src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/', line: 'echo one\necho two' });
+  out(src.journal, 'one\r\ntwo\r\n');
+  const whole = await readJournal(src, { tail: 4, commands: true }, { resultBytes: 16384 });
+  assert.equal(whole.text, '$ echo one\necho two\none\ntwo');
+  assert.equal(whole.lines?.cutHead, undefined);
+});
+
 test('a tail that reaches back to the line written last, cut by the byte cap, counts the lines it shows and reads on from where the page before ends', async () => {
   // The pty's line, begun before a Run's and written last, is held behind it (rule 6), so a tail of 1 reaches back
   // to it. At 1,024 bytes the cut dropped it whole while `returned` said 2, and at 2,048 it cut its head, which

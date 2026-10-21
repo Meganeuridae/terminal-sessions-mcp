@@ -35,8 +35,11 @@
  * - The projection (§6) runs at the session's geometry, and a Run's at the
  *   geometry it started with. A page starts in the lasting terminal state the
  *   output before it set (a scroll region, the alternate screen, modes; looked
- *   for in up to STATE_LOOKBACK bytes of that output), so a page deep in apt's
- *   output projects as the terminal showed it. Output of different sources
+ *   for in up to STATE_LOOKBACK bytes of that output, and in a session's pages
+ *   and tails within MAX_SCAN journal events back), so a page deep in apt's
+ *   output projects as the terminal showed it. A tail that begins inside a
+ *   control string reads it the same way: one opened further back than either
+ *   bound is not seen, and its payload shows as text. Output of different sources
  *   (the terminal, concurrent process Runs) is interleaved by whole lines (§6
  *   rule 6), and a page holding more than one source heads each change of
  *   source with a line `[terminal]` or `[run <runId>]`.
@@ -826,6 +829,9 @@ const STATE_LOOKBACK = 1024 * 1024;
  * The lasting terminal state (`persistentState`, screen.ts) set by the view's
  * output before the page: `first`'s bytes before `start`, and up to
  * STATE_LOOKBACK bytes of output before it — the Run's own for a Run's pages.
+ * A session's look-back also stops after MAX_SCAN journal events, output or
+ * not, so many small events end it before the bytes do (40,000 events of 8 bytes
+ * are 320 KB): state set before them is not applied.
  */
 function stateBefore(src: ReadSource, o: ReadOptions, first: Output, start = 0): string {
   const parts: string[] = [];
@@ -1024,8 +1030,12 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const note = (e: JournalEvent, text: string) => {
     chunks.push({ note: text });
     // A command's line can hold newlines: each of its lines is a line of the text, none with a head to cut.
+    // Only its first line can begin the lines shown (wholeNote; a byte cut that drops lines sets `cutHead`
+    // by its own rule), so only that one is kept to tell a first line that is a note from output. Every line
+    // kept, a head-cut first line of output that read like a later one (`done` under a three-line `for`)
+    // lost its `cutHead` and `head` (our read of the house's fixes for its review of f3750e4, PR #22: fbadcf1).
     const lines = text.split('\n');
-    for (const l of lines) notes.add(l);
+    notes.add(lines[0]!);
     items.push({ ev: e, lines: lines.length });
     carries.clear();
   };
@@ -1148,6 +1158,9 @@ const endsSequences = (e: JournalEvent, o: ReadOptions): boolean => isGap(e) || 
  * What `first`'s source left open where `first` begins (LineCarry's `open`: a control sequence's introducer, and
  * after a string's a last ESC that may begin its terminator), read in up to STATE_LOOKBACK bytes of that source's
  * output before it, as stateBefore reads lasting state; '' when nothing is. A hole ends any sequence open before it.
+ * Like stateBefore's, a session's look-back stops after MAX_SCAN journal events, so a title opened 160 KB back
+ * across 40,000 small events is not found, and the tail shows its payload as text; a Run's look-back is bounded in
+ * bytes alone (our read of the house's fixes for its review of f3750e4, PR #22: 14884ca).
  */
 function openBefore(src: ReadSource, o: ReadOptions, first: Output): string {
   const key = sourceKey(first);
