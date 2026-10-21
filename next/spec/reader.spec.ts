@@ -1271,6 +1271,27 @@ test('a Run’s tail across a hole marks its first line cut or begun before only
   assert.equal(long.lines?.cutHead, true, JSON.stringify(long.lines));
 });
 
+test('a Run’s tail with since, past what retention took of the Run’s start, is whole: older output is the range’s, as the session’s tail reads it (an independent read of the fixes for the review of f3750e4, PR #22)', async () => {
+  // `older` came from retention over the Run's whole range: the tail said truncated, cutHead, begunBefore and a head
+  // read on a whole first line, and grew its window to the cap, while the session's tail of the same range was whole.
+  for (const small of [false, true]) {
+    const journal = new Journal({ hot: new MemoryStore(small ? 3000 : 1 << 20), sessionId: 's' });
+    const src = source({ journal });
+    startRun(journal, 'p1');
+    for (let i = 0; i < 60; i++) out(journal, `old ${i} ${'x'.repeat(40)}\n`, 'stdout', 'p1');
+    const since = journal.lastSeq;
+    for (let i = 0; i < 5; i++) out(journal, `new ${i}\n`, 'stdout', 'p1');
+    endRun(journal, 'p1');
+    assert.equal(journal.oldestSeq! > 1, small, 'retention took the Run’s start only when the ring is small');
+    const run = await readJournal(src, { runId: 'p1', since, tail: 10 }, { resultBytes: 16384 });
+    const session = await readJournal(src, { since, tail: 10 }, { resultBytes: 16384 });
+    const said = `small ${small}: ${JSON.stringify(run.lines)} ${run.truncated}`;
+    assert.equal(run.text, 'new 0\nnew 1\nnew 2\nnew 3\nnew 4', said);
+    assert.deepEqual([run.truncated, run.lines], [session.truncated, session.lines], said);
+    assert.deepEqual([run.truncated, run.lines], [false, { requested: 10, returned: 5 }], said);
+  }
+});
+
 test('a tail whose first line the byte cap cuts keeps the header naming its source, and says the line lost its head, for every count asked', async () => {
   // The byte fit dropped the header ahead of a line longer than the cap and counted it as a line dropped ahead
   // of it: `tail: 3` and the compat pack's `tail: 54` read `zzz…`, nobody's, with no cutHead; `tail: 2` lost the

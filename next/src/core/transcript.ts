@@ -946,14 +946,24 @@ export function keepLines(lines: string[], max: number, keep: 'head' | 'tail', h
     let i = lines.length;
     while (i > 0 && count < max) if (!headers.has(lines[--i]!)) count++;
     if (i === 0) return undefined;
-    let h = i - 1;
-    while (h >= 0 && !headers.has(lines[h]!)) h--;
+    const h = namingHeader(lines, i, headers);
     if (h === i - 1) return h > 0 ? lines.slice(h) : undefined;
     return h === -1 ? lines.slice(i) : [lines[h]!, ...lines.slice(i)];
   }
   let i = 0;
   while (i < lines.length && count < max) if (!headers.has(lines[i++]!)) count++;
   return i < lines.length ? lines.slice(0, i) : undefined;
+}
+
+/**
+ * Where the header naming the source of `lines[first]` is: the nearest header line before it, wherever it
+ * sits (rule 6); -1 when none is. The one rule for a tail's lines, the projection's (keepLines) and the
+ * reader's byte fit (an independent read of the fixes for the review of f3750e4, PR #22: the fit had its own copy).
+ */
+export function namingHeader(lines: readonly string[], first: number, headers: ReadonlySet<string>): number {
+  let h = first - 1;
+  while (h >= 0 && !headers.has(lines[h]!)) h--;
+  return h;
 }
 
 /** The projection's text alone (the tail survives `maxLines`); see `project`. */

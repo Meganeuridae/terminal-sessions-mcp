@@ -85,7 +85,7 @@ import { persistentState } from '../core/screen.js';
 import { minusRanges } from '../core/ranges.js';
 import { lineBytes } from '../core/stores.js';
 import { countLines, cutTail, headAt, headIndex, indexAtByte, isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length, type LineCarry } from '../core/text.js';
-import { interleaveCut, project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
+import { interleaveCut, namingHeader, project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type Hole, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
 
 /**
@@ -1234,12 +1234,11 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     const cutByBytes = bytes > maxBytes;
     let drop = 0;
     while (lines.length - drop > Math.max(1, keepLines) && bytes > maxBytes) bytes -= utf8Length(lines[drop++]!) + 1;
-    const kept = lines.slice(drop);
-    let named: string | undefined;
-    if (multi) {
-      if (kept.length > 1 && headers.has(kept[0]!)) named = kept.shift();
-      else for (let h = drop - 1; h >= 0 && named === undefined; h--) if (headers.has(lines[h]!)) named = lines[h];
-    }
+    // The first line of output kept: past a header just before it, which is then the one that names it.
+    const first = multi && lines.length - drop > 1 && headers.has(lines[drop]!) ? drop + 1 : drop;
+    const kept = lines.slice(first);
+    const h = multi ? namingHeader(lines, first, headers) : -1;
+    const named = h === -1 ? undefined : lines[h];
     const tail = cutTail(kept.join('\n'), named === undefined ? maxBytes : Math.max(1, maxBytes - utf8Length(named) - 1));
     const text = named === undefined ? tail.text : `${named}\n${tail.text}`;
     return { kept, drop: outputLines(lines.slice(0, drop)), cutByBytes, tail: { cut: tail.cut, text } };

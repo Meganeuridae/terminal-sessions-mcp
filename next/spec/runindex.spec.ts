@@ -129,7 +129,12 @@ test('jr2-9: RunIndex.output(range) equals narrowOutput(whole output, range) —
           if (rand() < 0.4) range.until = pick();
           if (rand() < 0.4) range.limit = Math.floor(rand() * 12);
           if (rand() < 0.5) range.maxBytes = 1 + Math.floor(rand() * 3000);
-          assert.deepEqual(j.runs.output(j, r.runId, range), narrowOutput(whole, range), `${r.runId} ${JSON.stringify(range)} (seed ${seed})`);
+          // Older output is the range's (retention at its start, past `since`), which the whole output cannot say.
+          const lo = Math.max(from, (range.since ?? -Infinity) + 1);
+          const hi = Math.min(to, range.until ?? Infinity);
+          const { older: _o, ...rest } = whole;
+          const ref: RunOutput = j.gapAt(lo, hi) ? { ...rest, older: true } : rest;
+          assert.deepEqual(j.runs.output(j, r.runId, range), narrowOutput(ref, range), `${r.runId} ${JSON.stringify(range)} (seed ${seed})`);
           checked++;
         }
       }

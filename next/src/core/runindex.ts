@@ -73,12 +73,13 @@ export interface RunOutput {
   to: Seq;
   truncated: boolean;
   /**
-   * Output comes before the events returned, or came and is gone: `maxBytes` dropped older events, or
-   * retention took the start of the Run's output (with `since`, even where that lies before it). Unlike
-   * `truncated`, a hole inside the Run does not set it: a reader that asks whether what it was given
-   * begins where the Run's output does (a tail) asks this. A Run's tail across a hole read the hole as
-   * older output, and marked its whole first line as cut and begun before (our read of the house's fixes
-   * for its review of f3750e4, PR #22).
+   * Output of the range comes before the events returned, or came and is gone: `maxBytes` dropped older
+   * events, or retention took the range's start (the Run's start, or with `since` what follows it). Unlike
+   * `truncated`, a hole inside the range does not set it: a reader that asks whether what it was given
+   * begins where the range does (a tail) asks this. A Run's tail across a hole read the hole as older
+   * output, and marked its whole first line as cut and begun before (our read of the house's fixes for its
+   * review of f3750e4, PR #22). It depends on where retention stands, which the Run's whole output does not
+   * say: narrowOutput carries it from the output it is given and adds the `maxBytes` cut.
    */
   older?: boolean;
   /** With `limit`: output events of the range remain after the last one returned. */
@@ -230,8 +231,12 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
     if (g.seq > hi) gaps.push({ ...g, seq: Math.min(g.to, to) });
     else if (!seen.has(g.seq)) gaps.push(g);
   }
-  const whole: RunOutput = { events, from, to: hi, truncated: journal.gapAt(from, to) || holed };
-  if (journal.gapAt(from, to)) whole.older = true;
+  const startGone = journal.gapAt(from, to);
+  const whole: RunOutput = { events, from, to: hi, truncated: startGone || holed };
+  // Older output of the range asked for, not of the whole Run: retention that took only the Run's start, before
+  // `since`, left nothing of the range missing, and a tail of it read its whole first line as begun before, where
+  // the session's tail of the same range did not (an independent read of the fixes for the review of f3750e4, PR #22).
+  if (lo === from && hi === to ? startGone : journal.gapAt(lo, hi)) whole.older = true;
   if (gaps.length) whole.gaps = gaps.sort((a, b) => a.seq - b.seq);
   return narrowOutput(whole, range);
 }
