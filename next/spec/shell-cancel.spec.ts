@@ -253,8 +253,14 @@ test('fish: a stopped shell whose empty line a third ^C flushed reads keys again
   // flushed the daemon's replies with the unread input, and fish then read nothing, an Enter included,
   // until the session closed (found by run while answering question 1 of #22 comment 6310921374). The
   // first prompt fish draws after the interrupt runs none of its event handlers, so it carries no marks
-  // of ours: the advice's input may take two Enters.
-  const x = await realSession(FISH, { login: false });
+  // of ours: the advice's input may take two Enters. (fish 3.7 sends no queries; there the spec shows the
+  // recovery alone.)
+  //
+  // The completions dir is there already, as after any earlier fish start: in a fresh HOME fish 3.7 starts
+  // `python3 create_manpage_completions.py &` while it reads its config, in its own process group with
+  // the terminal as its input, and the reader check rightly takes that for a reader, so no empty line is
+  // typed (CI's Ubuntu runner, fish 3.7.0).
+  const x = await realSession(FISH, { login: false, rc: { '.local/share/fish/generated_completions/.keep': '' } });
   const pid = x.session.info().pid;
   try {
     await until(() => x.session.shellAvailable().ok, 8000, 'the shell is ready');
