@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { findBash, groupStillOurs, NodePtyBackend } from '../src/backends/node-pty.js';
+import { findBash, groupStillOurs, NodePtyBackend, otherReaderProc, type ProcFs } from '../src/backends/node-pty.js';
 import type { PtyExit } from '../src/backends/types.js';
 import { Journal } from '../src/core/journal.js';
 import { Session } from '../src/core/session.js';
@@ -438,50 +438,130 @@ test('bash is a checked requirement for sessions and process Runs: found at /bin
 });
 
 const PY3 = ['/usr/bin/python3', '/opt/homebrew/bin/python3', '/usr/local/bin/python3'].find((f) => fs.existsSync(f));
+const READLINE = { canonical: false, echo: false };
+
+/** Start bash with `rc`, wait for its READY> and terminal mode, and return what the real reader check answers. */
+async function readerAnswer(name: string, rc: string, mode: { canonical: boolean; echo: boolean }): Promise<boolean | undefined> {
+  const backend = new NodePtyBackend();
+  const home = fs.mkdtempSync(path.join(tmp, 'reader-'));
+  fs.writeFileSync(path.join(home, 'rc'), rc);
+  const p = backend.spawnShell({ shell: '/bin/bash', args: ['--rcfile', path.join(home, 'rc'), '-i'], cwd: home, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', TERM: 'dumb', HOME: home }, cols: 80, rows: 24 });
+  let out = '';
+  p.onData((d) => (out += d));
+  const exited = new Promise<PtyExit>((r) => p.onExit(r));
+  try {
+    await until(() => out.includes('READY>'), 5000, `${name}: ready`);
+    await until(() => JSON.stringify(p.inputMode?.()) === JSON.stringify(mode), 3000, `${name}: mode ${JSON.stringify(mode)}, seen ${JSON.stringify(p.inputMode?.())}`);
+    return p.otherReader?.();
+  } finally {
+    p.kill('SIGKILL');
+    await exited;
+    const pids = fs.existsSync(path.join(home, 'pids')) ? fs.readFileSync(path.join(home, 'pids'), 'utf8').split('\n').filter(Boolean) : [];
+    for (const pid of pids) {
+      try {
+        process.kill(Number(pid), 'SIGKILL');
+      } catch {
+        // gone with the terminal
+      }
+    }
+  }
+}
 
 test('the reader check tells a background job the rc started from a reader, and the mode tells read -n from readline', { skip: !hasShell('/bin/bash') }, async () => {
   // What the reinit gate after `exec bash` reads (the house's read of the 38 commits, #22 comment
   // 6274841346, items 2 and 3): an rc's `sleep 301 &` shares the shell's group with /dev/null as its
   // input and is no reader; a program reading the terminal on its stdin, or on the /dev/tty it opened
-  // beside a piped stdin (as less does), is one; `read -n` is the shell itself, told apart by ECHO.
-  const READLINE = { canonical: false, echo: false };
-  const pyPid = 'import os; open(os.environ["HOME"] + "/pids", "a").write("%d\\n" % os.getpid())';
+  // beside a piped stdin (as less does), is one; `read -n` is the shell itself, told apart by ECHO. The
+  // readers are sh and dd, not python3: added only when python3 was found, they dropped out where it
+  // was not, and a check that always answered false passed (the house's read of the 33 commits, #22
+  // comment 6307351617, item 10).
   const cases: Array<{ name: string; rc: string; mode: { canonical: boolean; echo: boolean }; reader: boolean }> = [
     { name: 'a prompt', rc: "PS1='READY> '\n", mode: READLINE, reader: false },
     { name: 'a background job the rc started', rc: `sleep 301 & echo $! >> "$HOME/pids"\nPS1='READY> '\n`, mode: READLINE, reader: false },
     { name: 'read -n in the rc', rc: "printf 'READY> '; read -n 1 __x\n", mode: { canonical: false, echo: true }, reader: false },
-    ...(PY3
-      ? [
-          { name: 'a reader on its stdin', rc: `${PY3} -c '${pyPid}; import sys,tty; tty.setcbreak(0); print("READY>", flush=True); sys.stdin.read(1)'\n`, mode: READLINE, reader: true },
-          { name: 'a reader of /dev/tty behind a pipe', rc: `echo | ${PY3} -c '${pyPid}; import os,tty; fd=os.open("/dev/tty", os.O_RDWR); tty.setcbreak(fd); print("READY>", flush=True); os.read(fd, 1)'\n`, mode: READLINE, reader: true },
-        ]
-      : []),
+    { name: 'a reader on its stdin', rc: `sh -c 'echo $$ >> "$HOME/pids"; stty -icanon -echo; echo READY">"; exec dd bs=1 count=1 2>/dev/null'\n`, mode: READLINE, reader: true },
+    { name: 'a reader of /dev/tty behind a pipe', rc: `echo | sh -c 'echo $$ >> "$HOME/pids"; stty -icanon -echo < /dev/tty; echo READY">"; exec dd if=/dev/tty bs=1 count=1 2>/dev/null'\n`, mode: READLINE, reader: true },
   ];
-  const backend = new NodePtyBackend();
-  for (const c of cases) {
-    const home = fs.mkdtempSync(path.join(tmp, 'reader-'));
-    fs.writeFileSync(path.join(home, 'rc'), c.rc);
-    const p = backend.spawnShell({ shell: '/bin/bash', args: ['--rcfile', path.join(home, 'rc'), '-i'], cwd: home, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', TERM: 'dumb', HOME: home }, cols: 80, rows: 24 });
-    let out = '';
-    p.onData((d) => (out += d));
-    const exited = new Promise<PtyExit>((r) => p.onExit(r));
-    try {
-      await until(() => out.includes('READY>'), 5000, `${c.name}: ready`);
-      await until(() => JSON.stringify(p.inputMode?.()) === JSON.stringify(c.mode), 3000, `${c.name}: mode ${JSON.stringify(c.mode)}, seen ${JSON.stringify(p.inputMode?.())}`);
-      assert.equal(p.otherReader?.(), c.reader, c.name);
-    } finally {
-      p.kill('SIGKILL');
-      await exited;
-      const pids = fs.existsSync(path.join(home, 'pids')) ? fs.readFileSync(path.join(home, 'pids'), 'utf8').split('\n').filter(Boolean) : [];
-      for (const pid of pids) {
-        try {
-          process.kill(Number(pid), 'SIGKILL');
-        } catch {
-          // gone with the terminal
-        }
-      }
-    }
+  for (const c of cases) assert.equal(await readerAnswer(c.name, c.rc, c.mode), c.reader, c.name);
+});
+
+test('a reader whose descriptors its own user cannot read (non-dumpable) makes the real reader check answer unknown, where the same reader dumpable answers true', { skip: process.platform !== 'linux' ? 'needs Linux: prctl(PR_SET_DUMPABLE) and /proc' : !PY3 ? 'needs python3 to call prctl' : !hasShell('/bin/bash') ? 'needs /bin/bash' : false }, async () => {
+  // The fail-closed answer for descriptors that cannot be read had no test: answering false there kept
+  // every spec green (the house's read of the 33 commits, #22 comment 6307351617, item 7, by run: its
+  // own user gets EACCES on /proc/<pid>/fd of a process that made itself non-dumpable).
+  const reader = (dumpable: boolean) =>
+    `${PY3} -c 'import ctypes,os,sys,tty; ${dumpable ? '' : 'ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); '}open(os.environ["HOME"] + "/pids", "a").write("%d\\n" % os.getpid()); tty.setcbreak(0); print("READY>", flush=True); sys.stdin.read(1)'\n`;
+  assert.equal(await readerAnswer('dumpable', reader(true), READLINE), true, 'the control: a reader on its stdin');
+  assert.equal(await readerAnswer('non-dumpable', reader(false), READLINE), undefined, 'unknown is not "no reader"');
+});
+
+test('the Linux reader walk answers unknown for a process it cannot read, in the shell’s group or on the way to it, and false only when it read every one (an injected /proc)', () => {
+  // The house's read of the 33 commits (#22 comment 6307351617): a member whose descriptors cannot be
+  // read, and the walk's own unknown, had no test (item 7); a descendant whose children or stat cannot
+  // be read was counted absent, so another user's process in the group under hidepid read as no reader
+  // (item 4). This machine's /proc gives those answers only for another user's processes, so the walk
+  // reads a scripted one; the dumpable and non-dumpable readers above run it for real on Linux.
+  const TTY = '/dev/pts/7';
+  const fault = (code: string) => Object.assign(new Error(code), { code });
+  const statLine = (pid: number, pgrp: number, tpgid = 100) => `${pid} (p) S 1 ${pgrp} ${pgrp} 34823 ${tpgid} ${Array(13).fill(0).join(' ')} 4242`;
+  interface P {
+    stat?: string | Error;
+    children?: string | Error;
+    fds?: Record<string, string> | Error;
+    exists?: boolean;
   }
+  const fakeProc = (procs: Record<number, P>): ProcFs => ({
+    readdir(dir) {
+      if (dir === '/proc') return Object.keys(procs);
+      const [, pid, what] = /^\/proc\/(\d+)\/(task|fd)$/.exec(dir)!;
+      const p = procs[Number(pid)];
+      if (!p) throw fault('ENOENT');
+      if (what === 'task') return [pid!];
+      if (p.fds instanceof Error) throw p.fds;
+      return Object.keys(p.fds ?? {});
+    },
+    readFile(file) {
+      const [, pid, what] = /^\/proc\/(\d+)\/(stat|task\/\d+\/children)$/.exec(file)!;
+      const p = procs[Number(pid)];
+      if (!p) throw fault('ENOENT');
+      const v = what === 'stat' ? p.stat : (p.children ?? '');
+      if (v === undefined) throw fault('ENOENT');
+      if (v instanceof Error) throw v;
+      return v;
+    },
+    readlink(link) {
+      const [, pid, fd] = /^\/proc\/(\d+)\/fd\/(\d+)$/.exec(link)!;
+      const fds = procs[Number(pid)]?.fds;
+      if (!fds || fds instanceof Error || fds[fd!] === undefined) throw fault('ENOENT');
+      return fds[fd!]!;
+    },
+    exists: (pid) => procs[pid]?.exists ?? pid in procs,
+  });
+  const shell = (children: string | Error = ''): P => ({ stat: statLine(100, 100), children, fds: { '0': TTY, '1': TTY, '2': TTY } });
+  const cases: Array<[string, Record<number, P>, boolean | undefined]> = [
+    ['the shell alone', { 100: shell() }, false],
+    ['the terminal given to another group', { 100: { ...shell(), stat: statLine(100, 100, 101) } }, true],
+    ['a member reading on its stdin', { 100: shell('101'), 101: { stat: statLine(101, 100), fds: { '0': TTY } } }, true],
+    ['a member holding /dev/tty above 2', { 100: shell('101'), 101: { stat: statLine(101, 100), fds: { '0': 'pipe:[9]', '3': '/dev/tty' } } }, true],
+    ['a member with the terminal on 1 and 2 only (a background job; more behind a pipe)', { 100: shell('101'), 101: { stat: statLine(101, 100), fds: { '0': '/dev/null', '1': TTY, '2': TTY } } }, false],
+    ['a member whose descriptors cannot be read (non-dumpable, or another user’s)', { 100: shell('101'), 101: { stat: statLine(101, 100), fds: fault('EACCES') } }, undefined],
+    ['one member unreadable, the other no reader', { 100: shell('101 102'), 101: { stat: statLine(101, 100), fds: fault('EACCES') }, 102: { stat: statLine(102, 100), fds: { '0': '/dev/null' } } }, undefined],
+    ['one member unreadable, the other a reader', { 100: shell('101 102'), 101: { stat: statLine(101, 100), fds: fault('EACCES') }, 102: { stat: statLine(102, 100), fds: { '0': TTY } } }, true],
+    ['a descendant whose stat cannot be read (hidepid=1)', { 100: shell('101'), 101: { stat: fault('EACCES') } }, undefined],
+    ['a descendant hidden as missing that still exists (hidepid=2)', { 100: shell('101'), 101: { exists: true } }, undefined],
+    ['a descendant that exited meanwhile', { 100: shell('101') }, false],
+    ['a descendant in its own group whose children cannot be read', { 100: shell('101'), 101: { stat: statLine(101, 101), children: fault('EACCES') } }, undefined],
+    ['a grandchild in the group, under a child in its own', { 100: shell('101'), 101: { stat: statLine(101, 101), children: '102' }, 102: { stat: statLine(102, 100), fds: { '0': TTY } } }, true],
+    ['no children files: every process, a member reading', { 100: shell(fault('ENOENT')), 200: { stat: statLine(200, 100), fds: { '0': TTY } } }, true],
+    ['no children files: a process whose stat cannot be read', { 100: shell(fault('ENOENT')), 300: { stat: fault('EACCES') } }, undefined],
+    ['no children files: none in the group', { 100: shell(fault('ENOENT')), 200: { stat: statLine(200, 200), fds: { '0': TTY } } }, false],
+  ];
+  // A descriptor link that cannot be read for a reason other than ENOENT is unknown too.
+  const badLink = fakeProc({ 100: shell('101'), 101: { stat: statLine(101, 100), fds: { '0': TTY } } });
+  const linkFault: ProcFs = { ...badLink, readlink: () => { throw fault('EACCES'); } };
+  for (const [name, procs, want] of cases) assert.equal(otherReaderProc(100, TTY, fakeProc(procs)), want, name);
+  assert.equal(otherReaderProc(100, TTY, linkFault), undefined, 'a descriptor link that cannot be read');
+  assert.equal(otherReaderProc(100, TTY, fakeProc({})), undefined, 'the shell itself cannot be read');
 });
 
 test('/dev/fd must list the process’s own descriptors: a missing one and a static one are refused, a real one passes, and the check runs once', () => {

@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import * as pty from 'node-pty';
 import { err } from '../core/errors.js';
 import { processLaunch, shellLaunch, viaBash } from '../core/launch.js';
-import { procStart, readProcStat } from '../core/lock.js';
+import { parseProcStat, procStart, readProcStat, type ProcStat } from '../core/lock.js';
 import type { ExecutionBackend, ForegroundInfo, ProcessHandle, PtyExit, PtyHandle, SpawnProcessOptions, SpawnShellOptions } from './types.js';
 
 const signalName = (n: number | undefined): string | undefined => {
@@ -101,12 +101,15 @@ const MAX_INSPECTED = 1024;
  * the shell's (a program took the terminal), or when a member of it other than the shell holds the
  * terminal on descriptor 0 or on one above 2 (a reader's stdin, or the /dev/tty a pager or password
  * tool opens beside a piped stdin); false when no member does; undefined when it cannot be told — no
- * process listing, or a member whose descriptors cannot be read (another user's, as sudo is) —
- * since unknown is not "no reader" (the house's read of the 38 commits, #22 comment 6274841346,
- * item 1). Descriptors 1 and 2 do not count: an rc's `sleep 301 &` shares the shell's group while
- * job control is off, with /dev/null as stdin and the terminal as its output, and held the reinit at
- * a real prompt when any child counted (item 2). A job started at a prompt has its own group and is
- * not in the foreground.
+ * process listing, a member whose descriptors cannot be read (another user's, as sudo is, or a
+ * non-dumpable process of the same user), or on Linux a descendant whose stat or children cannot be
+ * read (/proc mounted with hidepid), which may be a member — since unknown is not "no reader" (the
+ * house's read of the 38 commits, #22 comment 6274841346, item 1, and of the 33 commits, comment
+ * 6307351617, item 4). Descriptors 1 and 2 do not count: an rc's `sleep 301 &` shares the shell's
+ * group while job control is off, with /dev/null as stdin and the terminal as its output, and held
+ * the reinit at a real prompt when any child counted (item 2). The cost is a program that reads the
+ * terminal only through them, as `more` behind a pipe does: it reads as no reader (PtyHandle's doc).
+ * A job started at a prompt has its own group and is not in the foreground.
  *
  * On Linux it reads /proc and starts no process (item 4: a pgrep per tick blocked the event loop for
  * about 50 ms under load): the shell's descendants through `task/<tid>/children`, or every process
@@ -119,32 +122,76 @@ function otherReader(pid: number, tty: string | undefined): boolean | undefined 
   return process.platform === 'linux' ? otherReaderProc(pid, tty) : otherReaderPs(pid, tty);
 }
 
-function otherReaderProc(pid: number, tty: string): boolean | undefined {
-  const shell = readProcStat(pid);
-  if (!shell) return undefined;
+/**
+ * What the Linux reader walk reads of /proc, each call throwing as `fs` does, and whether a pid exists
+ * (a zero signal). A spec drives the walk through it with the answers a /proc mounted with hidepid, or
+ * a non-dumpable reader, gives (the house's read of the 33 commits, #22 comment 6307351617, items 4
+ * and 7): this machine's /proc gives them only to another user's processes.
+ */
+export interface ProcFs {
+  readdir(dir: string): string[];
+  readFile(file: string): string;
+  readlink(link: string): string;
+  exists(pid: number): boolean | undefined;
+}
+
+const realProc: ProcFs = {
+  readdir: (dir) => fs.readdirSync(dir),
+  readFile: (file) => fs.readFileSync(file, 'utf8'),
+  readlink: (link) => fs.readlinkSync(link),
+  exists: pidExists,
+};
+
+const errCode = (e: unknown): string | undefined => (e as NodeJS.ErrnoException).code;
+
+/** The reader check on Linux (see otherReader), exported for its spec. */
+export function otherReaderProc(pid: number, tty: string, proc: ProcFs = realProc): boolean | undefined {
+  const shell = procStatOf(pid, proc);
+  if (!shell || shell === 'gone') return undefined;
   if (shell.tpgid !== shell.pgrp) return true;
-  const members = procGroupMembers(pid, shell.tpgid);
+  const members = procGroupMembers(pid, shell.tpgid, proc);
   if (!members) return undefined;
   let unknown = false;
   for (const m of members) {
-    const held = holdsForInput(m, tty);
+    const held = holdsForInput(m, tty, proc);
     if (held === true) return true;
     if (held === undefined) unknown = true;
   }
   return unknown ? undefined : false;
 }
 
-/** The members of group `pgrp` other than `pid` among its descendants (every process, without children files); undefined past MAX_INSPECTED. */
-function procGroupMembers(pid: number, pgrp: number): number[] | undefined {
+/**
+ * `p`'s stat; 'gone' when it has exited; undefined when it cannot be read. ENOENT alone is not "gone":
+ * /proc mounted with hidepid=2 hides another user's process that way, and only a zero signal tells the
+ * two apart (ESRCH: gone; EPERM: there, and not ours to read).
+ */
+function procStatOf(p: number, proc: ProcFs): ProcStat | 'gone' | undefined {
+  try {
+    return parseProcStat(proc.readFile(`/proc/${p}/stat`));
+  } catch (e) {
+    return errCode(e) === 'ENOENT' && proc.exists(p) === false ? 'gone' : undefined;
+  }
+}
+
+/**
+ * The members of group `pgrp` other than `pid` among its descendants (every process, without children
+ * files). Undefined when it cannot be told: past MAX_INSPECTED, or a process whose stat or children
+ * cannot be read, which may be a member (another user's `sudo` under hidepid=1, whose directory is
+ * listed and whose files are not) — unknown, not absent, as for a member whose descriptors cannot be
+ * read (the house's read of the 33 commits, #22 comment 6307351617, item 4). Without children files a
+ * hidepid=2 mount lists no other user's process at all: that walk cannot see them.
+ */
+function procGroupMembers(pid: number, pgrp: number, proc: ProcFs): number[] | undefined {
+  // A process's children; [] when it has exited meanwhile; undefined when they cannot be read.
   const children = (p: number): number[] | undefined => {
     try {
       const out: number[] = [];
-      for (const t of fs.readdirSync(`/proc/${p}/task`)) {
-        for (const c of fs.readFileSync(`/proc/${p}/task/${t}/children`, 'utf8').split(' ')) if (c.trim()) out.push(Number(c));
+      for (const t of proc.readdir(`/proc/${p}/task`)) {
+        for (const c of proc.readFile(`/proc/${p}/task/${t}/children`).split(' ')) if (c.trim()) out.push(Number(c));
       }
       return out;
     } catch (e) {
-      return (e as NodeJS.ErrnoException).code === 'ENOENT' && p !== pid ? [] : undefined; // a descendant gone meanwhile has none
+      return errCode(e) === 'ENOENT' && proc.exists(p) === false ? [] : undefined;
     }
   };
   const members: number[] = [];
@@ -152,12 +199,17 @@ function procGroupMembers(pid: number, pgrp: number): number[] | undefined {
   if (candidates === undefined) {
     // No children files (a kernel without CONFIG_PROC_CHILDREN): every process is a candidate.
     try {
-      candidates = fs.readdirSync('/proc').filter((n) => /^\d+$/.test(n)).map(Number);
+      candidates = proc.readdir('/proc').filter((n) => /^\d+$/.test(n)).map(Number);
     } catch {
       return undefined;
     }
     if (candidates.length > MAX_INSPECTED * 8) return undefined;
-    for (const c of candidates) if (c !== pid && readProcStat(c)?.pgrp === pgrp) members.push(c);
+    for (const c of candidates) {
+      if (c === pid) continue;
+      const st = procStatOf(c, proc);
+      if (st === undefined) return undefined;
+      if (st !== 'gone' && st.pgrp === pgrp) members.push(c);
+    }
     return members;
   }
   const seen = new Set<number>();
@@ -166,27 +218,32 @@ function procGroupMembers(pid: number, pgrp: number): number[] | undefined {
     if (seen.has(c)) continue;
     seen.add(c);
     if (seen.size > MAX_INSPECTED) return undefined;
-    if (readProcStat(c)?.pgrp === pgrp) members.push(c);
-    candidates.push(...(children(c) ?? []));
+    const st = procStatOf(c, proc);
+    if (st === undefined) return undefined;
+    if (st === 'gone') continue;
+    if (st.pgrp === pgrp) members.push(c);
+    const kids = children(c);
+    if (kids === undefined) return undefined;
+    candidates.push(...kids);
   }
   return members;
 }
 
 /** Does `pid` hold `tty` (or /dev/tty) on descriptor 0 or one above 2? undefined when its descriptors cannot be read. */
-function holdsForInput(pid: number, tty: string): boolean | undefined {
+function holdsForInput(pid: number, tty: string, proc: ProcFs): boolean | undefined {
   let fds: string[];
   try {
-    fds = fs.readdirSync(`/proc/${pid}/fd`);
+    fds = proc.readdir(`/proc/${pid}/fd`);
   } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? false : undefined; // gone meanwhile: it reads nothing
+    return errCode(e) === 'ENOENT' ? false : undefined; // gone meanwhile: it reads nothing
   }
   for (const n of fds) {
     if (n === '1' || n === '2') continue;
     let target: string;
     try {
-      target = fs.readlinkSync(`/proc/${pid}/fd/${n}`);
+      target = proc.readlink(`/proc/${pid}/fd/${n}`);
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      if (errCode(e) === 'ENOENT') continue;
       return undefined;
     }
     if (target === tty || target === '/dev/tty') return true;
