@@ -15,6 +15,7 @@ import { App, type Caller } from '../src/api/app.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { callTool, toolsFor } from '../src/api/tools.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
+import { clocks } from '../src/core/clock.js';
 import { fakeShellBackend } from './fake-shell.js';
 import { until } from './testhost.js';
 
@@ -527,4 +528,35 @@ test('a reviewer’s read: a raw tail whose first shown line begins at the first
   } finally {
     await h.close();
   }
+});
+
+test('runCommand reports the session’s duration, on the monotonic clock: a wall-clock step back while the command runs reads no negative duration', async (t) => {
+  // A reviewer's read of the fixes for #22: runCommand's `duration` was the App's `endedAt - startedAt` on the wall clock, so
+  // with the clock stepped back 3 s during a 1 s command it read about -2000 while the journal held about 1000. The session
+  // is created after the stub, as a daemon's would be before a step.
+  const realNow = Date.now;
+  const realMono = clocks.monotonic;
+  let wallStep = 0;
+  let monoStep = 0;
+  Date.now = () => realNow() + wallStep;
+  clocks.monotonic = () => realMono() + monoStep;
+  t.after(() => {
+    Date.now = realNow;
+    clocks.monotonic = realMono;
+  });
+  const pending = call('runCommand', { session: 'cdur', command: 'sleep 1', timeout: 10_000 });
+  await until(() => {
+    const s = registry.get('cdur');
+    return s?.kind === 'live' && s.session.listRuns().some((r) => r.state === 'running');
+  }, 5000, 'the command to start');
+  wallStep -= 3000;
+  monoStep += 2500;
+  const r = await pending;
+  assert.equal(r.state, 'exited', JSON.stringify(r));
+  assert.ok((r.duration as number) >= 2500, `the session's measure: ${r.duration} ms`);
+  const live = registry.get('cdur');
+  assert.ok(live?.kind === 'live');
+  const end = live.session.journal.since(0).events.find((e) => e.type === 'run.end');
+  assert.ok(end?.type === 'run.end');
+  assert.equal(r.duration, end.durationMs, 'the duration the journal holds');
 });

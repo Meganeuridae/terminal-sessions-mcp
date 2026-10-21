@@ -299,7 +299,7 @@ test('item 11/G18: the App rereads a repaired record before judging a new life\'
   }
 });
 
-test('run, await and start results report the session’s duration, on the monotonic clock: a wall-clock step back reads no negative time', async (t) => {
+test('run, await and start results report the session’s duration, and a queued Run its wait, on the monotonic clock: a wall-clock step back reads no negative time', async (t) => {
   // A reviewer's read of the fixes for #22: the results computed `endedAt - startedAt` on the wall clock, so with the clock
   // stepped back 3 s while 2.5 s passed a result read `exited 0 in -2999ms` beside a completion's 2.5s. The sessions are
   // created after the stub, as a daemon's would be before a step.
@@ -313,11 +313,13 @@ test('run, await and start results report the session’s duration, on the monot
     Date.now = realNow;
     clocks.monotonic = realMono;
   });
-  const first = await tool('run', { session: 'dur', command: 'sleep 1.5', wait: 300 });
+  const first = await tool('run', { session: 'dur', command: 'sleep 3', wait: 300 });
   const runId = first.structured?.runId as string;
   const live = registry.get('dur');
   assert.ok(live?.kind === 'live');
   await until(() => live.session.run(runId).state === 'running', 5000, 'the Run to start');
+  const behind = await tool('run', { session: 'dur', command: 'echo behind', queue: true, wait: 0 });
+  assert.equal(behind.structured?.state, 'queued', JSON.stringify(behind.structured));
   const svc = await tool('start', { session: 'dursvc', command: 'echo up; sleep 30', ready: { pattern: 'up' }, wait: 5000, idempotencyKey: 'dur-svc-1' });
   assert.equal(svc.structured?.service, 'ready', JSON.stringify(svc.structured));
   wallStep -= 3000;
@@ -325,6 +327,10 @@ test('run, await and start results report the session’s duration, on the monot
   const mid = await tool('await', { runId, wait: 50 });
   assert.equal(mid.structured?.state, 'running');
   assert.ok((mid.structured?.durationMs as number) >= 2500, `a Run in flight, so far: ${mid.structured?.durationMs} ms`);
+  const waiting = await tool('await', { runId: behind.structured?.runId, wait: 50 });
+  assert.equal(waiting.structured?.state, 'queued');
+  assert.ok((waiting.structured?.queuedMs as number) >= 2500, `a queued Run's wait: ${waiting.structured?.queuedMs} ms`);
+  assert.doesNotMatch(waiting.text, /queued for -/, waiting.text);
   const done = await tool('await', { runId, wait: 10_000 });
   assert.equal(done.structured?.state, 'exited', JSON.stringify(done.structured));
   assert.ok((done.structured?.durationMs as number) >= 2500, `the ended Run: ${done.structured?.durationMs} ms`);

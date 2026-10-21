@@ -83,10 +83,12 @@ for (const line of [markerProbe(AT_NONCE), inlineProbe(AT_NONCE, false), inlineP
 }
 /**
  * The echo of a probe line typed after a ^C, split, through the end of the typed line when it is
- * there. The rests that share a head are alternatives after it, so a line that is not the first's
- * still matches whole (one branch per line would stop sh's at the nonce of fish's line).
+ * there; with no nonce, any Run's. The rests that share a head are alternatives after it, so a line
+ * that is not the first's still matches whole (one branch per line would stop sh's at the nonce of
+ * fish's line). Global: a reader strikes every line each match spans, as cutPlumbing does, and the
+ * compat pack's logs use it so they cut the same echo.
  */
-const probeEcho = (nonce: string): RegExp =>
+export const probeEcho = (nonce: string = NONCE): RegExp =>
   new RegExp([...PROBE_LINES].map(([head, rests]) => `${redrawn(head)}\\s*${redrawn(nonce)}(?:\\s*(?:${rests.map(redrawn).join('|')}))?`).join('|'), 'g');
 /** A probe answer with its nonce (1), pid (2) and token (3). */
 const probeAnswer = (nonce: string): RegExp => new RegExp(`<<<PROBE:(${nonce})(?::(\\d+)(?::(${NONCE}|))?)?>>>`, 'g');

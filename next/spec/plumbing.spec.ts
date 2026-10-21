@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
-import { cutPlumbing, exitMark, inlineProbe, markerProbe, nonceOf, probeMark, startMark } from '../src/core/plumbing.js';
+import { cutPlumbing, exitMark, inlineProbe, markerProbe, nonceOf, probeEcho, probeMark, startMark } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { journalRunText } from '../src/core/segmenter.js';
 import type { RunOutput } from '../src/core/runindex.js';
@@ -277,5 +277,7 @@ test('the probe lines the session types are the ones the grammar parses and the 
       const broken = `${line.slice(0, i)}\r\n${line.slice(i)}`;
       assert.equal(cutPlumbing(`${head}${broken}${tail}`, of), want, `${name}: broken at ${i}: ${JSON.stringify(broken)}`);
     }
+    // The matcher a reader without the nonce uses (the compat pack's logs) takes the whole line for any Run's.
+    assert.equal([...line.matchAll(probeEcho())][0]?.[0], line.slice(line.indexOf('<<<')), `${name}: with no nonce, the line from its mark to its end`);
   }
 });
