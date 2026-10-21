@@ -194,3 +194,75 @@ test("a page that ends inside a cancel's probe echo that came a character at a t
     assert.equal(page.text, 'abc', `ending ${k} characters into the echo: ${JSON.stringify(page.text)}`);
   }
 });
+
+test("a marker Run's output after a hole is cut as all its output after its start mark is: a cancel's probe echo goes, an echo-shaped line of the program's stays (our read of the 40 commits, PR #22)", async () => {
+  // Past a hole the stretch was cut as if from nowhere, and whatever the cutter struck ahead of its first kept range
+  // came back: a probe's echo showed, where the Run read without the hole struck it.
+  const typed = sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', NONCE);
+  for (const [after, want] of [
+    [`${markerProbe(NONCE)}\r\n`, 'after'],
+    [`${typed}\r\n`, `${typed}\nafter`],
+  ] as const) {
+    // The typed line's echo and the start mark, a line, a hole, then what came after it.
+    const fresh = source();
+    const fj = fresh.journal;
+    fj.append({ type: 'output', data: '$ ', stream: 'pty' });
+    fj.append({ type: 'run.admit', runId: 'r1', target: 'shell', principal: AGENT, origin: 'self', queued: false, line: 'run-it' });
+    fj.append({ type: 'run.start', runId: 'r1', cwd: '/', line: 'run-it', strategy: 'marker', nonce: NONCE });
+    out(fj, `${typed}\r\n<<<START:${NONCE}:4242>>>\r\n`, 'pty', 'r1');
+    out(fj, 'b1\r\n', 'pty', 'r1');
+    const hole = fj.lastSeq + 1;
+    fj.append({ type: 'gap', from: hole, to: hole, reason: 'torn-write' });
+    out(fj, after, 'pty', 'r1');
+    out(fj, 'after\r\n', 'pty', 'r1');
+    out(fj, `<<<EXIT:${NONCE}:0>>>\r\n$ `, 'pty', 'r1');
+    fj.append({ type: 'run.end', runId: 'r1', state: 'exited', exit: 0, durationMs: 1 });
+    const page = await readJournal(fresh, { runId: 'r1', since: hole }, { resultBytes: 16384 });
+    assert.equal(page.text, want, JSON.stringify(page.text));
+    const tail = await readJournal(fresh, { runId: 'r1', tail: 2 }, { resultBytes: 16384 });
+    const lines = tail.text!.split('\n');
+    assert.equal(lines[lines.length - 1], 'after', JSON.stringify(lines));
+    assert.equal(lines.some((l) => l.includes('PRO""BE')), false, JSON.stringify(lines));
+    assert.equal(lines.includes(typed), want.startsWith(typed), JSON.stringify(lines));
+  }
+});
+
+test("a declared shell's Run past a hole is cut after a start mark with its recorded shell pid, so its own probe answer ends it and another pid's does not", async () => {
+  // The cutter judges an inline answer by the pid of the start mark it finds: a synthetic mark with another pid would
+  // have struck the declared shell's own answer and shown what follows it.
+  for (const [pid, want] of [
+    ['777', 'after'],
+    ['999', 'after\nlater'],
+  ] as const) {
+    const src = source();
+    const j = src.journal;
+    out(j, `<<<START:${NONCE}:777>>>`);
+    j.append({ type: 'run.admit', runId: 'r1', target: 'shell', principal: AGENT, origin: 'self', queued: false, line: 'run-it' });
+    j.append({ type: 'run.start', runId: 'r1', cwd: '', line: 'run-it', strategy: 'inline', nonce: NONCE, shellPid: 777 });
+    out(j, '\r\nb1\r\n', 'pty', 'r1');
+    const hole = j.lastSeq + 1;
+    j.append({ type: 'gap', from: hole, to: hole, reason: 'torn-write' });
+    out(j, `after\r\n<<<PROBE:${NONCE}:${pid}:${NONCE}>>>\r\nlater\r\n`, 'pty', 'r1');
+    j.append({ type: 'run.end', runId: 'r1', state: 'exited', exit: 0, durationMs: 1 });
+    const page = await readJournal(src, { runId: 'r1', since: hole }, { resultBytes: 16384 });
+    assert.equal(page.text, want, `answer from ${pid}: ${JSON.stringify(page.text)}`);
+  }
+});
+
+test("a marker Run whose hole falls between the typed line's echo and its start mark is cut at that mark, past the hole (an independent read of the fixes for the review of the 40 commits, PR #22)", async () => {
+  // A start mark put ahead of a stretch is found first, so one that holds the Run's own mark was cut there, and the
+  // real mark's line read as output.
+  const src = source();
+  const j = src.journal;
+  j.append({ type: 'output', data: '$ ', stream: 'pty' });
+  j.append({ type: 'run.admit', runId: 'r1', target: 'shell', principal: AGENT, origin: 'self', queued: false, line: 'run-it' });
+  j.append({ type: 'run.start', runId: 'r1', cwd: '/', line: 'run-it', strategy: 'marker', nonce: NONCE });
+  out(j, `${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', NONCE)}\r\n`, 'pty', 'r1');
+  const hole = j.lastSeq + 1;
+  j.append({ type: 'gap', from: hole, to: hole, reason: 'torn-write' });
+  out(j, `<<<START:${NONCE}:4242>>>\r\nbody\r\n`, 'pty', 'r1');
+  out(j, `<<<EXIT:${NONCE}:0>>>\r\n$ `, 'pty', 'r1');
+  j.append({ type: 'run.end', runId: 'r1', state: 'exited', exit: 0, durationMs: 1 });
+  const page = await readJournal(src, { runId: 'r1', since: hole }, { resultBytes: 16384 });
+  assert.equal(page.text, 'body', JSON.stringify(page.text));
+});

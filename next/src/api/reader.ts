@@ -77,7 +77,7 @@
  */
 import { err } from '../core/errors.js';
 import type { Journal } from '../core/journal.js';
-import { keptRanges, type PlumbingOf } from '../core/plumbing.js';
+import { keptRanges, startMark, type PlumbingOf } from '../core/plumbing.js';
 import { compileUserRegex, headOnlyText } from '../core/regex.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
@@ -663,8 +663,24 @@ function runKept(src: ReadSource, runId: string, of: PlumbingOf, pieces: Array<C
     }
     // Read from the Run's head unless retention, a hole or the bound cut what came before.
     const atHead = !back.truncated;
-    let kept = keptRanges(before + stretch.map((p) => p.data).join('') + after, { ...of, truncated: !atHead });
-    if (!atHead && kept.length && kept[0]![0] > 0) kept = [[0, kept[0]![1]], ...kept.slice(1)];
+    const text = before + stretch.map((p) => p.data).join('') + after;
+    // Not from its head, a marker or declared shell's Run is cut after a start mark of its own nonce (and shell pid),
+    // as all its output after its head is: the cutter then strikes what the Run's own result strikes there and keeps
+    // an echo-shaped line of the program's. Taking back whatever it struck ahead of its first kept range showed a
+    // cancel's probe echo after a hole (our read of the 40 commits, PR #22); that stays only for a Run with no
+    // recorded nonce, or a declared shell's with no recorded pid, whose answers are judged by it.
+    // A stretch that holds the Run's own start mark (a hole between the typed line's echo and it) is cut at that one,
+    // with nothing taken back: a mark put ahead of it was found first, and the real mark's line read as output (an
+    // independent read of the fixes for the review of the 40 commits, PR #22).
+    const ownMark = of.nonce !== undefined && startMark(of.nonce).test(text);
+    const mark = !atHead && !ownMark && of.nonce !== undefined && (of.strategy === 'marker' || (of.strategy === 'inline' && of.pid !== undefined)) ? `<<<START:${of.nonce}:${of.pid ?? '0'}>>>\n` : '';
+    let kept: Array<[number, number]>;
+    if (mark) {
+      kept = keptRanges(mark + text, { ...of, truncated: true }).flatMap(([a, b]): Array<[number, number]> => (b > mark.length ? [[Math.max(0, a - mark.length), b - mark.length]] : []));
+    } else {
+      kept = keptRanges(text, { ...of, truncated: !atHead });
+      if (!atHead && !ownMark && kept.length && kept[0]![0] > 0) kept = [[0, kept[0]![1]], ...kept.slice(1)];
+    }
     let at = before.length;
     stretch.forEach((p, k) => {
       const lo = at;
