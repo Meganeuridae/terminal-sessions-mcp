@@ -45,9 +45,10 @@
  *   source with a line `[terminal]` or `[run <runId>]`.
  * - Gaps are visible (G11, G19): output lost to retention, a crash or a
  *   store failure appears in the text as a `[… N journal events missing …]`
- *   line where it was lost, and in `gap` (and `gaps`, when a page spans more
- *   than one). Every result — text or events, page or tail — reports the holes
- *   it spans the same way, and `describeGap` is the one wording of why.
+ *   line where it was lost ("up to N" when the count is a bound: `gapNote`),
+ *   and in `gap` (and `gaps`, when a page spans more than one). Every result —
+ *   text or events, page or tail — reports the holes it spans the same way,
+ *   and `describeGap` is the one wording of why.
  * - `tail: N` gives the last N lines of the range (the session, a Run with
  *   `runId`, bounded by `since` and `until`, which `untilOffset` can place inside
  *   an event), up to `maxBytes`. N counts lines of output and notes (a hole's,
@@ -77,14 +78,13 @@ import { minusRanges } from '../core/ranges.js';
 import { lineBytes } from '../core/stores.js';
 import { countLines, cutTail, headIndex, indexAtByte, isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length, type LineCarry } from '../core/text.js';
 import { interleaveCut, project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
-import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
+import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type Hole, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
 
-/** A hole in the journal (G11, G19), as a result reports it: the `gap` event's range and reason. */
-export interface GapInfo {
-  from: Seq;
-  to: Seq;
-  reason: GapReason;
-}
+/**
+ * A hole in the journal (G11, G19), as a result reports it: the `gap` event's range and reason, and `exact`
+ * when every seq of it was issued, so it counts the events lost; absent, the count is a bound.
+ */
+export type GapInfo = Hole;
 
 /** Why a hole's events are gone, in a result's words: the one wording for the gap line in text and for a status line. */
 export function describeGap(reason: GapReason): string {
@@ -243,21 +243,29 @@ const OPEN_SEQUENCE_BYTES = 1024 * 1024;
 const FIT_ATTEMPTS = 6;
 
 /**
- * The line a hole leaves in text (G11); the compat pack's raw tail marks its holes with it too. A hole a
- * crash left (`torn-write`, and `store-failed` when the daemon died before the disk took the events) is
- * counted as "up to": numbering resumes above the reservation the journal had synced, so most of its
- * range may be seqs never issued, up to 10,000 of them, and "9997 journal events missing" overstated
- * what was lost (an independent read of the fix for the house's read of the 33 commits, #22, comment
- * 6307350650).
+ * The line a hole leaves in text (G11); the compat pack's raw tail marks its holes with it too. The count is
+ * the hole's range when every seq of it was issued (`exact`), and "up to" it otherwise: numbering may have
+ * resumed above a reservation, so part of the range, up to 10,000 seqs, may never have been issued, and "9997
+ * journal events missing" overstated what was lost (an independent read of the fix for the house's read of
+ * the 33 commits, #22, comment 6307350650). Worded by what the journal knows, not by the hole's reason: a new
+ * life's hole of events every one of which was issued read "up to", and a reservation one seq ahead "1 journal
+ * event" (the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374, question 4). A gap
+ * an earlier build wrote carries no `exact`, and is counted as a bound.
  */
 export function gapNote(g: GapInfo): string {
   const n = g.to - g.from + 1;
-  const upTo = (g.reason === 'torn-write' || g.reason === 'store-failed') && n > 1;
-  const count = upTo ? `up to ${n} journal events` : `${n} journal event${n === 1 ? '' : 's'}`;
-  return `[… ${count} missing (seq ${g.from}–${g.to}: ${describeGap(g.reason)}) …]`;
+  const count = `${n} journal event${n === 1 ? '' : 's'}`;
+  return `[… ${g.exact ? count : `up to ${count}`} missing (seq ${g.from}–${g.to}: ${describeGap(g.reason)}) …]`;
 }
 
-const gapOf = (g: Gap): GapInfo => ({ from: g.from, to: g.to, reason: g.reason });
+const gapOf = (g: Gap): GapInfo => ({ from: g.from, to: g.to, reason: g.reason, ...(g.exact && { exact: true as const }) });
+
+/**
+ * A hole a read inferred (retention took it), counted exactly when the journal's history says every seq of it
+ * was issued (RunIndex.countsExactly), and as a bound otherwise: a reservation's skipped seqs may have aged
+ * out among the events around them.
+ */
+const vouched = (journal: Journal, g: GapInfo): GapInfo => (g.exact === undefined && journal.runs.countsExactly(g.from, g.to) ? { ...g, exact: true } : g);
 
 /** Report the holes a result spans: the first as `gap`, all of them as `gaps` when there are several. */
 function withGapInfo<R extends { gap?: GapInfo; gaps?: GapInfo[] }>(r: R, gaps: GapInfo[]): R {
@@ -303,7 +311,7 @@ function retentionGap(journal: Journal, from: Seq, to: Seq): GapInfo | undefined
 }
 
 /** A gap event standing for a hole the journal holds no event for (a Run's range cut, or events lost since the walk began). */
-const gapEvent = (g: GapInfo): Gap => ({ type: 'gap', seq: g.to, ts: Date.now(), from: g.from, to: g.to, reason: g.reason });
+const gapEvent = (g: GapInfo): Gap => ({ type: 'gap', seq: g.to, ts: Date.now(), from: g.from, to: g.to, reason: g.reason, ...(g.exact && { exact: true as const }) });
 
 /**
  * The parts of a hole a read inferred that no recorded gap the same result reports already covers,
@@ -315,9 +323,10 @@ const gapEvent = (g: GapInfo): Gap => ({ type: 'gap', seq: g.to, ts: Date.now(),
  * too, the inferred hole runs past the recorded range on both sides, and both pieces are kept. The
  * recorded gaps are the ones the result returns, not every one fetched: a page that stops before the
  * recorded event reports the whole hole, rather than leaving part of it to a later page (the house's
- * read of the 38 commits, #22, comment 6274935728, items 3 and 4).
+ * read of the 38 commits, #22, comment 6274935728, items 3 and 4). Each part is counted exactly where
+ * the journal's history vouches for it (`vouched`).
  */
-const uncovered = (gap: GapInfo, recorded: Iterable<GapInfo>): GapInfo[] => minusRanges([gap], recorded);
+const uncovered = (journal: Journal, gap: GapInfo, recorded: Iterable<GapInfo>): GapInfo[] => minusRanges([gap], recorded).map((g) => vouched(journal, g));
 
 /** The recorded holes among events. */
 const recordedIn = (events: Iterable<JournalEvent>): GapInfo[] => [...events].filter(isGap).map(gapOf);
@@ -356,8 +365,8 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
       // Events gone since the walk began (retention while a search yielded) are a hole, not a seam
       // to join lines across: a gap event stands where they were (the house's read of 1cabc6a, #22).
       const inferred = !resumed ? undefined : 'truncated' in r ? retentionGap(journal, (cursor ?? 0) + 1, Math.min(end, events[0] ? events[0].seq - 1 : end)) : r.gap;
-      const lost = inferred ? uncovered(inferred, recordedIn([...events, ...('gaps' in r ? (r.gaps ?? []) : [])])) : [];
-      events.unshift(...lost.filter((g) => g.to > reported).map((g) => gapEvent({ from: Math.max(g.from, reported + 1), to: g.to, reason: 'retention' })));
+      const lost = inferred ? minusRanges([inferred], recordedIn([...events, ...('gaps' in r ? (r.gaps ?? []) : [])])) : [];
+      events.unshift(...lost.filter((g) => g.to > reported).map((g) => gapEvent(vouched(journal, { ...g, from: Math.max(g.from, reported + 1) }))));
       if ('gaps' in r && r.gaps) {
         // A Run's output is filtered to its own events: its holes come apart and are placed among
         // them, each once; after its last output they reach to the range's end.
@@ -474,7 +483,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const firstOut = pieces.find((q): q is OutPiece => q.kind === 'out');
   const state = firstOut && o.since !== undefined ? stateBefore(src, o, firstOut.ev, firstOut.start) : '';
   let budget = maxBytes;
-  let chosen = choose(pieces, budget, hold);
+  let chosen = choose(pieces, budget, hold, journal);
   const continued = (c: Chosen) => open || scanCut || c.taken < pieces.length || c.nextOffset !== undefined;
   const projectChosen = (c: Chosen) => projectPage(c, geometry, maxBytes, continued(c), state, firstOut);
   let p = await projectChosen(chosen);
@@ -482,7 +491,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     // Scale by what the projected part of the input produced.
     const projected = Math.max(1, chosen.inputBytes - p.omitted);
     budget = Math.max(1, Math.floor(projected * Math.min(1, maxBytes / Math.max(1, p.textBytes)) * 0.9));
-    const next = choose(pieces, budget, hold);
+    const next = choose(pieces, budget, hold, journal);
     if (next.inputBytes >= chosen.inputBytes) break;
     chosen = next;
     p = await projectChosen(chosen);
@@ -492,7 +501,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // with what follows it, so no page reads as empty text that stood for a line.
   const collected = pieces.reduce((a, q) => a + (q.kind === 'out' ? q.bytes : 0), 0);
   for (let grow = 0; grow < 3 && p.text === '' && chosen.inputBytes > 0 && chosen.inputBytes < collected; grow++) {
-    const next = choose(pieces, Math.min(collected, chosen.inputBytes + maxBytes), hold);
+    const next = choose(pieces, Math.min(collected, chosen.inputBytes + maxBytes), hold, journal);
     if (next.inputBytes <= chosen.inputBytes) break;
     chosen = next;
     p = await projectChosen(chosen);
@@ -662,7 +671,7 @@ function safeBefore(pieces: Piece[], pos: Pos): Pos {
  * line end. When everything fits and the range may go on (`hold`), a control
  * sequence left unfinished at the end waits for the next page, where its end is.
  */
-function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
+function choose(pieces: Piece[], budget: number, hold: boolean, journal: Journal): Chosen {
   const out = (i: number) => (pieces[i]?.kind === 'out' ? (pieces[i] as OutPiece) : undefined);
   let used = 0;
   let k = 0;
@@ -757,7 +766,7 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
   const recorded = taken.flatMap((pc) => (pc.kind === 'gap' && !pc.atStart ? [pc.gap] : []));
   for (const pc of taken) {
     if (pc.kind === 'gap') {
-      for (const g of pc.atStart ? uncovered(pc.gap, recorded) : [pc.gap]) {
+      for (const g of pc.atStart ? uncovered(journal, pc.gap, recorded) : [pc.gap]) {
         chunks.push({ note: gapNote(g) });
         c.gaps.push(g);
       }
@@ -897,7 +906,7 @@ function eventsPage(src: ReadSource, o: ReadOptions, maxBytes: number): Omit<Rea
   const next = more ? page[page.length - 1]!.seq : Math.max(w.end, page[page.length - 1]?.seq ?? start);
   const r: Omit<ReadResult, 'session'> = { events: page, seq: [page[0]?.seq ?? start + 1, next], nextCursor: Math.min(next, journal.lastSeq), more, truncated: false };
   const recorded = recordedIn(page);
-  return withGapInfo(r, [...(w.gap ? uncovered(w.gap, recorded) : []), ...recorded]);
+  return withGapInfo(r, [...(w.gap ? uncovered(journal, w.gap, recorded) : []), ...recorded]);
 }
 
 // ───────────── tail ─────────────
@@ -950,7 +959,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     events = [...got, ...(ro.gaps ?? [])].sort((a, b) => a.seq - b.seq);
     // Nothing of the range retained: the hole is the range (the house's read of 1cabc6a, #22), less what a recorded gap already says.
     const inferred = ro.truncated && ro.events.length === 0 ? retentionGap(journal, rangeStart, end) : undefined;
-    if (inferred) events.unshift(...uncovered(inferred, recordedIn(events)).map(gapEvent));
+    if (inferred) events.unshift(...uncovered(journal, inferred, recordedIn(events)).map(gapEvent));
   } else {
     // Walk back from the end until the lines, the byte cap, the event bound, `since` or retention stops it.
     end = o.until !== undefined ? Math.min(o.until, journal.lastSeq) : journal.lastSeq;
@@ -969,7 +978,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
         const inferred = retentionGap(journal, (o.since ?? 0) + 1, cursor);
         if (inferred) {
           older = true;
-          parts.push(uncovered(inferred, recordedIn(parts.flat())).map(gapEvent));
+          parts.push(uncovered(journal, inferred, recordedIn(parts.flat())).map(gapEvent));
         }
         break;
       }
@@ -1559,7 +1568,7 @@ export async function searchJournal(src: ReadSource, o: SearchOptions, limits: P
     if (resume.offset > 0) r.nextOffset = resume.offset;
   }
   if (stoppedBy) r.stoppedBy = stoppedBy;
-  withGapInfo(r, [...(w.gap ? uncovered(w.gap, gaps) : []), ...gaps]);
+  withGapInfo(r, [...(w.gap ? uncovered(journal, w.gap, gaps) : []), ...gaps]);
   if (scanner.clippedLines > 0) r.clippedLines = scanner.clippedLines;
   return r;
 }

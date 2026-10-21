@@ -242,6 +242,12 @@ export class RunIndex {
   private readonly openIds = new Set<string>();
   /** The journal's gap events, in seq order: a Run's reads ask for those over its range, wherever each sits (see `gapsWithin`). */
   private readonly gaps: GapEvent[] = [];
+  /**
+   * The oldest seq whose gap events this index has seen: retention had taken the files below it when the
+   * index was first built (Journal sets it then), so a hole recorded among them is unknown here (see
+   * `countsExactly`). Undefined until set: everything since seq 1.
+   */
+  knownFrom: Seq | undefined;
 
   /** `sessionId` is stamped on every RunInfo. */
   constructor(readonly sessionId: string) {}
@@ -339,7 +345,10 @@ export class RunIndex {
         // ones is not the journal's, and is left out.
         if (ev.to >= ev.seq) return;
         this.gaps.push(ev);
-        if (this.gaps.length > MAX_GAPS) this.gaps.splice(0, this.gaps.length - MAX_GAPS);
+        if (this.gaps.length > MAX_GAPS) {
+          // A forgotten hole whose count is a bound takes its seqs out of what the index can vouch for.
+          for (const g of this.gaps.splice(0, this.gaps.length - MAX_GAPS)) if (g.exact !== true) this.knownFrom = Math.max(this.knownFrom ?? 1, g.to + 1);
+        }
         return;
       }
       default:
@@ -350,6 +359,16 @@ export class RunIndex {
   /** The gap events whose range `from..to` overlaps [from, to], wherever each was recorded, in seq order. */
   gapsWithin(from: Seq, to: Seq): GapEvent[] {
     return this.gaps.filter((g) => g.to >= from && g.from <= to);
+  }
+
+  /**
+   * Whether every seq of [from, to] was issued, as far as the journal's history tells: the range lies at or
+   * above `knownFrom` and no gap whose count is a bound meets it. A read that infers a hole (retention took
+   * it) counts its events exactly by this, and otherwise as "up to" (the house's review of the 40 commits
+   * through f3750e4, PR #22, comment 6310921374, question 4): a reservation's skipped seqs may lie among them.
+   */
+  countsExactly(from: Seq, to: Seq): boolean {
+    return from >= (this.knownFrom ?? 1) && !this.gaps.some((g) => g.exact !== true && g.to >= from && g.from <= to);
   }
 
   /** Take the Runs a rotation header names that this index has not seen admitted. */

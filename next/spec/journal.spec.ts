@@ -196,6 +196,7 @@ test('jr-9/G11: a torn last line is cut on open; the next append starts clean an
     const gap = j2.since(5).events[0]!;
     assert.equal(gap.type, 'gap');
     assert.deepEqual(gap.type === 'gap' && [gap.from, gap.to, gap.reason as string], [6, 6, 'torn-write']);
+    assert.equal(gap.type === 'gap' && gap.exact, true, 'one event was being written: the count is exact');
     j2.append({ type: 'recovered', class: 'history-only' });
     j2.close();
     for (const l of lines(path.join(dir, 'journal.jsonl'))) JSON.parse(l); // every line parses

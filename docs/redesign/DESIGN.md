@@ -1421,7 +1421,8 @@ type JournalEvent =
   | { seq; ts; type: 'detach';      attachmentId; principal }
   | { seq; ts; type: 'integration'; level: 'unknown'|'rich'|'basic'|'none' }                  // G5
   | { seq; ts; type: 'watch.fired'; watchId; label; kind: 'pattern'|'silence'|'idle'; principal; at: seq; match?; line?; clipped?: boolean; suppressed?: number }
-  | { seq; ts; type: 'gap';         from: seq; to: seq; reason: 'retention'|'keeper-overflow'|'torn-write'|'store-error'|'store-failed' }  // G11; the last three are G19's disk path; torn-write is also what a power loss took (G10)
+  | { seq; ts; type: 'gap';         from: seq; to: seq; reason: 'retention'|'keeper-overflow'|'torn-write'|'store-error'|'store-failed'; exact?: true }  // G11; the last three are G19's disk path; torn-write is also what a power loss took (G10)
+                                    // exact: every seq of the range was issued, so it counts the events lost; absent (and in a gap an earlier build wrote), the count is a bound, since numbering may have resumed above a reservation's never-issued seqs
   | { seq; ts; type: 'checkpoint';  screen: serialized }                                      // milestone 3; not in types.ts yet
   | { seq; ts; type: 'recovered';   class: 'continuous'|'reattached'|'history-only' }
   | { seq; ts; type: 'session.exit';code: number|null; signal?; reason? }                     // reason: why the daemon ended the shell (daemon-shutdown); absent when it ended on its own

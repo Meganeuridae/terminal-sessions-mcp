@@ -317,13 +317,13 @@ test('jr2-11: a torn write or store failure inside the range is a gap in the res
   const src = source();
   out(src.journal, 'line 1\r\n');
   out(src.journal, 'line 2\r\n');
-  src.journal.append({ type: 'gap', from: 3, to: 3, reason: 'torn-write' });
+  src.journal.append({ type: 'gap', from: 3, to: 3, reason: 'torn-write', exact: true });
   out(src.journal, 'line 3\r\n');
   const r = await readJournal(src, { since: 1 }, { resultBytes: 16384 });
-  assert.deepEqual(r.gap, { from: 3, to: 3, reason: 'torn-write' });
+  assert.deepEqual(r.gap, { from: 3, to: 3, reason: 'torn-write', exact: true });
   assert.equal(r.text, 'line 2\n[… 1 journal event missing (seq 3–3: a crash cut the journal short) …]\nline 3');
   // Two holes: both listed.
-  src.journal.append({ type: 'gap', from: 6, to: 9, reason: 'store-error' });
+  src.journal.append({ type: 'gap', from: 6, to: 9, reason: 'store-error', exact: true });
   out(src.journal, 'line 4\r\n');
   const both = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
   assert.equal(both.gaps?.length, 2);
@@ -334,7 +334,7 @@ test('jr2-11: a torn write or store failure inside the range is a gap in the res
   // The hole lies inside the Run's range (a gap for a hole wholly outside it is not the Run's: the
   // house's read of the 33 commits, #22 comment 6307350477, item 7); here it is the gap event's own seq.
   const hole = src.journal.lastSeq + 1;
-  src.journal.append({ type: 'gap', from: hole, to: hole, reason: 'torn-write' });
+  src.journal.append({ type: 'gap', from: hole, to: hole, reason: 'torn-write', exact: true });
   out(src.journal, 'run b\n', 'stdout', 'r1');
   const run = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
   assert.equal(run.text, `run a\n[… 1 journal event missing (seq ${hole}–${hole}: a crash cut the journal short) …]\nrun b`);
@@ -357,14 +357,14 @@ test('a hole recorded after a Run ended, for seqs inside it, is a line in the Ru
   endRun(src.journal, 'r1');
   assert.equal((await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 })).text, 'run a\nrun b');
   // The catch-up records, after the Run ended, that the seqs between its two outputs are gone.
-  src.journal.append({ type: 'gap', from: n1, to: n3, reason: 'store-error' });
+  src.journal.append({ type: 'gap', from: n1, to: n3, reason: 'store-error', exact: true });
   const line = `[… 3 journal events missing (seq ${n1}–${n3}: the journal store failed) …]`;
   const r = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
   assert.equal(r.text, `run a\n${line}\nrun b`);
-  assert.deepEqual(r.gap, { from: n1, to: n3, reason: 'store-error' });
+  assert.deepEqual(r.gap, { from: n1, to: n3, reason: 'store-error', exact: true });
   const tail = await readJournal(src, { runId: 'r1', tail: 5 }, { resultBytes: 16384 });
   assert.equal(tail.text, `run a\n${line}\nrun b`);
-  assert.deepEqual(tail.gap, { from: n1, to: n3, reason: 'store-error' });
+  assert.deepEqual(tail.gap, { from: n1, to: n3, reason: 'store-error', exact: true });
 });
 
 test('jr2-11 / G11: a cursor older than retention starts the text with the hole it cannot show', async () => {
@@ -374,26 +374,26 @@ test('jr2-11 / G11: a cursor older than retention starts the text with the hole 
   const oldest = j.oldestSeq!;
   assert.ok(oldest > 1);
   const r = await readJournal(src, { since: 0, maxBytes: 4096 }, { resultBytes: 16384 });
-  assert.deepEqual(r.gap, { from: 1, to: oldest - 1, reason: 'retention' });
+  assert.deepEqual(r.gap, { from: 1, to: oldest - 1, reason: 'retention', exact: true });
   assert.ok(r.text!.startsWith(`[… ${oldest - 1} journal events missing (seq 1–${oldest - 1}: past retention) …]`), r.text!.slice(0, 80));
 });
 
 test('every result reports the holes it spans the same way: events pages and events tails carry gap and gaps as text pages do, and store-failed is named', async () => {
   const src = source();
   out(src.journal, 'a\r\n'); // seq 1
-  src.journal.append({ type: 'gap', from: 2, to: 2, reason: 'torn-write' }); // seq 2
+  src.journal.append({ type: 'gap', from: 2, to: 2, reason: 'torn-write', exact: true }); // seq 2
   out(src.journal, 'b\r\n'); // seq 3
-  src.journal.append({ type: 'gap', from: 4, to: 4, reason: 'store-failed' }); // seq 4
+  src.journal.append({ type: 'gap', from: 4, to: 4, reason: 'store-failed', exact: true }); // seq 4
   out(src.journal, 'c\r\n'); // seq 5
   const text = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
   assert.equal(text.text, 'a\n[… 1 journal event missing (seq 2–2: a crash cut the journal short) …]\nb\n[… 1 journal event missing (seq 4–4: the journal store never took them) …]\nc');
   const page = await readJournal(src, { since: 0, as: 'events' }, { resultBytes: 16384 });
-  assert.deepEqual(page.gap, { from: 2, to: 2, reason: 'torn-write' });
+  assert.deepEqual(page.gap, { from: 2, to: 2, reason: 'torn-write', exact: true });
   assert.deepEqual(page.gaps, text.gaps, 'the same holes, reported the same way');
   assert.equal(page.gaps?.length, 2);
   const tail = await readJournal(src, { tail: 3, as: 'events' }, { resultBytes: 16384 });
   assert.deepEqual(tail.events!.map((e) => e.seq), [3, 4, 5]);
-  assert.deepEqual(tail.gap, { from: 4, to: 4, reason: 'store-failed' }, 'the one hole the tail spans');
+  assert.deepEqual(tail.gap, { from: 4, to: 4, reason: 'store-failed', exact: true }, 'the one hole the tail spans');
   assert.equal(tail.gaps, undefined);
   const cut = await readJournal(src, { since: 0, as: 'events', limit: 1 }, { resultBytes: 16384 });
   assert.equal(cut.gap, undefined, 'a page that ends before a hole does not span it');
@@ -475,7 +475,7 @@ test('er-2: the tail of apt-style output reads as the terminal shows it, though 
 
 const gapAt = (j: Journal) => {
   const g = j.lastSeq + 1;
-  return j.append({ type: 'gap', from: g, to: g, reason: 'torn-write' }).seq;
+  return j.append({ type: 'gap', from: g, to: g, reason: 'torn-write', exact: true }).seq;
 };
 
 test('1cabc6a 4: a Run\'s read and search show a hole wherever it lies: at a batch edge, after the last output, before the first, and 20,500 other events in', async () => {
@@ -600,11 +600,11 @@ test('1cabc6a: with every event of a range aged out, a Run\'s read and the sessi
   for (let i = 0; i < 2000; i++) j.append({ type: 'note', text: 'n'.repeat(200), principal: 'agent:x@test' });
   assert.ok(j.oldestSeq! > runEnd, 'the Run is gone entirely');
   const r = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
-  assert.deepEqual(r.gap, { from: 2, to: runEnd, reason: 'retention' });
+  assert.deepEqual(r.gap, { from: 2, to: runEnd, reason: 'retention', exact: true });
   assert.equal(r.text, `[… ${runEnd - 1} journal events missing (seq 2–${runEnd}: past retention) …]`);
   assert.equal(r.more, false);
   const t = await readJournal(src, { tail: 5, until: runEnd }, { resultBytes: 16384 });
-  assert.deepEqual(t.gap, { from: 1, to: runEnd, reason: 'retention' });
+  assert.deepEqual(t.gap, { from: 1, to: runEnd, reason: 'retention', exact: true });
   assert.equal(t.truncated, true);
   assert.deepEqual(t.lines, { requested: 5, returned: 1 });
 });
@@ -661,22 +661,22 @@ test('ed4ecac 3: output that ends inside a control sequence before a hole hides 
     const many = source();
     out(many.journal, 'line 1\r\n');
     out(many.journal, `prompt ${open}`);
-    many.journal.append({ type: 'gap', from: 3, to: 3, reason: 'torn-write' });
+    many.journal.append({ type: 'gap', from: 3, to: 3, reason: 'torn-write', exact: true });
     for (let i = 0; i < 1000; i++) out(many.journal, `after ${i}\r\n`);
     const { text, pages } = await readAll(many, { since: 0 });
     const lines = text.split('\n');
     assert.deepEqual(lines.slice(0, 4), ['line 1', 'prompt', '[… 1 journal event missing (seq 3–3: a crash cut the journal short) …]', 'after 0'], JSON.stringify(open));
     assert.equal(lines.length, 1003, JSON.stringify(open));
-    assert.deepEqual(pages[0]!.gap, { from: 3, to: 3, reason: 'torn-write' });
+    assert.deepEqual(pages[0]!.gap, { from: 3, to: 3, reason: 'torn-write', exact: true });
     // Two lines after the hole, in a live range: nothing waits for the sequence's end, which is gone.
     const few = source();
     out(few.journal, 'line 1\r\n');
     out(few.journal, `prompt ${open}`);
-    few.journal.append({ type: 'gap', from: 3, to: 3, reason: 'torn-write' });
+    few.journal.append({ type: 'gap', from: 3, to: 3, reason: 'torn-write', exact: true });
     out(few.journal, 'a\r\nb\r\n');
     const r = await readJournal(few, { since: 0 }, { resultBytes: 16384 });
     assert.equal(r.text, 'line 1\nprompt\n[… 1 journal event missing (seq 3–3: a crash cut the journal short) …]\na\nb', JSON.stringify(open));
-    assert.deepEqual(r.gap, { from: 3, to: 3, reason: 'torn-write' });
+    assert.deepEqual(r.gap, { from: 3, to: 3, reason: 'torn-write', exact: true });
     assert.equal(r.more, false);
     assert.equal(r.nextCursor, 4);
   }
@@ -772,7 +772,7 @@ test('78c4d6e 17: a recovery hole recorded as a store-failed gap event at the he
   out(j2, 'kept\r\n'); // seq 6
   const both = await readJournal(src2, { since: 0, as: 'events' }, { resultBytes: 16384 });
   assert.deepEqual(both.gaps, [
-    { from: 1, to: 2, reason: 'retention' },
+    { from: 1, to: 2, reason: 'retention', exact: true },
     { from: 3, to: 4, reason: 'store-failed' },
   ]);
 });
@@ -881,13 +881,13 @@ test('the 38 commits 3: a hole the reader infers keeps its pieces on both sides 
   const j = new Journal({ sessionId: 's', hot: new MemoryStore(600) });
   const src = source({ journal: j });
   for (let i = 1; i <= 4; i++) out(j, `gone ${i} ${'x'.repeat(1000)}\r\n`);
-  j.append({ type: 'gap', from: 2, to: 3, reason: 'store-error' }); // seq 5
+  j.append({ type: 'gap', from: 2, to: 3, reason: 'store-error', exact: true }); // seq 5
   out(j, 'kept\r\n'); // seq 6
   assert.equal(j.oldestSeq, 5);
   const want = [
-    { from: 1, to: 1, reason: 'retention' },
-    { from: 4, to: 4, reason: 'retention' },
-    { from: 2, to: 3, reason: 'store-error' },
+    { from: 1, to: 1, reason: 'retention', exact: true },
+    { from: 4, to: 4, reason: 'retention', exact: true },
+    { from: 2, to: 3, reason: 'store-error', exact: true },
   ];
   assert.deepEqual((await readJournal(src, { since: 0, as: 'events' }, { resultBytes: 16384 })).gaps, want, 'events page');
   const text = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
@@ -903,22 +903,22 @@ test('the 38 commits 4: the leading hole is trimmed by the recorded gaps a page 
   const src = source({ journal: j });
   for (let i = 1; i <= 4; i++) out(j, `gone ${i} ${'x'.repeat(3000)}\r\n`);
   for (let i = 5; i <= 7; i++) out(j, `kept ${i} ${'k'.repeat(300)}\r\n`);
-  j.append({ type: 'gap', from: 2, to: 3, reason: 'store-error' }); // seq 8
+  j.append({ type: 'gap', from: 2, to: 3, reason: 'store-error', exact: true }); // seq 8
   out(j, 'last\r\n'); // seq 9
   assert.equal(j.oldestSeq, 5);
   const events = await readJournal(src, { since: 0, as: 'events', limit: 2 }, { resultBytes: 16384 });
   assert.deepEqual(events.events!.map((e) => e.seq), [5, 6]);
-  assert.deepEqual(events.gap, { from: 1, to: 4, reason: 'retention' }, 'the page that stops before the recorded gap reports the whole hole');
+  assert.deepEqual(events.gap, { from: 1, to: 4, reason: 'retention', exact: true }, 'the page that stops before the recorded gap reports the whole hole');
   assert.equal(events.gaps, undefined);
   const text = await readJournal(src, { since: 0, maxBytes: 1024 }, { resultBytes: 16384 });
   assert.ok(text.seq[1] < 8, `the page stops before the recorded gap: ${JSON.stringify(text.seq)}`);
-  assert.deepEqual(text.gap, { from: 1, to: 4, reason: 'retention' });
+  assert.deepEqual(text.gap, { from: 1, to: 4, reason: 'retention', exact: true });
   // A page that returns the recorded gap reports the hole once, each part under its own reason.
   const whole = await readJournal(src, { since: 0, as: 'events' }, { resultBytes: 16384 });
   assert.deepEqual(whole.gaps, [
-    { from: 1, to: 1, reason: 'retention' },
-    { from: 4, to: 4, reason: 'retention' },
-    { from: 2, to: 3, reason: 'store-error' },
+    { from: 1, to: 1, reason: 'retention', exact: true },
+    { from: 4, to: 4, reason: 'retention', exact: true },
+    { from: 2, to: 3, reason: 'store-error', exact: true },
   ]);
 });
 
@@ -1138,22 +1138,55 @@ test('tail: N counts lines of output, and the headers naming sources come extra'
   assert.equal(b.text, '[terminal]\np1\n[run r1]\nr1\n[terminal]\np2');
 });
 
-test('a crash’s hole is counted as up to its range: most of it may be seqs never issued', async () => {
-  // The journal records the range a crash skipped above the last synced reservation, up to 10,000 seqs, so
-  // "9997 journal events missing" overstated what was lost.
+test('a hole is counted by what the journal knows: exactly when every seq of it was issued, as "up to" otherwise, and so is a gap an earlier build wrote', async () => {
+  // Worded by the hole's reason, a new life's hole of events every one of which was issued read "up to", and a
+  // reservation one seq ahead "1 journal event" for a seq that may never have been issued (the house's review of
+  // the 40 commits through f3750e4, PR #22, comment 6310921374, question 4).
   const src = source();
   out(src.journal, 'before\r\n');
-  src.journal.append({ type: 'gap', from: 2, to: 9998, reason: 'torn-write' });
+  src.journal.append({ type: 'gap', from: 2, to: 9998, reason: 'torn-write' }); // a crash above a reservation
+  src.journal.append({ type: 'gap', from: 10_000, to: 10_000, reason: 'torn-write' }); // a reservation one seq ahead
+  src.journal.append({ type: 'gap', from: 10_002, to: 10_004, reason: 'store-failed', exact: true }); // a new life's unwritten events
+  src.journal.append({ type: 'gap', from: 10_006, to: 10_006, reason: 'store-error', exact: true }); // what the ring dropped
   out(src.journal, 'after\r\n');
   const r = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
-  assert.equal(r.text, 'before\n[… up to 9997 journal events missing (seq 2–9998: a crash cut the journal short) …]\nafter');
-  // So is the range the store never took when the daemon died first; every other reason counts what is
-  // gone, and one seq is one event.
-  const other = source();
-  other.journal.append({ type: 'gap', from: 1, to: 3, reason: 'store-error' });
-  other.journal.append({ type: 'gap', from: 5, to: 5, reason: 'torn-write' });
-  other.journal.append({ type: 'gap', from: 7, to: 9, reason: 'store-failed' });
-  assert.equal((await readJournal(other, { since: 0 }, { resultBytes: 16384 })).text, '[… 3 journal events missing (seq 1–3: the journal store failed) …]\n[… 1 journal event missing (seq 5–5: a crash cut the journal short) …]\n[… up to 3 journal events missing (seq 7–9: the journal store never took them) …]');
+  assert.equal(
+    r.text,
+    [
+      'before',
+      '[… up to 9997 journal events missing (seq 2–9998: a crash cut the journal short) …]',
+      '[… up to 1 journal event missing (seq 10000–10000: a crash cut the journal short) …]',
+      '[… 3 journal events missing (seq 10002–10004: the journal store never took them) …]',
+      '[… 1 journal event missing (seq 10006–10006: the journal store failed) …]',
+      'after',
+    ].join('\n'),
+  );
+  assert.deepEqual(r.gaps?.map((g) => g.exact), [undefined, undefined, true, true], 'each result carries the count’s kind');
+  // A store-error gap an earlier build wrote says nothing of its count: a bound.
+  const older = source();
+  older.journal.append({ type: 'gap', from: 1, to: 3, reason: 'store-error' });
+  assert.equal((await readJournal(older, { since: 0 }, { resultBytes: 16384 })).text, '[… up to 3 journal events missing (seq 1–3: the journal store failed) …]');
+});
+
+test('a hole retention took is counted exactly when the journal saw every gap below it, and as "up to" when a reservation\'s skipped seqs may lie in it', async () => {
+  // A memory ring that keeps a few events: retention takes the start, the journal saw all of it.
+  const plain = new Journal({ sessionId: 's', hot: new MemoryStore(600) });
+  for (let i = 1; i <= 4; i++) out(plain, `gone ${i} ${'x'.repeat(1000)}\r\n`);
+  out(plain, 'kept\r\n');
+  const exact = await readJournal(source({ journal: plain }), { since: 0 }, { resultBytes: 16384 });
+  assert.deepEqual(exact.gap, { from: 1, to: 4, reason: 'retention', exact: true });
+  assert.match(exact.text!, /^\[… 4 journal events missing \(seq 1–4: past retention\) …\]/);
+  // A gap whose count is a bound aged out with the events around it: its seqs are among the retention hole's.
+  // (As a fixture its range holds events; the journal records one only for seqs no event has.)
+  const skipped = new Journal({ sessionId: 's', hot: new MemoryStore(600) });
+  for (let i = 1; i <= 2; i++) out(skipped, `gone ${'x'.repeat(1000)}\r\n`); // seq 1–2
+  skipped.append({ type: 'gap', from: 1, to: 2, reason: 'torn-write' }); // seq 3: a reservation's range, a bound
+  for (let i = 0; i < 3; i++) out(skipped, `gone ${'x'.repeat(1000)}\r\n`); // seq 4–6
+  out(skipped, 'kept\r\n'); // seq 7
+  assert.ok(skipped.oldestSeq! > 3, 'the bound gap aged out too');
+  const bound = await readJournal(source({ journal: skipped }), { since: 0 }, { resultBytes: 16384 });
+  assert.deepEqual(bound.gap, { from: 1, to: skipped.oldestSeq! - 1, reason: 'retention' });
+  assert.match(bound.text!, /^\[… up to \d+ journal events missing \(seq 1–\d+: past retention\) …\]/);
 });
 
 test('paging back past a title left open before a hole reaches every line: the title shows nothing, and the row its LF left counts', async () => {

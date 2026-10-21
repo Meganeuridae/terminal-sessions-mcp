@@ -59,8 +59,12 @@ export type EventInput =
    * A range of seqs that is gone (G11, Appendix A): `retention`, `keeper-overflow`, `torn-write` (a crash cut
    * the last line, or a power loss took the lines the disk had not yet written, G10), `store-error` (the ring dropped events the disk had refused), `store-failed` (the disk still
    * refused them when the journal sealed, or the daemon died first); their seqs are never reissued (G10).
+   * `exact`: every seq of the range was issued, so it counts the events lost (what the ring dropped, the life
+   * before this one's unwritten events, a torn line's one). Absent, the count is a bound: a reservation the
+   * journal numbered above may have skipped seqs never issued, and a gap an earlier build wrote says nothing
+   * (the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374, question 4).
    */
-  | { type: 'gap'; from: Seq; to: Seq; reason: 'retention' | 'keeper-overflow' | 'torn-write' | 'store-error' | 'store-failed' }
+  | { type: 'gap'; from: Seq; to: Seq; reason: 'retention' | 'keeper-overflow' | 'torn-write' | 'store-error' | 'store-failed'; exact?: true }
   | { type: 'recovered'; class: 'continuous' | 'reattached' | 'history-only' }
   /** `reason` names why the daemon ended the shell (e.g. 'daemon-shutdown'); absent when the shell ended on its own. */
   | { type: 'session.exit'; code: number | null; signal?: string; reason?: string }
@@ -90,6 +94,8 @@ export type EventType = JournalEvent['type'];
 export type EventOf<T extends EventType> = Extract<JournalEvent, { type: T }>;
 /** Why a range of the journal is gone: the `gap` event's reasons, the one list every report of a hole draws on. */
 export type GapReason = EventOf<'gap'>['reason'];
+/** A hole as a read reports it: the `gap` event's range, reason and count. */
+export type Hole = Pick<EventOf<'gap'>, 'from' | 'to' | 'reason' | 'exact'>;
 
 /** The terminal size a session, a transcript or a history read gets when nothing recorded one. */
 export const DEFAULT_GEOMETRY = { cols: 120, rows: 30 } as const;

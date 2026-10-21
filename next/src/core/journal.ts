@@ -28,7 +28,9 @@
  * the reservation left on disk is not marked failed, a start on the same boot
  * does not honour such a one, and numbering resumes at the files' last seq.
  * What the ring drops while the disk refuses is recorded as it is lost and
- * written as a `store-error` gap at the catch-up.
+ * written as a `store-error` gap at the catch-up. A gap says whether its count
+ * is exact (`exact`): where the journal opens, it knows which seqs of a hole
+ * were issued.
  */
 import { clocks, timerMs } from './clock.js';
 import { boots } from './lock.js';
@@ -78,7 +80,7 @@ export interface JournalStats {
   droppedAfterClose: number;
 }
 
-const gapEvent = (from: Seq, to: Seq, reason: GapReason): EventInput => ({ type: 'gap', from, to, reason });
+const gapEvent = (from: Seq, to: Seq, reason: GapReason, exact: boolean): EventInput => ({ type: 'gap', from, to, reason, ...(exact && { exact: true as const }) });
 
 const RETRY_MIN_MS = 1000;
 const RETRY_MAX_MS = 30_000;
@@ -184,19 +186,30 @@ export class Journal {
     // reservation is honoured (reservationHonoured).
     const r = hw?.reservation;
     const honoured = r !== undefined && reservationHonoured(r);
-    this.seq = Math.max(opts.startSeq ?? 0, accounted, honoured ? r.to : 0);
+    // A new life of a name in this daemon knows the last seq the life before it issued (startSeq): none above
+    // it was, so a reservation above it (the block a seal could not lower) adds nothing to skip. Skipped, those
+    // seqs made a hole of events every one of which was issued count as a bound (the house's review of the 40
+    // commits through f3750e4, PR #22, comment 6310921374, question 4).
+    const known = opts.startSeq;
+    this.seq = Math.max(accounted, known ?? (honoured ? r.to : 0));
     this.persisted = this.seq;
     this.runs = opts.runs ?? new RunIndex(opts.sessionId ?? '');
     if (!opts.runs) this.index();
+    // Below what the stores hold now, retention has taken the files, and the gaps they recorded with them.
+    this.runs.knownFrom ??= this.oldestSeq ?? accounted + 1;
     this.cold?.setRotationHeader?.((maxBytes) => this.runs.header(maxBytes));
     // Likewise a crash that cut the event after the last complete line (G11); a hole covers that event.
     const torn = this.cold?.takeTornTail?.() ?? false;
     const hole = this.cold !== undefined && this.seq > accounted;
     if (hole || torn) {
       if (!hole) this.persisted = ++this.seq;
-      const crash = honoured && !r.failed && this.seq === r.to;
+      // The count is exact where the journal knows every seq of the hole was issued: the one event a torn line
+      // held, or what the life before this one issued and the disk never took, unless a hole of its own whose
+      // count is a bound lies among it. Up to a reservation it is a bound: the block may hold seqs never issued.
+      const exact = !hole || (known !== undefined && this.runs.countsExactly(accounted + 1, this.seq));
+      const crash = known === undefined && honoured && !r.failed && this.seq === r.to;
       this.holeOpen = hole;
-      this.append(gapEvent(accounted + 1, this.seq, hole && !crash ? 'store-failed' : 'torn-write'));
+      this.append(gapEvent(accounted + 1, this.seq, hole && !crash ? 'store-failed' : 'torn-write', exact));
       if (this.holeOpen) {
         this.holeOpen = false;
         // The gap is in the store now: the block above it takes this boot, so a later stop on this boot is
@@ -408,7 +421,7 @@ export class Journal {
       // Even a sealed journal records what its ring lost, under the next seq (the next life numbers after it).
       if (lost) {
         this.lost = undefined;
-        this.issue(gapEvent(lost.from, lost.to, 'store-error'));
+        this.issue(gapEvent(lost.from, lost.to, 'store-error', true));
       }
       if (this.coldError === null && this.persisted >= this.seq) {
         this.markRetryAt = 0; // the disk takes writes again: the reservation's `failed` goes now, not at a throttle's deadline

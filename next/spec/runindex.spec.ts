@@ -265,6 +265,29 @@ test('the run index drops a gap line claiming seqs at or past its own seq — a 
   assert.equal(idx.gapsWithin(1, 100).length, 1, 'neither over-reaching gap was kept');
 });
 
+test('the run index vouches for a range\'s count only above what it has seen and where no gap whose count is a bound meets it, and a bound it forgets narrows what it vouches for', () => {
+  // A hole a read infers (retention took it) counts its events exactly only if no reservation's skipped seqs can lie in
+  // it (the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374, question 4).
+  const idx = new RunIndex('s');
+  assert.equal(idx.countsExactly(1, 1000), true, 'nothing recorded: every seq since 1 was issued');
+  idx.feed({ type: 'gap', from: 10, to: 20, reason: 'store-error', exact: true, seq: 30, ts: 0 } as JournalEvent);
+  idx.feed({ type: 'gap', from: 40, to: 49, reason: 'torn-write', seq: 50, ts: 0 } as JournalEvent);
+  assert.equal(idx.countsExactly(1, 39), true, 'an exact hole is seqs issued');
+  assert.equal(idx.countsExactly(45, 60), false, 'a bound meets the range');
+  assert.equal(idx.countsExactly(50, 60), true);
+  idx.knownFrom = 100;
+  assert.equal(idx.countsExactly(99, 200), false, 'below what the index has seen, nothing is known');
+  assert.equal(idx.countsExactly(100, 200), true);
+  // Past its bound the index forgets its oldest gaps; a forgotten bound's seqs are no longer vouched for.
+  const trimmed = new RunIndex('s');
+  trimmed.feed({ type: 'gap', from: 1, to: 5, reason: 'torn-write', seq: 6, ts: 0 } as JournalEvent);
+  for (let i = 0; i < 10_000; i++) trimmed.feed({ type: 'gap', from: 100 + 2 * i, to: 100 + 2 * i, reason: 'store-error', exact: true, seq: 101 + 2 * i, ts: 0 } as JournalEvent);
+  assert.equal(trimmed.gapsWithin(1, 5).length, 0, 'the oldest went');
+  assert.equal(trimmed.knownFrom, 6);
+  assert.equal(trimmed.countsExactly(1, 5), false);
+  assert.equal(trimmed.countsExactly(6, 99), true);
+});
+
 test('jr2-4: a run.start\'s start ticks and boot id reach the Run — as journaled, after a reopen\'s scan, and through a rotation header (the house\'s read of the 38 commits, PR #22, comment 6274857431)', () => {
   // The recovery tests set the ticks on a Run's info by hand: with this propagation removed, none failed.
   const dir = tmpDir();

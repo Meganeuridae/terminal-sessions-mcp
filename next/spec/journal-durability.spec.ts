@@ -103,6 +103,8 @@ test('jr2-6/G10/G11: a journal sealed while the disk still refuses leaves a high
     const again = new Journal({ cold: store });
     assert.equal(again.lastSeq, 9, 'numbering continues above everything issued');
     assert.deepEqual(gaps(again.since(0).events), [[4, 8, 'store-failed']]);
+    // After a restart nothing says the seal lowered the reservation rather than a crash leaving it a block ahead.
+    assert.equal(again.since(0).events.find((e) => e.type === 'gap' && e.exact), undefined, 'so its count is a bound');
     assert.equal(again.append(out('after')).seq, 10);
     assert.deepEqual(seqs(onDisk(dir)), [1, 2, 3, 9, 10], 'no seq a subscriber saw is reused');
     assert.equal(store.highWater()?.reservation?.failed, undefined, 'the flag goes once the gap is on disk');
@@ -210,6 +212,89 @@ test('G10: a daemon that dies after its start honoured an earlier boot\'s reserv
 });
 
 // ───────────── jr2-7: age retention reaches the active file and an idle ring ─────────────
+
+test('a new life numbers on from the last seq the life before it issued, and its hole of events the disk never took counts exactly, even when the seal could not lower the reservation', () => {
+  // The reservation a seal could not lower stands a block ahead; the new life numbered past it, and its hole, every
+  // seq of which the life before issued, read "up to 9998" (the house's review of the 40 commits through f3750e4,
+  // PR #22, comment 6310921374, question 4).
+  const dir = tmpDir();
+  try {
+    const cold = new FullDisk(dir);
+    const old = new Journal({ cold, sessionId: 's' });
+    for (let i = 0; i < 3; i++) old.append(out(`before-${i}`));
+    cold.broken = true;
+    for (let i = 0; i < 5; i++) old.append(out(`unwritten-${i}`)); // 4..8, in the ring only
+    const setHighWater = cold.setHighWater.bind(cold);
+    cold.setHighWater = () => false;
+    old.seal();
+    cold.setHighWater = setHighWater;
+    assert.ok((cold.highWater()?.reservation?.to ?? 0) > 8, 'the reservation stands a block ahead');
+    const life = new Journal({ cold, sessionId: 's', startSeq: old.lastSeq, runs: old.runs });
+    const gap = life.since(3).events[0]!;
+    assert.deepEqual(gap.type === 'gap' && [gap.seq, gap.from, gap.to, gap.reason, gap.exact], [9, 4, 8, 'store-failed', true]);
+    assert.equal(life.append(out('second life')).seq, 10);
+    // A hole of its own whose count is a bound among them makes the new life's a bound too: here the life before
+    // opened above a failed reservation, and the disk refused its gap with its events.
+    const dir2 = tmpDir();
+    try {
+      const c2 = new FullDisk(dir2);
+      c2.broken = true;
+      assert.equal(c2.setHighWater({ reservation: { to: 5, failed: true } }), true);
+      const first = new Journal({ cold: c2, sessionId: 's' }); // seqs 1–5 a bound hole, its gap at 6
+      first.append(out('x')); // seq 7
+      first.seal();
+      const next = new Journal({ cold: c2, sessionId: 's', startSeq: first.lastSeq, runs: first.runs });
+      const g = next.since(0).events.find((e) => e.seq > 7)!;
+      assert.deepEqual(g.type === 'gap' && [g.from, g.to, g.reason, g.exact], [1, 7, 'store-failed', undefined]);
+      next.close();
+    } finally {
+      fs.rmSync(dir2, { recursive: true, force: true });
+    }
+    life.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a reservation one seq ahead of the files after a reboot is counted as a bound: that seq may never have been issued', (t) => {
+  let boot = 'boot-A';
+  t.mock.method(boots, 'current', () => boot);
+  const dir = tmpDir();
+  try {
+    const j = new Journal({ cold: new FileStore(dir) });
+    for (let i = 0; i < 3; i++) j.append(out(`e${i}`));
+    j.close();
+    const metaFile = path.join(dir, 'journal.meta.json');
+    const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8')) as { reserved?: number };
+    fs.writeFileSync(metaFile, JSON.stringify({ ...meta, reserved: 4 }) + '\n');
+    boot = 'boot-B';
+    const again = new Journal({ cold: new FileStore(dir) });
+    const gap = again.since(3).events[0]!;
+    assert.deepEqual(gap.type === 'gap' && [gap.from, gap.to, gap.reason, gap.exact], [4, 4, 'torn-write', undefined]);
+    again.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a journal opened over files retention already thinned vouches for no count below what they hold: the gaps recorded there went with them', () => {
+  const dir = tmpDir();
+  try {
+    const j = new Journal({ cold: new FileStore(dir, { maxFileBytes: 2000, maxBytes: 6000 }), hot: new MemoryStore(4000) });
+    for (let i = 0; i < 200; i++) j.append(out(`line ${i} ${'r'.repeat(60)}`));
+    const oldest = j.oldestSeq!;
+    assert.ok(oldest > 1, 'retention took the first files');
+    assert.equal(j.runs.countsExactly(1, oldest - 1), true, 'the journal that wrote them saw every gap among them');
+    j.close();
+    const again = new Journal({ cold: new FileStore(dir, { maxFileBytes: 2000, maxBytes: 6000 }) });
+    assert.equal(again.runs.knownFrom, again.oldestSeq);
+    assert.equal(again.runs.countsExactly(1, again.oldestSeq! - 1), false, 'one opened after cannot tell');
+    assert.equal(again.runs.countsExactly(again.oldestSeq!, again.lastSeq), true);
+    again.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('jr2-7/G21/G26: the active file is rotated once its oldest event is past maxAgeMs, so aged content goes at the next append', () => {
   const dir = tmpDir();
@@ -662,6 +747,7 @@ test('numbering survives a power loss: a crash that takes the file\'s unsynced t
     boot = 'boot-B';
     const after = reopen('power');
     assert.deepEqual(gaps(after.since(0).events), [[21, HIGH_WATER_BLOCK, 'torn-write']], 'what the file lost, and the seqs reserved past it');
+    assert.equal(after.since(0).events.find((e) => e.type === 'gap' && e.exact), undefined, 'counted as a bound');
     const next = after.append(out('after the crash'));
     assert.ok(next.seq > Math.max(...seen) && !seen.includes(next.seq), `no seq a subscriber saw is issued again (next ${next.seq})`);
     after.close();
