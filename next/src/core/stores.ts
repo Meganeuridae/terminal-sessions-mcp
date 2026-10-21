@@ -719,7 +719,7 @@ export class FileStore implements JournalStore {
     if (w.synced && dirError === undefined) return 'written';
     if (!this.syncWarned) {
       this.syncWarned = true;
-      const why = w.synced ? `its new directory's entry could not be synced: ${dirError?.message ?? 'unknown error'}` : `its directory could not be synced: ${w.error?.message ?? 'unknown error'}`;
+      const why = w.synced ? `the entry of ${this.newDirs[0] ?? this.dir} in its parent could not be synced: ${dirError?.message ?? 'unknown error'}` : `its directory could not be synced: ${w.error?.message ?? 'unknown error'}`;
       this.log?.('warn', `the journal's metadata (${META}) is written but ${why}; a crash may undo the write`);
     }
     return 'unsynced';

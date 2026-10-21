@@ -1189,8 +1189,11 @@ test('a store syncs a directory it created into its parent with its first metada
     x.close();
     // A new session whose entry in sessions/ cannot be synced: the file holds the reservation, which is not counted until the sync lands.
     failIno = ino(path.join(root, 'sessions'));
-    const y = new FileStore(path.join(root, 'sessions', 'y'));
+    const warned: string[] = [];
+    const y = new FileStore(path.join(root, 'sessions', 'y'), { log: (level, text) => void (level === 'warn' && warned.push(text)) });
     assert.equal(reserve(y, 100), false, 'not counted while its directory entry may not survive a power loss');
+    // The warning names the directory whose entry it could not sync, made by this open or not (the house's review of a8b6f28..4860d4c, PR #22).
+    assert.deepEqual(warned, [`the journal's metadata (journal.meta.json) is written but the entry of ${path.join(root, 'sessions', 'y')} in its parent could not be synced: EIO: i/o error, fsync; a crash may undo the write`]);
     failIno = undefined;
     assert.equal(reserve(y, 100), true, 'counted once the sync lands');
     y.close();
