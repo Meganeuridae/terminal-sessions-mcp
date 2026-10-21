@@ -411,7 +411,7 @@ test('a cancel whose two ^C reach a shell that acts on them only later (stopped,
 });
 
 test('after a cancel whose ^C a line read before it outlived, the prompt that ends that line does not free the shell; the empty line’s prompt does', async () => {
-  // A DEBUG trap of the user's that ignores ^C runs before the line's start mark: two ^C bring no
+  // A DEBUG trap of the user's that ignores ^C runs before the line's pre-execution mark: two ^C bring no
   // mark, the line runs late (its file gone), and its prompt comes before the empty line the cancel
   // typed is read (the house's read of the 33 commits, #22 comment 6307351617, item 1).
   const h = await harness({ ignoreSignals: true, typeahead: true, setup: (s) => s.on(/^slowtrap/, () => ({ hang: true, noStartMark: true })) });
@@ -421,7 +421,7 @@ test('after a cancel whose ^C a line read before it outlived, the prompt that en
   assert.deepEqual([c.state, c.steps.at(-1)], ['cancelled', 'an empty line, whose prompt says the shell is back'], JSON.stringify(c));
   const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
   assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
-  // The trap returns: the line's start mark, its end, and its prompt.
+  // The trap returns: the line's pre-execution mark, its end, and its prompt.
   h.pty.emit(h.shell.mark(`633;E;${h.shell.typed[0]!}`) + h.shell.mark('133;C'));
   assert.equal(h.session.run(b.run.runId).state, 'queued', 'still queued while the late line runs');
   // Its end and its prompt; the editor then reads the empty line typed after the ^C, which runs and
@@ -435,7 +435,34 @@ test('after a cancel whose ^C a line read before it outlived, the prompt that en
   await h.session.close();
 });
 
-test('an end mark that arrives for a line under cancel whose start mark never came ends the Run cancelled at that mark', async () => {
+test('an empty line that runs only after the session gave it up does not discard the Run written behind it', async () => {
+  // Past PROMPT_PROBE_PROMPTS prompts without the empty line's pre-execution mark, the session gives it up
+  // and writes the queued Run's line, which waits behind the unread empty line. When that line ran at last,
+  // its own prompt discarded the pending Run (no-pre-execution-mark), and the Run's line then ran with its
+  // file gone: item 1 again, behind a third prompt (an independent read of the fix for #22 comment
+  // 6307351617).
+  const h = await harness({ quietEmptyInterrupt: true });
+  h.shell.pause(); // nothing typed is read until resume()
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.deepEqual([c.state, c.steps.at(-1)], ['cancelled', 'an empty line, whose prompt says the shell is back'], JSON.stringify(c));
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  // Three prompts before the shell reads the empty line: the session gives it up and writes the Run's line.
+  for (let i = 0; i < 3; i++) h.pty.emit(h.shell.mark('133;A') + '$ ' + h.shell.mark('133;B'));
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /did not run within 2 prompts/.test(e.text)), 'the give-up is said');
+  assert.equal(h.session.run(b.run.runId).state, 'starting', 'written behind the unread empty line');
+  h.shell.resume(); // the empty line runs (its file gone) and prompts; then the Run's line runs
+  const rb = await h.session.awaitRun(b.run.runId, 2000);
+  assert.deepEqual([rb.state, rb.exit, rb.reason], ['exited', 0, undefined], JSON.stringify(rb));
+  assert.equal((await h.session.runTranscript(rb.runId)).text, 'hello');
+  assert.ok(!ofType(h.journal.since(0).events, 'note').some((e) => /ran late/.test(e.text)), 'no line ran without its file');
+  assert.deepEqual(h.session.listRuns().map((x) => x.runId), [a.run.runId, b.run.runId], 'the empty line is no Run');
+  await h.session.close();
+});
+
+test('an end mark that arrives for a line under cancel whose pre-execution mark never came ends the Run cancelled at that mark', async () => {
   // The ^C landed in the hook before it printed the C mark; the command ran and its D came with no
   // Run running. The pending Run ends cancelled there (its exit is not attributed to it), without
   // waiting for a prompt (CI at cb603a8 on #22).
@@ -443,7 +470,7 @@ test('an end mark that arrives for a line under cancel whose start mark never ca
   const a = h.session.admit({ target: 'shell', line: 'nostart 1', principal: AGENT });
   assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
   await tick(20);
-  assert.equal(h.session.run(a.run.runId).state, 'starting', 'no start mark came');
+  assert.equal(h.session.run(a.run.runId).state, 'starting', 'no pre-execution mark came');
   // The first ^C (ignored by the job) marks the cancel as requested: the end mark follows it.
   let fired = false;
   h.pty.onWrite((d) => {
@@ -456,7 +483,7 @@ test('an end mark that arrives for a line under cancel whose start mark never ca
   assert.deepEqual(c.steps, ['^C'], 'the end mark ended it before a second ^C');
   const r = h.session.run(a.run.runId);
   assert.deepEqual([r.state, r.reason, r.exit], ['cancelled', 'cancelled-before-start', undefined]);
-  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /end mark arrived with no start mark/.test(e.text)), 'the reason is said');
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /end mark arrived with no pre-execution mark/.test(e.text)), 'the reason is said');
   h.shell.promptNow();
   await h.session.close();
 });

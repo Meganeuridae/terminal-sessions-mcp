@@ -161,13 +161,17 @@ export function otherReaderProc(pid: number, tty: string, proc: ProcFs = realPro
 }
 
 /**
- * `p`'s stat; 'gone' when it has exited; undefined when it cannot be read. ENOENT alone is not "gone":
+ * `p`'s stat; 'gone' when it has exited (a zombie included); undefined when it cannot be read. ENOENT alone is not "gone":
  * /proc mounted with hidepid=2 hides another user's process that way, and only a zero signal tells the
  * two apart (ESRCH: gone; EPERM: there, and not ours to read).
  */
 function procStatOf(p: number, proc: ProcFs): ProcStat | 'gone' | undefined {
   try {
-    return parseProcStat(proc.readFile(`/proc/${p}/stat`));
+    const st = parseProcStat(proc.readFile(`/proc/${p}/stat`));
+    // A zombie has exited: it reads nothing, holds no descriptors, and its children went to a reaper,
+    // so its children file is never read (an unreadable one made the answer unknown). Gone, as the
+    // lock's listing counts it (an independent read of the fix for #22 comment 6307351617).
+    return st?.state === 'Z' ? 'gone' : st;
   } catch (e) {
     return errCode(e) === 'ENOENT' && proc.exists(p) === false ? 'gone' : undefined;
   }

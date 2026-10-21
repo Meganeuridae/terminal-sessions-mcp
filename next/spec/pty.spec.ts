@@ -503,7 +503,7 @@ test('the Linux reader walk answers unknown for a process it cannot read, in the
   // reads a scripted one; the dumpable and non-dumpable readers above run it for real on Linux.
   const TTY = '/dev/pts/7';
   const fault = (code: string) => Object.assign(new Error(code), { code });
-  const statLine = (pid: number, pgrp: number, tpgid = 100) => `${pid} (p) S 1 ${pgrp} ${pgrp} 34823 ${tpgid} ${Array(13).fill(0).join(' ')} 4242`;
+  const statLine = (pid: number, pgrp: number, tpgid = 100, state = 'S') => `${pid} (p) ${state} 1 ${pgrp} ${pgrp} 34823 ${tpgid} ${Array(13).fill(0).join(' ')} 4242`;
   interface P {
     stat?: string | Error;
     children?: string | Error;
@@ -555,6 +555,11 @@ test('the Linux reader walk answers unknown for a process it cannot read, in the
     ['no children files: every process, a member reading', { 100: shell(fault('ENOENT')), 200: { stat: statLine(200, 100), fds: { '0': TTY } } }, true],
     ['no children files: a process whose stat cannot be read', { 100: shell(fault('ENOENT')), 300: { stat: fault('EACCES') } }, undefined],
     ['no children files: none in the group', { 100: shell(fault('ENOENT')), 200: { stat: statLine(200, 200), fds: { '0': TTY } } }, false],
+    // A zombie has exited: gone, as the lock's listing counts it, before its children or descriptors are
+    // read (an independent read of the fix for #22 comment 6307351617).
+    ['a zombie descendant whose children cannot be read', { 100: shell('101'), 101: { stat: statLine(101, 101, 100, 'Z'), children: fault('EACCES') } }, false],
+    ['a zombie in the group whose descriptors cannot be read', { 100: shell('101'), 101: { stat: statLine(101, 100, 100, 'Z'), fds: fault('EACCES') } }, false],
+    ['no children files: a zombie in the group', { 100: shell(fault('ENOENT')), 200: { stat: statLine(200, 100, 100, 'Z'), fds: fault('EACCES') } }, false],
   ];
   // A descriptor link that cannot be read for a reason other than ENOENT is unknown too.
   const badLink = fakeProc({ 100: shell('101'), 101: { stat: statLine(101, 100), fds: { '0': TTY } } });

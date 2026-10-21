@@ -206,7 +206,7 @@ const TRANSCRIPT_INPUT_CHARS = 4 * 1024 * 1024;
 /** Daemon lines remembered after their Run was declared lost before it started. */
 const MAX_ORPHAN_LINES = 32;
 /**
- * Prompts a cancel's empty line may wait behind before its start mark (askForPrompt): one for the
+ * Prompts a cancel's empty line may wait behind before its pre-execution mark (askForPrompt): one for the
  * pending ^C (bash, zsh), one for a line the shell read before the ^C. Past them the line is taken as
  * lost and the shell as back.
  */
@@ -548,13 +548,17 @@ export class Session {
   private readonly orphanLines = new Map<string, RunRecord>();
   /**
    * The empty line a cancel typed to learn when the shell is back (askForPrompt): its file, whether its
-   * start mark came (its line holds the file's quoted path), and the prompts seen before it. The shell is
-   * busy until the prompt after the mark — or after PROMPT_PROBE_PROMPTS prompts without it, when the
-   * line was lost (a later ^C flushed it, a program read it), so that it cannot hold the shell for good.
+   * pre-execution mark came (the mark's line holds the file's quoted path), and the prompts seen before
+   * it. The shell is busy until the prompt after the mark — or after PROMPT_PROBE_PROMPTS prompts without
+   * it, when the line was lost (a later ^C flushed it, a program read it), so that it cannot hold the
+   * shell for good.
    */
   private promptProbe: { path: string; started: boolean; prompts: number } | undefined;
-  /** The last empty line's quoted file: its start after the session gave up on it is not a person's command. */
-  private probeFile: string | undefined;
+  /**
+   * The last empty line's quoted file and its place in the write order: its start after the session gave
+   * up on it is not a person's command, and a Run written after it waits behind it (onPreExec).
+   */
+  private probeLine: { file: string; order: number } | undefined;
   private readonly queue: RunRecord[] = [];
   /**
    * Declared shells (§8.1): the Run in flight in front of each program — keyed by the Run whose
@@ -1107,8 +1111,8 @@ export class Session {
       this.discardPending(pending, pending.cancelRequested ? { state: 'cancelled', reason: 'cancelled-before-start' } : { state: 'lost', reason: 'no-pre-execution-mark' });
     }
     if (this.currentShellRun && isTerminal(this.currentShellRun.state)) this.currentShellRun = undefined;
-    // The empty line a cancel typed (askForPrompt): the prompt after its start mark says the shell is
-    // back; a prompt before it (the ^C's own, or one that ends a line read before it) does not.
+    // The empty line a cancel typed (askForPrompt): the prompt after its pre-execution mark says the
+    // shell is back; a prompt before it (the ^C's own, or one that ends a line read before it) does not.
     const probe = this.promptProbe;
     if (probe && (probe.started || ++probe.prompts > PROMPT_PROBE_PROMPTS)) {
       if (!probe.started) this.note(`the empty line typed after a cancel's ^C did not run within ${PROMPT_PROBE_PROMPTS} prompts; the shell counts as available again at this one`);
@@ -1182,11 +1186,18 @@ export class Session {
     this.typeaheadWatch = undefined;
     const line = this.lastCommandLine;
     this.lastCommandLine = undefined;
-    if (line !== undefined && this.probeFile !== undefined && line.includes(this.probeFile)) {
+    const probeLine = this.probeLine;
+    if (line !== undefined && probeLine !== undefined && line.includes(probeLine.file)) {
       // The empty line a cancel typed (askForPrompt): not a Run. The prompt after it frees the shell.
       this.shellState = 'busy';
       if (this.promptProbe) this.promptProbe.started = true;
-      this.probeFile = undefined;
+      this.probeLine = undefined;
+      // Run late, after the session gave up on it and wrote a Run's line behind it: that line is next
+      // in the tty's queue, and the empty line's own prompt must not discard it, as a line typed ahead
+      // of it would not (an independent read of the fix for #22 comment 6307351617: a third prompt
+      // before the empty line brought item 1 back).
+      const pending = this.pendingShellRun;
+      if (pending?.writeOrder !== undefined && pending.writeOrder > probeLine.order) pending.survivePrompts = (pending.survivePrompts ?? 0) + 1;
       return;
     }
     const cur = this.currentShellRun;
@@ -1254,11 +1265,11 @@ export class Session {
     const pending = this.pendingShellRun;
     if (!run && pending?.cancelRequested) {
       // An end mark with no Run running and our line still unstarted, while that line is being
-      // cancelled: the shell finished something whose start mark never came (a ^C that landed in
+      // cancelled: the shell finished something whose pre-execution mark never came (a ^C that landed in
       // the hook before it printed). Whatever it was, our line did not start as a Run; it ends
       // cancelled now rather than waiting for a prompt that a ^C-quiet shell may not print (CI at
       // cb603a8 on #22). The exit is not attributed to it (G3).
-      this.note(`${pending.runId}: an end mark arrived with no start mark for its line while it was being cancelled; the line never started as a Run`);
+      this.note(`${pending.runId}: an end mark arrived with no pre-execution mark for its line while it was being cancelled; the line never started as a Run`);
       this.discardPending(pending, { state: 'cancelled', reason: 'cancelled-before-start' });
     }
     this.currentShellRun = undefined;
@@ -2462,9 +2473,9 @@ export class Session {
 
   /**
    * After a cancel's two ^Cs drew no mark (item 1): type a daemon line with an empty command file, and
-   * count the shell available at the prompt that follows that line's start mark. The shell reads the
-   * line only after what the terminal held before it, and its start mark names the line, so the prompt
-   * after it is the one that says the shell is back. Any earlier prompt is not: bash prints one for the
+   * count the shell available at the prompt that follows that line's pre-execution mark. The shell reads
+   * the line only after what the terminal held before it, and that mark's line names its file, so the
+   * prompt after it is the one that says the shell is back. Any earlier prompt is not: bash prints one for the
    * pending ^C when it is scheduled again; zsh 5.9, when the ^C flushed input it had been woken for,
    * prints one only once the next byte arrives (here the empty line's first); fish prints none for a ^C
    * at an empty line; and a line read before the ^C ends with a prompt of its own. An Enter drew one
@@ -2484,12 +2495,12 @@ export class Session {
     const src = sourceLine(file, this.flavor);
     this.extraTempFiles.add(file);
     this.promptProbe = { path: file, started: false, prompts: 0 };
-    this.probeFile = shellQuote(file);
+    this.probeLine = { file: shellQuote(file), order: ++this.writeOrder };
     this.pty.write(`${CLEAR_LINE_KEYS}${src}\n`);
     return true;
   }
 
-  /** The empty line's file goes once its start mark came, or once the session gave up on it. */
+  /** The empty line's file goes at the prompt after its pre-execution mark, or once the session gave up on it. */
   private dropPromptProbe(): void {
     const probe = this.promptProbe;
     if (!probe) return;
