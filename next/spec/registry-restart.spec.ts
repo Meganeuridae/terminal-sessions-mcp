@@ -13,7 +13,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { SessionRegistry, type HistorySession } from '../src/api/registry.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
-import { groupAlive } from '../src/core/lock.js';
+import { livingGroups } from '../src/core/lock.js';
 import { until } from './testhost.js';
 import type { JournalEvent } from '../src/core/types.js';
 
@@ -110,8 +110,9 @@ test('tg-11/G20: after a SIGKILLed daemon, every admitted Run is terminal and ea
       // By its group, which run.start recorded: a listing of every process by command line outgrew execFileSync's
       // 1 MiB buffer on a busy host, whose ENOBUFS read as "not running", so the check passed without looking
       // (the house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715). A leader the SIGKILLed child
-      // fathered is reaped by init once recovery has ended it, and keeps the group's id until it is.
-      await until(() => !groupAlive(orphan.pgid!), 3000, 'the orphan to have been terminated at recovery');
+      // fathered keeps the group's id as a zombie until its new parent reaps it, so the spec waits for no
+      // member to run, as recovery judges (livingGroups).
+      await until(() => livingGroups([orphan.pgid!]).length === 0, 3000, 'the orphan to have been terminated at recovery');
       // Its note says the group went with the Run recovery ended, not that it outlived a Run that had ended (the house's read of cc8c909..39787b3, #22).
       assert.ok(notes.includes(`recovery: process group ${orphan.pgid} terminated with ${ids.orphan}, which recovery ended lost`), JSON.stringify(notes));
       assert.ok(!notes.some((t) => t.includes(`outlived ${ids.orphan}`)), JSON.stringify(notes));
@@ -125,7 +126,7 @@ test('tg-11/G20: after a SIGKILLed daemon, every admitted Run is terminal and ea
     const loop = h.run(ids.loop!);
     assert.deepEqual([loop.state, loop.exit, loop.leftovers], ['exited', 0, true]);
     if (loop.pgid !== undefined) {
-      assert.equal(groupAlive(loop.pgid), false, 'the loop and its newest child were terminated at recovery');
+      assert.deepEqual(livingGroups([loop.pgid]), [], 'the loop and its newest child were terminated at recovery');
       assert.ok(notes.includes(`recovery: process group ${loop.pgid} terminated; it outlived ${ids.loop}, which had ended`), JSON.stringify(notes));
     }
     const textOf = (runId: string) =>

@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { until, unusedPort } from './testhost.js';
-import { groupAlive } from '../src/core/lock.js';
+import { groupAlive, livingGroups } from '../src/core/lock.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON = path.resolve(here, '../src/daemon.js');
@@ -573,9 +573,10 @@ test('recovery after a SIGKILL is logged: the lock taken over, the Runs ended, t
     assert.match(text, /recovery ended Runs a previous daemon left in flight/, text);
     assert.match(text, /recovery ended process groups a previous daemon left running/, text);
     assert.ok(parsed(b).some((m) => m.msg === 'recovery ended Runs a previous daemon left in flight' && m.session === 'k1' && Array.isArray(m.runs) && m.runs.includes(r.runId)), text);
-    // Recovery waits for the group's members to go; a leader the dead daemon fathered is reaped by init
-    // after that, and keeps the group's id until it is.
-    await until(() => !groupAlive(pgid!), 3000, 'recovery to have ended the group');
+    // Recovery waits for the group's members to go. A leader the dead daemon fathered keeps the group's id
+    // as a zombie until its new parent reaps it, which a parent that never reaps never does, so the spec
+    // waits for no member to run, as recovery judges (livingGroups).
+    await until(() => livingGroups([pgid!]).length === 0, 3000, 'recovery to have ended the group');
     assert.equal((JSON.parse(listening(b)!) as { recovered?: number }).recovered, 1);
   } finally {
     if (a.child.exitCode === null) a.child.kill('SIGKILL');
