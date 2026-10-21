@@ -184,7 +184,10 @@ export class Journal {
   private readonly log: JournalOptions['log'];
   private catchingUp = false;
   private dropped = 0;
-  /** The reservation this journal has confirmed on disk (0: none yet): every seq issued is at or below it. */
+  /**
+   * The reservation this journal has confirmed on disk (0: none yet): every seq issued is at or below it, unless a
+   * write of a higher one was refused, when the journal issues on past it meanwhile (best effort, keepMark).
+   */
   private reserved = 0;
   /** Whether the confirmed reservation says the store refused the seqs above its last. */
   private reservedFailed = false;

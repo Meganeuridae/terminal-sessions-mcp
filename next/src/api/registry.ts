@@ -593,6 +593,7 @@ export class SessionRegistry {
         state: 'lost',
         // A group left running is recorded in a note, not in the Run's reason: it was not the Run's to end.
         reason: outcome?.text !== undefined && !outcome.left ? `daemon-restart; ${outcome.text}` : 'daemon-restart',
+        // The wall clock's estimate: no monotonic reference survives the dead daemon (RunInfo.durationMs).
         durationMs: Math.max(0, now - (run.startedAt ?? run.admittedAt)),
         recoveredEnd: true,
       };
@@ -997,6 +998,7 @@ export class SessionRegistry {
           runId: run.runId,
           state: 'lost',
           reason: 'daemon-restart',
+          // The wall clock's estimate, as recovery's own ends carry (RunInfo.durationMs).
           durationMs: Math.max(0, now - (run.startedAt ?? run.admittedAt)),
           recoveredEnd: true,
           ...(lastAliveTs !== undefined && { lastAliveTs }),

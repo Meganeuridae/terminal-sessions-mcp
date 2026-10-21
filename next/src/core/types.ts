@@ -121,7 +121,10 @@ export interface RunInfo {
    * An ended Run's duration, from its run.end: the session measured it on the monotonic clock, so
    * it is the one duration every reader reports, never `endedAt - startedAt`, which a wall-clock step
    * makes negative (a reviewer's read of the fixes for #22). A Run in flight has none: its elapsed
-   * time so far is Session.runDurationMs.
+   * time so far is Session.runDurationMs. An end a recovery wrote (`recoveredEnd`) is the one exception:
+   * no monotonic reference survives the daemon that measured the Run, so its duration is the wall clock's
+   * estimate from the Run's journaled start, which a clock step can skew (the house's review of
+   * 4f4c067..a8b6f28, PR #22).
    */
   durationMs?: number;
   exit?: number;
