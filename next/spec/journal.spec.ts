@@ -260,21 +260,31 @@ test('the cold store is tried again on the monotonic clock: a wall-clock step ne
   }
 });
 
-test('jr-2/G11: when the ring dropped part of what the disk refused, a store-error gap names it and reads stop at the hole', () => {
+test('jr-2/G11: when the ring dropped part of what the disk refused, every read shows the stretch where it is, as the store-error gap the catch-up then records', () => {
   const cold = new FlakyStore();
   cold.broken = false;
   const j = new Journal({ hot: new MemoryStore(600), cold });
   for (let i = 0; i < 3; i++) j.append(out(`ok${i}`)); // 1..3 persisted
   cold.broken = true;
   for (let i = 0; i < 20; i++) j.append(out(`lost-or-kept-${i}-${'z'.repeat(40)}`)); // 4..23 only in the small ring
-  const hotOldest = j.tail(1000).find((e) => e.seq > 3)!.seq;
+  const hotOldest = j.tail(1000).find((e) => e.seq > 3 && e.type === 'output')!.seq;
   assert.ok(hotOldest > 4, 'the ring dropped some of the unpersisted events');
-  // The cold part ends at 3; the read stops there instead of silently joining across the hole.
-  const first = j.since(0);
-  assert.deepEqual(first.events.map((e) => e.seq), [1, 2, 3]);
-  assert.equal(first.more, true);
-  const next = j.since(first.nextCursor);
-  assert.deepEqual(next.gap && [next.gap.from, next.gap.to], [4, hotOldest - 1]);
+  // The cold part ends at 3, the ring's begins at hotOldest: between them, the stretch's gap, seated at its end. A read
+  // never joins the two across it, the tail included (the house's review of the 40 commits through f3750e4, PR #22,
+  // comment 6310921374), and a read that begins inside it gets it whole, as it would the recorded gap.
+  const hole = { type: 'gap', from: 4, to: hotOldest - 1, reason: 'store-error', exact: true, seq: hotOldest - 1 };
+  const shape = (e: JournalEvent | undefined) => e && { type: e.type, ...(e.type === 'gap' ? { from: e.from, to: e.to, reason: e.reason, exact: e.exact } : {}), seq: e.seq };
+  const all = j.since(0);
+  assert.deepEqual(all.events.map((e) => e.seq), [1, 2, 3, hotOldest - 1, ...Array.from({ length: 24 - hotOldest }, (_, i) => hotOldest + i)]);
+  assert.deepEqual(shape(all.events[3]), hole);
+  assert.equal(all.more, false);
+  assert.equal(all.gap, undefined, 'the hole is the event, not a retention hole');
+  assert.deepEqual(shape(j.tail(1000)[3]), hole);
+  assert.deepEqual(j.tail(1000).map((e) => e.seq), all.events.map((e) => e.seq), 'the tail is the same events');
+  assert.deepEqual(shape(j.since(5).events[0]), hole);
+  assert.deepEqual(j.range(4, hotOldest - 2).gap, { from: 4, to: hotOldest - 2, reason: 'store-error', exact: true }, 'a read wholly inside it names it');
+  assert.deepEqual(j.since(0, 3).events.map((e) => e.seq), [1, 2, 3], 'limit counts it as one event');
+  assert.deepEqual(j.since(0, 4).events.map((e) => e.seq), [1, 2, 3, hotOldest - 1]);
   cold.broken = false;
   assert.equal(j.retryCold(), true);
   const gap = cold.read().find((e) => e.type === 'gap');
@@ -614,7 +624,7 @@ test('a catch-up after the ring aged out entirely records the hole as a gap and 
     assert.deepEqual(gaps.map((g) => [g.seq, g.from, g.to, g.reason]), [[7, 2, 6, 'store-error']]);
     assert.equal(j.append(out('after')).seq, 8);
     assert.deepEqual(j.range(2, 6).events, [], 'the hole holds nothing');
-    assert.deepEqual(j.range(2, 6).gap, { from: 2, to: 6, reason: 'retention' }, 'and a read inside it says so');
+    assert.deepEqual(j.range(2, 6).gap, { from: 2, to: 6, reason: 'store-error', exact: true }, 'and a read inside it says so, under the reason it was recorded with');
     j.close();
     const j2 = new Journal({ cold: new FileStore(dir) });
     assert.equal(j2.append(out('next life')).seq, 9, 'seqs the listener saw are never issued again');
@@ -633,7 +643,7 @@ test('a catch-up that fails partway keeps what the ring had dropped; the gap is 
     j.append(out('kept'));
     allowed = false;
     for (let i = 0; i < 30; i++) j.append(out(`z${i}-${'z'.repeat(40)}`)); // the small ring drops most of them
-    const oldestHeld = j.since(1).events[0]!.seq;
+    const oldestHeld = j.since(1).events.find((e) => e.type === 'output')!.seq;
     assert.ok(oldestHeld > 2, `the ring dropped seqs 2..${oldestHeld - 1}`);
     // The first catch-up writes two events and is refused again.
     allowed = true;
@@ -650,6 +660,64 @@ test('a catch-up that fails partway keeps what the ring had dropped; the gap is 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a catch-up that wrote part of the ring and was refused again keeps the stretches apart: no gap claims the events the disk took between them', () => {
+  // Kept as one stretch from the first seq lost to the last, the gap the catch-up recorded covered the two
+  // events the first attempt wrote, and a read showed them inside their own hole.
+  const dir = tmpDir();
+  try {
+    let allowed = true;
+    let budget = Number.POSITIVE_INFINITY;
+    const j = new Journal({ hot: new MemoryStore(700), cold: new FileStore(dir, { floor: { allow: () => allowed && budget-- > 0 } }) });
+    j.append(out('kept'));
+    allowed = false;
+    for (let i = 0; i < 30; i++) j.append(out(`z${i}-${'z'.repeat(40)}`));
+    const firstHeld = j.since(1).events.find((e) => e.type === 'output')!.seq;
+    allowed = true;
+    budget = 2;
+    assert.equal(j.retryCold(), false, 'two caught up, then refused');
+    allowed = false;
+    for (let i = 0; i < 30; i++) j.append(out(`y${i}-${'y'.repeat(40)}`)); // the ring drops past the two the disk took
+    const secondHeld = j.since(firstHeld + 1).events.find((e) => e.type === 'output')!.seq;
+    assert.ok(secondHeld > firstHeld + 2);
+    const open = j.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap');
+    assert.deepEqual(open.map((g) => [g.from, g.to, g.reason, g.exact]), [[2, firstHeld - 1, 'store-error', true], [firstHeld + 2, secondHeld - 1, 'store-error', true]], 'shown apart before the catch-up');
+    assert.deepEqual(j.since(0).events.filter((e) => e.type === 'output').slice(0, 3).map((e) => e.seq), [1, firstHeld, firstHeld + 1], 'and the two the disk took read between them');
+    allowed = true;
+    budget = Number.POSITIVE_INFINITY;
+    assert.equal(j.retryCold(), true);
+    const recorded = j.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap');
+    assert.deepEqual(recorded.map((g) => [g.from, g.to, g.reason, g.exact]), [[2, firstHeld - 1, 'store-error', true], [firstHeld + 2, secondHeld - 1, 'store-error', true]], 'recorded apart');
+    const onDisk = seqsOnDisk(dir);
+    assert.ok(onDisk.includes(firstHeld) && onDisk.includes(firstHeld + 1), 'the two the first attempt wrote');
+    j.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a hole the journal opened with is recorded at the catch-up even when the ring dropped its gap before the disk took it, and reads show it meanwhile', () => {
+  // The gap the constructor records goes to the ring alone while the disk refuses; once the ring dropped it, no event
+  // recorded the hole, the catch-up wrote only the stretch after it, and the files jumped over it in silence.
+  const cold = new FlakyStore(); // refusing from the start
+  const j = new Journal({ hot: new MemoryStore(600), cold, startSeq: 10 }); // a new life: seqs 1–10 are the life before's, never written
+  const opening = j.since(0).events[0]!;
+  assert.deepEqual(opening.type === 'gap' && [opening.seq, opening.from, opening.to, opening.reason, opening.exact], [11, 1, 10, 'store-failed', true]);
+  for (let i = 0; i < 20; i++) j.append(out(`z${i}-${'z'.repeat(40)}`)); // the small ring drops the opening gap and more
+  const held = j.tail(1000).find((e) => e.type === 'output')!.seq;
+  assert.ok(held > 12, 'the ring dropped the opening gap');
+  const want = [
+    [1, 10, 'store-failed', true],
+    [11, held - 1, 'store-error', true],
+  ];
+  const gapsOf = (evs: JournalEvent[]) => evs.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap').map((g) => [g.from, g.to, g.reason, g.exact]);
+  assert.deepEqual(gapsOf(j.since(0).events), want, 'each read shows both holes, not one taken for retention');
+  assert.equal(j.since(0).gap, undefined);
+  assert.deepEqual(gapsOf(j.tail(1000)), want);
+  cold.broken = false;
+  assert.equal(j.retryCold(), true);
+  assert.deepEqual(gapsOf(cold.read()), want, 'the catch-up recorded both');
 });
 
 test('a rotation header the disk refused is written before the new file’s first event, so the open Run survives retention', () => {

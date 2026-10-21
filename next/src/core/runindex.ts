@@ -211,8 +211,10 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
   // instead of a complete Run (the house's read of cc8c909..39787b3, #22). The seat may be a live
   // event's seq: `narrowOutput` sorts by seq and keeps both. One seated within the range after where a
   // `limit` read stopped goes too, as it stands: its hole may lie before the page's end, which keeps it
-  // (comment 6307350477, item 7).
-  for (const g of journal.runs.gapsWithin(lo, hi)) {
+  // (comment 6307350477, item 7). So does a hole the journal holds but has not recorded yet (the ring dropped
+  // what the disk refused), whose gap event a read finds seated at the hole's end: past `hi` when the Run ended
+  // inside it (the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374).
+  for (const g of journal.gapsWithin(lo, hi)) {
     if (g.seq > hi) gaps.push({ ...g, seq: Math.min(g.to, to) });
     else if (!seen.has(g.seq)) gaps.push(g);
   }

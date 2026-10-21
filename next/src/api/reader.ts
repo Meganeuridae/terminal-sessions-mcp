@@ -55,8 +55,9 @@
  *   a command's `$ <line>`), each a line of the text; the header lines naming
  *   sources come extra. `lines` says how many were asked for and
  *   returned: fewer returned without `truncated` means the range holds no more;
- *   `truncated` means `maxBytes`, retention, the scan bound or the projection's
- *   input cap cut lines (or a line's head) that were asked for. `lines.before`
+ *   `truncated` means `maxBytes`, retention, a hole among the lines shown, the
+ *   scan bound or the projection's input cap cut lines (or a line's head) that
+ *   were asked for. `lines.before`
  *   is where a tail of what came before ends, right where the lines shown
  *   begin, every line the text leaves out whole in it, and `lines.head` reads a
  *   first line shown without its head from its head, or, when that line began
@@ -1010,7 +1011,9 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       bytes += b;
     }
     ev.reverse();
-    const r: Omit<ReadResult, 'session'> = { events: ev, seq: [ev[0]?.seq ?? end, end], nextCursor: end, more: false, truncated: ev.length < n && (older || ev.length < events.length), lines: { requested: n, returned: ev.length } };
+    // A hole among them took events that were asked for, as retention does (see the text's rule below).
+    const truncated = (ev.length < n && (older || ev.length < events.length)) || ev.some(isGap);
+    const r: Omit<ReadResult, 'session'> = { events: ev, seq: [ev[0]?.seq ?? end, end], nextCursor: end, more: false, truncated, lines: { requested: n, returned: ev.length } };
     return withGapInfo(r, ev.filter(isGap).map(gapOf));
   }
   const chunks: ProjectChunk[] = [];
@@ -1024,6 +1027,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     if (state) chunks.push(chunkOf(firstOut, state));
   }
   const notes = new Set<string>();
+  /** The notes of holes, a subset of `notes`. */
+  const holes = new Set<string>();
   /** Per source, what its last event left unfinished for the line-end rule (lineEnds); a note ends it all, as the projection's CAN does. */
   const carries = new Map<string, LineCarry>();
   // A window that begins inside a control string its source left open reads as the output did: the string goes
@@ -1051,7 +1056,9 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   for (const e of events) {
     if (isGap(e)) {
       gaps.push(gapOf(e));
-      note(e, gapNote(gapOf(e)));
+      const line = gapNote(gapOf(e));
+      holes.add(line);
+      note(e, line);
     } else if (isOutput(e)) {
       const key = sourceKey(e);
       sources.add(key);
@@ -1134,7 +1141,10 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const text = tail.text;
   // The lines the text shows: a byte cut can drop lines ahead of the one it cuts.
   const returned = outputLines(text === '' ? [] : text.split('\n'));
-  const truncated = cutByBytes || (returned < n && older) || headCut;
+  // A hole's line among those shown stands where lines asked for were lost: the tail is incomplete, as when
+  // retention cuts its head. Without it, a tail across a stretch the disk refused said nothing of it (the house's
+  // review of the 40 commits through f3750e4, PR #22, comment 6310921374).
+  const truncated = cutByBytes || (returned < n && older) || headCut || (text !== '' && text.split('\n').some((l) => holes.has(l)));
   const counts: NonNullable<ReadResult['lines']> = { requested: n, returned };
   if (before) counts.before = before;
   // The first line returned is cut when the byte cap cut it, or when its head lies past what was

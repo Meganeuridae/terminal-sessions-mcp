@@ -461,9 +461,28 @@ test('jr2-9/G11: gapAt agrees with a read across a cold-store hole, without read
   for (let i = 0; i < 3; i++) j.append(out(`ok${i}`));
   cold.broken = true;
   for (let i = 0; i < 20; i++) j.append(out(`kept-${i}-${'z'.repeat(40)}`)); // the small ring drops some of these
-  for (let from = 0; from <= j.lastSeq + 1; from++) {
-    for (const to of [undefined, from, from + 3, j.lastSeq]) assert.equal(j.gapAt(from, to), j.range(from, to).gap !== undefined, `gapAt(${from}, ${to})`);
+  const agrees = (j: Journal, label: string) => {
+    for (let from = 0; from <= j.lastSeq + 1; from++) {
+      for (const to of [undefined, from, from + 1, from + 3, j.lastSeq]) assert.equal(j.gapAt(from, to), j.range(from, to).gap !== undefined, `${label}: gapAt(${from}, ${to})`);
+    }
+  };
+  agrees(j, 'between the stores');
+  // Two stretches apart, the disk holding what a catch-up wrote between them, and an opening hole whose gap the ring dropped.
+  let budget = 0; // refusing from the opening gap on
+  class Budget extends MemoryStore {
+    override append(event: JournalEvent): void {
+      if (budget-- <= 0) throw new Error('ENOSPC: no space left on device, write');
+      super.append(event);
+    }
   }
+  const split = new Journal({ hot: new MemoryStore(600), cold: new Budget(), startSeq: 4 });
+  for (let i = 0; i < 20; i++) split.append(out(`a-${i}-${'z'.repeat(40)}`));
+  budget = 2;
+  split.retryCold();
+  budget = 0;
+  for (let i = 0; i < 20; i++) split.append(out(`b-${i}-${'z'.repeat(40)}`));
+  assert.ok(split.since(0).events.filter((e) => e.type === 'gap').length >= 3, 'the opening hole and two stretches');
+  agrees(split, 'stretches apart');
 });
 
 test('writeDurably surfaces a write failure and its guarded cleanup leaves no temp file beside the target (the house\'s read of the 36 commits, #22)', () => {

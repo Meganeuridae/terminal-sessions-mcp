@@ -1189,6 +1189,56 @@ test('a hole retention took is counted exactly when the journal saw every gap be
   assert.match(bound.text!, /^\[… up to \d+ journal events missing \(seq 1–\d+: past retention\) …\]/);
 });
 
+test('a read across a stretch the ring dropped while the disk refuses shows the hole where it is: the session\'s tail and pages, the Run\'s tail and pages', async () => {
+  // Joined across it, the tails and the Run's pages read as whole (the house's review of the 40 commits through
+  // f3750e4, PR #22, comment 6310921374: the journal's tail across an unhealed store failure).
+  class Refusing extends MemoryStore {
+    broken = false;
+    override append(e: Parameters<MemoryStore['append']>[0]): void {
+      if (this.broken) throw new Error('ENOSPC: no space left on device, write');
+      super.append(e);
+    }
+  }
+  const cold = new Refusing();
+  const j = new Journal({ sessionId: 's', hot: new MemoryStore(1500), cold });
+  const src = source({ journal: j });
+  startRun(j, 'r1');
+  for (let i = 0; i < 3; i++) out(j, `early-${i}\n`, 'stdout', 'r1');
+  cold.broken = true;
+  for (let i = 0; i < 40; i++) out(j, `late-${i}-${'m'.repeat(30)}\n`, 'stdout', 'r1');
+  endRun(j, 'r1');
+  const lost = j.tail(1000).find((e) => e.type === 'gap');
+  assert.ok(lost && lost.type === 'gap' && lost.from === 6 && lost.reason === 'store-error' && lost.exact === true, JSON.stringify(lost));
+  const first = j.tail(1000).find((e) => e.type === 'output' && e.seq > 5)!.seq;
+  const line = `[… ${first - 6} journal events missing (seq 6–${first - 1}: the journal store failed) …]`;
+  const hole = { from: 6, to: first - 1, reason: 'store-error', exact: true };
+  const runTail = await readJournal(src, { runId: 'r1', tail: 40 }, { resultBytes: 16384 });
+  assert.ok(runTail.text!.includes(`early-2\n${line}\nlate-`), runTail.text);
+  assert.deepEqual(runTail.gap, hole);
+  const runPage = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
+  assert.ok(runPage.text!.includes(`early-2\n${line}\nlate-`), runPage.text);
+  assert.deepEqual(runPage.gap, hole);
+  const tail = await readJournal(src, { tail: 40 }, { resultBytes: 16384 });
+  assert.ok(tail.text!.includes(`early-2\n${line}\nlate-`), tail.text);
+  assert.deepEqual(tail.gap, hole);
+  assert.equal(tail.truncated, true, 'lines asked for were lost where the hole is');
+  assert.equal(runTail.truncated, true);
+  const events = await readJournal(src, { tail: 40, as: 'events' }, { resultBytes: 16384 });
+  assert.ok(events.events!.some((e) => e.type === 'gap' && e.from === 6), 'the events tail holds its gap');
+  assert.equal(events.truncated, true);
+  // A tail whose lines all follow the hole is whole: the hole is in its window, not among what it shows.
+  const after = await readJournal(src, { tail: 3 }, { resultBytes: 16384 });
+  assert.equal(after.truncated, false);
+  const page = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
+  assert.ok(page.text!.includes(`early-2\n${line}\nlate-`), page.text);
+  assert.deepEqual(page.gap, hole, 'under the reason the catch-up records, not as past retention');
+  // Once the disk takes writes, the catch-up records the same hole, and reads name it as before.
+  cold.broken = false;
+  assert.equal(j.retryCold(), true);
+  const healed = await readJournal(src, { runId: 'r1', tail: 40 }, { resultBytes: 16384 });
+  assert.ok(healed.text!.includes(`early-2\n${line}\nlate-`), healed.text);
+});
+
 test('paging back past a title left open before a hole reaches every line: the title shows nothing, and the row its LF left counts', async () => {
   // `one`, `two` ended by a bare LF, a title the hole leaves open, then the hole: the hole's line starts after a
   // blank row, which the tail had read as `two`, so the page before ended after `one`.
