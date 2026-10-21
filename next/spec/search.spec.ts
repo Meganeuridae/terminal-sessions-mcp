@@ -307,7 +307,7 @@ test('1cabc6a: without a cursor the recent window is scanned; a cursor older tha
   const oldest = j.oldestSeq!;
   assert.ok(oldest > 1);
   const g = await search(source({ journal: j }), { pattern: 'zzz', since: 0 });
-  assert.deepEqual(g.gap, { from: 1, to: oldest - 1, reason: 'retention' });
+  assert.deepEqual(g.gap, { from: 1, to: oldest - 1, reason: 'retention', exact: true });
 });
 
 test('jr2-10 / jr2-11: a scan reports the holes it spans: past retention at its start, and gap events inside', async () => {
