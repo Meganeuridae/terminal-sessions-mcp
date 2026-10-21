@@ -1013,6 +1013,8 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     home?: string;
     /** `default`: TSM_DATA_DIR unset, so the shim's termd would use $HOME/.tsm, as the unit's does; a path: the shim's TSM_DATA_DIR (one with spaces, read whole from the unit's text). */
     dataDir?: 'default' | string;
+    /** The shim's own settings besides the case's address and data dir. */
+    env?: Record<string, string>;
     expect: 'unknown' | 'managed' | 'shared' | 'dangling' | 'start';
     says: RegExp;
   }
@@ -1025,10 +1027,10 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     return child.pid!;
   };
   /** A real termd, as a unit runs it: its pid and the port its title names, once it listens. */
-  const liveTermd = async (dataDir: string): Promise<{ pid: number; port: number }> => {
+  const liveTermd = async (dataDir: string, extra: string[] = []): Promise<{ pid: number; port: number }> => {
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: tmp };
     for (const k of ['TSM_PORT', 'TSM_HOST', 'TSM_TOKEN', 'TSM_DATA_DIR', 'SESSION_SERVER_PORT', 'SESSION_SERVER_HOST', 'SESSION_SERVER_TOKEN']) delete env[k];
-    const child = spawn(process.execPath, [path.resolve(here, '../src/daemon.js'), '--port', '0', '--data-dir', dataDir, '--no-usage-log', '--shell', '/bin/bash'], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(process.execPath, [path.resolve(here, '../src/daemon.js'), '--port', '0', '--data-dir', dataDir, '--no-usage-log', '--shell', '/bin/bash', ...extra], { env, stdio: ['ignore', 'ignore', 'pipe'] });
     stand.push(child);
     let stderr = '';
     child.stderr!.on('data', (b: Buffer) => (stderr += b.toString()));
@@ -1050,6 +1052,9 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   };
   const toldDir = path.join(tmp, 'sup-data-dir-told-by-the-running-termd');
   const told = linux ? await liveTermd(toldDir) : undefined;
+  // A termd that requires a credential: it tells the shim, whose own goes once the socket is shown to be the termd's.
+  const lockedDir = path.join(tmp, 'sup-data-dir-told-by-a-running-termd-with-a-token');
+  const locked = linux ? await liveTermd(lockedDir, ['--token', 'unit-token']) : undefined;
   const sealed = linux && process.getuid?.() !== 0 ? await undumpable() : undefined;
   const edited = path.join(tmp, 'edited-termd.service');
   fs.writeFileSync(edited, '[Service]\n');
@@ -1110,6 +1115,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // start runs, and after an edit and a daemon-reload not what its running termd was started with. The running
     // termd says its port and data dir itself; read from the edited text, they were port 3101 and /srv/edited-since.
     { name: 'data-dir-told-by-the-running-termd', when: told !== undefined, stub: () => unitStub({ port: 3101, dataDir: '/srv/edited-since', mainPid: told!.pid }), dataDir: toldDir, expect: 'shared', says: /the systemd user unit termd \(its port and data dir told by its running termd, pid \d+\) serves port \d+ out of the data dir \S+sup-data-dir-told-by-the-running-termd, which a termd for port \d+ started here would use too/ },
+    { name: 'data-dir-told-by-a-running-termd-with-a-token', when: locked !== undefined, stub: () => unitStub({ port: 3101, dataDir: '/srv/edited-since', mainPid: locked!.pid }), dataDir: lockedDir, env: { TSM_TOKEN: 'unit-token' }, expect: 'shared', says: /the systemd user unit termd \(its port and data dir told by its running termd, pid \d+\) serves port \d+ out of the data dir \S+sup-data-dir-told-by-a-running-termd-with-a-token, which a termd for port \d+ started here would use too/ },
     // One that cannot be asked leaves the text, and the note says when the text may have changed since it started.
     { name: 'running-unit-needs-a-daemon-reload', when: linux, stub: (dataDir) => unitStub({ port: 3101, needReload: true, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /\(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"; the unit's text may have changed since that termd started: systemd says the unit needs a daemon-reload\) serves port 3101 out of the data dir/ },
     { name: 'running-unit-file-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: edited, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+edited-termd\.service is newer than its start\) serves port 3101 out of the data dir/ },
@@ -1130,7 +1136,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // port the other cases dial, as one did on macOS (Imago's runs of the house's e880589, #22).
     fs.mkdirSync(path.join(dataDir, 'termd.log'), { recursive: true });
     const stub = typeof c.stub === 'function' ? c.stub(dataDir) : c.stub;
-    const s = shim({ TSM_URL: `ws://127.0.0.1:${port}`, TSM_NO_SPAWN: '', TSM_DATA_DIR: c.dataDir === 'default' ? '' : dataDir, HOME: home, TSM_CONNECT_TIMEOUT_MS: '2000', PATH: supervisorPath(stub, port) });
+    const s = shim({ TSM_URL: `ws://127.0.0.1:${port}`, TSM_NO_SPAWN: '', TSM_DATA_DIR: c.dataDir === 'default' ? '' : dataDir, HOME: home, TSM_CONNECT_TIMEOUT_MS: '2000', PATH: supervisorPath(stub, port), ...c.env });
     s.send(init(1));
     s.end();
     const failed = await s.next(byId(1), 8000);

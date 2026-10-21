@@ -353,8 +353,10 @@ test("termd tells its data dir on /health to a caller on this machine that may s
   try {
     // Loopback-open, as a supervisor's termd runs: this caller is the anonymous principal, which may see sessions.
     assert.equal((await open.health()).dataDir, open.dataDir);
-    assert.deepEqual(await askDataDir(open.port, open.child.pid!, 3000), { dataDir: open.dataDir });
-    if (process.platform === 'linux') assert.equal(titlePort(open.child.pid!), open.port, "the port in termd's own title");
+    // The shim takes an answer only from a socket shown to be the termd's, which Linux's /proc shows.
+    const linux = process.platform === 'linux';
+    assert.deepEqual(await askDataDir(open.port, open.child.pid!, { timeoutMs: 3000 }), linux ? { dataDir: open.dataDir } : { error: 'this system does not show whose a socket is' });
+    if (linux) assert.equal(titlePort(open.child.pid!), open.port, "the port in termd's own title");
   } finally {
     await open.stop();
   }
@@ -363,7 +365,12 @@ test("termd tells its data dir on /health to a caller on this machine that may s
     const anonymous = await closed.health();
     assert.equal(anonymous.dataDir, undefined, 'a caller without a credential is told only that it is alive');
     assert.equal((await closed.health('health-secret')).dataDir, closed.dataDir);
-    assert.match(JSON.stringify(await askDataDir(closed.port, closed.child.pid!, 3000)), /its \/health names no data dir/, 'the shim presents no credential');
+    // A termd that requires a credential tells the shim, which sends its own once the socket is shown to be the termd's
+    // (a reviewer's read of the fixes for #22: asked without one, it was never told).
+    if (process.platform === 'linux') {
+      assert.match(JSON.stringify(await askDataDir(closed.port, closed.child.pid!, { timeoutMs: 3000 })), /its \/health names no data dir: no credential was presented/);
+      assert.deepEqual(await askDataDir(closed.port, closed.child.pid!, { timeoutMs: 3000, token: 'health-secret' }), { dataDir: closed.dataDir });
+    }
   } finally {
     await closed.stop();
   }

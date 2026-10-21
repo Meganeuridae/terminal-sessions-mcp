@@ -12,7 +12,7 @@ import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as http from 'node:http';
 import { fileURLToPath } from 'node:url';
-import { askDataDir, titlePort } from '../src/shim/running.js';
+import { askDataDir, connectionOf, titlePort } from '../src/shim/running.js';
 import { launchctlUnit, plistUnit, procEnviron, systemctlUnit, TERMD_BOOLEAN_FLAGS, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -296,9 +296,12 @@ test("this user's live termd whose environment cannot be read is alive and unrea
 });
 
 test("a running termd is asked for its data dir on the port its title names, and only the pid asked about counts as its answer (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715, question 1)", async () => {
-  // /health as termd answers it, from a stand-in whose answer the test sets.
+  // /health as termd answers it, from a stand-in whose answer the test sets; the connection taken for the pid's.
+  const proven = { prove: async () => undefined };
   let answer: Record<string, unknown> = {};
+  const seen: Array<string | undefined> = [];
   const server = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
     res.writeHead(req.url === '/health' ? 200 : 404, { 'content-type': 'application/json' });
     res.end(JSON.stringify(answer));
   });
@@ -306,14 +309,22 @@ test("a running termd is asked for its data dir on the port its title names, and
   const port = (server.address() as { port: number }).port;
   try {
     answer = { status: 'ok', pid: 4242, dataDir: '/srv/running' };
-    assert.deepEqual(await askDataDir(port, 4242, 1500), { dataDir: '/srv/running' });
-    assert.deepEqual(await askDataDir(port, 4343, 1500), { error: `port ${port} is served by pid 4242, not by it` }, 'another process on the port');
+    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, ...proven }), { dataDir: '/srv/running' });
+    assert.deepEqual(await askDataDir(port, 4343, { timeoutMs: 1500, ...proven }), { error: `port ${port} answers as pid 4242, not as it` }, 'another process on the port');
     answer = { status: 'ok', pid: 4242, detail: 'present a token (?token= or Authorization: Bearer) for sessions' };
-    assert.match(JSON.stringify(await askDataDir(port, 4242, 1500)), /its \/health names no data dir/);
+    assert.match(JSON.stringify(await askDataDir(port, 4242, { timeoutMs: 1500, ...proven })), /its \/health names no data dir: no credential was presented/);
+    // The shim's credential goes on a proven connection, and nothing at all on one that is not.
+    assert.equal(seen.pop(), undefined);
+    answer = { status: 'ok', pid: 4242, dataDir: '/srv/running' };
+    await askDataDir(port, 4242, { timeoutMs: 1500, token: 'shim-token', ...proven });
+    assert.equal(seen.pop(), 'Bearer shim-token');
+    const before = seen.length;
+    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, token: 'shim-token', prove: async () => 'not shown' }), { error: 'not shown' });
+    assert.equal(seen.length, before, 'an unproven listener is sent no request, so no credential');
   } finally {
     await new Promise((r) => server.close(r));
   }
-  assert.deepEqual(await askDataDir(port, 4242, 1500), { error: `nothing listens on port ${port}` });
+  assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, ...proven }), { error: `nothing listens on port ${port}` });
   // Linux shows a process's title in its cmdline, as termd sets it; elsewhere `ps` shows the start arguments.
   if (process.platform === 'linux') {
     const child = spawn(process.execPath, ['-e', "process.title = 'termd --port 4321'; console.log('ready'); setTimeout(() => {}, 30_000)"], { stdio: ['ignore', 'pipe', 'ignore'] });
@@ -325,6 +336,69 @@ test("a running termd is asked for its data dir on the port its title names, and
     }
   }
   assert.match(JSON.stringify(titlePort(process.pid)), /its title is not a termd's with a port/);
+});
+
+test("the ask has one deadline for the whole exchange and reads at most 1 MiB, however the answer trickles in (a reviewer's read of the fixes for #22)", async () => {
+  // A listener that wrote a byte every 200 ms held a 300 ms ask for 10 s: the socket's timeout fired only when it was idle.
+  const body = JSON.stringify({ status: 'ok', pid: 4242, dataDir: '/elsewhere' });
+  const timers = new Set<NodeJS.Timeout>();
+  const trickle = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    let i = 0;
+    const t = setInterval(() => (i < body.length ? res.write(body[i++]!) : (clearInterval(t), res.end())), 200);
+    timers.add(t);
+    req.on('close', () => clearInterval(t));
+  });
+  const flood = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('"' + 'x'.repeat(2 << 20) + '"');
+  });
+  await Promise.all([trickle, flood].map((s) => new Promise<void>((r) => s.listen(0, '127.0.0.1', r))));
+  const portOf = (s: http.Server) => (s.address() as { port: number }).port;
+  try {
+    const t0 = performance.now();
+    assert.deepEqual(await askDataDir(portOf(trickle), 4242, { timeoutMs: 300, prove: async () => undefined }), { error: 'it did not answer /health within 300 ms' });
+    const took = performance.now() - t0;
+    assert.ok(took < 1500, `the 300 ms ask took ${took.toFixed(0)} ms`);
+    assert.deepEqual(await askDataDir(portOf(flood), 4242, { timeoutMs: 5000, prove: async () => undefined }), { error: 'its /health answer is over 1048576 bytes' });
+  } finally {
+    for (const t of timers) clearInterval(t);
+    trickle.closeAllConnections();
+    flood.closeAllConnections();
+    await Promise.all([trickle, flood].map((s) => new Promise((r) => s.close(r))));
+  }
+});
+
+test("an answer counts only from the termd's own socket: a listener of another process that echoes its pid is not asked, and is sent no credential (a reviewer's read of the fixes for #22)", async (t) => {
+  if (process.platform !== 'linux') {
+    // Whose a socket is cannot be shown here, so no answer is taken.
+    const socket = new (await import('node:net')).Socket();
+    assert.equal(await connectionOf(socket, process.pid), 'this system does not show whose a socket is');
+    return;
+  }
+  // termd's pid is public: an impostor on its port, beside a termd on ::1, can claim it.
+  const impostor = spawn(process.execPath, ['-e', `const http = require('node:http'); const s = http.createServer((req, res) => { process.stdout.write('asked ' + (req.headers.authorization || '-') + '\\n'); res.end(JSON.stringify({ status: 'ok', pid: ${process.pid}, dataDir: '/impostor' })); }); s.listen(0, '127.0.0.1', () => process.stdout.write('port ' + s.address().port + '\\n'));`], { stdio: ['ignore', 'pipe', 'ignore'] });
+  let out = '';
+  impostor.stdout!.on('data', (b: Buffer) => (out += b.toString()));
+  try {
+    const deadline = Date.now() + 5000;
+    while (!/port \d+/.test(out) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    const port = Number(/port (\d+)/.exec(out)?.[1]);
+    if (!port) return t.skip('the impostor did not start');
+    assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 3000, token: 'shim-token' }), { error: `the socket that answered on port ${port} is not its` });
+    assert.doesNotMatch(out, /asked/, 'no request reached it, so no credential');
+    // The same ask of a listener this process owns is answered.
+    const own = http.createServer((_req, res) => res.end(JSON.stringify({ status: 'ok', pid: process.pid, dataDir: '/own' })));
+    await new Promise<void>((r) => own.listen(0, '127.0.0.1', r));
+    try {
+      assert.deepEqual(await askDataDir((own.address() as { port: number }).port, process.pid, { timeoutMs: 3000 }), { dataDir: '/own' });
+    } finally {
+      own.closeAllConnections();
+      await new Promise((r) => own.close(r));
+    }
+  } finally {
+    impostor.kill();
+  }
 });
 
 test("a running unit's env prefix is not applied again to the environment its termd has, and a ${NAME} it sets in termd's arguments is unknown (the house's read of the 17 commits over our fixes, #22)", () => {

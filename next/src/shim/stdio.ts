@@ -354,7 +354,8 @@ async function checkSupervisor(): Promise<Supervisor> {
     let notAsked = '';
     if (pid > 0) {
       const port = titlePort(pid);
-      const told = typeof port === 'number' ? await askDataDir(port, pid, SUPERVISOR_CHECK_MS) : port;
+      // The shim's own credential, so a termd that requires one answers too; sent only on a connection shown to be the termd's.
+      const told = typeof port === 'number' ? await askDataDir(port, pid, { timeoutMs: SUPERVISOR_CHECK_MS, token: chosen.token }) : port;
       if ('dataDir' in told) return { kind: 'managed', by: `the systemd user unit termd (its port and data dir told by its running termd, pid ${pid})`, port: String(port), dataDir: told.dataDir };
       notAsked = `; its running termd could not be asked: ${told.error}${unitChanged(pid, prop)}`;
     }
