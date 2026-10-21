@@ -372,7 +372,7 @@ const SUMMARY: Schema = {
     retention: { type: 'object', description: 'What the session keeps on disk: the retention its store applies now.', properties: { maxBytes: { type: 'integer' }, maxAgeMs: { type: 'integer' } } },
     pendingRetention: {
       type: 'object',
-      description: "The record's retention, not applied yet: recovery has not judged the process groups of the session's Runs, so every file is kept until a recovery that can list processes does.",
+      description: "The retention this session will apply, held for now: after a restart the daemon could not yet tell whether this session's earlier commands are still running, so it keeps every file, past this cap too, until a later start can tell. Nothing is lost meanwhile, and it applies by itself then.",
       properties: { maxBytes: { type: 'integer' }, maxAgeMs: { type: 'integer' } },
     },
     recovered: { type: 'string' },
