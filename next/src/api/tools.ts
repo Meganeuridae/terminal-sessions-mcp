@@ -184,10 +184,20 @@ export function renderRead(r: ReadResult, mode: ResultText): ToolResult {
   if (mode === 'json') return { text: JSON.stringify(r, null, 2), structured };
   const body = r.text !== undefined ? r.text : JSON.stringify(r.events, null, 1);
   const next = `since=${r.nextCursor}${r.nextOffset ? ` offset=${r.nextOffset}` : ''}`;
-  // A tail says where a read of what came before it ends, and when its first line is missing its head (the house's read of 78c4d6e, #22).
-  const lines = r.lines ? ` · ${r.lines.returned} of ${r.lines.requested} lines${r.lines.cutHead ? ' (the first cut at its head)' : ''}${r.lines.before !== undefined ? ` · earlier: read until=${r.lines.before}` : ''}` : '';
+  const lines = r.lines ? ` · ${r.lines.returned} of ${r.lines.requested} lines${tailMarks(r.lines)}` : '';
   const status = `[read ${r.session}${r.runId ? ` run ${r.runId}` : ''} seq ${r.seq[0]}–${r.seq[1]}${lines} · next: ${next}${r.more ? ` · more: read ${next}` : ''}${r.splitLine ? ' · last line continues' : ''}${gapsBit(r)}${r.truncated ? ' · truncated' : ''}]`;
   return { text: (body ? body + '\n' : '') + status, structured };
+}
+
+/**
+ * A tail's marks on the status line: the first line cut at its head and the read that shows it from
+ * there, and the read of what came before, each with every argument it needs, so following it twice
+ * gets further back each time (the house's reads of 78c4d6e and of the 38 commits, #22).
+ */
+function tailMarks(l: NonNullable<ReadResult['lines']>): string {
+  const head = l.cutHead ? ` (the first cut at its head${l.head ? `; from its head: read since=${l.head.since}${l.head.offset !== undefined ? ` offset=${l.head.offset}` : ''}` : ''})` : '';
+  const before = l.before ? ` · earlier: read tail=${l.requested} until=${l.before.until}${l.before.untilOffset !== undefined ? ` untilOffset=${l.before.untilOffset}` : ''}` : '';
+  return head + before;
 }
 
 /** The holes a read or a search spanned, as a status-line item (the reader words them). */
@@ -272,7 +282,17 @@ const READ_OUTPUT: Schema = {
     more: { type: 'boolean' },
     gap: GAP,
     gaps: { type: 'array', items: GAP },
-    lines: { type: 'object', properties: { requested: { type: 'integer' }, returned: { type: 'integer' }, cutHead: { type: 'boolean' }, before: { type: 'integer' } }, required: ['requested', 'returned'] },
+    lines: {
+      type: 'object',
+      properties: {
+        requested: { type: 'integer' },
+        returned: { type: 'integer' },
+        cutHead: { type: 'boolean' },
+        before: { type: 'object', description: 'Pass beside tail for what came before: until, and untilOffset when the lines begin inside an event.', properties: { until: { type: 'integer' }, untilOffset: { type: 'integer' } }, required: ['until'] },
+        head: { type: 'object', description: 'With cutHead: a head-first read (since, offset) that shows the first line from its head.', properties: { since: { type: 'integer' }, offset: { type: 'integer' } }, required: ['since'] },
+      },
+      required: ['requested', 'returned'],
+    },
     truncated: { type: 'boolean' },
     splitLine: { type: 'boolean' },
     oldestSeq: { type: 'integer' },
@@ -527,7 +547,7 @@ export const TOOLS: ToolDef[] = [
     description:
       "Read a session's history as text (default) or as journal events. `since: N` pages forward from a cursor — the " +
       'result says `more` and gives the next cursor, so nothing is read twice or skipped. `runId` pages through one ' +
-      "command's full output the same way. `tail: N` gives the last N lines (also of one Run with `runId`). Every result carries `nextCursor`; " +
+      "command's full output the same way. `tail: N` gives the last N lines (also of one Run with `runId`); its `lines.before`, passed with the same tail, reads what came before. Every result carries `nextCursor`; " +
       'when a page ends inside a large output event it also carries `nextOffset` — pass both back (`since`, `offset`). ' +
       'Use `screen` for what the terminal shows right now; use `search` to find a pattern in history.',
     inputSchema: {
@@ -537,6 +557,7 @@ export const TOOLS: ToolDef[] = [
         since: { type: 'integer', minimum: 0, description: 'Page forward from this cursor (exclusive).' },
         offset: { type: 'integer', minimum: 0, description: 'With since: continue inside the event after since (a result’s nextOffset).' },
         until: { type: 'integer', minimum: 0, description: 'Stop at this cursor (inclusive).' },
+        untilOffset: { type: 'integer', minimum: 0, description: 'With tail and until: stop inside the event at until, after this many of its bytes (a tail result’s lines.before).' },
         tail: { type: 'integer', minimum: 1, maximum: 10000, description: 'The last N lines of output.' },
         runId: { type: 'string', description: "One Run's output, paged from its start (combine with since)." },
         as: { type: 'string', enum: ['text', 'events'] },
@@ -548,7 +569,7 @@ export const TOOLS: ToolDef[] = [
     },
     outputSchema: READ_OUTPUT,
     async run(ctx, a) {
-      const o = pick<Parameters<App['read']>[1]>(a, ['session', 'since', 'offset', 'until', 'tail', 'runId', 'as', 'maxBytes', 'limit']);
+      const o = pick<Parameters<App['read']>[1]>(a, ['session', 'since', 'offset', 'until', 'untilOffset', 'tail', 'runId', 'as', 'maxBytes', 'limit']);
       if (o.since === undefined && o.tail === undefined && o.runId === undefined) o.tail = 50;
       const r = await ctx.app.read(ctx.caller, o);
       const res = renderRead(r, ctx.resultText);

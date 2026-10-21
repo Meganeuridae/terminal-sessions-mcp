@@ -216,7 +216,7 @@ test('tailLogs on a 30,000-line session returns the lines asked for, clean or ra
     assert.ok(tail.filter(isLine).length >= 497, `raw ${raw}: the output's own lines, counted as lines`);
   }
   const most = lines(await call('tailLogs', { session: 'long', lines: 10_000 }));
-  assert.match(most[0]!, /^\[earlier output not shown \((?:the tail reached a bound|the raw tail reached)[^)]*\); read \{"session": "long", "tail": 10000, "until": \d+\}/, 'the bound cut lines that were asked for: said, with why');
+  assert.match(most[0]!, /^\[earlier output not shown \((?:the tail reached a bound|the raw tail reached)[^)]*\); read \{"session": "long", "tail": 10000, "until": \d+(?:, "untilOffset": \d+)?\}/, 'the bound cut lines that were asked for: said, with why');
   assert.ok(most.length > 5000 && most.length <= 10_001, `${most.length} lines`);
   assert.ok(most.slice(1).filter(isLine).length >= most.length - 3, 'whole lines up to the end');
 });
@@ -337,13 +337,16 @@ test('78c4d6e 15 and 16: launch carries tailLogs’ cut note, and the advised pa
   const tail = lines(await call('tailLogs', { session: 'cutnote', lines: 50 }));
   const note = tail.find((l) => l.startsWith('[earlier output not shown'));
   assert.ok(note, `the cut is said: ${JSON.stringify(tail.slice(0, 1))}`);
-  const m = /read \{"session": "cutnote", "tail": 50, "until": (\d+)\}/.exec(note!);
+  const m = /read (\{"session": "cutnote", "tail": 50, "until": \d+(?:, "untilOffset": \d+)?\}) shows what came before/.exec(note!);
   assert.ok(m, note);
-  const until = Number(m![1]);
-  // A read at that `until` reaches what came before: its range ends at or just before the advised cut,
-  // so no line falls in neither page.
-  const first = (await call('read', { session: 'cutnote', tail: 50, until })) as unknown as { seq: [number, number] };
-  assert.ok(first.seq[1] >= until - 1 && first.seq[1] <= until, JSON.stringify(first.seq));
+  // The advised read ends right where the first line shown begins: its last line is the one just before,
+  // so no line falls in neither page and none is in both (the house's read of the 38 commits, #22).
+  // (The window may begin right at a line's start; the reader cannot tell that from what it read, and marks the line as cut.)
+  const shown = Number(/^…?(\d+) y/.exec(tail[1]!)?.[1]);
+  assert.ok(shown > 1, tail[1]!.slice(0, 20));
+  const earlier = (await call('read', { ...(JSON.parse(m![1]!) as Obj), maxBytes: 1024 * 1024 })) as unknown as { text: string };
+  assert.equal(/^(\d+) y/.exec(earlier.text.split('\n').at(-1)!)?.[1], String(shown - 1));
+
   const launched = await call('launch', { name: 'cutnote', command: 'echo started' });
   assert.ok(lines(launched.logs).some((l) => l.startsWith('[earlier output not shown')), `launch keeps the note: ${JSON.stringify(lines(launched.logs).slice(0, 1))}`);
   await call('killSession', { session: 'cutnote', graceful: false });
@@ -359,6 +362,50 @@ test('78c4d6e: searchLogs reports the holes it spanned and the lines it matched 
   const out = (await call('searchLogs', { session: 'snotes', pattern: 'findme' })) as unknown as Array<{ line?: string; note?: string }>;
   const note = out.find((m) => m.note !== undefined)?.note;
   assert.ok(note && /missing/.test(note), `the hole is noted: ${JSON.stringify(out)}`);
+});
+
+test('the 38 commits 6: a first line cut at its head is named with the read that shows it from its head, and that read does', async () => {
+  // One line longer than the 1 MiB the tail reads: shown as its last MiB, marked; the note's head-first read begins at its head.
+  await call('runCommand', { session: 'hugeline', command: 'echo before-the-line' });
+  const live = registry.get('hugeline');
+  assert.ok(live?.kind === 'live');
+  // After the prompt, on a line of its own, so the line's head is known.
+  await until(() => live.session.shellAvailable().ok, 5000, 'the prompt');
+  live.session.journal.append({ type: 'output', data: `\r\nHEAD-${'z'.repeat(1_200_000)}-TAIL\r\n`, stream: 'pty' });
+  const tail = lines(await call('tailLogs', { session: 'hugeline', lines: 1 }));
+  assert.equal(tail.length, 2, JSON.stringify(tail.map((l) => l.slice(0, 40))));
+  assert.ok(tail[1]!.startsWith('…z') && tail[1]!.endsWith('-TAIL'), tail[1]!.slice(0, 20));
+  const m = /; read (\{"session": "hugeline", "tail": 1, "until": \d+(?:, "untilOffset": \d+)?\}) shows what came before; read (\{"session": "hugeline", "since": \d+(?:, "offset": \d+)?\}) shows the first line below from its head\]$/.exec(tail[0]!);
+  assert.ok(m, tail[0]);
+  const head = (await call('read', JSON.parse(m![2]!) as Obj)) as unknown as { text: string; splitLine?: boolean };
+  assert.ok(head.text.startsWith('HEAD-zzz'), `the promise: the read begins at the line's head: ${head.text.slice(0, 20)}`);
+  // What came before, five lines of it: up to the line's start, without the line.
+  const before = (await call('read', { ...(JSON.parse(m![1]!) as Obj), tail: 5 })) as unknown as { text: string };
+  assert.ok(before.text.split('\n').some((l) => l.includes('before-the-line')) && !before.text.includes('HEAD-'), `what came before, without the cut line: ${JSON.stringify(before.text)}`);
+  await call('killSession', { session: 'hugeline', graceful: false });
+});
+
+test('the 38 commits: a raw tail that reaches its 1 MiB bound says so, and the page it advises ends right where its lines begin', async () => {
+  // No spec reached rawTail's byte bound (the house's read of the 38 commits, #22): 150 lines of 20,000 bytes
+  // (3 MB), each in three events, so the 50 lines asked for and the redraw room the tail reads for need more
+  // than the bound holds while older output remains.
+  await call('runCommand', { session: 'rawbound', command: 'echo start' });
+  const live = registry.get('rawbound');
+  assert.ok(live?.kind === 'live');
+  for (let i = 1; i <= 150; i++) {
+    const line = `${i} ${'y'.repeat(20_000)}\r\n`;
+    for (let at = 0; at < line.length; at += 7000) live.session.journal.append({ type: 'output', data: line.slice(at, at + 7000), stream: 'pty' });
+  }
+  const raw = lines(await call('tailLogs', { session: 'rawbound', lines: 50, raw: true }));
+  assert.equal(raw.length, 51, `the lines asked for, after the note: ${raw.length}`);
+  const m = /^\[earlier output not shown \(the raw tail reached its byte or page bound\); read (\{"session": "rawbound", "tail": 50, "until": \d+(?:, "untilOffset": \d+)?\}) shows what came before\]$/.exec(raw[0]!);
+  assert.ok(m, raw[0]);
+  // The first line shown is whole, among the last of the 150 (a raw tail keeps the empty line after the last line end).
+  const shown = Number(/^(\d+) y/.exec(raw[1]!)?.[1]);
+  assert.ok(shown >= 100 && shown <= 102, raw[1]!.slice(0, 20));
+  const earlier = (await call('read', { ...(JSON.parse(m![1]!) as Obj), maxBytes: 1024 * 1024 })) as unknown as { text: string };
+  assert.equal(Number(/^(\d+) y/.exec(earlier.text.split('\n').at(-1)!)?.[1]), shown - 1, 'the page before ends with the line just before: nothing in neither page');
+  await call('killSession', { session: 'rawbound', graceful: false });
 });
 
 test('6270946953: launch’s watch for error patterns is measured on the monotonic clock: a wall-clock jump neither ends it early nor stretches it', async (t) => {
@@ -453,9 +500,9 @@ test('a reviewer’s read: a raw tail whose first shown line begins at the first
     journal.append({ type: 'output', data: 'tail-b', stream: 'pty' });
     const raw = lines(await h.call('tailLogs', { session: 'rawhead', lines: 3, raw: true }));
     assert.equal(raw.length, 4, JSON.stringify(raw));
-    const m = /^\[earlier output not shown \(the first line begins before what was read\); read \{"session": "rawhead", "tail": 3, "until": (\d+)\} shows what came before, and the first line below whole\]$/.exec(raw[0]!);
+    const m = /^\[earlier output not shown \(the first line begins before what was read\); read \{"session": "rawhead", "tail": 3, "until": (\d+)\} shows what came before, ending with the head of the first line below\]$/.exec(raw[0]!);
     assert.ok(m, raw[0]);
-    assert.equal(Number(m![1]), headSeq, 'the earlier page includes the event the first shown line begins in');
+    assert.equal(Number(m![1]), headSeq - 1, 'the earlier page ends where what was read begins, so it ends with the head of the first line shown');
     assert.deepEqual(raw.slice(1), ['…head-line', 'tail-a', 'tail-b']);
   } finally {
     await h.close();

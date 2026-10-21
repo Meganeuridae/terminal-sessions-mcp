@@ -2,13 +2,14 @@
  * The tool surface without a shell behind it (the house's read of 1cabc6a, #22): a search's
  * status line says what the scan skipped, the validator's checks each refuse what they are
  * for and name the declared parameters, reserved names are refused wherever they sit, the
- * compat `takeScreenshot` honours json mode, and `watch` says when notifications cannot arrive.
+ * compat `takeScreenshot` honours json mode, `watch` says when notifications cannot arrive, and a
+ * tail's status line names the reads of what came before and of a cut line's head.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { App, Caller, ReadResult, SearchResult, SessionSummary } from '../src/api/app.js';
 import { describeGap } from '../src/api/reader.js';
-import { callTool, TOOLS, type ResultText } from '../src/api/tools.js';
+import { callTool, renderRead, TOOLS, type ResultText } from '../src/api/tools.js';
 import { validate, ValidationError, type Schema } from '../src/api/validate.js';
 import type { GapReason } from '../src/core/types.js';
 
@@ -116,4 +117,19 @@ test('watch says when this connection cannot receive notifications', async () =>
   assert.match((await call(false)).text, /\[watch w1 "w1" armed \(pattern\) — this connection cannot receive notifications: poll `watches` or use `wait_for`\]/);
   assert.doesNotMatch((await call(true)).text, /cannot receive/);
   assert.doesNotMatch((await call()).text, /cannot receive/);
+});
+
+test('renderRead: a tail marks a first line cut at its head, with the read from its head, and the read of what came before, every argument given', () => {
+  // The house's read of the 38 commits (#22, comment 6274935728): neither mark had a test, and nothing called renderRead directly.
+  const base: ReadResult = { session: 's', seq: [7, 9], nextCursor: 9, more: false, truncated: true, text: 'xyz' };
+  const cut = renderRead({ ...base, lines: { requested: 2, returned: 1, cutHead: true, head: { since: 6, offset: 12 }, before: { until: 7, untilOffset: 12 } } }, 'transcript');
+  assert.equal(cut.text, 'xyz\n[read s seq 7–9 · 1 of 2 lines (the first cut at its head; from its head: read since=6 offset=12) · earlier: read tail=2 until=7 untilOffset=12 · next: since=9 · truncated]');
+  const whole = renderRead({ ...base, truncated: false, lines: { requested: 3, returned: 3, before: { until: 6 } } }, 'transcript');
+  assert.equal(whole.text, 'xyz\n[read s seq 7–9 · 3 of 3 lines · earlier: read tail=3 until=6 · next: since=9]');
+  const first = renderRead({ ...base, truncated: false, lines: { requested: 5, returned: 2 } }, 'transcript');
+  assert.equal(first.text, 'xyz\n[read s seq 7–9 · 2 of 5 lines · next: since=9]', 'nothing came before: no earlier read');
+  const headOnly = renderRead({ ...base, lines: { requested: 1, returned: 1, cutHead: true, head: { since: 0 } } }, 'transcript');
+  assert.match(headOnly.text, / · 1 of 1 lines \(the first cut at its head; from its head: read since=0\) · next: since=9 · truncated\]$/);
+  for (const r of [cut, whole, first, headOnly]) validate(r.structured, TOOLS.find((t) => t.name === 'read')!.outputSchema!);
+  assert.deepEqual((JSON.parse(renderRead({ ...base, lines: { requested: 2, returned: 1, before: { until: 7, untilOffset: 12 } } }, 'json').text) as ReadResult).lines!.before, { until: 7, untilOffset: 12 });
 });
