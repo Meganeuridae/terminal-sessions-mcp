@@ -612,8 +612,12 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
   };
   /**
    * `data` without the rest of the sequence a cut left open for `key`, read on from `before`, what the
-   * source's data before it left unfinished (its carry): what goes is omitted. An ESC held back from
-   * the string that a new sequence's start turned out to be comes back with it.
+   * source's data before it left unfinished (its carry): what goes is omitted, read with the head it
+   * completes for the state it sets, since the head went with the cut and set nothing alone (our review
+   * of the 84 commits through a8b6f28, PR #22: `ESC [ 0 ; … ;` cut, then `4hXY CR Z`, showed `ZY`). A
+   * head over 64 bytes is the carry's short form (sequenceHead), so what its parameters set can differ
+   * from the whole sequence's. An ESC held back from the string that a new sequence's start turned out to
+   * be comes back with it.
    */
   const skipOpen = (key: string, data: string, before: string): string => {
     if (!dropping.has(key) || !data) return data;
@@ -625,7 +629,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     dropping.delete(key);
     if (end < before.length) return before.slice(end) + data;
     const gone = data.slice(0, end - before.length);
-    if (gone) drop(gone, utf8Length(gone));
+    if (gone) drop(before + gone, utf8Length(gone));
     return data.slice(end - before.length);
   };
   const emit = (key: string, pipe: boolean, info: SourceInfo | undefined, data: string, head?: string) => {

@@ -679,6 +679,18 @@ test('a tail cut inside the rest of a CSI a LF split keeps what the CSI set (our
   assert.equal((await project(long, { cols: 80, maxInputBytes: 8, keep: 'tail' })).text.split('\n').at(-1), 'Z....XY');
 });
 
+test('a tail cut past an unfinished CSI keeps what the CSI sets when its rest comes later (our review of the 84 commits through a8b6f28, PR #22)', async () => {
+  // A held line past twice the budget, ending in an open CSI: the cut moves past the CSI's start, and its rest `4h` comes
+  // in the next chunk. It was dropped without the head the cut took, so insert mode was lost and `XY CR Z` showed `ZY`.
+  const csi = `\x1b[${'0;'.repeat(12)}`;
+  for (const max of [6, 8, 10, 12, 16]) {
+    const split = await project([`${'A'.repeat(40)}${csi}`, '4hXY\rZ\r\n'], { cols: 80, maxInputBytes: max, keep: 'tail' });
+    const whole = await project([`${'A'.repeat(40)}${csi}4hXY\rZ\r\n`], { cols: 80, maxInputBytes: max, keep: 'tail' });
+    assert.equal(split.text.split('\n').at(-1), 'ZXY', `budget ${max}: ${JSON.stringify(split.text)}`);
+    assert.equal(split.text.split('\n').at(-1), whole.text.split('\n').at(-1), `budget ${max}: as in one chunk`);
+  }
+});
+
 test('a hole starts the projection afresh: no line, and no string, open before it takes what follows', async () => {
   // The Run renderers projected a Run's output without its gaps, so a title open before a hole took the lines after it.
   assert.deepEqual((await project(['ready \x1b]0;my title', { hole: true }, 'ERROR: boom\r\n'], { cols: 40 })).text.split('\n'), ['ready', 'ERROR: boom']);
