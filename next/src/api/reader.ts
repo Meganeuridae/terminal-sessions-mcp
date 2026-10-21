@@ -412,7 +412,10 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
   /**
    * The holes placed so far, by range: a hole wider than a batch (one joined past MAX_LOST spans events) is in each
    * batch it meets, seated where that batch's cover ends, so by its seat alone a text read printed it once per batch
-   * (the house's review of 4f4c067..a8b6f28, PR #22).
+   * (the house's review of 4f4c067..a8b6f28, PR #22). It's placed in the batch that holds its end, seated there, or in
+   * the last batch when the range ends first: placed in the first batch it met, its note stood among the output before
+   * its end, and the line break its last lost stretch makes was gone, so output on either side of it joined as one line
+   * (an independent read of the fixes for that review, PR #22).
    */
   const placed = new Set<string>();
   let done = false;
@@ -438,9 +441,13 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
       const lost = inferred ? minusRanges([inferred], recordedIn(holes)) : [];
       events.unshift(...lost.filter((g) => g.to > reported).map((g) => gapEvent(vouched(journal, { ...g, from: Math.max(g.from, reported + 1) }))));
       const upTo = done ? end : (r.events[r.events.length - 1]?.seq ?? reported);
+      // A gap line the batch holds is placed here whatever its range: one that isn't the journal's own can reach past
+      // its own seq, and only the batch that holds it reports it (an independent read of the fixes, PR #22).
+      const lines = new Set(r.events.filter(isGap).map((e) => `${e.seq}:${e.from}-${e.to}`));
       for (const g of holes) {
         const range = `${g.from}-${g.to}`;
-        if (g.seq > reported && g.seq <= upTo && !placed.has(range)) {
+        const here = g.to <= upTo || done || lines.has(`${g.seq}:${range}`);
+        if (g.seq > reported && g.seq <= upTo && here && !placed.has(range)) {
           placed.add(range);
           events.push(g);
         }

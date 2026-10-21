@@ -13,7 +13,7 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { clocks } from '../src/core/clock.js';
 import { SessionRegistry } from '../src/api/registry.js';
-import { gapNote, readJournal } from '../src/api/reader.js';
+import { gapNote, readJournal, searchJournal } from '../src/api/reader.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { HIGH_WATER_BLOCK, Journal } from '../src/core/journal.js';
 import { boots } from '../src/core/lock.js';
@@ -1829,5 +1829,68 @@ test('a lowering write refused as the journal closes is said with its mark faile
     assert.equal(lowered.length, 1, said.join(' | '));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a hole wider than a batch breaks the line where it ends: output on either side of its last lost stretch isn't joined (an independent read of the fixes for the review of 4f4c067..a8b6f28, PR #22)", async () => {
+  // As above, the two oldest holes, 1 and 2600, are joined past MAX_LOST. Seq 2600 holds no output here, so A (2599) and
+  // B (2601) are output on either side of the hole's end. Placed once at the first batch's end, its note stood among
+  // the output before it, and A and B read as one line, AB, which search found.
+  const dir = tmpDir();
+  try {
+    const first = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+    for (let i = 0; i < 3200; i++) {
+      if (i === 2599) first.append({ type: 'resize', cols: 80, rows: 24, principal: 'agent:a@test' });
+      else first.append(out(i === 2598 ? 'A' : i === 2600 ? 'B\n' : `e${i}\n`));
+    }
+    first.close();
+    const cold = new Flaky(dir);
+    cold.budget = 0;
+    const holes = [1, 2600, ...Array.from({ length: 254 }, (_, k) => 2602 + 2 * k)].map((s) => ({ from: s, to: s, reason: 'store-error' as const, exact: true as const }));
+    const j = new Journal({ hot: new MemoryStore(1), cold, startSeq: first.lastSeq, lost: holes, sessionId: 's' });
+    j.append(out('last\n'));
+    assert.ok(j.gapsWithin(1, j.lastSeq).some((g) => g.from === 1 && g.to === 2600), 'the two oldest holes were joined');
+    const src = { id: 's', journal: j, cols: 80, rows: 24, runOutput: (runId: string, range: Parameters<typeof j.runs.output>[2]) => j.runs.output(j, runId, range), run: (runId: string) => j.runs.get(runId) };
+    const r = await readJournal(src, { since: 0, maxBytes: 4 << 20 }, { resultBytes: 4 << 20 });
+    const lines = r.text!.split('\n').map((l) => l.trim());
+    const a = lines.indexOf('A');
+    assert.ok(a > 0, JSON.stringify(lines.filter((l) => l.startsWith('A') || l.endsWith('B'))));
+    assert.ok(lines[a + 1]!.startsWith('[… ') && lines[a + 1]!.includes('seq 1–2600'), JSON.stringify(lines.slice(a - 1, a + 3)));
+    assert.equal(lines[a + 2], 'B');
+    assert.equal(lines.filter((l) => l.includes('seq 1–2600')).length, 1, 'the note once');
+    const found = await searchJournal(src, { pattern: '^AB$', since: 0 });
+    assert.deepEqual(found.matches, []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a gap line the journal didn't write, whose range reaches past the batch that holds it, keeps its note (an independent read of the fixes for the review of 4f4c067..a8b6f28, PR #22)", async () => {
+  // Effie-2756's case: such a line is seated at its own seq and reported only by the batch that holds it, so waiting for
+  // the batch that holds its range's end lost its note when the batch boundary (2048) fell inside the range.
+  for (const [at, to] of [[1000, 1100], [2040, 2100]] as const) {
+    const dir = tmpDir();
+    try {
+      const first = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+      for (let i = 1; i <= 3000; i++) first.append(out(`e${i}\n`));
+      first.close();
+      for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.jsonl'))) {
+        const p = path.join(dir, f);
+        const lines = fs.readFileSync(p, 'utf8').split('\n').map((l) => {
+          if (!l) return l;
+          const e = JSON.parse(l) as { seq: number; ts: number };
+          return e.seq === at ? JSON.stringify({ type: 'gap', seq: at, ts: e.ts, from: at - 5, to, reason: 'store-error' }) : l;
+        });
+        fs.writeFileSync(p, lines.join('\n'));
+      }
+      const j = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+      const src = { id: 's', journal: j, cols: 80, rows: 24, runOutput: (runId: string, range: Parameters<typeof j.runs.output>[2]) => j.runs.output(j, runId, range), run: (runId: string) => j.runs.get(runId) };
+      const r = await readJournal(src, { since: 0, maxBytes: 4 << 20 }, { resultBytes: 4 << 20 });
+      const notes = r.text!.split('\n').filter((l) => l.includes(`seq ${at - 5}–${to}`));
+      assert.equal(notes.length, 1, `the gap line at ${at}, ${at - 5}–${to}: ${JSON.stringify(notes)}`);
+      j.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
