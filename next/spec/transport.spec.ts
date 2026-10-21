@@ -1391,40 +1391,46 @@ test('2f357bd-2: a detach naming a session that does not exist keeps nothing on 
 
 test('2f357bd-3: a reply is in flight until written, so a client that stops reading is refused once the limit of replies waits for it, and the queue stays bounded', async () => {
   const LIMIT = 8;
-  const HIGH = 64 * 1024;
-  const h = await start({ maxInFlight: LIMIT, highWaterBytes: HIGH });
+  const h = await start({ maxInFlight: LIMIT });
   try {
     const c = await Client.open(h.port, { profile: 'full' });
-    await c.call('session_open', { session: 'deaf' });
-    const s = liveSession(h, 'deaf');
-    await c.request('terminal/subscribe', { session: 'deaf' });
     const conn = [...conns(h.server)][0]!;
     const one = JSON.stringify(await c.request('tools/list')).length;
     assert.ok(one > 10_000, `a tools/list reply is ${one} bytes`);
-    // The client stops reading; a flood fills the kernel's buffers and pauses the follower at the high-water mark (as jr-15 shows).
-    c.ws.pause();
-    const chunk = 'y'.repeat(8 * 1024);
-    for (let i = 0; i < 2500; i++) {
-      s.journal.append({ type: 'note', text: `${i}:${chunk}`, principal: 'agent:a@test' });
-      if (i % 100 === 0) await sleep(1);
-    }
-    assert.equal(conn.followers.get('deaf')!.state, 'paused');
+    // Nothing the server sends is written from here: its socket is corked, which holds each write and its
+    // callback as a kernel does whose buffers a client that stopped reading has filled. Such a client
+    // stood in for it, behind a flood that paused the subscriber's follower, and the test failed in 2 of
+    // 5 runs under load by the house's run (the house's read of the 40 commits through f3750e4, #22,
+    // comment 6310921374) and in 5 of 22 by ours on Debian 13, because a loopback stream stalled there
+    // does not stay stalled: Linux grows the server's send buffer as acknowledgements come, up to
+    // tcp_wmem's maximum, and its persist timer sends what the client's window takes. By `ss`, the send
+    // buffer went from 2.5 to 4 MiB and 1.5 MB more was written; the first replies went with it, the
+    // other requests were refused meanwhile, and nothing was left in flight. Waiting until nothing had
+    // moved for 50 ms, even after a frame from the client, still failed 5 runs of 16. jr-15 shows the
+    // stall a client that stops reading makes.
+    const sock = (conn.ws as unknown as { _socket: net.Socket })._socket;
+    sock.cork();
     const base = conn.ws.bufferedAmount;
+    // Every frame has passed the in-flight check by the time this listener, added after the server's own, hears it.
+    let handled = 0;
+    conn.ws.on('message', () => handled++);
     // Now every reply waits on the socket: the limit of them, and a small refusal for each request past it.
     const N = 1500;
     for (let i = 0; i < N; i++) c.raw(JSON.stringify({ jsonrpc: '2.0', id: 1000 + i, method: 'tools/list' }));
-    await until(() => conn.inFlight === LIMIT, 3000, 'the limit of replies waiting on the socket');
-    await sleep(300); // whatever frames are still being handled are refused with a small reply each
-    assert.equal(conn.inFlight, LIMIT, 'no more than the limit is in flight while the client reads nothing');
+    await until(() => handled === N, 5000, 'every request to be taken in');
+    assert.equal(conn.inFlight, LIMIT, 'no more than the limit is in flight while nothing is written');
     const queued = conn.ws.bufferedAmount - base;
     assert.ok(queued < LIMIT * one + N * 400, `queued ${queued} more bytes for ${N} requests whose replies would come to ${((N * one) / 1048576).toFixed(1)} MiB`);
-    c.ws.resume();
+    sock.uncork();
     await until(() => conn.inFlight === 0, 15_000, 'the slots to go as the replies are written');
-    assert.deepEqual(await c.request('ping'), {}, 'once the client reads again the connection serves it');
+    assert.deepEqual(await c.request('ping'), {}, 'once the socket writes again the connection serves it');
     const answered = c.inbound.filter((m) => typeof m.id === 'number' && m.id >= 1000);
     assert.equal(answered.length, N, 'every request was answered: a reply or a refusal');
+    // Nothing was written, so no slot freed: the first LIMIT ran and every later one was refused.
     const refused = answered.filter((m) => m.error?.code === -32050);
-    assert.ok(refused.length > 0 && refused.length < N, `${refused.length} refused`);
+    const ran = answered.filter((m) => m.error === undefined).map((m) => m.id as number);
+    assert.deepEqual(ran.sort((a, b) => a - b), Array.from({ length: LIMIT }, (_, i) => 1000 + i));
+    assert.equal(refused.length, N - LIMIT);
     assert.deepEqual(refused[0]!.error!.data, { limit: LIMIT, executed: false });
     assert.match(refused[0]!.error!.message, /not run/);
     c.close();
