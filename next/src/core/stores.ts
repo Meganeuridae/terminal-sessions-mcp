@@ -77,12 +77,13 @@ export interface HighWater {
 
 /**
  * A journal keeps its reservation written and synced a block ahead of the seqs it issues, while its
- * appends are not synced, and lowers it to its last seq when it seals. A write of it the disk refuses is
- * tried again at most once a second, and the journal issues on meanwhile, past it if need be (best effort,
- * Journal.keepMark). After a power loss the files may have lost their unsynced tail, but not the
- * reservation, so the next journal numbers above every seq issued before it and records the seqs
- * between the files' last and `to` as a `torn-write` gap (the house's read of the 33 commits, PR #22,
- * comment 6307349700, its question of intent).
+ * appends are not synced as they are written (only before a failed mark is cleared), and lowers it to
+ * its last seq when it seals. A write of it the disk refuses is tried again at most once a second, and
+ * the journal issues on meanwhile, past it if need be (best effort, Journal.keepMark). After a power
+ * loss the files may have lost their unsynced tail, but not the reservation, so the next journal
+ * numbers above every seq issued before it and records the seqs between the files' last and `to` as a
+ * `torn-write` gap (the house's read of the 33 commits, PR #22, comment 6307349700, its question of
+ * intent).
  */
 export interface Reservation {
   to: Seq;

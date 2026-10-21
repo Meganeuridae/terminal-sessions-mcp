@@ -10,9 +10,10 @@
  * from it once the disk accepts writes again.
  *
  * No seq is issued twice, across a restart or a power loss (G10), with the
- * exceptions below, both while the disk refuses writes. Appends are
- * not synced: the page cache keeps them through a daemon crash, but a power
- * loss can take the files' unsynced tail. So a seq is issued only below a
+ * exceptions below, both while the disk refuses writes. Appends are not
+ * synced as they are written (only before a failed mark is cleared): the page
+ * cache keeps them through a daemon crash, but a power loss can take the
+ * files' unsynced tail. So a seq is issued only below a
  * reservation kept beside the cold store, written and synced a block ahead
  * (one small durable write per 10,000 seqs), lowered to the last seq when the
  * journal seals, and marked `failed` while the store refuses events. The next

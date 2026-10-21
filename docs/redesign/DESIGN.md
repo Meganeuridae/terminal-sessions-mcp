@@ -310,8 +310,8 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   `seq`, timestamped, typed (Appendix A). No `seq` is issued twice across a daemon crash, unless
   the disk was refusing the journal's writes when it crashed (below). Nor is one issued twice across
   a power loss, provided the disk took the journal's last reservation write. Appends are not
-  synced, so a power loss can take the journal's last lines, the ones the
-  disk had not yet written. The numbering survives it: before issuing a block of 10,000 seqs, the
+  synced as they are written (only before a failed mark is cleared), so a power loss can take the
+  journal's last lines, the ones the disk had not yet written. The numbering survives it: before issuing a block of 10,000 seqs, the
   journal reserves the block in a synced metadata write, and it lowers the reservation to its last
   seq when it closes. After a power loss the next start numbers above every seq issued before it,
   and the seqs between the last line on disk and the reservation read as a `torn-write` gap. After

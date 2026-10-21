@@ -1137,7 +1137,7 @@ test('a store syncs a directory it created into its parent with its first metada
   }
 });
 
-test('appends are never synced: a journal syncs one reservation write per block of seqs, and a refused reservation write leaves the events issued and stored, retried once a second (the house\'s read of the 33 commits, PR #22, comment 6307349700, its question of intent)', (t) => {
+test('appends are not synced as they are written: a journal syncs one reservation write per block of seqs, and a refused reservation write leaves the events issued and stored, retried once a second (the house\'s read of the 33 commits, PR #22, comment 6307349700, its question of intent)', (t) => {
   let mono = 0;
   t.mock.method(clocks, 'monotonic', () => mono);
   t.mock.method(boots, 'current', () => 'boot-A');
