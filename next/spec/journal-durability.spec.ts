@@ -99,7 +99,7 @@ test('jr2-6/G10/G11: a journal sealed while the disk still refuses leaves a high
     assert.deepEqual(seqs(j.since(0).events), [1, 2, 3, 4, 5, 6, 7, 8], 'the sealed journal still reads them from its ring');
     // The daemon restarts (or a new life opens the same store) once the disk is back.
     const store = new FileStore(dir);
-    assert.deepEqual(store.highWater()?.reservation, { to: 8, failed: true }, 'sealed: exactly at its last seq, marked failed');
+    assert.deepEqual(store.highWater()?.reservation, { to: 8, failed: true, failedFrom: 4 }, 'sealed: exactly at its last seq, marked failed from the first seq the disk refused');
     const again = new Journal({ cold: store });
     assert.equal(again.lastSeq, 9, 'numbering continues above everything issued');
     assert.deepEqual(gaps(again.since(0).events), [[4, 8, 'store-failed']]);
@@ -244,6 +244,78 @@ test('G10: a start that honours an earlier boot\'s reservation makes one durable
     again.close();
     recovered.close();
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a start after a stop while the disk refused looks for jumps in the files only from the seq its failed reservation names; a failed mark an earlier build wrote, naming none, is read through every file', () => {
+  // Read through every file, the look cost about 3 s a GB before termd served, and a full disk marks every session
+  // failed at once (a reviewer's read of the fixes for the review of f3750e4, PR #22).
+  const dir = tmpDir();
+  const cjs = createRequire(import.meta.url)('node:fs') as typeof fs;
+  const readSync = cjs.readSync;
+  try {
+    let budget = Number.POSITIVE_INFINITY;
+    class Budgeted extends FileStore {
+      override append(event: JournalEvent): void {
+        if (budget-- <= 0) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+        super.append(event);
+      }
+    }
+    const live = path.join(dir, 'live');
+    const j = new Journal({ hot: new MemoryStore(600), cold: new Budgeted(live) });
+    for (let i = 0; i < 20_000; i++) j.append(out(`history ${i} ${'h'.repeat(60)}`));
+    budget = 0;
+    for (let i = 0; i < 20; i++) j.append(out(`a-${i}-${'z'.repeat(40)}`));
+    budget = 2;
+    j.retryCold(); // two caught up past a stretch the ring dropped, then refused
+    budget = 0;
+    for (let i = 0; i < 20; i++) j.append(out(`b-${i}-${'z'.repeat(40)}`));
+    // The daemon dies.
+    const metaFile = (d: string) => path.join(d, 'journal.meta.json');
+    const meta = JSON.parse(fs.readFileSync(metaFile(live), 'utf8')) as Record<string, unknown>;
+    assert.deepEqual([meta.failed, meta.failedFrom], [true, 20_001], 'the failed mark names the first seq the files lacked');
+    const size = journalFiles(live).reduce((a, n) => a + fs.statSync(path.join(live, n)).size, 0);
+    /** The bytes a start reads over a copy of the store with its meta as `edit` leaves it, and the holes it records. */
+    const start = (name: string, edit: (m: Record<string, unknown>) => void) => {
+      const d = path.join(dir, name);
+      fs.cpSync(live, d, { recursive: true });
+      const m = { ...meta };
+      edit(m);
+      fs.writeFileSync(metaFile(d), JSON.stringify(m) + '\n');
+      let bytes = 0;
+      cjs.readSync = ((...args: Parameters<typeof fs.readSync>) => {
+        const n = (readSync as (...a: unknown[]) => number)(...args);
+        bytes += n;
+        return n;
+      }) as typeof fs.readSync;
+      syncBuiltinESMExports();
+      let k: Journal;
+      try {
+        k = new Journal({ cold: new FileStore(d) });
+      } finally {
+        cjs.readSync = readSync;
+        syncBuiltinESMExports();
+      }
+      const holes = gaps(k.since(20_000).events).filter((g) => g[2] === 'store-error');
+      k.close();
+      return { bytes, holes };
+    };
+    const healthy = start('healthy', (m) => {
+      delete m.failed;
+      delete m.failedFrom;
+    });
+    const named = start('named', () => {});
+    const older = start('older', (m) => delete m.failedFrom);
+    assert.deepEqual(healthy.holes, [], 'a store not marked failed is not looked through');
+    assert.equal(named.holes.length, 1, `the jump past the files' 20,000 lines: ${JSON.stringify(named.holes)}`);
+    assert.equal(named.holes[0]![0], 20_001);
+    assert.deepEqual(older.holes, named.holes, 'the same jump, found by reading every file');
+    assert.ok(named.bytes - healthy.bytes < size / 10, `from the named seq: ${named.bytes - healthy.bytes} bytes more than a healthy start, of ${size}`);
+    assert.ok(older.bytes - healthy.bytes > size * 0.9, `through every file: ${older.bytes - healthy.bytes} bytes more, of ${size}`);
+  } finally {
+    cjs.readSync = readSync;
+    syncBuiltinESMExports();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

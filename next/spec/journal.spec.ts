@@ -780,6 +780,7 @@ test('a start after a daemon crash while the disk refused records a jump in the 
     const cold = new Budgeted(dir, { n: Number.POSITIVE_INFINITY });
     const died = lostTwice(cold); // no seal: the daemon dies
     assert.equal(cold.highWater()?.reservation?.failed, true);
+    assert.equal(cold.highWater()?.reservation?.failedFrom, 4, 'the first seq the files lacked when the disk refused');
     const again = new Journal({ cold: new FileStore(dir) });
     const holes = holesOf(again.since(0).events);
     assert.deepEqual(holes[0], [21, holes[0]![1], 'store-failed', undefined], 'the hole above the files, up to the reservation');

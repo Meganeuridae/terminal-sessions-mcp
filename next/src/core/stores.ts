@@ -76,6 +76,13 @@ export interface Reservation {
   /** The disk refused the events between the files' last seq and `to`: a `store-failed` gap on any boot. */
   failed?: true;
   /**
+   * With `failed`: the lowest seq a hole the refusal left inside the files can start at (the first seq they
+   * lacked, or a stretch or a refused gap below it). A start after a stop while the disk refused looks for jumps
+   * in the files from here, not through every file (a reviewer's read of the fixes for the review of f3750e4, PR #22: about 3 s
+   * a GB, for every session a full disk marked at once). A failed reservation an earlier build wrote has none.
+   */
+  failedFrom?: Seq;
+  /**
    * The boot it was written under (Linux's boot id, macOS's boot session). On the same boot an unclean
    * stop lost nothing the page cache held, so the files hold every seq issued and the reservation is not
    * honoured; on another boot, or with none known, it is.
@@ -410,8 +417,8 @@ interface Segment {
 }
 
 /**
- * `journal.meta.json`. `highWater` is the floor (HighWater.floor); `reserved`, `failed` and `boot` are the
- * reservation. A file an earlier build wrote with `failed` and no `reserved` held a failing reservation in
+ * `journal.meta.json`. `highWater` is the floor (HighWater.floor); `reserved`, `failed`, `failedFrom` and `boot`
+ * are the reservation. A file an earlier build wrote with `failed` and no `reserved` held a failing reservation in
  * `highWater`, and is read so.
  */
 interface StoreMeta {
@@ -420,6 +427,7 @@ interface StoreMeta {
   highWater?: Seq;
   reserved?: Seq;
   failed?: true;
+  failedFrom?: Seq;
   boot?: string;
 }
 
@@ -580,7 +588,11 @@ export class FileStore implements JournalStore {
         else if (floor !== undefined) out.highWater = floor;
         if (reserved !== undefined) {
           out.reserved = reserved;
-          if (m.failed === true) out.failed = true;
+          if (m.failed === true) {
+            out.failed = true;
+            const from = seq(m.failedFrom);
+            if (from !== undefined) out.failedFrom = from;
+          }
           if (typeof m.boot === 'string' && m.boot) out.boot = m.boot;
         }
         this.onDisk = out;
@@ -651,7 +663,9 @@ export class FileStore implements JournalStore {
     if (m.highWater === undefined && m.reserved === undefined) return undefined;
     const hw: HighWater = {};
     if (m.highWater !== undefined) hw.floor = m.highWater;
-    if (m.reserved !== undefined) hw.reservation = { to: m.reserved, ...(m.failed && { failed: true as const }), ...(m.boot !== undefined && { boot: m.boot }) };
+    if (m.reserved !== undefined) {
+      hw.reservation = { to: m.reserved, ...(m.failed && { failed: true as const }), ...(m.failed && m.failedFrom !== undefined && { failedFrom: m.failedFrom }), ...(m.boot !== undefined && { boot: m.boot }) };
+    }
     return hw;
   }
 
@@ -663,11 +677,13 @@ export class FileStore implements JournalStore {
       meta.reserved = r.to;
       if (r.failed) meta.failed = true;
       else delete meta.failed;
+      if (r.failed && r.failedFrom !== undefined) meta.failedFrom = r.failedFrom;
+      else delete meta.failedFrom;
       if (r.boot !== undefined) meta.boot = r.boot;
       else delete meta.boot;
     }
     // Nothing to do only when memory and the file both hold these marks already (item 3 of comment 6307349700).
-    const mark = (m: StoreMeta | undefined) => `${m?.highWater ?? 0}:${m?.reserved ?? 0}:${m?.failed === true}:${m?.boot ?? ''}`;
+    const mark = (m: StoreMeta | undefined) => `${m?.highWater ?? 0}:${m?.reserved ?? 0}:${m?.failed === true}:${m?.failedFrom ?? ''}:${m?.boot ?? ''}`;
     if (mark(meta) === mark(this.meta) && mark(meta) === mark(this.onDisk)) return true;
     // Confirmed only once it is on disk (the house's read of b047b92, point 1): a refused write
     // changes nothing here, so a prune cannot delete the file whose newest seq the high water was
@@ -681,9 +697,11 @@ export class FileStore implements JournalStore {
     // newly marked failed) it is not done: the seqs it covers could be reissued after a crash (G10), so
     // memory keeps the old marks and the caller retries (the house's read of the 38 commits, PR #22,
     // comment 6274603516). A new boot on the same reservation is not a raise: either file is honoured on a
-    // later boot.
+    // later boot. Nor is a failed mark's `failedFrom` lowered, for the start that looks for jumps from it: the
+    // old file would send it past a hole.
+    const scanFrom = (m: StoreMeta) => (m.failed === true ? (m.failedFrom ?? 0) : Number.POSITIVE_INFINITY);
     const raising =
-      (meta.highWater ?? 0) > (this.meta.highWater ?? 0) || (meta.reserved ?? 0) > (this.meta.reserved ?? 0) || (meta.failed === true && this.meta.failed !== true);
+      (meta.highWater ?? 0) > (this.meta.highWater ?? 0) || (meta.reserved ?? 0) > (this.meta.reserved ?? 0) || scanFrom(meta) < scanFrom(this.meta);
     if (w === 'unsynced' && raising) return false;
     this.meta = meta;
     return true;

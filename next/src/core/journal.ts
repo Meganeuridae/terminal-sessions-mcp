@@ -178,6 +178,8 @@ export class Journal {
   private reserved = 0;
   /** Whether the confirmed reservation says the store refused the seqs above its last. */
   private reservedFailed = false;
+  /** With `reservedFailed`: the confirmed reservation's `failedFrom`, where a start after a stop looks for jumps from. */
+  private reservedFrom = Number.POSITIVE_INFINITY;
   /**
    * A reservation write was refused or could not be confirmed, so the file may hold something other
    * than what is confirmed (an unsynced raise): the wanted reservation is written again even where it
@@ -255,7 +257,7 @@ export class Journal {
     for (const h of opts.lost ?? []) {
       if (h.from <= accounted) this.addLost({ from: h.from, to: Math.min(h.to, accounted), reason: h.reason, exact: h.exact === true, ts: this.now() });
     }
-    if (known === undefined && r?.failed === true) for (const j of this.jumps()) this.addLost(j);
+    if (known === undefined && r?.failed === true) for (const j of this.jumps(r.failedFrom)) this.addLost(j);
     this.cold?.setRotationHeader?.((maxBytes) => this.runs.header(maxBytes));
     // Likewise a crash that cut the event after the last complete line (G11); a hole covers that event.
     const torn = this.cold?.takeTornTail?.() ?? false;
@@ -336,7 +338,10 @@ export class Journal {
     // Persist before the run index sees the event: a run.end that makes the store rotate then
     // gets a header naming its Run, still open, in the new file (the house's read of b047b92).
     if (this.cold) this.persist(event);
-    if (event.type === 'gap' && this.coldError !== null && this.persisted < event.seq) this.unwritten.push(event);
+    if (event.type === 'gap' && this.coldError !== null && this.persisted < event.seq) {
+      this.unwritten.push(event);
+      this.keepMark(); // the failed mark reaches down to its hole, which may lie below the first seq the files lack
+    }
     if (this.coldError !== null) this.noteRingDrops();
     this.runs.feed(event);
     if (!this.dispatching) this.dispatch();
@@ -384,14 +389,18 @@ export class Journal {
   }
 
   /**
-   * The jumps in the cold store's seqs that neither a recorded gap nor a known lost stretch covers. A full read of
-   * the files, so done only at a start that finds the reservation marked failed: a stop while the disk refused is
-   * the only one that can leave a jump unrecorded.
+   * The jumps in the cold store's seqs that neither a recorded gap nor a known lost stretch covers, read only at a
+   * start that finds the reservation marked failed: a stop while the disk refused is the only one that can leave a
+   * jump unrecorded. It reads from the seq before `from`, the lowest seq the refusal can have left a hole at
+   * (Reservation.failedFrom), so a jump that starts there is seen. Read through every file, it cost about 3 s a GB
+   * before termd served, for every session a full disk had marked at once (a reviewer's read of the fixes for the
+   * review of f3750e4, PR #22); only a failed mark an earlier build wrote, which names no `from`, is read so now.
    */
-  private jumps(): LostRange[] {
+  private jumps(from: Seq | undefined): LostRange[] {
     const found: LostRange[] = [];
     let prev: Seq | undefined;
-    for (let next = this.cold?.oldestSeq(); next !== undefined; ) {
+    const oldest = this.cold?.oldestSeq();
+    for (let next = oldest === undefined || from === undefined ? oldest : Math.max(oldest, from - 1); next !== undefined; ) {
       const page = this.cold!.read(next, undefined, JUMP_PAGE);
       for (const e of page) {
         if (prev !== undefined && e.seq > prev + 1) found.push({ from: prev + 1, to: e.seq - 1, reason: 'store-error', exact: true, ts: e.ts });
@@ -458,7 +467,9 @@ export class Journal {
     if (!this.cold?.setHighWater) return;
     const failed = this.coldError !== null;
     const ahead = this.reserved > this.seq;
-    if (ahead && this.reservedFailed === failed && !this.markUnsure) return;
+    // While failing, also when a hole the mark does not reach down to appeared (a refused gap's, below the files' last).
+    const reach = failed ? this.unrecordedFrom() : Number.POSITIVE_INFINITY;
+    if (ahead && this.reservedFailed === failed && this.reservedFrom <= reach && !this.markUnsure) return;
     if (clocks.monotonic() < this.markRetryAt) return;
     const to = ahead ? this.reserved : this.seq + (this.sealed ? 1 : HIGH_WATER_BLOCK);
     if (this.writeReservation(to, failed)) {
@@ -494,16 +505,33 @@ export class Journal {
     return r !== undefined && r.to === this.seq && r.failed !== true;
   }
 
-  /** Write the reservation `to`, marked `failed` or with this boot, and remember it once it is confirmed. */
+  /**
+   * Write the reservation `to`, marked `failed` (with the lowest seq a hole the refusal left can start at, never
+   * raised while the refusal lasts) or with this boot, and remember it once it is confirmed.
+   */
   private writeReservation(to: Seq, failed: boolean): boolean {
     const boot = failed ? undefined : boots.current();
-    const ok = this.cold!.setHighWater!({ reservation: { to, ...(failed && { failed: true as const }), ...(boot !== undefined && { boot }) } });
+    const from = failed ? Math.min(this.unrecordedFrom(), this.reservedFailed ? this.reservedFrom : Number.POSITIVE_INFINITY) : undefined;
+    const ok = this.cold!.setHighWater!({ reservation: { to, ...(from !== undefined && { failed: true as const, failedFrom: from }), ...(boot !== undefined && { boot }) } });
     if (ok) {
       this.reserved = to;
       this.reservedFailed = failed;
+      this.reservedFrom = from ?? Number.POSITIVE_INFINITY;
     }
     this.markUnsure = !ok;
     return ok;
+  }
+
+  /**
+   * While the disk refuses: the lowest seq a hole it leaves inside the files can start at, which a failed
+   * reservation carries (Reservation.failedFrom): the first seq the files lack, or a lost stretch or a refused
+   * gap's hole below it.
+   */
+  private unrecordedFrom(): Seq {
+    let from = (this.cold?.lastSeq() ?? 0) + 1;
+    if (this.lost.length) from = Math.min(from, this.lost[0]!.from);
+    for (const g of this.unwritten) from = Math.min(from, g.from);
+    return from;
   }
 
   /**
