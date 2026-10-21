@@ -771,6 +771,35 @@ test('input sent while the cancel reads the terminal’s mode is not erased: no 
   await h.session.close();
 });
 
+test('a temp file that cannot be removed at close is said and left, and close completes', async () => {
+  // A deferred unlink of the empty line's file (dropPromptProbe) is retried at close: an rmSync that threw
+  // there left close rejected for good, after the shell was killed (the house's review of the 40 commits
+  // through 4f4c067).
+  const h = await harness();
+  h.shell.stop();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.equal(c.steps.at(-1), 'an empty line, whose prompt says the shell is back', JSON.stringify(c));
+  const probe = (h.session as unknown as { promptProbe?: { path: string } }).promptProbe!.path;
+  const rm = fsc.rmSync;
+  fsc.rmSync = ((file: fs.PathLike, opts?: fs.RmOptions) => {
+    if (String(file) === probe) throw fault('EACCES', `permission denied, unlink '${probe}'`);
+    return rm(file, opts);
+  }) as typeof fs.rmSync;
+  syncBuiltinESMExports();
+  try {
+    h.shell.cont();
+    await until(() => h.session.shellAvailable().ok, 2000, 'back at its prompt');
+    await h.session.close(); // resolves, though the file stays
+  } finally {
+    fsc.rmSync = rm;
+    syncBuiltinESMExports();
+  }
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => e.text.includes(`${probe} could not be removed at close`)), 'the failure is said');
+  fs.rmSync(probe, { force: true });
+});
+
 test('a cancel whose empty line cannot be written types none, says so, and takes the shell’s next prompt as its answer', async () => {
   // askForPrompt's fallback when its file cannot be written: no line is typed, and the prompt the stopped
   // shell prints for the ^C when it runs again is the shell's answer.

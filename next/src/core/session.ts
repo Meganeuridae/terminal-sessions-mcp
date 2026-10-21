@@ -2312,13 +2312,23 @@ export class Session {
   }
 
   private cleanupTempFiles(): void {
+    // Each file goes on its own: one that cannot be removed (the command directory made read-only, say)
+    // is said and left, and close goes on (a throw here left close rejected for good, after the shell was
+    // killed: the house's review of the 40 commits through 4f4c067).
+    const remove = (f: string) => {
+      try {
+        fs.rmSync(f, { force: true });
+      } catch (e) {
+        this.note(`${f} could not be removed at close (${errMessage(e)}); it is left`);
+      }
+    };
     for (const r of this.runs.values()) {
       if (r.tempFile) {
-        fs.rmSync(r.tempFile, { force: true });
+        remove(r.tempFile);
         delete r.tempFile;
       }
     }
-    for (const f of this.extraTempFiles) fs.rmSync(f, { force: true });
+    for (const f of this.extraTempFiles) remove(f);
     this.extraTempFiles.clear();
     // A command directory of its own goes with the shell (when empty; a new life recreates it).
     if (this.commandDir !== this.tempDir) {
