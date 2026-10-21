@@ -299,7 +299,70 @@ test('/bin/bash: the reinit is not typed while a program the rc started is readi
     const out = handoffOutput(x);
     assert.ok(!out.includes('reinit typed'), 'nothing was typed into the child reader');
     assert.doesNotMatch(out, /PYGOT:/, 'the child reader received nothing from the daemon');
-    assert.ok(handoffNotes(x).some((t) => /has a child process in its own process group, so something its rc started may be reading its input/.test(t)), `the note says what the check knows: ${JSON.stringify(handoffNotes(x))}`);
+    assert.ok(handoffNotes(x).some((t) => /a process other than the shell, in the terminal’s foreground process group, holds the terminal for input/.test(t)), `the note says what the check knows: ${JSON.stringify(handoffNotes(x))}`);
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: a background job the rc started does not hold the reinit at a real prompt', { skip: !hasShell('/bin/bash') }, async () => {
+  // With job control off while the rc runs, `sleep 301 &` shares the shell's group, with /dev/null as
+  // its input. Counting it as a child, the gate held for the whole cap and gave up while the screen
+  // showed bash's prompt (the house's read of the 38 commits, #22 comment 6274841346, item 2); only a
+  // process that holds the terminal for input counts now.
+  const x = await realSession('/bin/bash', {
+    login: false,
+    rc: { '.bashrc': 'PROMPT_COMMAND=:\nif [ -n "${SECOND-}" ]; then sleep 301 & echo $! > "$HOME/bg.pid"; fi\n' },
+    startupCapMs: 1500,
+    integrationGraceMs: 400,
+  });
+  const pidFile = path.join(x.home, 'bg.pid');
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'first shell ready');
+    const handoff = await x.run('export SECOND=1; exec /bin/bash', 20_000);
+    assert.deepEqual([handoff.state, handoff.reason], ['lost', 'shell-replaced']);
+    const back = await x.run('echo back', 20_000);
+    assert.deepEqual([back.state, back.exit, back.text.trim()], ['exited', 0, 'back'], `the reinit was typed beside the rc's job: ${JSON.stringify(handoffNotes(x))}`);
+    assert.ok(fs.existsSync(pidFile), 'the rc started its job');
+    assert.ok(!handoffNotes(x).some((t) => /holds the terminal|did not type it in/.test(t)), 'no note blamed the job');
+  } finally {
+    await x.close();
+    if (fs.existsSync(pidFile)) {
+      try {
+        process.kill(Number(fs.readFileSync(pidFile, 'utf8').trim()), 'SIGKILL');
+      } catch {
+        // gone with the terminal
+      }
+    }
+  }
+});
+
+test('/bin/bash: a `read -n` in the rc never gets the reinit, and the recovery the note gives then loads the integration', { skip: !hasShell('/bin/bash') }, async () => {
+  // `read -n 1` leaves ECHO on where readline turns it off, so the gate holds (the house's read of the
+  // 38 commits, #22 comment 6274841346, item 3). After it gives up, the line its note advises, sent with
+  // input at the prompt, must load the integration: the give-up had retired the mark key, and the
+  // session stayed unavailable (item 5).
+  const x = await realSession('/bin/bash', {
+    login: false,
+    rc: { '.bashrc': 'PROMPT_COMMAND=:\nif [ -n "${SECOND-}" ]; then read -n 1 __x; printf "RC-GOT:[%s]\\n" "$__x"; fi\n' },
+    startupCapMs: 500,
+    integrationGraceMs: 400,
+  });
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'first shell ready');
+    const handoff = await x.run('export SECOND=1; exec /bin/bash', 20_000);
+    assert.deepEqual([handoff.state, handoff.reason], ['lost', 'shell-replaced']);
+    await until(() => x.session.info().state === 'unavailable', 10_000, 'unavailable');
+    assert.ok(!handoffOutput(x).includes('reinit typed'), 'nothing was typed into the read');
+    assert.match(handoffNotes(x).join(' | '), /non-canonical with echo on, as under `read -n`/);
+    x.session.input('y', { principal: AGENT });
+    await until(() => /RC-GOT:\[y\]/.test(handoffOutput(x)), 3000, 'the read took only the key sent');
+    await until(() => (handoffOutput(x).split('RC-GOT:[y]')[1] ?? '').trim().length > 0, 3000, 'the prompt after the read');
+    x.session.input(' . "$TSM_BASH_RC" reinit typed\n', { principal: AGENT });
+    await until(() => x.session.shellAvailable().ok, 5000, 'available after the advised recovery');
+    assert.equal(x.session.integration, 'rich');
+    const back = await x.run('echo back', 10_000);
+    assert.deepEqual([back.state, back.exit, back.text.trim()], ['exited', 0, 'back']);
   } finally {
     await x.close();
   }

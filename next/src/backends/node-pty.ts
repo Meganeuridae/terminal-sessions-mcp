@@ -17,6 +17,18 @@ const signalName = (n: number | undefined): string | undefined => {
 /** After the leader exits, how long to let its pipes drain before reporting the exit. */
 const DRAIN_MS = 200;
 
+/** `/proc/<pid>/stat`'s process group and the terminal's foreground group; undefined when it cannot be read. */
+function procGroups(pid: number): { pgrp: number; tpgid: number } | undefined {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // pid (comm) state ppid pgrp session tty_nr tpgid …; comm may contain spaces.
+    const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return { pgrp: Number(f[2]), tpgid: Number(f[5]) };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * The shell's process group and the terminal's foreground group (tcgetpgrp), read
  * synchronously: `/proc/<pid>/stat` on Linux, `ps` elsewhere (about 2 ms on macOS).
@@ -24,12 +36,8 @@ const DRAIN_MS = 200;
 function readForeground(pid: number): ForegroundInfo | undefined {
   try {
     if (process.platform === 'linux') {
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-      // pid (comm) state ppid pgrp session tty_nr tpgid …; comm may contain spaces.
-      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-      const shellPgid = Number(fields[2]);
-      const foregroundPgid = Number(fields[5]);
-      return shellPgid > 0 && foregroundPgid > 0 ? { shellPgid, foregroundPgid } : undefined;
+      const g = procGroups(pid);
+      return g && g.pgrp > 0 && g.tpgid > 0 ? { shellPgid: g.pgrp, foregroundPgid: g.tpgid } : undefined;
     }
     const out = execFileSync('ps', ['-o', 'pgid=,tpgid=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 }).trim().split(/\s+/);
     const shellPgid = Number(out[0]);
@@ -74,45 +82,166 @@ function pidExists(pid: number): boolean | undefined {
 }
 
 /**
- * Whether the terminal slave's input is in canonical mode: `stty -a` names `icanon` when on,
- * `-icanon` when off (readline at a prompt turns it off). true: a `read`/password prompt is
- * reading a line; false: readline is editing; undefined: the slave's termios cannot be read.
- * The daemon owns the slave name, so this reads it without disturbing the shell (the house's
- * read, #22 comment 6264958172: a typed reinit landed in an rc's `read -p`).
+ * The terminal slave's input mode, from `stty -a`: ICANON and ECHO (readline at a prompt turns both
+ * off; `read -n` turns ICANON off and leaves ECHO on, which tells it apart: the house's read of the 38
+ * commits, #22 comment 6274841346, item 3). Undefined when the slave's termios cannot be read. The
+ * daemon owns the slave name, so this reads it without disturbing the shell (the house's read, #22
+ * comment 6264958172: a typed reinit landed in an rc's `read -p`).
  */
-function canonicalInput(ptsName: string | undefined): boolean | undefined {
+function inputMode(ptsName: string | undefined): { canonical: boolean; echo: boolean } | undefined {
   if (!ptsName) return undefined;
   try {
     const flag = process.platform === 'linux' ? '-F' : '-f';
-    const out = execFileSync('stty', ['-a', flag, ptsName], { encoding: 'utf8', timeout: 2000 });
-    if (/-icanon\b/.test(out)) return false;
-    if (/\bicanon\b/.test(out)) return true;
-    return undefined;
+    const words = new Set(execFileSync('stty', ['-a', flag, ptsName], { encoding: 'utf8', timeout: 2000 }).split(/[\s;]+/));
+    const on = (name: string): boolean | undefined => (words.has(name) ? true : words.has(`-${name}`) ? false : undefined);
+    const canonical = on('icanon');
+    const echo = on('echo');
+    return canonical === undefined || echo === undefined ? undefined : { canonical, echo };
   } catch {
     return undefined;
   }
 }
 
+/** Most processes the reader check looks at before it answers "cannot tell". */
+const MAX_INSPECTED = 1024;
+
 /**
- * Does `pid` have a child process in its own process group right now? `pgrep -P <pid> -g <pid>` (on
- * macOS and Linux) exits 0 when it finds one, 1 when it finds none; any other failure (no pgrep) is
- * unknown. While an rc runs, job control is off, so a program the rc started (a pager, an editor, a
- * password tool) shares the shell's group; a job started at a prompt (`sleep 600 &`) gets its own
- * group, survives an `exec bash` as the shell's child, and must not count — any child at all kept the
- * reinit from being typed (a reviewer's read of the fixes for #22 comment 6269901528). A builtin
- * `read` has no child and is not caught either way.
+ * Could a process other than the shell `pid` read the terminal `tty` right now? Only the terminal's
+ * foreground process group can read it (anyone else gets SIGTTIN), so: true when that group is not
+ * the shell's (a program took the terminal), or when a member of it other than the shell holds the
+ * terminal on descriptor 0 or on one above 2 (a reader's stdin, or the /dev/tty a pager or password
+ * tool opens beside a piped stdin); false when no member does; undefined when it cannot be told — no
+ * process listing, or a member whose descriptors cannot be read (another user's, as sudo is) —
+ * since unknown is not "no reader" (the house's read of the 38 commits, #22 comment 6274841346,
+ * item 1). Descriptors 1 and 2 do not count: an rc's `sleep 301 &` shares the shell's group while
+ * job control is off, with /dev/null as stdin and the terminal as its output, and held the reinit at
+ * a real prompt when any child counted (item 2). A job started at a prompt has its own group and is
+ * not in the foreground.
+ *
+ * On Linux it reads /proc and starts no process (item 4: a pgrep per tick blocked the event loop for
+ * about 50 ms under load): the shell's descendants through `task/<tid>/children`, or every process
+ * when the kernel has no children files. A member that left the shell's descendants (an orphan the
+ * rc double-forked) is found only by that fallback. Elsewhere one `ps` lists the terminal's
+ * processes, and `lsof` reads descriptors only when a member other than the shell exists.
  */
-function hasChild(pid: number): boolean | undefined {
+function otherReader(pid: number, tty: string | undefined): boolean | undefined {
+  if (!tty) return undefined;
+  return process.platform === 'linux' ? otherReaderProc(pid, tty) : otherReaderPs(pid, tty);
+}
+
+function otherReaderProc(pid: number, tty: string): boolean | undefined {
+  const shell = procGroups(pid);
+  if (!shell) return undefined;
+  if (shell.tpgid !== shell.pgrp) return true;
+  const members = procGroupMembers(pid, shell.tpgid);
+  if (!members) return undefined;
+  let unknown = false;
+  for (const m of members) {
+    const held = holdsForInput(m, tty);
+    if (held === true) return true;
+    if (held === undefined) unknown = true;
+  }
+  return unknown ? undefined : false;
+}
+
+/** The members of group `pgrp` other than `pid` among its descendants (every process, without children files); undefined past MAX_INSPECTED. */
+function procGroupMembers(pid: number, pgrp: number): number[] | undefined {
+  const children = (p: number): number[] | undefined => {
+    try {
+      const out: number[] = [];
+      for (const t of fs.readdirSync(`/proc/${p}/task`)) {
+        for (const c of fs.readFileSync(`/proc/${p}/task/${t}/children`, 'utf8').split(' ')) if (c.trim()) out.push(Number(c));
+      }
+      return out;
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === 'ENOENT' && p !== pid ? [] : undefined; // a descendant gone meanwhile has none
+    }
+  };
+  const members: number[] = [];
+  let candidates = children(pid);
+  if (candidates === undefined) {
+    // No children files (a kernel without CONFIG_PROC_CHILDREN): every process is a candidate.
+    try {
+      candidates = fs.readdirSync('/proc').filter((n) => /^\d+$/.test(n)).map(Number);
+    } catch {
+      return undefined;
+    }
+    if (candidates.length > MAX_INSPECTED * 8) return undefined;
+    for (const c of candidates) if (c !== pid && procGroups(c)?.pgrp === pgrp) members.push(c);
+    return members;
+  }
+  const seen = new Set<number>();
+  while (candidates.length) {
+    const c = candidates.pop()!;
+    if (seen.has(c)) continue;
+    seen.add(c);
+    if (seen.size > MAX_INSPECTED) return undefined;
+    if (procGroups(c)?.pgrp === pgrp) members.push(c);
+    candidates.push(...(children(c) ?? []));
+  }
+  return members;
+}
+
+/** Does `pid` hold `tty` (or /dev/tty) on descriptor 0 or one above 2? undefined when its descriptors cannot be read. */
+function holdsForInput(pid: number, tty: string): boolean | undefined {
+  let fds: string[];
   try {
-    const out = execFileSync('pgrep', ['-P', String(pid), '-g', String(pid)], { encoding: 'utf8', timeout: 2000 });
-    return out.trim().length > 0;
+    fds = fs.readdirSync(`/proc/${pid}/fd`);
   } catch (e) {
-    // pgrep exits 1 with no match: that is a definite "no child". Anything else (ENOENT: no pgrep)
-    // leaves it unknown.
-    const x = e as NodeJS.ErrnoException & { status?: number | null };
-    if (x.status === 1) return false;
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? false : undefined; // gone meanwhile: it reads nothing
+  }
+  for (const n of fds) {
+    if (n === '1' || n === '2') continue;
+    let target: string;
+    try {
+      target = fs.readlinkSync(`/proc/${pid}/fd/${n}`);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      return undefined;
+    }
+    if (target === tty || target === '/dev/tty') return true;
+  }
+  return false;
+}
+
+function otherReaderPs(pid: number, tty: string): boolean | undefined {
+  let rows: Array<{ pid: number; pgid: number; tpgid: number }>;
+  try {
+    rows = execFileSync('ps', ['-t', tty.replace(/^\/dev\//, ''), '-o', 'pid=,pgid=,tpgid='], { encoding: 'utf8', timeout: 2000 })
+      .trim()
+      .split('\n')
+      .map((l) => l.trim().split(/\s+/).map(Number))
+      .map(([p = NaN, g = NaN, t = NaN]) => ({ pid: p, pgid: g, tpgid: t }));
+  } catch {
     return undefined;
   }
+  const shell = rows.find((r) => r.pid === pid);
+  if (!shell || !(shell.tpgid > 0)) return undefined;
+  if (shell.tpgid !== shell.pgid) return true;
+  const members = rows.filter((r) => r.pid !== pid && r.pgid === shell.tpgid).map((r) => r.pid);
+  if (members.length === 0) return false;
+  if (members.length > MAX_INSPECTED) return undefined;
+  let out: string;
+  try {
+    out = execFileSync('lsof', ['-a', '-p', members.join(','), '-d', '0-255', '-F', 'pfn'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch (e) {
+    // lsof exits 1 when it lists nothing for some pid; what it did list is still on stdout.
+    const x = e as NodeJS.ErrnoException & { status?: number | null; stdout?: string };
+    if (x.status !== 1 || typeof x.stdout !== 'string') return undefined;
+    out = x.stdout;
+  }
+  const listed = new Set<number>();
+  let fd = '';
+  for (const line of out.split('\n')) {
+    const tag = line[0];
+    const v = line.slice(1);
+    if (tag === 'p') listed.add(Number(v));
+    else if (tag === 'f') fd = v;
+    else if (tag === 'n' && fd !== '1' && fd !== '2' && /^\d+$/.test(fd) && (v === tty || v === '/dev/tty')) return true;
+  }
+  // A member lsof listed nothing for is gone (ESRCH: it reads nothing) or not ours to inspect.
+  for (const m of members) if (!listed.has(m) && pidExists(m) !== false) return undefined;
+  return false;
 }
 
 /** A process's current command line: `/proc/<pid>/cmdline` on Linux, `ps` elsewhere. */
@@ -164,11 +293,11 @@ class NodePty implements PtyHandle {
   command(): string | undefined {
     return readCommand(this.p.pid);
   }
-  canonicalInput(): boolean | undefined {
-    return canonicalInput((this.p as { ptsName?: string }).ptsName);
+  inputMode(): { canonical: boolean; echo: boolean } | undefined {
+    return inputMode((this.p as { ptsName?: string }).ptsName);
   }
-  hasChild(): boolean | undefined {
-    return hasChild(this.p.pid);
+  otherReader(): boolean | undefined {
+    return otherReader(this.p.pid, (this.p as { ptsName?: string }).ptsName);
   }
   signalGroup(pgid: number, signal: NodeJS.Signals): boolean {
     if (!(pgid > 1)) return false;

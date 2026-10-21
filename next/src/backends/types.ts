@@ -56,25 +56,27 @@ export interface PtyHandle {
   /** The shell process's current command line (it changes when the process execs); undefined if unknown. */
   command?(): string | undefined;
   /**
-   * Does the shell have a child process in its own process group right now (the house's read, #22
-   * comment 6269901528, narrowed by a reviewer's read of its fixes)? A pager, an editor, tmux or a
-   * password tool the rc started is one — job control is off while the rc runs, so it shares the
-   * shell's group — and the daemon never types a reinit while one may be reading. A job started at a
-   * prompt (`sleep 600 &`) has its own group and does not count, though it stays the shell's child
-   * across an `exec`. A builtin `read` has no child, so this does not catch it. Undefined when it
-   * cannot be read; the caller then falls back to the terminal mode alone.
+   * Could a process other than the shell read the terminal right now? Only the terminal's foreground
+   * process group can: true when that group is not the shell's, or when a member of it other than the
+   * shell holds the terminal on its input (descriptor 0) or on a descriptor above 2 (the /dev/tty a
+   * pager or password tool opens); false when none does. A program an rc started is one — job control
+   * is off while the rc runs, so it shares the shell's group — and the daemon never types a reinit
+   * while one may be reading. An rc's `sleep 301 &` shares the group too but has /dev/null as its
+   * input and does not count, nor does a job started at a prompt, which has its own group (the house's
+   * read of the 38 commits, #22 comment 6274841346, item 2). A builtin `read` is the shell itself:
+   * inputMode tells `read -n` apart. Undefined when it cannot be told; the gate then does not type
+   * (item 1: unknown is not "no reader").
    */
-  hasChild?(): boolean | undefined;
+  otherReader?(): boolean | undefined;
   /**
-   * Is the terminal's input line discipline canonical right now (the house's read, #22 comment
-   * 6269901528)? `false` is non-canonical: readline at a bash prompt, but also `read -e`, `read -n`,
-   * a pager, an editor and a raw-mode password tool — non-canonical does not mean readline. `true`
-   * is canonical: a plain `read`/`read -p`, and a `bash --noediting` prompt, which cannot be told
-   * apart from each other. Undefined when it cannot be read (no pts name, or `stty` failed). Used to
-   * decide whether a typed reinit is safe after `exec bash` (#22); the gate types only when `false`
-   * and the shell has no child.
+   * The terminal's input line discipline right now: ICANON and ECHO (the house's read, #22 comment
+   * 6269901528, and of the 38 commits, comment 6274841346, item 3). Readline at a bash prompt turns
+   * both off; `read -n` turns ICANON off and leaves ECHO on; `read -p` and a `bash --noediting` prompt
+   * leave both on and cannot be told apart; `read -e`, `read -s -n` and a raw-mode program turn both
+   * off, like readline. Undefined when it cannot be read (no pts name, or `stty` failed). The gate
+   * after `exec bash` types a reinit only with both off and no other reader.
    */
-  canonicalInput?(): boolean | undefined;
+  inputMode?(): { canonical: boolean; echo: boolean } | undefined;
   /** Stop reading the PTY (the writer blocks once the kernel buffer fills) — flow control for the daemon's own emulator (§6). */
   pause?(): void;
   resume?(): void;

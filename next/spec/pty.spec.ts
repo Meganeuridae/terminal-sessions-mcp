@@ -438,6 +438,53 @@ test('bash is a checked requirement for sessions and process Runs: found at /bin
   }
 });
 
+const PY3 = ['/usr/bin/python3', '/opt/homebrew/bin/python3', '/usr/local/bin/python3'].find((f) => fs.existsSync(f));
+
+test('the reader check tells a background job the rc started from a reader, and the mode tells read -n from readline', { skip: !hasShell('/bin/bash') }, async () => {
+  // What the reinit gate after `exec bash` reads (the house's read of the 38 commits, #22 comment
+  // 6274841346, items 2 and 3): an rc's `sleep 301 &` shares the shell's group with /dev/null as its
+  // input and is no reader; a program reading the terminal on its stdin, or on the /dev/tty it opened
+  // beside a piped stdin (as less does), is one; `read -n` is the shell itself, told apart by ECHO.
+  const READLINE = { canonical: false, echo: false };
+  const pyPid = 'import os; open(os.environ["HOME"] + "/pids", "a").write("%d\\n" % os.getpid())';
+  const cases: Array<{ name: string; rc: string; mode: { canonical: boolean; echo: boolean }; reader: boolean }> = [
+    { name: 'a prompt', rc: "PS1='READY> '\n", mode: READLINE, reader: false },
+    { name: 'a background job the rc started', rc: `sleep 301 & echo $! >> "$HOME/pids"\nPS1='READY> '\n`, mode: READLINE, reader: false },
+    { name: 'read -n in the rc', rc: "printf 'READY> '; read -n 1 __x\n", mode: { canonical: false, echo: true }, reader: false },
+    ...(PY3
+      ? [
+          { name: 'a reader on its stdin', rc: `${PY3} -c '${pyPid}; import sys,tty; tty.setcbreak(0); print("READY>", flush=True); sys.stdin.read(1)'\n`, mode: READLINE, reader: true },
+          { name: 'a reader of /dev/tty behind a pipe', rc: `echo | ${PY3} -c '${pyPid}; import os,tty; fd=os.open("/dev/tty", os.O_RDWR); tty.setcbreak(fd); print("READY>", flush=True); os.read(fd, 1)'\n`, mode: READLINE, reader: true },
+        ]
+      : []),
+  ];
+  const backend = new NodePtyBackend();
+  for (const c of cases) {
+    const home = fs.mkdtempSync(path.join(tmp, 'reader-'));
+    fs.writeFileSync(path.join(home, 'rc'), c.rc);
+    const p = backend.spawnShell({ shell: '/bin/bash', args: ['--rcfile', path.join(home, 'rc'), '-i'], cwd: home, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', TERM: 'dumb', HOME: home }, cols: 80, rows: 24 });
+    let out = '';
+    p.onData((d) => (out += d));
+    const exited = new Promise<PtyExit>((r) => p.onExit(r));
+    try {
+      await until(() => out.includes('READY>'), 5000, `${c.name}: ready`);
+      await until(() => JSON.stringify(p.inputMode?.()) === JSON.stringify(c.mode), 3000, `${c.name}: mode ${JSON.stringify(c.mode)}, seen ${JSON.stringify(p.inputMode?.())}`);
+      assert.equal(p.otherReader?.(), c.reader, c.name);
+    } finally {
+      p.kill('SIGKILL');
+      await exited;
+      const pids = fs.existsSync(path.join(home, 'pids')) ? fs.readFileSync(path.join(home, 'pids'), 'utf8').split('\n').filter(Boolean) : [];
+      for (const pid of pids) {
+        try {
+          process.kill(Number(pid), 'SIGKILL');
+        } catch {
+          // gone with the terminal
+        }
+      }
+    }
+  }
+});
+
 test('/dev/fd must list the process’s own descriptors: a missing one and a static one are refused, a real one passes, and the check runs once', () => {
   // A listing that holds 0, 1 and 2 whatever is open passed the old check, and the launcher's loop then
   // closed nothing above 2 (the house's read of the 38 commits, #22 comment 6274841346, item 6 and the

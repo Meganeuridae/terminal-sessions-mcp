@@ -19,10 +19,12 @@ export class ScriptedPty implements PtyHandle {
   foregroundPgid: number | undefined;
   /** The shell process's command line as the test scripts it (a test changes it to model an exec). */
   commandLine: string | undefined;
-  /** The terminal's input mode as the test scripts it: `false` non-canonical, `true` canonical, `undefined` unreadable (stty failed). */
-  canonicalMode: boolean | undefined;
-  /** Whether the shell has a child process as the test scripts it; `undefined` models a backend that cannot tell. */
-  childPresent: boolean | undefined;
+  /** The terminal's input mode as the test scripts it; `undefined` models an unreadable one (stty failed). */
+  mode: { canonical: boolean; echo: boolean } | undefined;
+  /** Whether a process other than the shell may read the terminal, as the test scripts it; `undefined` models a check that cannot tell. */
+  reader: boolean | undefined;
+  /** How many times the session asked otherReader (a real check costs a /proc walk or a process). */
+  readerChecks = 0;
   /** Called when a group is signalled (a test can end the job it models). */
   onGroupSignal?: (pgid: number, signal: NodeJS.Signals) => void;
   /** Process groups on this terminal the test says are alive (a job that survived its hangup). */
@@ -65,11 +67,12 @@ export class ScriptedPty implements PtyHandle {
   command(): string | undefined {
     return this.commandLine;
   }
-  canonicalInput(): boolean | undefined {
-    return this.canonicalMode;
+  inputMode(): { canonical: boolean; echo: boolean } | undefined {
+    return this.mode;
   }
-  hasChild(): boolean | undefined {
-    return this.childPresent;
+  otherReader(): boolean | undefined {
+    this.readerChecks++;
+    return this.reader;
   }
   groupAlive(pgid: number): boolean {
     return this.liveGroups.has(pgid);

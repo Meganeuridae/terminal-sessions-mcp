@@ -19,7 +19,7 @@ import { CLEAR_LINE_KEYS } from '../src/core/marks.js';
 import { narrowOutput, pageOutput, type RunOutputRange } from '../src/core/runindex.js';
 import { looksLikeSecretPrompt } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
-import { AGENT, code, HUMAN, OSC, ofType, scriptedSession as harness, tick } from './fake-shell.js';
+import { AGENT, code, HUMAN, OSC, ofType, scriptedSession as harness, tick, until } from './fake-shell.js';
 
 const TYPEAHEAD_GRACE_MS_IN_SPEC = 150; // mirrors session.ts
 const fileOf = (written: string): string => /'([^']*tsm-cmd-\d+)'/.exec(written.slice(written.lastIndexOf('tsm-cmd-') - 200))![1]!;
@@ -219,11 +219,14 @@ test('ss-4: a new shell that announces itself mid-Run ends it lost as shell-repl
 
 // ───────────── the reinit gate after exec bash: honest, and as narrow as it can be (#22 comment 6269901528) ─────────────
 
+type Mode = { canonical: boolean; echo: boolean } | undefined;
+const READLINE: Mode = { canonical: false, echo: false };
+
 /**
  * Arm an exec into a bash whose rc replaced PROMPT_COMMAND (no second hello), with the terminal mode
- * and child state the test scripts, then let the gate reach its decision after the startup cap.
+ * and reader state the test scripts, then let the gate reach its decision after the startup cap.
  */
-async function armExecBash(h: Awaited<ReturnType<typeof harness>>, mode: boolean | undefined, child: boolean | undefined) {
+async function armExecBash(h: Awaited<ReturnType<typeof harness>>, mode: Mode, reader: boolean | undefined) {
   h.shell.pause(); // the fake execs: it stops answering as a shell of ours
   const a = h.session.admit({ target: 'shell', line: 'exec bash', principal: AGENT });
   assert.ok(a.admitted);
@@ -232,41 +235,69 @@ async function armExecBash(h: Awaited<ReturnType<typeof harness>>, mode: boolean
   h.pty.emit(mark(`633;E; . '${file}'`) + mark('133;C') + mark('633;P;TsmExec=1'));
   assert.equal(h.session.run(a.run.runId).state, 'running');
   h.pty.commandLine = '/bin/bash -i';
-  h.pty.canonicalMode = mode;
-  h.pty.childPresent = child;
+  h.pty.mode = mode;
+  h.pty.reader = reader;
   return a.run.runId;
 }
 
-test('the reinit is typed only with no child and a non-canonical terminal', async () => {
+const notesOf = (h: Awaited<ReturnType<typeof harness>>) => ofType(h.journal.since(0).events, 'note').map((e) => e.text).join(' | ');
+
+test('the reinit is typed only in readline’s mode (ICANON and ECHO off) with no other reader', async () => {
   const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
-  await armExecBash(h, false, false);
+  await armExecBash(h, READLINE, false);
   await tick(500);
-  assert.ok(h.pty.written.includes(' . "$TSM_BASH_RC" reinit typed\n'), 'the reinit was typed at a non-canonical prompt with no child');
+  assert.ok(h.pty.written.includes(' . "$TSM_BASH_RC" reinit typed\n'), 'the reinit was typed at a readline prompt with no other reader');
   await h.session.close();
 });
 
-test('the reinit is not typed while a program the rc started is reading, even non-canonical', async () => {
-  // A pager, editor or password tool the rc started is a child; non-canonical does not prove readline.
-  // Without the child check the gate would type into that program (the house's read, #22 comment 6269901528).
+test('the reinit is not typed while a program the rc started is reading, even in readline’s mode', async () => {
+  // A pager, editor or password tool the rc started holds the terminal for input; the mode does not
+  // prove readline. Without the reader check the gate would type into that program (the house's read,
+  // #22 comment 6269901528).
   const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
-  const runId = await armExecBash(h, false, true);
+  const runId = await armExecBash(h, READLINE, true);
   await tick(600);
-  assert.ok(!h.pty.written.includes('reinit typed'), 'nothing was typed into the child');
+  assert.ok(!h.pty.written.includes('reinit typed'), 'nothing was typed into the reader');
   assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
-  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /has a child process in its own process group, so something its rc started may be reading its input/.test(e.text)), 'the note says what the check knows, no more');
+  assert.match(notesOf(h), /a process other than the shell, in the terminal’s foreground process group, holds the terminal for input/, 'the note says what the check knows, no more');
+  await h.session.close();
+});
+
+test('a reader check that cannot answer holds the reinit, and the note names that cause', async () => {
+  // Unknown is not "no reader": with pgrep missing the old gate typed into an rc's reader (the house's
+  // read of the 38 commits, #22 comment 6274841346, item 1).
+  const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
+  const runId = await armExecBash(h, READLINE, undefined);
+  await tick(600);
+  assert.ok(!h.pty.written.includes('reinit typed'), 'nothing typed while the reader check could not answer');
+  assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
+  assert.match(notesOf(h), /whether a process other than the shell is reading the terminal could not be checked/);
+  await h.session.close();
+});
+
+test('non-canonical with echo on (read -n) holds the reinit, and the reader check is not run for it', async () => {
+  // `read -n 1` leaves ECHO on where readline turns it off (the house's stty readings, item 3).
+  const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
+  const runId = await armExecBash(h, { canonical: false, echo: true }, false);
+  await tick(600);
+  assert.ok(!h.pty.written.includes('reinit typed'), 'nothing typed into a read -n');
+  assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
+  assert.match(notesOf(h), /non-canonical with echo on, as under `read -n`/);
+  assert.equal(h.pty.readerChecks, 0, 'the mode alone decided: no reader check per tick');
   await h.session.close();
 });
 
 test('a canonical prompt gets the honest note (read -p and --noediting cannot be told apart), not a false canonical-mode give-up', async () => {
   const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
-  const runId = await armExecBash(h, true, false);
+  const runId = await armExecBash(h, { canonical: true, echo: true }, false);
   await tick(600);
   assert.ok(!h.pty.written.includes('reinit typed'), 'nothing typed into a canonical reader or prompt');
   assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
-  const note = ofType(h.journal.since(0).events, 'note').map((e) => e.text).join(' | ');
+  const note = notesOf(h);
   assert.match(note, /canonical mode/);
   assert.match(note, /--noediting is unsupported for the handoff/);
   assert.match(note, /TSM_BASH_RC" reinit typed/, 'the manual recovery is given');
+  assert.equal(h.pty.readerChecks, 0);
   await h.session.close();
 });
 
@@ -276,7 +307,24 @@ test('an unreadable terminal mode (stty failed) gets its own note, and nothing i
   await tick(600);
   assert.ok(!h.pty.written.includes('reinit typed'));
   assert.deepEqual([h.session.run(runId).state, h.session.run(runId).reason], ['lost', 'shell-replaced']);
-  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /terminal mode could not be read \(stty failed\)/.test(e.text)), 'the note names the stty cause');
+  assert.match(notesOf(h), /terminal mode could not be read \(stty failed\)/, 'the note names the stty cause');
+  await h.session.close();
+});
+
+test('after the gate gives up, the recovery its note gives works: the bash’s marks are still accepted', async () => {
+  // The give-up retired the mark key, so the advised reinit, sent as input, re-sourced the rc with the
+  // key the exec left and every mark was refused: the session stayed unavailable (the house's read of
+  // the 38 commits, #22 comment 6274841346, item 5).
+  const h = await harness({ integrationGraceMs: 60, startupCapMs: 80 });
+  await armExecBash(h, { canonical: false, echo: true }, false);
+  await until(() => h.session.info().state === 'unavailable', 3000, 'the gate gave up');
+  assert.match(notesOf(h), /send ` \. "\$TSM_BASH_RC" reinit typed` with input/);
+  h.session.input(' . "$TSM_BASH_RC" reinit typed\n', { principal: AGENT });
+  // What the rc does when that line runs: its hello under the key it read, then a prompt.
+  h.pty.emit(h.shell.mark('633;P;TsmHello=bash') + h.shell.mark('133;A') + '$ ' + h.shell.mark('133;B'));
+  await until(() => h.session.shellAvailable().ok, 3000, 'available again');
+  assert.equal(h.session.integration, 'rich');
+  assert.equal(h.session.admit({ target: 'shell', line: 'echo back', principal: AGENT }).admitted, true);
   await h.session.close();
 });
 

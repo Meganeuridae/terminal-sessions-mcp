@@ -956,25 +956,20 @@ export class Session {
             // A new bash whose rc replaced the PROMPT_COMMAND the handoff left it never loaded the
             // integration (the house's read of 1d83ffa). The rc's path is still in its environment:
             // load it from here, once, and wait for its hello again — but only when it is safe, and
-            // the gate tells no more than it can (the house's read, #22 comment 6269901528). The
-            // reinit is typed only with no child process and a non-canonical terminal: readline at a
-            // prompt leaves it non-canonical, so the line is read and run. Everything else gives up
-            // as a replacement, with the cause named honestly:
-            //   - a child process (a pager, editor, tmux or password tool the rc started) is reading:
-            //     never type into it; non-canonical does not prove readline. `read -e` and `read -n`
-            //     are builtins with no child, so they stay indistinguishable from a prompt — a stated
-            //     limit, not a case this catches.
-            //   - canonical with no child: a `read -p` and a `bash --noediting` prompt cannot be told
-            //     apart, so do not type; say so, and that --noediting is unsupported for the handoff.
-            //   - the mode unreadable (stty failed): do not type; say that cause.
-            // The mode first, and the child check only when the mode would let the reinit be typed:
-            // one process spawned per tick, not two for the whole cap (a reviewer's read of the fixes
-            // for #22 comment 6269901528). The child check asks for a child in the shell's own process
-            // group — what an rc starts, with job control off — not a job started at a prompt before
-            // the exec, which keeps its own group and must not hold the reinit back.
-            const canon = this.pty.canonicalInput?.();
-            const child = canon === false ? this.pty.hasChild?.() : undefined;
-            if (child !== true && canon === false) {
+            // the gate tells no more than it can (the house's read, #22 comment 6269901528, and of the
+            // 38 commits, comment 6274841346). The reinit is typed only when the terminal is in
+            // readline's own mode (ICANON and ECHO off) and no process other than the shell can read
+            // it (PtyHandle.otherReader). Anything else, or anything the checks cannot answer, waits;
+            // at the cap the gate gives up as a replacement and says the last cause it saw. `read -e`
+            // and `read -s -n` are the shell itself in readline's mode: the stated limit.
+            // The mode first, and the reader check only when the mode would let the reinit be typed.
+            // stty is the one process a tick starts on Linux, where the reader check reads /proc;
+            // elsewhere the check adds a `ps`, and an `lsof` only while a program other than the shell
+            // is in the terminal's foreground group (item 4).
+            const mode = this.pty.inputMode?.();
+            const editing = mode !== undefined && !mode.canonical && !mode.echo;
+            const reader = editing ? this.pty.otherReader?.() : undefined;
+            if (editing && reader === false) {
               reinitTyped = true;
               changedAt = clocks.monotonic();
               this.note('the new bash did not load the shell integration (its rc replaced PROMPT_COMMAND): loading it once more');
@@ -982,16 +977,22 @@ export class Session {
             } else {
               reinitWaitStart ??= clocks.monotonic();
               if (clocks.monotonic() - reinitWaitStart >= cap) {
-                const manual = 'recover by typing ` . "$TSM_BASH_RC" reinit typed` at the prompt, or send that line with input';
                 const why =
-                  child === true
-                    ? 'it has a child process in its own process group, so something its rc started may be reading its input: the shell integration was not loaded, and the reinit was not typed into that program'
-                    : canon === true
-                      ? `its terminal is in canonical mode, where a \`read -p\` prompt and a \`bash --noediting\` prompt cannot be told apart, so the reinit was not typed (--noediting is unsupported for the handoff): the shell integration was not loaded — ${manual}`
-                      : `its terminal mode could not be read (stty failed), so whether a program is reading its input is unknown and the reinit was not typed: the shell integration was not loaded — ${manual}`;
-                this.note(`the new bash reached no prompt within ${cap} ms: ${why}`);
+                  mode === undefined
+                    ? 'its terminal mode could not be read (stty failed), so whether a program is reading its input is unknown'
+                    : mode.canonical
+                      ? 'its terminal is in canonical mode, where a `read -p` prompt and a `bash --noediting` prompt cannot be told apart (--noediting is unsupported for the handoff)'
+                      : mode.echo
+                        ? 'its terminal is non-canonical with echo on, as under `read -n` (readline turns echo off), so a read in its rc may be waiting for input'
+                        : reader === true
+                          ? 'a process other than the shell, in the terminal’s foreground process group, holds the terminal for input, so something its rc started may be reading it'
+                          : 'whether a process other than the shell is reading the terminal could not be checked (no process listing, or a process that cannot be inspected), and unknown is not none';
+                // The key stays: the bash in front still holds it in the file the exec left, so this
+                // recovery loads the integration with marks the daemon accepts (item 5; retiring the
+                // key here refused them, and the advised line left the session unavailable).
+                this.note(`the new bash did not load the shell integration within ${cap} ms, and the daemon did not type it in: ${why}. Once the shell shows its own prompt, send \` . "$TSM_BASH_RC" reinit typed\` with input to load it, or open a new session`);
                 this.stopExecWatch();
-                return this.onShellReplaced(now);
+                return this.onShellReplaced(now, { keepKey: true });
               }
             }
           } else {
@@ -1020,10 +1021,15 @@ export class Session {
    * replacement remains available for explicit input, but is not a verified shell command
    * destination. Neither a process name nor elapsed time establishes prompt readiness.
    */
-  private onShellReplaced(command: string): void {
+  private onShellReplaced(command: string, opts: { keepKey?: boolean } = {}): void {
     this.note(`the shell was replaced by \`${command}\`, which reports no marks: shell commands are unavailable; use input to interact, or open a new session`);
-    this.markKey = randomBytes(16).toString('hex');
-    this.marks.rekey(this.markKey);
+    // A fresh key, so nothing the replacement inherited can speak for the session — except for a bash
+    // of ours the reinit gate gave up on (keepKey): its key is in the file the exec left for it, and
+    // the recovery the gate's note gives reads it from there.
+    if (!opts.keepKey) {
+      this.markKey = randomBytes(16).toString('hex');
+      this.marks.rekey(this.markKey);
+    }
     this.helloCommand = command;
     this.flavor = flavorOf(command);
     const inFlight = [this.pendingShellRun, this.currentShellRun];
