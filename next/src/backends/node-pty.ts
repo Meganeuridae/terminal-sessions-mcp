@@ -109,7 +109,8 @@ const MAX_INSPECTED = 1024;
  * group, as what bash's rc starts does, with /dev/null as stdin and the terminal as its output, and held
  * the reinit at a real prompt when any child counted (item 2). The cost is a program that reads the
  * terminal only through them, as `more` behind a pipe does: it reads as no reader (PtyHandle's doc).
- * A job started at a prompt has its own group and is not in the foreground.
+ * A background job started at a prompt has its own group and is not the foreground; a foreground one
+ * is the foreground group, which is not the shell's, and counts.
  *
  * On Linux it reads /proc and starts no process (item 4: a pgrep per tick blocked the event loop for
  * about 50 ms under load): the shell's descendants through `task/<tid>/children`, or every process
