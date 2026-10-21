@@ -519,6 +519,13 @@ export class FileStore implements JournalStore {
   /** Said once per store: the epoch's write refused, and a metadata write the file holds whose directory could not be synced. */
   private refusedWarned = false;
   private syncWarned = false;
+  /**
+   * Directories this open created, the store's own and any parent made on the way, outermost first, whose
+   * entries are not yet synced into their parents. A metadata write counts as written only once they are:
+   * the file's own sync and its directory's left a new session's directory entry unsynced, so a power
+   * loss soon after could take the session with the reservation it had synced.
+   */
+  private newDirs: string[] = [];
   private readonly log: FileStoreOptions['log'];
   /** A rotation header the disk refused: written before the new file's first event (the house's read of b047b92, point 4). */
   private headerPending: Buffer | undefined;
@@ -535,7 +542,14 @@ export class FileStore implements JournalStore {
     this.floor = opts.floor;
     this.log = opts.log;
     // The journal holds whatever programs printed: private to the daemon's user (G26).
-    fs.mkdirSync(dir, { recursive: true, mode: DIR_MODE });
+    const made = fs.mkdirSync(dir, { recursive: true, mode: DIR_MODE });
+    if (made !== undefined) {
+      const top = path.resolve(made);
+      for (let d = path.resolve(dir); ; d = path.dirname(d)) {
+        this.newDirs.unshift(d);
+        if (d === top || path.dirname(d) === d) break;
+      }
+    }
     try {
       fs.chmodSync(dir, DIR_MODE);
     } catch {
@@ -578,10 +592,10 @@ export class FileStore implements JournalStore {
   }
 
   /**
-   * Atomically and privately (G26): `written` (durable), `unsynced` (the file holds it, the directory
-   * fsync failed: said once per store) or `failed` (nothing changed on disk). A refused write of the
-   * `epoch` is said once per store too; a refused high water is the journal's to report, as the store
-   * failure it is part of.
+   * Atomically and privately (G26): `written` (durable, with any directory this open created synced into
+   * its parent), `unsynced` (the file holds it, a directory fsync failed: said once per store) or `failed`
+   * (nothing changed on disk). A refused write of the `epoch` is said once per store too; a refused high
+   * water is the journal's to report, as the store failure it is part of.
    */
   private writeMeta(meta: StoreMeta, epoch = false): 'written' | 'unsynced' | 'failed' {
     let w: DurableWrite;
@@ -595,12 +609,24 @@ export class FileStore implements JournalStore {
       return 'failed';
     }
     this.onDisk = meta;
-    if (w.synced) return 'written';
+    const dirError = this.syncNewDirs();
+    if (w.synced && dirError === undefined) return 'written';
     if (!this.syncWarned) {
       this.syncWarned = true;
-      this.log?.('warn', `the journal's metadata (${META}) is written but its directory could not be synced: ${w.error?.message ?? 'unknown error'}; a crash may undo the write`);
+      const why = w.synced ? `its new directory's entry could not be synced: ${dirError?.message ?? 'unknown error'}` : `its directory could not be synced: ${w.error?.message ?? 'unknown error'}`;
+      this.log?.('warn', `the journal's metadata (${META}) is written but ${why}; a crash may undo the write`);
     }
     return 'unsynced';
+  }
+
+  /** Sync each directory this open created into its parent, outermost first; undefined once all are, else the first error (the rest stay pending for the next metadata write). */
+  private syncNewDirs(): NodeJS.ErrnoException | undefined {
+    while (this.newDirs.length > 0) {
+      const error = syncDir(this.newDirs[0]!);
+      if (error) return error;
+      this.newDirs.shift();
+    }
+    return undefined;
   }
 
   epoch(): string {

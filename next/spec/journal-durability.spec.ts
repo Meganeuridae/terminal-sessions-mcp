@@ -700,6 +700,49 @@ test('numbering survives a power loss: a crash that takes the file\'s unsynced t
   }
 });
 
+test('a store syncs a directory it created into its parent with its first metadata write, and counts a reservation only once that sync lands', (t) => {
+  t.mock.method(boots, 'current', () => 'boot-A');
+  const root = tmpDir();
+  const realFsync = fsc.fsyncSync;
+  const synced: number[] = [];
+  let failIno: number | undefined;
+  fsc.fsyncSync = ((fd: number) => {
+    const st = fsc.fstatSync(fd);
+    if (st.isDirectory()) {
+      if (st.ino === failIno) throw Object.assign(new Error('EIO: i/o error, fsync'), { code: 'EIO' });
+      synced.push(st.ino);
+    }
+    return realFsync(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  const ino = (p: string) => fs.statSync(p).ino;
+  const reserve = (s: FileStore, to: number) => s.setHighWater({ reservation: { to, boot: 'boot-A' } });
+  try {
+    // sessions/ and sessions/x are both new: each is synced into its parent before the reservation counts.
+    const x = new FileStore(path.join(root, 'sessions', 'x'));
+    assert.equal(reserve(x, 100), true);
+    assert.ok(synced.includes(ino(root)) && synced.includes(ino(path.join(root, 'sessions'))), 'the data dir and sessions/ were synced');
+    x.close();
+    // A new session whose entry in sessions/ cannot be synced: the file holds the reservation, which is not counted until the sync lands.
+    failIno = ino(path.join(root, 'sessions'));
+    const y = new FileStore(path.join(root, 'sessions', 'y'));
+    assert.equal(reserve(y, 100), false, 'not counted while its directory entry may not survive a power loss');
+    failIno = undefined;
+    assert.equal(reserve(y, 100), true, 'counted once the sync lands');
+    y.close();
+    // A directory that was already there is not synced into its parent again.
+    synced.length = 0;
+    const again = new FileStore(path.join(root, 'sessions', 'x'));
+    assert.equal(reserve(again, 200), true);
+    assert.ok(!synced.includes(ino(path.join(root, 'sessions'))), 'only the store\'s own directory, for its file');
+    again.close();
+  } finally {
+    fsc.fsyncSync = realFsync;
+    syncBuiltinESMExports();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('appends are never synced: a journal syncs one reservation write per block of seqs, and a refused reservation write leaves the events issued and stored, retried once a second (the house\'s read of the 33 commits, PR #22, comment 6307349700, its question of intent)', (t) => {
   let mono = 0;
   t.mock.method(clocks, 'monotonic', () => mono);
