@@ -1428,3 +1428,45 @@ test('a heal whose clearing write is refused writes it again a second later whil
   }
 });
 
+test('a hole the run index holds is listed once by gapsWithin when lost-range compaction joins it into a wider stretch', () => {
+  const dir = tmpDir();
+  try {
+    const first = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+    for (let i = 0; i < 520; i++) first.append(out(`e${i}`));
+    first.close();
+    // A new life inherits 256 holes while the disk refuses: their gaps go to the run index unwritten, the ring
+    // drops them, their holes are lost again beside the stretch of the dropped gaps' own seqs, and past MAX_LOST
+    // the oldest are joined.
+    const cold = new Flaky(dir);
+    cold.budget = 0;
+    const holes = Array.from({ length: 256 }, (_, k) => ({ from: 2 * k + 1, to: 2 * k + 1, reason: 'store-error' as const, exact: true as const }));
+    const j = new Journal({ hot: new MemoryStore(1), cold, startSeq: first.lastSeq, lost: holes, sessionId: 's' });
+    j.append(out('last'));
+    const listed = j.gapsWithin(1, j.lastSeq).map((g) => [g.from, g.to] as const).sort((a, b) => a[0] - b[0]);
+    assert.ok(listed.some(([from, to]) => to > from && from < 512), 'compaction joined holes');
+    const overlapping = listed.filter((g, i) => i > 0 && g[0] <= listed[i - 1]![1]);
+    assert.deepEqual(overlapping, [], 'no seq is in two of the gaps listed');
+    j.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a stretch gap the disk refused, then the ring dropped, is one hole to gapsWithin, as is one a new life records again', () => {
+  const dir = tmpDir();
+  try {
+    const { cold, j } = refusedStretch(dir);
+    const held = j.since(0).events.filter((e) => e.type === 'output' && e.seq > cold.lastSeq()!).length;
+    cold.budget = held; // the catch-up writes what the ring holds; the stretch's gap is refused
+    j.retryCold();
+    cold.budget = 0;
+    for (let i = 0; i < 40; i++) j.append(out(`b-${i}-${'y'.repeat(40)}`)); // the ring drops the refused gap
+    const holes = j.gapsWithin(1, j.lastSeq).filter((g) => g.from === 11 && g.to === 38);
+    assert.equal(holes.length, 1, JSON.stringify(j.gapsWithin(1, j.lastSeq).map((g) => [g.from, g.to, g.seq])));
+    assert.equal(holes[0]!.seq, 38, 'seated where the hole ends, as a read finds it');
+    j.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+

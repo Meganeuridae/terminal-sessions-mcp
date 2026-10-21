@@ -768,7 +768,21 @@ export class Journal {
    */
   gapsWithin(from: Seq, to: Seq): GapEvent[] {
     const lost = this.lost.filter((r) => r.to >= from && r.from <= to).map((r) => this.lostGap(r));
-    return lost.length ? [...this.runs.gapsWithin(from, to), ...lost].sort((a, b) => a.seq - b.seq) : this.runs.gapsWithin(from, to);
+    const all = lost.length ? [...this.runs.gapsWithin(from, to), ...lost].sort((a, b) => a.seq - b.seq) : this.runs.gapsWithin(from, to);
+    // One hole, one gap: a gap whose range another listed holds is left out, and of two with one range the earlier
+    // seat is kept. A gap the disk refused and the ring then dropped stays in the run index while its hole is lost
+    // again, and a new life records an inherited hole once more, so a Run's read showed it twice; past MAX_LOST, the
+    // hole lost again is joined into a wider stretch, which then holds it (the house's review of the 77 commits
+    // through 4f4c067, PR #22). Two ranges that only partly overlap are both kept.
+    if (all.length < 2) return all;
+    const kept = new Set<GapEvent>();
+    let reach = Number.NEGATIVE_INFINITY;
+    for (const g of [...all].sort((a, b) => a.from - b.from || b.to - a.to || a.seq - b.seq)) {
+      if (g.to <= reach) continue; // inside one already kept
+      kept.add(g);
+      reach = g.to;
+    }
+    return kept.size === all.length ? all : all.filter((g) => kept.has(g));
   }
 
   /**
