@@ -157,6 +157,20 @@ test('a raw read of a marker Run, paged by events, joins to its own output with 
   await assert.rejects(readJournal(src, { runId: 'p1', as: 'raw', tail: 2 }, { resultBytes: 16384 }), /raw read pages head first/);
 });
 
+test('a raw page puts each hole’s note on a line of its own where the hole lies, as a text page does (an independent read of the fixes for the review of f3750e4, PR #22)', async () => {
+  const src = source();
+  startRun(src.journal, 'p1');
+  out(src.journal, 'one\nhalf', 'stdout', 'p1');
+  const hole = src.journal.lastSeq + 1;
+  src.journal.append({ type: 'gap', from: hole, to: hole, reason: 'torn-write' });
+  out(src.journal, 'two\n', 'stdout', 'p1');
+  const note = `[… up to 1 journal event missing (seq ${hole}–${hole}: a crash cut the journal short) …]`;
+  assert.equal((await readJournal(src, { runId: 'p1', as: 'raw' }, { resultBytes: 16384 })).text, `one\nhalf\n${note}\ntwo\n`);
+  // A page that begins with the hole puts a line end before its note: the page before may have ended mid-line.
+  const from = await readJournal(src, { runId: 'p1', as: 'raw', since: hole - 1 }, { resultBytes: 16384 });
+  assert.equal(from.text, `\n${note}\ntwo\n`);
+});
+
 test('a read of the session still shows everything the terminal showed, plumbing included', async () => {
   const src = source();
   markerRun(src.journal, ['out\r\n']);

@@ -204,8 +204,8 @@ export interface ReadOptions {
   runId?: string;
   /**
    * `raw`: the output an events page holds, its data joined as written, escape codes kept, a shell Run's plumbing
-   * cut as its text is (runKept); holes go in `gap`/`gaps`, not the text. Not a tool's choice: the compat pack's
-   * raw output reads by it.
+   * cut as its text is (runKept), and each hole's note on a line of its own where the hole lies (rawPage). Not a
+   * tool's choice: the compat pack's raw output reads by it.
    */
   as?: 'text' | 'events' | 'raw';
   maxBytes?: number;
@@ -1043,14 +1043,29 @@ function eventsPage(src: ReadSource, o: ReadOptions, maxBytes: number): Omit<Rea
  * A raw page: the output of the events page `o` reads, its data joined as written, and for a shell Run's read
  * the Run's own (runKept), so its raw output and its text agree on what is the Run's. The compat pack's raw
  * runCommand output ran a second cutter, over the whole Run in memory, beside the one the reader runs (an
- * independent read of the fixes for the review of f3750e4, PR #22).
+ * independent read of the fixes for the review of f3750e4, PR #22). A hole's note (gapNote) stands on a line of its own where the
+ * hole lies, as a text page shows it: the raw output joined output across a hole with nothing to say so, the
+ * hole only in `gap`/`gaps`, which compat's raw path does not show (an independent read of the fixes for the review of f3750e4,
+ * PR #22; older than them). A note that begins a page after the range's start takes a line end before it, as
+ * what the page before ended with is not known here: at worst a blank line, never a note joined to output.
  */
 function rawPage(src: ReadSource, o: ReadOptions, maxBytes: number, run: RunInfo | undefined): Omit<ReadResult, 'session'> {
   const { events = [], ...page } = eventsPage(src, o, maxBytes);
   const outs = events.map((e) => (isOutput(e) ? e : undefined));
   const of = plumbingOf(o, run);
   const kept = of ? runKept(src, o.runId!, of, outs.map((e) => e && { ev: e, from: 0, data: e.data })) : [];
-  return { ...page, text: outs.map((e, i) => (!e ? '' : (kept[i]?.map(([a, b]) => e.data.slice(a, b)).join('') ?? e.data))).join('') };
+  let text = '';
+  const note = (g: GapInfo) => {
+    text += `${(text === '' ? o.since !== undefined : !text.endsWith('\n')) ? '\n' : ''}${gapNote(g)}\n`;
+  };
+  // A hole the page infers at its start (retention) is reported beside its events, not among them: its note leads.
+  const recorded = new Set(events.filter(isGap).map((e) => `${e.from}:${e.to}`));
+  for (const g of page.gaps ?? (page.gap ? [page.gap] : [])) if (!recorded.has(`${g.from}:${g.to}`)) note(g);
+  events.forEach((e, i) => {
+    if (isGap(e)) note(gapOf(e));
+    else if (isOutput(e)) text += kept[i]?.map(([a, b]) => e.data.slice(a, b)).join('') ?? e.data;
+  });
+  return { ...page, text };
 }
 
 // ───────────── tail ─────────────

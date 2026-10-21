@@ -17,7 +17,7 @@ import { callTool, toolsFor } from '../src/api/tools.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { clocks } from '../src/core/clock.js';
 import { commandFile, inlineProbe, markerProbe, probeEcho, sourceLine } from '../src/core/plumbing.js';
-import { fakeShellBackend } from './fake-shell.js';
+import { fakeShellBackend, type FakeShell } from './fake-shell.js';
 import { until } from './testhost.js';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-compat-'));
@@ -567,12 +567,14 @@ test('6270946953: launch’s watch for error patterns is measured on the monoton
 // ───────────── a reviewer's read of the fixes for #22 comment 6270045466: the marker strategy's plumbing in the logs ─────────────
 
 /** A registry over the scripted shell with no integration marks: Runs take the marker strategy, and their plumbing is printed as marks with a recorded nonce. */
-async function markerHarness(): Promise<{ app: App; registry: SessionRegistry; call(name: string, args: Obj): Promise<Obj & unknown[]>; close(): Promise<void> }> {
+async function markerHarness(): Promise<{ app: App; registry: SessionRegistry; shells: FakeShell[]; call(name: string, args: Obj): Promise<Obj & unknown[]>; close(): Promise<void> }> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-compat-marker-'));
+  const shells: FakeShell[] = [];
   const backend = fakeShellBackend(
     (sh) => {
       sh.on(/^echo /, (line) => ({ output: `${line.slice(5)}\r\n`, exit: 0 }));
       sh.on(/^sleep/, () => ({ hang: true }));
+      shells.push(sh);
     },
     { marks: 'none' },
   );
@@ -581,6 +583,7 @@ async function markerHarness(): Promise<{ app: App; registry: SessionRegistry; c
   return {
     app,
     registry,
+    shells,
     call: async (name, args) => JSON.parse((await callTool(name, args, { app, caller: A, resultText: 'json' }, compat)).text) as Obj & unknown[],
     close: async () => {
       await registry.closeAll();
@@ -648,6 +651,32 @@ test('a text tail names its first line’s source by the nearest header before i
     const said = JSON.stringify(cut.map((l) => l.slice(0, 40)));
     assert.match(cut[0]!, /^\[earlier output not shown/, said);
     assert.deepEqual(cut.slice(1, 4), ['[run rx]', '…done', '[terminal]'], said);
+  } finally {
+    await h.close();
+  }
+});
+
+test('runCommand’s raw output says where a hole lies, with the note its text output shows, between the raw pieces (an independent read of the fixes for the review of f3750e4, PR #22; older than them)', async () => {
+  // The raw path joined the output on both sides of a hole with nothing between: the hole was only in the reads' `gap`.
+  const h = await markerHarness();
+  try {
+    await h.call('runCommand', { session: 'holed', command: 'echo ready' });
+    const live = h.registry.get('holed');
+    assert.ok(live?.kind === 'live');
+    for (const raw of [false, true]) {
+      const pending = h.call('runCommand', { session: 'holed', command: 'sleep 9', raw, timeout: 5000 });
+      await until(() => live.session.listRuns().some((r) => r.line === 'sleep 9' && r.state === 'running'), 5000, 'the Run to be running');
+      const runId = live.session.listRuns().find((r) => r.line === 'sleep 9' && r.state === 'running')!.runId;
+      const j = live.session.journal;
+      j.append({ type: 'output', data: 'before\r\n', stream: 'pty', runId, attribution: 'temporal' });
+      j.append({ type: 'gap', from: j.lastSeq + 1, to: j.lastSeq + 1, reason: 'store-error' });
+      j.append({ type: 'output', data: 'after\r\n', stream: 'pty', runId, attribution: 'temporal' });
+      h.shells[h.shells.length - 1]!.finishHung(0);
+      const r = await pending;
+      assert.equal(r.exitCode, 0, JSON.stringify(r));
+      const hole = /\[… (?:up to )?1 journal event missing \(seq \d+–\d+: [^)]+\) …\]/.source;
+      assert.match(String(r.output), new RegExp(raw ? `^before\\r\\n${hole}\\nafter\\r\\n$` : `^before\\n${hole}\\nafter$`), `raw ${raw}: ${JSON.stringify(r.output)}`);
+    }
   } finally {
     await h.close();
   }
