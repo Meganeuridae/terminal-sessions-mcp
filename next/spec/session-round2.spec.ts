@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { clocks } from '../src/core/clock.js';
 import type { ScriptedProcess } from '../src/backends/scripted.js';
@@ -22,6 +23,9 @@ import type { JournalEvent } from '../src/core/types.js';
 import { AGENT, code, HUMAN, OSC, ofType, scriptedSession as harness, tick, until } from './fake-shell.js';
 
 const TYPEAHEAD_GRACE_MS_IN_SPEC = 150; // mirrors session.ts
+/** node:fs as session.js sees it: a patch here plus syncBuiltinESMExports reaches its `import * as fs` bindings. */
+const fsc = createRequire(import.meta.url)('node:fs') as { rmSync: typeof fs.rmSync; openSync: typeof fs.openSync };
+const fault = (code: string, what: string) => Object.assign(new Error(`${code}: ${what}`), { code });
 const fileOf = (written: string): string => /'([^']*tsm-cmd-\d+)'/.exec(written.slice(written.lastIndexOf('tsm-cmd-') - 200))![1]!;
 
 // ───────────── ss-1, ss-8: a daemon line never merges, never wedges, never runs unawaited ─────────────
@@ -460,6 +464,40 @@ test('an empty line that runs only after the session gave it up does not discard
   assert.ok(!ofType(h.journal.since(0).events, 'note').some((e) => /ran late/.test(e.text)), 'no line ran without its file');
   assert.deepEqual(h.session.listRuns().map((x) => x.runId), [a.run.runId, b.run.runId], 'the empty line is no Run');
   await h.session.close();
+});
+
+test('an empty line whose file cannot be removed at its prompt still frees the shell, and the Run admitted after the cancel runs', async () => {
+  // The empty line's file goes inside the prompt's own handling (dropPromptProbe). An unlink that threw
+  // there (EACCES on the command directory, say) ended that handling before the shell's state was set:
+  // the shell stayed busy, and the queued Run with it.
+  const h = await harness();
+  h.shell.stop();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.equal(c.steps.at(-1), 'an empty line, whose prompt says the shell is back', JSON.stringify(c));
+  const probe = (h.session as unknown as { promptProbe?: { path: string } }).promptProbe!.path;
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  const rm = fsc.rmSync;
+  fsc.rmSync = ((file: fs.PathLike, opts?: fs.RmOptions) => {
+    if (String(file) === probe) throw fault('EACCES', `permission denied, unlink '${probe}'`);
+    return rm(file, opts);
+  }) as typeof fs.rmSync;
+  syncBuiltinESMExports();
+  try {
+    h.shell.cont(); // the prompt for the ^C, then the empty line runs, then its prompt
+    const rb = await h.session.awaitRun(b.run.runId, 2000);
+    assert.deepEqual([rb.state, rb.exit], ['exited', 0], JSON.stringify(rb));
+    assert.equal((await h.session.runTranscript(rb.runId)).text, 'hello');
+  } finally {
+    fsc.rmSync = rm;
+    syncBuiltinESMExports();
+  }
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /empty line's file .* could not be removed/.test(e.text)), 'the failed unlink is said');
+  assert.ok(fs.existsSync(probe), 'the file stays for the session’s cleanup');
+  await h.session.close();
+  assert.ok(!fs.existsSync(probe), 'and goes with the session’s other files');
 });
 
 test('an end mark that arrives for a line under cancel whose pre-execution mark never came ends the Run cancelled at that mark', async () => {

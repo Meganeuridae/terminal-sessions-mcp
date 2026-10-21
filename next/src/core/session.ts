@@ -2500,13 +2500,22 @@ export class Session {
     return true;
   }
 
-  /** The empty line's file goes at the prompt after its pre-execution mark, or once the session gave up on it. */
+  /**
+   * The empty line's file goes at the prompt after its pre-execution mark, or once the session gave up on
+   * it. This runs inside the prompt's handling, which must go on whatever the unlink does: a file that
+   * cannot be removed now (the command directory made read-only, say) stays listed for the session's
+   * cleanup at close, and its line runs nothing if it is read late, since the file is empty.
+   */
   private dropPromptProbe(): void {
     const probe = this.promptProbe;
     if (!probe) return;
     this.promptProbe = undefined;
-    this.extraTempFiles.delete(probe.path);
-    fs.rmSync(probe.path, { force: true });
+    try {
+      fs.rmSync(probe.path, { force: true });
+      this.extraTempFiles.delete(probe.path);
+    } catch (e) {
+      this.note(`the empty line's file ${probe.path} could not be removed (${errMessage(e)}); it is removed with the session's other files`);
+    }
   }
 
   private requireCancel(run: RunRecord, principal: Principal, asOwner: boolean): void {
