@@ -668,6 +668,29 @@ test('a digest never shows a string’s payload, though the carry is cut far ins
   }
 });
 
+test('a digest never shows the payload of a string that ended inside a long carry (our review of the 40 commits through 4f4c067, PR #22)', async () => {
+  // A line that never ends, holding an OSC 52 that closed: the carry's cut, looking back 4,096 units, landed inside the
+  // 9,000-byte payload without finding where the string began, and the carry, and the digest's last line, read as base64.
+  const src = fakeSource();
+  startRun(src, 'copy');
+  const seg = new Segmenter(src, { cadenceMs: 40 });
+  const out = collect(seg);
+  const body = () => out.filter((s) => s.kind === 'output').at(-1)?.body ?? '';
+  try {
+    src.journal.append({ type: 'output', data: 'start\r\ncopying \x1b]52;c;' + 'S'.repeat(9000) + '\x07 still copying', stream: 'pty', runId: 'copy' });
+    await sleep(100);
+    src.journal.append({ type: 'output', data: ' 50%', stream: 'pty', runId: 'copy' });
+    await sleep(100);
+    assert.ok(!body().includes('SSS'), JSON.stringify(body().slice(-80)));
+    src.journal.append({ type: 'output', data: ' done\r\n', stream: 'pty', runId: 'copy' });
+    await sleep(100);
+    // The line's tail: its first 4,096 units went with the cut, the clipboard among them.
+    assert.deepEqual(body().split('\n'), ['start', ' still copying 50% done']);
+  } finally {
+    seg.dispose();
+  }
+});
+
 test('unread bytes are never short of what arrived after the read, even once marks were thinned', async () => {
   const src = fakeSource();
   startRun(src, 'many');

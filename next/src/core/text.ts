@@ -99,9 +99,9 @@ export function tailStart(text: string, maxBytes: number): number {
 /**
  * `index` moved forward to a point that splits nothing: past the control sequence it lies inside
  * (looked for through the whole text before it), past the low half of a surrogate pair, past the
- * LF of a CRLF. Never earlier, so a tail cut keeps its budget.
+ * LF of a CRLF. Never earlier, so a tail cut keeps its budget: tailStart's, and the segmenter's carry.
  */
-function pastSequence(text: string, index: number): number {
+export function pastSequence(text: string, index: number): number {
   let i = Math.min(index, text.length);
   const inside = enclosingSequence(text, i, Number.POSITIVE_INFINITY);
   if (inside) i = inside.end ?? text.length;

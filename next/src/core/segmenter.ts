@@ -24,7 +24,7 @@ import type { Journal } from './journal.js';
 import type { RunOutput } from './runindex.js';
 import { cutPlumbing, runEcho, startMark } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
-import { lineCarry, lineEnds, safeCut, tailStart, unfinishedSequence, type LineCarry } from './text.js';
+import { lineCarry, lineEnds, pastSequence, tailStart, unfinishedSequence, type LineCarry } from './text.js';
 import { headOnlyText } from './regex.js';
 import { minusRanges } from './ranges.js';
 import { project, runChunks } from './transcript.js';
@@ -1177,8 +1177,12 @@ export class Segmenter {
       // A line that never ends (a progress bar): what follows its last carriage return is what shows.
       // The cut lands on a safe boundary, never inside a control sequence or a surrogate pair (the
       // house's read of 78c4d6e, #22: a digest began with a lone low surrogate, another with `;5;196m`).
+      // It moves forward past the sequence it would start inside, as a tail cut does (pastSequence), so
+      // the carry keeps at most CARRY_MAX: a cut moved back by safeCut's 4,096-unit look-back stopped
+      // inside a 9,000-byte clipboard that had ended in the carry, and the digest showed its base64 (our
+      // review of the 40 commits through 4f4c067, PR #22).
       const cr = buf.lastIndexOf('\r', buf.length - 2);
-      buf = buf.slice(safeCut(buf, cr !== -1 && buf.length - cr - 1 <= CARRY_MAX ? cr + 1 : buf.length - CARRY_MAX));
+      buf = buf.slice(pastSequence(buf, cr !== -1 && buf.length - cr - 1 <= CARRY_MAX ? cr + 1 : buf.length - CARRY_MAX));
       // Inside a string the line-end rule holds open, whose introducer lay further back than safeCut looks, the
       // cut kept only its payload, which then read as the line's text (a clipboard's base64 in the digest: a
       // reviewer's read of the fixes for #22). The kept carry begins at the string's introducer again, with
