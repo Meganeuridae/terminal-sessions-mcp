@@ -223,6 +223,9 @@ test('persistentState keeps what the emulator applies of a sequence with C0 cont
     ['x\x9b4hy', '\x1b[4h'],
     ['\x1b[\x0e4h', '\x0e\x1b[4h'],
     ['\x9d2;title\x9cz', '\x1b]2;title\x1b\\'],
+    // A DEL inside, which the emulator ignores, with no C0 beside it.
+    ['x\x1b[4\x7fhy', '\x1b[4h'],
+    ['x\x1b[?10\x7f49hy', '\x1b[?1049h'],
   ] as const) {
     assert.equal(persistentState(data), kept, JSON.stringify(data));
     const whole = await state(data);

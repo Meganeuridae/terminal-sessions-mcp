@@ -126,7 +126,7 @@ function sequencesOf(data: string): string {
       // Only a CSI ending in h, l, p or r, and an escape sequence, can be a pattern's: an SGR, say, is passed over.
       const csi = c === 0x9b || data[kindAt(data, i)] === '[';
       if (!csi || /[hlpr]/.test(data[end - 1]!)) {
-        const t = executed.length ? sequenceText(data, i, end) : data.slice(i, end);
+        const t = sequenceText(data, i, end);
         out += t[0] === '\x9b' ? `\x1b[${t.slice(1)}` : t;
       }
     } else {
