@@ -1331,7 +1331,8 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
   const registry = new SessionRegistry({ dataDir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
   const app = new App({ registry, segmenter: { runSettleMs: 10 } });
   const sent: Msg[] = [];
-  const refuse = { value: false };
+  /** While `value` is set, the host refuses deliveries, or only those `only` names. */
+  const refuse: { value: boolean; only?: (req: Msg) => boolean } = { value: false };
   const refusal = (req: Msg): unknown => {
     if (req.method === 'channels/incoming') return { results: (req.params as { messages: Array<{ messageId: string }> }).messages.map((x) => ({ messageId: x.messageId, accepted: false, reason: 'queue_full' })) };
     if (req.method === 'push/event') return { accepted: false, reason: 'queue_full' };
@@ -1344,7 +1345,7 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     const req = m as Msg;
     sent.push(req);
     if (req.method === undefined || req.id === undefined) return;
-    const result = refuse.value ? refusal(req) : TestHost.accept(req);
+    const result = refuse.value && (refuse.only?.(req) ?? true) ? refusal(req) : TestHost.accept(req);
     const answer = () => out.handleResponse({ jsonrpc: '2.0', id: req.id!, result } as never);
     if (late.value && (req.method === 'push/event' || req.method === 'channels/incoming')) pending.push({ req, answer });
     else setImmediate(answer);
@@ -1369,11 +1370,12 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     open: Set<string>;
     registered: Set<string>;
     watched: Map<string, unknown>;
-    states: Map<string, { owed: Set<number>; inflight: Map<string, number>; retries: Map<string, { kind: string }>; summaries: Map<string, { folded?: { count: number }; owes?: number }> }>;
+    states: Map<string, { owed: Set<number>; inflight: Map<string, number>; retries: Map<string, { kind: string }>; held: Map<string, { since: number; seq?: number }>; summaries: Map<string, { from: number; folded?: { count: number }; owes?: number; covered: Set<number> }> }>;
     closes: Map<string, number>;
     batch: unknown[];
     flush(): Promise<void>;
     startCatchUp(sessions: string[]): Promise<void>;
+    catchingUp: Promise<void> | undefined;
     budgetOf(journal: Journal): { retained: unknown[]; seed(journal: Journal): Promise<void> };
     deliver(t: Session, seg: unknown, opts: { released: true }): void;
   };
@@ -2086,6 +2088,197 @@ test("a catch-up that retires a refused catch-up summary retires the seq it owed
     f.refuse.value = false;
     await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
     await until(() => s.cursorsOf(A).delivered >= lastEnd, 15_000, `the cursor to pass the last completion (owed ${JSON.stringify([...st().owed])}, delivered ${s.cursorsOf(A).delivered})`);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a catch-up's summary of a lost range covers the debts in it, so completions retention took before a scan, or after a refused summary covered them, don't pin the cursor", { timeout: 90_000 }, async () => {
+  // Completions owed while nothing carried the session have no retry of their own. Those retention took before
+  // any catch-up lay in the range the scan reported lost, and those a refused summary covered were left there once
+  // a catch-up retired it and retention took them: no summary covered either, and the cursor stayed below them for
+  // the life of the connection (the house's read of a8b6f28, #22: by run).
+  const f = await bareLane('c-lost-covered');
+  try {
+    const st = () => f.inside.states.get('rc')!;
+    const noPush = FULL_GRANT.filter((c) => c !== 'pushEvents');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: noPush }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'rc', retention: { maxBytes: 16 * 1024 } });
+    const s = live(f.registry, 'rc');
+    const ended = async (command: string): Promise<number> => {
+      const r = await f.app.run(f.caller, { session: 'rc', command, target: 'process', wait: 0 });
+      await until(() => s.run(r.runId!).seq.end !== undefined, 10_000, `${command} to end`);
+      return s.run(r.runId!).seq.end!;
+    };
+    const owedFirst: number[] = [];
+    for (let i = 0; i < 25; i++) owedFirst.push(await ended(`echo rc-${i}`));
+    const gone = owedFirst.filter((seq) => seq < (s.journal.oldestSeq ?? 1));
+    assert.ok(gone.length > 0, `retention took some owed completions before any catch-up (oldest ${s.journal.oldestSeq})`);
+    // The host takes the replayed completions and refuses the summary of the rest.
+    const eventId = (req: { params?: unknown }) => (req.params as { eventId?: string } | undefined)?.eventId ?? '';
+    f.refuse.value = true;
+    f.refuse.only = (req) => req.method === 'push/event' && /:summary[:~]/.test(eventId(req));
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => [...st().summaries.values()].some((x) => !x.folded && x.covered.size > 0), 10_000, "the catch-up's summary covering omitted completions");
+    const covered = [...[...st().summaries.values()].find((x) => !x.folded && x.covered.size > 0)!.covered];
+    const refused = eventId(f.sent.find((m) => m.method === 'push/event' && /:summary[:~]/.test(eventId(m)))!);
+    await until(() => f.inside.catchingUp === undefined, 5000, 'the first catch-up to finish');
+    // More output than retention keeps, each Run's completion pushed and taken as it ends.
+    for (let i = 0; i < 4; i++) await ended('seq 1 2000');
+    assert.ok((s.journal.oldestSeq ?? 1) > Math.max(...covered), `retention took the covered completions (${JSON.stringify(covered)}; oldest now ${s.journal.oldestSeq})`);
+    const lastEnd = await ended('echo rc-last');
+    // Only the old summary is refused now: the next catch-up retires it, and the host takes what replaces it.
+    f.refuse.only = (req) => req.method === 'push/event' && eventId(req) === refused;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: noPush }, f.ctx);
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => s.cursorsOf(A).delivered >= lastEnd, 15_000, `the cursor to pass the last completion (owed ${JSON.stringify([...st().owed].slice(0, 12))}, gone before the scan ${JSON.stringify(gone)}, covered ${JSON.stringify(covered)}, delivered ${s.cursorsOf(A).delivered})`);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a catch-up whose scan fails retires nothing: the refused fold summary still pins the cursor, and the next catch-up sends what it stood for", { timeout: 60_000 }, async () => {
+  // Retired before the scan, a scan that threw left the summary gone and the floor lowered, so delivered could
+  // pass the completions it stood for and nothing would scan them again (the house's read of a8b6f28, #22).
+  const was = McplLane.retryMax;
+  McplLane.retryMax = 4;
+  const f = await bareLane('c-retire-fail');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'rx' });
+    const s = live(f.registry, 'rx');
+    const st = () => f.inside.states.get('rx')!;
+    f.refuse.value = true;
+    f.late.value = true;
+    const ends: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      const r = await f.app.run(f.caller, { session: 'rx', command: `echo rx-${i}`, target: 'process', wait: 0 });
+      await until(() => s.run(r.runId!).seq.end !== undefined, 5000, `Run ${i} to end`);
+      ends.push(s.run(r.runId!).seq.end!);
+    }
+    await until(() => f.pending.length >= 6, 5000, 'six completions pushed and held');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'pushEvents') }, f.ctx);
+    for (const p of f.pending.splice(0)) p.answer();
+    await until(() => [...st().summaries.values()].some((x) => x.folded), 5000, 'the refusals to fold');
+    const folded = [...st().summaries.keys()];
+    f.refuse.value = false;
+    f.late.value = false;
+    // The next catch-up's scan fails at its first page.
+    const journal = s.journal as Journal & { pages: Journal['pages'] };
+    const pages = journal.pages.bind(journal);
+    let failures = 1;
+    journal.pages = function* (...a: Parameters<Journal['pages']>) {
+      if (failures-- > 0) throw new Error('EIO: the store could not be read');
+      yield* pages(...a);
+    } as Journal['pages'];
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => f.logs.some((l) => /catch-up failed: EIO/.test(l)), 5000, 'the catch-up failure logged');
+    assert.deepEqual([...st().summaries.keys()].filter((k) => folded.includes(k)), folded, 'the fold summary still stands');
+    assert.ok(s.cursorsOf(A).delivered < Math.min(...ends), `the cursor stays below the folded completions (delivered ${s.cursorsOf(A).delivered})`);
+    await f.inside.startCatchUp(['rx']);
+    await until(() => s.cursorsOf(A).delivered >= Math.max(...ends), 10_000, 'the cursor to pass every completion once a catch-up scans');
+  } finally {
+    McplLane.retryMax = was;
+    await f.close();
+  }
+});
+
+test("a catch-up retires a summary parked for an opening channel, so the open sends only what replaced it", { timeout: 60_000 }, async () => {
+  // A summary parked while the channel's history was read had no in-flight, sent or retry entry: retired, it
+  // still went out when the open finished, beside the summary that replaced it (the house's read of a8b6f28, #22).
+  const f = await bareLane('c-retire-opening');
+  try {
+    const noPush = FULL_GRANT.filter((c) => c !== 'pushEvents');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: noPush }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'ro2', visibility: 'shared' });
+    const s = live(f.registry, 'ro2');
+    const ended = async (command: string): Promise<string> => {
+      const r = await f.app.run(f.caller, { session: 'ro2', command, target: 'process', wait: 0 });
+      await until(() => s.run(r.runId!).seq.end !== undefined, 5000, `${command} to end`);
+      return r.runId!;
+    };
+    const runs: string[] = [];
+    for (let i = 0; i < 25; i++) runs.push(await ended(`echo ro2-${i}`));
+    // The open's history reads every Run; the hold is on the oldest, which a catch-up only counts in its summary.
+    const hold = holdTranscripts(s, runs[0]);
+    const opening = f.lane.handle('channels/open', { channelId: 'terminal:ro2', history: { limit: 40 } }, f.ctx);
+    await hold.reached;
+    const held = () => [...(f.inside.opening.get('terminal:ro2')?.held.keys() ?? [])].filter((k) => /:summary[:~]/.test(k));
+    // Push events carry the session again: the catch-up's summary is parked for the opening channel.
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => held().length === 1, 5000, "the first catch-up's summary parked for the opening");
+    const first = held()[0]!;
+    await until(() => f.inside.catchingUp === undefined, 5000, 'the first catch-up to finish');
+    // Two more completions: the next catch-up omits more, so its summary ends later, under another id.
+    for (let i = 0; i < 2; i++) await ended(`echo ro2-more-${i}`);
+    await f.inside.startCatchUp(['ro2']);
+    assert.ok(!held().includes(first), `the retired summary is no longer parked (${held().join(', ')})`);
+    assert.equal(held().length, 1, 'only the summary that replaced it is parked');
+    hold.release();
+    await opening;
+    hold.restore();
+    await sleep(300);
+    const summaries = new Set(f.sent.filter((m) => m.method === 'channels/incoming').flatMap((m) => (m.params as { messages: Array<{ messageId: string }> }).messages.map((x) => x.messageId)).filter((x) => /:summary[:~]/.test(x)));
+    assert.equal(summaries.size, 1, `one summary went on the channel: ${[...summaries].join(', ')}`);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a catch-up's summary of a lost range leaves out a debt a held message still carries", { timeout: 60_000 }, async () => {
+  // A completion held for a synchronous result (G28) goes out when its hold runs out. Covered by a summary of the
+  // range retention took, the summary's acceptance let the cursor pass it, and the host's refusal of it was then
+  // settled as accepted (a reviewer's read of the fixes for #22). The hold is stood in for by its entry.
+  const f = await bareLane('c-lost-held');
+  try {
+    const st = () => f.inside.states.get('rh')!;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'pushEvents') }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'rh', retention: { maxBytes: 16 * 1024 } });
+    const s = live(f.registry, 'rh');
+    const ends: number[] = [];
+    for (let i = 0; i < 25; i++) {
+      const r = await f.app.run(f.caller, { session: 'rh', command: `echo rh-${i}`, target: 'process', wait: 0 });
+      await until(() => s.run(r.runId!).seq.end !== undefined, 10_000, `Run ${i} to end`);
+      ends.push(s.run(r.runId!).seq.end!);
+    }
+    const gone = ends.filter((seq) => seq < (s.journal.oldestSeq ?? 1));
+    assert.ok(gone.length >= 2, `retention took at least two owed completions (${JSON.stringify(gone)}; oldest ${s.journal.oldestSeq})`);
+    st().held.set('rh-held', { since: performance.now(), seq: gone[0]! });
+    f.late.value = true;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => [...st().summaries.values()].some((x) => !x.folded), 10_000, "the catch-up's summary");
+    const covered = [...st().summaries.values()].find((x) => !x.folded)!.covered;
+    assert.ok(!covered.has(gone[0]!), `the held completion's debt is not covered (${JSON.stringify([...covered])})`);
+    assert.ok(gone.slice(1).every((seq) => covered.has(seq)), `the other gone completions are (${JSON.stringify([...covered])}, gone ${JSON.stringify(gone)})`);
+    assert.ok(st().owed.has(gone[0]!), 'the held completion is still owed');
+    f.late.value = false;
+    for (const p of f.pending.splice(0)) p.answer();
+  } finally {
+    await f.close();
+  }
+});
+
+test("a catch-up drops what a retired summary covered that its scan owes no more, so the cursor passes it", { timeout: 60_000 }, async () => {
+  // A debt owed only while the session's channel was open is owed no more once it closes, and the rescan neither
+  // replays nor covers it. Kept after its summary was retired, it pinned the cursor for the life of the connection
+  // (a reviewer's read of the fixes for #22). The spec stands in for it with an output event's seq, which no scan owes.
+  const f = await bareLane('c-retire-unowed');
+  try {
+    const st = () => f.inside.states.get('rn')!;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'pushEvents') }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'rn' });
+    const s = live(f.registry, 'rn');
+    let lastEnd = 0;
+    for (let i = 0; i < 3; i++) {
+      const r = await f.app.run(f.caller, { session: 'rn', command: `echo rn-${i}`, target: 'process', wait: 0 });
+      await until(() => s.run(r.runId!).seq.end !== undefined, 10_000, `Run ${i} to end`);
+      lastEnd = s.run(r.runId!).seq.end!;
+    }
+    const out = s.journal.since(0).events.find((e) => e.type === 'output')!.seq;
+    st().owed.add(out);
+    st().summaries.set('rn-retired-summary', { from: out, covered: new Set([out]) });
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => s.cursorsOf(A).delivered >= lastEnd, 10_000, `the cursor to pass the last completion (owed ${JSON.stringify([...st().owed])}, delivered ${s.cursorsOf(A).delivered})`);
+    assert.ok(!st().owed.has(out), 'the debt the scan owes no more is dropped');
   } finally {
     await f.close();
   }

@@ -1053,14 +1053,22 @@ export class McplLane {
   /** A closed life's owed entries whose message will never come (its segmenter has drained) stop pinning the cursor (mcpl-7). */
   private releaseUnsettled(t: Target, upTo: Seq): void {
     const st = this.stateOf(t);
-    const held = new Set([...st.held.values()].map((h) => h.seq));
-    // A message held for an open of the channel still in flight goes out when the open completes, so
-    // its debt stays: released, a catch-up lifting clearTo let `delivered` pass it before any host
-    // received it, and the host's later refusal was settled as accepted (a reviewer's read of the fixes for #22 comment 6270045466).
-    const opening = [...(this.opening.get(channelId(t.id))?.held.values() ?? [])].map((h) => h.seg.seq);
-    const pending = new Set([...st.inflight.values(), ...[...st.retries.values()].map((r) => r.seq), ...opening]);
-    for (const seq of st.owed) if (seq <= upTo && !pending.has(seq) && !held.has(seq)) st.owed.delete(seq);
+    const carried = this.carried(t, st);
+    for (const seq of st.owed) if (seq <= upTo && !carried.has(seq)) st.owed.delete(seq);
     this.advance(t, st);
+  }
+
+  /**
+   * The seqs a message of their own still carries: in flight, retried, held for a synchronous result (G28),
+   * or held for an open of the channel still in flight, which goes out when the open completes. Their debts
+   * stay until that message settles: released, a catch-up lifting clearTo let `delivered` pass one before any
+   * host received it, and the host's later refusal was settled as accepted (a reviewer's read of the fixes for
+   * #22 comment 6270045466).
+   */
+  private carried(t: Target, st: LaneState): Set<Seq> {
+    const opening = [...(this.opening.get(channelId(t.id))?.held.values() ?? [])].map((h) => h.seg.seq);
+    const held = [...st.held.values()].flatMap((h) => (h.seq === undefined ? [] : [h.seq]));
+    return new Set([...st.inflight.values(), ...[...st.retries.values()].map((r) => r.seq), ...opening, ...held]);
   }
 
   private remember(id: string): void {
@@ -1377,7 +1385,7 @@ export class McplLane {
    * across sessions; the rest of each session is one summary with the cursor to read it.
    */
   private async catchUpAll(only?: Set<string>): Promise<void> {
-    const plans: Array<{ t: Target; st: LaneState; src: ReplaySource; from: Seq; open: boolean; covered: Set<Seq>; scan?: LifecycleScan }> = [];
+    const plans: Array<{ t: Target; st: LaneState; src: ReplaySource; from: Seq; open: boolean; covered: Set<Seq>; retire: string[]; left?: Set<Seq>; scan?: LifecycleScan }> = [];
     // Every floor goes up before any scan yields, so the live path cannot move a cursor past what a scan has yet to find.
     for (const entry of this.app.registry.list()) {
       if (!this.app.can(this.me, entry, 'observe')) continue;
@@ -1387,8 +1395,9 @@ export class McplLane {
       if (from >= t.journal.lastSeq || !this.carries(t.id)) continue;
       const st = this.stateOf(t);
       st.scanningFrom = from;
-      this.retireSummaries(st);
-      plans.push({ t, st, src: this.sourceOf(entry), from, open: this.openOrOpening(channelId(t.id)), covered: new Set() });
+      // The summaries this catch-up may retire are those standing now: one made while it scans may hold what it won't find.
+      const retire = [...st.summaries.keys()].filter((id) => !st.inflight.has(id));
+      plans.push({ t, st, src: this.sourceOf(entry), from, open: this.openOrOpening(channelId(t.id)), covered: new Set(), retire });
     }
     try {
       for (const p of plans) {
@@ -1405,6 +1414,10 @@ export class McplLane {
       for (const p of plans) p.st.scanningFrom = undefined;
       throw e;
     }
+    // Only once every scan has returned, while scanningFrom still holds each floor: retired before, a scan that
+    // failed left the summaries gone and the floor lowered, and delivered could pass what they stood for (the
+    // house's read of a8b6f28, #22).
+    for (const p of plans) p.left = this.retireSummaries(p.t, p.st, p.retire);
     const all = plans.flatMap((p) => (p.scan?.picked ?? []).map((pk) => ({ p, pk })));
     all.sort((a, b) => b.pk.ev.ts - a.pk.ev.ts || b.pk.ev.seq - a.pk.ev.seq);
     const chosen = new Set(all.slice(0, CATCHUP_LIMIT).map((x) => x.pk));
@@ -1419,6 +1432,21 @@ export class McplLane {
         p.covered.delete(pk.ev.seq);
       }
       const w: (typeof work)[number] = { t: p.t, src: p.src, picked };
+      const carried = this.carried(p.t, p.st);
+      // A debt whose event retention took lies in a range the scan reports lost, where no event is found to cover
+      // it: the summary naming the range covers it, unless a message of its own still carries it. Left out,
+      // completions owed while nothing carried the session, and those a retired summary had covered, pinned the
+      // cursor for the life of the connection once their events were gone (the house's read of a8b6f28, #22: by
+      // run). Covered while a message carried it, the summary's acceptance let `delivered` pass a message still
+      // to go out, whose refusal was then settled as accepted (a reviewer's read of the fixes for #22).
+      if (scan.lost?.length) {
+        for (const seq of p.st.owed) if (!carried.has(seq) && scan.lost.some((g) => g.from <= seq && seq <= g.to)) p.covered.add(seq);
+      }
+      // What a retired summary covered that this scan neither replays nor covers, found or lost, and no message
+      // carries, the scan found owed no more, as a debt owed only while the channel was open is once it has
+      // closed: kept, it pinned the cursor for the life of the connection (a reviewer's read of the fixes for #22).
+      const replayed = new Set(picked.map((pk) => pk.ev.seq));
+      for (const seq of p.left ?? []) if (!replayed.has(seq) && !p.covered.has(seq) && !carried.has(seq)) p.st.owed.delete(seq);
       // One summary for what the host will not see replayed: the messages past the cap, and the
       // range retention took before the scan began, which the scan reports and nothing can replay
       // (the segmenter's read, comment 6265082050 on #22: the catch-up never told the host of it).
@@ -1454,25 +1482,34 @@ export class McplLane {
   /**
    * A catch-up scans from the delivered cursor, and every pending summary pins that cursor below what it
    * stands for, so the scan finds all of it again: it replays what it can and names the rest in its own
-   * summary. Each summary not in flight goes, with its retry. Kept, a fold made while nothing carried the
-   * session had no retry and pinned the cursor for the life of the connection, its messages never sent; a
-   * fold the catch-up replayed counted them a second time once accepted; and refused catch-up summaries,
-   * which never fold, piled up one per catch-up (the house's read of 4f4c067, #22). One in flight settles
-   * by its answer. One whose answer was lost after its request timed out may still reach the host, which
-   * then hears of its messages twice, as G22's at-least-once allows.
+   * summary, which covers the debts it finds and those in the ranges it reports lost. Each summary of `ids`
+   * not in flight goes, with its retry, the seq it owes and its place in an opening of the session's channel.
+   * Kept, a fold made while nothing carried the session had no retry and pinned the cursor for the life of the
+   * connection, its messages never sent; a fold the catch-up replayed counted them a second time once
+   * accepted; and refused catch-up summaries, which never fold, piled up one per catch-up (the house's read of
+   * 4f4c067, #22). Its owed seq stayed owed once retention moved past it, since nothing then had that seq to
+   * settle it (a reviewer's read of the retirement, #22). Parked for an opening, it went out when the open
+   * finished, beside what replaced it (the house's read of a8b6f28, #22). Its covered debts, returned, stay
+   * until the summary that replaces it is accepted, or go once the scan finds them owed no more. One in flight settles by its answer. One whose answer was lost after
+   * its request timed out may still reach the host, which then hears of its messages twice, as G22's
+   * at-least-once allows.
    */
-  private retireSummaries(st: LaneState): void {
-    for (const [id, summary] of [...st.summaries]) {
-      if (st.inflight.has(id)) continue;
+  private retireSummaries(t: Target, st: LaneState, ids: string[]): Set<Seq> {
+    const opening = this.opening.get(channelId(t.id));
+    const covered = new Set<Seq>();
+    for (const id of ids) {
+      const summary = st.summaries.get(id);
+      if (!summary || st.inflight.has(id)) continue;
       st.summaries.delete(id);
-      // Its own seq goes too, or it stays owed when retention has taken it, or it was a gap's end the new scan
-      // finds grown: nothing then has its seq to settle it (a reviewer's read of the retirement, #22). The scan re-owes an event still there.
       if (summary.owes !== undefined) st.owed.delete(summary.owes);
+      for (const seq of summary.covered) covered.add(seq);
       const r = st.retries.get(id);
       if (r?.timer) clearTimeout(r.timer);
       st.retries.delete(id);
       this.sent.delete(id);
+      opening?.held.delete(id);
     }
+    return covered;
   }
 
   private owedOnCatchUp(t: Target, st: LaneState, src: ReplaySource, { ev, lost }: Picked, open: boolean): boolean {
