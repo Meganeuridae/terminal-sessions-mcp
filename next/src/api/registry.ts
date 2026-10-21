@@ -1170,10 +1170,13 @@ export class SessionRegistry {
     } finally {
       live.cleanup();
       // A Run the session could not end before its shell went is `lost`, never `running` (G3);
-      // whatever it would journal later is refused by the sealed journal (jr-10).
+      // whatever it would journal later is refused by the sealed journal (jr-10). Its duration is the
+      // session's measure, on the monotonic clock, as the session's own ends are (a reviewer's read of
+      // the fixes for #22); only a Run the session does not hold is dated from its journaled start.
       const now = Date.now();
       for (const r of journal.runs.open()) {
-        journal.append({ type: 'run.end', runId: r.runId, state: 'lost', reason: 'session-closed', durationMs: Math.max(0, now - (r.startedAt ?? r.admittedAt)) });
+        const durationMs = live.session.runDurationMs(r.runId) ?? Math.max(0, now - (r.startedAt ?? r.admittedAt));
+        journal.append({ type: 'run.end', runId: r.runId, state: 'lost', reason: 'session-closed', durationMs });
       }
       journal.seal();
       slot.cursors.merge(live.session.cursorsSnapshot());

@@ -109,6 +109,13 @@ export interface RunInfo {
   admittedAt: number;
   startedAt?: number;
   endedAt?: number;
+  /**
+   * An ended Run's duration, from its run.end: the session measured it on the monotonic clock, so
+   * it is the one duration every reader reports, never `endedAt - startedAt`, which a wall-clock step
+   * makes negative (a reviewer's read of the fixes for #22). A Run in flight has none: its elapsed
+   * time so far is Session.runDurationMs.
+   */
+  durationMs?: number;
   exit?: number;
   signal?: string;
   reason?: string;

@@ -37,7 +37,8 @@ import { FileStore } from '../src/core/stores.js';
 import { Journal } from '../src/core/journal.js';
 import type { Session } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
-import { fakeShellBackend, type FakeShell } from './fake-shell.js';
+import { clocks } from '../src/core/clock.js';
+import { fakeShellBackend, until, type FakeShell } from './fake-shell.js';
 
 const A = 'agent:a@test';
 const B = 'agent:b@test';
@@ -799,4 +800,35 @@ test('G18: a record that is valid JSON but names no owner is refused as a damage
   assert.equal(hist(r2.reg.get('noown')).owner, 'unknown');
   for (const owner of [A, 'system']) await assert.rejects(r2.reg.ensure({ id: 'noown', owner }), /names no owner/, `refused for ${owner}`);
   await cleanup(r2, r);
+});
+
+test('a Run the closing session could not end gets the session’s duration, on the monotonic clock, across a wall-clock step back', async (t) => {
+  // A reviewer's read of the fixes for #22: the session-closed end took `now - startedAt` on the wall clock, a third rule
+  // beside the session's monotonic one. A process that ignores every signal outlives the close, so the registry ends its Run.
+  const realNow = Date.now;
+  const realMono = clocks.monotonic;
+  let wallStep = 0;
+  let monoStep = 0;
+  Date.now = () => realNow() + wallStep;
+  clocks.monotonic = () => realMono() + monoStep;
+  t.after(() => {
+    Date.now = realNow;
+    clocks.monotonic = realMono;
+  });
+  const r = rig();
+  try {
+    const s = (await r.reg.ensure({ id: 'dur', owner: A })).session;
+    s.attach(A, 'c1');
+    const a = s.admit({ target: 'process', line: 'stubborn', principal: A });
+    assert.ok(a.admitted);
+    await until(() => s.run(a.run.runId).state === 'running', 2000, 'the Run to start');
+    wallStep -= 3000;
+    monoStep += 2500;
+    await r.reg.close('dur');
+    const end = hist(r.reg.get('dur')).journal.since(0).events.find((e): e is Extract<JournalEvent, { type: 'run.end' }> => e.type === 'run.end' && e.runId === a.run.runId)!;
+    assert.equal(end.reason, 'session-closed');
+    assert.ok(end.durationMs >= 2500, `the session's monotonic measure: ${end.durationMs} ms`);
+  } finally {
+    await cleanup(r);
+  }
 });

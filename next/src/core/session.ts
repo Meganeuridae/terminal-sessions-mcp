@@ -1488,11 +1488,7 @@ export class Session {
   private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; leftovers?: boolean; pipeStatus?: number[] }): void {
     if (isTerminal(run.state)) return;
     const endedAt = this.now();
-    // An interval, so on the monotonic clock: from the wall clock a step back between start and end
-    // journaled a negative duration, and the completion read `exit 0 in -3.0s` (the house's read of
-    // the 38 commits, #22, comment 6274773484). A Run rebuilt from the journal has no monotonic stamp.
-    const mono = run.startedMono ?? run.admittedMono;
-    const durationMs = Math.max(0, Math.round(mono !== undefined ? clocks.monotonic() - mono : endedAt - (run.startedAt ?? run.admittedAt)));
+    const durationMs = this.elapsedMs(run);
     const reason = outcome.reason ?? (outcome.state !== 'exited' ? run.endReason : undefined);
     const ev: Parameters<Journal['append']>[0] = { type: 'run.end', runId: run.runId, state: outcome.state, durationMs };
     if (outcome.exit !== undefined) ev.exit = outcome.exit;
@@ -1505,6 +1501,7 @@ export class Session {
     const ended = this.append(ev);
     run.state = outcome.state;
     run.endedAt = endedAt;
+    run.durationMs = durationMs;
     run.seq.end = ended?.seq ?? this.journal.lastSeq;
     if (outcome.exit !== undefined) run.exit = outcome.exit;
     if (outcome.signal) run.signal = outcome.signal;
@@ -2551,6 +2548,32 @@ export class Session {
   runAgeMs(runId: string): number | undefined {
     const r = this.runs.get(runId);
     return r?.admittedMono === undefined ? undefined : clocks.monotonic() - r.admittedMono;
+  }
+
+  /**
+   * How long a Run ran, or has run so far: the one rule for a Run's duration, so a run or await
+   * result, a progress digest, a completion and a session-closed end agree. An ended Run's is the
+   * duration its run.end journaled (RunInfo.durationMs); a Run in flight is measured like it, by
+   * elapsedMs. Each reader computed its own from the wall clock, and a step back between the start
+   * and the read made a result say `exited 0 in -2999ms` beside a completion's 2.5s (a reviewer's
+   * read of the fixes for #22). Undefined for a Run this session does not hold in memory, whose
+   * journaled duration its RunInfo carries.
+   */
+  runDurationMs(runId: string): number | undefined {
+    const r = this.runs.get(runId);
+    if (!r) return undefined;
+    return isTerminal(r.state) ? r.durationMs : this.elapsedMs(r);
+  }
+
+  /**
+   * A Run's time since its start, or since its admission while it has not started: an interval, so on
+   * the monotonic clock (the house's read of the 38 commits, #22, comment 6274773484: from the wall
+   * clock, a step back journaled a negative duration and the completion read `exit 0 in -3.0s`). A Run
+   * this daemon life did not admit has no monotonic stamp: from its journaled start, never below zero.
+   */
+  private elapsedMs(r: RunRecord): number {
+    const mono = r.startedMono ?? r.admittedMono;
+    return Math.max(0, Math.round(mono !== undefined ? clocks.monotonic() - mono : this.now() - (r.startedAt ?? r.admittedAt)));
   }
 
   listRuns(): RunInfo[] {

@@ -60,6 +60,8 @@ function fakeSource(journal = new Journal({ hot: new MemoryStore(64 * 1024 * 102
     listRuns: () => [...runs.values()],
     runTranscript: async (runId) => ({ text: `output of ${runId}`, truncated: false, seq: [1, 2], nextCursor: 2 }),
     snapshot: () => screen,
+    // A fake holds no monotonic stamps: a digest counts from when the segmenter began tracking.
+    runDurationMs: () => undefined,
   };
 }
 

@@ -30,6 +30,8 @@ function fakeSource(): SegmentSource & { runs: Map<string, RunInfo>; screen: Scr
     listRuns: () => [...runs.values()],
     runTranscript: async (runId) => ({ text: `output of ${runId}`, truncated: false, seq: [1, 2], nextCursor: 2 }),
     snapshot: () => screen,
+    // A fake holds no monotonic stamps: a digest counts from when the segmenter began tracking.
+    runDurationMs: () => undefined,
   };
 }
 

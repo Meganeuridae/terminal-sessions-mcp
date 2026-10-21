@@ -15,6 +15,7 @@ import { callTool, TOOLS, type ResultText, type ToolResult } from '../src/api/to
 import { analyze, type UsageRecord } from '../src/api/usage.js';
 import { validate } from '../src/api/validate.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
+import { clocks } from '../src/core/clock.js';
 import { until } from './testhost.js';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-app-'));
@@ -296,4 +297,40 @@ test('item 11/G18: the App rereads a repaired record before judging a new life\'
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('run, await and start results report the session’s duration, on the monotonic clock: a wall-clock step back reads no negative time', async (t) => {
+  // A reviewer's read of the fixes for #22: the results computed `endedAt - startedAt` on the wall clock, so with the clock
+  // stepped back 3 s while 2.5 s passed a result read `exited 0 in -2999ms` beside a completion's 2.5s. The sessions are
+  // created after the stub, as a daemon's would be before a step.
+  const realNow = Date.now;
+  const realMono = clocks.monotonic;
+  let wallStep = 0;
+  let monoStep = 0;
+  Date.now = () => realNow() + wallStep;
+  clocks.monotonic = () => realMono() + monoStep;
+  t.after(() => {
+    Date.now = realNow;
+    clocks.monotonic = realMono;
+  });
+  const first = await tool('run', { session: 'dur', command: 'sleep 1.5', wait: 300 });
+  const runId = first.structured?.runId as string;
+  const live = registry.get('dur');
+  assert.ok(live?.kind === 'live');
+  await until(() => live.session.run(runId).state === 'running', 5000, 'the Run to start');
+  const svc = await tool('start', { session: 'dursvc', command: 'echo up; sleep 30', ready: { pattern: 'up' }, wait: 5000, idempotencyKey: 'dur-svc-1' });
+  assert.equal(svc.structured?.service, 'ready', JSON.stringify(svc.structured));
+  wallStep -= 3000;
+  monoStep += 2500;
+  const mid = await tool('await', { runId, wait: 50 });
+  assert.equal(mid.structured?.state, 'running');
+  assert.ok((mid.structured?.durationMs as number) >= 2500, `a Run in flight, so far: ${mid.structured?.durationMs} ms`);
+  const done = await tool('await', { runId, wait: 10_000 });
+  assert.equal(done.structured?.state, 'exited', JSON.stringify(done.structured));
+  assert.ok((done.structured?.durationMs as number) >= 2500, `the ended Run: ${done.structured?.durationMs} ms`);
+  assert.doesNotMatch(done.text, /in -\d/, done.text);
+  const replayed = await tool('start', { session: 'dursvc', command: 'echo up; sleep 30', ready: { pattern: 'up' }, wait: 5000, idempotencyKey: 'dur-svc-1' });
+  assert.equal(replayed.structured?.replayed, true);
+  assert.ok((replayed.structured?.durationMs as number) >= 2500, `a service, so far: ${replayed.structured?.durationMs} ms`);
+  await app.sessionClose(A, { session: 'dursvc' });
 });

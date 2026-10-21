@@ -285,6 +285,9 @@ export class RunIndex {
         const r = this.runs.get(ev.runId) ?? this.add(this.partial(ev.runId, 'shell', ev.seq, ev.ts - ev.durationMs));
         r.state = ev.state;
         r.endedAt = ev.ts;
+        // The session's measure, the one a reader reports (Session.runDurationMs). A journal written before
+        // durations were measured on the monotonic clock can hold a negative one (a wall-clock step back).
+        r.durationMs = Math.max(0, ev.durationMs);
         r.seq.end = ev.seq;
         if (ev.exit !== undefined) r.exit = ev.exit;
         if (ev.signal) r.signal = ev.signal;

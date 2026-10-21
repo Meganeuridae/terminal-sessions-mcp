@@ -78,6 +78,8 @@ export interface SegmentSource {
   listRuns(): RunInfo[];
   runTranscript(runId: string): Promise<RunText>;
   snapshot(): ScreenSnapshot;
+  /** How long the Run has run so far, by the session's one rule (Session.runDurationMs); undefined for a Run the source does not hold. */
+  runDurationMs(runId: string): number | undefined;
 }
 
 export interface SegmenterOptions {
@@ -1019,10 +1021,11 @@ export class Segmenter {
   private track(runId: string): RunWatch | undefined {
     if (this.running.has(runId) || this.disposing) return undefined;
     const run = runOf(this.s, runId);
-    // The start is journaled on the wall clock; its age is read once, here, and the digests count on from it on the
-    // monotonic clock, so a later step neither stops their elapsed time nor jumps it (comment 6274773484). A Run
-    // already in flight when the segmenter began has only that one reading, clamped at zero.
-    const startMono = clocks.monotonic() - Math.max(0, Date.now() - (run?.startedAt ?? run?.admittedAt ?? Date.now()));
+    // The digests count the Run's elapsed time on the monotonic clock, so a step neither stops it nor jumps it
+    // (comment 6274773484), from the session's own measure of the time so far: a Run already in flight when the
+    // segmenter began was dated from the wall-clock age of its journaled start, which a step back before then
+    // clamped to zero while the result said minutes (a reviewer's read of the fixes for #22).
+    const startMono = clocks.monotonic() - (this.s.runDurationMs(runId) ?? 0);
     const w: RunWatch = { runId, startMono, pipes: run?.target === 'process', bytes: 0, bytesAtLeast: false, bytesAtLastDigest: 0, lines: [], carry: '', marks: [] };
     this.running.set(runId, w);
     w.timer = setInterval(() => this.digest(w), this.o.cadenceMs);

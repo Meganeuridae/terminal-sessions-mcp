@@ -1172,8 +1172,9 @@ export class TermServer {
       // Cut at the read's byte cap, or to the last lines: the transcript does not start where the history does.
       truncated: read.truncated || lines.length > TRANSCRIPT_LINES,
       lastSeq,
-      // With each ended Run's duration, as a live session's activity shows it.
-      runs: s.listRuns().slice(-50).map((r) => (r.endedAt === undefined ? r : { ...r, durationMs: r.endedAt - (r.startedAt ?? r.admittedAt) })),
+      // Each ended Run carries its journaled duration, as a live session's activity shows it (never the
+      // wall clock's `endedAt - startedAt`: a reviewer's read of the fixes for #22).
+      runs: s.listRuns().slice(-50),
       info: this.summaryOf(conn, sid),
     };
   }

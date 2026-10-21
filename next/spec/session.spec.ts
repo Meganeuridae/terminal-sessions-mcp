@@ -10,6 +10,7 @@ import type { ScriptedProcess } from '../src/backends/scripted.js';
 import type { Journal } from '../src/core/journal.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { clocks } from '../src/core/clock.js';
+import { Segmenter, type Segment } from '../src/core/segmenter.js';
 import { AGENT, HUMAN, scriptedSession as harness, until } from './fake-shell.js';
 
 const types = (j: Journal, from = 0) => j.since(from).events.map((e) => e.type);
@@ -448,6 +449,52 @@ test('a Run’s duration is measured on the monotonic clock: a wall-clock step b
     assert.equal((await h.session.awaitRun(a.run.runId, 5000)).state, 'exited');
     const end = h.journal.since(0).events.find((e): e is Extract<JournalEvent, { type: 'run.end' }> => e.type === 'run.end')!;
     assert.ok(end.durationMs >= 2500 && end.durationMs < 4500, `the monotonic interval, not the wall clock's: ${end.durationMs} ms`);
+  } finally {
+    await h.session.close();
+  }
+});
+
+test('one rule for a Run’s duration across a wall-clock step back: so far, at its end, in the run index, and in the digests of a segmenter that began after the step', async (t) => {
+  // A reviewer's read of the fixes for #22: the journaled duration was monotonic, but a run result read `endedAt - startedAt`
+  // (`exited 0 in -2999ms` beside a completion's 2.5s), and a segmenter that began after the step dated the Run's digests
+  // from the wall-clock age of its journaled start, clamped to zero.
+  const realNow = Date.now;
+  const realMono = clocks.monotonic;
+  let wallStep = 0;
+  let monoStep = 0;
+  Date.now = () => realNow() + wallStep;
+  clocks.monotonic = () => realMono() + monoStep;
+  t.after(() => {
+    Date.now = realNow;
+    clocks.monotonic = realMono;
+  });
+  const h = await harness();
+  try {
+    const a = h.session.admit({ target: 'shell', line: 'sleep 3', principal: AGENT });
+    assert.ok(a.admitted);
+    const id = a.run.runId;
+    await until(() => h.session.run(id).state === 'running', 5000, 'the Run to start');
+    wallStep -= 3000;
+    monoStep += 2500;
+    const seg = new Segmenter(h.session, { cadenceMs: 40 });
+    t.after(() => seg.dispose());
+    const out: Segment[] = [];
+    seg.subscribe((s) => out.push(s));
+    h.pty.emit('tick\r\n');
+    await until(() => out.some((s) => s.kind === 'output'), 5000, 'a digest');
+    const elapsed = out.find((s) => s.kind === 'output')!.metadata.elapsedMs as number;
+    assert.ok(elapsed >= 2500 && elapsed < 4500, `the digest counts from the session's measure: ${elapsed} ms`);
+    const sofar = h.session.runDurationMs(id)!;
+    assert.ok(sofar >= 2500 && sofar < 4500, `so far, on the monotonic clock: ${sofar} ms`);
+    assert.equal(h.session.run(id).durationMs, undefined, 'a Run in flight carries no duration of its own');
+    h.shell.finishHung(0, 'ok\r\n');
+    assert.equal((await h.session.awaitRun(id, 5000)).state, 'exited');
+    const end = h.journal.since(0).events.find((e): e is Extract<JournalEvent, { type: 'run.end' }> => e.type === 'run.end')!;
+    assert.ok(end.durationMs >= 2500, `${end.durationMs} ms`);
+    assert.equal(h.session.run(id).durationMs, end.durationMs, 'the ended Run carries the journaled duration');
+    assert.equal(h.session.runDurationMs(id), end.durationMs, 'and the rule answers with it');
+    assert.equal(h.session.listRuns().find((r) => r.runId === id)!.durationMs, end.durationMs, 'a listing carries it (the GUI shows it)');
+    assert.equal(h.journal.runs.run(id)!.durationMs, end.durationMs, 'history’s Run, from the journal, carries the same one');
   } finally {
     await h.session.close();
   }

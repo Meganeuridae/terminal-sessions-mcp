@@ -863,8 +863,12 @@ export class App {
     if (run.reason) res.reason = run.reason;
     if (run.leftovers) res.leftovers = true;
     if (run.pipeStatus) res.pipeStatus = [...run.pipeStatus];
-    if (run.startedAt !== undefined) res.durationMs = (run.endedAt ?? Date.now()) - run.startedAt;
-    else if (run.state === 'queued') res.queuedMs = Date.now() - run.admittedAt;
+    // The session's one rule for a Run's duration, and its monotonic age for a queued Run's wait: never the
+    // wall clock's `endedAt - startedAt`, which a step back made negative (a reviewer's read of the fixes for #22).
+    if (run.startedAt !== undefined) {
+      const ms = run.durationMs ?? session?.runDurationMs(run.runId);
+      if (ms !== undefined) res.durationMs = ms;
+    } else if (run.state === 'queued') res.queuedMs = Math.max(0, Math.round(session?.runAgeMs(run.runId) ?? Date.now() - run.admittedAt));
     if (run.envBasis) res.envBasis = run.envBasis;
     if (run.line !== undefined) res.line = head(run.line, 200);
     if (run.shell !== undefined) res.shell = run.shell;
@@ -1106,7 +1110,10 @@ export class App {
     if (run.reason) res.reason = run.reason;
     if (run.leftovers) res.leftovers = true;
     if (run.pipeStatus) res.pipeStatus = [...run.pipeStatus];
-    if (run.startedAt !== undefined) res.durationMs = (run.endedAt ?? Date.now()) - run.startedAt;
+    if (run.startedAt !== undefined) {
+      const ms = run.durationMs ?? session.runDurationMs(runId);
+      if (ms !== undefined) res.durationMs = ms;
+    }
     if (run.envBasis) res.envBasis = run.envBasis;
     if (run.shell !== undefined) res.shell = run.shell;
     if (run.within !== undefined) res.within = run.within;
