@@ -1388,8 +1388,13 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     // before it (`[terminal]` over a Run's line: our read of the 40 commits, PR #22). Room is kept for the longest
     // header that could be needed: the one naming the first line kept, or one among the lines kept.
     const h0 = multi ? namingHeader(lines, first, headers) : -1;
-    const room = multi ? Math.max(h0 === -1 ? 0 : utf8Length(lines[h0]!) + 1, ...kept.filter((l) => headers.has(l)).map((l) => utf8Length(l) + 1)) : 0;
-    const tail = cutTail(joined, room ? Math.max(1, maxBytes - room) : maxBytes);
+    const lead = h0 === -1 ? 0 : utf8Length(lines[h0]!) + 1;
+    // Lines that fit the cap with the header naming their first are not cut: room for a longer header among them,
+    // kept for a cut that never came, cut tails that fit, and said nothing of it (an independent read of the fixes
+    // for the review of the 40 commits, PR #22).
+    const fits = utf8Length(joined) + lead <= maxBytes;
+    const room = fits || !multi ? 0 : Math.max(lead, ...kept.filter((l) => headers.has(l)).map((l) => utf8Length(l) + 1));
+    const tail = fits ? { text: joined, cut: false } : cutTail(joined, room ? Math.max(1, maxBytes - room) : maxBytes);
     const dropped = joined.slice(0, joined.length - tail.text.length);
     // The line of `lines` the cut text begins in; a header it begins with whole names what follows itself.
     const at = first + countLines(dropped);
@@ -1397,7 +1402,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     const h = !multi || (atStart && headers.has(lines[at]!)) ? -1 : namingHeader(lines, at, headers);
     const named = h === -1 ? undefined : lines[h];
     const text = named === undefined ? tail.text : `${named}\n${tail.text}`;
-    return { kept, drop: outputLines(lines.slice(0, drop)), cutByBytes, tail: { cut: tail.cut, text } };
+    // A cut to fit the cap is a cut by bytes, whatever the lines' count said before it.
+    return { kept, drop: outputLines(lines.slice(0, drop)), cutByBytes: cutByBytes || tail.cut, tail: { cut: tail.cut, text } };
   };
   const outputLines = (kept: string[]) => (multi ? kept.filter((l) => !headers.has(l)).length : kept.length);
   let all = await projectTail(n);

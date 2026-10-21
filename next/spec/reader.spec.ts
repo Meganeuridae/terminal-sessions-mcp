@@ -1767,3 +1767,30 @@ test("a raw page notes the parts of a retention hole in order among the gaps it 
   assert.deepEqual(order.slice(0, 2), [[1, 4], [5, 8]]);
   assert.deepEqual(order, notes(text.text!), 'as a text page orders them');
 });
+
+test('a two-source tail that fits its cap is not cut, and one that is cut says so (an independent read of the fixes for the review of the 40 commits, PR #22)', async () => {
+  // Room kept for the longest header among the lines kept, `[run r123456789]`, cut a tail that fit 1,024 bytes with its
+  // first header, `[terminal]`, and `truncated` stayed false.
+  for (const [x, y] of [[490, 492], [700, 282]] as const) {
+    const src = source({ cols: 4000 });
+    out(src.journal, 'p'.repeat(x) + '\r\n');
+    startRun(src.journal, 'r123456789');
+    out(src.journal, 'r'.repeat(y) + '\r\n', 'stdout', 'r123456789');
+    out(src.journal, 'q\r\n');
+    const full = await readJournal(src, { tail: 3, maxBytes: 1 << 20 }, { resultBytes: 1 << 20 });
+    assert.equal(Buffer.byteLength(full.text!), 1024);
+    const r = await readJournal(src, { tail: 3, maxBytes: 1024 }, { resultBytes: 1 << 20 });
+    assert.equal(r.text, full.text, `${x}/${y}`);
+    assert.equal(r.truncated, false);
+    assert.equal(r.lines?.returned, 3);
+    // One byte more than the cap: now it's cut, and says so.
+    const src2 = source({ cols: 4000 });
+    out(src2.journal, 'p'.repeat(x + 1) + '\r\n');
+    startRun(src2.journal, 'r123456789');
+    out(src2.journal, 'r'.repeat(y) + '\r\n', 'stdout', 'r123456789');
+    out(src2.journal, 'q\r\n');
+    const cut = await readJournal(src2, { tail: 3, maxBytes: 1024 }, { resultBytes: 1 << 20 });
+    assert.ok(Buffer.byteLength(cut.text!) <= 1024, `${Buffer.byteLength(cut.text!)} bytes`);
+    assert.equal(cut.truncated, true, `${x + 1}/${y}: ${JSON.stringify(cut.lines)}`);
+  }
+});
