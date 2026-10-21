@@ -8,7 +8,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { launchctlUnit, systemctlUnit, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
+import * as fs from 'node:fs';
+import { launchctlUnit, plistUnit, systemctlUnit, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
 
 /** ExecStart as systemd 255 prints it: the argv joined by one space each, unquoted. */
 const execStart = (argv: string[]) => `{ path=/bin/sh ; argv[]=${['/bin/sh', '/pkg/next/config/termd-launch.sh', ...argv].join(' ')} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }`;
@@ -74,4 +75,62 @@ test('a launchctl print with no arguments block is unknown, not termd with no ar
   assert.equal(unitArg(u, '--data-dir'), ' /srv/my  data ');
   // Only the job's own environment: the inherited one is another block.
   assert.deepEqual(u.env, { TSM_DATA_DIR: '/ignored' });
+});
+
+test('an option given twice is read as termd reads it, by its last value (the house\'s read of the 40 commits, #22)', () => {
+  // The first value was read: `/a`, where termd's parseArgs takes `/b`.
+  assert.equal(unitDataDir(systemd(['--data-dir', '/a', '--data-dir', '/b'])), '/b');
+  assert.equal(unitArg(systemd(['--port', '4100', '--port=4200']), '--port'), '4200');
+  assert.equal(unitPort(systemd(['--port', '4100', '--port', '4200'])), '4200');
+});
+
+test('a --port with no value is an unknown port, not the environment\'s or termd\'s default (the house\'s read of the 40 commits, #22)', () => {
+  // termd refuses it, as it refuses a --data-dir with none: read on, it was TSM_PORT's 4100, and with no environment 3101.
+  assert.equal(unitPort(systemd(['--port'], 'TSM_PORT=4100')), undefined);
+  assert.equal(unitPort(systemd(['--port='])), undefined);
+  assert.equal(unitPort(systemd(['--port', '', '--data-dir', '/srv/d'])), undefined);
+  const launchd = launchctlUnit(launchctlPrint({ argv: ['--port'], env: { SESSION_SERVER_PORT: '4100' } }));
+  assert.ok(launchd);
+  assert.equal(unitPort(launchd), undefined);
+});
+
+test('an empty ExecStart is unknown, not termd with no arguments (the house\'s read of the 40 commits, #22)', () => {
+  assert.equal(systemctlUnit('', ''), undefined);
+  assert.equal(systemctlUnit('', 'TSM_PORT=4100'), undefined);
+});
+
+test('a data dir is read as termd will be given it: systemd expands ${NAME} when it runs the unit, nothing expands ~, and termd resolves from $HOME (the house\'s read of the 40 commits, #22)', () => {
+  const home = os.homedir();
+  // systemd 255 left `~/ab` as it was, ran `${HOME}/brace` as $HOME/brace, and passed no `$HOME/x` at all.
+  assert.equal(unitDataDir(systemd(['--data-dir', '~/x'])), path.join(home, '~/x'));
+  assert.equal(unitDataDir(systemd(['--data-dir', '${HOME}/y'])), path.join(home, 'y'));
+  assert.equal(unitDataDir(systemd(['--data-dir', '${TSM_BASE}/z'], 'TSM_BASE=/srv/base')), '/srv/base/z');
+  assert.equal(systemctlUnit(execStart(['--data-dir', '$HOME/x']), ''), undefined, 'an argument systemd drops leaves the argv unknown');
+  assert.equal(systemctlUnit(execStart(['--data-dir', '${UNSET_HERE}/x']), ''), undefined, 'a variable not known here leaves the argv unknown');
+  // An Environment value systemd passes as written (its `${...}` unexpanded); a relative one is from $HOME.
+  assert.equal(unitDataDir(systemd([], 'TSM_DATA_DIR=~/env')), path.join(home, '~/env'));
+  assert.equal(unitDataDir(systemd([], 'TSM_DATA_DIR=rel/d')), path.join(home, 'rel/d'));
+  // launchd passes ProgramArguments as written.
+  const launchd = launchctlUnit(launchctlPrint({ argv: ['--data-dir', '~/x'] }));
+  assert.ok(launchd);
+  assert.equal(unitDataDir(launchd), path.join(home, '~/x'));
+});
+
+test('a LaunchAgent plist\'s environment keeps every key past an empty <string/> (the house\'s read of the 40 commits, #22)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-plist-'));
+  try {
+    const file = path.join(dir, 'com.animalabs.termd.plist');
+    fs.writeFileSync(
+      file,
+      '<plist><dict><key>ProgramArguments</key><array><string>/bin/sh</string></array>' +
+        '<key>EnvironmentVariables</key><dict><key>EMPTY</key><string/><key>TSM_DATA_DIR</key><string>/data/t</string><key>OTHER</key><string /></dict></dict></plist>',
+    );
+    const u = plistUnit(file);
+    assert.ok(!('error' in u), JSON.stringify(u));
+    // The lazy key ran on over `<string/>`: the env was {"EMPTY</key><string/><key>TSM_DATA_DIR": "/data/t"}.
+    assert.deepEqual(u.env, { EMPTY: '', TSM_DATA_DIR: '/data/t', OTHER: '' });
+    assert.equal(unitDataDir(u), '/data/t');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

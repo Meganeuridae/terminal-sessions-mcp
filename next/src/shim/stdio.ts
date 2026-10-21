@@ -257,7 +257,12 @@ function ask(cmd: string, args: string[]): Promise<Asked> {
   });
 }
 
-const managed = (by: string, u: UnitText): Supervisor => ({ kind: 'managed', by, port: unitPort(u), dataDir: unitDataDir(u) });
+const managed = (by: string, u: UnitText): Supervisor => {
+  const port = unitPort(u);
+  // A port the unit names without a value is one termd refuses: which port the unit means is unknown.
+  if (port === undefined) return { kind: 'unknown', why: `${by} names --port without a value, so its port is unknown` };
+  return { kind: 'managed', by, port, dataDir: unitDataDir(u) };
+};
 
 /** Whether two paths name one directory: by what they resolve to on disk where they exist, else by their spelling. */
 function sameDir(a: string, b: string): boolean {
@@ -336,7 +341,7 @@ async function checkSupervisor(): Promise<Supervisor> {
     const enabled = /^(enabled|static|linked|indirect|generated|transient|alias)/.test(prop('UnitFileState'));
     if (!running && !enabled) return { kind: 'none' };
     const unit = systemctlUnit(prop('ExecStart'), prop('Environment'));
-    if (!unit) return { kind: 'unknown', why: `the systemd user unit termd's ExecStart is not in the shape read here (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown` };
+    if (!unit) return { kind: 'unknown', why: prop('ExecStart') ? `the systemd user unit termd's ExecStart is not in the shape read here, or names a variable not known here (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown` : "the systemd user unit termd has no ExecStart, so its port and data dir are unknown" };
     return managed('the systemd user unit termd', unit);
   }
   return { kind: 'none' };
