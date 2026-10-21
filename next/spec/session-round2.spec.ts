@@ -500,6 +500,42 @@ test('an empty line whose file cannot be removed at its prompt still frees the s
   assert.ok(!fs.existsSync(probe), 'and goes with the session’s other files');
 });
 
+test('a cancel whose empty line cannot be written types none, says so, and takes the shell’s next prompt as its answer', async () => {
+  // askForPrompt's fallback when its file cannot be written: no line is typed, and the prompt the stopped
+  // shell prints for the ^C when it runs again is the shell's answer.
+  const h = await harness();
+  h.shell.stop();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const before = h.pty.written.length;
+  const open = fsc.openSync;
+  fsc.openSync = ((file: fs.PathLike, ...rest: unknown[]) => {
+    if (/tsm-cmd-/.test(String(file))) throw fault('ENOSPC', `no space left on device, open '${String(file)}'`);
+    return (open as (...args: unknown[]) => number)(file, ...rest);
+  }) as typeof fs.openSync;
+  syncBuiltinESMExports();
+  let c: Awaited<ReturnType<typeof h.session.cancel>>;
+  try {
+    c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  } finally {
+    fsc.openSync = open;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(c.steps, ['^C', '^C', 'the line was discarded before it started'], JSON.stringify(c));
+  assert.doesNotMatch(h.pty.written.slice(before), /tsm-cmd-/, 'no empty line was typed');
+  const said = ofType(h.journal.since(0).events, 'note').map((e) => e.text);
+  assert.ok(said.some((t) => /empty line that asks the shell for its prompt could not be written \(ENOSPC/.test(t)), JSON.stringify(said));
+  assert.ok(said.some((t) => /counts as available again at its next prompt/.test(t)), JSON.stringify(said));
+  assert.deepEqual(h.session.shellAvailable(), { ok: false, reason: 'prompt-pending' }, 'no mark says the shell is back yet');
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  h.shell.cont(); // the prompt for the ^C: the shell's answer
+  const rb = await h.session.awaitRun(b.run.runId, 2000);
+  assert.deepEqual([rb.state, rb.exit], ['exited', 0], JSON.stringify(rb));
+  assert.equal((await h.session.runTranscript(rb.runId)).text, 'hello');
+  await h.session.close();
+});
+
 test('an end mark that arrives for a line under cancel whose pre-execution mark never came ends the Run cancelled at that mark', async () => {
   // The ^C landed in the hook before it printed the C mark; the command ran and its D came with no
   // Run running. The pending Run ends cancelled there (its exit is not attributed to it), without
