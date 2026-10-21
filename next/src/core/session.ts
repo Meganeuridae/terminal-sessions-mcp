@@ -571,7 +571,7 @@ export class Session {
    * up on it is not a person's command, and a Run written after it waits behind it (onPreExec).
    */
   private probeLine: { file: string; order: number } | undefined;
-  /** The replies the screen wrote to the shell's terminal queries since its last command ended, the newest REPLIES_KEPT (resendReplies). */
+  /** The replies the screen wrote to the shell's terminal queries since its last prompt start, the newest REPLIES_KEPT (resendReplies). */
   private replies: string[] = [];
   private readonly queue: RunRecord[] = [];
   /**
@@ -1086,6 +1086,9 @@ export class Session {
 
   private onPromptStart(): void {
     this.sawPromptStart = true;
+    // The prompt's own queries follow its start mark (fish sends them after the fish_prompt event that
+    // prints it); a reply kept from before it was a running program's (resendReplies).
+    this.replies = [];
     this.sawPromptEnd = false;
     this.humanEditing = false;
     this.submittedAt = undefined;
@@ -1304,8 +1307,6 @@ export class Session {
 
   private onCommandEnd(exit: number | undefined, pipeStatus?: number[]): void {
     this.declareIntegration('basic');
-    // The prompt drawn next sends its own queries; what the command was answered is its own (resendReplies).
-    this.replies = [];
     const run = this.currentShellRun;
     if (run && run.strategy === 'marker') return; // its marker ends it
     if (run && run.state === 'running') {
@@ -2496,7 +2497,6 @@ export class Session {
       // 6307351617, item 1). It stays busy until the shell shows it is back, which askForPrompt asks.
       this.discardPending(run, { state: 'cancelled', reason: 'cancelled-before-start' });
       steps.push('the line was discarded before it started');
-      this.resendReplies();
       const asked = await this.askForPrompt();
       const discarded = `${runId}: no mark followed two ^C; the line was discarded before it started`;
       if (asked === 'typed') {
@@ -2566,6 +2566,7 @@ export class Session {
     if (this.shellState === 'exited' || this.shellState === 'unavailable' || this.closing) return 'gone';
     if (this.promptProbe !== waiting) return 'answered';
     if (why !== undefined) return { why };
+    this.resendReplies();
     let file: string;
     try {
       file = this.writeTempFile('', true);
@@ -2627,18 +2628,24 @@ export class Session {
    * queries with it. fish 4.9 sends queries with each prompt and reads no key until the DA1 reply
    * comes: stopped across a cancel, whose empty line a later ^C flushed, it read nothing more, an Enter
    * included, until the session closed (found by run on macOS while answering the house's review of the
-   * 40 commits through f3750e4, #22 comment 6310921374, question 1). So the replies written since the shell's last command ended go
-   * again after the ^Cs of a cancel that drew no mark, ahead of its empty line, and after any ^C while the
-   * shell has not answered it. A shell that read them already gets them twice: fish ignores a reply it
-   * did not ask for; bash and zsh, whose prompts send no queries unless a theme does, would show one in
-   * the editor, which a daemon line's clear keys empty.
+   * 40 commits through f3750e4, #22 comment 6310921374, question 1). So the replies written since the
+   * shell's last prompt start go again after the ^Cs of a cancel that drew no mark, ahead of its empty
+   * line, and after any ^C while the shell has not answered it — each time only once the checks that
+   * gate the empty line say the line editor holds the terminal (whyNotEditor). Sent while a program or a
+   * DEBUG trap's `read` holds it, they were that reader's input, and from before the prompt start they
+   * could be a program's (an independent read of the fix for question 1). A shell that read them already
+   * gets them twice: fish ignores a reply it did not ask for; bash and zsh, whose prompts send no queries
+   * unless a theme does, would show one in the editor, which a daemon line's clear keys empty.
    */
   private resendReplies(): void {
     for (const reply of this.replies) this.writeReply(reply);
   }
 
-  private resendRepliesWhileUnanswered(): void {
-    if (this.promptProbe && !this.promptProbe.started) this.resendReplies();
+  private async resendRepliesWhileUnanswered(): Promise<void> {
+    const probe = this.promptProbe;
+    if (!probe || probe.started || this.replies.length === 0) return;
+    if ((await this.whyNotEditor()) !== undefined) return;
+    if (this.promptProbe === probe && !probe.started && !this.closing && this.shellState !== 'exited') this.resendReplies();
   }
 
   private writeReply(reply: string): void {
@@ -2850,7 +2857,7 @@ export class Session {
       this.noteEditing(data);
     }
     this.pty.write(data);
-    if (data.includes('\x03')) this.resendRepliesWhileUnanswered();
+    if (data.includes('\x03')) void this.resendRepliesWhileUnanswered();
     // Send the user's clearing keys before giving a waiting declared Run its turn.
     const layer = this.layers.at(-1);
     if (layer) queueMicrotask(() => this.drainDeclared(layer.within));
@@ -2955,7 +2962,7 @@ export class Session {
     if (c !== undefined) {
       this.append(ev);
       this.pty.write(c);
-      if (name === 'SIGINT') this.resendRepliesWhileUnanswered();
+      if (name === 'SIGINT') void this.resendRepliesWhileUnanswered();
       return;
     }
     const fg = this.pty.foreground?.();

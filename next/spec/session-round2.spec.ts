@@ -602,7 +602,7 @@ test('a prompt that comes while the terminal is read is the shell’s answer: no
   await h.session.close();
 });
 
-test('the replies to the shell’s terminal queries since its last command go again after a cancel’s ^Cs, ahead of its empty line, and after a ^C while it has not answered', async () => {
+test('the replies to the shell’s terminal queries since its last prompt start go again after a cancel’s ^Cs, ahead of its empty line, and after a ^C while it has not answered', async () => {
   // A ^C's tty flush took the daemon's replies with the input the shell had not read: fish 4.9, which reads
   // no key until its DA1 reply comes, then read nothing more (found by run while answering question 1 of
   // #22 comment 6310921374).
@@ -610,7 +610,7 @@ test('the replies to the shell’s terminal queries since its last command go ag
   const h = await harness();
   const first = h.session.admit({ target: 'shell', line: 'sleep 1', principal: AGENT });
   assert.ok(first.admitted);
-  h.pty.emit('\x1b[c'); // a query during the command: its reply is the command's
+  h.pty.emit('\x1b[c'); // a query during the command: its reply is the command's, and the prompt after it starts afresh
   await h.session.screen.settled();
   h.shell.finishHung(0);
   assert.equal((await h.session.awaitRun(first.run.runId, 2000)).state, 'exited');
@@ -627,12 +627,40 @@ test('the replies to the shell’s terminal queries since its last command go ag
   assert.deepEqual(afterCancel.match(DA1), [reply], 'the prompt’s reply once, not the command’s');
   assert.ok(afterCancel.indexOf(reply) < afterCancel.indexOf('tsm-cmd-'), 'ahead of the empty line');
   h.session.input('\x03', { principal: AGENT }); // a ^C typed after the empty line, while the shell has not answered
-  assert.deepEqual(h.pty.written.slice(h.pty.written.lastIndexOf('\x03') + 1).match(DA1), [reply], 'again after that ^C');
+  const third = h.pty.written.lastIndexOf('\x03') + 1;
+  await until(() => h.pty.written.slice(third).match(DA1)?.length === 1, 2000, 'the reply again, once the checks pass');
   h.shell.cont();
   await until(() => h.session.shellAvailable().ok, 2000, 'back at the shell’s prompt');
   const n = h.pty.written.length;
   h.session.input('\x03', { principal: AGENT }); // a ^C at a prompt that answered: nothing goes again
   assert.doesNotMatch(h.pty.written.slice(n), DA1);
+  await h.session.close();
+});
+
+test('a reader holding the terminal gets none of the kept replies: not after the cancel’s ^Cs, nor after a later ^C', async () => {
+  // A DEBUG trap's read holds the terminal in cooked mode, so the cancel types no empty line. The replies
+  // went into that read all the same: after the cancel's ^Cs, before the checks that gate the empty line,
+  // and again at each ^C while the shell had not answered (an independent read of the fix for question 1
+  // of #22 comment 6310921374).
+  const DA1 = /\x1b\[\?[\d;]+c/;
+  const h = await harness({ ignoreSignals: true, setup: (s) => s.on(/^trapread/, () => ({ hang: true, noStartMark: true })) });
+  h.pty.emit('\x1b[c'); // the prompt's query
+  await h.session.screen.settled();
+  assert.match(h.pty.written, DA1, 'the screen answered the query');
+  const a = h.session.admit({ target: 'shell', line: 'trapread', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  let reads = 0;
+  const mode = h.pty.inputMode.bind(h.pty);
+  h.pty.inputMode = () => (reads++, mode());
+  const before = h.pty.written.length;
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.match(c.steps.at(-1) ?? '', /^no empty line typed, since its terminal is in canonical mode/, JSON.stringify(c));
+  assert.doesNotMatch(h.pty.written.slice(before), DA1, 'no reply after the cancel’s ^Cs');
+  const checked = reads;
+  h.session.input('\x03', { principal: AGENT }); // a ^C while the shell has not answered
+  await until(() => reads > checked, 2000, 'the checks run for that ^C');
+  await tick();
+  assert.doesNotMatch(h.pty.written.slice(before), DA1, 'none after that ^C either');
   await h.session.close();
 });
 
