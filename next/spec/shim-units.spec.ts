@@ -178,6 +178,19 @@ test("a unit's environment starts from the user manager's, which Environment= ov
   assert.equal(unitPort(read([], '', { manager: 'TSM_PORT=4100', unset: 'TSM_PORT=4100' })), '3101');
 });
 
+test("a unit's port is read as termd reads it: trimmed and as a number, and one termd refuses is unknown (the house's read of the 40 commits over our fixes, #22)", () => {
+  // Compared as written, `03101` and ` 3101` were another port than the shim's 3101.
+  assert.equal(unitPort(systemd(['--port', '03101'])), '3101');
+  assert.equal(unitPort(systemd([], '"TSM_PORT= 3101"')), '3101');
+  assert.equal(unitPort(systemd([], 'SESSION_SERVER_PORT=04100')), '4100');
+  const launchd = launchctlUnit(launchctlPrint({ argv: ['--port=03101'] }));
+  assert.ok(launchd);
+  assert.equal(unitPort(launchd), '3101');
+  for (const bad of ['31o1', '70000', ' ']) {
+    assert.deepEqual(unitPort(systemd([], `"TSM_PORT=${bad}"`)), { unknown: `gives the port ${JSON.stringify(bad)}, which termd refuses` }, bad);
+  }
+});
+
 test("a unit's data dir is resolved from the HOME its environment gives termd, which the launcher starts in, and a ${HOME} it takes away is unknown (the house's read of the 40 commits over our fixes, #22)", () => {
   // systemd 255, transient user units: Environment=HOME=<dir> ran `${HOME}/x` as <dir>/x with HOME=<dir>,
   // and UnsetEnvironment=HOME ran it as /x with HOME unset. Taken from this shim's home, both were read wrong.

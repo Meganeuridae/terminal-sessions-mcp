@@ -179,14 +179,19 @@ export function unitArg(u: UnitText, flag: string): string | undefined | null {
  * listens on 4100 (the house's read of the 33 commits, #22 comment 6307350861). Unknown when the
  * unit names the flag without a value, which termd refuses: read on, `--port` with TSM_PORT=4100 was
  * port 4100 and `--port=` port 3101 (the house's read of the 40 commits, #22); and without the flag
- * when the environment has a source not read here (see `systemctlUnit`).
+ * when the environment has a source not read here (see `systemctlUnit`). The value is read as termd
+ * reads it, trimmed and as a number, so `03101` and ` 3101` are port 3101; compared as written, they
+ * were another port than the shim's 3101 (the house's read of the 40 commits over our fixes, #22). A
+ * value termd refuses, not digits or past 65535, is unknown, as a flag without one is.
  */
 export function unitPort(u: UnitText): string | Unknown {
   const arg = unitArg(u, '--port');
   if (arg === null) return { unknown: 'names --port without a value' };
-  if (arg !== undefined) return arg;
-  if (u.unreadEnv) return { unknown: `names no --port and reads ${u.unreadEnv}, which may set TSM_PORT or SESSION_SERVER_PORT` };
-  return setting('TSM_PORT', u.env) ?? setting('SESSION_SERVER_PORT', u.env) ?? '3101';
+  if (arg === undefined && u.unreadEnv) return { unknown: `names no --port and reads ${u.unreadEnv}, which may set TSM_PORT or SESSION_SERVER_PORT` };
+  const value = arg ?? setting('TSM_PORT', u.env) ?? setting('SESSION_SERVER_PORT', u.env) ?? '3101';
+  const digits = value.trim();
+  const n = /^\d+$/.test(digits) ? Number(digits) : NaN;
+  return n <= 65535 ? String(n) : { unknown: `gives the port ${JSON.stringify(value)}, which termd refuses` };
 }
 
 /**
