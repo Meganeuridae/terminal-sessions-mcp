@@ -87,6 +87,12 @@ const collect = (seg: Segmenter) => {
   seg.subscribe((s) => out.push(s));
   return out;
 };
+/** The output digest that counts `bytes` of the Run's output: the one a phase's appends produce, once it comes. */
+async function digestOf(out: Segment[], bytes: number): Promise<Segment> {
+  const of = () => out.find((s) => s.kind === 'output' && s.metadata.bytes === bytes);
+  await until(() => of() !== undefined, 5000, `a digest of ${bytes} bytes`);
+  return of()!;
+}
 const snap = (lines: string[], x: number, y: number): ScreenSnapshot => ({ cols: 80, rows: lines.length, alt: false, cursor: { x, y }, lines, title: '', seq: 1 });
 /** Catch-up over a live session: every lifecycle message after seq 0. */
 const replay = async (src: Fake) => renderPicked(liveSource(src), (await scanLifecycle(liveSource(src), 0)).picked);
@@ -626,8 +632,8 @@ test('leaving the alternate screen starts a shell Run’s line-end rule afresh: 
     src.screen.alt = false;
     src.journal.append({ type: 'screen.mode', alt: false });
     src.journal.append({ type: 'output', data: 'after\r\nnext\r\n', stream: 'pty', runId: 'vi' });
-    await sleep(100);
-    assert.deepEqual(out.filter((s) => s.kind === 'output').at(-1)?.body?.split('\n'), ['after', 'next']);
+    const bytes = 'before\r\n\x1b]0;title'.length + ' still the title\x07a full-screen frame\r\n'.length + 'after\r\nnext\r\n'.length;
+    assert.deepEqual((await digestOf(out, bytes)).body?.split('\n'), ['after', 'next']);
   } finally {
     seg.dispose();
   }
@@ -641,18 +647,22 @@ test('a digest never shows a string’s payload, though the carry is cut far ins
   startRun(src, 'copy');
   const seg = new Segmenter(src, { cadenceMs: 40 });
   const out = collect(seg);
-  const body = () => out.filter((s) => s.kind === 'output').at(-1)?.body ?? '';
+  // Each phase reads the digest of everything appended so far, not whichever came last: a fixed sleep could read the
+  // phase before's, which for "still open" says the same (a reviewer's read of the fixes for #22).
+  let bytes = 0;
+  const append = (data: string) => {
+    bytes += data.length;
+    src.journal.append({ type: 'output', data, stream: 'pty', runId: 'copy' });
+  };
+  const body = async () => (await digestOf(out, bytes)).body ?? '';
   try {
-    src.journal.append({ type: 'output', data: 'start\r\ncopying \x1b]52;c;' + 'S'.repeat(3000), stream: 'pty', runId: 'copy' });
-    src.journal.append({ type: 'output', data: 'E'.repeat(6000), stream: 'pty', runId: 'copy' });
-    await sleep(100);
-    assert.equal(body(), 'start', 'while the string is open');
-    src.journal.append({ type: 'output', data: 'C'.repeat(6000), stream: 'pty', runId: 'copy' });
-    await sleep(100);
-    assert.equal(body(), 'start', 'still open, after another cut');
-    src.journal.append({ type: 'output', data: '\x07done\r\n', stream: 'pty', runId: 'copy' });
-    await sleep(100);
-    assert.deepEqual(body().split('\n'), ['start', 'done'], 'the line it ended in');
+    append('start\r\ncopying \x1b]52;c;' + 'S'.repeat(3000));
+    append('E'.repeat(6000));
+    assert.equal(await body(), 'start', 'while the string is open');
+    append('C'.repeat(6000));
+    assert.equal(await body(), 'start', 'still open, after another cut');
+    append('\x07done\r\n');
+    assert.deepEqual((await body()).split('\n'), ['start', 'done'], 'the line it ended in');
   } finally {
     seg.dispose();
   }
