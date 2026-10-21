@@ -509,13 +509,15 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
   // journal recorded with no nonce reads by shape (an independent read of the fix for the house's
   // read of the 33 commits, #22, comment 6307351104). A string the line opened that runs past it
   // keeps what it hides (see above).
-  const striker = (): ((i: number, j: number) => void) => {
+  const striker = (): ((i: number, j: number, wholeLine?: boolean) => void) => {
     let end = 0;
-    return (i, j) => {
+    return (i, j, wholeLine = true) => {
       if (j < end) return;
-      const s = i < end ? end : rest.lastIndexOf('\n', i - 1) + 1;
+      const lineStart = rest.lastIndexOf('\n', i - 1) + 1;
+      // From the match's own start, the typed line's leading space with it, and then the line end stays.
+      const s = i < end ? end : wholeLine ? lineStart : i > lineStart && rest[i - 1] === ' ' ? i - 1 : i;
       const nl = rest.indexOf('\n', j);
-      end = nl === -1 ? rest.length : nl + 1;
+      end = nl === -1 ? rest.length : !wholeLine && s > lineStart ? nl : nl + 1;
       const lineRaw = from + s === 0 ? 0 : map[from + s - 1]! + 1;
       const lineRawEnd = map[from + end - 1]! + 1;
       const inside = open.get(from + i);
@@ -532,6 +534,8 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
     };
   };
   const strikeAnswer = striker();
+  // Where each probe answer before the end is, the accepted one's included: a shell answered the probe.
+  const answers: number[] = [];
   for (const m of rest.matchAll(probeAnswer(nonce))) {
     if (m.index >= to) break;
     // Accepted as the session accepts it (applyInlineMarker): the marker strategy's answer names
@@ -543,6 +547,7 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
     // 78c4d6e, #22, comment 6269901528). With no pid known, the token is the one evidence: the
     // Run's token is accepted, an empty one is not; from before tokens, any pid.
     const ok = m[2] === undefined || (pid !== undefined ? m[2] === pid && (m[3] === undefined || m[3] === '' || m[3] === m[1]) : m[3] === undefined || m[3] === m[1]);
+    answers.push(m.index);
     if (ok) {
       to = m.index;
       break;
@@ -554,11 +559,16 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
   // line of it: a redraw can break the typed line, its nonce included, over two lines, and striking
   // only the line where it began kept the rest (the house's read of the 38 commits, #22, comment
   // 6274773484). A probe nothing answered leaves only its echo, and what was printed after it stays.
+  // A probe a shell answered, accepted or not, goes from its line's start, which is that shell's
+  // prompt; one nothing answered goes from its own start, its line end kept, since a program read it
+  // after whatever the program had printed on that line: striking the whole line took a program's
+  // `Continue? [y/N] ` with it (the house's review of f3750e4..4f4c067, PR #22, comment 6315636412).
   const strikeEcho = striker();
-  for (const m of rest.matchAll(probeEcho(of.nonce))) {
-    if (m.index >= to) break;
-    strikeEcho(m.index, m.index + m[0].length - 1);
-  }
+  const probes = [...rest.matchAll(probeEcho(of.nonce))].filter((m) => m.index < to);
+  probes.forEach((m, k) => {
+    const next = probes[k + 1]?.index ?? Number.POSITIVE_INFINITY;
+    strikeEcho(m.index, m.index + m[0].length - 1, answers.some((a) => a > m.index && a < next));
+  });
   // Each kept piece, whether it ends where a struck line begins, and where in the raw it begins when a
   // string the struck line before it opened runs on into it.
   const kept: Array<[number, number, boolean, number | undefined]> = [];

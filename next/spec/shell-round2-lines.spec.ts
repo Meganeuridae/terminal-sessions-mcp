@@ -288,8 +288,26 @@ test('fish without its integration: a cancel’s probe that a long prompt wraps 
 });
 
 // The house's review of f3750e4..4f4c067 (PR #22, comment 6315636412), question 6 and the cutter's "left for later", in dash and
-// bash run as sh: a trace sent past the typed lines' redirects by a BASH_XTRACEFD.
+// bash run as sh: a probe typed into a program's prompt, and a trace sent past the typed lines' redirects by a BASH_XTRACEFD.
 for (const [name, shell] of [...(hasShell('/bin/dash') ? [['dash', '/bin/dash']] : []), ['bash as sh', bashAsSh]] as const) {
+  test(`${name}: a cancel's probe that a program read on its own prompt's line leaves the prompt: only the echo is struck`, async () => {
+    // With `Continue? [y/N] ` printed and ^C ignored, the result showed only `not continuing`: the striker took the probe echo's
+    // whole line, which suits a probe a shell answered at its prompt.
+    const x = await realSession(shell);
+    try {
+      const a = await x.session.admitWhenAvailable({ target: 'shell', line: "trap '' INT; printf 'Continue? [y/N] '; read x; echo not continuing; trap - INT", principal: AGENT }, 3000);
+      assert.ok(a.admitted);
+      const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
+      await until(() => output().includes('Continue? [y/N] '), 3000, 'the program’s prompt');
+      await x.session.cancel(a.run.runId, AGENT, { graceMs: 1500 });
+      const r = await x.session.awaitRun(a.run.runId, 3000);
+      assert.equal(r.exit, 0, JSON.stringify(r));
+      assert.equal((await x.session.runTranscript(a.run.runId)).text, 'Continue? [y/N] ^C\nnot continuing');
+    } finally {
+      await x.close();
+    }
+  });
+
   test(`${name}: with a BASH_XTRACEFD and set -x on before the Run, nothing of the daemon's lines stays in a Run's result, and a last line with no line end stays`, async () => {
     // bash 4.1 and later write the trace to the BASH_XTRACEFD past the start line's and the end mark's redirects; macOS's 3.2
     // writes it to the redirected stderr, and the result is the same.

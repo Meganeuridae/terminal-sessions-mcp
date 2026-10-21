@@ -94,8 +94,9 @@ test('a declared shell’s Run: its output begins after the start marker’s lin
   assert.equal(cutPlumbing(`\r\nA\r\n$ ${echo}\r\n<<<PROBE:${N}:2000:>>>\r\nB\r\n$ ${echo}\r\n<<<PROBE:${N}:1000:${N}>>>\r\n$ `, inline), 'A\r\nB\r\n');
   // An accepted answer whose echo was not shown (echo off), after a rejected probe: the cut is at the answer, the rejected lines struck.
   assert.equal(cutPlumbing(`\r\nA\r\n$ ${echo}\r\n<<<PROBE:${N}:2000:>>>\r\nB\r\n<<<PROBE:${N}:1000:${N}>>>\r\n`, inline), 'A\r\nB\r\n');
-  // A probe nothing answered (a program read it) leaves its echo: struck; the Run's natural end still ends the output.
-  assert.equal(cutPlumbing(`\r\nA\r\n$ ${echo}\r\nB\r\n<<<EXIT:${N}:3>>>`, inline), 'A\r\nB\r\n');
+  // A probe nothing answered (a program read it) leaves its echo: struck from its own start, so what the program printed on its
+  // line stays (the house's review of f3750e4..4f4c067, PR #22, comment 6315636412); the Run's natural end still ends the output.
+  assert.equal(cutPlumbing(`\r\nA\r\nContinue? ${echo}\r\nB\r\n<<<EXIT:${N}:3>>>`, inline), 'A\r\nContinue? \r\nB\r\n');
   // From before tokens, the start marker's pid judges the answers when the output holds it.
   const old = `<<<START:${N}:1000>>>\r\nA\r\n<<<PROBE:${N}:2000>>>\r\nB\r\n<<<PROBE:${N}:1000>>>\r\n`;
   assert.equal(cutPlumbing(old, inline), 'A\r\nB\r\n');
@@ -227,7 +228,7 @@ test('a probe’s echo broken over two lines is struck on every line it spans, t
   const afterNonce = probe.replace(`${nonce}:`, () => `${nonce}\r\n:`);
   assert.equal(cutPlumbing(`\r\nout\r\n^C\r\n$${afterNonce}\r\n<<<PROBE:${nonce}:1000:${nonce}>>>\r\n$ `, inline), 'out\r\n^C\r\n');
   const inArgs = probe.replace(`' "$$"`, () => `'\r\n "$$"`);
-  assert.equal(cutPlumbing(`\r\nout\r\n^C\r\n$${inArgs}\r\nmore\r\n<<<EXIT:${nonce}:0>>>`, inline), 'out\r\n^C\r\nmore\r\n', 'an unanswered probe: its echo struck, the output after it kept');
+  assert.equal(cutPlumbing(`\r\nout\r\n^C${inArgs}\r\nmore\r\n<<<EXIT:${nonce}:0>>>`, inline), 'out\r\n^C\r\nmore\r\n', 'an unanswered probe: its echo struck, the ^C before it and the output after it kept');
   const fish = inlineProbe(nonce, true).replace('$fish_pid', () => '\r\n$fish_pid');
   assert.equal(cutPlumbing(`\r\nout\r\n${fish}\r\nmore\r\n<<<EXIT:${nonce}:0>>>`, inline), 'out\r\nmore\r\n', 'fish’s probe line');
   const marker = { strategy: 'marker' as const, nonce };
@@ -505,23 +506,24 @@ test('a string a program opened on a probe echo’s line, running past it, keeps
     const ranges = keptRanges(`${head}${before}${end}`, marker);
     ranges.forEach(([s, e], i) => assert.ok(s < e && (i === 0 || ranges[i - 1]![1] <= s), `kept ranges in order: ${JSON.stringify(ranges)}`));
     // The OSC opened after the echo, on its line, and never closed before the Run's end: the echo goes, the string stays.
-    const after = `$${probe}\x1b]0;tit\r\npayload-rest\r\n`;
+    const after = `${probe}\x1b]0;tit\r\npayload-rest\r\n`;
     assert.equal(await shown(cutPlumbing(`${head}${after}${end}`, marker)), 'out', JSON.stringify(after));
   }
   // A string the echo's line opened and closed goes with the line, as before.
-  assert.equal(await shown(cutPlumbing(`${head}$${markerProbe(N)}\x1b]0;tit\x07\r\nafter\r\n${end}`, marker)), 'out\nafter');
+  assert.equal(await shown(cutPlumbing(`${head}${markerProbe(N)}\x1b]0;tit\x07\r\nafter\r\n${end}`, marker)), 'out\nafter');
 });
 
-test('the marker strategy’s start line prints the Run’s start mark with the shell’s pid, keeps the status the shell had for the body, leaves no temporary behind, ends no shell under set -e, and traces nothing after the mark', () => {
+test('the marker strategy’s start line prints the Run’s start mark with the shell’s pid, keeps the status the shell had for the body, leaves no temporary behind, ends no shell under set -e, and traces nothing after the mark, under a BASH_XTRACEFD too', () => {
   // The house's answer 2 on the 33 commits (#22, comment 6307351985): `$?` after `false` is still 1 in the body. The house's review
   // of the 40 commits through f3750e4 (PR #22, comment 6310921374): `__tsm_q` stayed set in the user's shell, and after
-  // `set -e; ! true` a body of only comments ended the shell, the start line's group being the file's last command.
+  // `set -e; ! true` a body of only comments ended the shell, the start line's group being the file's last command. Its review of
+  // f3750e4..4f4c067 (PR #22, comment 6315636412), question 6: a BASH_XTRACEFD sent the restore's traces past the redirect, and
+  // `++ eval 'unset __tsm_q; …'` and three more lines stayed at the head of every such Run's result (bash 5; macOS's 3.2 has none).
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-start-line-'));
   try {
     assert.ok(MARKER_SHELLS.length > 0, 'one of dash, bash, zsh and fish to run the lines in');
-    for (const { shell, flavor, status, trace } of MARKER_SHELLS) {
-      const what = path.basename(shell);
-      const file = path.join(dir, `${what}-${commandFile(1)}`);
+    for (const { name: what, shell, flavor, status, trace } of MARKER_SHELLS) {
+      const file = path.join(dir, `${what.replace(/\W+/g, '-')}-${commandFile(1)}`);
       const dot = sourceLine(file, flavor, N).trimStart().replace(/;.*$/, '');
       const left = flavor === 'fish' ? 'echo "q=[$__tsm_q]"; functions -q __tsm_start; and echo leaked-function; true' : 'echo "q=[${__tsm_q-}]"';
       const run = (head: string, body: string) => {
@@ -586,7 +588,8 @@ test('the cut reads a long line of probe-shaped fragments in time linear in it, 
       const t = performance.now();
       const cut = cutPlumbing(raw, of);
       const ms = performance.now() - t;
-      assert.equal(cut, 'after\r\n', `${fragment}: the line of fragments is struck`);
+      // Echo-shaped fragments nothing answered are struck from the first, and an answer's line whole.
+      assert.equal(cut, fragment.startsWith('<<<PROBE') ? 'after\r\n' : 'out\r\nafter\r\n', `${fragment}: the fragments are struck`);
       // Tens of seconds on the old pass; about 150 ms now, and the bound leaves room for a loaded machine.
       assert.ok(ms < 2000, `${fragment} ${JSON.stringify(of)}: ${Math.round(ms)} ms`);
     }
@@ -597,8 +600,11 @@ test('an escape before a struck probe echo stays with the output: a colour, a ti
   // An independent read of the fix: ending every kept piece right after the line end before a struck line dropped them.
   const marker = { strategy: 'marker' as const, nonce: N };
   for (const esc of ['\x1b[31m', '\x1b]0;title\x07', '\x1b]8;;http://x\x07']) {
-    const raw = `${typed(N)}<<<START:${N}:4242>>>\r\nout\r\n${esc}$${markerProbe(N)}\r\nmore\r\n<<<EXIT:${N}:0>>>\r\n`;
-    assert.equal(cutPlumbing(raw, marker), `out\r\n${esc}more\r\n`, JSON.stringify(esc));
+    // An answered probe's line goes whole, from the shell's prompt; an unanswered one from its echo's start.
+    const answered = `${typed(N)}<<<START:${N}:4242>>>\r\nout\r\n${esc}$${markerProbe(N)}\r\n<<<PROBE:${N}>>>\r\n$ `;
+    assert.equal(cutPlumbing(answered, marker), `out\r\n${esc}`, JSON.stringify(esc));
+    const unanswered = `${typed(N)}<<<START:${N}:4242>>>\r\nout\r\n${esc}${markerProbe(N)}\r\nmore\r\n<<<EXIT:${N}:0>>>\r\n`;
+    assert.equal(cutPlumbing(unanswered, marker), `out\r\n${esc}more\r\n`, JSON.stringify(esc));
   }
 });
 
