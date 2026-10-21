@@ -47,6 +47,14 @@ export interface JournalStore {
   /** What the store keeps beside its files for the numbering (G10); undefined when it keeps nothing. */
   highWater?(): HighWater | undefined;
   /**
+   * Sync to disk every file holding a seq this store has not synced since it opened: all of them at its first call,
+   * since an earlier life on this boot may have left its appends unsynced, and after that the files appended to
+   * since the last call. False when the disk refused. Appends are not synced otherwise: a journal syncs them only
+   * before it clears a failed reservation, whose holes the gaps it and the lives before it appended record
+   * (Journal.writeReservation).
+   */
+  syncAppends?(): boolean;
+  /**
    * Change the parts given, keeping the others. False when the disk refused the write, or when a raise is
    * written but could not be confirmed (its directory could not be synced): the caller retries.
    */
@@ -520,6 +528,8 @@ export class FileStore implements JournalStore {
   readonly kind = 'file';
   private readonly active: string;
   private fd: number | null = null;
+  /** The newest seq this store had appended when it last synced its appends (syncAppends); 0 until it first does. */
+  private syncedThrough = 0;
   private segments: Segment[] = [];
   private nextN = 1;
   private readonly fixedFileBytes: number | undefined;
@@ -590,6 +600,27 @@ export class FileStore implements JournalStore {
     this.meta = this.loadMeta();
     this.load();
     this.setRetention(opts);
+  }
+
+  syncAppends(): boolean {
+    for (const s of this.segments) {
+      if (s.last === undefined || s.last <= this.syncedThrough) continue;
+      try {
+        if (s.n === 0 && this.fd !== null) fs.fsyncSync(this.fd);
+        else {
+          const fd = fs.openSync(s.file, 'r');
+          try {
+            fs.fsyncSync(fd);
+          } finally {
+            fs.closeSync(fd);
+          }
+        }
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return false; // a file retention took holds nothing to sync
+      }
+    }
+    this.syncedThrough = this.lastSeq() ?? this.syncedThrough;
+    return true;
   }
 
   // ───────────── epoch and high water (G10, mcpl-4, jr2-6) ─────────────

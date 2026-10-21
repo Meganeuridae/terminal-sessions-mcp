@@ -1279,3 +1279,126 @@ test('a refused open of another principal\'s torn, epoch-less journal leaves its
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+// ───────────── the house's review of the 77 commits through 4f4c067, PR #22 ─────────────
+
+/** A file store whose appends are refused once `budget` runs out, and whose reservation and append syncs can be refused, with each call logged. */
+class Flaky extends FileStore {
+  budget = Number.POSITIVE_INFINITY;
+  refuseMarks = false;
+  refuseSync = false;
+  calls: string[] = [];
+  override append(event: JournalEvent): void {
+    if (this.budget-- <= 0) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+    super.append(event);
+  }
+  override setHighWater(change: Parameters<FileStore['setHighWater']>[0]): boolean {
+    const r = change.reservation;
+    const what = r ? (r.failed ? 'failed' : 'clear') : 'floor';
+    if (this.refuseMarks) {
+      this.calls.push(`${what} refused`);
+      return false;
+    }
+    this.calls.push(what);
+    return super.setHighWater(change);
+  }
+  override syncAppends(): boolean {
+    this.calls.push(this.refuseSync ? 'sync refused' : 'sync');
+    return this.refuseSync ? false : super.syncAppends();
+  }
+}
+
+/** The reservation on disk, read through a store opened and closed for the look. */
+function peekReservation(dir: string) {
+  const s = new FileStore(dir);
+  try {
+    return s.highWater()?.reservation;
+  } finally {
+    s.close();
+  }
+}
+
+/** 10 events on disk, then 40 the disk refuses, of which the ring (1500 bytes) drops 11–38. */
+function refusedStretch(dir: string) {
+  const cold = new Flaky(dir);
+  const j = new Journal({ hot: new MemoryStore(1500), cold, sessionId: 's' });
+  for (let i = 0; i < 10; i++) j.append(out(`ok${i}`));
+  cold.budget = 0;
+  for (let i = 0; i < 40; i++) j.append(out(`a-${i}-${'z'.repeat(40)}`));
+  return { cold, j };
+}
+
+test('a start over the failed mark an earlier life left syncs every file before it clears it, the rotated one holding that life\'s gap among them', () => {
+  const dir = tmpDir();
+  const realFsync = fsc.fsyncSync;
+  const synced = new Set<string>();
+  let life1: Journal | undefined;
+  try {
+    // Life 1: the disk refuses a stretch the ring partly drops, then takes events again while every sync is
+    // refused, so the stretch's gap is in the files, unsynced, and the mark on disk is still failed. More events
+    // rotate that gap's file out of the active one. Then it dies.
+    const cold = new Flaky(dir, { maxFileBytes: 2000 });
+    life1 = new Journal({ hot: new MemoryStore(1500), cold, sessionId: 's' });
+    for (let i = 0; i < 10; i++) life1.append(out(`ok${i}`));
+    cold.budget = 0;
+    for (let i = 0; i < 40; i++) life1.append(out(`a-${i}-${'z'.repeat(40)}`));
+    cold.refuseSync = true;
+    cold.budget = Number.POSITIVE_INFINITY;
+    life1.retryCold();
+    for (let i = 0; i < 40; i++) life1.append(out(`b-${i}-${'y'.repeat(40)}`));
+    const files = fs.readdirSync(dir).filter((n) => /^journal(\.\d+)?\.jsonl$/.test(n));
+    const gapFile = files.find((n) => gaps(lines(path.join(dir, n)).map((l) => JSON.parse(l) as JournalEvent)).some((g) => g[0] === 11 && g[1] === 38));
+    assert.ok(gapFile !== undefined && gapFile !== 'journal.jsonl', `the stretch's gap is in a rotated file (${gapFile} of ${files.join(', ')})`);
+    assert.equal(peekReservation(dir)?.failed, true, 'and the mark on disk is failed');
+    // Life 2 starts over it and closes: its clear waits for a sync of every file, the rotated one included.
+    fsc.fsyncSync = ((fd: number) => {
+      const st = fsc.fstatSync(fd);
+      if (!st.isDirectory()) synced.add(String(st.ino));
+      return realFsync(fd);
+    }) as typeof fs.fsyncSync;
+    syncBuiltinESMExports();
+    const cold2 = new Flaky(dir, { maxFileBytes: 2000 });
+    new Journal({ cold: cold2, sessionId: 's' }).close();
+    assert.deepEqual(cold2.calls.filter((c) => c === 'sync' || c === 'clear').slice(0, 2), ['sync', 'clear'], cold2.calls.join(' → '));
+    assert.ok(synced.has(String(fs.statSync(path.join(dir, gapFile)).ino)), 'the file holding the earlier life\'s gap was synced');
+  } finally {
+    fsc.fsyncSync = realFsync;
+    syncBuiltinESMExports();
+    life1?.close(); // every sync it tries is refused, so it changes nothing on disk
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a heal clears the failed mark only once the gaps it waited for are synced, and a refused sync keeps it failed: a power loss after the clear cannot take a stretch\'s gap with it', () => {
+  const dir = tmpDir();
+  const realFsync = fsc.fsyncSync;
+  const synced: string[] = [];
+  fsc.fsyncSync = ((fd: number) => {
+    const st = fsc.fstatSync(fd);
+    if (!st.isDirectory()) synced.push(String(st.ino));
+    return realFsync(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  try {
+    const { cold, j } = refusedStretch(dir);
+    cold.budget = Number.POSITIVE_INFINITY;
+    cold.refuseSync = true;
+    cold.calls.length = 0;
+    j.retryCold();
+    assert.deepEqual(cold.calls, ['sync refused'], 'the clear waits for the sync');
+    assert.equal(peekReservation(dir)?.failed, true, 'still failed on disk');
+    cold.refuseSync = false;
+    cold.calls.length = 0;
+    synced.length = 0;
+    j.close();
+    assert.deepEqual(cold.calls.slice(0, 2), ['sync', 'clear'], `synced, then cleared: ${cold.calls.join(' → ')}`);
+    const journalIno = String(fs.statSync(path.join(dir, 'journal.jsonl')).ino);
+    assert.ok(synced.includes(journalIno), 'the file holding the stretch\'s gap was synced');
+    assert.ok(gaps(onDisk(dir)).some((g) => g[0] === 11 && g[1] === 38), 'and the gap is in it');
+  } finally {
+    fsc.fsyncSync = realFsync;
+    syncBuiltinESMExports();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+

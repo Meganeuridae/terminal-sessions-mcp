@@ -181,6 +181,14 @@ export class Journal {
   /** With `reservedFailed`: the confirmed reservation's `failedFrom`, where a start after a stop looks for jumps from. */
   private reservedFrom = Number.POSITIVE_INFINITY;
   /**
+   * A failed mark may be on disk: the reservation this journal opened over, or one it wrote or tried to write since
+   * its last clear landed. A clear waits for the appends' sync then (writeReservation). `reservedFailed` knows only
+   * this journal's own confirmed writes, and a start over the failed mark of the life before it cleared that mark
+   * with no sync of the gaps either life had appended (an independent read of the fixes for the house's review of
+   * the 77 commits through 4f4c067, PR #22).
+   */
+  private failedMayBeOnDisk = false;
+  /**
    * A reservation write was refused or could not be confirmed, so the file may hold something other
    * than what is confirmed (an unsynced raise): the wanted reservation is written again even where it
    * matches the confirmed one, and the store writes only if the file differs. A clear compared with the
@@ -236,6 +244,7 @@ export class Journal {
     // restart — and reached subscribers: never reissue them, and record the hole (jr2-6, G10), when the
     // reservation is honoured (reservationHonoured).
     const r = hw?.reservation;
+    this.failedMayBeOnDisk = r?.failed === true;
     const honoured = r !== undefined && reservationHonoured(r, accounted);
     // A new life of a name in this daemon knows the last seq the life before it issued (startSeq): none above
     // it was, so a reservation above it (the block a seal could not lower) adds nothing to skip. Skipped, those
@@ -529,13 +538,21 @@ export class Journal {
    * raised while the refusal lasts) or with this boot, and remember it once it is confirmed.
    */
   private writeReservation(to: Seq, failed: boolean): boolean {
+    // Clearing a failed mark says the files now record every hole it stood for. Appends are not synced, so the
+    // gaps that record them are synced first: a power loss that took a stretch's gap line and kept the clear left
+    // the hole unrecorded for good, since only a failed mark makes a start look for jumps in the files (the
+    // house's review of the 77 commits through 4f4c067, PR #22). A sync the disk refuses refuses the clear too.
+    // The mark may be one an earlier life left, or one a refused write left in the file (failedMayBeOnDisk).
+    if (!failed && this.failedMayBeOnDisk && this.cold!.syncAppends?.() === false) return false;
     const boot = failed ? undefined : boots.current();
     const from = failed ? Math.min(this.unrecordedFrom(), this.reservedFailed ? this.reservedFrom : Number.POSITIVE_INFINITY) : undefined;
+    if (failed) this.failedMayBeOnDisk = true; // refused or not: a refused write may still have reached the file
     const ok = this.cold!.setHighWater!({ reservation: { to, ...(from !== undefined && { failed: true as const, failedFrom: from }), ...(boot !== undefined && { boot }) } });
     if (ok) {
       this.reserved = to;
       this.reservedFailed = failed;
       this.reservedFrom = from ?? Number.POSITIVE_INFINITY;
+      if (!failed) this.failedMayBeOnDisk = false;
     }
     this.markUnsure = !ok;
     return ok;
