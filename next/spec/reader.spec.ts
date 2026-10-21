@@ -6,7 +6,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { gapNote, readJournal, searchJournal, type ReadOptions, type ReadResult, type ReadSource } from '../src/api/reader.js';
+import * as reader from '../src/api/reader.js';
+import { gapNote, readJournal, searchJournal, type GapInfo, type ReadOptions, type ReadResult, type ReadSource } from '../src/api/reader.js';
 import { Journal } from '../src/core/journal.js';
 import { lineBytes, MemoryStore } from '../src/core/stores.js';
 import { project } from '../src/core/transcript.js';
@@ -1624,7 +1625,7 @@ test('an events tail stops walking back once it holds the events it returns (our
 
 test('search reports a hole once when its recorded range spans several the reads showed (our read of the 40 commits, PR #22)', async () => {
   // Before the store heals, reads show a lost stretch in pieces; the catch-up's record can span more than one of
-  // them. Merged into the first alone, the second stood beside it, and the hole was reported twice.
+  // them. The journal's page gives them as the one hole (the merge in search itself is pinned below, by addHole).
   const src = source();
   out(src.journal, 'one\r\n');
   src.journal.append({ type: 'gap', from: 5, to: 5, reason: 'store-error' });
@@ -1687,9 +1688,9 @@ test('a tail cut by the byte cap across a change of source names the source of t
   }
 });
 
-test('a tail over many Runs reads what the sources left open in one walk back, and none for a Run that starts in its window (an independent read of the fixes for the review of the 40 commits, PR #22)', async () => {
+test('a tail over many Runs reads what the sources left open in one walk back (an independent read of the fixes for the review of the 40 commits, PR #22)', async () => {
   // A walk back for every source of the window: a tail of 2,000 over 40,000 lines and 1,000 Runs of two lines took
-  // 17 s. A process Run whose run.start lies in the window has nothing before it, and the pty is read once.
+  // 17 s. The pty is read once, with the Runs that began before the window.
   const src = source();
   for (let i = 0; i < 40_000; i++) out(src.journal, `pty line ${i}\r\n`);
   for (let r = 0; r < 200; r++) {
@@ -1793,4 +1794,41 @@ test('a two-source tail that fits its cap is not cut, and one that is cut says s
     assert.ok(Buffer.byteLength(cut.text!) <= 1024, `${Buffer.byteLength(cut.text!)} bytes`);
     assert.equal(cut.truncated, true, `${x + 1}/${y}: ${JSON.stringify(cut.lines)}`);
   }
+});
+
+test('a tail whose window holds only Runs that start in it walks back for none of them (an independent read of the fixes for the review of the 40 commits, PR #22)', async () => {
+  // A process Run whose run.admit lies in the window has nothing before it. With the pty's output in the window too, a
+  // walk back ran for the pty anyway, so the spec above passed with the skip removed. Here 256 Runs of four events are
+  // the window's two batches exactly, after 40,000 lines of the pty's: looked for, they walk back to the event bound.
+  const src = source();
+  for (let i = 0; i < 40_000; i++) out(src.journal, `pty line ${i}\r\n`);
+  for (let r = 0; r < 256; r++) {
+    startRun(src.journal, `r${r}`);
+    out(src.journal, `r${r} one\r\nr${r} two\r\n`, 'stdout', `r${r}`);
+    endRun(src.journal, `r${r}`);
+  }
+  // The look-back's batches, told from the window's and the lasting state's by the function that reads them.
+  let lookBack = 0;
+  const tail = src.journal.tail.bind(src.journal);
+  src.journal.tail = (n: number, to?: number) => {
+    if ((new Error().stack ?? '').includes('opensBefore')) lookBack++;
+    return tail(n, to);
+  };
+  const r = await readJournal(src, { tail: 300 }, { resultBytes: 1 << 20 });
+  assert.ok(r.text!.endsWith('r255 two'), r.text!.slice(-40));
+  assert.equal(lookBack, 0, `${lookBack} batches read looking back`);
+});
+
+test('a hole a scan adds merges with every entry of its reason it overlaps (an independent read of the fixes for the review of the 40 commits, PR #22)', () => {
+  // The search spec above passes with the merge into the first entry alone: the journal hands over a page's holes
+  // already merged and seats each by its range, and neither that layout nor one with the holes a page apart reached
+  // search's own merge. It's pinned here.
+  // By the module, not a named import: an older reader.ts without it fails this spec, not the file.
+  const { addHole } = reader;
+  const gaps: GapInfo[] = [];
+  addHole(gaps, { from: 5, to: 5, reason: 'store-error' });
+  addHole(gaps, { from: 8, to: 8, reason: 'store-error' });
+  addHole(gaps, { from: 20, to: 20, reason: 'retention' });
+  addHole(gaps, { from: 4, to: 9, reason: 'store-error', exact: true });
+  assert.deepEqual(gaps, [{ from: 4, to: 9, reason: 'store-error' }, { from: 20, to: 20, reason: 'retention' }]);
 });

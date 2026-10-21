@@ -288,9 +288,11 @@ const vouched = (journal: Journal, g: GapInfo): GapInfo => (g.exact === undefine
  * with the same range or one grown since: a search that yields between its batches met both, and reported one hole
  * twice (an independent read of the fixes for the review of f3750e4, PR #22, its question 1). Matched by range rather than by marking the read's
  * gap provisional: the recorded gap carries the stretch's range, reason and count, so any reader can tell the two
- * apart from other holes, and no event or result gains a mark.
+ * apart from other holes, and no event or result gains a mark. Exported for its spec: a journal's pages hand over
+ * their holes merged already, so no fixture of a journal's reached the merge (an independent read of the fixes for
+ * the review of the 40 commits, PR #22).
  */
-function addHole(gaps: GapInfo[], g: GapInfo): void {
+export function addHole(gaps: GapInfo[], g: GapInfo): void {
   // Every entry of its reason that the hole meets merges with it: one recorded range can span several the reads
   // showed (lost-range compaction), and merged into the first alone, it left the others beside it (our read of
   // the 40 commits, PR #22).
