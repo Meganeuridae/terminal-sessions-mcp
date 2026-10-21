@@ -718,7 +718,9 @@ itself, as a DEBUG trap of the user's may run: it sets the editor's mode and is 
 passes, takes the empty line as its answer, and the session recovers through the grace at the
 shell's next prompt. Under the marker strategy the end-marker probe's answer shows the shell
 reads lines again: the Run ends `lost` (`exit-unobserved`) unless a cancel in progress ended it,
-and the shell is available.
+and the shell is available. The answer names the process that evaluated the probe, and only the
+pid the Run's first start mark bound ends the Run: a program or subshell of the Run that took the
+probe answers with its own, and the Run runs on.
 
 ---
 

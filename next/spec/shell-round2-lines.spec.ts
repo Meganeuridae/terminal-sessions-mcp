@@ -308,13 +308,19 @@ for (const [name, shell] of [...(hasShell('/bin/dash') ? [['dash', '/bin/dash']]
     }
   });
 
-  test(`${name}: a probe a reader in the shell's own process group answers is no end: the Run runs on, and ends after the reader, by its end mark or the shell's own answer`, async () => {
+  // A program the Run started, and a subshell of the shell: the house's review of 4f4c067..a8b6f28 (PR #22, comment 6323055715),
+  // question 7, found the subshell answering with the shell's own `$$`, so the Run ended cancelled and a queued Run ran inside it.
+  for (const [reader, line] of [
+    ['a reader', `sh -c 'trap "" INT QUIT; echo reader-ready; while read l; do eval "$l"; done'`],
+    ['a subshell', `(trap "" INT QUIT; echo reader-ready; while read l; do eval "$l"; done)`],
+  ] as const)
+  test(`${name}: a probe ${reader} in the shell's own process group answers is no end: the Run runs on, and ends after the reader, by its end mark or the shell's own answer`, async () => {
     // An independent read of the fixes for #22: with job control off, a reader the Run started took the cancel's probe and
     // answered it, and the Run ended there and the shell counted as back while the reader held the terminal.
     const x = await realSession(shell);
     try {
       await run(x, 'set +m');
-      const a = await x.session.admitWhenAvailable({ target: 'shell', line: `sh -c 'trap "" INT QUIT; echo reader-ready; while read l; do eval "$l"; done'`, principal: AGENT }, 3000);
+      const a = await x.session.admitWhenAvailable({ target: 'shell', line, principal: AGENT }, 3000);
       assert.ok(a.admitted);
       const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
       await until(() => output().includes('reader-ready'), 3000, 'the reader');
@@ -351,6 +357,15 @@ for (const [name, shell] of [...(hasShell('/bin/dash') ? [['dash', '/bin/dash']]
       x.session.input('false\r', { principal: AGENT });
       const kept = await run(x, 'echo "after $?"');
       assert.match(kept.text, /^\++ echo '?after 1'?\nafter 1$/, JSON.stringify(kept.text));
+      // A cancel's probe: its pid's command substitution and its printf are traced past the redirect, and neither stays.
+      const a = await x.session.admitWhenAvailable({ target: 'shell', line: 'sleep 5', principal: AGENT }, 3000);
+      assert.ok(a.admitted);
+      const nonce = x.session.listRuns().find((r) => r.runId === a.run.runId)!.nonce!;
+      const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
+      await until(() => output().includes(`<<<START:${nonce}:`), 3000, 'the command file ran');
+      assert.equal((await x.session.cancel(a.run.runId, AGENT, { graceMs: 1500 })).state, 'cancelled');
+      const cancelled = (await x.session.runTranscript(a.run.runId)).text;
+      assert.doesNotMatch(cancelled, /PPID|printf|<<</, JSON.stringify(cancelled));
       await run(x, 'set +x');
     } finally {
       await x.close();

@@ -291,7 +291,7 @@ export class FakeShell {
     } else {
       // The marker strategy's end-marker probe: a marker of its own (the house's read of a6d0c35, #22),
       // printf-built (plumbing.ts markerProbe).
-      const probe = /^\s*(?:\{ )?printf '%s:%s>>>\\n' "<<<PRO""BE:([0-9a-f]+)" (?:"\$\$"|\$fish_pid)(?:; \} 2>\/dev\/null)?$/.exec(typedLine);
+      const probe = /^\s*(?:\{ )?printf '%s:%s>>>\\n' "<<<PRO""BE:([0-9a-f]+)" (?:"\$\(exec \/bin\/sh -c 'echo \$PPID'\)"|"\$\$"|\$fish_pid)(?:; \} 2>\/dev\/null)?$/.exec(typedLine);
       if (probe) {
         this.pty.emit(`<<<PROBE:${probe[1]}:${this.pty.pid}>>>\r\n`);
         this.prompt();

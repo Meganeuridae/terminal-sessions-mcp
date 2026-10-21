@@ -491,6 +491,9 @@ test('a trace a shell writes past the typed line’s redirect is named by the Ru
   assert.equal(cutPlumbing(`${echo}${mark}on\r\n[t] printf %s:%s>>>\\n <<<EXIT:${N} 0\r\n${end}`, marker), 'on\r\n', 'a PS4 of the body’s own, in dash’s shape');
   const probe = `^C\r\n$ ${markerProbe(N, 'fish').trimStart()}\r\n> printf '%s>>>\\\\n' '<<<PROBE:${N}'\r\n<<<PROBE:${N}>>>\r\n$ `;
   assert.equal(cutPlumbing(`${echo}${mark}out\r\n${probe}`, marker), 'out\r\n^C\r\n', 'the probe’s trace before its answer');
+  // bash given a BASH_XTRACEFD traces the probe's pid, a command substitution, on the line before the probe's own trace.
+  const bashProbe = `^C\r\n$ ${markerProbe(N).trimStart()}\r\n++ exec /bin/sh -c 'echo $PPID'\r\n+ printf '%s:%s>>>\\n' '<<<PROBE:${N}' 4242\r\n<<<PROBE:${N}:4242>>>\r\n$ `;
+  assert.equal(cutPlumbing(`${echo}${mark}out\r\n${bashProbe}`, marker), 'out\r\n^C\r\n', 'the probe’s pid substitution’s trace too');
   // Not traces: the echo that printed the mark in earlier builds traced as the mark itself, and the guess at that trace's head
   // cut a program's own line that ended in `echo `; another Run's nonce names nothing.
   assert.equal(cutPlumbing(`${echo}${mark}+ echo ${end}`, marker), '+ echo ', 'a program’s `+ echo ` before the mark');
@@ -724,5 +727,21 @@ test('the cut decides each probe echo with one pass over the answers: 120,000 ec
       base = Math.min(base, performance.now() - t);
     }
     assert.ok(ms < 3 * base + 50, `${name}: ${Math.round(ms)} ms with the answers, ${Math.round(base)} ms without`);
+  }
+});
+
+test('the marker probe names the process that evaluates it: the shell’s own pid in the shell, its subshell’s own in a subshell, so a subshell’s answer is no end', () => {
+  // The house's review of 4f4c067..a8b6f28 (PR #22, comment 6323055715), question 7: the probe printed `$$`, which a subshell keeps,
+  // and a subshell of the Run that evaluated what it read answered as the shell, by run on dash.
+  const shells = ['/bin/dash', '/bin/bash', '/bin/sh', '/bin/zsh'].filter((s) => fs.existsSync(s));
+  assert.ok(shells.length > 0);
+  for (const shell of shells) {
+    const probe = markerProbe(N, shell.endsWith('zsh') ? 'zsh' : 'posix').trim();
+    const out = execFileSync(shell, ['-c', `p=$1; eval "$p"; (eval "$p"); echo "shell $$"`, shell, probe], { encoding: 'utf8' });
+    const pids = [...out.matchAll(new RegExp(probeMark(N).source, 'g'))].map((m) => m[1]);
+    const self = /shell (\d+)/.exec(out)![1];
+    assert.equal(pids.length, 2, `${shell}: ${out}`);
+    assert.equal(pids[0], self, `${shell}: in the shell, its own pid, as the start mark’s \`$$\`: ${out}`);
+    assert.notEqual(pids[1], self, `${shell}: in a subshell, not the shell’s: ${out}`);
   }
 });

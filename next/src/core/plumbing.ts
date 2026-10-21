@@ -9,7 +9,7 @@
  * Shapes: the start marker `<<<START:nonce:pid>>>` (both strategies name the shell's pid: a
  * declared shell's typed line prints it, and a marker Run's command file from its first line), the
  * end marker `<<<EXIT:nonce:status>>>` (both strategies), and the end-marker probe typed after a ^C:
- * `<<<PROBE:nonce:pid>>>` under the marker strategy, with the pid of the shell that ran it, which
+ * `<<<PROBE:nonce:pid>>>` under the marker strategy, with the pid of the process that evaluated it, which
  * ends the Run only when it is the pid the start marker named (an earlier build's probe, which
  * journals keep, printed none: `<<<PROBE:nonce>>>`), and
  * inline `<<<PROBE:nonce:pid:token>>>`, where the token is the Run's nonce again, printed from a shell
@@ -129,13 +129,19 @@ const printedMark = (word: string, nonce: string, fields: string[] = []): string
  * end it is (the house's read of a6d0c35, #22). It names the pid of the shell that runs it, as the
  * start mark does, so an answer counts only from the session's shell: a reader the Run started in the
  * shell's own process group (job control off) took the probe, answered it, and the shell counted as
- * back while the reader held the terminal (an independent read of the fixes for #22). The pid is the
- * shell's `$$`, which a subshell keeps: with job control off, a subshell of the Run that evaluates
- * what it reads answers as the shell (the house's review of 4f4c067..a8b6f28, by run on dash). The end
- * mark names no pid: only the line typed for this Run prints it, read before the Run's program began.
+ * back while the reader held the terminal (an independent read of the fixes for #22). The pid is that
+ * of the process that evaluates the line, a child's parent: the shell's `$$` is kept by a subshell, and
+ * with job control off a subshell of the Run that evaluated what it read answered as the shell, so the
+ * Run ended cancelled, the shell counted idle, and a queued Run ran inside the subshell (the house's
+ * review of 4f4c067..a8b6f28, PR #22, comment 6323055715, question 7, by run on dash). In the shell it
+ * is the start mark's `$$`; a probe is typed only after a cancel, so its fork and exec cost nothing
+ * that matters. fish has no subshells, and `$fish_pid` is the evaluating fish's. The end mark names no
+ * pid: only the line typed for this Run prints it, read before the Run's program began.
  */
 export const markerProbe = (nonce: string, flavor: ShellFlavor = 'posix'): string =>
-  ` ${untraced(printedMark('PRO""BE', nonce, [flavor === 'fish' ? '$fish_pid' : '"$$"']), flavor)}`;
+  ` ${untraced(printedMark('PRO""BE', nonce, [flavor === 'fish' ? '$fish_pid' : EVALUATING_PID]), flavor)}`;
+/** The pid of the process that evaluates the word: the parent of a child it starts for the purpose. */
+const EVALUATING_PID = `"$(exec /bin/sh -c 'echo $PPID')"`;
 /**
  * The probe the inline strategy types after a ^C (which may have cut the line before its end
  * marker): a marker of its own, with the Run's nonce, the pid of the shell that runs it, and the
@@ -268,9 +274,10 @@ const PROBE_LINES = new Map<string, { leads: string[]; rests: string[] }>();
 const LEGACY_PROBE = ` echo "<<<PRO""BE:${AT_NONCE}>>>"`;
 /**
  * The marker strategy's probe as builds before it named the shell's pid typed it, printf-built: its lead
- * stayed on a program's prompt line once the probe named a pid (a reviewer's read of the fixes for #22).
+ * stayed on a program's prompt line once the probe named a pid (a reviewer's read of the fixes for #22);
+ * and as builds before it named the evaluating process's typed it, naming the shell's `$$`.
  */
-const PIDLESS_PROBES = FLAVORS.map((f) => ` ${untraced(printedMark('PRO""BE', AT_NONCE), f)}`);
+const PIDLESS_PROBES = [...FLAVORS.map((f) => ` ${untraced(printedMark('PRO""BE', AT_NONCE), f)}`), ...(['posix', 'zsh'] as const).map((f) => ` ${untraced(printedMark('PRO""BE', AT_NONCE, ['"$$"']), f)}`)];
 for (const line of [...FLAVORS.map((f) => markerProbe(AT_NONCE, f)), ...PIDLESS_PROBES, LEGACY_PROBE, inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true)]) {
   const [before, after] = line.split(AT_NONCE) as [string, string];
   const at = before.indexOf('<<<');
@@ -675,5 +682,13 @@ function markTraceStart(text: string, to: number, nonce: string, prefix: string 
   const at = mark ? line.lastIndexOf('printf ', mark.index) : -1;
   if (at === -1) return to;
   const head = prefix ?? (line.slice(at, mark!.index).includes('\\\\n') ? '> ' : undefined);
-  return head && line.slice(0, at).endsWith(head) ? lineStart + at - head.length : lineStart;
+  const cut = head && line.slice(0, at).endsWith(head) ? lineStart + at - head.length : lineStart;
+  // The probe's pid comes from a command substitution (markerProbe), which bash traces on the line before.
+  if (cut === lineStart && lineStart > 0 && mark![0].startsWith('<<<PROBE')) {
+    const prev = text.lastIndexOf('\n', lineStart - 2) + 1;
+    if (PID_TRACE.test(text.slice(prev, lineStart))) return prev;
+  }
+  return cut;
 }
+/** The trace of the command substitution that gives the marker probe its pid (EVALUATING_PID). */
+const PID_TRACE = /exec \/bin\/sh -c '?echo \$PPID'?\n$/;
