@@ -8,6 +8,7 @@
  * annotation, nothing worse (the house's read of 1cabc6a, #22).
  */
 import { createHash } from 'node:crypto';
+import { clocks } from '../core/clock.js';
 import { err, TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import type { PlumbingOf } from '../core/plumbing.js';
@@ -196,7 +197,8 @@ interface IdemEntry {
   principal: Principal;
   tool: string;
   digest: string;
-  at: number;
+  /** When the entry was made, on the monotonic clock: the window is measured there, so a wall-clock step neither expires a young key nor keeps an old one. */
+  mono: number;
   value: Promise<unknown>;
 }
 
@@ -238,7 +240,7 @@ class Idempotency {
   ): Promise<T> {
     if (key === undefined) return fn(undefined);
     if (key.length === 0 || key.length > MAX_KEY_LENGTH) throw err('invalid_argument', `idempotencyKey must be 1–${MAX_KEY_LENGTH} characters (a UUID is ideal)`);
-    const now = Date.now();
+    const now = clocks.monotonic();
     this.sweep(now);
     const k = `${principal}\u0000${key}`;
     const digest = argsDigest(args);
@@ -255,11 +257,11 @@ class Idempotency {
     const idem = `${identity}:${tool}:${digest}`;
     const recovered = opts.recover?.(idem);
     if (recovered !== undefined) {
-      this.put(k, { principal, tool, digest, at: now, value: Promise.resolve(recovered) });
+      this.put(k, { principal, tool, digest, mono: now, value: Promise.resolve(recovered) });
       return replay(recovered);
     }
     const value = fn(idem);
-    const entry: IdemEntry = { principal, tool, digest, at: now, value };
+    const entry: IdemEntry = { principal, tool, digest, mono: now, value };
     this.put(k, entry);
     value.then(
       (v) => {
@@ -296,10 +298,15 @@ class Idempotency {
     else this.counts.delete(e.principal);
   }
 
-  /** Entries are in insertion (time) order: expire from the oldest until one is inside the window. */
+  /**
+   * Entries are in insertion (time) order: expire from the oldest until one is inside the window, on the
+   * monotonic clock (the house's read of the 38 commits, #22, comment 6274935728, item 7). A key only a
+   * restart's journal knows (recoverIdentity, App.recoverRun) has the journal's wall-clock stamp alone, and
+   * is aged on the wall clock, as the Run's own age is (App.runAgeMs).
+   */
   private sweep(now: number): void {
     for (const [k, v] of this.entries) {
-      if (now - v.at <= this.windowMs) break;
+      if (now - v.mono <= this.windowMs) break;
       this.drop(k, v);
     }
   }
@@ -1283,6 +1290,10 @@ export class App {
       // Only a shell Run prints marks; a process Run records no strategy, and reading its absence as "journaled
       // before the recording" would cut program lines by shape whenever one is in the window.
       if (r.target !== 'shell') continue;
+      // Nor does a shell Run that has not started: it gets its strategy and nonce at its start, so a queued one
+      // would read as journaled before the recording, and while it waited every mark-shaped line, a program's
+      // included, would be cut (the house's read of the 38 commits, #22, comment 6274935728, item 5).
+      if (r.seq.start === undefined) continue;
       const p: Pick<PlumbingOf, 'strategy' | 'nonce'> = {};
       if (r.strategy !== undefined) p.strategy = r.strategy;
       if (r.nonce !== undefined) p.nonce = r.nonce;

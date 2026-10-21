@@ -16,6 +16,7 @@
  * itself refused can reissue seqs. What the ring drops while the disk refuses is
  * recorded as it is lost and written as a `store-error` gap at the catch-up.
  */
+import { clocks, timerMs } from './clock.js';
 import { RunIndex } from './runindex.js';
 import { lineBytes, MemoryStore, newEpoch, type JournalStore } from './stores.js';
 import type { EventInput, GapReason, JournalEvent, Seq } from './types.js';
@@ -82,6 +83,7 @@ export class Journal {
   private coldError: string | null = null;
   /** The newest seq the cold store has accepted. */
   private persisted: Seq;
+  /** When the cold store is tried again, on the monotonic clock: a wall-clock step neither delays the retry nor brings it on (the house's read of the 38 commits, #22, comment 6274935728, item 7). */
   private retryAt = 0;
   private retryMs = RETRY_MIN_MS;
   /** Retries the cold store at `retryAt` even if no event arrives meanwhile: an idle session's unwritten history must not wait for its next event (the house's read of dd8b602). */
@@ -222,9 +224,9 @@ export class Journal {
       } catch (e) {
         this.coldFailed(e);
       }
-    } else if (!this.catchingUp && Date.now() >= this.retryAt) {
+    } else if (!this.catchingUp && clocks.monotonic() >= this.retryAt) {
       this.catchUp();
-    } else if (this.reserved === 0 ? Date.now() >= this.reserveRetryAt : this.seq >= this.reserved) {
+    } else if (this.reserved === 0 ? clocks.monotonic() >= this.reserveRetryAt : this.seq >= this.reserved) {
       // A refused reservation is tried again, throttled; a block used up is extended.
       this.reserve();
     }
@@ -233,7 +235,7 @@ export class Journal {
   private coldFailed(e: unknown): void {
     const first = this.coldError === null;
     this.coldError = e instanceof Error ? e.message : String(e);
-    this.retryAt = Date.now() + this.retryMs;
+    this.retryAt = clocks.monotonic() + this.retryMs;
     this.retryMs = Math.min(this.retryMs * 2, RETRY_MAX_MS);
     this.reserve();
     this.armRetry();
@@ -246,7 +248,7 @@ export class Journal {
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined;
       if (this.coldError !== null && !this.catchingUp && !this.sealed) this.catchUp();
-    }, Math.max(0, this.retryAt - Date.now()));
+    }, timerMs(this.retryAt - clocks.monotonic()));
     this.retryTimer.unref();
   }
 
@@ -260,7 +262,7 @@ export class Journal {
     if (!this.cold?.setHighWater || this.reserved > this.seq) return;
     const target = this.seq + HIGH_WATER_BLOCK;
     if (this.cold.setHighWater(target, true)) this.reserved = target;
-    else this.reserveRetryAt = Date.now() + 1000;
+    else this.reserveRetryAt = clocks.monotonic() + 1000;
   }
 
   /** The store holds every seq issued again: the reservation is released. */

@@ -11,6 +11,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { App, commitReadDelivery, takeReadCommit, type Caller, type RunResult } from '../src/api/app.js';
+import { clocks } from '../src/core/clock.js';
 import { cutPlumbing } from '../src/core/plumbing.js';
 import { serviceOutcomeKey } from '../src/core/session.js';
 import { SessionRegistry } from '../src/api/registry.js';
@@ -134,6 +135,7 @@ test('defect 9: session_list shows the 20 newest Runs and counts the rest', asyn
   const list = await tool('session_list', {});
   const summary = (list.structured?.sessions as Array<Record<string, unknown>>).find((x) => x.id === s)!;
   assert.equal((summary.runs as unknown[]).length, 20, 'the 20 newest');
+  assert.deepEqual((summary.runs as Array<{ runId: string }>).map((x) => x.runId), ids.slice(-20), 'the last 20 admitted, in order');
   assert.equal(summary.runsOmitted, 3, 'the other three are counted, not dropped silently');
   assert.match(list.text, /\(\+3 older not listed\)/);
   for (const id of ids) await tool('cancel', { runId: id });
@@ -152,6 +154,8 @@ test('item 19: session_list shows the 20 newest services and counts the rest (th
   const list = await tool('session_list', {});
   const summary = (list.structured?.sessions as Array<Record<string, unknown>>).find((x) => x.id === s)!;
   assert.equal((summary.services as unknown[]).length, 20, 'the 20 newest');
+  // The newest by id, not any 20: returning the oldest 20 passed a count (the house's read of the 38 commits, #22, comment 6274935728).
+  assert.deepEqual((summary.services as Array<{ runId: string }>).map((x) => x.runId), ids.slice(-20), 'the last 20 started, in order');
   assert.equal(summary.servicesOmitted, 3, 'the other three are counted, not dropped silently');
   assert.match(list.text, /\(\+3 older not listed\)/);
   for (const id of ids) await tool('cancel', { runId: id });
@@ -414,4 +418,25 @@ test('a reviewer’s read (6270045466): a read with `advance: false` stages no c
   assert.equal(live.session.cursorsOf(A.principal).read, at, 'neither read moved the cursor');
   const counted = await app.read(A, { session: s, since: 0 });
   assert.equal(live.session.cursorsOf(A.principal).read, counted.nextCursor, 'an ordinary read still does');
+});
+
+test('the 38 commits 7: the idempotency window is measured on the monotonic clock: a wall-clock step never expires a young key', async (t) => {
+  // The store swept on Date.now: an hour's step forward expired a key made a moment before, and the retry ran
+  // the command again (the house's read of the 38 commits, #22, comment 6274935728, item 7).
+  const s = 'idemclock';
+  await tool('session_open', { session: s });
+  const call = () => app.run(A, { session: s, command: 'echo once', target: 'process', wait: 5000, idempotencyKey: 'the-38-commits-7' });
+  const first = await call();
+  assert.equal(first.state, 'exited', JSON.stringify(first));
+  const realNow = Date.now.bind(Date);
+  t.mock.method(Date, 'now', () => realNow() + 60 * 60_000);
+  const again = await call();
+  assert.equal(again.runId, first.runId, 'the same Run, not a second execution');
+  assert.equal(again.replayed, true);
+  // Past the 15-minute window on the monotonic clock, the key is forgotten and the call runs anew.
+  const realMono = clocks.monotonic;
+  t.mock.method(clocks, 'monotonic', () => realMono() + 16 * 60_000);
+  const later = await call();
+  assert.notEqual(later.runId, first.runId);
+  assert.equal(later.replayed, undefined);
 });

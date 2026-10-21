@@ -39,7 +39,11 @@ while `termd` listens on 3101 by default (it takes `SESSION_SERVER_PORT` when ne
   `killSession`, `killAll`, `launch` and `takeScreenshot` over `termd`, for a 1.x host
   configuration pointed at the shim; `runCommand`'s result also says when a command is still
   running or queued, and `listSessions` returns 1.x's fields (`id`, `name`, `isAlive`,
-  `createdAt`, `lastActivity`, `logSize`, `state`). The shim also reads the 1.x settings
+  `createdAt`, `lastActivity`, `logSize`, `state`). Unlike 1.x, `tailLogs`' and `launch`'s logs
+  can begin with an `[earlier output not shown (…)]` line, which names the `read` that shows what
+  came before (and, when the first line is cut at its head, the read that shows it from there),
+  and the logs, raw ones included, mark a hole with a `[… N journal events missing …]` line where
+  output was lost: a host that parses the logs sees these lines. The shim also reads the 1.x settings
   (`SESSION_SERVER_URL`, `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT`, `SESSION_SERVER_TOKEN`)
   where the `TSM_*` ones are unset, and `termd` accepts a 1.x `session-server` command line
   (`--headless`, `--host localhost`, the same variables).

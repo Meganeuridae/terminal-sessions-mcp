@@ -12,9 +12,13 @@ export const timerMs = (ms: number): number => Math.min(MAX_TIMER_MS, Math.max(0
 
 /**
  * The monotonic clock intervals are measured on, which a wall-clock step never moves; a test may
- * replace it. One exception: a watch's age for output the manager did not stamp on arrival — output
- * from before the manager existed, or older than the newest 8,192 output events it saw — falls back
- * to the journal's wall-clock age, clamped at zero (watches.ts `ageOf`), since there is no monotonic
- * stamp for it (the house's read of the 36 commits, #22, comment 6269992150).
+ * replace it. The exceptions are spans with no monotonic stamp, aged by the journal's wall-clock
+ * stamp: a watch's age for output the manager did not stamp on arrival — output from before the
+ * manager existed, or older than the newest 8,192 output events it saw — clamped at zero (watches.ts
+ * `ageOf`; the house's read of the 36 commits, #22, comment 6269992150); and a keyed Run, or an
+ * idempotency key, that only a restart's journal knows (App.runAgeMs, the idempotency store's
+ * recovered keys). Everything this daemon life stamps itself is measured here, the idempotency
+ * window and the journal's cold-store retry included (the house's read of the 38 commits, #22,
+ * comment 6274935728, item 7).
  */
 export const clocks = { monotonic: (): number => performance.now() };

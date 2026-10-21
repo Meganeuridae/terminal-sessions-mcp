@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { clocks } from '../src/core/clock.js';
 import { Journal } from '../src/core/journal.js';
 import { FileStore, MemoryStore } from '../src/core/stores.js';
 import { pageOutput } from '../src/core/runindex.js';
@@ -229,6 +230,33 @@ test('jr-2/G19: a failing cold store never throws out of append; the ring carrie
   assert.deepEqual(cold.read().map((e) => e.seq), [1, 2, 3, 4, 5], 'the cold store caught up from the ring, in order');
   j.append(out('after'));
   assert.deepEqual(cold.read().map((e) => e.seq), [1, 2, 3, 4, 5, 6]);
+});
+
+test('the cold store is tried again on the monotonic clock: a wall-clock step neither brings the retry on nor delays it', (t) => {
+  // The retry deadline was on Date.now: a forward step retried at once, a backward one waited out the step (the
+  // house's read of the 38 commits, #22, comment 6274935728, item 7).
+  const realNow = Date.now.bind(Date);
+  const realMono = clocks.monotonic;
+  let wall = 0;
+  let mono = 0;
+  t.mock.method(Date, 'now', () => realNow() + wall);
+  t.mock.method(clocks, 'monotonic', () => realMono() + mono);
+  for (const step of [60 * 60_000, -60 * 60_000]) {
+    wall = 0;
+    const cold = new FlakyStore();
+    const j = new Journal({ cold });
+    j.append(out('refused')); // the first failure: retried after RETRY_MIN_MS (1 s) of the monotonic clock
+    assert.match(j.stats().coldFailed ?? '', /ENOSPC/);
+    cold.broken = false;
+    wall = step;
+    j.append(out('after the step'));
+    assert.match(j.stats().coldFailed ?? '', /ENOSPC/, `a wall step of ${step} ms is not time passing: no retry yet`);
+    mono += 1100;
+    j.append(out('a second later'));
+    assert.equal(j.stats().coldFailed, null, `retried once a second has passed, whatever the wall clock did (${step} ms)`);
+    assert.deepEqual(cold.read().map((e) => e.seq), [1, 2, 3]);
+    j.close();
+  }
 });
 
 test('jr-2/G11: when the ring dropped part of what the disk refused, a store-error gap names it and reads stop at the hole', () => {

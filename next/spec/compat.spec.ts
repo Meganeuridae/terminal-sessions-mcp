@@ -285,7 +285,8 @@ test('78c4d6e 7 and 8: launch’s start keeps another Run’s unread output unre
 
 test('78c4d6e 18: a many-page runCommand advances the deferred cursor across every page once written', async () => {
   const deferred: Caller = { principal: A.principal, connectionId: 'ca-ws18', deferReadDelivery: true };
-  // 1.5 MB of output: runOutput pages it (256 KiB a page), and Drawn carries every page's commit, not its text.
+  // About 0.86 MB of output (15,000 lines of about 57 bytes with CRLF): runOutput pages it in four 256 KiB pages,
+  // and Drawn carries every page's commit, not its text.
   const ran = await callTool('runCommand', { session: 'pages', command: "awk 'BEGIN { for (i = 1; i <= 15000; i++) print i, \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" }'", timeout: 30_000 }, { app, caller: deferred, resultText: 'json' }, compat);
   const runId = (JSON.parse(ran.text) as { runId: string }).runId;
   const live = registry.get('pages');
@@ -359,9 +360,13 @@ test('78c4d6e: searchLogs reports the holes it spanned and the lines it matched 
   const j = live.session.journal;
   j.append({ type: 'gap', from: j.lastSeq + 1, to: j.lastSeq + 2, reason: 'store-error' });
   j.append({ type: 'output', data: 'findme-again\r\n', stream: 'pty' });
+  // A matching line longer than the pattern's match window (64 KiB) is matched on its head only (the house's read of the 38 commits, #22).
+  j.append({ type: 'output', data: `findme-long ${'w'.repeat(70_000)}\r\n`, stream: 'pty' });
   const out = (await call('searchLogs', { session: 'snotes', pattern: 'findme' })) as unknown as Array<{ line?: string; note?: string }>;
   const note = out.find((m) => m.note !== undefined)?.note;
   assert.ok(note && /missing/.test(note), `the hole is noted: ${JSON.stringify(out)}`);
+  assert.match(note!, /1 line longer than the match window, searched on its head only/);
+  assert.ok(out.some((m) => m.line?.startsWith('findme-long ')), 'the long line still matched on its head');
 });
 
 test('the 38 commits 6: a first line cut at its head is named with the read that shows it from its head, and that read does', async () => {
@@ -406,6 +411,21 @@ test('the 38 commits: a raw tail that reaches its 1 MiB bound says so, and the p
   const earlier = (await call('read', { ...(JSON.parse(m![1]!) as Obj), maxBytes: 1024 * 1024 })) as unknown as { text: string };
   assert.equal(Number(/^(\d+) y/.exec(earlier.text.split('\n').at(-1)!)?.[1]), shown - 1, 'the page before ends with the line just before: nothing in neither page');
   await call('killSession', { session: 'rawbound', graceful: false });
+});
+
+test('the 38 commits 5: a queued shell Run does not turn shape-only cutting on while it waits', async () => {
+  await call('runCommand', { session: 'qshape', command: 'echo ready' });
+  const running = await app.run(A, { session: 'qshape', command: 'sleep 5', wait: 0 });
+  const queued = await app.run(A, { session: 'qshape', command: 'echo after', queue: true, wait: 0 });
+  assert.equal(queued.state, 'queued', JSON.stringify(queued));
+  const live = registry.get('qshape');
+  assert.ok(live?.kind === 'live');
+  // A Run with neither strategy nor nonce read as one journaled before the recording: every mark-shaped line was cut by shape.
+  live.session.journal.append({ type: 'output', data: 'program prints <<<EXIT:deadbeef00:0>>> while one waits\r\n', stream: 'pty' });
+  const tail = lines(await call('tailLogs', { session: 'qshape', lines: 50 }));
+  assert.ok(tail.some((l) => l.includes('<<<EXIT:deadbeef00:0>>>')), `the program's line is not the daemon's: ${JSON.stringify(tail)}`);
+  for (const r of [queued, running]) await app.cancel(A, { runId: r.runId! });
+  await call('killSession', { session: 'qshape', graceful: false });
 });
 
 test('6270946953: launch’s watch for error patterns is measured on the monotonic clock: a wall-clock jump neither ends it early nor stretches it', async (t) => {
