@@ -158,16 +158,25 @@ const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-marker-start-'));
 after(() => fs.rmSync(markerDir, { recursive: true, force: true }));
 const bashAsSh = path.join(markerDir, 'sh');
 fs.symlinkSync('/bin/bash', bashAsSh);
+// The rc waits for a file the spec writes once the line is typed, so the banner comes after it.
 const slowRc = path.join(markerDir, 'slow.rc');
-fs.writeFileSync(slowRc, 'sleep 1\necho "Welcome, slow shell"\n');
+fs.writeFileSync(slowRc, 'while [ ! -e "$TSM_SPEC_GATE" ]; do sleep 0.05; done\necho "Welcome, slow shell"\n');
 for (const [name, shell] of [...(hasShell('/bin/dash') ? [['dash', '/bin/dash']] : []), ['bash as sh', bashAsSh]] as const) {
   test(`${name}: the marker strategy cuts at the start mark its command file prints: a still-starting shell's banner and second echo, the typed line's and the end mark's traces under set -x${name === 'dash' ? '' : ', and nothing before a history line with the echo off'}`, async () => {
     // $ENV runs before the first prompt, and a shell without integration takes the line at once: it is typed while the
-    // shell sleeps, echoed by the terminal, then the banner, then (bash) the prompt shows it again.
-    const x = await realSession(shell, { env: { ENV: slowRc } });
+    // shell waits in its rc, echoed by the terminal, then the banner, then (bash) the prompt shows it again. The rc waits
+    // until the line is typed, where a 1 s sleep left the order to the session's start (ready at about 800 ms).
+    const gate = path.join(markerDir, `gate-${name.replace(/ /g, '-')}`);
+    const x = await realSession(shell, { env: { ENV: slowRc, TSM_SPEC_GATE: gate } });
+    const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
     try {
       assert.equal(x.session.integration, 'none');
-      assert.equal((await run(x, 'echo first; echo second', 8000)).text, 'first\nsecond', 'item 6');
+      const first = run(x, 'echo first; echo second', 8000);
+      await until(() => output().includes('tsm-cmd-'), 5000, 'the line typed while the rc waits');
+      fs.writeFileSync(gate, '');
+      assert.equal((await first).text, 'first\nsecond', 'item 6');
+      const seen = output();
+      assert.ok(seen.indexOf('tsm-cmd-') < seen.indexOf('Welcome, slow shell'), `typed before the banner: ${JSON.stringify(seen.slice(0, 300))}`);
       // Item 9: no `+ command . <file>` at the head, no dangling `+ echo ` at the end, in the Run that turns tracing on and after.
       assert.match((await run(x, 'set -x; echo on')).text, /^\++ echo on\non$/);
       assert.match((await run(x, 'echo traced')).text, /^\++ echo traced\ntraced$/);
