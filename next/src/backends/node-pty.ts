@@ -106,7 +106,7 @@ const MAX_INSPECTED = 1024;
  * read (/proc mounted with hidepid), which may be a member — since unknown is not "no reader" (the
  * house's read of the 38 commits, #22 comment 6274841346, item 1, and of the 33 commits, comment
  * 6307351617, item 4). Descriptors 1 and 2 do not count: an rc's `sleep 301 &` shares the shell's
- * group, as what an rc starts does, with /dev/null as stdin and the terminal as its output, and held
+ * group, as what bash's rc starts does, with /dev/null as stdin and the terminal as its output, and held
  * the reinit at a real prompt when any child counted (item 2). The cost is a program that reads the
  * terminal only through them, as `more` behind a pipe does: it reads as no reader (PtyHandle's doc).
  * A job started at a prompt has its own group and is not in the foreground.
