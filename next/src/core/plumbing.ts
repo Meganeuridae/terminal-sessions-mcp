@@ -574,7 +574,8 @@ function firstAtOrAfter(xs: number[], x: number): number {
  * whatever PS4 is (the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374,
  * question 2): from the prefix the typed line's trace showed (`prefix`), or fish's own when the trace
  * is fish's (fish has no PS4: a command the prompt runs is traced after `> `, and its trace writes the
- * format's backslash doubled), when it stands before it, so output with no line end before the trace
+ * format's backslash doubled, fish 4 as `'%s:%s>>>\\n'`, fish 3.7 escaping each character it would
+ * quote, `\%s:\%s\>\>\>\\n`), when it stands before it, so output with no line end before the trace
  * stays, or else from its line's start. The echo that printed the end mark in earlier builds traced as
  * the mark itself, and a guess at that trace's head cut a program's line that ended in `echo `.
  */
@@ -582,6 +583,6 @@ function markTraceStart(text: string, to: number, nonce: string, prefix: string 
   const lineStart = text.lastIndexOf('\n', to - 2) + 1;
   const t = new RegExp(`printf ([^\\n]*)<<<(?:EXIT|PROBE):${literal(nonce)}'?(?: -?\\d+)?\\n$`).exec(text.slice(lineStart, to));
   if (!t) return to;
-  const head = prefix ?? (t[1]!.includes('>>>\\\\n') ? '> ' : undefined);
+  const head = prefix ?? (t[1]!.includes('\\\\n') ? '> ' : undefined);
   return head && text.slice(lineStart, lineStart + t.index).endsWith(head) ? lineStart + t.index - head.length : lineStart;
 }

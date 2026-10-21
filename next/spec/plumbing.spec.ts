@@ -434,7 +434,8 @@ test('the marker strategy’s end mark and probe are printf-built: no `set -x` t
         assert.deepEqual([...out.matchAll(new RegExp(exitMark(N).source, 'g'))].map((m) => m[1]), ['0'], `one end mark, the real one: ${said}`);
         assert.equal([...out.matchAll(new RegExp(probeMark(N).source, 'g'))].length, 1, `one probe answer: ${said}`);
         if (flavor !== 'fish') assert.doesNotMatch(out, /printf[^\n]*<<<(?:EXIT|PROBE)/, `neither traced: ${said}`);
-        else if (head) assert.match(out, /abc> printf '%s:%s>>>\\\\n' '<<<EXIT:[^']*' 0\n/, `fish traces past the redirect: ${said}`);
+        // fish 4 quotes the format (`'%s:%s>>>\\n'`), fish 3.7 escapes it (`\%s:\%s\>\>\>\\n`).
+        else if (head) assert.match(out, /abc> printf \S+ '<<<EXIT:[^']*' 0\n/, `fish traces past the redirect: ${said}`);
         assert.match(cutPlumbing(out, { strategy: 'marker', nonce: N }), shown, said);
       }
     }
@@ -454,6 +455,9 @@ test('a trace a shell writes past the typed line’s redirect is named by the Ru
   assert.equal(cutPlumbing(`${echo}> source ${file}\r\n${mark}--> printf abc\r\nabc> ${fishTrace}${end}`, marker), '--> printf abc\r\nabc', 'the typed line’s trace showed the prefix: output with no line end stays');
   assert.equal(cutPlumbing(`${echo}${mark}--> echo on\r\non\r\n> ${fishTrace}${end}`, marker), '--> echo on\r\non\r\n', 'the body turned tracing on: the trace’s line');
   assert.equal(cutPlumbing(`${echo}${mark}--> printf abc\r\nabc> ${fishTrace}${end}`, marker), '--> printf abc\r\nabc', 'fish’s own prefix, which its trace’s doubled backslash shows');
+  // fish 3.7 (Ubuntu 24.04's) escapes what fish 4 quotes: the doubled backslash is still there, and `abc` stayed only with fish 4's.
+  const fish37 = `printf \\%s:\\%s\\>\\>\\>\\\\n '<<<EXIT:${N}' 0\r\n`;
+  assert.equal(cutPlumbing(`${echo}${mark}--> printf abc\r\nabc> ${fish37}${end}`, marker), '--> printf abc\r\nabc', 'fish 3.7’s trace');
   assert.equal(cutPlumbing(`${echo}${mark}on\r\n[t] printf %s:%s>>>\\n <<<EXIT:${N} 0\r\n${end}`, marker), 'on\r\n', 'a PS4 of the body’s own, in dash’s shape');
   const probe = `^C\r\n$ ${markerProbe(N, 'fish').trimStart()}\r\n> printf '%s>>>\\\\n' '<<<PROBE:${N}'\r\n<<<PROBE:${N}>>>\r\n$ `;
   assert.equal(cutPlumbing(`${echo}${mark}out\r\n${probe}`, marker), 'out\r\n^C\r\n', 'the probe’s trace before its answer');
