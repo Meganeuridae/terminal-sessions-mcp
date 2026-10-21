@@ -143,6 +143,8 @@ interface Segment {
   bytes: number;
   /** A header line naming a source (rule 6): no line of output, so `maxLines` does not count it. */
   header?: true;
+  /** The header that names this segment's source, emitted just before it. */
+  named?: Segment;
 }
 
 /**
@@ -516,12 +518,14 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       last.bytes += bytes;
     } else {
       const header = info && label?.(info);
+      let named: Segment | undefined;
       if (header) {
         const h = `${header}\n`;
-        out.push({ key: `n:${notes++}`, pipe: true, data: h, bytes: utf8Length(h), header: true });
+        named = { key: `n:${notes++}`, pipe: true, data: h, bytes: utf8Length(h), header: true };
+        out.push(named);
         outBytes += utf8Length(h);
       }
-      out.push({ key, pipe, data, bytes });
+      out.push({ key, pipe, data, bytes, ...(named ? { named } : {}) });
     }
     if (budget?.keep !== 'tail') return;
     // Kept tail: the segments after the first hold the budget, so the first cannot survive the cut.
@@ -748,7 +752,17 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
   const dropped: string[] = budget?.state ? [budget.state] : [];
   if (budget) omitted += cutInput(segs, budget.max, keep, dropped);
   if (keep === 'tail') omitted += cutToLastNewlines(segs, maxLines + 2 * rows, rows, dropped);
+  // A cut inside a source's data keeps the header naming that source: the tail budget, cutInput and
+  // cutToLastNewlines each dropped the segments before the cut, its header among them, and the first
+  // lines kept were nobody's (a reviewer's read of the fixes for #22). The header is no input omitted.
+  const first = segs[0];
+  if (first?.named) {
+    segs.unshift(first.named);
+    omitted -= first.named.bytes;
+  }
   // The omitted head still set lasting terminal state (rule 7): a scroll region, modes, character sets.
+  // It applies before the first thing kept, a restored header too, as before a header a cut kept whole,
+  // so a header lands in the state of the lines it names.
   const state = dropped.length ? persistentState(dropped.map(persistentState).join('')) : '';
   if (state && segs[0]) segs[0].data = state + segs[0].data;
 
@@ -805,7 +819,10 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
  * first line's source; undefined when all of them fit. A header names a source and is no line of
  * output (rule 6), so `maxLines` counts output lines, and a tail of 5 across two sources showed 4 of
  * them (an independent read of the fix for the house's read of the 33 commits, #22, comment
- * 6307350650). Headers are known by their text.
+ * 6307350650). Headers are known by their text. The header naming the first kept line's source is the
+ * nearest one before it, wherever it sits: one only just before the cut was kept, and a tail of 3
+ * over a Run's `a1` to `a3` then the pty's `p2` began with `a2` and no name (a reviewer's read of the
+ * fixes for #22).
  */
 function keepLines(lines: string[], max: number, keep: 'head' | 'tail', headers: ReadonlySet<string>): string[] | undefined {
   if (lines.length <= max) return undefined;
@@ -813,8 +830,11 @@ function keepLines(lines: string[], max: number, keep: 'head' | 'tail', headers:
   if (keep === 'tail') {
     let i = lines.length;
     while (i > 0 && count < max) if (!headers.has(lines[--i]!)) count++;
-    if (i > 0 && headers.has(lines[i - 1]!)) i--;
-    return i > 0 ? lines.slice(i) : undefined;
+    if (i === 0) return undefined;
+    let h = i - 1;
+    while (h >= 0 && !headers.has(lines[h]!)) h--;
+    if (h === i - 1) return h > 0 ? lines.slice(h) : undefined;
+    return h === -1 ? lines.slice(i) : [lines[h]!, ...lines.slice(i)];
   }
   let i = 0;
   while (i < lines.length && count < max) if (!headers.has(lines[i++]!)) count++;

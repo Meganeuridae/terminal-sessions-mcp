@@ -518,6 +518,18 @@ test('maxLines counts lines of output: the headers naming sources come extra, wi
   assert.equal((await project(chunks, { cols: 80, rows: 24, label: sourceLabel, maxLines: 3, keep: 'head' })).text, '[terminal]\np1\np2\n[run r1]\nr1');
 });
 
+test('a tail names its first line’s source wherever the cut falls: past the source’s first line, or inside its data under a byte budget', async () => {
+  // The header was kept only when it sat just before the cut: a tail of 3 over r1's three lines then the pty's read
+  // `a2 a3 [terminal] p2`, and a budget whose cut fell inside r1's data dropped the header before the projection.
+  const three: ProjectChunk[] = [{ data: 'p1\r\n', stream: 'pty' }, { data: 'a1\na2\na3\n', stream: 'stdout', runId: 'r1' }, { data: 'p2\r\n', stream: 'pty' }];
+  assert.deepEqual((await project(three, { cols: 80, rows: 24, label: sourceLabel, maxLines: 3 })).text.split('\n'), ['[run r1]', 'a2', 'a3', '[terminal]', 'p2']);
+  assert.deepEqual((await project(three, { cols: 80, rows: 24, label: sourceLabel, maxLines: 2 })).text.split('\n'), ['[run r1]', 'a3', '[terminal]', 'p2']);
+  const long: ProjectChunk[] = [{ data: 'p1\r\n', stream: 'pty' }, { data: 'a1-long-long-long\na2-long-long-long\na3\n', stream: 'stdout', runId: 'r1' }, { data: 'p2\r\n', stream: 'pty' }];
+  const cut = await project(long, { cols: 80, rows: 24, label: sourceLabel, maxLines: 10, maxInputBytes: 40 });
+  assert.deepEqual(cut.text.split('\n'), ['[run r1]', 'a2-long-long-long', 'a3', '[terminal]', 'p2']);
+  assert.equal(cut.omittedInputBytes, 'p1\r\na1-long-long-long\n'.length + '[terminal]\n'.length, 'the restored header is no input omitted');
+});
+
 test('a held line cut for the byte budget drops what was emitted before it: a title’s payload after a whole line keeps only the tail', async () => {
   // `head\r\n`, then an OSC 52 of 10 KB in a later chunk with no line end, under a 4 KiB budget: `head` survived
   // the payload between it and the end.
