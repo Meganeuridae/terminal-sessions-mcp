@@ -611,6 +611,28 @@ test('digests render carriage returns and backspaces as the transcript does, see
   seg.dispose();
 });
 
+test('leaving the alternate screen starts a shell Run’s line-end rule afresh: a string open before the screen took no line after it', async () => {
+  // The exit cleared the watch's lines and carry but not its line-end scan, which nothing fed while the screen was up,
+  // so a title left open before the full-screen program (closed while it ran) kept every line after it inside the string.
+  const src = fakeSource();
+  startRun(src, 'vi');
+  const seg = new Segmenter(src, { cadenceMs: 40 });
+  const out = collect(seg);
+  try {
+    src.journal.append({ type: 'output', data: 'before\r\n\x1b]0;title', stream: 'pty', runId: 'vi' });
+    src.screen.alt = true;
+    src.journal.append({ type: 'screen.mode', alt: true });
+    src.journal.append({ type: 'output', data: ' still the title\x07a full-screen frame\r\n', stream: 'pty', runId: 'vi' });
+    src.screen.alt = false;
+    src.journal.append({ type: 'screen.mode', alt: false });
+    src.journal.append({ type: 'output', data: 'after\r\nnext\r\n', stream: 'pty', runId: 'vi' });
+    await sleep(100);
+    assert.deepEqual(out.filter((s) => s.kind === 'output').at(-1)?.body?.split('\n'), ['after', 'next']);
+  } finally {
+    seg.dispose();
+  }
+});
+
 test('unread bytes are never short of what arrived after the read, even once marks were thinned', async () => {
   const src = fakeSource();
   startRun(src, 'many');

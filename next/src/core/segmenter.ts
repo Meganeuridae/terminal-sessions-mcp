@@ -1199,11 +1199,14 @@ export class Segmenter {
     this.screenTimer = undefined;
     this.screenAt = undefined;
     this.screenDirtySince = undefined;
-    // What a full-screen program drew is not lines of output; a process Run's pipes it never touched.
+    // What a full-screen program drew is not lines of output; a process Run's pipes it never touched. The
+    // line-end rule starts afresh too: nothing fed it while the screen was up, so a string it held open
+    // before took every line after (a reviewer's read of the fixes for #22).
     for (const w of this.running.values()) {
       if (w.pipes) continue;
       w.lines = [];
       w.carry = '';
+      w.scan = lineCarry();
     }
   }
 
