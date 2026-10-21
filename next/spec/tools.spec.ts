@@ -18,13 +18,13 @@ const A: Caller = { principal: 'agent:a@test', connectionId: 'ct' };
 const stub = (methods: Record<string, unknown> = {}) => methods as unknown as App;
 const ctx = (app: App, resultText: ResultText = 'transcript', notifications?: boolean) => ({ app, caller: A, resultText, ...(notifications === undefined ? {} : { notifications }) });
 
-test('search: the status line names the gap the scan spanned and the lines it searched on their head only', async () => {
+test('search: the status line names the gap the scan spanned and the lines it matched on their head only', async () => {
   const r: SearchResult = { session: 's', matches: [], scanned: [1, 4], more: false, bounded: false, gap: { from: 2, to: 40, reason: 'retention' }, clippedLines: 1 };
   const search = async (res: SearchResult, mode: ResultText = 'transcript') => callTool('search', { session: 's', pattern: 'needle' }, ctx(stub({ search: async () => res }), mode), TOOLS);
   const one = await search(r);
-  assert.equal(one.text, '(no matches)\n[search s · 0 matches · scanned seq 1–4 · gap 2–40 (past retention) · 1 line longer than the match window, searched on its head only]');
+  assert.equal(one.text, '(no matches)\n[search s · 0 matches · scanned seq 1–4 · gap 2–40 (past retention) · 1 line longer than the match window, matched on its head only]');
   const several: SearchResult = { session: 's', matches: [], scanned: [1, 9], more: false, bounded: false, gaps: [{ from: 2, to: 3, reason: 'store-error' }, { from: 5, to: 5, reason: 'retention' }], clippedLines: 3 };
-  assert.match((await search(several)).text, /scanned seq 1–9 · 2 gaps: gap 2–3 \(the journal store failed\), gap 5–5 \(past retention\) · 3 lines longer than the match window, searched on their head only\]$/);
+  assert.match((await search(several)).text, /scanned seq 1–9 · 2 gaps: gap 2–3 \(the journal store failed\), gap 5–5 \(past retention\) · 3 lines longer than the match window, matched on their head only\]$/);
   const clean = await search({ session: 's', matches: [], scanned: [1, 4], more: false, bounded: false });
   assert.equal(clean.text, '(no matches)\n[search s · 0 matches · scanned seq 1–4]');
   assert.equal((JSON.parse((await search(r, 'json')).text) as SearchResult).clippedLines, 1, 'json mode is the envelope');
@@ -132,4 +132,21 @@ test('renderRead: a tail marks a first line cut at its head, with the read from 
   assert.match(headOnly.text, / · 1 of 1 lines \(the first cut at its head; from its head: read since=0\) · next: since=9 · truncated\]$/);
   for (const r of [cut, whole, first, headOnly]) validate(r.structured, TOOLS.find((t) => t.name === 'read')!.outputSchema!);
   assert.deepEqual((JSON.parse(renderRead({ ...base, lines: { requested: 2, returned: 1, before: { until: 7, untilOffset: 12 } } }, 'json').text) as ReadResult).lines!.before, { until: 7, untilOffset: 12 });
+});
+
+test('renderRead: a Run tail’s advice names the Run and the tail’s since, and a line begun before the page is read on from where the earlier page ends', () => {
+  // A reviewer's read of the fixes for #22: the marks left out runId and since, so following a Run tail's
+  // `earlier` or `from its head` advice read the session, and an earlier page left the tail's range; and
+  // `head` promised the line's head for a line begun before the window, whose head-first read starts mid-line.
+  const base: ReadResult = { session: 's', runId: 'r1-ab', seq: [7, 9], nextCursor: 9, more: false, truncated: true, text: 'xyz' };
+  const lines = { requested: 2, returned: 1, cutHead: true as const, head: { since: 6, offset: 12 }, before: { until: 7, untilOffset: 12 } };
+  const run = renderRead({ ...base, lines }, 'transcript', { since: 3 });
+  assert.equal(run.text, 'xyz\n[read s run r1-ab seq 7–9 · 1 of 2 lines (the first cut at its head; from its head: read since=6 offset=12 runId=r1-ab) · earlier: read tail=2 until=7 untilOffset=12 since=3 runId=r1-ab · next: since=9 · truncated]');
+  const { runId: _, ...session } = base;
+  const begun = renderRead({ ...session, lines: { ...lines, begunBefore: true, head: { since: 6 }, before: { until: 6 } } }, 'transcript');
+  assert.equal(begun.text, 'xyz\n[read s seq 7–9 · 1 of 2 lines (the first cut at its head, begun before this page; on from where the earlier page ends: read since=6) · earlier: read tail=2 until=6 · next: since=9 · truncated]');
+  // A head-first page of a Run with more after it, inside `until`: reading on keeps both.
+  const page = renderRead({ ...base, truncated: false, more: true }, 'transcript', { since: 3, until: 40 });
+  assert.equal(page.text, 'xyz\n[read s run r1-ab seq 7–9 · next: since=9 · more: read since=9 until=40 runId=r1-ab]');
+  for (const r of [run, begun, page]) validate(r.structured, TOOLS.find((t) => t.name === 'read')!.outputSchema!);
 });

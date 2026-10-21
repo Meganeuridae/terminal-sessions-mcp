@@ -236,7 +236,7 @@ class Idempotency {
     args: object,
     fn: (idem: string | undefined) => Promise<T>,
     replay: (prev: T) => Promise<T>,
-    opts: { keep?: (v: T) => boolean; compact?: (v: T) => T; recover?: (idem: string) => T | undefined } = {},
+    opts: { keep?: (v: T) => boolean; compact?: (v: T) => T; recover?: (idem: string) => { value: T; ageMs: number } | undefined } = {},
   ): Promise<T> {
     if (key === undefined) return fn(undefined);
     if (key.length === 0 || key.length > MAX_KEY_LENGTH) throw err('invalid_argument', `idempotencyKey must be 1–${MAX_KEY_LENGTH} characters (a UUID is ideal)`);
@@ -245,7 +245,13 @@ class Idempotency {
     const k = `${principal}\u0000${key}`;
     const digest = argsDigest(args);
     const identity = createHash('sha256').update(k).digest('hex').slice(0, 24);
-    const prev = this.entries.get(k);
+    let prev = this.entries.get(k);
+    // A recovered entry is stamped with its age and can sit after younger ones, where the sweep stops
+    // short of it: past the window it is gone wherever it sits.
+    if (prev && now - prev.mono > this.windowMs) {
+      this.drop(k, prev);
+      prev = undefined;
+    }
     const prior = prev ?? this.recoverIdentity(identity);
     if (prior) {
       if (prior.tool !== tool) throw err('invalid_argument', `idempotencyKey ${key} was used for ${prior.tool}, not ${tool}; use a new key for a new operation`, { idempotencyKey: key });
@@ -257,8 +263,10 @@ class Idempotency {
     const idem = `${identity}:${tool}:${digest}`;
     const recovered = opts.recover?.(idem);
     if (recovered !== undefined) {
-      this.put(k, { principal, tool, digest, mono: now, value: Promise.resolve(recovered) });
-      return replay(recovered);
+      // Stamped as old as the Run is, so the key lives out the window from its admission, not a fresh
+      // window from this retry (a reviewer's read of the fixes for #22).
+      this.put(k, { principal, tool, digest, mono: now - Math.max(0, recovered.ageMs), value: Promise.resolve(recovered.value) });
+      return replay(recovered.value);
     }
     const value = fn(idem);
     const entry: IdemEntry = { principal, tool, digest, mono: now, value };
@@ -299,10 +307,12 @@ class Idempotency {
   }
 
   /**
-   * Entries are in insertion (time) order: expire from the oldest until one is inside the window, on the
+   * Entries are in insertion order: expire from the oldest until one is inside the window, on the
    * monotonic clock (the house's read of the 38 commits, #22, comment 6274935728, item 7). A key only a
-   * restart's journal knows (recoverIdentity, App.recoverRun) has the journal's wall-clock stamp alone, and
-   * is aged on the wall clock, as the Run's own age is (App.runAgeMs).
+   * restart's journal knows (recoverIdentity, App.recoverRun) has the journal's wall-clock stamp alone: it
+   * is aged on the wall clock until a retry finds it, as the Run's own age is (App.runAgeMs), and then
+   * stamped here with that age, so it expires when its window from the admission ends. Being older than
+   * the entries before it, it may outlive the sweep; a lookup drops it (run).
    */
   private sweep(now: number): void {
     for (const [k, v] of this.entries) {
@@ -753,13 +763,15 @@ export class App {
     }
   }
 
-  private recoverRun(idem: string): RunResult | undefined {
+  /** A keyed Run the journal knows, and its age, while that is inside the idempotency window. */
+  private recoverRun(idem: string): { value: RunResult; ageMs: number } | undefined {
     this.indexRecoveredIdem();
     const hit = this.recoveredIdem!.get(idem);
-    if (!hit || this.runAgeMs(hit.session, hit.run) > this.idem.windowMs) return undefined;
+    const ageMs = hit ? this.runAgeMs(hit.session, hit.run) : Infinity;
+    if (!hit || ageMs > this.idem.windowMs) return undefined;
     const r = hit.run;
     const last = r.seq.end ?? r.seq.admit;
-    return { runId: r.runId, session: hit.session, target: r.target, state: r.state, cwd: r.cwd ?? '', attribution: r.attribution, output: { text: '', truncated: false, seq: [r.seq.admit, last], nextCursor: last } };
+    return { value: { runId: r.runId, session: hit.session, target: r.target, state: r.state, cwd: r.cwd ?? '', attribution: r.attribution, output: { text: '', truncated: false, seq: [r.seq.admit, last], nextCursor: last } }, ageMs };
   }
 
   /** The Run's age for a window this daemon life measures: monotonic when this life admitted it, else the wall clock's, the only stamp a recovered Run has (a reviewer's read of the fixes for #22 comment 6270045466). */
@@ -1294,13 +1306,11 @@ export class App {
     const out: Array<Pick<PlumbingOf, 'strategy' | 'nonce'>> = [];
     for (const r of s.listRuns()) {
       if ((r.seq.end ?? Number.POSITIVE_INFINITY) < o.from || r.seq.admit > o.to) continue;
-      // Only a shell Run prints marks; a process Run records no strategy, and reading its absence as "journaled
-      // before the recording" would cut program lines by shape whenever one is in the window.
-      if (r.target !== 'shell') continue;
-      // Nor does a shell Run that has not started: it gets its strategy and nonce at its start, so a queued one
-      // would read as journaled before the recording, and while it waited every mark-shaped line, a program's
-      // included, would be cut (the house's read of the 38 commits, #22, comment 6274935728, item 5).
-      if (r.seq.start === undefined) continue;
+      // Only a shell Run that has started printed marks. A process Run records no strategy, and a shell Run
+      // gets its strategy and nonce at its start; reading either's absence as "journaled before the
+      // recording" cut every mark-shaped line in the window by shape, a program's included (the house's
+      // read of the 38 commits, #22, comment 6274935728, item 5).
+      if (r.target !== 'shell' || r.seq.start === undefined) continue;
       const p: Pick<PlumbingOf, 'strategy' | 'nonce'> = {};
       if (r.strategy !== undefined) p.strategy = r.strategy;
       if (r.nonce !== undefined) p.nonce = r.nonce;

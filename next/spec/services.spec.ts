@@ -340,7 +340,7 @@ test('a fail-pattern match on a line longer than the splitter keeps says it matc
   f.out('up\n');
   f.out(`BOOM ${'z'.repeat(70_000)}\n`, 'stdout');
   assert.equal(m.status, 'unhealthy');
-  assert.match(String(m.info().evidence), /^BOOM z+ \(matched on the line's head\)$/);
+  assert.match(String(m.info().evidence), /^BOOM z+ \(the line is longer than the match window: matched on its head only\)$/);
   m.dispose();
 });
 
@@ -352,6 +352,6 @@ test('a fail-pattern match on a line longer than the pattern\'s window says it m
   f.out('up\n');
   f.out(`${'x'.repeat(999)}0${'y'.repeat(20_000)}\n`, 'stdout');
   assert.equal(m.status, 'unhealthy');
-  assert.match(String(m.info().evidence), /\(matched on the line's head\)$/);
+  assert.match(String(m.info().evidence), /\(the line is longer than the match window: matched on its head only\)$/);
   m.dispose();
 });

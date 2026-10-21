@@ -251,12 +251,15 @@ function lineOffsets(text: string): number[] {
  * Where a tail was cut. `before` is where a read of what came before ends: right where the first
  * line shown begins (inside its event when it begins there), so the two pages meet with nothing in
  * neither. `cutHead` says the first line shown is missing its head, and `head` is a head-first read
- * that shows it from its head; without `head`, the page before ends with that head (a raw tail's
- * first line begun before what was read). The house's reads of 78c4d6e and of the 38 commits, #22.
+ * that shows it from its head, or, `begunBefore` (the reader's), on from where the page before ends,
+ * whose end is the line's earlier part; without `head`, the page before ends with that earlier part
+ * (a raw tail's first line begun before what was read). The house's reads of 78c4d6e and of the 38
+ * commits, #22.
  */
 interface TailCut {
   before: { until: Seq; untilOffset?: number };
   cutHead: boolean;
+  begunBefore?: boolean;
   head?: { since: Seq; offset?: number };
   why: string;
 }
@@ -294,6 +297,7 @@ async function textTail(ctx: ToolContext, session: string, n: number, d: Drawn |
       const from = !kept.first ? r : await readFor(ctx, d, { session, tail: all.length - kept.first, until: r.seq[1], commands: true, maxBytes: TAIL_BYTES });
       const c: TailCut = { before: from.lines?.before ?? { until: from.seq[0] - 1 }, cutHead: from.lines?.cutHead === true, why };
       if (from.lines?.head) c.head = from.lines.head;
+      if (from.lines?.begunBefore) c.begunBefore = true;
       return c;
     };
     if (r.truncated) return { lines: kept.lines, cut: await cut(gapsText(r) ?? 'the tail reached a bound, or a line longer than it') };
@@ -341,13 +345,24 @@ const callArgs = (o: Record<string, string | number>): string => `{${Object.entr
  * where the first line shown begins, and for a first line without its head the head-first read that
  * shows it from its head: a page of the default size may still cut a line longer than it, so the
  * read promises the line's head, not the whole line (the house's reads of 78c4d6e and of the 38
- * commits, #22, comment 6274935728, item 6).
+ * commits, #22, comment 6274935728, item 6). A first line begun before what was read has its head in
+ * the page before, and the head-first read goes on from where that page ends (a reviewer's read of
+ * the fixes for #22: the note promised the line's head and the read showed its middle).
  */
 async function tailLogLines(ctx: ToolContext, session: string, n: number, raw: boolean, d: Drawn | null): Promise<string[]> {
   const { lines, cut } = await tailLines(ctx, session, n, raw, d);
   if (cut === undefined) return lines;
   if (cut.cutHead && lines.length) lines[0] = `…${lines[0]}`;
-  const head = cut.head ? `; read ${callArgs({ session, ...cut.head })} shows the first line below from its head` : cut.cutHead ? ', ending with the head of the first line below' : '';
+  // A line begun before what was read goes on from the page before, whose end is that line's earlier part:
+  // its head when the line is shorter than that page, else more of its middle.
+  const earlier = ', ending with the earlier part of the first line below';
+  const head = cut.head
+    ? cut.begunBefore
+      ? `${earlier}; read ${callArgs({ session, ...cut.head })} shows that line on from where that page ends`
+      : `; read ${callArgs({ session, ...cut.head })} shows the first line below from its head`
+    : cut.cutHead
+      ? earlier
+      : '';
   lines.unshift(`[earlier output not shown (${cut.why}); read ${callArgs({ session, tail: n, ...cut.before })} shows what came before${head}]`);
   return lines;
 }

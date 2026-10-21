@@ -25,6 +25,7 @@ import type { RunOutput } from './runindex.js';
 import { cutPlumbing } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
 import { safeCut, tailStart, unfinishedSequence } from './text.js';
+import { headOnlyText } from './regex.js';
 import { project } from './transcript.js';
 import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type JournalEvent, type OutputStream, type Principal, type RunInfo, type ScreenSnapshot, type Seq } from './types.js';
 
@@ -403,7 +404,7 @@ class Render {
     const what = ev.kind === 'pattern' ? `matched: ${oneLine(ev.line ?? ev.match ?? '', 160)}` : ev.kind === 'silence' ? (ev.match ?? 'output went quiet') : 'the shell is available';
     // `clipped`: the line was longer than the pattern's match window and matched on its head; carried
     // to the reader, as the hit and waitFor's result carry it (the house's read of the 36 commits, #22).
-    const clip = ev.clipped ? ' (matched on the line\'s head)' : '';
+    const clip = ev.clipped ? ` (${headOnlyText()})` : '';
     return {
       ...this.base('watch', ev.seq, { watchId: ev.watchId, label: ev.label, watchKind: ev.kind, match: ev.match, at: ev.at, ...(ev.clipped ? { clipped: true } : {}) }, ev.ts),
       lifecycle: true,

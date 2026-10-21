@@ -53,13 +53,14 @@
  *   input cap cut lines (or a line's head) that were asked for. `lines.before`
  *   is where a tail of what came before ends, exactly where the lines shown
  *   begin, and `lines.head` reads a first line shown without its head from its
- *   head. As events, the tail is the newest N events whose stored lines fit
+ *   head, or, when that line began before the lines read (`lines.begunBefore`),
+ *   on from where the page before ends. As events, the tail is the newest N events whose stored lines fit
  *   `maxBytes`. `commands` heads each Run's output in a text tail with
  *   `$ <line>` where it started (the 1.x log shape the compat pack serves).
  */
 import { err } from '../core/errors.js';
 import type { Journal } from '../core/journal.js';
-import { compileUserRegex } from '../core/regex.js';
+import { compileUserRegex, headOnlyText } from '../core/regex.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
 import { persistentState } from '../core/screen.js';
@@ -98,10 +99,9 @@ export function gapsText(r: { gap?: GapInfo; gaps?: GapInfo[] }): string | undef
   return r.gap ? one(r.gap) : undefined;
 }
 
-/** Lines a search matched on their head only, being longer than the pattern's match window (G11); undefined when none. */
+/** Lines a search matched on their head only, being longer than the pattern's match window (G11), in the one wording of it (headOnlyText); undefined when none. */
 export function clippedText(n: number | undefined): string | undefined {
-  if (!n) return undefined;
-  return `${n} line${n === 1 ? '' : 's'} longer than the match window, searched on ${n === 1 ? 'its' : 'their'} head only`;
+  return n ? headOnlyText(n) : undefined;
 }
 
 export interface ReadResult {
@@ -134,9 +134,13 @@ export interface ReadResult {
    * `cutHead`: the first line returned is missing its head (the byte cap, the input cap or the
    * window's start cut it), and `head` is a head-first read (`since`, `offset`) from where the page
    * before ends, which shows that line from its head (the house's reads of 78c4d6e and of the 38
-   * commits, #22).
+   * commits, #22). `begunBefore`: the lines shown reach back to the start of what was read, and
+   * older output precedes it, so the first line may have begun in the page before; `head` then
+   * reads it on from where that page ends, which is the only read reaching the bytes between, and
+   * not from its head (a reviewer's read of the fixes for #22: the head read of a line begun long
+   * before the window started in its middle).
    */
-  lines?: { requested: number; returned: number; cutHead?: true; before?: { until: Seq; untilOffset?: number }; head?: { since: Seq; offset?: number } };
+  lines?: { requested: number; returned: number; cutHead?: true; begunBefore?: true; before?: { until: Seq; untilOffset?: number }; head?: { since: Seq; offset?: number } };
 }
 
 export interface SearchResult {
@@ -1026,9 +1030,12 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     // The first line returned is cut when the byte cap cut it, or when its head lies past what was
     // projected (and no line was dropped ahead of it, and it is no note): a line dropped for bytes alone
     // set `truncated`, and said nothing of which line was cut (the house's read of the 38 commits, #22,
-    // comment 6274935728, item 1). Its head is read head-first from where the page before ends.
+    // comment 6274935728, item 1). Its head is read head-first from where the page before ends. When the
+    // lines shown reach back to the window's start and older output precedes it, that is where the
+    // window starts, not where the line does: the read goes on from there (`begunBefore`).
     if (tail.cut || (drop === 0 && headCut && !notes.has(kept[0]!))) {
       counts.cutHead = true;
+      if (!at && older) counts.begunBefore = true;
       counts.head = from.untilOffset !== undefined ? { since: from.until - 1, offset: from.untilOffset } : { since: from.until };
     }
   }

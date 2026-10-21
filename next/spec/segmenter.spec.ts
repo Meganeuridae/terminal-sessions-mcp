@@ -133,8 +133,9 @@ test('a watch segment says when the hit was on the line\'s head only, and carrie
   src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 3, match: 'ERROR', line: 'ERROR: boom' });
   src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 5, match: 'ERROR', line: 'ERROR: long', clipped: true });
   assert.equal(out.length, 2);
-  assert.ok(!out[0]!.head.includes("(matched on the line's head)") && out[0]!.metadata.clipped === undefined, out[0]!.head);
-  assert.ok(out[1]!.head.endsWith("(matched on the line's head) · read since=4"), out[1]!.head);
+  // In the words search's status and wait_for use (a reviewer's read of the fixes for #22: three wordings of one fact).
+  assert.ok(!out[0]!.head.includes('match window') && out[0]!.metadata.clipped === undefined, out[0]!.head);
+  assert.ok(out[1]!.head.endsWith('(the line is longer than the match window: matched on its head only) · read since=4'), out[1]!.head);
   assert.equal(out[1]!.metadata.clipped, true);
   seg.dispose();
 });

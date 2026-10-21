@@ -270,7 +270,7 @@ test('Measure: the usage report finds the confusion signatures', () => {
   assert.equal(r.byTool.cancel!.errors, 1);
 });
 
-test('item 11/G18: the App rereads a repaired record before judging a new life\'s owner, so the owner reopens without a restart (the house\'s read of the 36 commits, #22)', async () => {
+test('G18: the App rereads a repaired record before judging a new life\'s owner, so the owner reopens without a restart (the house\'s read of the 36 commits, #22, comment 6269992150)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-app-repair-'));
   try {
     const r1 = new SessionRegistry({ dataDir: dir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });

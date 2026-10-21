@@ -20,7 +20,7 @@
  * evidence and a repeat count on the monitor, not the journal (m2-16).
  */
 import { compileLinePattern, LineSplitter, type SplitLine } from './ansi.js';
-import { testBounded } from './regex.js';
+import { headOnlyText, testBounded } from './regex.js';
 import type { Journal } from './journal.js';
 import { timerMs } from './clock.js';
 import { describeSpec, hasReadinessProbe, LIVENESS_MS, tcpConnect, type Connect, type ServiceSpec, type TcpTarget } from './probes.js';
@@ -220,7 +220,7 @@ export class ServiceMonitor {
     // and on the head the splitter kept of a line longer than MAX_LINE; the evidence says when only
     // the head was looked at.
     const text = line.text;
-    const evidenceOf = (clipped: boolean) => (clipped || line.cut ? `${text.trim()} (matched on the line's head)` : text.trim());
+    const evidenceOf = (clipped: boolean) => (clipped || line.cut ? `${text.trim()} (${headOnlyText()})` : text.trim());
     const fail = this.failRe ? testBounded(this.failRe, text) : undefined;
     if (fail?.matched) {
       this.onFail(evidenceOf(fail.clipped));

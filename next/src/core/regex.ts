@@ -161,6 +161,17 @@ export function testBounded(re: RegExp, text: string): { matched: boolean; clipp
   return { matched: r.match !== null, clipped: r.clipped };
 }
 
+/**
+ * The one wording of a `clipped` hit: a line longer than the pattern's match window, matched on its
+ * head only. Without `n`, the one line a watch, a service's probe or wait_for matched; with it, the
+ * count of such lines a search scanned. Search, wait_for and the watch and service notices said it
+ * three ways (a reviewer's read of the fixes for #22).
+ */
+export function headOnlyText(n?: number): string {
+  if (n === undefined) return 'the line is longer than the match window: matched on its head only';
+  return `${n} line${n === 1 ? '' : 's'} longer than the match window, matched on ${n === 1 ? 'its' : 'their'} head only`;
+}
+
 /** The fallback: refuse back-references and the classic exponential shapes. */
 function backtracking(pattern: string, flags: string): RegExp {
   if (/\\[1-9]|\\k</.test(pattern)) throw err('invalid_argument', 'back-references are not supported in patterns');

@@ -141,7 +141,7 @@ test('defect 9: session_list shows the 20 newest Runs and counts the rest', asyn
   for (const id of ids) await tool('cancel', { runId: id });
 });
 
-test('item 19: session_list shows the 20 newest services and counts the rest (the house\'s read of the 36 commits, #22)', async () => {
+test('session_list shows the 20 newest services and counts the rest (the house\'s read of the 36 commits, #22, comment 6269992150)', async () => {
   const s = 'manysvc';
   await tool('session_open', { session: s });
   const ids: string[] = [];
@@ -439,4 +439,40 @@ test('the 38 commits 7: the idempotency window is measured on the monotonic cloc
   const later = await call();
   assert.notEqual(later.runId, first.runId);
   assert.equal(later.replayed, undefined);
+});
+
+test('a key a restart’s journal recovers keeps its age: it expires a window after its Run’s admission, not a window after its first retry', async (t) => {
+  // It was stamped with the retry's monotonic time, so a key 14 minutes old lived 15 more minutes from its
+  // first retry (a reviewer's read of the fixes for #22).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-idem-aged-'));
+  const open = () => {
+    const registry = new SessionRegistry({ dataDir: dir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
+    return { registry, app: new App({ registry, defaultWaitMs: 5000 }) };
+  };
+  let life = open();
+  const call = () => life.app.run(A, { session: 'aged', command: 'echo once', target: 'process', wait: 5000, idempotencyKey: 'aged-key' });
+  try {
+    await life.app.sessionOpen(A, { id: 'aged' });
+    const first = await call();
+    assert.equal(first.state, 'exited', JSON.stringify(first));
+    await life.registry.closeAll();
+    // The daemon comes back 14 minutes later: the key is recovered from the journal and replays the Run.
+    const realNow = Date.now.bind(Date);
+    let wall = 14 * 60_000;
+    t.mock.method(Date, 'now', () => realNow() + wall);
+    life = open();
+    const again = await call();
+    assert.equal(again.runId, first.runId, 'the same Run');
+    assert.equal(again.replayed, true);
+    // Two minutes on, by both clocks: 16 minutes since the admission, past the window.
+    const realMono = clocks.monotonic;
+    t.mock.method(clocks, 'monotonic', () => realMono() + 2 * 60_000);
+    wall = 16 * 60_000;
+    const later = await call();
+    assert.notEqual(later.runId, first.runId, 'the key expired with its window');
+    assert.equal(later.replayed, undefined);
+  } finally {
+    await life.registry.closeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

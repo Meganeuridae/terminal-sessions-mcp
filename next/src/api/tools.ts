@@ -7,6 +7,8 @@
  * `code: message`), which MCP permits.
  */
 import { TermError } from '../core/errors.js';
+import { headOnlyText } from '../core/regex.js';
+import type { Seq } from '../core/types.js';
 import { commitReadDelivery, type App, type Caller, type ReadResult, type RunResult, type SearchResult, type SessionSummary } from './app.js';
 import { clippedText, gapsText, type GapInfo } from './reader.js';
 import { COMPAT_TOOLS } from './compat.js';
@@ -179,24 +181,41 @@ export function renderRun(r: RunResult, mode: ResultText): ToolResult {
   return { text: head + status, structured };
 }
 
-export function renderRead(r: ReadResult, mode: ResultText): ToolResult {
+/**
+ * A read's result as text: the page, then a status line whose advice names every argument the read
+ * it advises needs. `asked` is the request's range (`since`, `until`), which the result does not echo:
+ * a Run's page or tail read on, or back, without its Run read the session, and an earlier page without
+ * the request's `since` left its range (a reviewer's read of the fixes for #22).
+ */
+export function renderRead(r: ReadResult, mode: ResultText, asked: { since?: Seq | undefined; until?: Seq | undefined } = {}): ToolResult {
   const structured = env(r);
   if (mode === 'json') return { text: JSON.stringify(r, null, 2), structured };
   const body = r.text !== undefined ? r.text : JSON.stringify(r.events, null, 1);
   const next = `since=${r.nextCursor}${r.nextOffset ? ` offset=${r.nextOffset}` : ''}`;
-  const lines = r.lines ? ` · ${r.lines.returned} of ${r.lines.requested} lines${tailMarks(r.lines)}` : '';
-  const status = `[read ${r.session}${r.runId ? ` run ${r.runId}` : ''} seq ${r.seq[0]}–${r.seq[1]}${lines} · next: ${next}${r.more ? ` · more: read ${next}` : ''}${r.splitLine ? ' · last line continues' : ''}${gapsBit(r)}${r.truncated ? ' · truncated' : ''}]`;
+  const lines = r.lines ? ` · ${r.lines.returned} of ${r.lines.requested} lines${tailMarks(r.lines, r.runId, asked.since)}` : '';
+  const more = r.more ? ` · more: read ${next}${argWords({ until: asked.until, runId: r.runId })}` : '';
+  const status = `[read ${r.session}${r.runId ? ` run ${r.runId}` : ''} seq ${r.seq[0]}–${r.seq[1]}${lines} · next: ${next}${more}${r.splitLine ? ' · last line continues' : ''}${gapsBit(r)}${r.truncated ? ' · truncated' : ''}]`;
   return { text: (body ? body + '\n' : '') + status, structured };
 }
 
+/** ` key=value` for each argument given, in order. */
+const argWords = (o: Record<string, string | number | undefined>): string =>
+  Object.entries(o)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => ` ${k}=${v}`)
+    .join('');
+
 /**
  * A tail's marks on the status line: the first line cut at its head and the read that shows it from
- * there, and the read of what came before, each with every argument it needs, so following it twice
- * gets further back each time (the house's reads of 78c4d6e and of the 38 commits, #22).
+ * there (or, begun before this page, on from where the page before ends), and the read of what came
+ * before, each with every argument it needs, the tail's Run and its `since` included, so following it
+ * twice gets further back each time (the house's reads of 78c4d6e and of the 38 commits, #22; a
+ * reviewer's read of the fixes for #22).
  */
-function tailMarks(l: NonNullable<ReadResult['lines']>): string {
-  const head = l.cutHead ? ` (the first cut at its head${l.head ? `; from its head: read since=${l.head.since}${l.head.offset !== undefined ? ` offset=${l.head.offset}` : ''}` : ''})` : '';
-  const before = l.before ? ` · earlier: read tail=${l.requested} until=${l.before.until}${l.before.untilOffset !== undefined ? ` untilOffset=${l.before.untilOffset}` : ''}` : '';
+function tailMarks(l: NonNullable<ReadResult['lines']>, runId: string | undefined, since: Seq | undefined): string {
+  const from = l.begunBefore ? ', begun before this page; on from where the earlier page ends' : '; from its head';
+  const head = l.cutHead ? ` (the first cut at its head${l.head ? `${from}: read${argWords({ since: l.head.since, offset: l.head.offset, runId })}` : ''})` : '';
+  const before = l.before ? ` · earlier: read${argWords({ tail: l.requested, until: l.before.until, untilOffset: l.before.untilOffset, since, runId })}` : '';
   return head + before;
 }
 
@@ -288,8 +307,9 @@ const READ_OUTPUT: Schema = {
         requested: { type: 'integer' },
         returned: { type: 'integer' },
         cutHead: { type: 'boolean' },
+        begunBefore: { type: 'boolean', description: 'With cutHead: the first line may have begun before the lines read, in the page before; head then reads it on from where that page ends, not from its head.' },
         before: { type: 'object', description: 'Pass beside tail for what came before: until, and untilOffset when the lines begin inside an event.', properties: { until: { type: 'integer' }, untilOffset: { type: 'integer' } }, required: ['until'] },
-        head: { type: 'object', description: 'With cutHead: a head-first read (since, offset) that shows the first line from its head.', properties: { since: { type: 'integer' }, offset: { type: 'integer' } }, required: ['since'] },
+        head: { type: 'object', description: 'With cutHead: a head-first read (since, offset) from where the page before ends, which shows the first line from its head (with begunBefore, on from there).', properties: { since: { type: 'integer' }, offset: { type: 'integer' } }, required: ['since'] },
       },
       required: ['requested', 'returned'],
     },
@@ -572,7 +592,7 @@ export const TOOLS: ToolDef[] = [
       const o = pick<Parameters<App['read']>[1]>(a, ['session', 'since', 'offset', 'until', 'untilOffset', 'tail', 'runId', 'as', 'maxBytes', 'limit']);
       if (o.since === undefined && o.tail === undefined && o.runId === undefined) o.tail = 50;
       const r = await ctx.app.read(ctx.caller, o);
-      const res = renderRead(r, ctx.resultText);
+      const res = renderRead(r, ctx.resultText, o);
       // The read cursor advances only once this result reaches the caller (G22; the house's read of 1cabc6a, #22).
       res.onSent = () => commitReadDelivery(r);
       return res;
@@ -879,8 +899,8 @@ export const TOOLS: ToolDef[] = [
     outputSchema: WAIT_OUTPUT,
     async run(ctx, a) {
       const r = await ctx.app.waitFor(ctx.caller, pick(a, ['session', 'pattern', 'silenceMs', 'idle', 'runId', 'since', 'wait']));
-      // A match on a clipped line is said in the text as search's status says it; only `--json` showed `clipped` (the house's read of the 38 commits, #22 comment 6274806357).
-      const clipped = r.clipped ? ' · the line is longer than the match window: matched on its head only' : '';
+      // A match on a clipped line is said in the text, in the words search's status and the watch notice use (headOnlyText); only `--json` showed `clipped` (the house's read of the 38 commits, #22 comment 6274806357).
+      const clipped = r.clipped ? ` · ${headOnlyText()}` : '';
       const text = r.matched ? `[${r.kind} matched after ${fmt(r.elapsedMs)}${r.line ? `: ${r.line}` : r.match ? `: ${r.match}` : ''} · seq ${r.seq ?? '?'}${clipped}]` : `[no ${r.kind} match${r.reason ? ` · ${r.reason}` : ` within ${fmt(r.elapsedMs)}`} · next=${r.nextCursor}]`;
       return render(ctx, text, env(r));
     },

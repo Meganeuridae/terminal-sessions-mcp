@@ -533,8 +533,8 @@ test('1cabc6a 5: a tail of one line longer than the old input cap keeps the whol
   assert.ok(cut.text!.length > 0 && cut.text!.length < 1_300_000);
   assert.equal(cut.truncated, true, 'the line came back without its head');
   // The one line is shown with its head gone: said as such. It began before what was read, so the page
-  // before ends with its head, and `head` reads it from where what was read begins.
-  assert.deepEqual(cut.lines, { requested: 1, returned: 1, cutHead: true, before: { until: cut.seq[0] - 1 }, head: { since: cut.seq[0] - 1 } });
+  // before ends with its head, and `head` reads it on from where what was read begins (`begunBefore`).
+  assert.deepEqual(cut.lines, { requested: 1, returned: 1, cutHead: true, begunBefore: true, before: { until: cut.seq[0] - 1 }, head: { since: cut.seq[0] - 1 } });
 });
 
 test('1cabc6a 6: a control string longer than any lookback (an OSC 52 clipboard) never leaks its payload into a page, whatever the page size', async () => {
@@ -916,4 +916,34 @@ test('untilOffset goes with a text tail and until, and is refused anywhere else'
   }
   const r = await readJournal(src, { tail: 2, until: 1, untilOffset: 5 }, { resultBytes: 16384 });
   assert.equal(r.text, 'one');
+});
+
+// ───────────── a reviewer's read of the fixes for #22 ─────────────
+
+test('a first line begun before the tail’s window is marked so, and its head-first read is said to go on from where the page before ends', async () => {
+  // A line of 600 KB in 1 KB events after two short lines, longer than the tail's window: `head` was said
+  // to show it from its head, and read its middle from the window's start (the read reaching those bytes).
+  const src = source();
+  out(src.journal, 'short 1\r\nshort 2\r\n');
+  const line = `HEAD${'a'.repeat(600_000)}TAIL`;
+  for (let i = 0; i < line.length; i += 1000) out(src.journal, line.slice(i, i + 1000));
+  out(src.journal, '\r\n');
+  const r = await readJournal(src, { tail: 3, maxBytes: 16384 }, { resultBytes: 16384 });
+  assert.ok(r.text!.endsWith('TAIL'));
+  assert.equal(r.lines!.cutHead, true);
+  assert.equal(r.lines!.begunBefore, true, 'the line began before the lines read');
+  assert.deepEqual(r.lines!.head, { since: r.lines!.before!.until }, 'the head-first read starts where the page before ends');
+  const h = await readJournal(src, { ...r.lines!.head! }, { resultBytes: 16384 });
+  assert.ok(!h.text!.startsWith('HEAD') && h.text!.startsWith('a'), 'on from there, not from its head');
+  assert.equal(h.seq[0], r.seq[0], 'the window’s first event');
+  // The page before ends right there, with the line's earlier part.
+  const b = await readJournal(src, { tail: 3, maxBytes: 16384, ...r.lines!.before! }, { resultBytes: 16384 });
+  assert.equal(b.seq[1], r.lines!.before!.until);
+  assert.ok(b.text!.endsWith('a') && !b.text!.includes('TAIL'));
+  // A line the byte cap cut whose head lies inside the window is shown from its head, as before.
+  const inside = source();
+  out(inside.journal, `short\r\n${'b'.repeat(3000)}\r\n`);
+  const c = await readJournal(inside, { tail: 1, maxBytes: 1024 }, { resultBytes: 16384 });
+  assert.equal(c.lines!.cutHead, true);
+  assert.equal(c.lines!.begunBefore, undefined, 'the line begins inside what was read');
 });
