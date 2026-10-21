@@ -1232,11 +1232,12 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // on, its payload's LFs end no line, and the projection shows none of it (openBefore). So for every source, at
   // its first output in the window, seeded just ahead of it: seeded for the first source alone, another's title
   // left open showed its payload as lines (our read of the 40 commits, PR #22). A note ahead of a source's first
-  // output ends the string first.
+  // output ends the string first. What every source left open is read in one walk (opensBefore).
   let noted = false;
+  const opens = older ? opensBefore(src, o, events) : undefined;
   const seed = (e: Output, key: string) => {
-    if (!older || noted || sources.has(key)) return;
-    const open = openBefore(src, o, e);
+    if (noted || sources.has(key)) return;
+    const open = opens?.get(key);
     if (!open) return;
     chunks.push(chunkOf(e, open));
     carries.set(key, { open });
@@ -1411,48 +1412,89 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
 const endsSequences = (e: JournalEvent, o: ReadOptions): boolean => isGap(e) || (o.commands === true && e.type === 'run.start' && e.line !== undefined);
 
 /**
- * What `first`'s source left open where `first` begins (LineCarry's `open`: a control sequence's introducer, and
- * after a string's a last ESC that may begin its terminator), read in up to STATE_LOOKBACK bytes of that source's
- * output before it, as stateBefore reads lasting state; '' when nothing is. A hole ends any sequence open before it.
- * Like stateBefore's, a session's look-back stops after MAX_SCAN journal events, so a title opened 160 KB back
- * across 40,000 small events is not found, and the tail shows its payload as text; a Run's look-back is bounded in
- * bytes alone (our read of the house's fixes for its review of f3750e4, PR #22: 14884ca).
+ * What a Run's output left open where `first` begins (LineCarry's `open`: a control sequence's introducer, and after a
+ * string's a last ESC that may begin its terminator), read in up to STATE_LOOKBACK bytes of its output before `first`,
+ * as stateBefore reads lasting state; '' when nothing is. A hole ends any sequence open before it. A Run's look-back
+ * is bounded in bytes alone; a session's is opensBefore's, which, like stateBefore's, stops after MAX_SCAN journal
+ * events, so a title opened 160 KB back across 40,000 small events is not found, and the tail shows its payload as
+ * text (our read of the house's fixes for its review of f3750e4, PR #22: 14884ca).
  */
-function openBefore(src: ReadSource, o: ReadOptions, first: Output): string {
+function openBefore(src: ReadSource, o: ReadOptions & { runId: string }, first: Output): string {
   const key = sourceKey(first);
   const back: string[] = [];
-  let bytes = 0;
-  if (o.runId !== undefined) {
-    // A Run's holes come apart from its events (RunOutput.gaps): the look-back stops at the last one before
-    // `first`. Looked for among the events, which are outputs, a title left open before a hole hid every line of a
-    // tail after it (our read of the 40 commits, PR #22).
-    const ro = src.runOutput(o.runId, { until: first.seq - 1, maxBytes: STATE_LOOKBACK });
-    const holeEnd = Math.max(-1, ...(ro.gaps ?? []).filter((g) => g.from < first.seq).map((g) => Math.min(g.to, g.seq)));
-    for (let i = ro.events.length - 1; i >= 0; i--) {
-      const e = ro.events[i]!;
-      if (e.seq <= holeEnd) break;
-      if (isOutput(e) && sourceKey(e) === key) back.push(e.data);
-    }
-  } else {
-    let cursor = first.seq - 1;
-    let examined = 0;
-    walk: while (bytes < STATE_LOOKBACK && cursor > 0 && examined < MAX_SCAN) {
-      const batch = src.journal.tail(512, cursor);
-      if (batch.length === 0) break;
-      examined += batch.length;
-      for (let i = batch.length - 1; i >= 0 && bytes < STATE_LOOKBACK; i--) {
-        const e = batch[i]!;
-        if (isGap(e)) break walk;
-        if (!isOutput(e) || sourceKey(e) !== key) continue;
-        back.push(e.data);
-        bytes += e.data.length;
-      }
-      cursor = batch[0]!.seq - 1;
-    }
+  // A Run's holes come apart from its events (RunOutput.gaps): the look-back stops at the last one before `first`.
+  // Looked for among the events, which are outputs, a title left open before a hole hid every line of a tail after
+  // it (our read of the 40 commits, PR #22).
+  const ro = src.runOutput(o.runId, { until: first.seq - 1, maxBytes: STATE_LOOKBACK });
+  const holeEnd = Math.max(-1, ...(ro.gaps ?? []).filter((g) => g.from < first.seq).map((g) => Math.min(g.to, g.seq)));
+  for (let i = ro.events.length - 1; i >= 0; i--) {
+    const e = ro.events[i]!;
+    if (e.seq <= holeEnd) break;
+    if (isOutput(e) && sourceKey(e) === key) back.push(e.data);
   }
   const carry = lineCarry();
   lineEnds(back.reverse().join(''), carry);
   return carry.open;
+}
+
+/**
+ * What each source of a tail's window left open where its first output in the window begins (openBefore), for the
+ * sources whose first output comes ahead of any note; only those that left something open are in the map. A process
+ * Run that starts inside the window has nothing before it and is not looked for. A session's sources are read in one
+ * walk back from the window's first event, up to STATE_LOOKBACK bytes of each and MAX_SCAN events in all: a walk for
+ * each source took about 10 ms apiece, and a tail of 2,000 over 1,000 two-line Runs took 17 s (an independent read of
+ * the fixes for the review of the 40 commits, PR #22).
+ */
+function opensBefore(src: ReadSource, o: ReadOptions, evs: JournalEvent[]): Map<string, string> {
+  const want = new Map<string, Output>();
+  const seen = new Set<string>();
+  for (const e of evs) {
+    if (endsSequences(e, o)) break;
+    if (e.type === 'run.admit' || e.type === 'run.start') seen.add(`p:${e.runId}`);
+    else if (isOutput(e)) {
+      const key = sourceKey(e);
+      if (!seen.has(key)) want.set(key, e);
+      seen.add(key);
+    }
+  }
+  const opens = new Map<string, string>();
+  if (o.runId !== undefined) {
+    for (const [key, first] of want) {
+      const open = openBefore(src, { ...o, runId: o.runId }, first);
+      if (open) opens.set(key, open);
+    }
+    return opens;
+  }
+  const back = new Map<string, string[]>();
+  const bytes = new Map<string, number>();
+  let left = want.size;
+  let cursor = (evs[0]?.seq ?? 1) - 1;
+  let examined = 0;
+  walk: while (left > 0 && cursor > 0 && examined < MAX_SCAN) {
+    const batch = src.journal.tail(512, cursor);
+    if (batch.length === 0) break;
+    examined += batch.length;
+    for (let i = batch.length - 1; i >= 0; i--) {
+      const e = batch[i]!;
+      if (isGap(e)) break walk;
+      if (!isOutput(e)) continue;
+      const key = sourceKey(e);
+      const had = bytes.get(key) ?? 0;
+      if (!want.has(key) || had >= STATE_LOOKBACK) continue;
+      let parts = back.get(key);
+      if (!parts) back.set(key, (parts = []));
+      parts.push(e.data);
+      bytes.set(key, had + e.data.length);
+      if (had + e.data.length >= STATE_LOOKBACK) left--;
+    }
+    cursor = batch[0]!.seq - 1;
+  }
+  for (const key of want.keys()) {
+    const carry = lineCarry();
+    lineEnds((back.get(key) ?? []).reverse().join(''), carry);
+    if (carry.open) opens.set(key, carry.open);
+  }
+  return opens;
 }
 
 /**
@@ -1462,6 +1504,7 @@ function openBefore(src: ReadSource, o: ReadOptions, first: Output): string {
  */
 function windowEnds(src: ReadSource, o: ReadOptions, evs: JournalEvent[], olderBefore: boolean): number {
   const carries = new Map<string, LineCarry>();
+  const opens = olderBefore ? opensBefore(src, o, evs) : undefined;
   let noted = false;
   let count = 0;
   for (const e of evs) {
@@ -1471,7 +1514,7 @@ function windowEnds(src: ReadSource, o: ReadOptions, evs: JournalEvent[], olderB
     } else if (isOutput(e)) {
       const key = sourceKey(e);
       let carry = carries.get(key);
-      if (!carry) carries.set(key, (carry = olderBefore && !noted ? { open: openBefore(src, o, e) } : lineCarry()));
+      if (!carry) carries.set(key, (carry = !noted && opens?.has(key) ? { open: opens.get(key)! } : lineCarry()));
       count += lineEnds(e.data, carry).length;
     }
   }

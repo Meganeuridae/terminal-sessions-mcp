@@ -1591,3 +1591,24 @@ test('a tail cut by the byte cap across a change of source names the source of t
     assert.ok(Buffer.byteLength(r.text!) <= maxBytes, `${Buffer.byteLength(r.text!)} bytes`);
   }
 });
+
+test('a tail over many Runs reads what the sources left open in one walk back, and none for a Run that starts in its window (an independent read of the fixes for the review of the 40 commits, PR #22)', async () => {
+  // A walk back for every source of the window: a tail of 2,000 over 40,000 lines and 1,000 Runs of two lines took
+  // 17 s. A process Run whose run.start lies in the window has nothing before it, and the pty is read once.
+  const src = source();
+  for (let i = 0; i < 40_000; i++) out(src.journal, `pty line ${i}\r\n`);
+  for (let r = 0; r < 200; r++) {
+    startRun(src.journal, `r${r}`);
+    out(src.journal, `r${r} one\r\nr${r} two\r\n`, 'stdout', `r${r}`);
+    endRun(src.journal, `r${r}`);
+  }
+  let calls = 0;
+  const tail = src.journal.tail.bind(src.journal);
+  src.journal.tail = (n: number, to?: number) => {
+    calls++;
+    return tail(n, to);
+  };
+  const r = await readJournal(src, { tail: 2000 }, { resultBytes: 1 << 20 });
+  assert.ok(r.text!.endsWith('r199 two'), r.text!.slice(-40));
+  assert.ok(calls < 1000, `${calls} batches read`);
+});
