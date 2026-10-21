@@ -1316,3 +1316,39 @@ test('jr2-7/G21/G26: a live session\'s aged output is gone after expire(), with 
   assert.ok(!fs.readdirSync(path.join(r.dir, 'sessions', 'short')).some((n) => n.startsWith('journal') && n.endsWith('.jsonl') && fs.readFileSync(path.join(r.dir, 'sessions', 'short', n), 'utf8').includes('SECRET')), 'nor on disk');
   await r.reg.closeAll();
 });
+
+test('jr2-4: a journal recovery never read, opened for a new life, ends the Runs it left in flight as recovery does, so the next recovery that can list processes ends a leader still running (the house\'s review of the 77 commits through 4f4c067, PR #22)', { timeout: 20_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const kids = detachedKids();
+  try {
+    const r = rig(dir, { terminateOrphans: true, listProcesses: () => undefined });
+    // Written after the registry started, so its recovery never read it: a Run in flight whose leader still runs,
+    // with its start ticks and boot recorded.
+    const T = Date.now() - 60_000;
+    const sdir = path.join(dir, 'sessions', 'late');
+    const g = kids.spawn('sleep', ['433']);
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'late', now: () => T });
+    j.append({ type: 'run.admit', runId: 'r1-late', target: 'process', line: 'r1-late', principal: A, origin: 'self', queued: false });
+    j.append({ type: 'run.start', runId: 'r1-late', cwd: '/', envBasis: 'configured', pid: g, pgid: g, startTicks: 4242, bootId: 'boot-X' });
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    await r.reg.ensure({ id: 'late', owner: A });
+    await r.reg.closeAll();
+    const ends = onDisk(sdir).filter((e): e is Extract<JournalEvent, { type: 'run.end' }> => e.type === 'run.end' && e.runId === 'r1-late');
+    assert.deepEqual(
+      ends.map((e) => [e.state, e.reason, e.recoveredEnd, e.lastAliveTs, e.groupJudged]),
+      [['lost', 'daemon-restart', true, T, undefined]],
+      'one end, a recovery\'s: the dead daemon\'s last evidence, and no judgement',
+    );
+    // The next recovery lists the leader, with the Run's ticks under the Run's boot: the group is the Run's.
+    const leader: ProcessRow = { pid: g, pgid: g, startMs: T + 200, zombie: false, startTicks: 4242, bootId: 'boot-X' };
+    const r2 = rig(dir, { terminateOrphans: true, listProcesses: () => [leader] });
+    assert.equal(hist(r2.reg.get('late')).run('r1-late').groupJudged, true);
+    await kids.exited(g);
+    const killed = kids.kids.find((c) => c.pid === g)!;
+    assert.ok(killed.signalCode === 'SIGTERM' || killed.signalCode === 'SIGKILL', `ended by recovery (${killed.signalCode})`);
+    await r2.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});

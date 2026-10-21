@@ -979,7 +979,28 @@ export class SessionRegistry {
       else store.setRetention(before);
       jo.runs = runs;
       jo.cold = store;
+      // The dead daemon's last evidence, read before the journal opens (and may write its gap): see recover.
+      const lastAliveTs = lastAlive(store);
       journal = new Journal(jo);
+      // The Runs it left in flight end here as recovery ends them: `lost`, marked as ends a recovery wrote, with
+      // the dead daemon's last evidence and no judgement. Left open, this life's close ended each as one it had
+      // seen end, and a later recovery took a leader still running for a stranger's reuse of its pid and left it
+      // running for good (the house's review of the 77 commits through 4f4c067, PR #22).
+      const now = Date.now();
+      const ended: string[] = [];
+      for (const run of runs.open()) {
+        journal.append({
+          type: 'run.end',
+          runId: run.runId,
+          state: 'lost',
+          reason: 'daemon-restart',
+          durationMs: Math.max(0, now - (run.startedAt ?? run.admittedAt)),
+          recoveredEnd: true,
+          ...(lastAliveTs !== undefined && { lastAliveTs }),
+        });
+        ended.push(run.runId);
+      }
+      if (ended.length) this.opts.log?.('info', 'a session recovery could not read ended the Runs a previous daemon left in flight', { session: id, runs: ended });
     }
     const reuse = reusable ? recordedOptions(recorded, retention) : undefined;
     const options = this.resolveOptions(o, reuse, retention);
