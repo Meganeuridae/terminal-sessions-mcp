@@ -173,22 +173,25 @@ const legacySourceLine = (file: string, flavor: ShellFlavor, nonce: string): str
  * it and the output before it went (the house's read of the 33 commits, #22, comment 6307351104, and
  * its answer 2). Printed from the file, the typed line, its echo and its history entry stay as they
  * are. With `restore`, the status the shell had is kept for the body (`$?` after `false` is still 1),
- * restored in an AND-OR list's first place so `set -e` never ends the shell on it, and the variable
- * that carried it is gone again, as the integrations' temporaries are (`__tsm_q` stayed set in the
- * user's shell: the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374):
- * POSIX expands it into an eval that unsets it before the restore, a subshell only when it is not 0;
- * zsh keeps it local to a function; fish, whose source gives the file a scope of its own, erases it
- * from a function that sees the file's (`-S`), and the function erases itself. dash and bash trace
- * none of the line under `set -x` (the group's stderr is /dev/null), unless a BASH_XTRACEFD sends
- * bash's trace past the redirect, when the restore's eval, unset and test are traced after the mark
- * and stay in the output (a reviewer's read of the fixes for #22); zsh and fish trace a sourced
- * file's commands whatever their stderr, so each runs the mark from a function with its trace off,
- * traced only up to the call, before the mark, and zsh's AND-OR list ends in an empty group, which it
- * does not trace (a block's end, and a `:`, were traced after the mark). It adds one line, so a
- * message that names a line of the body names the next one.
+ * restored in an AND-OR list's first place so `set -e` never ends the shell on it, and nothing the
+ * line sets stays in the user's shell, as the integrations' temporaries do not (`__tsm_q` stayed set:
+ * the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374). POSIX needs no
+ * variable: a case on `$?` prints the mark when the status is 0, and otherwise has /bin/sh print it and
+ * exit with the status, so the mark is the last thing the line does and nothing of it is traced after
+ * the mark, even where a BASH_XTRACEFD sends bash's trace past the group's redirect (the restore's
+ * eval, unset and test, traced after the mark, stayed at the head of every such Run's result: the
+ * house's review of f3750e4..4f4c067, PR #22, comment 6315636412, question 6); a child process only
+ * when the status is not 0. zsh keeps the status local to a function; fish, whose source gives the
+ * file a scope of its own, erases it from a function that sees the file's (`-S`), and the function
+ * erases itself. dash and bash trace none of the line under `set -x` otherwise (the group's stderr is
+ * /dev/null); zsh and fish trace a sourced file's commands whatever their stderr, so each runs the
+ * mark from a function with its trace off, traced only up to the call, before the mark, and zsh's
+ * AND-OR list ends in an empty group, which it does not trace (a block's end, and a `:`, were traced
+ * after the mark). It adds one line, so a message that names a line of the body names the next one.
  */
 export function markerStartLine(nonce: string, flavor: ShellFlavor, restore = true): string {
-  const mark = `printf '<<<STAR''T:%s:%s>>>\\n' ${nonce} ${flavor === 'fish' ? '$fish_pid' : '"$$"'}`;
+  const format = `'<<<STAR''T:%s:%s>>>\\n'`;
+  const mark = `printf ${format} ${nonce} ${flavor === 'fish' ? '$fish_pid' : '"$$"'}`;
   if (flavor === 'fish') {
     const quiet = 'set -l fish_trace; functions -e __tsm_start';
     return restore
@@ -196,7 +199,8 @@ export function markerStartLine(nonce: string, flavor: ShellFlavor, restore = tr
       : `function __tsm_start; ${quiet}; ${mark}; end; __tsm_start`;
   }
   if (flavor === 'zsh') return restore ? `() { local __tsm_q=$?; setopt localoptions noxtrace; ${mark}; return $__tsm_q; } && { }` : `() { setopt localoptions noxtrace; ${mark}; }`;
-  return restore ? `{ __tsm_q=$?; ${mark}; eval "unset __tsm_q; [ $__tsm_q = 0 ] || (exit $__tsm_q)" && :; } 2>/dev/null` : `{ ${mark}; } 2>/dev/null`;
+  const child = `/bin/sh -c 'printf "$1" "$2" "$3"; exit "$4"' sh ${format} ${nonce} "$$" "$?" && :`;
+  return restore ? `{ case $? in 0) ${mark};; *) ${child};; esac; } 2>/dev/null` : `{ ${mark}; } 2>/dev/null`;
 }
 /**
  * A marker Run's command file: its start line, then the body. A body of blank lines and comments runs
@@ -219,10 +223,12 @@ const MARKER_LINES = FLAVORS.flatMap((f) => [sourceLine(AT_FILE, f, AT_NONCE), l
 const MARKER_RESTS = [...new Set(MARKER_LINES.map((line) => line.split(AT_NONCE)[1]!))];
 /**
  * Under `set -x`, the trace of the typed line that ran a command file (`+ command . /tmp/x/tsm-cmd-3`,
- * fish's `> source …`); group 1 is the trace's prefix, PS4 as the shell expanded it. The trace does not
- * quote the path, where the typed line, and so its echo, does.
+ * fish's `> source …`); group 1 is the trace's prefix, PS4 as the shell expanded it, with whatever the
+ * line held before it (see tracePrefix). The trace quotes the path only where it holds a character the
+ * shell would (a space, in a session's own directory under a data dir with one), where the typed line,
+ * and so its echo, always does.
  */
-const RUN_TRACE = new RegExp(`(?:^|\\n)([^\\n]*?)(?:command \\.|\\.|source) /[^\\s']*/${literal(COMMAND_FILE)}\\d+\\r?(?=\\n|$)`);
+const RUN_TRACE = new RegExp(`(?:^|\\n)([^\\n]*?)(?:command \\.|\\.|source) (?:/[^\\s']*|'/[^'\\n]*)/${literal(COMMAND_FILE)}\\d+'?\\r?(?=\\n|$)`);
 /** A command file's path as a source line quotes it: any directory, then the file's name. */
 const QUOTED_FILE = `'(?:[^'\\n]|'\\\\'')*/${literal(COMMAND_FILE)}\\d+'`;
 /**
@@ -450,7 +456,7 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
     pid = start[1];
     const nl = text.indexOf('\n', start.index + start[0].length);
     from = nl === -1 ? text.length : nl + 1;
-    if (of.strategy === 'marker') trace = RUN_TRACE.exec(text.slice(0, start.index))?.[1];
+    if (of.strategy === 'marker') trace = tracePrefix(raw, text, map, start.index);
   } else {
     // The typed line's echo, and the lines that follow it without a break, which are more of it: the
     // same line echoed again (typed ahead of its prompt), or the pieces of a redraw, which can split
@@ -579,6 +585,26 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
   return kept
     .map(([s, e, atLine, r]): [number, number] => [r ?? (from + s === 0 ? 0 : map[from + s - 1]! + 1), atLine && open.has(from + e) ? map[from + e - 1]! + 1 : (map[from + e] ?? raw.length)])
     .filter(([s, e]) => s < e);
+}
+
+/**
+ * The prefix of the typed line's trace before a marker Run's start mark at `before` in `text` (the cut's
+ * text of `raw`, `map` its raw indices), when the shell was tracing: what stands on the trace's line
+ * before the command, after the last carriage return the raw holds there. The text holds no carriage
+ * return, so a line the cursor went back to the start of keeps what it held before: bash writes
+ * `ESC[?2004l` and a CR before its trace, and a prefix holding the line's earlier text matched no trace
+ * of the end mark, whose line then went whole, a last `printf abc` with it (the house's review of
+ * f3750e4..4f4c067, PR #22, comment 6315636412).
+ */
+function tracePrefix(raw: string, text: string, map: number[], before: number): string | undefined {
+  const t = RUN_TRACE.exec(text.slice(0, before));
+  if (!t) return undefined;
+  const from = t.index + (t[0].startsWith('\n') ? 1 : 0);
+  const to = from + t[1]!.length;
+  const cr = raw.lastIndexOf('\r', (map[to] ?? raw.length) - 1);
+  let k = from;
+  while (k < to && map[k]! < cr) k++;
+  return text.slice(k, to);
 }
 
 /** The index of the first of the increasing `xs` at or after `x`. */

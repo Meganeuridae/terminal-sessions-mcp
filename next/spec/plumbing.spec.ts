@@ -413,11 +413,15 @@ test('under the marker strategy the start mark the command file prints bounds th
  * read of the fixes for #22).
  */
 const FISH = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find((p) => fs.existsSync(p));
+/** bash 4.1 and later take a BASH_XTRACEFD, which sends the trace past the groups' redirects (bash 5 on Linux; macOS has 3.2). */
+const XTRACEFD = fs.existsSync('/bin/bash') && Number(execFileSync('/bin/bash', ['-c', 'echo $((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1]))'], { encoding: 'utf8' })) >= 401;
+/** `past`: the shell writes its trace past the typed lines' redirects, so the cutter, not the redirect, takes the end mark's trace. */
 const MARKER_SHELLS = [
-  { shell: '/bin/dash', flavor: 'posix' as const, trace: "PS4='>> '; set -x; ", status: '$?' },
-  { shell: '/bin/bash', flavor: 'posix' as const, trace: "PS4='>> '; set -x; ", status: '$?' },
-  { shell: '/bin/zsh', flavor: 'zsh' as const, trace: "PS4='>> '; set -x; ", status: '$?' },
-  { shell: FISH, flavor: 'fish' as const, trace: 'set fish_trace 1; ', status: '$status' },
+  { name: 'dash', shell: '/bin/dash', flavor: 'posix' as const, trace: "PS4='>> '; set -x; ", status: '$?', past: false },
+  { name: 'bash', shell: '/bin/bash', flavor: 'posix' as const, trace: "PS4='>> '; set -x; ", status: '$?', past: false },
+  ...(XTRACEFD ? [{ name: 'bash with a BASH_XTRACEFD', shell: '/bin/bash', flavor: 'posix' as const, trace: "exec 3>&2; BASH_XTRACEFD=3; PS4='>> '; set -x; ", status: '$?', past: true }] : []),
+  { name: 'zsh', shell: '/bin/zsh', flavor: 'zsh' as const, trace: "PS4='>> '; set -x; ", status: '$?', past: false },
+  { name: 'fish', shell: FISH, flavor: 'fish' as const, trace: 'set fish_trace 1; ', status: '$status', past: true },
 ].filter((x): x is typeof x & { shell: string } => x.shell !== undefined && fs.existsSync(x.shell));
 /** A script run by `shell -c`, its stderr (where every shell writes its trace) joined to its output. */
 const runMerged = (shell: string, script: string): string => execFileSync('/bin/sh', ['-c', 'exec "$0" -c "$1" 2>&1', shell, script], { encoding: 'utf8' });
@@ -429,8 +433,7 @@ test('the marker strategy’s end mark and probe are printf-built: no `set -x` t
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-printf-mark-'));
   try {
     assert.ok(MARKER_SHELLS.length > 0, 'one of dash, bash, zsh and fish to run the lines in');
-    for (const { shell, flavor, trace } of MARKER_SHELLS) {
-      const what = path.basename(shell);
+    for (const { name: what, shell, flavor, trace, past } of MARKER_SHELLS) {
       // A command file's own name: the typed line's trace is known by it.
       fs.mkdirSync(path.join(dir, what));
       const file = path.join(dir, what, commandFile(1));
@@ -443,9 +446,9 @@ test('the marker strategy’s end mark and probe are printf-built: no `set -x` t
         const said = `${what} ${JSON.stringify(head)}: ${JSON.stringify(out)}`;
         assert.deepEqual([...out.matchAll(new RegExp(exitMark(N).source, 'g'))].map((m) => m[1]), ['0'], `one end mark, the real one: ${said}`);
         assert.equal([...out.matchAll(new RegExp(probeMark(N).source, 'g'))].length, 1, `one probe answer: ${said}`);
-        if (flavor !== 'fish') assert.doesNotMatch(out, /printf[^\n]*<<<(?:EXIT|PROBE)/, `neither traced: ${said}`);
-        // fish 4 quotes the format (`'%s:%s>>>\\n'`), fish 3.7 escapes it (`\%s:\%s\>\>\>\\n`).
-        else if (head) assert.match(out, /abc> printf \S+ '<<<EXIT:[^']*' 0\n/, `fish traces past the redirect: ${said}`);
+        if (!past) assert.doesNotMatch(out, /printf[^\n]*<<<(?:EXIT|PROBE)/, `neither traced: ${said}`);
+        // fish 4 quotes the format (`'%s:%s>>>\\n'`), fish 3.7 escapes it (`\%s:\%s\>\>\>\\n`), bash quotes it.
+        else if (head) assert.match(out, /abc[^\n]*?printf \S+ '<<<EXIT:[^']*' 0\n/, `the trace past the redirect: ${said}`);
         assert.match(cutPlumbing(out, { strategy: 'marker', nonce: N }), shown, said);
       }
     }
@@ -468,6 +471,14 @@ test('a trace a shell writes past the typed line’s redirect is named by the Ru
   // fish 3.7 (Ubuntu 24.04's) escapes what fish 4 quotes: the doubled backslash is still there, and `abc` stayed only with fish 4's.
   const fish37 = `printf \\%s:\\%s\\>\\>\\>\\\\n '<<<EXIT:${N}' 0\r\n`;
   assert.equal(cutPlumbing(`${echo}${mark}--> printf abc\r\nabc> ${fish37}${end}`, marker), '--> printf abc\r\nabc', 'fish 3.7’s trace');
+  // bash writes `ESC[?2004l` and a CR before tracing: a typed line's trace on a line the cursor went back to the start of has the
+  // prefix after the CR, and a last `printf abc` stays (the house's review of f3750e4..4f4c067, PR #22, comment 6315636412).
+  const bash = `${sourceLine(file, 'posix', N)}\r\nsh-5.2$ \x1b[?2004l\r+ command . ${file}\r\n${mark}++ printf abc\r\nabc+ printf '%s:%s>>>\\n' '<<<EXIT:${N}' 0\r\n${end}`;
+  assert.equal(cutPlumbing(bash, marker), '++ printf abc\r\nabc', 'the prefix after the CR');
+  // bash quotes the path in its trace when it holds a space (a session's own directory under such a data dir).
+  const spaced = '/Users/x/Application Support/tsm/s1/tsm-cmd-1';
+  const quoted = `${sourceLine(spaced, 'posix', N)}\r\n>> command . '${spaced}'\r\n${mark}>>> printf abc\r\nabc>> printf '%s:%s>>>\\n' '<<<EXIT:${N}' 0\r\n${end}`;
+  assert.equal(cutPlumbing(quoted, marker), '>>> printf abc\r\nabc', 'the prefix of a trace that quotes the path');
   assert.equal(cutPlumbing(`${echo}${mark}on\r\n[t] printf %s:%s>>>\\n <<<EXIT:${N} 0\r\n${end}`, marker), 'on\r\n', 'a PS4 of the body’s own, in dash’s shape');
   const probe = `^C\r\n$ ${markerProbe(N, 'fish').trimStart()}\r\n> printf '%s>>>\\\\n' '<<<PROBE:${N}'\r\n<<<PROBE:${N}>>>\r\n$ `;
   assert.equal(cutPlumbing(`${echo}${mark}out\r\n${probe}`, marker), 'out\r\n^C\r\n', 'the probe’s trace before its answer');
@@ -525,8 +536,10 @@ test('the marker strategy’s start line prints the Run’s start mark with the 
       assert.match(run('true; ', body), /body sees 0/, what);
       assert.match(run('false; ', '\n  # only a comment\n\n'), /<<<START:[^\n]*\n<<<EXIT:[^:]+:0>>>\nq=\[\]\n$/, `${what}: a body of comments exits 0`);
       for (const head of [`${trace}false; `, `${trace}true; `]) {
-        const after = run(head, 'echo traced\n').split('<<<START')[1]!;
-        assert.match(after, /^:[^\n]*\n[^\n]*echo traced\ntraced\n/, `${what} ${head}: nothing of the start line is traced after the mark: ${after}`);
+        // After the mark's own line (the trace before it may hold the mark's format, `<<<START:%s:%s>>>`, and no mark).
+        const traced = run(head, 'echo traced\n');
+        const after = traced.slice(traced.indexOf('\n', startMark(N).exec(traced)!.index) + 1);
+        assert.match(after, /^[^\n]*echo traced\ntraced\n/, `${what} ${head}: nothing of the start line is traced after the mark: ${after}`);
       }
       if (flavor === 'fish') continue;
       assert.match(run('set -e; ! true; ', body), /body sees 1\n<<<EXIT/, `${what}: set -e kept the shell`);

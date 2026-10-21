@@ -286,3 +286,25 @@ test('fish without its integration: a cancel’s probe that a long prompt wraps 
     }
   }
 });
+
+// The house's review of f3750e4..4f4c067 (PR #22, comment 6315636412), question 6 and the cutter's "left for later", in dash and
+// bash run as sh: a trace sent past the typed lines' redirects by a BASH_XTRACEFD.
+for (const [name, shell] of [...(hasShell('/bin/dash') ? [['dash', '/bin/dash']] : []), ['bash as sh', bashAsSh]] as const) {
+  test(`${name}: with a BASH_XTRACEFD and set -x on before the Run, nothing of the daemon's lines stays in a Run's result, and a last line with no line end stays`, async () => {
+    // bash 4.1 and later write the trace to the BASH_XTRACEFD past the start line's and the end mark's redirects; macOS's 3.2
+    // writes it to the redirected stderr, and the result is the same.
+    const x = await realSession(shell);
+    try {
+      await run(x, 'exec 9>&2; BASH_XTRACEFD=9; set -x');
+      assert.match((await run(x, 'printf abc')).text, /^\++ printf abc\nabc$/);
+      assert.match((await run(x, 'false')).text, /^\++ false$/);
+      // A status that is not 0 at the prompt (a line typed there failed): the start line keeps it through /bin/sh.
+      x.session.input('false\r', { principal: AGENT });
+      const kept = await run(x, 'echo "after $?"');
+      assert.match(kept.text, /^\++ echo '?after 1'?\nafter 1$/, JSON.stringify(kept.text));
+      await run(x, 'set +x');
+    } finally {
+      await x.close();
+    }
+  });
+}
