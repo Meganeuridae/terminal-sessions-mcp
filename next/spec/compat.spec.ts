@@ -705,7 +705,7 @@ test('the 33 commits 6: a searchLogs pattern holding a tab, as a character or an
   assert.ok(found.some((h) => h.line !== undefined && /^key +value$/.test(h.line)), JSON.stringify(found));
 });
 
-test('6307351617 5: a declared Run typed but not started carries its nonce, so its pieces’ marks and a GONE mark stay out of the logs', async () => {
+test('6307351617 5: a declared Run typed but not started carries its nonce, so its pieces’ marks, a GONE mark and a cancel probe’s answer stay out of the logs', async () => {
   // runPlumbing skipped a Run with no start, and a declared Run's nonce came only with its start, so the marks
   // its pieces print before it, or a GONE with no start at all, reached tailLogs (the house's read of the 33
   // commits, #22, comment 6307351617, item 5). `cat` declared as sh takes the typed lines and never starts the Run.
@@ -718,8 +718,10 @@ test('6307351617 5: a declared Run typed but not started carries its nonce, so i
   const run = live.session.run(String(typed.runId));
   assert.equal(run.state, 'starting', JSON.stringify(run));
   assert.match(run.nonce ?? '', /^[0-9a-f]{8}$/, 'the nonce is there from the launch');
-  // What a shell that took the first piece and then a cut line prints, and a program's mark of another Run.
-  live.session.journal.append({ type: 'output', data: `<<<ACK:${run.nonce}:1>>>\r\n<<<GONE:${run.nonce}>>>\r\n<<<ACK:0badf00d:1>>> a program line\r\n`, stream: 'pty' });
+  // What a shell that took the first piece and then a cut line prints, a cancel probe's answer from a shell that
+  // never ran the line (an empty token), and a program's mark of another Run.
+  const marks = [`<<<ACK:${run.nonce}:1>>>`, `<<<GONE:${run.nonce}>>>`, `<<<PROBE:${run.nonce}:4242:>>>`].map((m) => `${m}\r\n`).join('');
+  live.session.journal.append({ type: 'output', data: `${marks}<<<ACK:0badf00d:1>>> a program line\r\n`, stream: 'pty' });
   for (const raw of [false, true]) {
     const tail = lines(await call('tailLogs', { session: 'unstarted', lines: 40, raw }));
     const said = `raw ${raw}: ${JSON.stringify(tail.map((l) => l.slice(0, 80)))}`;
