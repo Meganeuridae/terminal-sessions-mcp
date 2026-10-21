@@ -271,9 +271,11 @@ test("a Run's time is rounded to whole seconds before it is split into minutes: 
     await until(() => s.run(proc.runId!).state === 'running', 5000, 'the Run running');
     const real = performance.now.bind(performance);
     for (const [ms, shown] of [[119_600, '2m0s'], [59_600, '1m0s']] as const) {
-      // The monotonic clock moves on so the Run has run `ms` (and a few ms more, by the time presence reads it).
+      // The monotonic clock stands where the Run has run `ms`: left moving, a slow read could carry 119.6 s past
+      // 120.5 and the boundary checked would move (our read of the 40 commits, PR #22).
       const ran = s.runDurationMs(proc.runId!)!;
-      t.mock.method(clocks, 'monotonic', () => real() + ms - ran);
+      const at = real() + ms - ran;
+      t.mock.method(clocks, 'monotonic', () => at);
       const text = P(A, ['pm']);
       t.mock.restoreAll();
       assert.match(text, new RegExp(`running \`sleep 20\` ${shown} \\(process\\)`), text);
