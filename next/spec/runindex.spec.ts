@@ -11,6 +11,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { Journal } from '../src/core/journal.js';
 import { boundHeader, distinctGaps, narrowOutput, RunIndex, type RunOutput, type RunOutputRange } from '../src/core/runindex.js';
+import { markerProbe, sourceLine } from '../src/core/plumbing.js';
+import { journalRunText } from '../src/core/segmenter.js';
 import { FileStore, MemoryStore } from '../src/core/stores.js';
 import type { EventInput, JournalEvent, RunInfo } from '../src/core/types.js';
 
@@ -412,4 +414,28 @@ test('distinctGaps keeps both of two holes that only partly overlap, leaves out 
   const c = gap(20, 30, 30);
   const inside = gap(22, 25, 25);
   assert.deepEqual(distinctGaps([inside, c, b, a]), [a, b, c]);
+});
+
+test('an ended marker Run’s shell is the one its run.end names, where its start mark bound another than run.start’s, and a page past its head judges probe answers by it', async () => {
+  // The house's review of 4f4c067..a8b6f28 (PR #22, comment 6323055715), question 8: run.start journals the session's program,
+  // and the start mark rebound only the live record, so a page past the Run's head judged the shell's answer as a stranger's.
+  const N = 'a1b2c3d4';
+  const j = new Journal({ sessionId: 's' });
+  j.append({ type: 'run.admit', runId: 'r1', target: 'shell', line: 'sleep 5', principal: 'agent:a@test', origin: 'agent', queued: false });
+  j.append({ type: 'run.start', runId: 'r1', cwd: '/', strategy: 'marker', nonce: N, shellPid: 100 });
+  j.append({ type: 'output', data: `${sourceLine('/tmp/x/tsm-cmd-1', 'posix', N)}\r\n<<<START:${N}:200>>>\r\n`, stream: 'pty', runId: 'r1' });
+  const tail = [`out\r\n^C\r\n`, `$${markerProbe(N)}\r\n<<<PROBE:${N}:200>>>\r\n$ `];
+  for (const data of tail) j.append({ type: 'output', data, stream: 'pty', runId: 'r1' });
+  j.append({ type: 'run.end', runId: 'r1', state: 'cancelled', durationMs: 5, shellPid: 200 });
+  const r = j.runs.get('r1')!;
+  assert.equal(r.shellPid, 200, 'run.end’s pid');
+  const page = j.runs.output(j, 'r1', { maxBytes: Buffer.byteLength(tail.join('')) });
+  assert.equal(page.older, true, 'a page past the head, its start mark not in it');
+  assert.equal((await journalRunText(page, { cols: 80, rows: 24 }, r)).text, 'out\n^C', 'the bound shell’s answer ends it');
+  assert.equal((await journalRunText(page, { cols: 80, rows: 24 }, { ...r, shellPid: 100 })).text, 'out\n^C\n$', 'by run.start’s pid it was a stranger’s');
+  // A run.end that names none (one recovery wrote, or one whose shell was run.start's) leaves run.start's.
+  const k = new Journal({ sessionId: 's' });
+  k.append({ type: 'run.start', runId: 'r2', cwd: '/', strategy: 'marker', nonce: N, shellPid: 100 });
+  k.append({ type: 'run.end', runId: 'r2', state: 'lost', durationMs: 5, recoveredEnd: true });
+  assert.equal(k.runs.get('r2')!.shellPid, 100);
 });

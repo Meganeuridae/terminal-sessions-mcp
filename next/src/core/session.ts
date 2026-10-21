@@ -191,6 +191,8 @@ interface RunRecord extends RunInfo {
   markerTail?: string;
   /** A marker Run's start mark was seen, and `shellPid` is the pid it named: bound once, as history binds it. */
   markerStarted?: boolean;
+  /** The `shellPid` the Run's run.start journaled, which a start mark can rebind (endRun journals the bound one). */
+  startShellPid?: number;
   /** Whether the end-marker probe was typed (marker and inline strategies, after an aborting ^C). */
   probed?: boolean;
   /** The reason a process Run ends with when the daemon tears it down (close, shell exit). */
@@ -237,7 +239,7 @@ const REPLIES_KEPT = 8;
 /** What a note says when the reinit gate after `exec bash` gives up: the recovery that loads the integration with the session's key. */
 const REINIT_RECOVERY = 'Shell commands are unavailable until it loads: once the shell shows its own prompt, send ` . "$TSM_BASH_RC" reinit typed` with input to load it, or open a new session';
 const publicRun = (r: RunRecord): RunInfo => {
-  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, markerStarted: _ms, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, startedMono: _sm, ...info } = r;
+  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, markerStarted: _ms, startShellPid: _ssp, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, startedMono: _sm, ...info } = r;
   return { ...info, seq: { ...info.seq } };
 };
 
@@ -1578,7 +1580,7 @@ export class Session {
       if (run.markerNonce !== undefined) ev.nonce = run.nonce = run.markerNonce;
       // The pid the inline start marker named, which history has no other way to know (comment 6274773484),
       // or the marker strategy's shell, whose probe answers name it.
-      if (run.shellPid !== undefined) ev.shellPid = run.shellPid;
+      if (run.shellPid !== undefined) ev.shellPid = run.startShellPid = run.shellPid;
     }
     // Stamped before the append, which dispatches run.start to listeners at once: the segmenter dates the
     // Run's digests from what the session measures then, and with no start stamp yet that was the
@@ -1641,6 +1643,12 @@ export class Session {
     if (reason) ev.reason = reason;
     if (outcome.leftovers) ev.leftovers = true;
     if (outcome.pipeStatus) ev.pipeStatus = [...outcome.pipeStatus];
+    // The shell a marker Run's start mark bound, where it is not the one run.start journaled (the session's
+    // program is not the shell that ran the file: ssh, docker exec, a wrapper): a reader of a page past the
+    // Run's head, or after recovery, judged probe answers by run.start's pid, rejected the real answer and kept
+    // the probe the live transcript cut (the house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715,
+    // question 8). A recovery-written end cannot know it, and its readers keep run.start's.
+    if (run.shellPid !== undefined && run.shellPid !== run.startShellPid) ev.shellPid = run.shellPid;
     // G28: run.end is journaled while the waiting principals are still recorded as
     // awaiting; the waiters are released after it.
     const ended = this.append(ev);

@@ -350,6 +350,9 @@ export class RunIndex {
         if (ev.reason) r.reason = ev.reason;
         if (ev.leftovers) r.leftovers = true;
         if (ev.pipeStatus) r.pipeStatus = [...ev.pipeStatus];
+        // The shell a marker Run's start mark bound, where it differs from run.start's: what an ended Run's probe answers
+        // are judged by (the house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715, question 8).
+        if (ev.shellPid !== undefined) r.shellPid = ev.shellPid;
         // A recovery-written end carries the recovery's time, not evidence of when the group could form,
         // and once recovery has judged the group a later restart does not judge it again (comment 6269992150).
         if (ev.recoveredEnd) r.recoveredEnd = true;

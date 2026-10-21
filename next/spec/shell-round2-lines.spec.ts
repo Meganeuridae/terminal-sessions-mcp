@@ -13,6 +13,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { AGENT, hasShell, realSession, until, type Real } from './fake-shell.js';
+import { startMark } from '../src/core/plumbing.js';
 import { DEFAULT_GEOMETRY } from '../src/core/types.js';
 import { sleep } from './testhost.js';
 
@@ -372,3 +373,28 @@ for (const [name, shell] of [...(hasShell('/bin/dash') ? [['dash', '/bin/dash']]
     }
   });
 }
+
+test('a marker Run whose file another shell than the session’s program ran journals that shell on its run.end, which its history reads', { skip: !hasShell('/bin/dash') }, async () => {
+  // The house's review of 4f4c067..a8b6f28 (PR #22, comment 6323055715), question 8: run.start names the session's program, here
+  // a wrapper running dash in its own process group, and the start mark's `$$` rebound only the live record.
+  const wrapper = path.join(markerDir, 'wrapper');
+  fs.writeFileSync(wrapper, '#!/bin/sh\n/bin/dash +m -i\nexit\n', { mode: 0o755 });
+  const x = await realSession(wrapper);
+  try {
+    assert.equal(x.session.integration, 'none');
+    const a = await x.session.admitWhenAvailable({ target: 'shell', line: 'sleep 5', principal: AGENT }, 3000);
+    assert.ok(a.admitted);
+    const nonce = x.session.listRuns().find((r) => r.runId === a.run.runId)!.nonce!;
+    const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
+    await until(() => output().includes(`<<<START:${nonce}:`), 3000, 'the command file ran');
+    const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 800 });
+    assert.equal(c.state, 'cancelled', JSON.stringify(c));
+    const ends = x.journal.since(0).events.filter((e) => (e.type === 'run.start' || e.type === 'run.end') && e.runId === a.run.runId);
+    const [start, end] = ends as Array<{ shellPid?: number }>;
+    assert.ok(end!.shellPid !== undefined && end!.shellPid !== start!.shellPid, JSON.stringify(ends));
+    assert.equal(end!.shellPid, Number(startMark(nonce).exec(output())![1]), 'the pid the start mark named');
+    assert.equal(x.journal.runs.get(a.run.runId)!.shellPid, end!.shellPid, 'history reads it');
+  } finally {
+    await x.close();
+  }
+});

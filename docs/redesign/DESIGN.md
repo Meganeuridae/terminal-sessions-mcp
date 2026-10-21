@@ -720,7 +720,8 @@ shell's next prompt. Under the marker strategy the end-marker probe's answer sho
 reads lines again: the Run ends `lost` (`exit-unobserved`) unless a cancel in progress ended it,
 and the shell is available. The answer names the process that evaluated the probe, and only the
 pid the Run's first start mark bound ends the Run: a program or subshell of the Run that took the
-probe answers with its own, and the Run runs on.
+probe answers with its own, and the Run runs on. Where that pid is not the one `run.start`
+journaled (the session's program is not the shell that ran the file), `run.end` journals it.
 
 ---
 
@@ -1444,10 +1445,11 @@ type JournalEvent =
                                     // C mark, or spawn. cols/rows: the geometry the transcript is projected at (§6); pid/pgid: a process Run's group, ended by recovery (G19c);
                                     // startTicks/bootId: the leader's /proc start time in clock ticks and the boot id, so recovery judges its group without a clock frame (Linux);
                                     // strategy/nonce: how the Run's boundaries were observed and the nonce in its marks, so history cuts its plumbing as the live transcript did (§8.1)
-                                    // shellPid: the shell an inline Run's start marker named, the one whose probe answer ends the Run, for history to judge answers by (§8.1)
-  | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true; lastAliveTs? }
+                                    // shellPid: the shell an inline Run's start marker named, or a marker Run's session shell, the one whose probe answer ends the Run, for history to judge answers by (§8.1)
+  | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true; lastAliveTs?; shellPid? }
                                     // leftovers: a process Run's group had members when its process exited; pipeStatus: a pipeline's statuses, one per command (§8.1);
                                     // recoveredEnd: recovery wrote this end; groupJudged: recovery ended or left its group; lastAliveTs: the dead daemon's last journal time, which bounds the group a later recovery may take for the Run's
+                                    // shellPid: the shell a marker Run's start mark bound, where it is not run.start's; a recovery-written end cannot know it, and run.start's stands
   | { seq; ts; type: 'run.judged';  runId }                                                     // recovery judged this Run's group (ended or left it) after the Run had ended: folds into groupJudged, so no later restart judges it again
   | { seq; ts; type: 'run.waiting'; runId; lastLine; silentMs; state }                        // G15's input-wanted heuristic, journaled with its evidence
   | { seq; ts; type: 'service';     runId; status: 'starting'|'ready'|'running'|'unhealthy'|'exited'|'lost'; probe; principal; name?; evidence?; exit? }  // §8.3; principal started it

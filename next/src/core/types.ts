@@ -41,7 +41,7 @@ export type EventInput =
   /** `shell`/`within`: a Run declared for the shell in front of the terminal (§8.1): the kind of shell, and the Run whose program it is (null: what replaced the session's shell). */
   | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string; shell?: string; within?: string | null }
   | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number; startTicks?: number; bootId?: string; strategy?: RunStrategy; nonce?: string; shellPid?: number }
-  | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true; lastAliveTs?: number }
+  | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true; lastAliveTs?: number; shellPid?: number }
   /** Recovery judged this Run's process group (ended it or left it) after the Run had already ended: the run index folds it into groupJudged, so no later restart judges it again. */
   | { type: 'run.judged'; runId: string }
   | { type: 'prompt'; cwd: string; phase: 'start' | 'end' }
@@ -154,8 +154,10 @@ export interface RunInfo {
   nonce?: string;
   /**
    * An `inline` Run's shell, the one that printed its start marker, or a `marker` Run's, the session's shell
-   * or the one its start mark named, from its run.start: only that shell's probe answer ends the Run, so
-   * history judges answers by it as the live transcript does. The App's rendered results never carry it.
+   * or the one its start mark named, from its run.start, or its run.end when the start mark bound another:
+   * only that shell's probe answer ends the Run, so history judges answers by it as the live transcript does.
+   * A recovery-written end cannot know the bound pid, and run.start's stands. The App's rendered results never
+   * carry it.
    * The marker's chunk is journaled before the Run starts, outside its output, so history cannot
    * read the pid from the text (the house's read of the 38 commits, #22, comment 6274773484).
    */
