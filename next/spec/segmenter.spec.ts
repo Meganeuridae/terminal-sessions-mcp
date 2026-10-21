@@ -254,6 +254,30 @@ test('a marker Run’s progress digest shows neither the typed line’s echo nor
   assert.equal(out.filter((s) => s.kind === 'output').at(-1)!.body, 'building 1\nbuilding 2\nhalf');
 });
 
+test('a marker Run in flight when the segmenter begins: its digest drops the echo and the start mark when the read reaches them, and holds nothing back when it does not', async (t) => {
+  // A reviewer's read of the fixes for #22: trackInflight gave a Run in flight no preamble, so a lane's first digest showed
+  // the typed line's echo and `<<<START:…>>>`. A read the byte bound cut begins past the mark, which it must not wait for.
+  const src = fakeSource();
+  const nonce = 'a1b2c3d4';
+  const echo = `sh$ ${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce)}\r\n<<<START:${nonce}:4242>>>\r\n`;
+  for (const runId of ['near', 'far']) {
+    src.runs.set(runId, { runId, sessionId: 's1', target: 'shell', origin: 'agent', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'temporal', line: 'make', strategy: 'marker', nonce });
+    src.journal.append({ type: 'run.start', runId, cwd: '/w', strategy: 'marker', nonce });
+  }
+  src.journal.append({ type: 'output', data: `${echo}building 1\r\nhalf`, stream: 'pty', runId: 'near' });
+  src.journal.append({ type: 'output', data: echo, stream: 'pty', runId: 'far' });
+  for (let k = 0; k < 18; k++) src.journal.append({ type: 'output', data: `${'x'.repeat(65_534)}\r\n`, stream: 'pty', runId: 'far' });
+  src.journal.append({ type: 'output', data: 'last\r\nhalf', stream: 'pty', runId: 'far' });
+  const seg = new Segmenter(src, { runSettleMs: 5, cadenceMs: 40, screenQuietMs: 20 });
+  t.after(() => seg.dispose());
+  const out = collect(seg);
+  const digest = (runId: string) => out.filter((s) => s.kind === 'output' && s.runId === runId).at(-1);
+  await until(() => digest('near') !== undefined && digest('far') !== undefined, 5000, 'a digest of each Run');
+  assert.equal(digest('near')!.body, 'building 1\nhalf');
+  assert.equal(digest('far')!.metadata.bytesAtLeast, true, 'the read was cut');
+  assert.equal(digest('far')!.body?.split('\n').slice(-2).join('\n'), 'last\nhalf');
+});
+
 test('an inline Run’s progress digest shows its partial line: its output begins after its start mark, so nothing waits for one', async (t) => {
   // A reviewer's read of the fixes for #22: the session journals the piece through an inline Run's start mark to the Run
   // around it, before the Run starts, so the Run's watch waited for a mark that never came and held back its partial line,

@@ -1084,6 +1084,11 @@ export class Segmenter {
     } catch {
       return; // nothing journaled for it yet
     }
+    // A marker Run's preamble, as a run.start gives one (track), when the read reaches the Run's head and so
+    // its start mark: a Run in flight when the segmenter began showed the typed line's echo and the mark
+    // (a reviewer's read of the fixes for #22). A read the byte bound cut began past the mark, which would
+    // never come.
+    if (run.strategy === 'marker' && run.nonce !== undefined && !out.older) w.preamble = { start: startMark(run.nonce), echo: runEcho(run.nonce) };
     const gaps = out.gaps ?? [];
     let prev: Seq | undefined;
     for (const ev of out.events) {
