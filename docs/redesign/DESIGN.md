@@ -307,14 +307,18 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 ### Observation
 
 - **G10.** The journal is the single source of truth: append-only, per-session monotonic
-  `seq`, timestamped, typed (Appendix A). No `seq` is issued twice, across a daemon crash or a
-  power loss. Appends are not synced, so a power loss can take the journal's last lines, the ones
-  the disk had not yet written. The numbering survives it: seqs are issued only below a
-  reservation kept a block of 10,000 ahead in a synced metadata write, and lowered to the last seq
-  when the journal closes. After a power loss the next start numbers above every seq issued
-  before it, and the seqs between the last line on disk and the reservation read as a
-  `torn-write` gap. After a daemon crash on the same boot, nothing the page cache held is lost, and
-  numbering continues from the last line. Three products derive from it and each states
+  `seq`, timestamped, typed (Appendix A). No `seq` is issued twice across a daemon crash. Nor is
+  one issued twice across a power loss, provided the disk took the journal's last reservation
+  write. Appends are not synced, so a power loss can take the journal's last lines, the ones the
+  disk had not yet written. The numbering survives it: before issuing a block of 10,000 seqs, the
+  journal reserves the block in a synced metadata write, and it lowers the reservation to its last
+  seq when it closes. After a power loss the next start numbers above every seq issued before it,
+  and the seqs between the last line on disk and the reservation read as a `torn-write` gap. After
+  a daemon crash on the same boot, nothing the page cache held is lost, and numbering continues
+  from the last line. The reservation is a write to the journal's own disk, so it is best effort.
+  While the disk refuses it, seqs go on being issued past the last reservation the disk took, and
+  the write is retried once a second. A power loss in that window can issue some of those seqs
+  again after the restart. Three products derive from it and each states
   what it is. **Raw output** is retained decoded UTF-8 text with provenance, a pure function of a
   range. **Transcript** is a documented line-oriented projection of a range, a pure
   function of that range and the width it is projected at, for reading and search — not a
