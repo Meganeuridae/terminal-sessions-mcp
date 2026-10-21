@@ -640,7 +640,11 @@ export async function stopWhileWaiting(pid: number, attempts = 50): Promise<void
     const waitsIn = call();
     process.kill(pid, 'SIGSTOP');
     await until(() => /^T/.test(proc('stat')?.split(') ')[1] ?? ''), 2000, 'the shell to stop');
-    if (waitsIn !== undefined && waitsIn !== 'running' && call() === waitsIn) return;
+    // On arm64 a stopped task's syscall file reads -1 whatever call the stop interrupted (by run on Linux 6.8,
+    // aarch64: 72, pselect6, before the stop; -1 after), so there the reading before the stop is all there is and
+    // the race stays open, as without /proc. Elsewhere -1 is a task stopped outside a call, which this stop must miss.
+    const after = call();
+    if (waitsIn !== undefined && waitsIn !== 'running' && (after === waitsIn || (after === '-1' && process.arch === 'arm64'))) return;
     process.kill(pid, 'SIGCONT');
   }
   throw new Error(`the shell was never stopped in its wait for input in ${attempts} attempts`);
