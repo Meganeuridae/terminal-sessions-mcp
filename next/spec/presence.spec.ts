@@ -10,10 +10,12 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { App, type Caller } from '../src/api/app.js';
 import { presence } from '../src/api/presence.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
+import { clocks } from '../src/core/clock.js';
 import type { Session } from '../src/core/session.js';
 import { until } from './testhost.js';
 
@@ -257,5 +259,25 @@ test("a running Run's time is the session's own count of it, on the monotonic cl
   } finally {
     await app.cancel(A, { runId: proc.runId! });
     await app.cancel(A, { runId: shell.runId! });
+  }
+});
+
+test("a Run's time is rounded to whole seconds before it is split into minutes: 119.6 s reads 2m0s and 59.6 s reads 1m0s, never 1m60s or 60s (the house's read of the 40 commits, #22)", async (t) => {
+  await app.sessionOpen(A, { id: 'pm' });
+  const s = live('pm');
+  const proc = await app.run(A, { session: 'pm', command: 'sleep 20', target: 'process', wait: 0 });
+  try {
+    await until(() => s.run(proc.runId!).state === 'running', 5000, 'the Run running');
+    const real = performance.now.bind(performance);
+    for (const [ms, shown] of [[119_600, '2m0s'], [59_600, '1m0s']] as const) {
+      // The monotonic clock moves on so the Run has run `ms` (and a few ms more, by the time presence reads it).
+      const ran = s.runDurationMs(proc.runId!)!;
+      t.mock.method(clocks, 'monotonic', () => real() + ms - ran);
+      const text = P(A, ['pm']);
+      t.mock.restoreAll();
+      assert.match(text, new RegExp(`running \`sleep 20\` ${shown} \\(process\\)`), text);
+    }
+  } finally {
+    await app.cancel(A, { runId: proc.runId! });
   }
 });

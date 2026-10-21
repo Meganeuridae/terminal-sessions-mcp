@@ -26,7 +26,11 @@ const MAX_LINES = 10;
 /** Events scanned backwards from the newest for unread bytes and typing. */
 const SCAN = 5000;
 
-const dur = (ms: number) => (ms >= 60_000 ? `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s` : `${Math.max(0, Math.round(ms / 1000))}s`);
+/** A duration in whole seconds, then split into minutes: rounding the seconds left after the minutes printed 119.6 s as 1m60s, and 59.6 s as 60s (the house's read of the 40 commits, #22). */
+const dur = (ms: number) => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s >= 60 ? `${Math.floor(s / 60)}m${s % 60}s` : `${s}s`;
+};
 const describe = (r: RunInfo) => oneLine(r.line ?? r.argv?.join(' ') ?? r.runId, 60);
 const running = (r: RunInfo) => r.state === 'running' || r.state === 'starting';
 
