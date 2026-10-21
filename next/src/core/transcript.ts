@@ -362,8 +362,15 @@ class Projector {
     this.rebaseSavedCursor(removed);
   }
 
-  get cursorX(): number {
-    return this.term.buffer.active.cursorX;
+  /**
+   * Whether a line is begun where the cursor is: it stands past its row's start, or its row holds text a CR
+   * went back over. What a segment boundary puts next starts a line of its own then (rule 6): `progress 50%`,
+   * a CR, a hole, then `done` read `doneress 50%`, and a note after such a line wrote over it (the house's
+   * review of f3750e4..4f4c067, #22, comment 6315636412).
+   */
+  get lineBegun(): boolean {
+    const b = this.term.buffer.active;
+    return b.cursorX > 0 || (b.getLine(b.baseY + b.cursorY)?.translateToString(true) ?? '') !== '';
   }
 
   /** Rows the next batch may add before the scratch scrollback could drop an unread row. */
@@ -935,7 +942,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
       // house's read of the 33 commits, #22, comment 6307350650: a title held open at the range's end
       // took a Run's held line, unlabelled).
       if (s + 1 < segs.length) {
-        await pr.feed(`\x18${pr.cursorX > 0 ? '\r\n' : ''}`);
+        await pr.feed(`\x18${pr.lineBegun ? '\r\n' : ''}`);
         await pr.afterBatch();
       }
     }

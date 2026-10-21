@@ -508,9 +508,9 @@ substantially more work than a reliable current screen; deferred until a workflo
    its final frame follows; a range ending inside a program ends with its current frame.
    Intermediate frames are not kept.
 6. *Streams.* Process stdout/stderr come from pipes: a bare LF projects as CRLF; a change of
-   source starts on a fresh line. A process Run's two pipes are one source, for search and
-   watches too: a hit names the pipe of its line's first character, and says when the line
-   holds both.
+   source starts on a fresh line, as a hole and a note do, wherever the cursor stands. A
+   process Run's two pipes are one source, for search and watches too: a hit names the pipe
+   of its line's first character, and says when the line holds both.
 7. *Budgets, all visible.* `maxInputBytes` keeps the head or tail (never splitting a
    character, preferring a line boundary) and reports `omittedInputBytes`; `maxLines`
    caps logical lines; any omission sets `truncated`.

@@ -746,3 +746,15 @@ test('a live Run’s transcript renders its gaps as holes too', async () => {
     await h.session.close();
   }
 });
+
+test('a line a CR went back over is a line of its own at a boundary: a hole, a note, a header or another source starts a fresh line wherever the cursor stands (the house’s review of f3750e4..4f4c067, #22, comment 6315636412)', async () => {
+  // `progress 50%`, a CR, a hole, then `done` read `doneress 50%`, since a boundary started a fresh line only past column 0.
+  const run = (data: string): ProjectChunk => ({ data, stream: 'stdout', runId: 'r1' });
+  const read = async (chunks: ProjectChunk[], label?: typeof sourceLabel) => (await project(chunks, { cols: 40, ...(label ? { label } : {}) })).text.split('\n');
+  assert.deepEqual(await read(['progress 50%\r', { hole: true }, 'done\r\n']), ['progress 50%', 'done']);
+  assert.deepEqual(await read(['progress 50%\r', { note: '[… lost …]' }, 'done\r\n']), ['progress 50%', '[… lost …]', 'done'], 'the note wrote over it');
+  assert.deepEqual(await read([run('50%\r'), 'p1\r\n', run('done\n')]), ['p1', 'done'], 'one source: its own CR still goes back over its line');
+  assert.deepEqual(await read(['progress 50%\r', run('r1 line\n')], sourceLabel), ['[run r1]', 'r1 line', '[terminal]', 'progress 50%'], 'a held line flushed at the end');
+  assert.deepEqual(await read(['progress 50%\rdone\r\n']), ['doneress 50%'], 'with no boundary, as the terminal shows it');
+  assert.deepEqual(await read(['one\r\n', { hole: true }, 'two\r\n']), ['one', 'two'], 'a line already ended: no blank line');
+});
