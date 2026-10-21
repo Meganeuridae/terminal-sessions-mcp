@@ -211,6 +211,43 @@ test('G10: a daemon that dies after its start honoured an earlier boot\'s reserv
   }
 });
 
+test('G10: a start that honours an earlier boot\'s reservation makes one durable write for it, stamped with this boot, and a later daemon crash on the same boot reads nothing missing', (t) => {
+  // Written without a boot and then again with it once the gap was in the file, every start over a hole cost two
+  // durable writes: 200 journals reopened after a power loss in 3.7 s instead of 2.0 s (a reviewer's read of the
+  // house's 5af8f68). The one write is honoured on this boot while the files do not reach the seq it was reserved
+  // above, which only a death before the gap's line leaves (the test above).
+  let boot = 'boot-A';
+  t.mock.method(boots, 'current', () => boot);
+  const dir = tmpDir();
+  try {
+    const j = new Journal({ cold: new FileStore(dir) });
+    for (let i = 0; i < 50; i++) j.append(out(`a${i}`));
+    const file = path.join(dir, 'journal.jsonl');
+    fs.writeFileSync(file, lines(file).slice(0, 20).join('\n') + '\n'); // a power loss keeps 20 lines
+    boot = 'boot-B';
+    class Counting extends FileStore {
+      writes = 0;
+      override setHighWater(change: Parameters<FileStore['setHighWater']>[0]): boolean {
+        this.writes++;
+        return super.setHighWater(change);
+      }
+    }
+    const store = new Counting(dir);
+    const recovered = new Journal({ cold: store });
+    assert.deepEqual(gaps(recovered.since(20).events), [[21, HIGH_WATER_BLOCK, 'torn-write']]);
+    assert.equal(store.writes, 1, 'one reservation write');
+    assert.deepEqual(store.highWater()?.reservation, { to: 2 * HIGH_WATER_BLOCK, boot: 'boot-B' });
+    // The daemon dies on boot B with the gap in the file: the next start numbers on from it, no needless hole.
+    const again = new Journal({ cold: new FileStore(dir) });
+    assert.equal(again.lastSeq, HIGH_WATER_BLOCK + 1);
+    assert.deepEqual(gaps(again.since(20).events), [[21, HIGH_WATER_BLOCK, 'torn-write']], 'only the hole the power loss left');
+    again.close();
+    recovered.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ───────────── jr2-7: age retention reaches the active file and an idle ring ─────────────
 
 test('a new life numbers on from the last seq the life before it issued, and its hole of events the disk never took counts exactly, even when the seal could not lower the reservation', () => {

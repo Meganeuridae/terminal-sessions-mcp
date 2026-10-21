@@ -1514,12 +1514,14 @@ function expired(store: FileStore, retention: SessionRetention, now: number): bo
   // so such a session read as past its age (the house's read of the 33 commits, PR #22, comment
   // 6307350477; an independent read of the fix). A reservation above the floor that the journal honours
   // says seqs were issued after the files that aged out, and a power loss may have taken their lines: the
-  // session is not past its age by what is missing. One the journal does not honour (written on this
-  // boot) covers nothing issued, as the journal reads it.
+  // session is not past its age by what is missing. One the journal does not honour covers nothing
+  // issued, as the journal reads it, judged against what the files account for, retention's floor, as
+  // the journal's start judges it: on this boot only a block a start reserved above a hole it honoured,
+  // with that hole's gap not yet in the file, still stands.
   if (newest === undefined) {
     const hw = store.highWater();
     const r = hw?.reservation;
-    return hw?.floor !== undefined && !(r !== undefined && r.to > hw.floor && reservationHonoured(r));
+    return hw?.floor !== undefined && !(r !== undefined && r.to > hw.floor && reservationHonoured(r, hw.floor));
   }
   return newest < now - retention.maxAgeMs;
 }

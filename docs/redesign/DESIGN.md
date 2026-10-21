@@ -316,7 +316,8 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   seq when it closes. After a power loss the next start numbers above every seq issued before it,
   and the seqs between the last line on disk and the reservation read as a `torn-write` gap. After
   a daemon crash on the same boot, nothing the page cache held is lost, and numbering continues
-  from the last line. The reservation is a write to the journal's own disk, so it is best effort.
+  from the last line, except where a start died after reserving above a hole it honoured and before
+  the hole's gap reached the file: the next start on that boot honours the hole again. The reservation is a write to the journal's own disk, so it is best effort.
   While the disk refuses it, seqs go on being issued past the last reservation the disk took, and
   the write is retried once a second. A power loss in that window can issue some of those seqs
   again after the restart. So can a daemon crash on the same boot while the disk refuses the events

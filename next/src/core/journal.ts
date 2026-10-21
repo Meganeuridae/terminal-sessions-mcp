@@ -20,7 +20,9 @@
  * above it and records the seqs between the files' last and the reservation as
  * a gap: `store-failed` when the disk refused them, `torn-write` when a crash
  * on another boot may have taken them (G11). On the same boot nothing the page
- * cache held was lost, and numbering simply continues. The reservation is best
+ * cache held was lost, and numbering simply continues, except across a hole a
+ * start honoured: the block it reserves above the hole stays honoured on that
+ * boot until the gap that records the hole is in the file. The reservation is best
  * effort — a write to the same disk, retried at most once a second while it is
  * refused — so a journal whose reservation the disk refuses can reissue seqs
  * after a power loss. So can a daemon crash on the same boot while the disk
@@ -113,21 +115,30 @@ const RETRY_MAX_MS = 30_000;
  * Seqs are reserved this many ahead of the last one issued: one durable write per block. Forcing every
  * append to disk instead cost about 4 ms an event on macOS and 0.4 ms on Linux; a reservation a block
  * ahead costs microseconds an event, amortized (the house's read of the 33 commits, PR #22, comment
- * 6307349700, its question of intent).
+ * 6307349700, its question of intent). A start reads the seq a block was reserved above from it
+ * (reservationHonoured): a build that changes the block must still read reservations written with this one.
  */
 export const HIGH_WATER_BLOCK = 10_000;
 
 /**
  * Whether a journal opening over the store honours its reservation: numbers above it, and records the
  * seqs between the files' last and it as a hole. A failed reservation always (the disk refused those
- * seqs). A standing one unless it was written on this very boot: then the daemon stopped but the machine
- * did not, the page cache kept every line, and no seq above the files' last was issued. With no boot
- * known, on either side, it is honoured. The journal's constructor and the registry's expiry both read it.
+ * seqs). A standing one written on another boot, or with no boot known on either side, too. One written
+ * on this very boot only while what the store accounts for (`accounted`: its last seq, or retention's
+ * floor) lies below the seq the block was reserved above (`to - HIGH_WATER_BLOCK`): a block is reserved
+ * above the last seq issued, which the page cache kept through the daemon's stop, so the files reach it
+ * and no seq above them was issued. The one exception is the block a start reserves as it opens a hole it
+ * honoured, above the hole, before the gap that records it reaches the file: a daemon that died between
+ * them left files short of it, and the hole is honoured again. So that one write, stamped with this boot,
+ * keeps the hole on this boot until the gap lands, and lets a later stop read as one that lost nothing; a
+ * second write, after the gap, made every start over a hole cost two (the house's 5af8f68; a reviewer's
+ * read of it: 200 journals reopened after a power loss in 3.7 s instead of 2.0 s). The registry's expiry
+ * passes no `accounted`, and reads one written on this boot as covering nothing.
  */
-export function reservationHonoured(r: Reservation): boolean {
+export function reservationHonoured(r: Reservation, accounted = Number.POSITIVE_INFINITY): boolean {
   if (r.failed === true || r.boot === undefined) return true;
   const boot = boots.current();
-  return boot === undefined || boot !== r.boot;
+  return boot === undefined || boot !== r.boot || accounted < r.to - HIGH_WATER_BLOCK;
 }
 
 export class Journal {
@@ -163,13 +174,6 @@ export class Journal {
    * house's read of the 33 commits, PR #22, comment 6307349700, item 3).
    */
   private markUnsure = false;
-  /**
-   * The constructor honoured a reservation left by another boot (or by none known) and has not yet appended
-   * the gap that records its hole: a reservation written meanwhile carries no boot, so it is honoured on
-   * this boot too. Stamped with this boot, it told a recovery on this boot, after a daemon crash before the
-   * gap reached the file, that the files held every seq issued, and the seqs above them were issued again.
-   */
-  private holeOpen = false;
   /**
    * When a refused reservation write is tried again, on the monotonic clock: one durable write a second
    * while the disk refuses, whatever the write was for. An extension was retried on every event, 1,976
@@ -218,7 +222,7 @@ export class Journal {
     // restart — and reached subscribers: never reissue them, and record the hole (jr2-6, G10), when the
     // reservation is honoured (reservationHonoured).
     const r = hw?.reservation;
-    const honoured = r !== undefined && reservationHonoured(r);
+    const honoured = r !== undefined && reservationHonoured(r, accounted);
     // A new life of a name in this daemon knows the last seq the life before it issued (startSeq): none above
     // it was, so a reservation above it (the block a seal could not lower) adds nothing to skip. Skipped, those
     // seqs made a hole of events every one of which was issued count as a bound (the house's review of the 40
@@ -241,15 +245,9 @@ export class Journal {
       // count is a bound lies among it. Up to a reservation it is a bound: the block may hold seqs never issued.
       const exact = !hole || (known !== undefined && this.runs.countsExactly(accounted + 1, this.seq));
       const crash = known === undefined && honoured && !r.failed && this.seq === r.to;
-      this.holeOpen = hole;
+      // Its block, reserved above the hole with this boot, keeps the hole honoured on this boot until the gap
+      // is in the file (reservationHonoured).
       this.append(gapEvent(accounted + 1, this.seq, hole && !crash ? 'store-failed' : 'torn-write', exact));
-      if (this.holeOpen) {
-        this.holeOpen = false;
-        // The gap is in the store now: the block above it takes this boot, so a later stop on this boot is
-        // read as one that lost nothing the page cache held. With the store refusing it, the reservation
-        // is the failed one keepMark wrote, which no boot affects.
-        if (this.coldError === null && this.reserved > this.seq) this.writeReservation(this.reserved, false);
-      }
     }
   }
 
@@ -429,7 +427,7 @@ export class Journal {
 
   /** Write the reservation `to`, marked `failed` or with this boot, and remember it once it is confirmed. */
   private writeReservation(to: Seq, failed: boolean): boolean {
-    const boot = failed || this.holeOpen ? undefined : boots.current();
+    const boot = failed ? undefined : boots.current();
     const ok = this.cold!.setHighWater!({ reservation: { to, ...(failed && { failed: true as const }), ...(boot !== undefined && { boot }) } });
     if (ok) {
       this.reserved = to;
