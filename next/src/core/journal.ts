@@ -12,9 +12,10 @@
  * beside it, and the next journal over that store (a new life, or the daemon
  * after a restart) numbers above it and records the hole as a `store-failed`
  * gap (G10, G11). The reservation is best effort — it is a write to the same
- * disk, retried while it is refused — so a daemon that dies with the reservation
- * itself refused can reissue seqs. What the ring drops while the disk refuses is
- * recorded as it is lost and written as a `store-error` gap at the catch-up.
+ * disk, retried at most once a second while it is refused — so a daemon that
+ * dies with the reservation itself refused can reissue seqs. What the ring drops
+ * while the disk refuses is recorded as it is lost and written as a `store-error`
+ * gap at the catch-up.
  */
 import { clocks, timerMs } from './clock.js';
 import { RunIndex } from './runindex.js';
@@ -93,8 +94,16 @@ export class Journal {
   private dropped = 0;
   /** The seq reserved beside the cold store while it fails (0: none); numbering after a restart resumes above it. */
   private reserved = 0;
-  /** When a refused reservation is tried again (one meta write a second while the disk refuses). */
-  private reserveRetryAt = 0;
+  /**
+   * When a refused write of the high water is tried again, on the monotonic clock: one durable write a
+   * second while the disk refuses, whether it was the first reservation, the extension of a block used
+   * up, or the clear once the store holds everything. The extension was retried on every event, 1,976
+   * full write attempts in 3,000 events (the house's read of the 33 commits, PR #22, comment 6307349700,
+   * item 4).
+   */
+  private markRetryAt = 0;
+  /** The store holds every seq again but its mark could not be cleared yet: retried as events land. */
+  private clearOwed = false;
   /**
    * Events the ring dropped that the cold store never took, recorded as they are lost (not computed
    * at the catch-up from `persisted` and the ring's oldest seq: an empty ring or a catch-up that
@@ -139,7 +148,7 @@ export class Journal {
       this.append(gapEvent(accounted + 1, this.seq, hole ? 'store-failed' : 'torn-write'));
     }
     // The hole is on disk now (or the store caught up after all and only the flag was left behind).
-    if (hw?.failed && this.coldError === null) this.cold!.setHighWater?.(0, false);
+    if (hw?.failed && this.coldError === null) this.healed();
   }
 
   /**
@@ -223,11 +232,13 @@ export class Journal {
         this.persisted = event.seq;
       } catch (e) {
         this.coldFailed(e);
+        return;
       }
+      if (this.clearOwed) this.healed();
     } else if (!this.catchingUp && clocks.monotonic() >= this.retryAt) {
       this.catchUp();
-    } else if (this.reserved === 0 ? clocks.monotonic() >= this.reserveRetryAt : this.seq >= this.reserved) {
-      // A refused reservation is tried again, throttled; a block used up is extended.
+    } else if (this.seq >= this.reserved) {
+      // No reservation stands, or its block is used up: reserve (throttled while refused).
       this.reserve();
     }
   }
@@ -259,16 +270,25 @@ export class Journal {
    * journal may refuse this too; it is retried with the catch-up.
    */
   private reserve(): void {
-    if (!this.cold?.setHighWater || this.reserved > this.seq) return;
+    if (!this.cold?.setHighWater || this.reserved > this.seq || clocks.monotonic() < this.markRetryAt) return;
     const target = this.seq + HIGH_WATER_BLOCK;
     if (this.cold.setHighWater(target, true)) this.reserved = target;
-    else this.reserveRetryAt = clocks.monotonic() + 1000;
+    else this.markRetryAt = clocks.monotonic() + 1000;
   }
 
-  /** The store holds every seq issued again: the reservation is released. */
+  /**
+   * The store holds every seq issued again: the mark is cleared, whether or not a reservation was
+   * confirmed. A raise the store refused to confirm (its directory fsync failed) may still be in its
+   * file, and skipped here because none was confirmed, it read after a restart as up to a block of seqs
+   * lost that were never issued (the house's read of the 33 commits, PR #22, comment 6307349700, item 3).
+   * The store writes nothing when neither memory nor the file holds a mark. A refused clear is retried,
+   * throttled, as events land.
+   */
   private healed(): void {
-    if (this.reserved === 0) return;
-    if (this.cold?.setHighWater?.(0, false) !== false) this.reserved = 0;
+    if (!this.cold?.setHighWater || (this.clearOwed && clocks.monotonic() < this.markRetryAt)) return;
+    this.clearOwed = !this.cold.setHighWater(0, false);
+    if (this.clearOwed) this.markRetryAt = clocks.monotonic() + 1000;
+    else this.reserved = 0;
   }
 
   /**
@@ -302,7 +322,10 @@ export class Journal {
         this.lost = undefined;
         this.issue(gapEvent(lost.from, lost.to, 'store-error'));
       }
-      if (this.coldError === null && this.persisted >= this.seq) this.healed();
+      if (this.coldError === null && this.persisted >= this.seq) {
+        this.markRetryAt = 0; // the disk takes writes again: the clear is not held back by a refused raise's throttle
+        this.healed();
+      }
       return this.coldError === null;
     } finally {
       this.catchingUp = false;
@@ -537,6 +560,10 @@ export class Journal {
     if (this.cold && this.coldError !== null && !this.catchUp()) {
       // Exact now: a sealed journal issues no more seqs. If the disk refuses this too, the reservation stands.
       if (this.cold.setHighWater?.(this.seq, true)) this.reserved = this.seq;
+    } else if (this.clearOwed) {
+      // No append comes after this to retry an owed clear: try it now, whatever the throttle says.
+      this.markRetryAt = 0;
+      this.healed();
     }
     this.sealed = true;
     this.listeners.clear();

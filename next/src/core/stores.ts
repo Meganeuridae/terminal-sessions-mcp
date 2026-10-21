@@ -7,6 +7,7 @@
 import { randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { clocks } from './clock.js';
 import type { RotationHeader } from './runindex.js';
 import type { JournalEvent, Seq } from './types.js';
 
@@ -100,7 +101,8 @@ export interface MemoryStoreOptions {
  * directory synced too: after a crash of the process or the machine the file is the old one or the
  * new one, never torn or missing (the house's read of 2c35df8, #22). Owner-only (G26). The session
  * records, the cursors and the store's own metadata are written this way. The lock is not: it is
- * written to a synced temp and linked into place (lock.ts), and shares only the directory sync below.
+ * written to a synced temp and linked into place, or without hard links created in place under its
+ * guard (lock.ts), and shares only the directory sync below.
  */
 export function writeDurably(file: string, text: string): DurableWrite {
   const tmp = `${file}.${process.pid}.tmp`;
@@ -296,20 +298,23 @@ export interface DiskFloor {
 /**
  * Free space by statfs, asked at most once a second per directory or after a megabyte written
  * since the last answer: a flood of appends costs one syscall a second. A filesystem that cannot
- * be asked is not a full one: the write itself decides then.
+ * be asked is not a full one: the write itself decides then. The second is measured on the
+ * monotonic clock: on the wall clock a step back kept a refusal cached long after space returned,
+ * an hour's step for 59 minutes (the house's read of the 33 commits, PR #22, comment 6307349700,
+ * item 5). An injected clock that goes back asks again rather than trusting the answer.
  */
 export class FreeSpaceFloor implements DiskFloor {
   private readonly seen = new Map<string, { at: number; written: number; ok: boolean }>();
   constructor(
     readonly floorBytes: number,
     private readonly statfs: (dir: string) => { bavail: number | bigint; bsize: number | bigint } = (d) => fs.statfsSync(d),
-    private readonly now: () => number = Date.now,
+    private readonly now: () => number = () => clocks.monotonic(),
   ) {}
 
   allow(dir: string, bytes: number): boolean {
     const t = this.now();
     const s = this.seen.get(dir);
-    if (s && t - s.at < 1000 && s.written + bytes < 1024 * 1024) {
+    if (s && t >= s.at && t - s.at < 1000 && s.written + bytes < 1024 * 1024) {
       s.written += bytes;
       return s.ok;
     }
@@ -332,7 +337,11 @@ export interface FileStoreOptions {
   floor?: DiskFloor;
   /** Retained bytes on disk, active file included (G21). Default: no limit. */
   maxBytes?: number;
-  /** Where the store says, once, that its metadata is written but its directory could not be synced. */
+  /**
+   * Where the store says that its metadata could not be written, or is written but its directory could
+   * not be synced: each once per store, and a store is one session's (the house's read of the 33
+   * commits, PR #22, comment 6307349700, item 10).
+   */
   log?: ((level: 'warn', text: string) => void) | undefined;
   /**
    * Rotated files whose newest event is older than this are dropped (G21). Default: no limit.
@@ -447,15 +456,27 @@ export class FileStore implements JournalStore {
   private tornEvent = false;
   private meta: StoreMeta;
   /**
-   * The epoch's first write was refused (a disk refusing writes): retried after the next successful
-   * append. Only a refused write: one the file holds while its directory could not be synced counts as
-   * written, since a crash that loses it only gives the journal a new epoch at the next open, which is
-   * what an absent file does anyway. Kept pending, it was rewritten (a rename and a directory fsync)
-   * on every append while the fsync kept failing (a reviewer's read of the fixes for #22 comment
-   * 6274603516).
+   * What `journal.meta.json` holds, as far as this store knows: what it read at open or last wrote there,
+   * its directory synced or not; undefined while no write of it has landed. A raise the file holds but
+   * memory does not (its directory fsync failed) differs from `meta` until a write settles it: a clear
+   * compared with memory alone found nothing to do and left that raise on disk, a false lost range
+   * after the next restart (the house's read of the 33 commits, PR #22, comment 6307349700, item 3).
+   */
+  private onDisk: StoreMeta | undefined;
+  /**
+   * The epoch's first write was refused (a disk refusing writes): retried as appends land, at most once
+   * a second on the monotonic clock (`metaRetryAt`), and said once. Retried after every append, 200
+   * appends made 201 attempts and said nothing (the house's read of the 33 commits, PR #22, comment
+   * 6307349700, item 6). Only a refused write: one the file holds while its directory could not be
+   * synced counts as written, since a crash that loses it only gives the journal a new epoch at the
+   * next open, which is what an absent file does anyway. Kept pending, it was rewritten (a rename and a
+   * directory fsync) on every append while the fsync kept failing (a reviewer's read of the fixes for
+   * #22 comment 6274603516).
    */
   private metaPending = false;
-  /** A metadata write the file holds but whose directory could not be synced has been said once. */
+  private metaRetryAt = 0;
+  /** Said once per store: the epoch's write refused, and a metadata write the file holds whose directory could not be synced. */
+  private refusedWarned = false;
   private syncWarned = false;
   private readonly log: FileStoreOptions['log'];
   /** A rotation header the disk refused: written before the new file's first event (the house's read of b047b92, point 4). */
@@ -496,27 +517,36 @@ export class FileStore implements JournalStore {
         const out: StoreMeta = { v: 1, epoch: m.epoch };
         if (typeof m.highWater === 'number' && Number.isFinite(m.highWater) && m.highWater > 0) out.highWater = Math.floor(m.highWater);
         if (m.failed === true && out.highWater !== undefined) out.failed = true;
+        this.onDisk = out;
         return out;
       }
     } catch {
       // absent (a new journal, or one an older build wrote) or damaged: a new epoch
     }
     const meta: StoreMeta = { v: 1, epoch: newEpoch() };
-    this.metaPending = this.writeMeta(meta) === 'failed';
+    this.metaPending = this.writeMeta(meta, true) === 'failed';
+    if (this.metaPending) this.metaRetryAt = clocks.monotonic() + 1000;
     return meta;
   }
 
   /**
    * Atomically and privately (G26): `written` (durable), `unsynced` (the file holds it, the directory
-   * fsync failed: said once, like the cursors and the lock) or `failed` (nothing changed on disk).
+   * fsync failed: said once per store) or `failed` (nothing changed on disk). A refused write of the
+   * `epoch` is said once per store too; a refused high water is the journal's to report, as the store
+   * failure it is part of.
    */
-  private writeMeta(meta: StoreMeta): 'written' | 'unsynced' | 'failed' {
+  private writeMeta(meta: StoreMeta, epoch = false): 'written' | 'unsynced' | 'failed' {
     let w: DurableWrite;
     try {
       w = writeDurably(path.join(this.dir, META), JSON.stringify(meta) + '\n');
-    } catch {
+    } catch (e) {
+      if (epoch && !this.refusedWarned) {
+        this.refusedWarned = true;
+        this.log?.('warn', `the journal's metadata (${META}) could not be written: ${(e as Error).message}; it is retried at most once a second while appends land, and a restart before it is written gives this journal a new epoch, which readers outside the daemon take for a new journal`);
+      }
       return 'failed';
     }
+    this.onDisk = meta;
     if (w.synced) return 'written';
     if (!this.syncWarned) {
       this.syncWarned = true;
@@ -538,7 +568,9 @@ export class FileStore implements JournalStore {
     const meta: StoreMeta = { v: 1, epoch: this.meta.epoch };
     if (seq > 0) meta.highWater = seq;
     if (failed && seq > 0) meta.failed = true;
-    if (meta.highWater === this.meta.highWater && meta.failed === this.meta.failed) return true;
+    // Nothing to do only when memory and the file both hold this mark already (item 3 of comment 6307349700).
+    const mark = (m: StoreMeta | undefined) => `${m?.highWater ?? 0}:${m?.failed === true}`;
+    if (mark(meta) === mark(this.meta) && mark(meta) === mark(this.onDisk)) return true;
     // Confirmed only once it is on disk (the house's read of b047b92, point 1): a refused write
     // changes nothing here, so a prune cannot delete the file whose newest seq the high water was
     // to keep, and a refused reservation is never written later as if its seqs had been issued.
@@ -786,7 +818,10 @@ export class FileStore implements JournalStore {
     seg.firstTs ??= event.ts;
     seg.last = event.seq;
     seg.lastTs = event.ts;
-    if (this.metaPending) this.metaPending = this.writeMeta(this.meta) === 'failed';
+    if (this.metaPending && clocks.monotonic() >= this.metaRetryAt) {
+      this.metaPending = this.writeMeta(this.meta, true) === 'failed';
+      if (this.metaPending) this.metaRetryAt = clocks.monotonic() + 1000;
+    }
   }
 
   private write(buf: Buffer): void {

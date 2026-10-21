@@ -11,11 +11,12 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
+import { clocks } from '../src/core/clock.js';
 import { Journal } from '../src/core/journal.js';
-import { cannotSyncDir, FileStore, MemoryStore, writeDurably } from '../src/core/stores.js';
+import { cannotSyncDir, FileStore, MemoryStore, writeDurably, type JournalStore } from '../src/core/stores.js';
 
 /** node:fs as stores.js sees it: a patch here plus syncBuiltinESMExports reaches its `import * as fs` bindings. */
-const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync; renameSync: typeof fs.renameSync };
+const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync; renameSync: typeof fs.renameSync; openSync: typeof fs.openSync };
 /** A directory fsync that fails with EIO while `fn` runs (file fsyncs still work). */
 function withDirFsyncEIO<T>(fn: () => T): T {
   const real = fsc.fsyncSync;
@@ -362,8 +363,10 @@ test('with the directory fsync failing, clearing the high water counts as done (
   }
 });
 
-test('a new epoch the file holds while its directory cannot be synced counts as written: appends do not rewrite it, and the store says so once; a refused write stays pending until an append lands it (a reviewer\'s read of the fixes for #22, comment 6274603516)', () => {
+test('a new epoch the file holds while its directory cannot be synced counts as written: appends do not rewrite it, and the store says so once; a refused write stays pending until an append lands it (a reviewer\'s read of the fixes for #22, comment 6274603516)', (t) => {
   const dir = tmpDir();
+  let mono = 0;
+  t.mock.method(clocks, 'monotonic', () => mono);
   const realRename = fsc.renameSync;
   let metaRenames = 0;
   fsc.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
@@ -395,11 +398,153 @@ test('a new epoch the file holds while its directory cannot be synced counts as 
     assert.equal(fs.existsSync(path.join(dir, 'b', 'journal.meta.json')), false, 'refused');
     fsc.renameSync = realRename;
     syncBuiltinESMExports();
+    mono += 1000; // the refused write is retried at most once a second (comment 6307349700, item 6)
     refused.append({ ...out('y'), seq: 1, ts: Date.now() } as JournalEvent);
     assert.equal(new FileStore(path.join(dir, 'b')).epoch(), refused.epoch(), 'the append landed the pending epoch');
     refused.close();
   } finally {
     fsc.renameSync = realRename;
+    syncBuiltinESMExports();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ───────────── the house's read of the 33 commits (PR #22, comment 6307349700): the high water and the epoch ─────────────
+
+test('a raise the store wrote but could not confirm, then a clear: the clear writes, so a restart reads no lost range of seqs never issued (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 3)', () => {
+  const dir = tmpDir();
+  try {
+    const sdir = path.join(dir, 'store');
+    const store = new FileStore(sdir);
+    assert.equal(withDirFsyncEIO(() => store.setHighWater(100, true)), false, 'the raise is not confirmed');
+    assert.equal(store.highWater(), undefined, 'memory holds no mark');
+    assert.equal(store.setHighWater(0, false), true);
+    assert.equal(new FileStore(sdir).highWater(), undefined, 'nor does the file: the clear was written, though memory already held none');
+    const j = new Journal({ cold: new FileStore(sdir) });
+    assert.equal(j.lastSeq, 0);
+    assert.deepEqual(gaps(j.since(0).events), [], 'no store-failed gap');
+    j.close();
+    // The journal's side: a reservation the store wrote but could not confirm is cleared once the store holds every seq again.
+    const jdir = path.join(dir, 'journal');
+    const kc = new FullDisk(jdir);
+    const k = new Journal({ cold: kc });
+    k.append(out('a'));
+    kc.broken = true;
+    withDirFsyncEIO(() => k.append(out('b')));
+    assert.equal(kc.highWater(), undefined, 'the reservation is not confirmed');
+    assert.equal(new FileStore(jdir).highWater()?.failed, true, 'but the file holds it');
+    kc.broken = false;
+    assert.equal(k.retryCold(), true);
+    k.close();
+    const again = new Journal({ cold: new FileStore(jdir) });
+    assert.equal(again.lastSeq, 2, 'after a restart the numbering continues where it was');
+    assert.deepEqual(gaps(again.since(0).events), [], 'and no gap claims the reserved block');
+    again.close();
+    // A clear the disk refuses is owed: retried as events land and, since none follows a seal, at the seal.
+    const odir = path.join(dir, 'owed');
+    const oc = new FullDisk(odir);
+    const o = new Journal({ cold: oc });
+    o.append(out('a'));
+    oc.broken = true;
+    o.append(out('b'));
+    assert.equal(oc.highWater()?.failed, true, 'a confirmed reservation');
+    oc.broken = false;
+    const realRename = fsc.renameSync;
+    fsc.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+      if (String(to).endsWith('journal.meta.json')) throw Object.assign(new Error('EIO: i/o error, rename'), { code: 'EIO' });
+      return realRename(from, to);
+    }) as typeof fs.renameSync;
+    syncBuiltinESMExports();
+    try {
+      assert.equal(o.retryCold(), true, 'caught up');
+    } finally {
+      fsc.renameSync = realRename;
+      syncBuiltinESMExports();
+    }
+    assert.equal(new FileStore(odir).highWater()?.failed, true, 'but the clear was refused');
+    o.close();
+    assert.equal(new FileStore(odir).highWater(), undefined, 'the seal cleared it');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a refused reservation of the high water, and a refused extension of a used-up one, are each tried at most once a second on the monotonic clock (the house\'s read of the 33 commits, PR #22, comment 6307349700, items 4 and 7)', (t) => {
+  let mono = 0;
+  t.mock.method(clocks, 'monotonic', () => mono);
+  /** A cold store whose appends fail and which accepts only its first `accept` high-water writes. */
+  const refusing = (accept: number) => {
+    let calls = 0;
+    const cold: JournalStore = {
+      kind: 'refusing',
+      append() {
+        throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+      },
+      read: () => [],
+      oldestSeq: () => undefined,
+      lastSeq: () => undefined,
+      close() {},
+      highWater: () => undefined,
+      setHighWater: () => ++calls <= accept,
+    };
+    return { cold, calls: () => calls };
+  };
+  // Every reservation refused: the first one is retried once a second, not at every event.
+  const none = refusing(0);
+  const a = new Journal({ cold: none.cold });
+  for (let i = 0; i < 3000; i++) a.append(out(`a${i}`));
+  assert.equal(none.calls(), 1, '3,000 events within a second: one attempt');
+  mono += 1000;
+  a.append(out('a-later'));
+  assert.equal(none.calls(), 2, 'a second later: tried again');
+  // The first reservation written and every extension refused: once its 1,024-seq block is used up, the
+  // extension is tried once a second too. It was tried at every event: 1,977 writes in 3,000 events.
+  const first = refusing(1);
+  const b = new Journal({ cold: first.cold });
+  for (let i = 0; i < 3000; i++) b.append(out(`b${i}`));
+  assert.equal(first.calls(), 2, 'the reservation, and one refused extension');
+  mono += 1000;
+  b.append(out('b-later'));
+  assert.equal(first.calls(), 3, 'a second later: the extension is tried again');
+  a.close();
+  b.close();
+});
+
+test('an epoch whose first write is refused is retried at most once a second as appends land, and the store says so once (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 6)', (t) => {
+  const dir = tmpDir();
+  let mono = 0;
+  t.mock.method(clocks, 'monotonic', () => mono);
+  const realOpen = fsc.openSync;
+  let attempts = 0;
+  let refuse = true;
+  fsc.openSync = ((p: fs.PathLike, ...rest: unknown[]) => {
+    if (refuse && String(p).includes('journal.meta.json')) {
+      attempts++;
+      throw Object.assign(new Error('ENOSPC: no space left on device, open'), { code: 'ENOSPC' });
+    }
+    return (realOpen as (...a: unknown[]) => number)(p, ...rest);
+  }) as typeof fs.openSync;
+  syncBuiltinESMExports();
+  try {
+    const warnings: string[] = [];
+    const store = new FileStore(dir, { log: (_level, text) => void warnings.push(text) });
+    const ev = (seq: number) => ({ ...out(`x${seq}`), seq, ts: Date.now() }) as JournalEvent;
+    for (let seq = 1; seq <= 200; seq++) store.append(ev(seq));
+    assert.equal(store.lastSeq(), 200, 'the appends went through');
+    assert.equal(attempts, 1, '200 appends within a second: the epoch was tried once, at open');
+    assert.equal(warnings.length, 1, JSON.stringify(warnings));
+    assert.match(warnings[0]!, /journal\.meta\.json\) could not be written: ENOSPC.*retried at most once a second.*new epoch/);
+    mono += 1000;
+    store.append(ev(201));
+    assert.equal(attempts, 2, 'a second later: tried again');
+    assert.equal(warnings.length, 1, 'said once');
+    refuse = false;
+    mono += 1000;
+    store.append(ev(202));
+    store.close();
+    assert.equal(new FileStore(dir).epoch(), store.epoch(), 'the epoch landed');
+  } finally {
+    fsc.openSync = realOpen;
     syncBuiltinESMExports();
     fs.rmSync(dir, { recursive: true, force: true });
   }

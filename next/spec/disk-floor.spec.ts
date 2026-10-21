@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { clocks } from '../src/core/clock.js';
 import { Journal } from '../src/core/journal.js';
 import { FileStore, FreeSpaceFloor, MemoryStore } from '../src/core/stores.js';
 
@@ -38,6 +39,28 @@ test('the floor asks the filesystem once a second or once a megabyte, and refuse
     throw new Error('ENOSYS');
   });
   assert.equal(silent.allow('/d', 100), true);
+});
+
+test('the floor ages its cached answer on the monotonic clock: a wall-clock step back does not keep a refusal once space returns, and an injected clock that goes back asks again (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 5)', (t) => {
+  let free = 0;
+  let wall = 1_700_000_000_000;
+  let mono = 0;
+  t.mock.method(Date, 'now', () => wall);
+  t.mock.method(clocks, 'monotonic', () => mono);
+  const floor = new FreeSpaceFloor(1e9, () => ({ bavail: free, bsize: 1 }));
+  assert.equal(floor.allow('/d', 100), false, 'below the floor');
+  free = 1e12;
+  wall -= 60 * 60_000; // the wall clock steps back an hour as space returns
+  mono += 1000;
+  assert.equal(floor.allow('/d', 100), true, 'a second later on the monotonic clock: asked again, and space is back');
+  // A clock injected by a caller that goes back is not trusted to age the answer either.
+  let now = 5_000_000;
+  free = 0;
+  const injected = new FreeSpaceFloor(1e9, () => ({ bavail: free, bsize: 1 }), () => now);
+  assert.equal(injected.allow('/d', 100), false);
+  free = 1e12;
+  now -= 60 * 60_000;
+  assert.equal(injected.allow('/d', 100), true, 'the clock went back: asked again');
 });
 
 test('below the floor the journal keeps the ring and the disk is left alone; above it again, the store catches up and nothing is lost', () => {
