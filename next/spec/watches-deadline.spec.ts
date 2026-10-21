@@ -561,6 +561,12 @@ test('a pattern reads a process Run’s stdout and stderr as one source, as the 
     f.journal.append({ type: 'output', runId: 'p', data: 'only err\n', stream: 'stderr' });
     const err = await f.manager.waitFor({ pattern: '^only err$' }, 300, 0);
     assert.deepEqual([err.matched, err.stream, err.mixed], [true, 'stderr', undefined]);
+    // A cursor-hide alone on stdout shows nothing: the line is stderr's, and not mixed (our review of the 84 commits
+    // through a8b6f28, PR #22).
+    f.out('\x1b[?25l', 'p', 'stdout');
+    f.journal.append({ type: 'output', runId: 'p', data: 'late err\n', stream: 'stderr' });
+    const late = await f.manager.waitFor({ pattern: '^late err$' }, 300, 0);
+    assert.deepEqual([late.matched, late.stream, late.mixed], [true, 'stderr', undefined]);
     // Another Run's pipes and the terminal are sources of their own: their output never joins this Run's line.
     f.startRun('q', 'process');
     f.out('q-out ', 'q', 'stdout');

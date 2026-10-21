@@ -72,6 +72,23 @@ test('er-5: stdout and stderr of a process Run are one source, as a read shows t
   assert.equal(by('shell line').stream, undefined, 'the terminal\'s lines name no pipe');
 });
 
+test('a match names the pipe of the first character its line shows, and mixed only for characters the line keeps (our review of the 84 commits through a8b6f28, PR #22)', async () => {
+  const src = source();
+  startRun(src.journal, 'r1');
+  // An SGR reset alone on stdout, then the line's text on stderr: the match is stderr's, and not mixed.
+  out(src.journal, '\x1b[0m', 'stdout', 'r1');
+  out(src.journal, 'boom\n', 'stderr', 'r1');
+  // Past the raw cut, the other pipe's text is no part of the line the match shows.
+  out(src.journal, 'x'.repeat(300_000), 'stdout', 'r1');
+  out(src.journal, 'tail\n', 'stderr', 'r1');
+  endRun(src.journal, 'r1');
+  const r = await search(src, { pattern: '^(boom|x+)', since: 0, context: 0 });
+  const boom = r.matches.find((m) => m.line === 'boom')!;
+  assert.deepEqual([boom.stream, boom.mixed], ['stderr', undefined]);
+  const long = r.matches.find((m) => m.line.startsWith('x'))!;
+  assert.deepEqual([long.stream, long.mixed, long.clipped], ['stdout', undefined, true]);
+});
+
 test('er-5: a real PTY `cat` of 5000 lines: every line is found, whatever the read boundaries', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-search-'));
   const registry = new SessionRegistry({ dataDir: dir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });

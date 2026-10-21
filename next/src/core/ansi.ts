@@ -7,7 +7,7 @@
  */
 import { err } from './errors.js';
 import { compileUserRegex, execBounded } from './regex.js';
-import { executedIn, isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, sequenceText, type LineCarry } from './text.js';
+import { executedIn, isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, sequenceText, showsCharacter, type LineCarry } from './text.js';
 
 /**
  * The longest line a StreamMatcher holds: a longer one is matched on its first MAX_LINE, the hit says
@@ -216,9 +216,9 @@ export interface SplitLine {
   text: string;
   /** The line was longer than MAX_LINE: this is its head, and the rest was dropped. */
   cut?: true;
-  /** The `source` `feed` was given with the chunk holding the line's first character (a process Run's pipe). */
+  /** The `source` `feed` was given with the chunk holding the first character the line shows (a process Run's pipe). */
   from?: string;
-  /** The line holds output from chunks of different sources: both of a process Run's pipes. */
+  /** The line shows characters from chunks of different sources: both of a process Run's pipes. */
   mixed?: true;
 }
 
@@ -258,8 +258,9 @@ export interface LineSplitterOptions {
  * than MAX_LINE is cut there: its head comes out marked `cut` and the rest of the
  * line is dropped, as search keeps only a line's head (the same read: a line
  * matched in pieces let `^MATCH` hit mid-line). The unterminated line (a prompt:
- * `Password: `, `>>> `) can be offered once the stream has gone quiet. One splitter
- * per stream: interleaving two streams' writes would join their partial lines.
+ * `Password: `, `>>> `) can be offered once the stream has gone quiet. Writers that
+ * take turns on one line, a process Run's two pipes, share a splitter with a `source`
+ * each, and a line names where its first shown character came from.
  */
 export class LineSplitter {
   /** The unterminated line, raw (its head, once `cut`). */
@@ -272,9 +273,11 @@ export class LineSplitter {
   private readonly scan: LineCarry = lineCarry();
   /** The unterminated line was consumed as a prompt. */
   private spent = false;
-  /** Where the unterminated line's first character came from, and whether the line holds output from elsewhere too (SplitLine). */
+  /** Where the unterminated line's first shown character came from, and whether it shows characters from elsewhere too (SplitLine). */
   private from: string | undefined;
   private mixed = false;
+  /** The unterminated line shows a character: `from` is decided. */
+  private shown = false;
   private timer: NodeJS.Timeout | undefined;
   private readonly quietMs: number;
   private readonly onPartial: ((line: SplitLine) => boolean) | undefined;
@@ -329,17 +332,21 @@ export class LineSplitter {
    * commits, #22, comment 6274773484: a head ended in a lone high surrogate).
    */
   private add(part: string, source: string | undefined): void {
-    if (!part) return;
-    if (!this.raw) this.from = source;
-    else if (source !== this.from) this.mixed = true;
-    if (this.cut) return;
-    if (this.raw.length + part.length <= MAX_LINE) {
-      this.raw += part;
-      return;
+    if (!part || this.cut) return;
+    const before = this.raw;
+    if (this.raw.length + part.length <= MAX_LINE) this.raw += part;
+    else {
+      const head = this.raw + part.slice(0, MAX_LINE - this.raw.length + 1);
+      this.raw = head.slice(0, safeCut(head, MAX_LINE));
+      this.cut = true;
     }
-    const head = this.raw + part.slice(0, MAX_LINE - this.raw.length + 1);
-    this.raw = head.slice(0, safeCut(head, MAX_LINE));
-    this.cut = true;
+    // Only what the line keeps names a pipe, and only once it shows a character.
+    if (source === undefined || this.mixed || (this.shown && source === this.from)) return;
+    if (!showsCharacter(before, this.raw.slice(before.length))) return;
+    if (!this.shown) {
+      this.from = source;
+      this.shown = true;
+    } else this.mixed = true;
   }
 
   /** The stream ended: the unterminated line is complete (unless it was spent as a prompt). */
@@ -374,6 +381,7 @@ export class LineSplitter {
     this.spent = false;
     this.from = undefined;
     this.mixed = false;
+    this.shown = false;
     if (line) out.push(line);
   }
 

@@ -318,3 +318,21 @@ test('a line says where its first character came from, and that it holds output 
   assert.deepEqual(lines, [{ text: 'abcdef', from: 'stdout', mixed: true }, { text: 'err only', from: 'stderr' }, { text: 'x', from: 'stdout' }, { text: 'tail', from: 'stdout' }]);
   assert.deepEqual(new LineSplitter().feed('plain\n'), [{ text: 'plain' }], 'with no source given, none is said');
 });
+
+test('a line names the pipe of the first character it shows: escape sequences, a carried CSI head and controls name none (our review of the 84 commits through a8b6f28, PR #22)', () => {
+  const lines = (...chunks: [string, string][]) => {
+    const s = new LineSplitter();
+    const out = chunks.flatMap(([source, data]) => s.feed(data, source));
+    return [...out, ...s.flush()];
+  };
+  // A cursor-hide or an SGR reset on stdout, then the line's text on stderr: the text is stderr's, and the line not mixed.
+  assert.deepEqual(lines(['stdout', '\x1b[?25l'], ['stderr', 'boom\n']), [{ text: 'boom', from: 'stderr' }]);
+  assert.deepEqual(lines(['stdout', '\x1b[0m\r'], ['stderr', 'boom\n']), [{ text: 'boom', from: 'stderr' }]);
+  assert.deepEqual(lines(['stderr', 'boom'], ['stdout', '\x1b[0m\n']), [{ text: 'boom', from: 'stderr' }]);
+  // A CSI's rest finished on the other pipe shows only what follows it.
+  assert.deepEqual(lines(['stdout', '\x1b[3'], ['stderr', '1mboom\n']), [{ text: 'boom', from: 'stderr' }]);
+  // The line after a LF a stdout CSI executed begins with the CSI's head, which shows nothing.
+  assert.deepEqual(lines(['stdout', 'a\x1b[4\nh'], ['stderr', 'X\n']), [{ text: 'a', from: 'stdout' }, { text: 'X', from: 'stderr' }]);
+  // A space is a character shown, as the rule's words say.
+  assert.deepEqual(lines(['stdout', ' '], ['stderr', 'boom\n']), [{ text: cleanLine(' boom'), from: 'stdout', mixed: true }]);
+});

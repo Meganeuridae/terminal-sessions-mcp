@@ -57,7 +57,7 @@
  */
 import { cleanLine } from './ansi.js';
 import { testBounded } from './regex.js';
-import { headAt, indexAtByte, isStringStart, lineCarry, lineEnds, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
+import { headAt, indexAtByte, isStringStart, lineCarry, lineEnds, showsCharacter, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
 import type { JournalEvent, OutputStream, Seq } from './types.js';
 
 export interface SearchMatch {
@@ -100,9 +100,14 @@ interface Carry {
   raw: string;
   /** The line's raw bytes passed MAX_LINE_RAW: only its head is kept. */
   cut: boolean;
-  /** The stream of the event the line began in, and whether a later piece of it came from the other pipe (rule 1). */
+  /**
+   * The stream of the piece holding the first character the line shows (of the event it began in until one shows),
+   * and whether a piece from the other pipe shows a character of the line too, within what the line keeps (rule 1).
+   */
   stream: OutputStream;
   mixed: boolean;
+  /** The line shows a character: `stream` is decided. */
+  shown: boolean;
   start: Resume;
   /** Lines completed when this one began (rule 6: more since means other lines came between). */
   linesAt: number;
@@ -239,12 +244,12 @@ export class LineScanner {
     while (pos <= data.length && !this.full) {
       if (!carry) {
         if (pos === data.length) break;
-        carry = { raw: head, cut: false, stream, mixed: false, start: { cursor: seq - 1, offset: bytes }, linesAt: this.lines };
+        carry = { raw: head, cut: false, stream, mixed: false, shown: false, start: { cursor: seq - 1, offset: bytes }, linesAt: this.lines };
         this.carries.set(key, carry);
       }
       const nl = e < ends.length ? ends[e++]! : -1;
       const piece = data.slice(pos, nl === -1 ? undefined : nl);
-      if (piece && stream !== carry.stream) carry.mixed = true;
+      const was = carry.raw;
       if (!carry.cut) {
         const room = MAX_LINE_RAW - carry.raw.length;
         if (piece.length > room) {
@@ -253,6 +258,13 @@ export class LineScanner {
           carry.raw = head.slice(0, unfinishedSequence(head));
           carry.cut = true;
         } else carry.raw += piece;
+      }
+      // Only what the line keeps names a pipe, and only once it shows a character.
+      if (stream !== 'pty' && carry.raw !== was && !carry.mixed && !(carry.shown && stream === carry.stream) && showsCharacter(was, carry.raw.slice(was.length))) {
+        if (!carry.shown) {
+          carry.stream = stream;
+          carry.shown = true;
+        } else carry.mixed = true;
       }
       if (nl === -1) break;
       bytes += bytesOf(piece, ascii) + 1;

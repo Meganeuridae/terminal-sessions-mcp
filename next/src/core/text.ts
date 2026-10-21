@@ -383,6 +383,17 @@ export function stripEscapes(s: string): { text: string; map: number[] } {
 }
 
 /**
+ * Whether `part` shows a character, read on from the data before it: its text without control sequences and controls
+ * (stripEscapes), tabs and line ends aside, with the sequence that data left unfinished read first, so a part that
+ * finishes one shows only what follows it. A line names the pipe of the first character it shows (§6 rule 6): an
+ * escape sequence, a CSI head carried over a LF, or a control alone names none (our review of the 84 commits through
+ * a8b6f28, PR #22: a cursor-hide on stdout before `boom` on stderr named stdout, and the line mixed).
+ */
+export function showsCharacter(before: string, part: string): boolean {
+  return /[^\t\n]/.test(stripEscapes(before.slice(unfinishedSequence(before)) + part).text);
+}
+
+/**
  * How far back `safeCut` and `unfinishedSequence` look for the start of a control sequence by
  * default. A control string can be longer than this (an OSC 52 carries a clipboard): a caller
  * that holds the whole of a source's output passes a wider lookback, since a cut inside a string
