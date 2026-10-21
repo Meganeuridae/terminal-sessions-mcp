@@ -64,6 +64,8 @@ export interface SessionOptions {
   seatGraceMs?: number;
   /** A partial line typed at the prompt stops blocking shell Runs after this long without input (default 30 s). */
   editingStaleMs?: number;
+  /** After a cancel's empty line, how long a prompt's start waits for the prompt's end mark before the line is taken as lost (default PROMPT_DRAWN_WAIT_MS). */
+  promptDrawnWaitMs?: number;
   /** Cursors carried over from an earlier life or a restart (G22): the registry persists them. */
   cursors?: Record<Principal, Cursors>;
   /** Called when a principal's cursor advances (cheap and synchronous; the registry debounces its writes). */
@@ -1168,7 +1170,7 @@ export class Session {
     if (probe && (probe.started || probe.path === undefined)) this.dropPromptProbe();
     else if (probe) {
       probe.prompted = true;
-      this.armPromptProbeGrace(this.promptsCarryEnd ? PROMPT_DRAWN_WAIT_MS : PROMPT_PROBE_GRACE_MS);
+      this.armPromptProbeGrace(this.promptsCarryEnd ? (this.opts.promptDrawnWaitMs ?? PROMPT_DRAWN_WAIT_MS) : PROMPT_PROBE_GRACE_MS);
     }
     if (this.shellState !== 'exited') this.shellState = this.currentShellRun || this.pendingShellRun || this.promptProbe ? 'busy' : 'idle';
     if (!this.ready && !this.readyTimer) {

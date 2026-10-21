@@ -414,6 +414,7 @@ export interface HarnessOptions extends FakeShellOptions {
   env?: Record<string, string>;
   seatGraceMs?: number;
   editingStaleMs?: number;
+  promptDrawnWaitMs?: number;
   integrationGraceMs?: number;
   startupCapMs?: number;
   owner?: string;
@@ -478,6 +479,7 @@ export async function scriptedSession(opts: HarnessOptions = {}): Promise<Harnes
   };
   if (opts.seatGraceMs !== undefined) so.seatGraceMs = opts.seatGraceMs;
   if (opts.editingStaleMs !== undefined) so.editingStaleMs = opts.editingStaleMs;
+  if (opts.promptDrawnWaitMs !== undefined) so.promptDrawnWaitMs = opts.promptDrawnWaitMs;
   if (opts.startupCapMs !== undefined) so.startupCapMs = opts.startupCapMs;
   if (marks !== 'none') so.integration = { args: [], env: {} };
   const session = await Session.start(so);

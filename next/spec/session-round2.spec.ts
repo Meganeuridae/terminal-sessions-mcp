@@ -778,8 +778,10 @@ test('an empty line whose file cannot be removed at its prompt still frees the s
 test('the empty line’s grace runs from the prompt’s end mark: a prompt slow to draw does not give the line up before it is drawn', async () => {
   // By run with bash 5.2.37 and a PS1 holding a second's command substitution: the grace ran from the
   // prompt's start mark, gave the line up at 300 ms and wrote the queued Run's line, and the empty line ran
-  // at 1 s, once the prompt was drawn (the house's review of the 40 commits through 4f4c067).
-  const h = await harness({ quietEmptyInterrupt: true });
+  // at 1 s, once the prompt was drawn (the house's review of the 40 commits through 4f4c067). The bound on
+  // drawing is set far past this spec's waits, so a runner's stall can't reach it (the house's review of
+  // 4f4c067..a8b6f28).
+  const h = await harness({ quietEmptyInterrupt: true, promptDrawnWaitMs: 60_000 });
   h.shell.pause(); // nothing typed is read until resume()
   const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
   assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
@@ -802,8 +804,9 @@ test('the empty line’s grace runs from the prompt’s end mark: a prompt slow 
 
 test('a prompt that stops carrying its end mark still gives the empty line up, at the bound on drawing it', async () => {
   // bash's `shopt -u promptvars` after the first prompts leaves PS1's end mark unexpanded, so the prompts
-  // carry the start mark alone: the grace, waiting for an end mark, must still end (Gladys-2413's read).
-  const h = await harness({ quietEmptyInterrupt: true });
+  // carry the start mark alone: the grace, waiting for an end mark, must still end (Gladys-2413's read). The
+  // bound is the session's promptDrawnWaitMs, set short here.
+  const h = await harness({ quietEmptyInterrupt: true, promptDrawnWaitMs: 400 });
   h.shell.pause();
   const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
   assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
@@ -815,8 +818,8 @@ test('a prompt that stops carrying its end mark still gives the empty line up, a
   h.pty.emit(h.shell.mark('133;A') + '$ '); // no end mark follows
   await until(() => h.session.run(b.run.runId).state === 'starting', 6000, 'the Run’s line written once the wait ends');
   const waited = performance.now() - t0;
-  assert.ok(waited >= 2500, `not before the bound (${Math.round(waited)} ms)`);
-  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /did not start within 3000 ms of the shell's prompt: it was lost/.test(e.text)), 'the give-up is said, with its wait');
+  assert.ok(waited >= 380, `not before the bound (${Math.round(waited)} ms)`);
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /did not start within 400 ms of the shell's prompt: it was lost/.test(e.text)), 'the give-up is said, with its wait');
   h.shell.resume();
   const rb = await h.session.awaitRun(b.run.runId, 2000);
   assert.deepEqual([rb.state, rb.exit], ['exited', 0], JSON.stringify(rb));
