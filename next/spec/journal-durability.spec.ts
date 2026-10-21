@@ -171,6 +171,44 @@ test('jr2-6/G10: a journal.meta.json an earlier build wrote is read as it meant:
   }
 });
 
+test('G10: a daemon that dies after its start honoured an earlier boot\'s reservation, before the gap reached the file, does not have the seqs issued again on the same boot (the house\'s read of the 40 commits, PR #22)', (t) => {
+  let boot = 'boot-A';
+  t.mock.method(boots, 'current', () => boot);
+  const dir = tmpDir();
+  try {
+    const live = path.join(dir, 'live');
+    const atDeath = path.join(dir, 'at-death');
+    const j = new Journal({ cold: new FileStore(live) });
+    const seen: number[] = [];
+    j.subscribe((e) => seen.push(e.seq));
+    for (let i = 0; i < 50; i++) j.append(out(`a${i}`));
+    // A power loss keeps the file's first 20 lines; the machine comes back as boot B.
+    const file = path.join(live, 'journal.jsonl');
+    fs.writeFileSync(file, lines(file).slice(0, 20).join('\n') + '\n');
+    boot = 'boot-B';
+    /** What the disk holds when the daemon dies at the gap's append, before its line is written. */
+    class DiesAtTheGap extends FileStore {
+      override append(event: JournalEvent): void {
+        if (event.type === 'gap' && !fs.existsSync(atDeath)) fs.cpSync(live, atDeath, { recursive: true });
+        super.append(event);
+      }
+    }
+    const recovered = new Journal({ cold: new DiesAtTheGap(live) });
+    assert.deepEqual(gaps(recovered.since(20).events), [[21, HIGH_WATER_BLOCK, 'torn-write']]);
+    const peek = new FileStore(live);
+    assert.equal(peek.highWater()?.reservation?.boot, 'boot-B', 'with the gap in the file, the block above it takes this boot');
+    peek.close();
+    // The next start on boot B finds the disk as it was at the death.
+    const again = new Journal({ cold: new FileStore(atDeath) });
+    const next = again.append(out('after the second crash'));
+    assert.ok(next.seq > Math.max(...seen) && !seen.includes(next.seq), `no seq a subscriber saw is issued again (next ${next.seq})`);
+    again.close();
+    recovered.close(); // `j` is left as the first crash left it
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ───────────── jr2-7: age retention reaches the active file and an idle ring ─────────────
 
 test('jr2-7/G21/G26: the active file is rotated once its oldest event is past maxAgeMs, so aged content goes at the next append', () => {

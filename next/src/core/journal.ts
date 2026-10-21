@@ -132,6 +132,13 @@ export class Journal {
    */
   private markUnsure = false;
   /**
+   * The constructor honoured a reservation left by another boot (or by none known) and has not yet appended
+   * the gap that records its hole: a reservation written meanwhile carries no boot, so it is honoured on
+   * this boot too. Stamped with this boot, it told a recovery on this boot, after a daemon crash before the
+   * gap reached the file, that the files held every seq issued, and the seqs above them were issued again.
+   */
+  private holeOpen = false;
+  /**
    * When a refused reservation write is tried again, on the monotonic clock: one durable write a second
    * while the disk refuses, whatever the write was for. An extension was retried on every event, 1,976
    * full write attempts in 3,000 events (comment 6307349700, item 4).
@@ -181,7 +188,15 @@ export class Journal {
     if (hole || torn) {
       if (!hole) this.persisted = ++this.seq;
       const crash = honoured && !r.failed && this.seq === r.to;
+      this.holeOpen = hole;
       this.append(gapEvent(accounted + 1, this.seq, hole && !crash ? 'store-failed' : 'torn-write'));
+      if (this.holeOpen) {
+        this.holeOpen = false;
+        // The gap is in the store now: the block above it takes this boot, so a later stop on this boot is
+        // read as one that lost nothing the page cache held. With the store refusing it, the reservation
+        // is the failed one keepMark wrote, which no boot affects.
+        if (this.coldError === null && this.reserved > this.seq) this.writeReservation(this.reserved, false);
+      }
     }
   }
 
@@ -327,7 +342,7 @@ export class Journal {
 
   /** Write the reservation `to`, marked `failed` or with this boot, and remember it once it is confirmed. */
   private writeReservation(to: Seq, failed: boolean): boolean {
-    const boot = failed ? undefined : boots.current();
+    const boot = failed || this.holeOpen ? undefined : boots.current();
     const ok = this.cold!.setHighWater!({ reservation: { to, ...(failed && { failed: true as const }), ...(boot !== undefined && { boot }) } });
     if (ok) {
       this.reserved = to;
