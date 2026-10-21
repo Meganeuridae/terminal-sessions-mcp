@@ -10,7 +10,7 @@ import { cleanLine, compileLinePattern, LineSplitter, MAX_LINE, StreamMatcher, t
 import { LINEAR_REGEX, MIN_WINDOW, matchWindow } from '../src/core/regex.js';
 import { TermError } from '../src/core/errors.js';
 import { transcript } from '../src/core/transcript.js';
-import { sleep } from './testhost.js';
+import { sleep, until } from './testhost.js';
 
 const matcher = (pattern: string, opts?: ConstructorParameters<typeof StreamMatcher>[1]) => new StreamMatcher(compileLinePattern(pattern), opts);
 const matches = (pattern: string, chunks: string[]) => {
@@ -206,20 +206,20 @@ test('m2-10: control sequences are stripped per line, even when a write splits o
 
 test('m2-10: a prompt with no newline is matched after a quiet moment, once — not again when the line completes', async () => {
   const got: LineMatch[] = [];
-  // A quiet period long against the sleeps between writes, so a loaded runner's late timer cannot fire it early.
+  // A quiet period long against the sleeps between writes, so a loaded runner's late timer cannot fire it early. The time it
+  // fired is taken in the callback itself: one read when the loop saw the match passed an early firing seen late, and the
+  // check before the quiet period was skipped whenever the sleep overslept it (a reviewer's read of the fixes for #22).
   const quiet = 400;
-  const m = matcher('Password: ?$', { onPartial: (h) => got.push(h), partialAfterMs: quiet });
+  const fired: number[] = [];
+  const m = matcher('Password: ?$', { onPartial: (h) => (got.push(h), fired.push(performance.now())), partialAfterMs: quiet });
   const t0 = performance.now();
   assert.deepEqual(m.feed('Password'), []);
   await sleep(50);
   assert.deepEqual(m.feed(': '), [], 'more output restarts the quiet period');
   const fed = performance.now();
-  await sleep(50);
-  if (performance.now() - fed < quiet) assert.equal(got.length, 0, 'nothing before the quiet period has passed');
-  const deadline = Date.now() + 5000;
-  while (got.length === 0 && Date.now() < deadline) await sleep(20);
+  await until(() => got.length > 0, 5000, 'the partial match');
   assert.equal(got.length, 1);
-  assert.ok(performance.now() - fed >= quiet - 5, `fired ${Math.round(performance.now() - fed)} ms after the last write, quiet since ${Math.round(fed - t0)}`);
+  assert.ok(fired[0]! - fed >= quiet - 5, `fired ${Math.round(fired[0]! - fed)} ms after the last write, quiet since ${Math.round(fed - t0)}`);
   assert.equal(got[0]!.line, 'Password: ');
   assert.deepEqual(m.feed('\r\n'), [], 'the completed line already produced its match');
   // Without onPartial, only terminated lines match.
