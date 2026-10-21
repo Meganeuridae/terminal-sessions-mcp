@@ -26,6 +26,7 @@ import { cutPlumbing } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
 import { safeCut, tailStart, unfinishedSequence } from './text.js';
 import { headOnlyText } from './regex.js';
+import { minusRanges } from './ranges.js';
 import { project } from './transcript.js';
 import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type JournalEvent, type OutputStream, type Principal, type RunInfo, type ScreenSnapshot, type Seq } from './types.js';
 
@@ -645,8 +646,7 @@ function goneRanges(recorded: Gone[], inferred: Gone[], from: Seq, to: Seq): Gon
     return f > t ? [] : [{ from: f, to: t, reason: g.reason }];
   };
   const known = recorded.flatMap(clip);
-  let rest = inferred.flatMap(clip);
-  for (const r of known) rest = rest.flatMap((p) => (r.to < p.from || r.from > p.to ? [p] : [...(r.from > p.from ? [{ ...p, to: r.from - 1 }] : []), ...(r.to < p.to ? [{ ...p, from: r.to + 1 }] : [])]));
+  const rest = minusRanges(inferred.flatMap(clip), known);
   const out: Gone[] = [];
   for (const g of [...known, ...rest].sort((a, b) => a.from - b.from || a.to - b.to)) {
     const last = out[out.length - 1];

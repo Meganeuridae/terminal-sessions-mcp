@@ -64,6 +64,7 @@ import { compileUserRegex, headOnlyText } from '../core/regex.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
 import { persistentState } from '../core/screen.js';
+import { minusRanges } from '../core/ranges.js';
 import { lineBytes } from '../core/stores.js';
 import { countLines, cutTail, headIndex, indexAtByte, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length } from '../core/text.js';
 import { project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
@@ -282,13 +283,7 @@ const gapEvent = (g: GapInfo): Gap => ({ type: 'gap', seq: g.to, ts: Date.now(),
  * recorded event reports the whole hole, rather than leaving part of it to a later page (the house's
  * read of the 38 commits, #22, comment 6274935728, items 3 and 4).
  */
-function uncovered(gap: GapInfo, recorded: Iterable<GapInfo>): GapInfo[] {
-  let left = [gap];
-  for (const r of recorded) {
-    left = left.flatMap((p) => (r.to < p.from || r.from > p.to ? [p] : [...(r.from > p.from ? [{ ...p, to: r.from - 1 }] : []), ...(r.to < p.to ? [{ ...p, from: r.to + 1 }] : [])]));
-  }
-  return left;
-}
+const uncovered = (gap: GapInfo, recorded: Iterable<GapInfo>): GapInfo[] => minusRanges([gap], recorded);
 
 /** The recorded holes among events. */
 const recordedIn = (events: Iterable<JournalEvent>): GapInfo[] => [...events].filter(isGap).map(gapOf);

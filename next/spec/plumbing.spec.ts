@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
-import { ackMark, cutPlumbing, exitMark, goneMark, inlineProbe, inlineTypedLine, markerProbe, nonceOf, probeEcho, probeMark, startMark } from '../src/core/plumbing.js';
+import { ackMark, commandFile, cutPlumbing, exitMark, goneMark, inlineProbe, inlineTypedLine, markerProbe, nonceOf, probeEcho, probeMark, shellQuote, sourceLine, sourceLineEcho, startMark } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { journalRunText } from '../src/core/segmenter.js';
 import type { RunOutput } from '../src/core/runindex.js';
@@ -302,4 +302,31 @@ test('every line the inline strategy types is the typed-line echo whole, and the
   assert.equal(nonceOf('<<<ACK:n0ff:2>>>'), 'n0ff');
   assert.equal(nonceOf('<<<GONE:n0ff>>>'), 'n0ff');
   for (const line of ['__tsm_b is a name', 'echo done', ' set -g PATH /bin']) assert.doesNotMatch(line, inlineTypedLine(), line);
+});
+
+test('the line that runs a command file, for each flavor, with the marker strategy’s end mark and without, is the echo compat cuts and the one the cutter takes for the Run’s echo', () => {
+  // compat kept a hand copy of these lines, with no line for fish's marker strategy; it is now derived from
+  // the session's own builder (a reviewer's read of the fixes for #22).
+  const file = `/tmp/it's here/${commandFile(12)}`;
+  assert.equal(shellQuote(file), `'/tmp/it'\\''s here/tsm-cmd-12'`);
+  const whole = new RegExp(`^(?:${sourceLineEcho().source})$`);
+  for (const flavor of ['posix', 'zsh', 'fish'] as const) {
+    for (const nonce of [undefined, 'n0ff']) {
+      const line = sourceLine(file, flavor, nonce);
+      const what = `${flavor}, ${nonce ? 'marker' : 'integrated'}: ${line}`;
+      assert.match(line, whole, what);
+      assert.equal(`bash-3.2$ ${line}`.replace(sourceLineEcho(), '').trimEnd(), 'bash-3.2$', `after a prompt, the whole line: ${what}`);
+      if (nonce) {
+        // The marker strategy's Run output begins with the echo: the cutter takes it by the split end mark it carries.
+        assert.match(line, /; echo "<<<EXI""T:n0ff:\$(?:\?|status)>>>"$/, what);
+        assert.equal(cutPlumbing(`${line}\r\nout\r\n<<<EXIT:n0ff:0>>>\r\n`, { strategy: 'marker', nonce }), 'out\r\n', what);
+      } else {
+        // Under `basic` the output's first line is the echo.
+        assert.equal(cutPlumbing(`${line}\r\nout\r\n`, { strategy: 'basic' }), 'out\r\n', what);
+      }
+    }
+  }
+  assert.equal(sourceLine(file, 'posix', 'n0ff').startsWith(' command . '), true, 'POSIX under the marker strategy: `command .`');
+  assert.equal(sourceLine(file, 'zsh', 'n0ff').startsWith(' . '), true, 'zsh: `.`');
+  for (const line of ['. ./setup.sh', 'source ~/.bashrc', ` . '/tmp/x/other-12'`]) assert.doesNotMatch(line, sourceLineEcho(), line);
 });

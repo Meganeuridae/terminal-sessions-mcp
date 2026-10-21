@@ -11,7 +11,7 @@
 import { clocks } from '../core/clock.js';
 import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
-import { ackMark, exitMark, goneMark, inlineTypedLine, nonceOf, probeEcho, probeMark, startMark } from '../core/plumbing.js';
+import { ackMark, exitMark, goneMark, inlineTypedLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLineEcho, startMark } from '../core/plumbing.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
 import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
 import { commitReadDelivery, takeReadCommit, type App, type ReadResult, type SessionSummary } from './app.js';
@@ -35,8 +35,6 @@ const anyOf = (patterns: unknown): string | undefined => {
 /** Core tool names in texts that reach a compat caller, in the compat profile's words. */
 const compatWords = (text: string): string => text.replace(/\bsession_close\b/g, 'killSession').replace(/\bsession_open\b/g, 'runCommand');
 
-/** Quote a path for a POSIX shell line. */
-const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -125,17 +123,16 @@ async function runOutput(ctx: ToolContext, session: string, runId: string, raw: 
 }
 
 /**
- * The daemon's own typed line as the shell echoes it (Session.sourceLine): ` . '<dir>/tsm-cmd-N'`,
- * `command . '…'` with the chained exit echo under the marker strategy, fish's
- * `eval (__tsm_collect '…' $status)`; the lines typed for a declared shell's body (plumbing.ts
- * inlineTypedLine); and the marks both strategies print, from the core's grammar. The probe lines
- * typed after a ^C are struck by the cutter's own matcher (keptLines). 1.x kept these out of its logs
- * and logged `$ <command>` in their place (the house's read of 1cabc6a, #22). The inline strategy's
- * body, its start mark and its pieces' marks reached the logs while this held a copy of the marker
- * strategy's shapes alone (a reviewer's read of the fixes for #22).
+ * The daemon's own typed lines as the shell echoes them: the line that runs a Run's command file
+ * (plumbing.ts sourceLineEcho, from the session's own builder, the marker strategy's chained end
+ * mark included), the lines typed for a declared shell's body (inlineTypedLine), and the marks both
+ * strategies print, from the core's grammar. The probe lines typed after a ^C are struck by the
+ * cutter's own matcher (keptLines). 1.x kept these out of its logs and logged `$ <command>` in their
+ * place (the house's read of 1cabc6a, #22). The inline strategy's body, its start mark and its
+ * pieces' marks reached the logs while this held a copy of the marker strategy's shapes alone, and
+ * that copy had no line for fish's marker strategy (a reviewer's read of the fixes for #22).
  */
-const TYPED_LINE = /(?:command )?\. '(?:[^'\n]|'\\'')*\/tsm-cmd-\d+'(?:; echo "<<<EXI""T:[0-9a-f]+:\$\?>>>")?|eval \(__tsm_collect '(?:[^'\n]|'\\'')*\/tsm-cmd-\d+' \$status\)/;
-const PLUMBING = new RegExp([TYPED_LINE, inlineTypedLine(), startMark(), exitMark(), probeMark(), ackMark(), goneMark()].map((re) => re.source).join('|'), 'g');
+const PLUMBING = new RegExp([sourceLineEcho(), inlineTypedLine(), startMark(), exitMark(), probeMark(), ackMark(), goneMark()].map((re) => re.source).join('|'), 'g');
 
 /**
  * What tells the daemon's plumbing from a program's in a stretch of the session's text: the nonces
@@ -488,7 +485,7 @@ export const COMPAT_TOOLS: ToolDef[] = [
       // the newline before the closing brace keeps a trailing `&` or comment from taking it (the house's read of 1cabc6a, #22).
       const existing = summaryOf(ctx, name);
       const exists = existing !== undefined && existing.state !== 'exited';
-      const command = exists && typeof a.cwd === 'string' ? `cd -- ${shq(a.cwd)} && {\n${a.command as string}\n}` : (a.command as string);
+      const command = exists && typeof a.cwd === 'string' ? `cd -- ${shellQuote(a.cwd)} && {\n${a.command as string}\n}` : (a.command as string);
       // Without patterns 1.x waited 2 s and said `running`: wait just past the 2 s liveness window (atc-7).
       const o: Parameters<App['start']>[1] = { session: name, command, name, wait: ready || fail ? 30_000 : 2_500 };
       if (a.cwd !== undefined && !exists) o.cwd = a.cwd as string;

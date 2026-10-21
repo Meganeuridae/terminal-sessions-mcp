@@ -14,7 +14,8 @@
  * PID namespace, has no such variable and answers with an empty token (the house's read of
  * 39787b3, #22). The typed lines that print them spell each word split (`EXI""T`, `STAR''T`,
  * `PRO""BE`), so an echo of the typed line never matches a mark. The probe lines are built here
- * (markerProbe, inlineProbe), and the cutter matches their echo from the same text.
+ * (markerProbe, inlineProbe), and the cutter matches their echo from the same text; so is the line
+ * that runs a Run's command file (sourceLine), whose echo the compat pack's logs find from it.
  */
 import { stripEscapes } from './text.js';
 import type { RunStrategy } from './types.js';
@@ -73,8 +74,50 @@ export const markerProbe = (nonce: string): string => ` echo "<<<PRO""BE:${nonce
  * … sh` is pid 1), the variable does not travel (the house's read of 39787b3, #22).
  */
 export const inlineProbe = (nonce: string, fish: boolean): string => ` printf '<<<PRO''BE:${nonce}:%s:%s>>>\\n' ${fish ? '$fish_pid "$__tsm_r"' : '"$$" "$\{__tsm_r-}"'}`;
+/** How the session's own shell runs a typed line: POSIX (bash, dash, an unknown sh), zsh, or fish. */
+export type ShellFlavor = 'posix' | 'zsh' | 'fish';
+/** Text as one word for a POSIX shell or fish: single-quoted, each quote in it closed, escaped and reopened. */
+export const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+const COMMAND_FILE = 'tsm-cmd-';
+/** A Run's command file's name: the integration scripts know the daemon's typed line by it. */
+export const commandFile = (n: number): string => `${COMMAND_FILE}${n}`;
+/**
+ * The line typed to run a Run's command file: sourced text gets no history expansion, completion
+ * or PS2 (G6). The leading space keeps it out of history where the shell honours ignorespace. An
+ * integrated fish evaluates the file's text with `eval` (its integration's __tsm_collect prints
+ * the file and returns the status the prompt had, so the text sees $status as a typed line would),
+ * which runs it at the prompt's own level: jobs get process groups of their own, so cancel and
+ * signal reach them and never fish (ss-2), and `set -l` persists as when typed (ss-11) — `source`
+ * gave neither; without the integration fish has `source`. With `nonce`, the marker strategy's
+ * line: its end mark is chained after it, with the shell's status. There a POSIX shell abandons
+ * the rest of the typed line when a dot script has a syntax error or a special builtin fails;
+ * `command .` strips that, so the chained mark still reports the status (ss-5). zsh never
+ * abandons the line, and its `command` would look for an external `.`.
+ */
+export function sourceLine(file: string, flavor: ShellFlavor, nonce?: string): string {
+  const marker = nonce !== undefined;
+  const run = flavor === 'fish' ? (marker ? ` source ${shellQuote(file)}` : ` eval (__tsm_collect ${shellQuote(file)} $status)`) : ` ${marker && flavor === 'posix' ? 'command .' : '.'} ${shellQuote(file)}`;
+  return marker ? `${run}; echo "<<<EXI""T:${nonce}:${flavor === 'fish' ? '$status' : '$?'}>>>"` : run;
+}
 /** Where a builder's line holds the nonce, to split it there: no builder types this character. */
 const AT_NONCE = '\0';
+/** Where a source line holds its command file's path: no builder types it, and quoting leaves it as it is. */
+const AT_FILE = '\u0001';
+/** A command file's path as a source line quotes it: any directory, then the file's name. */
+const QUOTED_FILE = `'(?:[^'\\n]|'\\\\'')*/${literal(COMMAND_FILE)}\\d+'`;
+/**
+ * The echo of a line that runs a Run's command file, for each flavor, with and without the marker
+ * strategy's end mark, taken from sourceLine with a placeholder path and nonce: the file's quoted
+ * path matches any command file, the nonce any Run's. The longest first, so a line with its end mark
+ * is matched whole. For a reader of the session's text as a whole (the compat pack's logs, which
+ * kept a hand copy of these lines without fish's marker line: a reviewer's read of the fixes for #22).
+ */
+export const sourceLineEcho = (): RegExp => {
+  const lines = new Set<string>();
+  for (const flavor of ['posix', 'zsh', 'fish'] as const) for (const nonce of [undefined, AT_NONCE]) lines.add(sourceLine(AT_FILE, flavor, nonce));
+  const pattern = (line: string) => line.split(shellQuote(AT_FILE)).map((part) => part.split(AT_NONCE).map(literal).join(NONCE)).join(QUOTED_FILE);
+  return new RegExp([...lines].sort((a, b) => b.length - a.length).map(pattern).join('|'));
+};
 /**
  * The typed probe lines around their nonce, taken from the builders above: each head, from its
  * mark's `<<<` up to the nonce, with the rests of the lines that follow the nonce after it. The

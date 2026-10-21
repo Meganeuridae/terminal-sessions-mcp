@@ -16,7 +16,7 @@ import { SessionRegistry } from '../src/api/registry.js';
 import { callTool, toolsFor } from '../src/api/tools.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { clocks } from '../src/core/clock.js';
-import { probeEcho } from '../src/core/plumbing.js';
+import { commandFile, probeEcho, sourceLine } from '../src/core/plumbing.js';
 import { fakeShellBackend } from './fake-shell.js';
 import { until } from './testhost.js';
 
@@ -566,6 +566,27 @@ async function hungMarkerRun(h: Awaited<ReturnType<typeof markerHarness>>, sessi
   assert.ok(run.nonce, 'the marker Run recorded its nonce');
   return { nonce: run.nonce!, journal: live.session.journal };
 }
+
+test('a reviewer’s read: the logs drop the line that runs a command file for every shell flavor the session types for, fish’s marker line included', async () => {
+  // compat's hand copy of these lines had none for fish's marker strategy; it is now derived from the session's builder.
+  const h = await markerHarness();
+  try {
+    const { nonce, journal } = await hungMarkerRun(h, 'srcline');
+    let k = 100;
+    for (const flavor of ['posix', 'zsh', 'fish'] as const) {
+      for (const n of [undefined, nonce]) journal.append({ type: 'output', data: `prompt$ ${sourceLine(`/tmp/tsm-501/ab12/${commandFile(k++)}`, flavor, n)}\r\nran-${flavor}-${n ? 'marker' : 'integrated'}\r\n`, stream: 'pty' });
+    }
+    for (const raw of [false, true]) {
+      const tail = lines(await h.call('tailLogs', { session: 'srcline', lines: 30, raw }));
+      const said = `raw ${raw}: ${JSON.stringify(tail)}`;
+      assert.ok(!tail.some((l) => l.includes('tsm-cmd-') || l.includes('EXI""T')), `no typed line: ${said}`);
+      assert.equal(tail.filter((l) => l === 'prompt$').length, 6, `each prompt stays: ${said}`);
+      assert.equal(tail.filter((l) => l.startsWith('ran-')).length, 6, said);
+    }
+  } finally {
+    await h.close();
+  }
+});
 
 test('a reviewer’s read: a tail whose window the daemon’s own lines fill reads further back for the lines asked, and at its cap says the shortfall instead of returning fewer in silence', async () => {
   const h = await markerHarness();

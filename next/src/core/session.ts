@@ -21,7 +21,7 @@ import { clocks, timerMs } from './clock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
-import { cutPlumbing, exitMark, inlineProbe, markerProbe, probeMark, startMark } from './plumbing.js';
+import { commandFile, cutPlumbing, exitMark, inlineProbe, markerProbe, probeMark, shellQuote, sourceLine, startMark, type ShellFlavor } from './plumbing.js';
 import { stripEscapes } from './text.js';
 import { project, type ProjectChunk } from './transcript.js';
 import { type AttachmentRole, type ControlPolicy, type Cursors, DEFAULT_GEOMETRY, type EnvBasis, type EventOf, type IntegrationLevel, type JournalEvent, type Principal, type RunInfo, type RunOrigin, type RunState, type RunTarget, type ScreenSnapshot, type Seq, type ShellState, SYSTEM, type Visibility } from './types.js';
@@ -388,7 +388,6 @@ function declaredFlavor(name: string): 'posix' | 'fish' {
 
 type OutputEvent = EventOf<'output'>;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 /** The position of whichever of `needles` comes first in `text`; -1 when none does. */
 /**
  * Create a command file that did not exist, never through a symlink (jr2-3). The directory
@@ -427,12 +426,6 @@ function normalizeSignal(signal: unknown): NodeJS.Signals {
   if (!Object.prototype.hasOwnProperty.call(os.constants.signals, name)) throw err('invalid_argument', `unknown signal ${signal}`, { signal });
   return name as NodeJS.Signals;
 }
-
-/**
- * How daemon lines are written for the shell in the terminal: fish sources through
- * `eval`, zsh and other POSIX shells through `.` (`command .` under the marker strategy).
- */
-type ShellFlavor = 'posix' | 'zsh' | 'fish';
 
 /**
  * The flavor of a shell path or command line (`-zsh` for a login shell, `/bin/bash --rcfile …`).
@@ -1165,7 +1158,7 @@ export class Session {
     if (pending && (trimmed === undefined || trimmed === pending.execLine)) {
       this.pendingShellRun = undefined;
       run = pending;
-    } else if (pending && line !== undefined && pending.tempFile !== undefined && line.includes(shq(pending.tempFile))) {
+    } else if (pending && line !== undefined && pending.tempFile !== undefined && line.includes(shellQuote(pending.tempFile))) {
       // ss-1: our line merged with text already in the line editor (a history search left
       // open, a mode the clear keys do not reach): what the shell runs for our write is ours.
       this.pendingShellRun = undefined;
@@ -2082,24 +2075,6 @@ export class Session {
     return { runId, state: run.state, contract: 'shell', steps };
   }
 
-  /**
-   * The line typed for a temp file: sourced text gets no history expansion, completion or
-   * PS2 (G6). The leading space keeps it out of history where the shell honours ignorespace.
-   * An integrated fish evaluates the file's text with `eval`, which runs it at the prompt's
-   * own level: jobs get process groups of their own, so cancel and signal reach them and
-   * never fish (ss-2), and `set -l` persists as when typed (ss-11) — `source` gave neither.
-   * Under the marker strategy a POSIX shell abandons the rest of the typed line when a dot
-   * script has a syntax error or a special builtin fails; `command .` strips that, so the
-   * chained marker still reports the status (ss-5). zsh never abandons the line, and its
-   * `command` would look for an external `.`.
-   */
-  private sourceLine(file: string, marker = false): string {
-    // (The fish integration's __tsm_collect prints the file and returns the status the prompt
-    // had, so the text sees $status as a typed line would; without the integration, `source`.)
-    if (this.flavor === 'fish') return marker ? ` source ${shq(file)}` : ` eval (__tsm_collect ${shq(file)} $status)`;
-    return ` ${marker && this.flavor === 'posix' ? 'command .' : '.'} ${shq(file)}`;
-  }
-
   private launchShellRun(run: RunRecord): void {
     // Every daemon-issued line goes through the temp file, never typed as its own
     // text: history expansion (`!`), completion (a literal tab), comments, syntax
@@ -2116,7 +2091,9 @@ export class Session {
     }
     run.tempFile = file;
     const marker = this.integrationLevel === 'none';
-    const src = this.sourceLine(file, marker);
+    // Marker strategy (§8.1 fallback): the end mark is chained on the same line, with a per-Run nonce.
+    if (marker) run.markerNonce = randomBytes(4).toString('hex');
+    const src = sourceLine(file, this.flavor, run.markerNonce);
     run.execLine = src.trim();
     run.writeOrder = ++this.writeOrder;
     // Whatever is in the line editor would merge with ours (ss-1). Our integration binds the
@@ -2127,13 +2104,11 @@ export class Session {
     this.staleLine = false;
     this.typeaheadWatch = undefined;
     if (marker) {
-      // Marker strategy (§8.1 fallback): the marker is chained on the same line, per-Run nonce.
-      run.markerNonce = randomBytes(4).toString('hex');
       run.strategy = 'marker';
       run.markerTail = '';
       this.shellState = 'busy'; // G5: a marker Run occupies the shell too (core-8)
       this.startRun(run, { cwd: this.cwdPath });
-      this.pty.write(`${clear}${src}; echo "<<<EXI""T:${run.markerNonce}:${this.statusVar()}>>>"\n`);
+      this.pty.write(`${clear}${src}\n`);
       return;
     }
     if (this.integrationLevel === 'basic') {
@@ -2152,14 +2127,10 @@ export class Session {
     this.pty.write(`${clear}${src}\n`);
   }
 
-  private statusVar(): string {
-    return this.flavor === 'fish' ? '$status' : '$?';
-  }
-
   private writeTempFile(body: string, capturePipeStatus = false): string {
     // Typed (and echoed at the prompt) as ` . '<dir>/tsm-cmd-N'`: the integration scripts know
     // plumbing by that name, and a short command directory keeps the echo short.
-    const name = `tsm-cmd-${++this.tempCounter}`;
+    const name = commandFile(++this.tempCounter);
     let text = body.endsWith('\n') ? body : body + '\n';
     // The pipeline's statuses (shell tools 3) are gone by the time the integration's end hook
     // runs: after `. file`, bash, zsh and fish report the statuses of `.` itself. So the file
@@ -2776,7 +2747,7 @@ export class Session {
     if (principal !== SYSTEM && this.control !== 'open') this.requireSeat(principal, 'run', opts);
     const out = path.join(this.tempDir, `tsm-env-${process.pid}-${this.safeId}-${++this.tempCounter}.bin`);
     this.extraTempFiles.add(out);
-    const admitted = await this.admitWhenAvailable({ target: 'shell', line: `env -0 > ${shq(out)}`, principal, internal: true, origin: 'system' });
+    const admitted = await this.admitWhenAvailable({ target: 'shell', line: `env -0 > ${shellQuote(out)}`, principal, internal: true, origin: 'system' });
     if (!admitted.admitted) throw err('busy', `shell not available: ${admitted.reason}`, { reason: admitted.reason });
     const run = await this.awaitRun(admitted.run.runId, waitMs);
     if (run.state !== 'exited') throw err('timeout', `env capture did not complete (${run.state})`, { runId: run.runId });
