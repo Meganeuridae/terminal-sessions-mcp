@@ -681,3 +681,28 @@ test('the 33 commits 6: a searchLogs pattern holding a tab, as a character or an
   const found = await search('key\\s+value');
   assert.ok(found.some((h) => h.line !== undefined && /^key +value$/.test(h.line)), JSON.stringify(found));
 });
+
+test('6307351617 5: a declared Run typed but not started carries its nonce, so its pieces’ marks and a GONE mark stay out of the logs', async () => {
+  // runPlumbing skipped a Run with no start, and a declared Run's nonce came only with its start, so the marks
+  // its pieces print before it, or a GONE with no start at all, reached tailLogs (the house's read of the 33
+  // commits, #22, comment 6307351617, item 5). `cat` declared as sh takes the typed lines and never starts the Run.
+  const opened = await call('runCommand', { session: 'unstarted', command: 'cat', timeout: -1 });
+  await until(() => summary('unstarted')?.runs?.some((x) => x.runId === opened.runId && x.state === 'running') === true, 5000, 'cat in front');
+  await call('session_declare_shell', { session: 'unstarted', shell: 'sh' });
+  const typed = await call('runCommand', { session: 'unstarted', command: `echo long-${'x'.repeat(3000)}`, timeout: 300 });
+  const live = registry.get('unstarted');
+  assert.ok(live?.kind === 'live');
+  const run = live.session.run(String(typed.runId));
+  assert.equal(run.state, 'starting', JSON.stringify(run));
+  assert.match(run.nonce ?? '', /^[0-9a-f]{8}$/, 'the nonce is there from the launch');
+  // What a shell that took the first piece and then a cut line prints, and a program's mark of another Run.
+  live.session.journal.append({ type: 'output', data: `<<<ACK:${run.nonce}:1>>>\r\n<<<GONE:${run.nonce}>>>\r\n<<<ACK:0badf00d:1>>> a program line\r\n`, stream: 'pty' });
+  for (const raw of [false, true]) {
+    const tail = lines(await call('tailLogs', { session: 'unstarted', lines: 40, raw }));
+    const said = `raw ${raw}: ${JSON.stringify(tail.map((l) => l.slice(0, 80)))}`;
+    assert.ok(!tail.some((l) => l.includes(run.nonce!)), `no mark of the declared Run: ${said}`);
+    assert.ok(!tail.some((l) => l.includes('__tsm_')), `no typed piece: ${said}`);
+    assert.ok(tail.includes('<<<ACK:0badf00d:1>>> a program line'), `another nonce's mark is a program's: ${said}`);
+  }
+  await call('killSession', { session: 'unstarted', graceful: false });
+});

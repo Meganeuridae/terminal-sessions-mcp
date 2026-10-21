@@ -1867,6 +1867,10 @@ export class Session {
   private launchInline(run: RunRecord): void {
     const fish = declaredFlavor(run.shell!) === 'fish';
     run.markerNonce = randomBytes(4).toString('hex');
+    // Public from the launch: the pieces' marks and a GONE mark print before the start mark, or with none,
+    // and a reader of the session's text cuts them by it (App.runPlumbing; the house's read of the 33
+    // commits, #22, comment 6307351617, item 5).
+    run.nonce = run.markerNonce;
     run.strategy = 'inline';
     run.inlineLines = inlineLines(run.line ?? '', run.markerNonce, fish);
     run.inlineAck = 0;

@@ -133,7 +133,7 @@ export interface RunInfo {
    * recorded: its history is cut by shape (the house's read of 39787b3, #22).
    */
   strategy?: RunStrategy;
-  /** The nonce in a `marker` or `inline` Run's marks, from its run.start: what its plumbing is cut by. For the readers of history: an events read returns the run.start as journaled, nonce included; the App's rendered results (run, await, a text read) never carry it. */
+  /** The nonce in a `marker` or `inline` Run's marks, from its run.start (a live `inline` Run's from its launch): what its plumbing is cut by. For the readers of history: an events read returns the run.start as journaled, nonce included; the App's rendered results (run, await, a text read) never carry it. */
   nonce?: string;
   /**
    * An `inline` Run's shell, the one that printed its start marker, from its run.start: only that

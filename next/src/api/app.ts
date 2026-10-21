@@ -1312,11 +1312,14 @@ export class App {
     const out: Array<Pick<PlumbingOf, 'strategy' | 'nonce'>> = [];
     for (const r of s.listRuns()) {
       if ((r.seq.end ?? Number.POSITIVE_INFINITY) < o.from || r.seq.admit > o.to) continue;
-      // Only a shell Run that has started printed marks. A process Run records no strategy, and a shell Run
-      // gets its strategy and nonce at its start; reading either's absence as "journaled before the
-      // recording" cut every mark-shaped line in the window by shape, a program's included (the house's
-      // read of the 38 commits, #22, comment 6274935728, item 5).
-      if (r.target !== 'shell' || r.seq.start === undefined) continue;
+      // Only a shell Run that has started, or a declared shell's Run whose lines are typed, printed marks. A
+      // process Run records no strategy, and a shell Run gets its strategy and nonce at its start; reading
+      // either's absence as "journaled before the recording" cut every mark-shaped line in the window by
+      // shape, a program's included (the house's read of the 38 commits, #22, comment 6274935728, item 5).
+      // A declared shell's Run carries its nonce from its launch: its pieces' marks print before its start,
+      // and one that never starts (its line reaching the shell cut) prints a GONE mark and no start (the
+      // house's read of the 33 commits, #22, comment 6307351617, item 5).
+      if (r.target !== 'shell' || (r.seq.start === undefined && r.nonce === undefined)) continue;
       const p: Pick<PlumbingOf, 'strategy' | 'nonce'> = {};
       if (r.strategy !== undefined) p.strategy = r.strategy;
       if (r.nonce !== undefined) p.nonce = r.nonce;
