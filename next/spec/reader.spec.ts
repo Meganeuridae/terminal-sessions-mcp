@@ -321,7 +321,7 @@ test('jr2-11: a torn write or store failure inside the range is a gap in the res
   out(src.journal, 'line 3\r\n');
   const r = await readJournal(src, { since: 1 }, { resultBytes: 16384 });
   assert.deepEqual(r.gap, { from: 3, to: 3, reason: 'torn-write' });
-  assert.equal(r.text, 'line 2\n[… 1 journal event missing (seq 3–3: a torn write) …]\nline 3');
+  assert.equal(r.text, 'line 2\n[… 1 journal event missing (seq 3–3: a crash cut the journal short) …]\nline 3');
   // Two holes: both listed.
   src.journal.append({ type: 'gap', from: 6, to: 9, reason: 'store-error' });
   out(src.journal, 'line 4\r\n');
@@ -337,7 +337,7 @@ test('jr2-11: a torn write or store failure inside the range is a gap in the res
   src.journal.append({ type: 'gap', from: hole, to: hole, reason: 'torn-write' });
   out(src.journal, 'run b\n', 'stdout', 'r1');
   const run = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
-  assert.equal(run.text, `run a\n[… 1 journal event missing (seq ${hole}–${hole}: a torn write) …]\nrun b`);
+  assert.equal(run.text, `run a\n[… 1 journal event missing (seq ${hole}–${hole}: a crash cut the journal short) …]\nrun b`);
   // A gap the Run's events carry for a hole wholly outside the Run is not shown in its text.
   startRun(src.journal, 'r2');
   out(src.journal, 'run c\n', 'stdout', 'r2');
@@ -386,7 +386,7 @@ test('every result reports the holes it spans the same way: events pages and eve
   src.journal.append({ type: 'gap', from: 4, to: 4, reason: 'store-failed' }); // seq 4
   out(src.journal, 'c\r\n'); // seq 5
   const text = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
-  assert.equal(text.text, 'a\n[… 1 journal event missing (seq 2–2: a torn write) …]\nb\n[… 1 journal event missing (seq 4–4: the journal store never took them) …]\nc');
+  assert.equal(text.text, 'a\n[… 1 journal event missing (seq 2–2: a crash cut the journal short) …]\nb\n[… 1 journal event missing (seq 4–4: the journal store never took them) …]\nc');
   const page = await readJournal(src, { since: 0, as: 'events' }, { resultBytes: 16384 });
   assert.deepEqual(page.gap, { from: 2, to: 2, reason: 'torn-write' });
   assert.deepEqual(page.gaps, text.gaps, 'the same holes, reported the same way');
@@ -487,7 +487,7 @@ test('1cabc6a 4: a Run\'s read and search show a hole wherever it lies: at a bat
   for (let i = 0; i < 10; i++) out(edge.journal, `m${i}\n`, 'stdout', 'r1');
   endRun(edge.journal, 'r1');
   const { text, pages } = await readAll(edge, { runId: 'r1', maxBytes: 1024 * 1024 });
-  assert.match(text, /l2047\n\[… 1 journal event missing \(seq \d+–\d+: a torn write\) …\]\nm0\n/);
+  assert.match(text, /l2047\n\[… 1 journal event missing \(seq \d+–\d+: a crash cut the journal short\) …\]\nm0\n/);
   assert.deepEqual(pages.flatMap((p) => (p.gaps ?? (p.gap ? [p.gap] : [])).map((g) => g.from)), [ge]);
   assert.equal((await searchJournal(edge, { pattern: 'zzz', runId: 'r1' })).gap?.from, ge);
   // After the last output, and before the first.
@@ -500,7 +500,7 @@ test('1cabc6a 4: a Run\'s read and search show a hole wherever it lies: at a bat
     endRun(src.journal, 'r1');
     const r = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
     assert.equal(r.gap?.reason, 'torn-write', where);
-    assert.equal(r.text, where === 'before' ? '[… 1 journal event missing (seq 3–3: a torn write) …]\nonly' : 'only\n[… 1 journal event missing (seq 4–4: a torn write) …]', where);
+    assert.equal(r.text, where === 'before' ? '[… 1 journal event missing (seq 3–3: a crash cut the journal short) …]\nonly' : 'only\n[… 1 journal event missing (seq 4–4: a crash cut the journal short) …]', where);
     assert.equal(r.more, false, where);
     assert.equal((await searchJournal(src, { pattern: 'zzz', runId: 'r1' })).gap?.reason, 'torn-write', where);
   }
@@ -514,7 +514,7 @@ test('1cabc6a 4: a Run\'s read and search show a hole wherever it lies: at a bat
   endRun(far.journal, 'r1');
   const r = await readJournal(far, { runId: 'r1' }, { resultBytes: 16384 });
   assert.equal(r.gap?.from, gf);
-  assert.equal(r.text, `a\n[… 1 journal event missing (seq ${gf}–${gf}: a torn write) …]\nb`);
+  assert.equal(r.text, `a\n[… 1 journal event missing (seq ${gf}–${gf}: a crash cut the journal short) …]\nb`);
   assert.equal((await searchJournal(far, { pattern: 'zzz', runId: 'r1' })).gap?.from, gf);
 });
 
@@ -665,7 +665,7 @@ test('ed4ecac 3: output that ends inside a control sequence before a hole hides 
     for (let i = 0; i < 1000; i++) out(many.journal, `after ${i}\r\n`);
     const { text, pages } = await readAll(many, { since: 0 });
     const lines = text.split('\n');
-    assert.deepEqual(lines.slice(0, 4), ['line 1', 'prompt', '[… 1 journal event missing (seq 3–3: a torn write) …]', 'after 0'], JSON.stringify(open));
+    assert.deepEqual(lines.slice(0, 4), ['line 1', 'prompt', '[… 1 journal event missing (seq 3–3: a crash cut the journal short) …]', 'after 0'], JSON.stringify(open));
     assert.equal(lines.length, 1003, JSON.stringify(open));
     assert.deepEqual(pages[0]!.gap, { from: 3, to: 3, reason: 'torn-write' });
     // Two lines after the hole, in a live range: nothing waits for the sequence's end, which is gone.
@@ -675,7 +675,7 @@ test('ed4ecac 3: output that ends inside a control sequence before a hole hides 
     few.journal.append({ type: 'gap', from: 3, to: 3, reason: 'torn-write' });
     out(few.journal, 'a\r\nb\r\n');
     const r = await readJournal(few, { since: 0 }, { resultBytes: 16384 });
-    assert.equal(r.text, 'line 1\nprompt\n[… 1 journal event missing (seq 3–3: a torn write) …]\na\nb', JSON.stringify(open));
+    assert.equal(r.text, 'line 1\nprompt\n[… 1 journal event missing (seq 3–3: a crash cut the journal short) …]\na\nb', JSON.stringify(open));
     assert.deepEqual(r.gap, { from: 3, to: 3, reason: 'torn-write' });
     assert.equal(r.more, false);
     assert.equal(r.nextCursor, 4);

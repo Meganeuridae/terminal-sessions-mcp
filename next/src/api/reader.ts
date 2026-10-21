@@ -40,7 +40,7 @@
  *   (the terminal, concurrent process Runs) is interleaved by whole lines (§6
  *   rule 6), and a page holding more than one source heads each change of
  *   source with a line `[terminal]` or `[run <runId>]`.
- * - Gaps are visible (G11, G19): output lost to retention, a torn write or a
+ * - Gaps are visible (G11, G19): output lost to retention, a crash or a
  *   store failure appears in the text as a `[… N journal events missing …]`
  *   line where it was lost, and in `gap` (and `gaps`, when a page spans more
  *   than one). Every result — text or events, page or tail — reports the holes
@@ -87,7 +87,10 @@ export function describeGap(reason: GapReason): string {
     case 'retention':
       return 'past retention';
     case 'torn-write':
-      return 'a torn write';
+      // A line torn as the daemon died, and, since the journal reserves its numbering, the seqs a machine crash
+      // skipped above the last synced reservation: "a torn write" named only the first (the house's read of the
+      // 33 commits, #22, comment 6307349700).
+      return 'a crash cut the journal short';
     case 'store-error':
       return 'the journal store failed';
     case 'store-failed':

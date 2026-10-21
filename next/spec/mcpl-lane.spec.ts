@@ -1280,7 +1280,7 @@ test('a catch-up summary of omitted messages and gone ranges names them apart, a
     // Each range says why it is gone, in a read's words: every range was called past retention, a failed store's
     // hole and a torn write's too (a reviewer's read of the fixes for #22). The metadata stays two scalars.
     const mixed = summary(t, undefined, [{ from: 6, to: 9, reason: 'retention' }, { from: 10, to: 30, reason: 'store-failed' }, { from: 80, to: 90, reason: 'store-failed' }, { from: 95, to: 96, reason: 'torn-write' }]);
-    assert.match(mixed.head, /^\[terminal\] sm: seq 6–9 \(past retention\), 10–30, 80–90 \(the journal store never took them\), 95–96 \(a torn write\) gone, with whatever happened then · read session=sm since=96 as=events$/);
+    assert.match(mixed.head, /^\[terminal\] sm: seq 6–9 \(past retention\), 10–30, 80–90 \(the journal store never took them\), 95–96 \(a crash cut the journal short\) gone, with whatever happened then · read session=sm since=96 as=events$/);
     assert.deepEqual([mixed.metadata.lostFrom, mixed.metadata.lostTo], [6, 96]);
   } finally {
     lane.dispose();
