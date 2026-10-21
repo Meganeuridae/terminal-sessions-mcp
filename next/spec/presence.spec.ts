@@ -238,3 +238,24 @@ test('services: shown to their owner or the session’s, and an ended one the re
   await app.read(A, { session: 'svc', since: 0 });
   assert.doesNotMatch(P(A, ['svc']), /service job/, 'an ended service the reader has read past');
 });
+
+test("a running Run's time is the session's own count of it, on the monotonic clock: a wall-clock step does not change it (the house's read of the 33 commits, #22 comment 6307350861)", async (t) => {
+  await app.sessionOpen(A, { id: 'pw' });
+  const s = live('pw');
+  const proc = await app.run(A, { session: 'pw', command: 'sleep 20', target: 'process', wait: 0 });
+  const shell = await app.run(A, { session: 'pw', command: 'sleep 20', wait: 0 });
+  try {
+    await until(() => s.run(proc.runId!).state === 'running' && s.run(shell.runId!).state === 'running', 5000, 'both Runs running');
+    // The wall clock steps two minutes forward: timed against it, both Runs read 2m0s.
+    const real = Date.now.bind(Date);
+    t.mock.method(Date, 'now', () => real() + 120_000);
+    const text = P(A, ['pw']);
+    t.mock.restoreAll();
+    assert.match(text, /running `sleep 20` [0-9]s \(cwd /, text);
+    assert.match(text, /running `sleep 20` [0-9]s \(process\)/, text);
+    assert.doesNotMatch(text, /\dm\d+s/, text);
+  } finally {
+    await app.cancel(A, { runId: proc.runId! });
+    await app.cancel(A, { runId: shell.runId! });
+  }
+});

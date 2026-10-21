@@ -297,7 +297,7 @@ export class McplLane {
    * that ended during it, and the opener never heard of it (the house's read of 78c4d6e, #22).
    */
   private readonly opening = new Map<string, Opening>();
-  /** How many closes each channel has had on this connection: an open that saw the count change during its history read leaves the channel closed (see `closeChannel`). */
+  /** How many closes each channel open or opening has had on this connection: an open that saw the count change during its history read leaves the channel closed (see `closeChannel`). */
   private readonly closes = new Map<string, number>();
   private readonly registered = new Set<string>();
   /** Session id → the life followed, its segmenter, and the subscriptions. */
@@ -594,7 +594,7 @@ export class McplLane {
     channelId?: string;
     history?: { limit?: number; beforeMessageId?: string };
   }): Promise<{ channel: ChannelDescriptor; history?: IncomingMessage[]; historyTruncated?: boolean }> {
-    if (!this.has('channels.lifecycle')) throw new RpcError(CAPABILITY_DENIED, 'channels.lifecycle not granted', { capability: 'channels.lifecycle' });
+    this.mayChangeChannels();
     const sid = params.address?.session ?? (params.channelId ? sessionOf(params.channelId) : undefined);
     if (!sid) throw new RpcError(UNKNOWN_CHANNEL, 'channels/open needs address.session or channelId');
     const id = channelId(sid);
@@ -633,11 +633,12 @@ export class McplLane {
         const r = await replayNewest(this.sourceOf(s), before !== undefined ? { limit, before } : { limit });
         // The connection closed during the read: nothing is registered or followed (a subscription
         // nothing would remove), and the open is answered with an error, should anything still carry
-        // it (the house's read of 78c4d6e, #22).
-        if (this.disposed) throw new RpcError(INTERNAL, 'the connection closed while the channel history was read; nothing was opened');
-        // The session the open began on is gone or replaced: a forgotten name's channel was opened
-        // for nobody, and a name re-created meanwhile found its channel open (the reviewer's read above).
-        if (this.app.registry.get(sid) !== s) throw new RpcError(UNKNOWN_CHANNEL, `session ${sid} was closed or replaced while its history was read; nothing was opened`, { channelId: id });
+        // it (the house's read of 78c4d6e, #22). The session the open began on is gone or replaced: a
+        // forgotten name's channel was opened for nobody, and a name re-created meanwhile found its
+        // channel open (the reviewer's read above). A grant update that revoked channels.lifecycle
+        // during the read still had the channel opened (the house's read of the 33 commits (PR #22,
+        // comment 6307350861)).
+        this.recheck(sid, s, id, "the channel's history was read", 'opened', () => this.mayChangeChannels());
         res.history = r.segments.map((seg) => this.message(t, seg));
         if (r.truncated) res.historyTruncated = true;
         // The host closed the channel during the read (see `closeChannel`): the close stands, whether
@@ -708,21 +709,47 @@ export class McplLane {
   }
 
   closeChannel(id: string): { closed: boolean } {
-    // §14.1: lifecycle methods need channels.lifecycle, close as much as open (the house's review of #11).
-    if (!this.has('channels.lifecycle')) throw new RpcError(CAPABILITY_DENIED, 'channels.lifecycle not granted', { capability: 'channels.lifecycle' });
+    this.mayChangeChannels();
     // A close while the channel's history is read stands: the opening is abandoned, what it held goes
     // a closed channel's way, and the open leaves the channel closed when its read returns. Answered
     // from `open` alone, the close said false and the returning open undid it, while the host kept the
     // close as standing, so a reconnect dropped a channel this connection still delivered on (the house's read of the 38 commits (PR #22, comment 6274370651)).
     // Every open whose read is under way sees the close by the count, an open channel's page read too.
-    this.closes.set(id, (this.closes.get(id) ?? 0) + 1);
+    // Such a read's channel is open or opening until a close, so only those are counted: counted for any
+    // id, a close naming no session stayed in the map for the connection's life (the house's read of the
+    // 33 commits (PR #22, comment 6307350861)).
     const p = this.opening.get(id);
+    if (p || this.open.has(id)) this.closes.set(id, (this.closes.get(id) ?? 0) + 1);
     if (p) {
       this.opening.delete(id);
       for (const h of p.held.values()) this.deliver(h.t, h.seg, { released: true });
     }
     const wasOpen = this.open.delete(id);
     return { closed: wasOpen || p !== undefined };
+  }
+
+  /** §14.1: the lifecycle methods need channels.lifecycle, close as much as open (the house's review of #11). */
+  private mayChangeChannels(): void {
+    if (!this.has('channels.lifecycle')) throw new RpcError(CAPABILITY_DENIED, 'channels.lifecycle not granted', { capability: 'channels.lifecycle' });
+  }
+
+  /** What a note on a channel needs of the grant. */
+  private mayPublish(channelId: string): void {
+    if (!this.has('channels.publish')) throw new RpcError(CAPABILITY_DENIED, 'channels.publish not granted', { capability: 'channels.publish' });
+    if (!this.enabledFeatureSets.has('terminal.annotate')) throw new RpcError(CHANNEL_NOT_PERMITTED, 'terminal.annotate is not enabled', { channelId });
+  }
+
+  /**
+   * What a channel method checked before an await, checked again after it, since the server runs a
+   * connection's requests concurrently: the connection may have closed, a featureSets/update changed
+   * the grant (`grant` checks it), the session been closed or its name re-created, or the principal
+   * lost sight of it. Any of these refuses the method with nothing done.
+   */
+  private recheck(sid: string, s: AnySession, channel: string, during: string, done: string, grant: () => void): void {
+    if (this.disposed) throw new RpcError(INTERNAL, `the connection closed while ${during}; nothing was ${done}`);
+    grant();
+    if (this.app.registry.get(sid) !== s) throw new RpcError(UNKNOWN_CHANNEL, `session ${sid} was closed or replaced while ${during}; nothing was ${done}`, { channelId: channel });
+    if (!this.app.can(this.me, s, 'observe')) throw new RpcError(UNKNOWN_CHANNEL, `unknown channel ${channel}`, { channelId: channel });
   }
 
   private attach(session: Session): void {
@@ -741,8 +768,7 @@ export class McplLane {
    * (mcpl-5, G17, G21).
    */
   async publish(params: { channelId: string; content?: Array<{ type: string; text?: string }> }): Promise<{ delivered: boolean; messageId?: string }> {
-    if (!this.has('channels.publish')) throw new RpcError(CAPABILITY_DENIED, 'channels.publish not granted', { capability: 'channels.publish' });
-    if (!this.enabledFeatureSets.has('terminal.annotate')) throw new RpcError(CHANNEL_NOT_PERMITTED, 'terminal.annotate is not enabled', { channelId: params.channelId });
+    this.mayPublish(params.channelId);
     const sid = sessionOf(params.channelId);
     const s = sid !== undefined ? this.app.registry.get(sid) : undefined;
     if (!sid || !s || !this.app.can(this.me, s, 'observe')) throw new RpcError(UNKNOWN_CHANNEL, `unknown channel ${params.channelId}`, { channelId: params.channelId });
@@ -768,7 +794,13 @@ export class McplLane {
       budget = this.budgetOf(journal);
       // After a daemon restart the budget starts empty while the journal still holds every note it kept.
       capped = Number.isFinite(retention);
-      if (capped) await budget.seed(journal);
+      if (capped) {
+        await budget.seed(journal);
+        // The first seed reads the journal's notes in pages and yields between them: a grant update, or a
+        // close and re-creation of the name, landing meanwhile had the note go out under a revoked grant
+        // or into the name's next life (the house's read of the 33 commits (PR #22, comment 6307350861)).
+        this.recheck(sid, s, params.channelId, "the session's notes were counted", 'published', () => this.mayPublish(params.channelId));
+      }
       const refused = budget.take(this.me, stored, journal, retention, clocks.monotonic());
       if (refused) throw new RpcError(OVERLOADED, refused.message, { channelId: params.channelId, retryAfterMs: refused.retryAfterMs });
     }

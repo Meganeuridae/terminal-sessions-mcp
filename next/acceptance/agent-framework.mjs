@@ -171,8 +171,10 @@ try {
     assert.equal(registry.get(SESSION).session.run(runId).state, 'running', 'the Run was in flight across the drop');
   });
   // Shown or failed, the Run is released now, so the checks after this one see it end. A completion
-  // that falls inside the disconnect is not staged here: mcpl-lane.spec's reconnect cases (mcpl-7,
-  // mcpl-8, m2-18, the channels-only host) cover it.
+  // that falls inside the disconnect is not staged here: mcpl-lane.spec stages it in mcpl-8 (the
+  // connection drops while a completion settles, and the new one gets it once) and in the
+  // channels-only host's reconnect (a completion nothing could carry while the host was away,
+  // delivered when the new connection opens the channel).
   fs.writeFileSync(released, '');
 
   await check('a useful completion notification through the host, and the inference call it woke', async () => {

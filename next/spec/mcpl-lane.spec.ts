@@ -1364,8 +1364,11 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     registered: Set<string>;
     watched: Map<string, unknown>;
     states: Map<string, { owed: Set<number>; retries: Map<string, unknown> }>;
+    closes: Map<string, number>;
+    batch: unknown[];
+    flush(): Promise<void>;
     startCatchUp(sessions: string[]): Promise<void>;
-    budgetOf(journal: Journal): { retained: unknown[] };
+    budgetOf(journal: Journal): { retained: unknown[]; seed(journal: Journal): Promise<void> };
     deliver(t: Session, seg: unknown, opts: { released: true }): void;
   };
   /** A Run whose outcome counts as returned by its call: once settled, nothing of it is held or owed. */
@@ -1508,11 +1511,16 @@ test("a close sent while the channel's history is read stands: it answers closed
     const hold = holdTranscripts(s, one);
     const opening = f.lane.handle('channels/open', { channelId: 'terminal:cm', history: { limit: 5 } }, f.ctx) as Promise<{ history?: unknown[] }>;
     await hold.reached;
-    s.journal.append({ type: 'control', controller: null, by: A, how: 'release' }); // a message for the opening channel
+    const seat = s.journal.append({ type: 'control', controller: null, by: A, how: 'release' }); // a message for the opening channel
     await until(() => (f.inside.opening.get('terminal:cm')?.held.size ?? 0) >= 1, 3000, 'the seat change held for the opening channel');
+    assert.ok(s.cursorsOf(A).delivered < seat.seq, 'held, the seat change is not yet settled');
     const closed = await f.lane.handle('channels/close', { channelId: 'terminal:cm' }, f.ctx);
     assert.deepEqual(closed, { closed: true });
     assert.equal(f.inside.opening.size, 0, 'the opening is abandoned');
+    // What it held went a closed channel's way: a seat change is no lifecycle message, so it is settled as
+    // owed to nobody here, and the cursor passes it. Dropped with the opening, it was never settled (the
+    // house's read of the 33 commits, #22 comment 6307350861: the test passed with the release removed).
+    await until(() => s.cursorsOf(A).delivered >= seat.seq, 3000, 'the held seat change settled as not owed');
     hold.release();
     const res = await opening;
     hold.restore();
@@ -1665,6 +1673,130 @@ test('without a byte cap the note budget keeps no sizes, only the rates apply; u
     for (let i = 0; i < 2; i++) await publish('terminal:nc', `note ${i}`);
     assert.equal(kept('nc'), 2, 'a cap: each retained note counts');
   } finally {
+    await f.close();
+  }
+});
+
+// ───────────── the house's read of the 33 commits (PR #22, comment 6307350861) ─────────────
+
+test("a note whose publish waits on the note budget's first count is refused when the grant is revoked or the name re-created meanwhile, and nothing is noted", { timeout: 20_000 }, async () => {
+  // publish checked the grant and the session, awaited the budget's seed, then noted by the session's name:
+  // a featureSets/update landing during the read had the note go out under a revoked grant, and a close and
+  // re-creation of the name put it into the name's next life.
+  const f = await bareLane('c-publish-await');
+  try {
+    const publish = (text: string) => f.lane.handle('channels/publish', { channelId: 'terminal:pa', content: [{ type: 'text', text }] }, f.ctx);
+    const notes = (s: Session) => s.journal.since(0).events.flatMap((e) => (e.type === 'note' ? [e.text] : []));
+    const retention = { maxBytes: 64 * 1024 }; // a byte cap: the budget counts the journal's notes first
+    await f.app.sessionOpen(f.caller, { id: 'pa', visibility: 'shared', retention });
+    const old = live(f.registry, 'pa');
+    // The update is handled while the publish waits on its count (the call runs to its first await).
+    const revoked = publish('under a revoked grant');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'channels.publish') }, f.ctx);
+    await assert.rejects(revoked, (e: Error & { code?: number }) => e.code === -32002 && /channels\.publish not granted/.test(e.message));
+    assert.deepEqual(notes(old), [], 'nothing noted under the revoked grant');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    const disabled = publish('with terminal.annotate disabled');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT, enabled: ['terminal.live', 'terminal.channels'] }, f.ctx);
+    await assert.rejects(disabled, (e: Error & { code?: number }) => e.code === -32017 && /terminal\.annotate is not enabled/.test(e.message));
+    assert.deepEqual(notes(old), []);
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    // The name forgotten and re-created while the count is read (held here until the new life exists).
+    const budget = f.inside.budgetOf(old.journal);
+    let release = () => undefined as void;
+    const gate = new Promise<void>((r) => (release = r));
+    const seed = budget.seed.bind(budget);
+    budget.seed = async (j) => {
+      await gate;
+      return seed(j);
+    };
+    const moved = publish('into the next life');
+    await f.app.sessionClose(f.caller, { session: 'pa', forget: true });
+    await f.app.sessionOpen(f.caller, { id: 'pa', visibility: 'shared', retention });
+    release();
+    await assert.rejects(moved, (e: Error & { code?: number }) => e.code === -32023 && /session pa was closed or replaced while the session's notes were counted; nothing was published/.test(e.message));
+    assert.deepEqual(notes(live(f.registry, 'pa')), [], "nothing noted in the name's next life");
+    assert.deepEqual(notes(old), []);
+    // And with nothing changed, the same publish goes in.
+    assert.equal(((await publish('a note')) as { delivered: boolean }).delivered, true);
+    assert.deepEqual(notes(live(f.registry, 'pa')), ['a note']);
+  } finally {
+    await f.close();
+  }
+});
+
+test("an open whose history read sees the grant revoked opens nothing", { timeout: 20_000 }, async () => {
+  // openChannel re-checked the disposal state and the session after its read, not the grant.
+  const f = await bareLane('c-open-revoked');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'or2', visibility: 'shared' });
+    const one = await f.settledRun('or2', 'echo one');
+    const s = live(f.registry, 'or2');
+    const hold = holdTranscripts(s, one);
+    const opening = f.lane.handle('channels/open', { channelId: 'terminal:or2', history: { limit: 5 } }, f.ctx);
+    await hold.reached;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'channels.lifecycle') }, f.ctx);
+    hold.release();
+    await assert.rejects(opening, (e: Error & { code?: number }) => e.code === -32002 && /channels\.lifecycle not granted/.test(e.message));
+    hold.restore();
+    assert.equal(f.inside.open.has('terminal:or2'), false, 'not open');
+    assert.equal(f.inside.opening.size, 0, 'nothing left opening');
+  } finally {
+    await f.close();
+  }
+});
+
+test('a close counts only for a channel open or opening: closes naming channels that are neither leave nothing behind', async () => {
+  // Every close was counted, known channel or not, and an entry went only when its session closed.
+  const f = await bareLane('c-close-count');
+  try {
+    for (let i = 0; i < 50; i++) assert.deepEqual(await f.lane.handle('channels/close', { channelId: `terminal:nobody-${i}` }, f.ctx), { closed: false });
+    await f.app.sessionOpen(f.caller, { id: 'cc', visibility: 'shared' });
+    await f.lane.handle('channels/close', { channelId: 'terminal:cc' }, f.ctx); // a session's, but not open
+    assert.equal(f.inside.closes.size, 0, 'nothing counted');
+    await f.lane.handle('channels/open', { channelId: 'terminal:cc' }, f.ctx);
+    assert.deepEqual(await f.lane.handle('channels/close', { channelId: 'terminal:cc' }, f.ctx), { closed: true });
+    assert.equal(f.inside.closes.get('terminal:cc'), 1, 'an open channel\'s close is counted, for a read that may be under way');
+  } finally {
+    await f.close();
+  }
+});
+
+test("a batch queued for a forgotten life's open channel never goes on the channel of the life re-created under the name", { timeout: 20_000 }, async () => {
+  // flush re-routes what no longer may go on a channel; only its lineage check stops a message the old life
+  // queued before the name was forgotten and re-created, the channel still open (the endpoint's removal
+  // not yet landed), from going out on the new life's channel. All the lane tests passed without it.
+  const f = await bareLane('c-batch-lineage', { removals: 'manual' });
+  const lane = f.inside;
+  const flush = lane.flush.bind(f.lane);
+  let release = () => undefined as void;
+  const gate = new Promise<void>((r) => (release = r));
+  let flushed = false;
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'bl', visibility: 'shared' });
+    await f.lane.handle('channels/open', { channelId: 'terminal:bl' }, f.ctx);
+    const old = live(f.registry, 'bl');
+    lane.flush = async () => {
+      await gate;
+      await flush();
+      flushed = true;
+    };
+    old.journal.append({ type: 'control', controller: null, by: A, how: 'release' }); // the old life's message
+    await until(() => lane.batch.length >= 1, 3000, "the old life's seat change queued for the open channel");
+    await f.app.sessionClose(f.caller, { session: 'bl', forget: true });
+    await until(() => f.removed.includes('bl'), 3000, 'the name forgotten');
+    await f.app.sessionOpen(f.caller, { id: 'bl', visibility: 'shared' });
+    assert.equal(lane.open.has('terminal:bl'), true, 'the channel is still open: the removal has not landed');
+    release();
+    await until(() => flushed, 3000, 'the batch flushed');
+    const ids = f.sent
+      .filter((m) => m.method === 'channels/incoming')
+      .flatMap((m) => (m.params as { messages: Array<{ messageId: string }> }).messages)
+      .map((x) => x.messageId);
+    assert.deepEqual(ids.filter((id) => id.includes(`~${old.journal.epoch}:`)), [], `nothing of the forgotten life on the channel: ${ids.join(', ')}`);
+  } finally {
+    release();
+    lane.flush = flush;
     await f.close();
   }
 });

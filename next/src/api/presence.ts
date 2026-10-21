@@ -59,7 +59,7 @@ function scanUnread(journal: Journal, read: Seq, principal: Principal): { bytes:
   return { bytes, humanTyped, bounded };
 }
 
-function lineFor(app: App, s: AnySession, principal: Principal, now: number): { text: string; quiet: boolean } | undefined {
+function lineFor(app: App, s: AnySession, principal: Principal): { text: string; quiet: boolean } | undefined {
   const t = s.kind === 'live' ? s.session : s;
   const { id, journal } = t;
   const read = t.cursorsOf(principal).read;
@@ -82,6 +82,10 @@ function lineFor(app: App, s: AnySession, principal: Principal, now: number): { 
   }
 
   const session = s.session;
+  // How long a Run has run, by the session's one rule for a Run's duration: on the wall clock, a step
+  // made presence say a Run had run for minutes, or 0s, beside its result's own count (the house's read
+  // of the 33 commits (PR #22, comment 6307350861)). Every running Run is one the session holds.
+  const ran = (r: RunInfo) => dur(session.runDurationMs(r.runId) ?? 0);
   const info = session.info();
   const current = info.currentRun ? runs.find((r) => r.runId === info.currentRun) : undefined;
   const shellBusy = current !== undefined && running(current);
@@ -92,14 +96,14 @@ function lineFor(app: App, s: AnySession, principal: Principal, now: number): { 
   const front = declared.at(-1);
   const enclosing = front?.within ? runs.find((r) => r.runId === front.within) : undefined;
   if (session.exit !== undefined) bits.push('shell exited');
-  else if (front) bits.push(`running \`${describe(front)}\` ${dur(now - (front.startedAt ?? front.admittedAt))} in the declared ${front.shell} shell${enclosing ? ` (inside \`${describe(enclosing)}\`)` : ''}`);
-  else if (shellBusy) bits.push(`${info.state === 'tui' ? 'full-screen' : 'running'} \`${describe(current)}\` ${dur(now - (current.startedAt ?? current.admittedAt))} (cwd ${info.cwd})${info.declared ? `, a declared ${info.declared.shell} shell at its prompt` : ''}`);
+  else if (front) bits.push(`running \`${describe(front)}\` ${ran(front)} in the declared ${front.shell} shell${enclosing ? ` (inside \`${describe(enclosing)}\`)` : ''}`);
+  else if (shellBusy) bits.push(`${info.state === 'tui' ? 'full-screen' : 'running'} \`${describe(current)}\` ${ran(current)} (cwd ${info.cwd})${info.declared ? `, a declared ${info.declared.shell} shell at its prompt` : ''}`);
   else bits.push(`${info.state} (cwd ${info.cwd})${info.declared ? `, a declared ${info.declared.shell} shell in front` : ''}`);
 
   // Process Runs never make the shell busy (§4), so they get their own bit (m2-7).
   const procs = runs.filter((r) => r.target === 'process' && running(r));
   const mine = procs.filter((r) => r.principal === principal);
-  for (const r of mine.slice(0, 2)) bits.push(`running \`${describe(r)}\` ${dur(now - (r.startedAt ?? r.admittedAt))} (process)`);
+  for (const r of mine.slice(0, 2)) bits.push(`running \`${describe(r)}\` ${ran(r)} (process)`);
   if (mine.length > 2) bits.push(`${mine.length - 2} more process runs of yours`);
   if (procs.length > mine.length) bits.push(`${procs.length - mine.length} process run${procs.length - mine.length > 1 ? 's' : ''} by others`);
 
@@ -138,13 +142,13 @@ function pushEnded(bits: string[], ended: RunInfo[], principal: Principal): void
 }
 
 /** The presence block for `principal`, covering `sessionIds`; undefined when there is nothing to say. */
-export function presence(app: App, principal: Principal, sessionIds: Iterable<string>, now = Date.now()): string | undefined {
+export function presence(app: App, principal: Principal, sessionIds: Iterable<string>): string | undefined {
   const lines: string[] = [];
   const quiet: string[] = [];
   for (const id of sessionIds) {
     const s = app.registry.get(id);
     if (!s || !app.can(principal, s, 'observe')) continue;
-    const l = lineFor(app, s, principal, now);
+    const l = lineFor(app, s, principal);
     if (!l) continue;
     if (l.quiet) quiet.push(s.kind === 'live' ? s.session.id : s.id);
     else lines.push(l.text);
