@@ -15,7 +15,7 @@ import { Journal } from '../src/core/journal.js';
 import { cannotSyncDir, FileStore, MemoryStore, writeDurably } from '../src/core/stores.js';
 
 /** node:fs as stores.js sees it: a patch here plus syncBuiltinESMExports reaches its `import * as fs` bindings. */
-const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync };
+const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync; renameSync: typeof fs.renameSync };
 /** A directory fsync that fails with EIO while `fn` runs (file fsyncs still work). */
 function withDirFsyncEIO<T>(fn: () => T): T {
   const real = fsc.fsyncSync;
@@ -343,7 +343,7 @@ test('writeDurably tells "written, directory not synced" (a real EIO after the r
   }
 });
 
-test('item 7: with the directory fsync failing, clearing the high water counts as done (a crash can only bring back the older, higher reservation) and raising it does not (the house\'s read of the 38 commits, #22)', () => {
+test('with the directory fsync failing, clearing the high water counts as done (a crash can only bring back the older, higher reservation) and raising it does not (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 7)', () => {
   const dir = tmpDir();
   try {
     const store = new FileStore(dir);
@@ -358,6 +358,49 @@ test('item 7: with the directory fsync failing, clearing the high water counts a
     assert.equal(store.setHighWater(50, true), true, 'the retry lands once the directory syncs again');
     assert.deepEqual(store.highWater(), { seq: 50, failed: true });
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a new epoch the file holds while its directory cannot be synced counts as written: appends do not rewrite it, and the store says so once; a refused write stays pending until an append lands it (a reviewer\'s read of the fixes for #22, comment 6274603516)', () => {
+  const dir = tmpDir();
+  const realRename = fsc.renameSync;
+  let metaRenames = 0;
+  fsc.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+    if (String(to).endsWith('journal.meta.json')) metaRenames++;
+    return realRename(from, to);
+  }) as typeof fs.renameSync;
+  syncBuiltinESMExports();
+  try {
+    const warnings: string[] = [];
+    const store = withDirFsyncEIO(() => {
+      const st = new FileStore(path.join(dir, 'a'), { log: (_level, text) => void warnings.push(text) });
+      for (let seq = 1; seq <= 200; seq++) st.append({ ...out(`x${seq}`), seq, ts: Date.now() } as JournalEvent);
+      return st;
+    });
+    // Kept pending, the meta was renamed and its directory fsynced again at every one of the 200 appends.
+    assert.equal(metaRenames, 1, 'written once, at the epoch\'s creation');
+    assert.equal(warnings.filter((w) => /journal\.meta\.json\) is written but its directory could not be synced: EIO/.test(w)).length, 1, JSON.stringify(warnings));
+    assert.equal(warnings.length, 1, 'said once');
+    store.close();
+    assert.equal(new FileStore(path.join(dir, 'a')).epoch(), store.epoch(), 'the file holds the epoch');
+    // A write the disk refused is still pending: the next append writes it.
+    metaRenames = 0;
+    fsc.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+      if (String(to).endsWith('journal.meta.json')) throw Object.assign(new Error('EIO: i/o error, rename'), { code: 'EIO' });
+      return realRename(from, to);
+    }) as typeof fs.renameSync;
+    syncBuiltinESMExports();
+    const refused = new FileStore(path.join(dir, 'b'));
+    assert.equal(fs.existsSync(path.join(dir, 'b', 'journal.meta.json')), false, 'refused');
+    fsc.renameSync = realRename;
+    syncBuiltinESMExports();
+    refused.append({ ...out('y'), seq: 1, ts: Date.now() } as JournalEvent);
+    assert.equal(new FileStore(path.join(dir, 'b')).epoch(), refused.epoch(), 'the append landed the pending epoch');
+    refused.close();
+  } finally {
+    fsc.renameSync = realRename;
+    syncBuiltinESMExports();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

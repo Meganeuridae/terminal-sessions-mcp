@@ -673,7 +673,7 @@ test('G19: one unreadable session directory does not keep the registry from star
   await cleanup(r2, r);
 });
 
-test('item 8: cursors written while their directory cannot be synced are logged once, not rewritten forever — the file holds them (the house\'s read of the 38 commits, #22)', async () => {
+test('cursors written while their directory cannot be synced are logged once, not rewritten forever — the file holds them (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 8)', async () => {
   const r = rig();
   const s = (await r.reg.ensure({ id: 'cur', owner: A })).session;
   await run(s, A, 'echo one');
@@ -701,6 +701,35 @@ test('item 8: cursors written while their directory cannot be synced are logged 
   assert.equal(readOf(), 6, 'a later change is still written');
   assert.equal(said(), 1, 'but the failure is said once, and nothing is rewritten in a loop');
   await cleanup(r2, r);
+});
+
+test('a session record written while its directory cannot be synced is said once per name, like the cursors and the lock, not at every write (a reviewer\'s read of the fixes for #22, comment 6274603516)', async () => {
+  const warnings: string[] = [];
+  const { backend, shells } = scripted();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-registry-'));
+  const reg = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), log: (level, text, fields) => void (level === 'warn' && warnings.push(`${String(fields?.['session'])}: ${text}`)) });
+  const r: Rig = { dir, backend, shells, reg, changes: [] };
+  const real = fsc.fsyncSync;
+  fsc.fsyncSync = ((fd: number) => {
+    if (fsc.fstatSync(fd).isDirectory()) throw Object.assign(new Error('EIO: i/o error, fsync'), { code: 'EIO' });
+    return real(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  try {
+    // A new name's record before its start; its closedAt at the close; a new life's record before and after its start.
+    await reg.ensure({ id: 'rec', owner: A });
+    await reg.close('rec');
+    await reg.ensure({ id: 'rec', owner: A });
+    await reg.ensure({ id: 'other', owner: A });
+  } finally {
+    fsc.fsyncSync = real;
+    syncBuiltinESMExports();
+  }
+  const said = (id: string) => warnings.filter((w) => w.startsWith(`${id}: the session record is written but its directory could not be synced: EIO`)).length;
+  assert.equal(said('rec'), 1, JSON.stringify(warnings));
+  assert.equal(said('other'), 1, 'once per name');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'sessions', 'rec', 'session.json'), 'utf8')).owner, A, 'the record stands');
+  await cleanup(r);
 });
 
 test('G18/G20: while a reopen starts, the record on disk is the new life\'s under the old retention; a failed start puts the old record back, and a start that succeeds takes the new retention (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 6)', async () => {

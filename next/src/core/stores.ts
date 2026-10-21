@@ -98,8 +98,9 @@ export interface MemoryStoreOptions {
 /**
  * Write `text` through a temp file beside `file`, synced to disk, then renamed over it, with the
  * directory synced too: after a crash of the process or the machine the file is the old one or the
- * new one, never torn or missing (the house's read of 2c35df8, #22). Owner-only (G26). The session records, the store's own
- * metadata and the lock file are all written this way.
+ * new one, never torn or missing (the house's read of 2c35df8, #22). Owner-only (G26). The session
+ * records, the cursors and the store's own metadata are written this way. The lock is not: it is
+ * written to a synced temp and linked into place (lock.ts), and shares only the directory sync below.
  */
 export function writeDurably(file: string, text: string): DurableWrite {
   const tmp = `${file}.${process.pid}.tmp`;
@@ -331,6 +332,8 @@ export interface FileStoreOptions {
   floor?: DiskFloor;
   /** Retained bytes on disk, active file included (G21). Default: no limit. */
   maxBytes?: number;
+  /** Where the store says, once, that its metadata is written but its directory could not be synced. */
+  log?: ((level: 'warn', text: string) => void) | undefined;
   /**
    * Rotated files whose newest event is older than this are dropped (G21). Default: no limit.
    * Age applies per file: the active file is rotated once its oldest event is past the
@@ -443,8 +446,18 @@ export class FileStore implements JournalStore {
   private dirty = false;
   private tornEvent = false;
   private meta: StoreMeta;
-  /** The epoch's first write was refused (a disk refusing writes): retried after the next successful append. */
+  /**
+   * The epoch's first write was refused (a disk refusing writes): retried after the next successful
+   * append. Only a refused write: one the file holds while its directory could not be synced counts as
+   * written, since a crash that loses it only gives the journal a new epoch at the next open, which is
+   * what an absent file does anyway. Kept pending, it was rewritten (a rename and a directory fsync)
+   * on every append while the fsync kept failing (a reviewer's read of the fixes for #22 comment
+   * 6274603516).
+   */
   private metaPending = false;
+  /** A metadata write the file holds but whose directory could not be synced has been said once. */
+  private syncWarned = false;
+  private readonly log: FileStoreOptions['log'];
   /** A rotation header the disk refused: written before the new file's first event (the house's read of b047b92, point 4). */
   private headerPending: Buffer | undefined;
   /** Bytes read from disk by reads and scans (observability; the tests bound it). */
@@ -458,6 +471,7 @@ export class FileStore implements JournalStore {
     this.now = opts.now ?? Date.now;
     this.fixedFileBytes = opts.maxFileBytes;
     this.floor = opts.floor;
+    this.log = opts.log;
     // The journal holds whatever programs printed: private to the daemon's user (G26).
     fs.mkdirSync(dir, { recursive: true, mode: DIR_MODE });
     try {
@@ -488,18 +502,27 @@ export class FileStore implements JournalStore {
       // absent (a new journal, or one an older build wrote) or damaged: a new epoch
     }
     const meta: StoreMeta = { v: 1, epoch: newEpoch() };
-    this.metaPending = this.writeMeta(meta) !== 'written';
+    this.metaPending = this.writeMeta(meta) === 'failed';
     return meta;
   }
 
-  /** Atomically and privately (G26); false when the disk refuses. */
-  /** `written` (durable), `unsynced` (the file holds it, the directory fsync failed) or `failed` (nothing changed on disk). */
+  /**
+   * Atomically and privately (G26): `written` (durable), `unsynced` (the file holds it, the directory
+   * fsync failed: said once, like the cursors and the lock) or `failed` (nothing changed on disk).
+   */
   private writeMeta(meta: StoreMeta): 'written' | 'unsynced' | 'failed' {
+    let w: DurableWrite;
     try {
-      return writeDurably(path.join(this.dir, META), JSON.stringify(meta) + '\n').synced ? 'written' : 'unsynced';
+      w = writeDurably(path.join(this.dir, META), JSON.stringify(meta) + '\n');
     } catch {
       return 'failed';
     }
+    if (w.synced) return 'written';
+    if (!this.syncWarned) {
+      this.syncWarned = true;
+      this.log?.('warn', `the journal's metadata (${META}) is written but its directory could not be synced: ${w.error?.message ?? 'unknown error'}; a crash may undo the write`);
+    }
+    return 'unsynced';
   }
 
   epoch(): string {
@@ -521,6 +544,7 @@ export class FileStore implements JournalStore {
     // to keep, and a refused reservation is never written later as if its seqs had been issued.
     const w = this.writeMeta(meta);
     if (w === 'failed') return false;
+    this.metaPending = false; // the file holds this epoch now, whatever becomes of the mark
     // The file holds the new mark but its directory could not be synced, so a machine crash may bring the
     // old file back. For a clear or a lower mark that is done: the crash can only restore the older,
     // higher reservation, which is safe. For a raise (a higher mark, or a reservation newly marked failed)
@@ -762,7 +786,7 @@ export class FileStore implements JournalStore {
     seg.firstTs ??= event.ts;
     seg.last = event.seq;
     seg.lastTs = event.ts;
-    if (this.metaPending) this.metaPending = this.writeMeta(this.meta) !== 'written';
+    if (this.metaPending) this.metaPending = this.writeMeta(this.meta) === 'failed';
   }
 
   private write(buf: Buffer): void {

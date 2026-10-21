@@ -384,6 +384,8 @@ export class SessionRegistry {
   private readonly listeners = new Set<(c: RegistryChange) => void>();
   /** The data dir's lock while this registry holds it (jr2-2). */
   private dirLock: DataDirLock | undefined;
+  /** Names whose record was written while its directory could not be synced, said once per name (noteUnsynced). */
+  private readonly recordSyncSaid = new Set<string>();
   /** Session directories recovery could not read at startup (skipped, left on disk). */
   readonly recoveryErrors: Array<{ id: string; error: string }> = [];
 
@@ -492,7 +494,7 @@ export class SessionRegistry {
     // retention is applied once a valid record reads (rereadRecord / newLife). The house's read of the
     // 36 commits, #22 (comment 6269992150): the default pruned before finishRecovery refused the name.
     const retention = recordRefusal(id, meta) ? {} : this.retentionFor(undefined, meta.retention);
-    const store = new FileStore(dir, this.storeOptions(retention));
+    const store = new FileStore(dir, this.storeOptions(id, retention));
     const gone = expired(store, retention, Date.now());
     // The last event the dead daemon wrote, read before the journal opens: opening a journal over a torn
     // last line (or a failed high water) appends a gap stamped with this recovery's time, and read after
@@ -826,7 +828,7 @@ export class SessionRegistry {
       // fallback opened with was applied at once, before the refusal (the house's read of the 38 commits,
       // PR #22, comment 6274857431, item 7). With no history there is nothing to keep, and the default applies.
       const refusal = recordRefusal(id, recorded);
-      store = new FileStore(dir, this.storeOptions(refusal ? {} : before));
+      store = new FileStore(dir, this.storeOptions(id, refusal ? {} : before));
       // A journal this registry did not surface (recovery could not read it): its owner stands (G18),
       // and a record that cannot be read, or is not there, names none.
       if (store.lastSeq() === undefined) {
@@ -953,9 +955,15 @@ export class SessionRegistry {
     return session;
   }
 
-  /** A record that is written but whose directory could not be synced (a real fsync error): the record stands; said in the log (comment 6274603516). */
+  /**
+   * A record that is written but whose directory could not be synced (a real fsync error): the record
+   * stands; said in the log once per name, as the cursors and the lock are, not at every write (comment
+   * 6274603516; a reviewer's read of the fixes for #22).
+   */
   private noteUnsynced(id: string, w: DurableWrite): void {
-    if (!w.synced) this.opts.log?.('warn', `the session record is written but its directory could not be synced: ${w.error?.message ?? 'unknown error'}`, { session: id });
+    if (w.synced || this.recordSyncSaid.has(id)) return;
+    this.recordSyncSaid.add(id);
+    this.opts.log?.('warn', `the session record is written but its directory could not be synced: ${w.error?.message ?? 'unknown error'}`, { session: id });
   }
 
   /** Requested over recorded over daemon defaults, for every creation option (ux-4). */
@@ -992,8 +1000,9 @@ export class SessionRegistry {
     return log ? (level, text) => log(level, text, { session: id }) : undefined;
   }
 
-  private storeOptions(retention: Retention): FileStoreOptions {
-    return this.floor ? { ...retention, floor: this.floor } : retention;
+  private storeOptions(id: string, retention: Retention): FileStoreOptions {
+    const log = this.opts.log;
+    return { ...retention, ...(this.floor && { floor: this.floor }), ...(log && { log: (level: 'warn', text: string) => log(level, text, { session: id }) }) };
   }
 
   /** Requested over recorded over daemon defaults. A bad request is refused; a bad record falls back. */
@@ -1117,6 +1126,7 @@ export class SessionRegistry {
     slot.cursors.cancel();
     this.removeFiles(slot.id, slot.dir);
     this.slots.delete(slot.id);
+    this.recordSyncSaid.delete(slot.id);
     this.emit({ type: 'removed', id: slot.id });
   }
 
@@ -1147,7 +1157,7 @@ export class SessionRegistry {
       if (o.persist) {
         slot.meta = { ...slot.meta, closedAt: Date.now() };
         try {
-          writeMeta(slot.dir, slot.meta);
+          this.noteUnsynced(slot.id, writeMeta(slot.dir, slot.meta));
         } catch {
           // the history is still readable; after a restart it reads as history-only
         }
