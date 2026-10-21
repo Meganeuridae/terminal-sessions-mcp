@@ -446,6 +446,19 @@ test('a reviewer’s read: a declared shell’s typed body, its start mark and i
   await call('killSession', { session: 'declog', graceful: false });
 });
 
+test('a declared shell’s Run: runCommand’s output carries no marks, as text and raw (our read of the house’s fixes for its review of f3750e4, PR #22; older than them)', async () => {
+  // runCommand paged the Run through read {runId}, which cuts nothing: `\nviacompat\n<<<EXIT:…:0>>>`, while the run's own result was clean.
+  const opened = await call('runCommand', { session: 'declout', command: 'sh', timeout: -1 });
+  await until(() => summary('declout')?.runs?.some((x) => x.runId === opened.runId && x.state === 'running') === true, 5000, 'sh in front');
+  await call('session_declare_shell', { session: 'declout', shell: 'sh' });
+  const text = await call('runCommand', { session: 'declout', command: 'echo single' });
+  assert.equal(text.exitCode, 0, JSON.stringify(text));
+  assert.equal(text.output, 'single', JSON.stringify(text.output));
+  const raw = await call('runCommand', { session: 'declout', command: 'printf "\\033[1mbold\\033[0m\\n"; printf no-newline', raw: true });
+  assert.equal(raw.output, '\x1b[1mbold\x1b[0m\r\nno-newline', JSON.stringify(raw.output));
+  await call('killSession', { session: 'declout', graceful: false });
+});
+
 test('a declared shell’s two-line command shows in the logs with no empty line under it: the start mark’s line end is struck after the heading’s every line (our read of the house’s fixes for its review of f3750e4, PR #22: e8a8d52)', async () => {
   // The empty line a start mark's line end leaves was struck one line after a `$ <command>` heading, whatever the command's lines.
   const opened = await call('runCommand', { session: 'declml', command: 'sh', timeout: -1 });
@@ -583,6 +596,20 @@ async function hungMarkerRun(h: Awaited<ReturnType<typeof markerHarness>>, sessi
   assert.ok(run.nonce, 'the marker Run recorded its nonce');
   return { nonce: run.nonce!, journal: live.session.journal };
 }
+
+test('a marker Run’s runCommand output is its command’s alone: no typed line, no start or end mark, no prompt after it, as text and raw (our read of the house’s fixes for its review of f3750e4, PR #22)', async () => {
+  // Under the marker strategy (dash, an unknown sh) the Run's range holds the typed line's echo, the start mark, the end
+  // mark and the prompt the shell printed after it, and runCommand returned them all, paged through read {runId}.
+  const h = await markerHarness();
+  try {
+    const text = await h.call('runCommand', { session: 'mout', command: 'echo hi' });
+    assert.deepEqual([text.exitCode, text.output], [0, 'hi'], JSON.stringify(text));
+    const raw = await h.call('runCommand', { session: 'mout', command: 'echo there', raw: true });
+    assert.deepEqual([raw.exitCode, raw.output], [0, 'there\r\n'], JSON.stringify(raw));
+  } finally {
+    await h.close();
+  }
+});
 
 test('a reviewer’s read: the logs drop the line that runs a command file for every shell flavor the session types for, fish’s marker line included', async () => {
   // compat's hand copy of these lines had none for fish's marker strategy; it is now derived from the session's builder.
