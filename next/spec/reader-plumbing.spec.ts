@@ -179,3 +179,18 @@ test('a read of the session still shows everything the terminal showed, plumbing
   const page = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
   assert.ok(page.text?.includes(`<<<EXIT:${NONCE}:0>>>`), JSON.stringify(page.text));
 });
+
+test("a page that ends inside a cancel's probe echo that came a character at a time strikes all of it (our read of the 40 commits, PR #22)", async () => {
+  // The cutter saw 32 events past a page's end: the echo's rest, in more events than that, was not there to tell
+  // it from output, and the page showed the echo's head.
+  const probe = `${markerProbe(NONCE)}\r\n`;
+  const src = source();
+  markerRun(src.journal, ['abc\r\n', ...probe.split(''), 'def\r\n']);
+  const whole = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
+  assert.equal(whole.text, 'abc\ndef');
+  const abc = src.journal.tail(10_000).find((e) => e.type === 'output' && e.data === 'abc\r\n')!.seq;
+  for (const k of [1, 5, 10, 20]) {
+    const page = await readJournal(src, { runId: 'r1', until: abc + k }, { resultBytes: 16384 });
+    assert.equal(page.text, 'abc', `ending ${k} characters into the echo: ${JSON.stringify(page.text)}`);
+  }
+});

@@ -644,13 +644,22 @@ function runKept(src: ReadSource, runId: string, of: PlumbingOf, pieces: Array<C
     const holeEnd = Math.max(-1, ...(back.gaps ?? []).map((g) => g.to));
     const before = back.events.filter((e): e is Output => isOutput(e) && e.seq > holeEnd).map((e) => e.data).join('') + first.ev.data.slice(0, first.from);
     let after = last.ev.data.slice(last.from + last.data.length);
-    if (after.length < CUT_AHEAD) {
-      const fwd = src.runOutput(runId, { since: last.ev.seq, limit: 32 });
+    // Paged on to CUT_AHEAD, a hole or the Run's end: one page of 32 events, in output that came a few bytes at a
+    // time, fell short of it, and a probe's echo split past it showed its head (our read of the 40 commits, PR #22).
+    for (let since = last.ev.seq; after.length < CUT_AHEAD; ) {
+      const fwd = src.runOutput(runId, { since, limit: 512 });
       const holeStart = Math.min(Number.POSITIVE_INFINITY, ...(fwd.gaps ?? []).map((g) => g.from));
+      let stop = !fwd.more;
       for (const e of fwd.events) {
-        if (!isOutput(e) || e.seq >= holeStart || after.length >= CUT_AHEAD) break;
+        if (!isOutput(e) || e.seq >= holeStart) {
+          stop = true;
+          break;
+        }
         after += e.data;
+        since = e.seq;
+        if (after.length >= CUT_AHEAD) break;
       }
+      if (stop || fwd.events.length === 0) break;
     }
     // Read from the Run's head unless retention, a hole or the bound cut what came before.
     const atHead = !back.truncated;
