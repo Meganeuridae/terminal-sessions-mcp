@@ -337,6 +337,18 @@ test('a line names the pipe of the first character it shows: escape sequences, a
   assert.deepEqual(lines(['stdout', ' '], ['stderr', 'boom\n']), [{ text: cleanLine(' boom'), from: 'stdout', mixed: true }]);
 });
 
+test('a line\'s text past MAX_LINE names no pipe: the splitter keeps it out of the line, and out of where the line came from (our review of the 73 commits through 4860d4c, PR #22)', () => {
+  // stdout's text runs past MAX_LINE, then stderr's comes: the line is stdout's head alone, so stdout's and not mixed.
+  const s = new LineSplitter();
+  const [line] = [...s.feed('x'.repeat(MAX_LINE + 10), 'stdout'), ...s.feed('err\n', 'stderr')];
+  assert.deepEqual([line?.cut, line?.from, line?.mixed], [true, 'stdout', undefined]);
+  // A part that crosses the cut: stdout's line holds MAX_LINE, and stderr's whole part lands past it, so none of it is kept.
+  const t = new LineSplitter();
+  t.feed('y'.repeat(MAX_LINE), 'stdout');
+  const [held] = t.feed('err\n', 'stderr');
+  assert.deepEqual([held?.cut, held?.from, held?.mixed], [true, 'stdout', undefined]);
+});
+
 test('a line of many parts that show nothing costs each part its own length (Imago\'s read of 7af55b8, PR #22)', () => {
   // Each part looked back over the line for an open sequence: 65,536 one-byte tab writes took 1.1 to 2.3 s, where the
   // splitter took about 20 ms before the pipe was decided by the first character shown. 65,000 here, so the line's `x`
