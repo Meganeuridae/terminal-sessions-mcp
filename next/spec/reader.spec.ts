@@ -1735,3 +1735,19 @@ test('a read that ends inside what retention took reports the hole only as far a
     assert.deepEqual(ev.gap, { from: 1, to: until, reason: 'retention', exact: true }, `events until ${until}`);
   }
 });
+
+test('a batch of gap events that adds nothing new does not end a read or a search (an independent read of the fixes for the review of the 40 commits, PR #22)', async () => {
+  // A whole batch of gap events naming a hole already reported filters to nothing, and the callers took an empty batch
+  // for the range's end: "after" was in no read or search.
+  const src = source();
+  out(src.journal, 'before\r\n');
+  const h = src.journal.lastSeq + 1;
+  for (let i = 0; i < 4200; i++) src.journal.append({ type: 'gap', from: h, to: h, reason: 'store-error' });
+  out(src.journal, 'after\r\n');
+  const text = await readJournal(src, { since: 0, maxBytes: 1 << 20 }, { resultBytes: 1 << 20 });
+  assert.ok(text.text!.endsWith('after'), text.text!.slice(-80));
+  const raw = await readJournal(src, { since: 0, as: 'raw', maxBytes: 1 << 20 }, { resultBytes: 1 << 20 });
+  assert.ok(raw.text!.includes('after'), raw.text!.slice(-80));
+  const found = await searchJournal(src, { pattern: 'after', since: 0 });
+  assert.equal(found.matches.length, 1);
+});

@@ -412,10 +412,11 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
    */
   const placed = new Set<string>();
   let done = false;
-  return {
+  const walker = {
     gap,
     end,
-    next() {
+    /** One batch as the journal gives it, which may filter to nothing. */
+    step(): JournalEvent[] {
       if (done) return [];
       const r = pending ?? fetch();
       const resumed = pending === undefined;
@@ -445,7 +446,17 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
       if (r.events.length) cursor = r.events[r.events.length - 1]!.seq;
       return events;
     },
+    next(): JournalEvent[] {
+      // A batch that filters to nothing (gap events naming holes already reported) is not the range's end: the
+      // callers stop at an empty batch, and the output after it was never read (an independent read of the fixes
+      // for the review of the 40 commits, PR #22).
+      for (;;) {
+        const events = walker.step();
+        if (events.length > 0 || done) return events;
+      }
+    },
   };
+  return walker;
 }
 
 const rangeOf = (since: Seq | undefined, until: Seq | undefined, r: RunOutputRange): RunOutputRange => {
