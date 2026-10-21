@@ -610,18 +610,27 @@ export class WatchManager {
           // A stretch still lost reads as a gap seated in its own hole, at its last seq, so a stretch of one
           // seq makes no jump: the gap itself starts the lines afresh. A gap recorded later sits after its
           // hole, which showed as a jump where it lay, and splits nothing (the house's read of the 40
-          // commits over our fixes, #22).
+          // commits over our fixes, #22). A page also lists every hole that meets its seqs (`gaps`), each
+          // seated at the hole's last seq it covers wherever its gap was recorded: the lines start afresh
+          // past each, so a hole whose gap lies elsewhere, or that runs past the page's last event, joins
+          // nothing across it either (the house's review of f3750e4..4f4c067, #22, comment 6315636412).
           const lastBy = new Map<string, JournalEvent>();
           let prev = since;
           for (const page of this.host.journal.pages(since)) {
+            const holes = (page.gaps ?? []).map((g) => g.seq).sort((a, b) => a - b);
+            let h = 0;
             for (const ev of page.events) {
-              if (ev.seq > prev + 1 || (ev.type === 'gap' && ev.seq <= ev.to)) predicate.restartLines();
+              let hole = ev.seq > prev + 1 || (ev.type === 'gap' && ev.seq <= ev.to);
+              for (; h < holes.length && holes[h]! < ev.seq; h++) hole = true;
+              if (hole) predicate.restartLines();
               prev = ev.seq;
               if (done) return;
               predicate.feed(ev);
               if (done) return;
               if (ev.type === 'output') lastBy.set(sourceKey(ev), ev);
             }
+            if (h < holes.length) predicate.restartLines();
+            if (done) return;
           }
           // A stream whose replayed last line has no newline and has been quiet for the partial
           // delay already (a prompt sitting there) is matched now, not after the delay restarts.

@@ -5,6 +5,7 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { TermError } from '../src/core/errors.js';
 import { Journal } from '../src/core/journal.js';
+import { MemoryStore } from '../src/core/stores.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { clocks } from '../src/core/clock.js';
 import { WatchManager, type WaitResult, type WatchHost } from '../src/core/watches.js';
@@ -50,8 +51,7 @@ test('silence rechecks its deadline when the timer wakes before the quiet durati
 
 const A = 'agent:a@test';
 
-function bare() {
-  const journal = new Journal();
+function bare(journal = new Journal()) {
   const waiters: Array<() => void> = [];
   const host: WatchHost & { available: boolean; notify: () => void } = {
     journal,
@@ -573,3 +573,57 @@ test('a pattern reads a process Run’s stdout and stderr as one source, as the 
     f.close();
   }
 });
+
+/** A cold store that refuses every append while `broken`, as a full disk does. */
+class FlakyStore extends MemoryStore {
+  broken = false;
+  override append(event: Parameters<MemoryStore['append']>[0]): void {
+    if (this.broken) throw new Error('ENOSPC: no space left on device, write');
+    super.append(event);
+  }
+}
+
+test('a wait replaying output starts its lines afresh at every hole a page reports, wherever its gap was recorded and wherever the hole ends (the house’s review of f3750e4..4f4c067, #22, comment 6315636412)', async () => {
+  // The disk refused a stretch, the ring dropped it, and the heal recorded its gap after the output that followed it:
+  // the title open before the hole must not take the line after it.
+  const cold = new FlakyStore();
+  const f = bare(new Journal({ hot: new MemoryStore(1500), cold }));
+  try {
+    f.startRun('r');
+    f.out('ready \x1b]0;my title', 'r');
+    cold.broken = true;
+    f.out('the rest of it\x07\n', 'r');
+    for (let i = 0; i < 40; i++) f.out(`lost ${i} ${'z'.repeat(40)}\n`, 'r');
+    const after = f.out('ERROR: boom\n', 'r').seq;
+    cold.broken = false;
+    assert.equal(f.journal.retryCold(), true);
+    const recorded = f.journal.since(0).events.find((e) => e.type === 'gap');
+    assert.ok(recorded && recorded.seq > after, 'the gap was recorded after the output that follows its hole');
+    assert.ok([...f.journal.pages(0)].some((p) => p.gaps?.length), 'the pages report the hole');
+    assert.equal((await f.manager.waitFor({ pattern: '^ERROR' }, 300, 0)).matched, true);
+    assert.equal((await f.manager.waitFor({ pattern: '^ready $' }, 300, 0)).matched, true, 'the line open before the hole is a line of its own');
+  } finally {
+    f.close();
+  }
+  // A page that reports a hole past its last event: what comes after the hole, here the live output, is read afresh too.
+  const g = bare();
+  const since = g.journal.since.bind(g.journal);
+  try {
+    g.startRun('r');
+    g.out('abc', 'r');
+    const lost = g.out('XYZ', 'r');
+    g.journal.since = (cursor: number, limit?: number) => {
+      const r = since(cursor, limit);
+      return { ...r, events: r.events.filter((e) => e.seq !== lost.seq), gaps: [{ seq: lost.seq, ts: lost.ts, type: 'gap', from: lost.seq, to: lost.seq, reason: 'store-error' }] };
+    };
+    const joined = g.manager.waitFor({ pattern: 'abcdef' }, 200, 0);
+    const own = g.manager.waitFor({ pattern: '^def$' }, 2000, 0);
+    g.out('def\n', 'r');
+    assert.equal((await joined).matched, false, 'no line is joined across the hole');
+    assert.equal((await own).matched, true);
+  } finally {
+    g.journal.since = since;
+    g.close();
+  }
+});
+
