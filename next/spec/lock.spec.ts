@@ -1020,10 +1020,10 @@ test('a guard entry that cannot be read is kept, and the refusal names the guard
   );
   assert.equal(code(thrown), 'data_dir_locked');
   const message = (thrown as TermError).message;
-  // Its pid runs nowhere, so the refusal names the guard, not another termd starting.
-  assert.ok(message.includes(`in use by a takeover guard, ${guard}, holding pid 999999 (not running)`), message);
+  // Its record cannot be read, so the refusal says so and names the guard, not another termd starting.
+  assert.ok(message.includes(`in use by a takeover guard, ${guard}, holding pid 999999 (its record cannot be read: EACCES)`), message);
   assert.ok(!message.includes('another termd starting'), message);
-  assert.ok(message.includes(`rm -r ${guard} only if no termd is starting`), message);
+  assert.ok(message.includes(`rm -r '${guard}' only if no termd is starting`), message);
   assert.deepEqual([(thrown as TermError).data?.['guard'], (thrown as TermError).data?.['guardEntries']], [guard, [path.basename(entry)]], 'the details carry the guard and its entries');
   assert.deepEqual(fs.readdirSync(guard), [path.basename(entry)], 'the entry is kept: a dead pid in a file that cannot be read is not judged gone');
   assert.equal(readLock(dir).pid, 999_999);
@@ -1040,9 +1040,9 @@ const refusal = (dir: string): TermError => {
   assert.fail('the start was not refused');
 };
 
-test('the refusal at a guard says what the guard holds as this start sees it: a running owner is another termd starting, an entry not named as an owner and a guard with no owner yet are said as such, and a guard it cannot list is named with its error', () => {
-  // A running owner (our parent, the test runner), old and with no attempt in flight: a holder stopped after
-  // its rename. Kept, and it is another termd starting.
+test('the refusal at a guard says what the guard holds as this start sees it: an owner live by its record is another termd starting, an entry not named as an owner and a guard with no owner yet are said as such, and a guard it cannot list is named with its error', () => {
+  // An owner live by its record (our parent, the test runner, which started before it), old and with no attempt
+  // in flight: a holder stopped after its rename. Kept, and it is another termd starting.
   const live = dataDir();
   staleLock(live);
   const liveGuard = guardOf(live);
@@ -1051,7 +1051,7 @@ test('the refusal at a guard says what the guard holds as this start sees it: a 
   aged(path.join(liveGuard, `${process.ppid}.4444444444444444`));
   aged(liveGuard);
   const running = refusal(live);
-  assert.ok(running.message.includes(`another termd starting at the same time, behind its takeover guard ${liveGuard}, holding pid ${process.ppid} (running)`), running.message);
+  assert.ok(running.message.includes(`another termd starting at the same time, behind its takeover guard ${liveGuard}, holding pid ${process.ppid} (live by its record)`), running.message);
   assert.deepEqual(running.data?.['guardEntries'], [`${process.ppid}.4444444444444444`]);
 
   // An entry that is no owner's, still young: kept, and said by its name.
@@ -1077,9 +1077,71 @@ test('the refusal at a guard says what the guard holds as this start sees it: a 
   fs.writeFileSync(guardOf(file), 'not a directory');
   const unlisted = refusal(file);
   assert.ok(unlisted.message.includes(`in use by a takeover guard, ${guardOf(file)}, that this start cannot list (ENOTDIR)`), unlisted.message);
-  assert.ok(unlisted.message.includes(`rm -r ${guardOf(file)} only if no termd is starting`), unlisted.message);
+  assert.ok(unlisted.message.includes(`rm -r '${guardOf(file)}' only if no termd is starting`), unlisted.message);
   assert.deepEqual([unlisted.data?.['guard'], unlisted.data?.['guardError']], [guardOf(file), 'ENOTDIR']);
   assert.equal(readLock(file).pid, 999_999, 'the stale lock is still there, kept by the guard');
+
+  // A data dir whose path a shell would split or expand: the advice quotes the guard's path as one word.
+  const odd = path.join(dataDir(), "it's my data");
+  staleLock(odd);
+  fs.mkdirSync(guardOf(odd));
+  const quoted = refusal(odd);
+  assert.ok(quoted.message.includes(`rm -r '${guardOf(odd).replace("it's", "it'\\''s")}' only if no termd is starting`), quoted.message);
+});
+
+test('a guard owner whose pid another process has now is gone by its record, and the refusal says so, not another termd starting', () => {
+  // The Linux branch through an injected /proc, as above: the owner's pid is a real, live process (a sleeper),
+  // but its stat holds other start ticks than the owner recorded, so the pid was reused. A young stray entry
+  // beside it keeps the guard, so the attempts run out.
+  const dir = dataDir();
+  staleLock(dir);
+  const guard = guardOf(dir);
+  const sleeper = spawn('sleep', ['30'], { stdio: 'ignore' });
+  try {
+    const reused = sleeper.pid!;
+    const stat = (pid: number, ticks: number) => `${pid} (sleep) S 1 ${pid} ${pid} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 ${ticks} 12345678 500`;
+    const files: Record<string, string> = { '/proc/uptime': '1000.50 2000.00\n', [`/proc/${process.pid}/stat`]: stat(process.pid, 5000), [`/proc/${reused}/stat`]: stat(reused, 4243), [`/proc/${reused}/cmdline`]: 'sleep\u000030' };
+    const linux: ProcessSource = {
+      platform: 'linux',
+      read: (f) => files[f],
+      entries: () => [String(process.pid), String(reused)],
+      ps: () => undefined,
+      now: () => Date.now(),
+      bootId: () => 'boot-A',
+      self: process.pid,
+    };
+    fs.mkdirSync(guard);
+    const owner = `${reused}.5555555555555555`;
+    fs.writeFileSync(path.join(guard, owner), JSON.stringify({ pid: reused, startedAt: Date.now(), hostname: os.hostname(), nonce: '5555555555555555', startTicks: 4242, bootId: 'boot-A' }) + '\n');
+    fs.writeFileSync(path.join(guard, 'notes.txt'), 'x');
+    let thrown: unknown;
+    try {
+      acquireDataDirLock(dir, { processes: linux });
+    } catch (e) {
+      thrown = e;
+    }
+    assert.equal(code(thrown), 'data_dir_locked', String(thrown));
+    const message = (thrown as TermError).message;
+    assert.ok(message.includes(`in use by a takeover guard, ${guard}, holding pid ${reused} (gone by its record), an entry named notes.txt;`) || message.includes(`in use by a takeover guard, ${guard}, holding an entry named notes.txt, pid ${reused} (gone by its record);`), message);
+    assert.ok(!message.includes('another termd starting'), message);
+  } finally {
+    sleeper.kill('SIGKILL');
+  }
+});
+
+test('with no guard standing when the attempts run out, the refusal says what the last one met: a termd.lock with no whole record, still young, is no termd starting', () => {
+  // An empty termd.lock dated ahead, so it stays young through every attempt: as an older build's start between
+  // its create and its write leaves it, or a crash there. No guard is ever made, since the attempts wait it out.
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, LOCK_FILE);
+  fs.writeFileSync(file, '');
+  const ahead = new Date(Date.now() + 60_000);
+  fs.utimesSync(file, ahead, ahead);
+  const e = refusal(dir);
+  assert.ok(e.message.includes(`in use by a ${LOCK_FILE} with no whole record, under 2 s old by its mtime; one daemon per data dir (remove ${file} only if no termd is running)`), e.message);
+  assert.equal(e.data?.['guard'], undefined, 'no guard in the details');
+  assert.equal(fs.readFileSync(file, 'utf8'), '', 'the lock is untouched');
 });
 
 test('an owner file the disk refuses fails the start with that error and takes the attempt\'s temp and guard with it', () => {

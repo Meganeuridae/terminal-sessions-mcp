@@ -22,6 +22,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { err } from './errors.js';
+import { shellQuote } from './plumbing.js';
 import { syncDir } from './stores.js';
 
 export const LOCK_FILE = 'termd.lock';
@@ -428,13 +429,16 @@ function holderLive(h: LockHolder, current: string, file: string, src: ProcessSo
 
 /**
  * The refusal. Given the takeover guard (its path, what it holds, or why it cannot be listed), the advice is
- * to remove the guard, a directory (`rm -r`): without it the next start takes over or creates the lock as
- * usual. A termd.lock removed instead leaves the guard, which keeps out every later takeover, and every start
- * on a filesystem without hard links, for as long as an entry in it cannot be judged or its owner lives; a
- * guard whose owners are all gone is broken by the next start that meets it.
+ * to remove the guard, a directory (`rm -r`, its path quoted for a shell, since the data dir is the user's to
+ * name): without it the next start takes over or creates the lock as usual. A termd.lock removed instead
+ * leaves the guard, which keeps out every later takeover, and every start on a filesystem without hard links,
+ * until a start breaks it (breakGuard), which it does only once every entry in it is judged gone: an owner by
+ * its record, at once; an entry without a whole record, and an empty guard, by its age past GUARD_STALE_MS on
+ * the wall clock with no attempt in flight, which a clock stepped back holds off for the step; an entry that
+ * cannot be read, never.
  */
 const lockedError = (dataDir: string, file: string, h: LockHolder | undefined, why: string, guard?: { path: string; entries: string[]; error?: string }) =>
-  err('data_dir_locked', `data dir ${dataDir} is in use by ${why}; one daemon per data dir (${guard ? `rm -r ${guard.path} only if no termd is starting` : `remove ${file} only if no termd is running`})`, {
+  err('data_dir_locked', `data dir ${dataDir} is in use by ${why}; one daemon per data dir (${guard ? `rm -r ${shellQuote(guard.path)} only if no termd is starting` : `remove ${file} only if no termd is running`})`, {
     dataDir,
     lockFile: file,
     ...(h ? { pid: h.pid, hostname: h.hostname, startedAt: h.startedAt } : {}),
@@ -710,7 +714,10 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
   };
   // Our own frame-free start (Linux), through the reader recovery and the listing use.
   const self = procStart(process.pid, src);
+  // Whether the last attempt ended on a termd.lock with no whole record, still young: the refusal says so when no guard stands.
+  let tornYoung = false;
   for (let attempt = 0; attempt < 50; attempt++) {
+    tornYoung = false;
     const me: LockHolder = { pid: process.pid, startedAt: Date.now(), hostname: os.hostname(), nonce: randomBytes(8).toString('hex'), ...(self && { startTicks: self.startTicks, bootId: self.bootId }) };
     const raw = JSON.stringify(me) + '\n';
     const tmp = `${file}.${process.pid}.${me.nonce}.tmp`;
@@ -791,6 +798,7 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
         continue;
       }
       if (age < 2000) {
+        tornYoung = true;
         rmTemp(tmp);
         sleepSync(20);
         continue;
@@ -830,21 +838,38 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
     entries = fs.readdirSync(guard);
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') throw lockedError(dataDir, file, holder, 'another termd starting at the same time');
+    // No guard now. The last attempt met a termd.lock still being written or cut short (an older build's start,
+    // or a fallback start a crash stopped between its create and its write), or another termd: a start's guard
+    // held then, a lock changed under the compare, or one released meanwhile.
+    if (code === 'ENOENT') throw lockedError(dataDir, file, holder, tornYoung ? `a ${LOCK_FILE} with no whole record, under 2 s old by its mtime` : 'another termd starting or stopping at the same time');
     // A file at the guard's path, or a guard this start cannot list, keeps out every takeover just the same.
     throw lockedError(dataDir, file, holder, `a takeover guard, ${guard}, that this start cannot list (${code ?? (e as Error).message})`, { path: guard, entries: [], error: code ?? (e as Error).message });
   }
-  // Each owner by its pid, and whether a process has that pid now, read once: a guard's pid is another termd
-  // starting only while it runs.
-  const seenNow = entries.map((n) => {
-    const pid = isOwnerName(n) ? Number(n.slice(0, n.indexOf('.'))) : undefined;
-    return { n, pid, running: pid !== undefined && exists(pid) };
-  });
-  const holding = `holding ${seenNow.map((e) => (e.pid !== undefined ? `pid ${e.pid} (${e.running ? 'running' : 'not running'})` : `an entry named ${e.n}`)).join(', ')}`;
+  // Each entry as the breaker judges it (entryGone): an owner by its record, read once, since a process with its
+  // pid may be another one now; anything else by what keeps it from being judged.
+  const seenNow = entries.map((n) => guardEntry(path.join(guard, n), src, seen));
+  const holding = `holding ${seenNow.map((e) => e.text).join(', ')}`;
   const why = !entries.length
     ? `a takeover guard, ${guard}, with no owner in it yet`
-    : seenNow.some((e) => e.running)
+    : seenNow.some((e) => e.live)
       ? `another termd starting at the same time, behind its takeover guard ${guard}, ${holding}`
       : `a takeover guard, ${guard}, ${holding}`;
   throw lockedError(dataDir, file, holder, why, { path: guard, entries });
+}
+
+/** A guard entry as a refusal names it: an owner with whether its record shows it live, as the breaker judges it, or why it cannot be judged. */
+function guardEntry(entry: string, src: ProcessSource, seen: Map<string, boolean>): { text: string; live: boolean } {
+  const name = path.basename(entry);
+  if (!isOwnerName(name)) return { text: `an entry named ${name}`, live: false };
+  const pid = `pid ${name.slice(0, name.indexOf('.'))}`;
+  let raw: string | undefined;
+  try {
+    raw = readRaw(entry);
+  } catch (e) {
+    return { text: `${pid} (its record cannot be read: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`, live: false };
+  }
+  if (raw === undefined) return { text: `${pid} (gone meanwhile)`, live: false };
+  const h = parseHolder(raw);
+  if (!h) return { text: `${pid} (no whole record)`, live: false };
+  return recordLive(h, raw, entry, src, seen) ? { text: `${pid} (live by its record)`, live: true } : { text: `${pid} (gone by its record)`, live: false };
 }
