@@ -363,14 +363,23 @@ class Projector {
   }
 
   /**
-   * Whether a line is begun where the cursor is: it stands past its row's start, or its row holds text a CR
-   * went back over. What a segment boundary puts next starts a line of its own then (rule 6): `progress 50%`,
-   * a CR, a hole, then `done` read `doneress 50%`, and a note after such a line wrote over it (the house's
-   * review of f3750e4..4f4c067, #22, comment 6315636412).
+   * What takes the cursor to a fresh line for what a segment boundary puts next (rule 6): past the last row at or
+   * below the cursor that holds text, or none when the cursor stands at the start of an empty row with nothing
+   * below it. A line a CR went back over is begun: `progress 50%`, a CR, a hole, then `done` read `doneress 50%`,
+   * and a note after such a line wrote over it (the house's review of f3750e4..4f4c067, #22, comment
+   * 6315636412). And rows below the cursor are written: after a cursor up, as a multi-line progress display
+   * leaves it mid-redraw, one line end took the next segment onto the row below, and it wrote over that row's
+   * text (`line1`, then `Xine2`: a reviewer's read of the fixes for #22). A full-screen program's frame is rows
+   * below the cursor too: on the alternate screen, which keeps no scrollback, the line end past its last row
+   * scrolls the frame's top row away, where before the next segment wrote over the row below the cursor; neither
+   * keeps the frame whole, and a redraw of the whole frame repairs either.
    */
-  get lineBegun(): boolean {
+  get freshLine(): string {
     const b = this.term.buffer.active;
-    return b.cursorX > 0 || (b.getLine(b.baseY + b.cursorY)?.translateToString(true) ?? '') !== '';
+    let last = -1;
+    for (let y = b.cursorY; y < this.term.rows; y++) if ((b.getLine(b.baseY + y)?.translateToString(true) ?? '') !== '') last = y;
+    if (last === -1) return b.cursorX > 0 ? '\r\n' : '';
+    return `${last > b.cursorY ? `\x1b[${last - b.cursorY}B` : ''}\r\n`;
   }
 
   /** Rows the next batch may add before the scratch scrollback could drop an unread row. */
@@ -942,7 +951,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
       // house's read of the 33 commits, #22, comment 6307350650: a title held open at the range's end
       // took a Run's held line, unlabelled).
       if (s + 1 < segs.length) {
-        await pr.feed(`\x18${pr.lineBegun ? '\r\n' : ''}`);
+        await pr.feed(`\x18${pr.freshLine}`);
         await pr.afterBatch();
       }
     }

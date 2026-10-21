@@ -758,3 +758,14 @@ test('a line a CR went back over is a line of its own at a boundary: a hole, a n
   assert.deepEqual(await read(['progress 50%\rdone\r\n']), ['doneress 50%'], 'with no boundary, as the terminal shows it');
   assert.deepEqual(await read(['one\r\n', { hole: true }, 'two\r\n']), ['one', 'two'], 'a line already ended: no blank line');
 });
+
+test('a boundary after a cursor moved up starts the next segment below every row with text, not on the row below the cursor', async () => {
+  // A reviewer's read of the fixes for #22: a multi-line display redrawn with cursor-up, as docker's and cargo's progress is,
+  // leaves the cursor above its own rows when a segment ends, and the boundary's one line end took the next segment onto the
+  // row below, over its text: `line1`, then `Xine2`.
+  const read = async (chunks: ProjectChunk[]) => (await project(chunks, { cols: 40 })).text.split('\n');
+  assert.deepEqual(await read(['line1\r\nline2\r\n\x1b[2A', { hole: true }, 'X\r\n']), ['line1', 'line2', 'X']);
+  assert.deepEqual(await read(['line1\r\nline2\r\nline3\r\n\x1b[3A', { note: '[… lost …]' }, 'X\r\n']), ['line1', 'line2', 'line3', '[… lost …]', 'X'], 'a note');
+  assert.deepEqual(await read(['line1\r\nline2\r\n\x1b[2AX\r\n']), ['Xine1', 'line2'], 'with no boundary, as the terminal shows it');
+  assert.deepEqual(await read(['one\r\n\r\n\r\n\x1b[2A', { hole: true }, 'two\r\n']), ['one', 'two'], 'blank rows below the cursor are no text');
+});
