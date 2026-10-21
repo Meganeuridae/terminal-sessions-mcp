@@ -68,12 +68,14 @@ export interface PtyHandle {
    * inputMode tells `read -n` apart. Undefined when it cannot be told; the gate then does not type
    * (item 1: unknown is not "no reader").
    *
-   * The limit: a program that reads the terminal only through descriptor 1 or 2, as util-linux's
-   * `more` behind a pipe does (stdin the pipe: its read_user_input reads keys with read(STDERR_FILENO),
-   * "Keep the read() reading from stderr", text-utils/more.c at v2.41.5), looks like the rc's
-   * background job and answers false (the house's read of the 33 commits, #22 comment 6307351617,
-   * item 3). A reinit typed into it draws no hello, and the gate then gives up keeping the key, with
-   * the recovery line in its note.
+   * The limits: on Linux, a member of the shell's group that left its descendants (an orphan an rc
+   * double-forked) is found only when the kernel has no children files, so it answers false where `ps
+   * -t` elsewhere finds it (the house's review of 4f4c067..a8b6f28); and a program that reads the
+   * terminal only through descriptor 1 or 2, as util-linux's `more` behind a pipe does (stdin the
+   * pipe: its read_user_input reads keys with read(STDERR_FILENO), "Keep the read() reading from
+   * stderr", text-utils/more.c at v2.41.5), looks like the rc's background job and answers false (the
+   * house's read of the 33 commits, #22 comment 6307351617, item 3). A reinit typed into it draws no
+   * hello, and the gate then gives up keeping the key, with the recovery line in its note.
    */
   otherReader?(): boolean | undefined;
   /**
