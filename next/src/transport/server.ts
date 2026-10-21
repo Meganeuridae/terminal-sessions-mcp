@@ -275,7 +275,7 @@ export class TermServer {
   private readonly conns = new Set<Conn>();
   private readonly opts: ServerOptions;
   private readonly statics: StaticFiles;
-  /** When this endpoint was built, on the monotonic clock: `/health`'s uptime is an elapsed time inside one process, which a wall-clock step must not move or make negative (the house's read of the 33 commits, #22, comment 6307351372). */
+  /** When this endpoint was built, on the monotonic clock: `/health`'s uptime is an elapsed time inside one process, which a wall-clock step must not move or make negative (the house's read of the 33 commits, #22, comment 6307351372). That clock does not advance while the host is suspended, so after a sleep the uptime reads less than the time since termd started. */
   private readonly startedAt = clocks.monotonic();
   private offRegistry: (() => void) | undefined;
   private allowed: HostPattern[] = [];

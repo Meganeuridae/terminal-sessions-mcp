@@ -253,8 +253,9 @@ test("a running Run's time is the session's own count of it, on the monotonic cl
     t.mock.method(Date, 'now', () => real() + 120_000);
     const text = P(A, ['pw']);
     t.mock.restoreAll();
-    assert.match(text, /running `sleep 20` [0-9]s \(cwd /, text);
-    assert.match(text, /running `sleep 20` [0-9]s \(process\)/, text);
+    // Any count of seconds, however slow the runner: the two minutes of the step are what must not show.
+    assert.match(text, /running `sleep 20` \d+s \(cwd /, text);
+    assert.match(text, /running `sleep 20` \d+s \(process\)/, text);
     assert.doesNotMatch(text, /\dm\d+s/, text);
   } finally {
     await app.cancel(A, { runId: proc.runId! });

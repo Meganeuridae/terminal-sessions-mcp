@@ -105,7 +105,8 @@ test('G4: a queued Run is dated from its start, not its admission: what reads it
     h.shell.finishHung(0);
     await until(() => atStart !== undefined, 3000, 'the queued Run started');
     off();
-    assert.ok(atStart! < 1000, `${atStart} ms at its start`);
+    // Below the minute it queued for, whatever the runner's speed: counted from its admission it is that minute and more.
+    assert.ok(atStart! < 60_000, `${atStart} ms at its start`);
     h.shell.finishHung(0);
   } finally {
     await h.session.close();

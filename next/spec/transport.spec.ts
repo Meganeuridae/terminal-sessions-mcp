@@ -784,7 +784,9 @@ test('/health’s uptime and a tool call’s latency are elapsed times on the mo
     wall = () => realNow();
     const rec = h.usage.at(-1)!;
     assert.equal(rec.tool, 'session_list');
-    assert.ok(rec.ms >= 0, `the call's latency: ${rec.ms} ms`);
+    // Bounded both ways: a latency whose end read the wall clock and its start the monotonic one is
+    // off by decades, and a check for a negative value alone passed it.
+    assert.ok(rec.ms >= 0 && rec.ms < 3_600_000, `the call's latency: ${rec.ms} ms`);
     c.close();
   } finally {
     await h.close();

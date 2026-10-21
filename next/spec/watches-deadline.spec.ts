@@ -131,12 +131,14 @@ test('a quiet live Run keeps its last output’s stamp however much another Run 
     const quietOf = (w: WaitResult) => Number(/no output for (\d+)ms/.exec(String(w.match))?.[1]);
     const live = await f.manager.waitFor({ silenceMs: 200, runId: 'r' }, 5000);
     assert.equal(live.matched, true, JSON.stringify(live));
-    assert.ok(quietOf(live) < 5000, `the live Run's last output is aged on the monotonic clock: ${live.match}`);
+    // Each ceiling is the step, not a guess at the real time: aged on the wall clock, the quiet is the
+    // step and more, while a slow runner flooding 9,000 lines only adds real seconds below it.
+    assert.ok(quietOf(live) < 10_000, `the live Run's last output is aged on the monotonic clock: ${live.match}`);
     f.journal.append({ type: 'run.end', runId: 'r', state: 'exited', exit: 0, durationMs: 1 });
     flood();
     const ended = await f.manager.waitFor({ silenceMs: 200, runId: 'r' }, 5000);
     assert.equal(ended.matched, true, JSON.stringify(ended));
-    assert.ok(quietOf(ended) < 5000, `the ended Run's last output is aged on the monotonic clock: ${ended.match}`);
+    assert.ok(quietOf(ended) < 10_000, `the ended Run's last output is aged on the monotonic clock: ${ended.match}`);
   } finally {
     f.close();
   }
