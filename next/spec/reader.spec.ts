@@ -1832,3 +1832,13 @@ test('a hole a scan adds merges with every entry of its reason it overlaps (an i
   addHole(gaps, { from: 4, to: 9, reason: 'store-error', exact: true });
   assert.deepEqual(gaps, [{ from: 4, to: 9, reason: 'store-error' }, { from: 20, to: 20, reason: 'retention' }]);
 });
+
+test('a raw page whose retention hole trails every event it holds is that hole\'s note (an independent read of the fixes for the review of 4f4c067..a8b6f28, PR #22)', async () => {
+  // A raw read ending inside what retention took holds no event to put the note before: the parts left after the last
+  // event are noted after it, and here that is the page.
+  const j = new Journal({ sessionId: 's', hot: new MemoryStore(600) });
+  const src = source({ journal: j });
+  for (let i = 0; i < 60; i++) out(j, `line ${i}\r\n`);
+  const r = await readJournal(src, { since: 0, until: 3, as: 'raw', maxBytes: 1 << 20 }, { resultBytes: 1 << 20 });
+  assert.equal(r.text, '\n[… 3 journal events missing (seq 1–3: past retention) …]\n');
+});

@@ -204,3 +204,11 @@ test("search and wait_for name a process Run line's pipe, and `mixed` when it ho
   assert.equal(await wait({ ...base, stream: 'stdout' }), '[pattern matched after 12ms: boom · stdout · seq 7]');
   assert.equal(await wait(base), '[pattern matched after 12ms: boom · seq 7]');
 });
+
+test("wait_for's text says where its matching line starts, a cursor of 0 and an offset included (an independent read of the fixes for the review of 4f4c067..a8b6f28, PR #22)", async () => {
+  const wait = async (w: Record<string, unknown>) => (await callTool('wait_for', { session: 's', pattern: 'x' }, ctx(stub({ waitFor: async () => w })), TOOLS)).text;
+  const base = { session: 's', matched: true, kind: 'pattern', line: 'boom', seq: 7, elapsedMs: 12, nextCursor: 8 };
+  assert.equal(await wait({ ...base, cursor: 0 }), '[pattern matched after 12ms: boom · seq 7 · read since=0]');
+  assert.equal(await wait({ ...base, cursor: 6, offset: 3 }), '[pattern matched after 12ms: boom · seq 7 · read since=6 offset=3]');
+  assert.equal(await wait(base), '[pattern matched after 12ms: boom · seq 7]');
+});
