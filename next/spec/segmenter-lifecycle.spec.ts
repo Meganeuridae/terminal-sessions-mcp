@@ -853,11 +853,49 @@ test('a hole a cold-store failure left on a later page of the scan is reported, 
   }
 });
 
+test('a hole the store heals while a scan reads is named by that scan: its gap event lies past the scan\'s end, and the pages read after the heal report none', async () => {
+  // The house's read of the 33 commits (#22, comment 6307351104), item 5: the scan stopped at the end it froze, so it never
+  // read the gap event, and the next scan clipped the range to its own span.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-seg-heal-'));
+  try {
+    const cold = new FileStore(dir);
+    const journal = new Journal({ hot: new MemoryStore(2048), cold });
+    const src = fakeSource(journal);
+    // More than a scan page persists to disk, so the scan yields before it reaches the hole.
+    for (let i = 0; i < 5100; i++) journal.append({ type: 'output', data: 'x\r\n', stream: 'pty' });
+    const persisted = journal.lastSeq;
+    const orig = cold.append.bind(cold);
+    cold.append = () => {
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+    };
+    try {
+      for (let i = 0; i < 60; i++) {
+        startRun(src, `b${i}`);
+        endRun(src, `b${i}`, { state: 'lost', reason: 'daemon-shutdown' });
+      }
+    } finally {
+      cold.append = orig;
+    }
+    const scanning = scanLifecycle(liveSource(src), 0);
+    // The scan read its first page and yielded; the disk comes back before it reads on.
+    assert.ok(journal.retryCold(), 'the disk is back');
+    const recorded = journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap' && e.from > persisted);
+    assert.ok(recorded.length >= 1, 'the journal recorded the hole');
+    const scan = await scanning;
+    for (const g of recorded) {
+      assert.ok(g.seq > scan.end && g.to <= scan.end, `the hole ${g.from}–${g.to} is in the scan’s span, its event past it (end ${scan.end}, event ${g.seq})`);
+      assert.ok(scan.lost?.some((x) => x.from <= g.from && x.to >= g.to && x.reason === g.reason), `named: ${JSON.stringify(scan.lost)}`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a scan clips each gone range to the seqs it covers, names a hole reported twice once, and keeps each range\'s reason', async () => {
   // The house's read of the 38 commits (#22, comment 6274773484): a page's gap was copied whole, and the lane pinned its
   // summary at the last gap's end, which can lie past the scan's end when the ring drops events during a paged scan.
   let page: { events: JournalEvent[]; gap?: { from: number; to: number; reason: 'retention' }; nextCursor: number; more: boolean } = { events: [], gap: { from: 1, to: 150, reason: 'retention' }, nextCursor: 0, more: false };
-  const journal = { lastSeq: 100, *pages() { yield page; } } as unknown as Journal;
+  const journal = { lastSeq: 100, runs: { gapsWithin: () => [] }, *pages() { yield page; } } as unknown as Journal;
   const src = { id: 's', journal, owner: A, state: 'idle', cwd: undefined, controller: null, run: () => { throw new Error('run_not_found'); }, runText: async () => ({ text: '', truncated: false, seq: [0, 0], nextCursor: 0 }) } as unknown as ReplaySource;
   assert.deepEqual((await scanLifecycle(src, 0)).lost, [{ from: 1, to: 100, reason: 'retention' }], 'clipped to the scan’s end');
   assert.deepEqual((await scanLifecycle(src, 40)).lost, [{ from: 41, to: 100, reason: 'retention' }], 'and to its start');

@@ -622,6 +622,11 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
   }
   for (const t of tentative) commit(t);
   trim();
+  // A hole the store healed while this scan read: the journal records it as a gap event issued after
+  // `end`, which the scan does not read, and the pages it read across the hole after the heal reported
+  // none; the next scan clips the range to its own span. The journal's index of gap events names it
+  // wherever its event sits (the house's read of the 33 commits, #22, comment 6307351104).
+  for (const g of src.journal.runs.gapsWithin(since + 1, end)) if (g.seq > end) recorded.push({ from: g.from, to: g.to, reason: g.reason });
   const out: LifecycleScan = { picked: kept, end };
   if (omitted) out.omitted = omitted;
   const gones = goneRanges(recorded, inferred, since + 1, end);

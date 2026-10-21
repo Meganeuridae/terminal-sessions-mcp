@@ -86,6 +86,32 @@ test('G4: a queued Run advances only after the Run ahead ended AND a prompt conf
   await h.session.close();
 });
 
+test('G4: a queued Run is dated from its start, not its admission: what reads its duration as its run.start is dispatched (the segmenter) counts none of the time it queued', async (t) => {
+  // The house's read of the 33 commits (#22, comment 6307351104), item 10: run.start was appended before the start's monotonic
+  // stamp was set, so the segmenter's digests said "running … Ns" counting the time the Run waited for the shell.
+  const realMono = clocks.monotonic;
+  let queuedFor = 0;
+  t.mock.method(clocks, 'monotonic', () => realMono() + queuedFor);
+  const h = await harness({ setup: (s) => s.on('echo second', () => ({ hang: true })) });
+  try {
+    const first = h.session.admit({ target: 'shell', line: 'sleep 10', principal: AGENT });
+    const queued = h.session.admit({ target: 'shell', line: 'echo second', principal: AGENT, queue: true });
+    assert.ok(first.admitted && queued.admitted);
+    let atStart: number | undefined;
+    const off = h.journal.subscribe((ev) => {
+      if (ev.type === 'run.start' && ev.runId === queued.run.runId) atStart = h.session.runDurationMs(ev.runId);
+    });
+    queuedFor = 60_000;
+    h.shell.finishHung(0);
+    await until(() => atStart !== undefined, 3000, 'the queued Run started');
+    off();
+    assert.ok(atStart! < 1000, `${atStart} ms at its start`);
+    h.shell.finishHung(0);
+  } finally {
+    await h.session.close();
+  }
+});
+
 test('G3/G4: a prompt without an end mark makes the Run `lost`, never `exited`', async () => {
   const h = await harness();
   const a = h.session.admit({ target: 'shell', line: 'sleep 10', principal: AGENT });

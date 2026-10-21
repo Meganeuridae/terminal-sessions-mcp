@@ -335,6 +335,23 @@ test('G11: output that outruns the scratch emulator\'s row bound (REP) is still 
   assert.deepEqual(small, { text: `start\n${'x'.repeat(1000)}\nend`, truncated: false, omittedInputBytes: 0 });
 });
 
+test('a kept-tail cut past the start of a control string still unfinished drops the rest of it as it comes: split across chunks, it reads as in one chunk', async () => {
+  // The house's read of the 33 commits (#22, comment 6307351104), item 7: `head `, then an OSC 52 longer than twice a 4 KiB
+  // budget, then its end in a later chunk, showed `QUJDQUJDtail-of-payload after`; in one chunk only ` after`.
+  const pay = 'QUJD'.repeat(2600);
+  const read = async (chunks: string[]) => (await project(chunks, { cols: 80, rows: 24, maxInputBytes: 4096 })).text;
+  assert.equal(await read([`head \x1b]52;c;${pay}tail-of-payload\x07 after`]), ' after', 'one chunk');
+  assert.equal(await read(['head ', `\x1b]52;c;${pay}`, 'tail-of-payload\x07 after']), ' after');
+  assert.equal(await read(['head ', '\x1b]52;c;', ...Array.from({ length: 26 }, () => 'QUJD'.repeat(100)), 'tail-of-payload\x07 after']), ' after', 'the payload in pieces');
+  assert.equal(await read(['head ', `\x1b]52;c;${pay}\x1b`, '\\ after']), ' after', 'the string terminator split between chunks');
+  assert.equal(await read(['head ', `\x1b]52;c;${pay}`, 'tail\x1b[31mred\x1b[m after']), 'red after', 'a new sequence abandons the string');
+  assert.equal(await read(['head ', `\x1bPq${pay}`, '#0~~\x1b\\ after']), ' after', 'a DCS');
+  // A payload holding newlines (base64 in lines) is cut as an emitted run, and its rest goes the same way.
+  const lines = `${'QUJD'.repeat(19)}\n`.repeat(150);
+  assert.equal(await read(['head\r\n', `\x1b]52;c;${lines}`, `${lines}\x07 after`]), ' after', 'newlines inside the payload');
+  assert.equal(await read([`out\r\n\x1b]52;c;${lines}${lines}\x07 after`]), ' after', 'the same in one chunk');
+});
+
 test('api-20: maxInputBytes keeps the tail or head, never splits a character, and says what it omitted', async () => {
   const accents = 'é'.repeat(3000); // 2 bytes each
   const tail = await project([accents], { cols: 80, maxInputBytes: 1025 });

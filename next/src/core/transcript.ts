@@ -84,7 +84,7 @@ import xterm from '@xterm/headless';
 import type { IBuffer, Terminal as TerminalType } from '@xterm/headless';
 import { persistentState } from './screen.js';
 import { DEFAULT_GEOMETRY } from './types.js';
-import { headIndex, sequenceEnd, tailStart, utf8Length } from './text.js';
+import { headIndex, sequenceEnd, tailStart, unfinishedSequence, utf8Length } from './text.js';
 
 const { Terminal } = xterm;
 
@@ -437,7 +437,12 @@ const pipeToTty = (s: string): string => s.replace(/\n/g, '\r\n');
  * hold the budget, and a segment or a held line is cut to its last budget's
  * worth (not inside a sequence) once it holds twice that; when the head is kept,
  * everything after the budget is full goes. A dropped head leaves its lasting state in
- * `budget.state`, as `cutInput`'s does. The exact cut is still `cutInput`'s.
+ * `budget.state`, as `cutInput`'s does. The exact cut is still `cutInput`'s. A tail cut that
+ * moves past the start of a control sequence still unfinished (an OSC 52 longer than the budget,
+ * its end in a later chunk) drops the rest of that sequence too as it arrives, up to its end, so
+ * the projection reads as it does with the whole sequence in one chunk: the cut dropped the
+ * introducer, and the payload after it showed as text (the house's read of the 33 commits, #22,
+ * comment 6307351104).
  */
 function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label'], budget?: Budget): Segment[] {
   const out: Segment[] = [];
@@ -447,6 +452,32 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
   const drop = (data: string, bytes: number) => {
     budget!.omitted += bytes;
     if (budget!.keep === 'tail') budget!.state = persistentState(budget!.state + persistentState(data));
+  };
+  // Per source, the introducer of a sequence a tail cut left open, and whether an ESC that may begin its terminator was held back.
+  const open = new Map<string, { intro: string; esc: boolean }>();
+  /** Note the sequence a tail cut of `data` at `cut` moved past, if it is unfinished. */
+  const leaveOpen = (key: string, data: string, cut: number) => {
+    const u = unfinishedSequence(data, Number.POSITIVE_INFINITY);
+    if (u >= cut) return;
+    const intro = data.slice(u, u + (data.charCodeAt(u) === 0x9b ? 1 : 2));
+    open.set(key, { intro, esc: u + intro.length < data.length && data.endsWith('\x1b') });
+  };
+  /** `data` without the rest of the sequence a cut left open for `key`: what goes is omitted. */
+  const skipOpen = (key: string, data: string): string => {
+    const o = open.get(key);
+    if (!o || !data) return data;
+    const joined = `${o.intro}${o.esc ? '\x1b' : ''}${data}`;
+    const end = sequenceEnd(joined, 0);
+    if (end === undefined) {
+      o.esc = data.endsWith('\x1b');
+      const gone = o.esc ? data.slice(0, -1) : data;
+      drop(gone, utf8Length(gone));
+      return '';
+    }
+    open.delete(key);
+    const gone = joined.slice(o.intro.length, end);
+    if (gone) drop(gone, utf8Length(gone));
+    return joined.slice(end);
   };
   const emit = (key: string, pipe: boolean, info: SourceInfo | undefined, data: string) => {
     const bytes = utf8Length(data);
@@ -479,6 +510,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     const end = out[out.length - 1]!;
     if (end.bytes > 2 * budget.max) {
       const cut = tailStart(end.data, budget.max);
+      leaveOpen(end.key, end.data, cut);
       const gone = end.data.slice(0, cut);
       end.data = end.data.slice(cut);
       outBytes -= end.bytes;
@@ -502,6 +534,8 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     if (!c.data) continue;
     const pipe = c.stream === 'stdout' || c.stream === 'stderr';
     const key = pipe ? `p:${c.runId ?? ''}` : 'pty';
+    const data = skipOpen(key, c.data);
+    if (!data) continue;
     let h = held.get(key);
     if (!h) {
       // A Run's pipes together are labelled `stdout`.
@@ -511,18 +545,19 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       held.set(key, h);
     }
     // Only the new data is searched for a LF, so a long unfinished line costs its length once.
-    const nl = c.data.lastIndexOf('\n');
+    const nl = data.lastIndexOf('\n');
     if (nl === -1) {
       if (h.full) {
-        drop(c.data, utf8Length(c.data));
+        drop(data, utf8Length(data));
         continue;
       }
-      h.data += c.data;
-      h.bytes += utf8Length(c.data);
+      h.data += data;
+      h.bytes += utf8Length(data);
       if (budget && h.bytes > 2 * budget.max) {
         // An unfinished line past twice the budget: only a budget's worth of it can survive. Kept
         // head: that worth is its start, and the rest of the line (`full`) is dropped as it comes.
         const cut = budget.keep === 'tail' ? tailStart(h.data, budget.max) : headIndex(h.data, budget.max);
+        if (budget.keep === 'tail') leaveOpen(key, h.data, cut);
         const gone = budget.keep === 'tail' ? h.data.slice(0, cut) : h.data.slice(cut);
         h.data = budget.keep === 'tail' ? h.data.slice(cut) : h.data.slice(0, cut);
         h.bytes = utf8Length(h.data);
@@ -531,11 +566,11 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       }
       continue;
     }
-    if (h.full) drop(c.data.slice(0, nl + 1), utf8Length(c.data.slice(0, nl + 1)));
-    emit(key, pipe, h.info, h.full ? h.data : h.data + c.data.slice(0, nl + 1));
+    if (h.full) drop(data.slice(0, nl + 1), utf8Length(data.slice(0, nl + 1)));
+    emit(key, pipe, h.info, h.full ? h.data : h.data + data.slice(0, nl + 1));
     // Re-inserted, so the held ends keep the order in which they began.
     held.delete(key);
-    h.data = c.data.slice(nl + 1);
+    h.data = skipOpen(key, data.slice(nl + 1));
     h.bytes = utf8Length(h.data);
     h.full = false;
     if (h.data) held.set(key, h);

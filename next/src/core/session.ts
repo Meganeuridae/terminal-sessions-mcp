@@ -1438,10 +1438,14 @@ export class Session {
       // The pid the inline start marker named, which history has no other way to know (comment 6274773484).
       if (run.shellPid !== undefined) ev.shellPid = run.shellPid;
     }
+    // Stamped before the append, which dispatches run.start to listeners at once: the segmenter dates the
+    // Run's digests from what the session measures then, and with no start stamp yet that was the
+    // admission, counting the time the Run queued (the house's read of the 33 commits, #22, comment
+    // 6307351104).
+    run.startedMono = clocks.monotonic();
     const started = this.append(ev);
     run.state = 'running';
     run.startedAt = started?.ts ?? this.now();
-    run.startedMono = clocks.monotonic();
     run.seq.start = started?.seq ?? this.journal.lastSeq;
     run.cwd = info.cwd;
     run.cols = this.screen.cols;
