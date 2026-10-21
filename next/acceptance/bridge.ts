@@ -29,6 +29,9 @@ const { WakeGate } = await import(path.join(BRIDGE, 'wake.ts'))
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 23), ...a)
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+// Every wait below is timed on the monotonic clock, as the framework check's are, so a step of the wall
+// clock neither ends one early nor stretches it.
+const now = () => performance.now()
 const fail = (msg: string): never => {
   throw new Error(msg)
 }
@@ -127,13 +130,25 @@ const check = async (name: string, fn: () => Promise<void>) => {
   }
 }
 const waitFor = async (pred: () => boolean, ms: number, what: string) => {
-  const end = Date.now() + ms
+  const end = now() + ms
   while (!pred()) {
-    if (Date.now() > end) fail(`timed out: ${what}`)
+    if (now() > end) fail(`timed out: ${what}`)
     await sleep(50)
   }
 }
 const completions = (runId: string) => deliveries.filter((d) => d.text.includes(runId) && /→ exit/.test(d.text))
+// What the publisher has been sent is counted after a fence: termd's lane offers the session's events to
+// a connection in journal order and settles a principal's own note as it is offered (mcpl-14), so once a
+// note the observer published later reaches the publisher, whatever the lane sent it straight away for
+// earlier events, an echo of its own note or a second copy of a completion, has arrived. What the lane
+// sends later on a timer (a retry from 500 ms, a hold's release at 2 s) is not ordered with the fence.
+let fences = 0
+const fence = async (after: string) => {
+  const text = `fence ${++fences}`
+  const answer = (await observer.publish(`terminal:${SESSION}`, text)) as { delivered?: boolean } | undefined
+  if (answer?.delivered !== true) fail(`the observer's fence after ${after} answered ${JSON.stringify(answer)}`)
+  await waitFor(() => deliveries.some((d) => d.text.includes(text)), 10_000, `the publisher receiving the observer's fence after ${after}`)
+}
 
 try {
   h.start()
@@ -148,8 +163,16 @@ try {
 
   const opened = await call('session_open', { session: SESSION, visibility: 'shared', cwd: tmp })
   if (opened.isError) fail(opened.text)
-  await sleep(200)
-  await observer.openChannel(`terminal:${SESSION}`)
+  // The channel registers with the observer's host a moment after session_open, and an open names a
+  // registered channel: retried until it is, as the framework check retries its channel_open.
+  for (const until = now() + 10_000; ; await sleep(100)) {
+    try {
+      await observer.openChannel(`terminal:${SESSION}`)
+      break
+    } catch (e) {
+      if (now() > until) throw e
+    }
+  }
 
   // The Run ends when this file appears in the session's cwd, and the check creates it once the
   // reconnect has been shown: a Run that slept 1.5 s raced the reconnect's own waits (3 s, then
@@ -184,8 +207,9 @@ try {
 
   let firstCompletionAt = 0
   await check('one useful completion notification, and it wakes the session', async () => {
-    await waitFor(() => deliveries.some((d) => d.text.includes(runId)), 8000, 'completion delivery')
-    firstCompletionAt = Date.now()
+    // The completion itself: the Run's progress digest names the Run too.
+    await waitFor(() => completions(runId).length > 0, 8000, 'completion delivery')
+    firstCompletionAt = now()
     const mine = completions(runId)
     if (mine.length !== 1) fail(`deliveries for the run: ${mine.length}`)
     const d = mine[0]
@@ -229,6 +253,7 @@ try {
     if (!/bridge-output/.test(screen.text)) fail(`the screen does not show the session's output:\n${screen.text}`)
     if (!/after-the-note/.test(screen.text)) fail(`the screen does not show the marker command run after the note:\n${screen.text}`)
     if (/typed-by-publish/.test(screen.text)) fail(`typed into the shell:\n${screen.text}`)
+    await fence('the note')
     const echoes = deliveries.slice(before).filter((d) => /typed-by-publish/.test(d.text))
     if (echoes.length) fail('a note came back as a delivery (loop risk)')
   })
@@ -239,9 +264,12 @@ try {
     if (!text.includes('[terminal]') || !text.includes(SESSION)) fail(text)
   })
 
-  await check('still one completion for the Run two seconds on: nothing re-delivered after the reconnect', async () => {
-    // Counted right after the first arrived, a late duplicate could not fail the check.
-    await sleep(Math.max(0, firstCompletionAt + 2000 - Date.now()))
+  await check('still one completion for the Run once the lane has passed it and two seconds on: nothing re-delivered after the reconnect', async () => {
+    // Counted right after the first arrived, a late duplicate could not fail the check. The fence covers
+    // what the lane sends in order; the two seconds after the first cover a copy sent on a timer within
+    // them, as a retry from 500 ms would be.
+    await fence('the completion')
+    await sleep(Math.max(0, firstCompletionAt + 2000 - now()))
     const mine = completions(runId)
     if (mine.length !== 1) fail(`deliveries for the run: ${mine.length}`)
   })
@@ -264,7 +292,7 @@ try {
       if (own) termd.kill(signal)
       else process.kill(termdPid as number, signal)
     } catch {}
-    for (const end = Date.now() + graceMs; !stopped() && Date.now() < end; ) await sleep(100)
+    for (const end = now() + graceMs; !stopped() && now() < end; ) await sleep(100)
     return stopped()
   }
   if (!(await stop('SIGTERM', 5000))) {
