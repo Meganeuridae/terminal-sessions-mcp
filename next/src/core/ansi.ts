@@ -302,6 +302,9 @@ export class LineSplitter {
     // One a CSI executes ends one, and the next begins with the CSI's head, so the CSI's rest is not text
     // (the house's review of the 40 commits through f3750e4, #22, comment 6310921374).
     const heads = new Map<number, string>();
+    // What the stream left open before this chunk: the first part reads on from it (showsCharacter); a later part
+    // begins with its own head.
+    const open = this.scan.open;
     const breaks = lineEnds(text, this.scan, Number.POSITIVE_INFINITY, true, heads);
     this.pendingCr = text.endsWith('\r') && breaks[breaks.length - 1] === text.length - 1;
     const parts: string[] = [];
@@ -317,11 +320,11 @@ export class LineSplitter {
     }
     parts.push(head + text.slice(from));
     const last = parts.pop()!;
-    for (const part of parts) {
-      this.add(part, source);
+    parts.forEach((part, k) => {
+      this.add(part, source, k === 0 ? open : '');
       this.complete(out);
-    }
-    this.add(last, source);
+    });
+    this.add(last, source, parts.length === 0 ? open : '');
     this.schedulePartial();
     return out;
   }
@@ -331,18 +334,21 @@ export class LineSplitter {
    * boundary: never inside a control sequence or a surrogate pair (the house's read of the 38
    * commits, #22, comment 6274773484: a head ended in a lone high surrogate).
    */
-  private add(part: string, source: string | undefined): void {
+  private add(part: string, source: string | undefined, open: string): void {
     if (!part || this.cut) return;
-    const before = this.raw;
+    // What of `part` the line keeps, found without slicing `raw`, which would flatten it once per part.
+    let kept = part;
     if (this.raw.length + part.length <= MAX_LINE) this.raw += part;
     else {
       const head = this.raw + part.slice(0, MAX_LINE - this.raw.length + 1);
-      this.raw = head.slice(0, safeCut(head, MAX_LINE));
+      const at = safeCut(head, MAX_LINE);
+      kept = part.slice(0, Math.max(0, at - this.raw.length));
+      this.raw = head.slice(0, at);
       this.cut = true;
     }
     // Only what the line keeps names a pipe, and only once it shows a character.
     if (source === undefined || this.mixed || (this.shown && source === this.from)) return;
-    if (!showsCharacter(before, this.raw.slice(before.length))) return;
+    if (!kept || !showsCharacter(open, kept)) return;
     if (!this.shown) {
       this.from = source;
       this.shown = true;

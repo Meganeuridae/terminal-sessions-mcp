@@ -89,6 +89,21 @@ test('a match names the pipe of the first character its line shows, and mixed on
   assert.deepEqual([long.stream, long.mixed, long.clipped], ['stdout', undefined, true]);
 });
 
+test('a Run line of many events that show nothing is searched to its end, each event costing its own length (Imago\'s read of 7af55b8, PR #22)', async () => {
+  // Each event looked back over the line for an open sequence: a Run of 65,536 one-byte tab events ran into the scan's
+  // 2 s budget and stopped, where the whole scan took about 70 ms before the pipe was decided by the first character shown.
+  const src = source();
+  startRun(src.journal, 'r1');
+  for (let i = 0; i < 65_536; i++) out(src.journal, '\t', 'stdout', 'r1');
+  out(src.journal, 'x\n', 'stderr', 'r1');
+  endRun(src.journal, 'r1');
+  const t0 = performance.now();
+  const r = await search(src, { pattern: 'x', since: 0 });
+  const ms = performance.now() - t0;
+  assert.deepEqual([r.more, r.stoppedBy], [false, undefined], 'the scan reached the end of its range');
+  assert.ok(ms < 1000, `${ms.toFixed(0)} ms`);
+});
+
 test('er-5: a real PTY `cat` of 5000 lines: every line is found, whatever the read boundaries', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-search-'));
   const registry = new SessionRegistry({ dataDir: dir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });

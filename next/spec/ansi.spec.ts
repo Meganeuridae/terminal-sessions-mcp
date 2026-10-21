@@ -336,3 +336,17 @@ test('a line names the pipe of the first character it shows: escape sequences, a
   // A space is a character shown, as the rule's words say.
   assert.deepEqual(lines(['stdout', ' '], ['stderr', 'boom\n']), [{ text: cleanLine(' boom'), from: 'stdout', mixed: true }]);
 });
+
+test('a line of many parts that show nothing costs each part its own length (Imago\'s read of 7af55b8, PR #22)', () => {
+  // Each part looked back over the line for an open sequence: 65,536 one-byte tab writes took 1.1 to 2.3 s, where the
+  // splitter took about 20 ms before the pipe was decided by the first character shown. 65,000 here, so the line's `x`
+  // comes before MAX_LINE's cut.
+  const s = new LineSplitter();
+  const t0 = performance.now();
+  for (let i = 0; i < 65_000; i++) s.feed('\t', 'stdout');
+  const [line] = s.feed('x\n', 'stderr');
+  const ms = performance.now() - t0;
+  s.dispose();
+  assert.deepEqual([line?.from, line?.mixed], ['stderr', undefined], 'tabs show no character, so the line is stderr\'s');
+  assert.ok(ms < 500, `${ms.toFixed(0)} ms`);
+});

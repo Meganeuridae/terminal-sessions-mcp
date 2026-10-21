@@ -235,6 +235,9 @@ export class LineScanner {
     // A line begun inside a CSI, after a LF it executed, begins with the CSI's head (rule 2): the one open
     // where this data begins, or the one a line end inside this data names.
     let head = isStringStart(scan.open, 0) ? '' : scan.open;
+    // What a piece reads on from for showsCharacter: what the stream left open before this data, then each later
+    // line's head.
+    let open = scan.open;
     const heads = new Map<number, string>();
     // A LF inside a window title ends no line: search found the title's rest as a line of its own, and not
     // the line the tail showed (an independent read of the fix for the house's read of the 33 commits, #22,
@@ -249,18 +252,24 @@ export class LineScanner {
       }
       const nl = e < ends.length ? ends[e++]! : -1;
       const piece = data.slice(pos, nl === -1 ? undefined : nl);
-      const was = carry.raw;
+      // What of the piece the line keeps, found without slicing `raw`, which would flatten it once per piece.
+      let kept = '';
       if (!carry.cut) {
         const room = MAX_LINE_RAW - carry.raw.length;
         if (piece.length > room) {
           // Cut before a control sequence the cut would split, so no half of one shows as text.
           const head = carry.raw + piece.slice(0, room);
-          carry.raw = head.slice(0, unfinishedSequence(head));
+          const at = unfinishedSequence(head);
+          kept = piece.slice(0, Math.max(0, at - carry.raw.length));
+          carry.raw = head.slice(0, at);
           carry.cut = true;
-        } else carry.raw += piece;
+        } else {
+          kept = piece;
+          carry.raw += piece;
+        }
       }
       // Only what the line keeps names a pipe, and only once it shows a character.
-      if (stream !== 'pty' && carry.raw !== was && !carry.mixed && !(carry.shown && stream === carry.stream) && showsCharacter(was, carry.raw.slice(was.length))) {
+      if (stream !== 'pty' && kept && !carry.mixed && !(carry.shown && stream === carry.stream) && showsCharacter(open, kept)) {
         if (!carry.shown) {
           carry.stream = stream;
           carry.shown = true;
@@ -270,6 +279,7 @@ export class LineScanner {
       bytes += bytesOf(piece, ascii) + 1;
       pos = nl + 1;
       head = heads.get(nl) ?? '';
+      open = head;
       this.complete(carry, seq);
       this.carries.delete(key);
       carry = undefined;
