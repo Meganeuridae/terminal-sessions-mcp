@@ -195,9 +195,11 @@ export function renderRead(r: ReadResult, mode: ResultText, asked: { since?: Seq
   if (mode === 'json') return { text: JSON.stringify(r, null, 2), structured };
   const body = r.text !== undefined ? r.text : JSON.stringify(r.events, null, 1);
   const next = `since=${r.nextCursor}${r.nextOffset ? ` offset=${r.nextOffset}` : ''}`;
-  // Both counts are output lines; more than asked for reach back to the line written last (ReadResult.lines).
+  // Both counts are output lines, or for an events tail events (our read of the 40 commits, PR #22); more lines
+  // than asked for reach back to the line written last (ReadResult.lines).
+  const unit = r.events !== undefined ? 'events' : 'lines';
   const back = r.lines && r.lines.returned > r.lines.requested ? ', back to the line written last' : '';
-  const lines = r.lines ? ` · ${r.lines.returned} of ${r.lines.requested} lines${back}${tailMarks(r.lines, r.runId, asked.since)}` : '';
+  const lines = r.lines ? ` · ${r.lines.returned} of ${r.lines.requested} ${unit}${back}${tailMarks(r.lines, r.runId, asked.since)}` : '';
   const more = r.more ? ` · more: read ${next}${argWords({ until: asked.until, runId: r.runId })}` : '';
   const status = `[read ${r.session}${r.runId ? ` run ${r.runId}` : ''} seq ${r.seq[0]}–${r.seq[1]}${lines} · next: ${next}${more}${r.splitLine ? ' · last line continues' : ''}${gapsBit(r)}${r.truncated ? ' · truncated' : ''}]`;
   return { text: (body ? body + '\n' : '') + status, structured };

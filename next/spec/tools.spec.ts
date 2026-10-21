@@ -134,6 +134,13 @@ test('renderRead: a tail marks a first line cut at its head, with the read from 
   assert.deepEqual((JSON.parse(renderRead({ ...base, lines: { requested: 2, returned: 1, before: { until: 7, untilOffset: 12 } } }, 'json').text) as ReadResult).lines!.before, { until: 7, untilOffset: 12 });
 });
 
+test('renderRead: an events tail counts events on its status line, not lines (our read of the 40 commits, PR #22)', () => {
+  const r: ReadResult = { session: 's', seq: [7, 9], nextCursor: 9, more: false, truncated: false, events: [], lines: { requested: 5, returned: 3 } };
+  assert.match(renderRead(r, 'transcript').text, / · 3 of 5 events · /);
+  const text: ReadResult = { session: 's', seq: [7, 9], nextCursor: 9, more: false, truncated: false, text: 'a', lines: { requested: 5, returned: 3 } };
+  assert.match(renderRead(text, 'transcript').text, / · 3 of 5 lines · /);
+});
+
 test('renderRead: a Run tail’s advice names the Run and the tail’s since, and a line begun before the page is read on from where the earlier page ends', () => {
   // A reviewer's read of the fixes for #22: the marks left out runId and since, so following a Run tail's
   // `earlier` or `from its head` advice read the session, and an earlier page left the tail's range; and
