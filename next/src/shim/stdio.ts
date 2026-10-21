@@ -434,6 +434,13 @@ let open = false;
 let stdinClosed = false;
 let finishing = false;
 let everOpened = false;
+/**
+ * Something waited past the connect timeout and was dropped (see expireQueue) since the shim last had a
+ * connection: a session that ends with no connection then exits 1, whether its stdin ended before the wait ran
+ * out or after it. A connection clears it, as expireQueue's own exit is only ever for a drop in the stretch
+ * without one (a reviewer's read of the fixes for #22).
+ */
+let expired = false;
 let attempt = 0;
 /** One per connection attempt: the daemon's request ids are scoped to it. */
 let generation = 0;
@@ -635,10 +642,13 @@ function maybeFinish(): void {
   if (!stdinClosed || finishing) return;
   if (queue.length || inflight.size) return;
   finishing = true;
+  // With no connection, the exit is expireQueue's when stdin has ended first: 1 once anything waiting for one was
+  // dropped. Exiting 0 here, a shim that never reached termd exited 1 or 0 as its stdin's end came before or after
+  // the wait ran out, which a loaded host decided (the house's read of the 17 commits over our fixes, #22).
   if (ws && open) {
     ws.close(1000, 'stdin closed');
     setTimeout(() => exit(0), 1000).unref();
-  } else exit(0);
+  } else exit(expired ? 1 : 0);
 }
 
 /**
@@ -668,6 +678,7 @@ function expireQueue(): void {
     gone.answers ? `${gone.answers} answer${gone.answers === 1 ? '' : 's'} to the daemon's requests dropped` : '',
     gone.other ? `${gone.other} other line${gone.other === 1 ? '' : 's'} dropped` : '',
   ].filter(Boolean);
+  expired = true;
   const named = [...methods].slice(0, 8).join(', ') + (methods.size > 8 ? `, and ${methods.size - 8} more` : '');
   log(`waited ${connectTimeoutMs} ms for a connection to ${target}: ${parts.join(', ')}${named ? ` (${named})` : ''}`);
   pruneClosed();
@@ -930,6 +941,7 @@ function connect(): void {
     if (ws !== sock) return;
     open = true;
     attempt = 0;
+    expired = false;
     lastError = '';
     if (spawned) spawned.reached = true;
     if (everOpened) {

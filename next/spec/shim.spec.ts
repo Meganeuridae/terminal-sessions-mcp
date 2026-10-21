@@ -1165,6 +1165,51 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   }
 });
 
+test("tg-19: a shim that never reaches termd exits 1 whether its stdin ends before its connect wait runs out or after it, and one that reached termd since a drop exits 0 when it ends away from it (the house's read of the 17 commits over our fixes, #22)", async () => {
+  // Ended after the wait, the request was failed while stdin was open, and the end then found nothing left and exited
+  // 0: under load a starved shim read its stdin's end after the wait, and tg-19's cases failed 0 !== 1.
+  const port = await unusedPort();
+  for (const endAfterMs of [0, 1500]) {
+    const s = shim({ TSM_URL: `ws://127.0.0.1:${port}`, TSM_CONNECT_TIMEOUT_MS: '600' });
+    s.send(init(1));
+    if (endAfterMs) {
+      const failed = await s.next(byId(1), 5000);
+      assert.equal(failed.error?.code, -32000, 'answered before stdin ends');
+      await new Promise((r) => setTimeout(r, endAfterMs - 600));
+      s.end();
+    } else {
+      s.end();
+      assert.equal((await s.next(byId(1), 5000)).error?.code, -32000);
+    }
+    assert.equal(await s.exited, 1, `stdin ended ${endAfterMs ? 'after' : 'before'} the wait ran out`);
+  }
+  // A drop before termd was reached is the stretch's, not the session's: one that reached it since and ends while
+  // it is away again, with nothing dropped meanwhile, exits 0, as it would had its stdin ended while connected
+  // (a reviewer's read of the fixes for #22).
+  const s = shim({ TSM_URL: `ws://127.0.0.1:${port}`, TSM_CONNECT_TIMEOUT_MS: '600' });
+  let d: Daemon | undefined;
+  try {
+    s.send(init(1));
+    assert.equal((await s.next(byId(1), 5000)).error?.code, -32000, 'dropped before termd was reached');
+    d = await daemon(port);
+    // The shim reaches it on its backoff's next try: a ping sent before that waits out the 600 ms and is dropped too.
+    let reached = false;
+    for (let id = 2; !reached && id < 40; id++) {
+      s.send({ jsonrpc: '2.0', id, method: 'ping' });
+      reached = (await s.next(byId(id), 8000)).error === undefined;
+    }
+    assert.ok(reached, 'a ping answered by termd');
+    await d.close();
+    d = undefined;
+    await until(() => s.err.join('').includes('daemon connection closed'), 5000, 'the shim to see termd go');
+    s.end();
+    assert.equal(await s.exited, 0, 'ended away from termd with nothing dropped since it was reached');
+  } finally {
+    s.child.kill();
+    if (d) await d.close();
+  }
+});
+
 test("tg-19: no termd is started for a wss:// address, and a URL without a port means the scheme's port (the house's read of 4e37a11, #22)", async () => {
   const port = await unusedPort();
   const dir = path.join(tmp, 'spawn-wss');
