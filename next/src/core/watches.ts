@@ -589,8 +589,11 @@ export class WatchManager {
         const cur = run && (this.host.journal.runs.get(run.runId) ?? run);
         const last = run ? this.lastRunOutput(run.runId) : lastOutput(this.host.journal);
         if (cur && isTerminal(cur.state)) {
-          const quiet = last ? this.ageOf(last) : Math.max(0, Date.now() - (cur.endedAt ?? Date.now()));
-          return finish(result({ matched: true, match: `${endText(cur)}; no output for ${quiet}ms`, seq: cur.seq.end ?? this.host.journal.lastSeq }));
+          // A Run that printed nothing has no output to age, and says so as a watch on it does: its quiet was
+          // taken from the journal's wall-clock end, so a clock step put any figure there (the house's read
+          // of the 40 commits, #22).
+          const quiet = last ? ` no output for ${this.ageOf(last)}ms` : ' no output';
+          return finish(result({ matched: true, match: `${endText(cur)};${quiet}`, seq: cur.seq.end ?? this.host.journal.lastSeq }));
         }
         const age = last ? this.ageOf(last) : 0;
         if (last && age >= spec.silenceMs!) return finish(result({ matched: true, match: `no output for ${age}ms`, seq: last.seq }));

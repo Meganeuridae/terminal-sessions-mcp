@@ -430,3 +430,22 @@ test('silence rechecks its deadline deterministically under mock timers, beside 
     journal.close();
   }
 });
+
+test('a silence wait answering for an ended Run that printed nothing says "no output", as a watch on it does, with no figure from the wall clock (the house’s read of the 40 commits, #22)', async (t) => {
+  // Its quiet was Date.now() minus the journal's end: a forward step of 10 s reported 10 s of quiet.
+  const f = bare();
+  try {
+    f.startRun('q');
+    const watch = f.manager.add({ silenceMs: 60_000, runId: 'q' }, A);
+    f.journal.append({ type: 'run.end', runId: 'q', state: 'exited', exit: 0, durationMs: 1 });
+    const fired = f.firings(watch.watchId)[0]?.match;
+    assert.equal(fired, 'run q ended (exited 0); no output');
+    const wall = Date.now();
+    t.mock.method(Date, 'now', () => wall + 10_000);
+    const w = await f.manager.waitFor({ silenceMs: 200, runId: 'q' }, 5000);
+    assert.equal(w.matched, true, JSON.stringify(w));
+    assert.equal(w.match, fired);
+  } finally {
+    f.close();
+  }
+});
