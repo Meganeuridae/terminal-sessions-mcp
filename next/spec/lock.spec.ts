@@ -964,6 +964,37 @@ function patching<K extends keyof typeof fsc, T>(name: K, replacement: (real: (t
 }
 const temps = (dir: string) => fs.readdirSync(dir).filter((n) => n.startsWith(`${LOCK_FILE}.`) && n.endsWith('.tmp'));
 
+test('a start that finds another owner beside its own in the guard it made backs off: that owner stays, and the lock is untouched', () => {
+  // Another start's owner file lands in this start's fresh guard before it looks, as when a guard removed
+  // while empty was made again by this start and a late owner wrote into it.
+  const dir = dataDir();
+  staleLock(dir);
+  const guard = guardOf(dir);
+  const other = path.join(guard, `${process.ppid}.2222222222222222`);
+  let injected = false;
+  assert.throws(
+    () =>
+      patching(
+        'mkdirSync',
+        (real) =>
+          ((p: fs.PathLike, ...rest: unknown[]) => {
+            const made = (real as (...a: unknown[]) => string | undefined)(p, ...rest);
+            if (String(p) === guard && !injected) {
+              injected = true;
+              fs.writeFileSync(other, record(process.ppid, '2222222222222222'));
+            }
+            return made;
+          }) as typeof fs.mkdirSync,
+        () => acquireDataDirLock(dir),
+      ),
+    locked,
+  );
+  assert.ok(injected, 'the other owner went in between the mkdir and the look');
+  assert.deepEqual(fs.readdirSync(guard), [path.basename(other)], 'the other owner is kept, and this start left only its own file');
+  assert.equal(readLock(dir).pid, 999_999, 'the lock is untouched');
+  assert.deepEqual(temps(dir), [], 'no temp is left');
+});
+
 test('a guard entry that cannot be read is kept, and the refusal names the guard and what it holds, with the advice to remove the guard', () => {
   const dir = dataDir();
   staleLock(dir);
