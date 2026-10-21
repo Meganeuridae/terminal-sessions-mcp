@@ -1541,3 +1541,20 @@ test('search reports a hole once when its recorded range spans several the reads
   const holes = r.gaps ?? (r.gap ? [r.gap] : []);
   assert.deepEqual(holes.map((g) => [g.from, g.to, g.reason]), [[4, 9, 'store-error']], JSON.stringify(holes));
 });
+
+test("a Run's tail after a hole is not read as inside a string left open before the hole (our read of the 40 commits, PR #22)", async () => {
+  // The look-back looked for the Run's holes among its events, which are outputs: a title left open before a hole
+  // took every line after it, and a tail of 3 came back empty and truncated.
+  const src = source();
+  startRun(src.journal, 'r1');
+  out(src.journal, 'a\r\n\x1b]0;title-left-open', 'stdout', 'r1');
+  const hole = src.journal.lastSeq + 1;
+  src.journal.append({ type: 'gap', from: hole, to: hole, reason: 'torn-write' });
+  for (let i = 0; i < 8000; i++) out(src.journal, `line ${String(i).padStart(4, '0')} ${'x'.repeat(30)}\r\n`, 'stdout', 'r1');
+  endRun(src.journal, 'r1');
+  for (const tail of [1, 3]) {
+    const r = await readJournal(src, { runId: 'r1', tail }, { resultBytes: 16384 });
+    const want = Array.from({ length: tail }, (_, i) => `line ${String(8000 - tail + i).padStart(4, '0')} ${'x'.repeat(30)}`);
+    assert.deepEqual(r.text!.split('\n'), want, JSON.stringify(r.lines));
+  }
+});

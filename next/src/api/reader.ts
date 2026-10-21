@@ -1382,10 +1382,14 @@ function openBefore(src: ReadSource, o: ReadOptions, first: Output): string {
   const back: string[] = [];
   let bytes = 0;
   if (o.runId !== undefined) {
+    // A Run's holes come apart from its events (RunOutput.gaps): the look-back stops at the last one before
+    // `first`. Looked for among the events, which are outputs, a title left open before a hole hid every line of a
+    // tail after it (our read of the 40 commits, PR #22).
     const ro = src.runOutput(o.runId, { until: first.seq - 1, maxBytes: STATE_LOOKBACK });
+    const holeEnd = Math.max(-1, ...(ro.gaps ?? []).filter((g) => g.from < first.seq).map((g) => Math.min(g.to, g.seq)));
     for (let i = ro.events.length - 1; i >= 0; i--) {
       const e = ro.events[i]!;
-      if (isGap(e)) break;
+      if (e.seq <= holeEnd) break;
       if (isOutput(e) && sourceKey(e) === key) back.push(e.data);
     }
   } else {
