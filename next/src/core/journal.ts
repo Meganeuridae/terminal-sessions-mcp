@@ -274,7 +274,10 @@ export class Journal {
       this.append(gapEvent(accounted + 1, this.seq, hole && !crash ? 'store-failed' : 'torn-write', exact));
     }
     // With the disk taking writes, the stretches found inside the files are recorded now; else at the catch-up.
-    if (this.lost.length && this.coldError === null) this.recordLost();
+    if (this.lost.length && this.coldError === null) {
+      this.recordLost();
+      this.keepMark(); // and the mark is no longer failed, if every gap is on disk
+    }
   }
 
   /**
@@ -383,9 +386,24 @@ export class Journal {
 
   /** Issue the gaps of every lost stretch, now that the disk takes writes, and forget them. */
   private recordLost(): void {
-    const lost = this.lost;
-    this.lost = [];
-    for (const r of lost) this.issue(gapEvent(r.from, r.to, r.reason, r.exact));
+    // Each stretch leaves `lost` only once its gap is on disk, or is carried by `unwritten` because the disk refused
+    // it: meanwhile the reservation stays failed from at most its first seq. Taken out before its gap was issued, the
+    // stretch let that issue write the mark not failed, and the gap's refusal mark it failed from the files' last
+    // seq plus one, above the stretch; with the lowering write refused too, a crash left the next start reading the
+    // files past the stretch with no gap for it (a reviewer's check of the fixes for the review of f3750e4, PR #22).
+    for (const r of [...this.lost]) {
+      this.issue(gapEvent(r.from, r.to, r.reason, r.exact));
+      const i = this.lost.indexOf(r);
+      if (i !== -1) this.lost.splice(i, 1);
+    }
+  }
+
+  /**
+   * A hole no file records yet: the disk refuses events, or a lost stretch or a gap the disk refused is still to be
+   * written. The reservation is marked failed exactly while this holds, from at most the lowest such hole's seq.
+   */
+  private holesUnrecorded(): boolean {
+    return this.coldError !== null || this.lost.length > 0 || this.unwritten.length > 0;
   }
 
   /**
@@ -455,7 +473,8 @@ export class Journal {
   /**
    * Keep the reservation where the next seq needs it, before that seq is issued: above it, a block ahead
    * (exactly at it once sealed: a sealed journal issues only what its catch-up records), and marked
-   * `failed` exactly while the cold store refuses events. One comparison an event while nothing is due.
+   * `failed` exactly while a hole no file records remains (holesUnrecorded): while the cold store refuses
+   * events, and until the gaps of what it lost are on disk. One comparison an event while nothing is due.
    * A refused write is retried at most once a second; the event is issued meanwhile, so a power loss
    * while the disk refuses can reissue seqs (best effort, as the module says). A refusal that leaves
    * numbering exposed is said, once until a write lands: a refused failed mark (a daemon crash on this
@@ -465,7 +484,7 @@ export class Journal {
    */
   private keepMark(): void {
     if (!this.cold?.setHighWater) return;
-    const failed = this.coldError !== null;
+    const failed = this.holesUnrecorded();
     const ahead = this.reserved > this.seq;
     // While failing, also when a hole the mark does not reach down to appeared (a refused gap's, below the files' last).
     const reach = failed ? this.unrecordedFrom() : Number.POSITIVE_INFINITY;
@@ -500,7 +519,7 @@ export class Journal {
    * independent read of the fix for the house's read of the 33 commits, PR #22, comment 6307349700).
    */
   private exactlyReserved(): boolean {
-    if (this.coldError !== null || this.markUnsure) return false;
+    if (this.holesUnrecorded() || this.markUnsure) return false;
     const r = this.cold?.highWater?.()?.reservation;
     return r !== undefined && r.to === this.seq && r.failed !== true;
   }
@@ -828,7 +847,7 @@ export class Journal {
       // Exact now: a sealed journal issues no more seqs, so the next journal over the store numbers on from
       // this one's last, and after a power loss records as lost only what the files lost. If the disk
       // refuses this too, the reservation a block ahead stands, which is safe.
-      this.writeReservation(this.seq, this.coldError !== null);
+      this.writeReservation(this.seq, this.holesUnrecorded());
     }
     this.sealed = true;
     this.listeners.clear();

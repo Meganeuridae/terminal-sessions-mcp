@@ -320,6 +320,52 @@ test('a start after a stop while the disk refused looks for jumps in the files o
   }
 });
 
+test('a catch-up whose stretch\'s gap the disk refuses never marks the reservation above the stretch, and a crash with any of its mark writes refused still leaves the next start the hole', () => {
+  // The catch-up wrote the mark not failed as it issued the gap, then failed from the files' last seq plus one when
+  // the disk refused the gap, then lowered it: with that last write refused, an idle session's crash left the next
+  // start reading 10 then 39 with no gap for 11–38 (a reviewer's check of the fixes for the review of f3750e4, PR #22).
+  for (const allowed of [0, 1, 2, 3]) {
+    const dir = tmpDir();
+    try {
+      let budget = Number.POSITIVE_INFINITY;
+      let marks = Number.POSITIVE_INFINITY;
+      const written: string[] = [];
+      class Refusing extends FileStore {
+        override append(event: JournalEvent): void {
+          if (budget-- <= 0) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+          super.append(event);
+        }
+        override setHighWater(change: Parameters<FileStore['setHighWater']>[0]): boolean {
+          if (marks-- <= 0) return false;
+          const r = change.reservation;
+          if (r) written.push(r.failed ? `failed from ${r.failedFrom}` : 'not failed');
+          return super.setHighWater(change);
+        }
+      }
+      const cold = new Refusing(dir);
+      const j = new Journal({ hot: new MemoryStore(1500), cold, sessionId: 's' });
+      for (let i = 0; i < 10; i++) j.append(out(`ok${i}`));
+      budget = 0;
+      for (let i = 0; i < 40; i++) j.append(out(`a-${i}-${'z'.repeat(40)}`)); // refused from seq 11; the ring drops 11–38
+      const held = j.since(0).events.filter((e) => e.type === 'output' && e.seq > cold.lastSeq()!).length;
+      budget = held; // the catch-up writes what the ring holds, then the disk refuses the stretch's gap
+      written.length = 0;
+      marks = allowed;
+      j.retryCold();
+      assert.equal(j.stats().coldFailed !== null, true, 'the gap was refused');
+      assert.deepEqual(written.filter((w) => w !== 'failed from 11'), [], `allowed ${allowed}: no mark above the stretch, none cleared: ${written.join(' → ')}`);
+      // The daemon dies, idle; the next start finds the disk taking writes.
+      budget = Number.POSITIVE_INFINITY;
+      marks = Number.POSITIVE_INFINITY;
+      const next = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+      assert.ok(gaps(next.since(0).events).some((g) => g[0] === 11 && g[1] === 38), `allowed ${allowed}: the hole is recorded: ${JSON.stringify(gaps(next.since(0).events))}`);
+      next.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 // ───────────── jr2-7: age retention reaches the active file and an idle ring ─────────────
 
 test('a new life numbers on from the last seq the life before it issued, and its hole of events the disk never took counts exactly, even when the seal could not lower the reservation', () => {
