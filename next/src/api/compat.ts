@@ -13,11 +13,11 @@ import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
 import { ackMark, cutPlumbing, exitMark, goneMark, inlineTypedLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLineEcho, startMark } from '../core/plumbing.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
-import { keepLines as tailOfLines, project, type ProjectChunk } from '../core/transcript.js';
+import { keepLines as tailOfLines } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
 import { commitReadDelivery, takeReadCommit, type App, type PlumbedRun, type ReadResult, type SessionSummary } from './app.js';
 import { looksLikeShellOpener } from './hints.js';
-import { clippedText, gapNote, gapsText, isSourceHeader, type GapInfo } from './reader.js';
+import { clippedText, gapNote, gapsText, isSourceHeader } from './reader.js';
 import type { ToolContext, ToolDef, ToolResult } from './tools.js';
 
 const json = (value: unknown): ToolResult => ({
@@ -94,12 +94,12 @@ const omitted = (runId: string, text: string): string => `[… earlier output om
  * A Run's whole output, paged through `read` (text, or raw events), keeping the last
  * COMPAT_OUTPUT_BYTES with a visible marker when more was cut (er-14, atc-11). The bound
  * is counted in bytes, as the reader counts, not in UTF-16 units (the house's read of 1cabc6a, #22).
- * A shell Run whose output holds the daemon's plumbing is cut first (cutRunOutput).
+ * `read`'s text of a shell Run is cut of the daemon's plumbing; its raw output is cut here (rawRunOutput).
  */
 async function runOutput(ctx: ToolContext, session: string, run: { runId: string; seq: [Seq, Seq] }, raw: boolean, d: Drawn): Promise<string> {
   const runId = run.runId;
-  const plumbed = ctx.app.runPlumbing(ctx.caller, { session, from: run.seq[0], to: run.seq[1] }).find((p) => p.runId === runId);
-  if (plumbed && plumbed.strategy !== 'rich') return cutRunOutput(ctx, session, plumbed, raw, d);
+  const plumbed = raw ? ctx.app.runPlumbing(ctx.caller, { session, from: run.seq[0], to: run.seq[1] }).find((p) => p.runId === runId) : undefined;
+  if (plumbed && plumbed.strategy !== 'rich') return rawRunOutput(ctx, session, plumbed, d);
   const parts: string[] = [];
   let bytes = 0;
   let cut = false;
@@ -130,27 +130,26 @@ async function runOutput(ctx: ToolContext, session: string, run: { runId: string
 }
 
 /**
- * A shell Run's output without the daemon's plumbing, cut by the core's one cutter (plumbing.ts cutPlumbing) with
- * the strategy, nonce and shell its run.start recorded, as the run's own result is cut, then projected at the size
- * the Run started at, or kept raw. `read` pages a Run as the terminal showed it, plumbing and all: through it a
- * declared shell's Run ended in its `<<<EXIT:…>>>` mark, and a marker Run (dash) began with the typed line's echo
- * and its start mark and ended in its end mark and the prompt after it (our read of the house's fixes for its
- * review of f3750e4, PR #22; older than them). Its raw events are read whole, the newest COMPAT_OUTPUT_BYTES of
- * output kept; what follows a hole is cut as output read from after the Run's start, and as text the hole shows as
- * its note.
+ * A shell Run's raw output without the daemon's plumbing. `read`'s text of a Run is cut by the reader (reader.ts
+ * runKept); an events read is the journal as it stands, plumbing and all: the typed line's echo and the marks a
+ * marker Run (dash) printed, a declared shell's end mark. So the raw output is cut here by the core's one cutter
+ * (plumbing.ts cutPlumbing), by the strategy, nonce and shell the Run's run.start recorded, as its own result is cut
+ * (our read of the house's fixes for its review of f3750e4, PR #22; older than them). The Run's events are read
+ * whole, the newest COMPAT_OUTPUT_BYTES of output kept; what follows a hole is cut as output read from after the
+ * Run's start.
  */
-async function cutRunOutput(ctx: ToolContext, session: string, run: PlumbedRun, raw: boolean, d: Drawn): Promise<string> {
+async function rawRunOutput(ctx: ToolContext, session: string, run: PlumbedRun, d: Drawn): Promise<string> {
   const events: JournalEvent[] = [];
   let bytes = 0;
   let cut = false;
-  let since: number | undefined;
   // A hole retention left at the Run's head, which the reader reports beside the events rather than among them.
-  let lead: GapInfo | undefined;
+  let headless = false;
+  let since: number | undefined;
   for (let page = 0; page < 4096; page++) {
     const o: Parameters<App['read']>[1] = { session, runId: run.runId, as: 'events', limit: 2000, maxBytes: 256 * 1024 };
     if (since !== undefined) o.since = since;
     const r = await readFor(ctx, d, o);
-    if (page === 0 && r.gap !== undefined && !(r.events ?? []).some((e) => e.type === 'gap' && e.from === r.gap!.from)) lead = r.gap;
+    if (page === 0 && r.gap !== undefined && !(r.events ?? []).some((e) => e.type === 'gap' && e.from === r.gap!.from)) headless = true;
     for (const e of r.events ?? []) {
       if (e.type !== 'output' && e.type !== 'gap') continue;
       events.push(e);
@@ -165,27 +164,20 @@ async function cutRunOutput(ctx: ToolContext, session: string, run: PlumbedRun, 
     since = r.nextCursor;
   }
   // The output between holes, each stretch cut on its own: a hole ends what was open before it.
-  const chunks: ProjectChunk[] = lead ? [{ note: gapNote(lead) }] : [];
+  const kept: string[] = [];
   let stretch = '';
-  let atHead = !cut && !lead;
+  let atHead = !cut && !headless;
   const flush = () => {
-    if (stretch) chunks.push({ data: cutPlumbing(stretch, { strategy: run.strategy, nonce: run.nonce, pid: run.pid, truncated: !atHead }), stream: 'pty' });
+    if (stretch) kept.push(cutPlumbing(stretch, { strategy: run.strategy, nonce: run.nonce, pid: run.pid, truncated: !atHead }));
     stretch = '';
     atHead = false;
   };
   for (const e of events) {
     if (e.type === 'output') stretch += e.data;
-    else if (e.type === 'gap') {
-      flush();
-      chunks.push({ note: gapNote(e) });
-    }
+    else flush();
   }
   flush();
-  // Raw, the output alone, as runOutput's raw pages join it; as text, projected as the reader projects a Run, holes as their notes.
-  const s = run.cols === undefined || run.rows === undefined ? summaryOf(ctx, session) : undefined;
-  const out = raw
-    ? chunks.map((c) => (typeof c === 'object' && 'data' in c ? c.data : '')).join('')
-    : (await project(chunks, { cols: run.cols ?? s?.cols ?? DEFAULT_GEOMETRY.cols, rows: run.rows ?? s?.rows ?? DEFAULT_GEOMETRY.rows, keep: 'tail' })).text;
+  const out = kept.join('');
   return cut || utf8Length(out) > COMPAT_OUTPUT_BYTES ? omitted(run.runId, out) : out;
 }
 

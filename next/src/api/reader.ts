@@ -29,6 +29,12 @@
  *   than the rest of its page is cut mid-line, and its rest begins the next page
  *   at column 0, so a tab or cursor motion in that rest lands on a different
  *   column than it would unsplit.
+ * - A shell Run's pages and tails (`runId`) show what the Run's own result
+ *   shows: the daemon's plumbing in its range (a marker Run's typed line,
+ *   marks and the prompt after its end mark, a declared shell's end mark, a
+ *   cancel's probe lines) is cut by the core's cutter, and the cursors and
+ *   `lines.before` are journal positions still (runKept). A read of the
+ *   session shows everything, as the terminal did.
  * - `splitLine` is set whenever the page ends mid-line and the line may go on:
  *   more follows, or the range is still open (a running Run, a live session).
  * - `more` is true whenever retained events of the range remain after the page.
@@ -71,6 +77,7 @@
  */
 import { err } from '../core/errors.js';
 import type { Journal } from '../core/journal.js';
+import { keptRanges, type PlumbingOf } from '../core/plumbing.js';
 import { compileUserRegex, headOnlyText } from '../core/regex.js';
 import type { RunOutput, RunOutputRange } from '../core/runindex.js';
 import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
@@ -291,7 +298,8 @@ const chunkOf = (e: Output, data = e.data): ProjectChunk => ({ data, stream: e.s
 
 /** A piece of a page: an output event (or its part from `start` bytes on), or a hole. */
 /** `ends`: the line ends in `data` (lineEnds), read from the page's start, which lies outside every control sequence. */
-type OutPiece = { kind: 'out'; ev: Output; data: string; start: number; bytes: number; ends: number[] };
+/** `kept`: in a shell Run's page, the parts of `data` that are the Run's own (runKept); absent when all of it is. */
+type OutPiece = { kind: 'out'; ev: Output; data: string; start: number; bytes: number; ends: number[]; kept?: Array<[number, number]> };
 type Piece = OutPiece | { kind: 'gap'; seq: Seq; gap: GapInfo; atStart?: true };
 
 /** The range a read or search walks: events after a cursor, in batches, up to an end. */
@@ -411,7 +419,7 @@ export async function readJournal(src: ReadSource, o: ReadOptions, defaults: { r
   if (o.untilOffset !== undefined && (o.tail === undefined || o.until === undefined || o.as === 'events')) {
     throw err('invalid_argument', 'untilOffset goes with a text tail and until: pass a tail result’s lines.before.until and lines.before.untilOffset as until and untilOffset, beside tail');
   }
-  if (o.tail !== undefined) return res(await tailRead(src, o, maxBytes, geometry));
+  if (o.tail !== undefined) return res(await tailRead(src, o, maxBytes, geometry, run));
   if (o.as === 'events') return res(eventsPage(src, o, maxBytes));
   return res(await textPage(src, o, maxBytes, geometry, run));
 }
@@ -470,6 +478,14 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
         bytes += b;
       }
     }
+  }
+  // A shell Run's page shows the Run's own output, its plumbing cut (runKept); the cursors stay the journal's.
+  const of = plumbingOf(o, run);
+  if (of) {
+    const outs = pieces.map((q) => (q.kind === 'out' ? q : undefined));
+    runKept(src, o.runId!, of, outs.map((q) => q && { ev: q.ev, from: indexAtByte(q.ev.data, q.start), data: q.data })).forEach((k, i) => {
+      if (k) outs[i]!.kept = k;
+    });
   }
   // Whether events of the range remain after everything collected (the scan stopped early).
   const scanCut = !exhausted;
@@ -530,6 +546,83 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   if (nextOffset !== undefined) r.nextOffset = nextOffset;
   if (chosen.midLine && (more || open)) r.splitLine = true;
   return withGapInfo(r, chosen.gaps);
+}
+
+/**
+ * What a shell Run's output holds besides its command's, from its record: the strategy, nonce and shell its
+ * run.start recorded (core/plumbing.ts), for a read of that Run; undefined for a read that cuts nothing (the
+ * session's, as the terminal showed it; a process Run's; a rich shell Run's, whose marks are no output). A Run
+ * journaled before the recording is cut by shape, as history renders it (segmenter.ts journalRunText).
+ */
+function plumbingOf(o: ReadOptions, run: RunInfo | undefined): PlumbingOf | undefined {
+  if (o.runId === undefined || run?.target !== 'shell' || run.strategy === 'rich') return undefined;
+  return { strategy: run.strategy, nonce: run.nonce, pid: run.shellPid !== undefined ? String(run.shellPid) : undefined };
+}
+
+/** A Run's output before a stretch it is cut with: from the Run's head when that lies within this many bytes, so its typed line's echo and start mark are the cutter's. */
+const CUT_HEAD = 64 * 1024;
+/** A Run's output after a stretch it is cut with, at least: a mark or a struck line that a page or a tail ends inside is whole to the cutter. */
+const CUT_AHEAD = 4 * 1024;
+
+/** A piece of a Run's output to cut: event `ev`'s data from character `from` on, `data` long. */
+interface CutPiece {
+  ev: Output;
+  from: number;
+  data: string;
+}
+
+/**
+ * Which characters of each piece are the Run's own, by the core's one cutter (plumbing.ts keptRanges), so a
+ * shell Run's pages and tails show what its own result shows: under the marker strategy without the typed
+ * line's echo, the start and end marks and the prompt the shell printed after the end, under a declared
+ * shell's without its end mark, and without the lines a cancel's probe left. Read through `read {runId}`,
+ * and the compat pack's runCommand with it, a Run showed all of them (our read of the house's fixes for its
+ * review of f3750e4, PR #22; older than them). `pieces` holds the read's output in order, undefined at a
+ * hole: each stretch between holes is cut with the Run's output around it, back to the Run's head when that
+ * lies within CUT_HEAD (else as far, and as output read from after the Run's start: what the cutter takes
+ * from the head of such a stretch, a line in the typed line's echo's shape, is the program's), and CUT_AHEAD
+ * past it, each up to a hole. Returns, per piece, its kept ranges (character indices into its data), or
+ * undefined when all of it is kept. The cut is made on the text; the read's cursors stay journal positions.
+ */
+function runKept(src: ReadSource, runId: string, of: PlumbingOf, pieces: Array<CutPiece | undefined>): Array<Array<[number, number]> | undefined> {
+  const out: Array<Array<[number, number]> | undefined> = pieces.map(() => undefined);
+  for (let i = 0; i < pieces.length; ) {
+    if (!pieces[i]) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < pieces.length && pieces[j]) j++;
+    const stretch = pieces.slice(i, j) as CutPiece[];
+    const first = stretch[0]!;
+    const last = stretch[stretch.length - 1]!;
+    const back = src.runOutput(runId, { until: first.ev.seq - 1, maxBytes: CUT_HEAD });
+    const holeEnd = Math.max(-1, ...(back.gaps ?? []).map((g) => g.to));
+    const before = back.events.filter((e): e is Output => isOutput(e) && e.seq > holeEnd).map((e) => e.data).join('') + first.ev.data.slice(0, first.from);
+    let after = last.ev.data.slice(last.from + last.data.length);
+    if (after.length < CUT_AHEAD) {
+      const fwd = src.runOutput(runId, { since: last.ev.seq, limit: 32 });
+      const holeStart = Math.min(Number.POSITIVE_INFINITY, ...(fwd.gaps ?? []).map((g) => g.from));
+      for (const e of fwd.events) {
+        if (!isOutput(e) || e.seq >= holeStart || after.length >= CUT_AHEAD) break;
+        after += e.data;
+      }
+    }
+    // Read from the Run's head unless retention, a hole or the bound cut what came before.
+    const atHead = !back.truncated;
+    let kept = keptRanges(before + stretch.map((p) => p.data).join('') + after, { ...of, truncated: !atHead });
+    if (!atHead && kept.length && kept[0]![0] > 0) kept = [[0, kept[0]![1]], ...kept.slice(1)];
+    let at = before.length;
+    stretch.forEach((p, k) => {
+      const lo = at;
+      at += p.data.length;
+      const parts: Array<[number, number]> = [];
+      for (const [a, b] of kept) if (Math.min(b, at) > Math.max(a, lo)) parts.push([Math.max(a, lo) - lo, Math.min(b, at) - lo]);
+      if (parts.length !== 1 || parts[0]![0] !== 0 || parts[0]![1] !== p.data.length) out[i + k] = parts;
+    });
+    i = j;
+  }
+  return out;
 }
 
 /** True when output after the range's end may still continue its last line: a running Run, a live journal. */
@@ -775,7 +868,7 @@ function choose(pieces: Piece[], budget: number, hold: boolean, journal: Journal
       lastBySource.clear(); // a hole ends every line
       continue;
     }
-    chunks.push(chunkOf(pc.ev, pc.data));
+    chunks.push(chunkOf(pc.ev, pc.kept ? pc.kept.map(([a, b]) => pc.data.slice(a, b)).join('') : pc.data));
     const key = sourceKey(pc.ev);
     sources.add(key);
     const prior = lastBySource.get(key);
@@ -912,7 +1005,7 @@ function eventsPage(src: ReadSource, o: ReadOptions, maxBytes: number): Omit<Rea
 
 // ───────────── tail ─────────────
 
-async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geometry: { cols: number; rows: number }): Promise<Omit<ReadResult, 'session'>> {
+async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geometry: { cols: number; rows: number }, run: RunInfo | undefined): Promise<Omit<ReadResult, 'session'>> {
   const journal = src.journal;
   const n = clamp(o.tail!, 1, 10_000);
   // Input with enough line ends for the last n lines, and room for a screenful of redraw (§6 rule 7).
@@ -933,6 +1026,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
         });
   let events: JournalEvent[];
   let end: Seq;
+  /** The output events read, before `clip` cut the event `until` (a Run's window). */
+  let whole: ReadonlyMap<Seq, Output> | undefined;
   /** Output of the range older than what was fetched exists, or existed and is gone. */
   let older: boolean;
   /** The range's first seq: after `since`, and not before a Run's first. */
@@ -957,6 +1052,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     end = o.until !== undefined ? Math.min(ro.to, o.until) : ro.to;
     rangeStart = Math.max(rangeStart, ro.from);
     older = ro.truncated;
+    whole = new Map(ro.events.filter(isOutput).map((e) => [e.seq, e]));
     events = [...got, ...(ro.gaps ?? [])].sort((a, b) => a.seq - b.seq);
     // Nothing of the range retained: the hole is the range (the house's read of 1cabc6a, #22), less what a recorded gap already says.
     const inferred = ro.truncated && ro.events.length === 0 ? retentionGap(journal, rangeStart, end) : undefined;
@@ -1053,6 +1149,14 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     items.push({ ev: e, lines: lines.length });
     carries.clear();
   };
+  // A shell Run's tail shows the Run's own output, its plumbing cut (runKept): each event's kept parts are items
+  // of their own, so where the lines shown begin is a position in the journal still.
+  const of = plumbingOf(o, run);
+  const ownParts = new Map<JournalEvent, Array<[number, number]> | undefined>();
+  if (of) {
+    const outs = events.map((e) => (isOutput(e) ? e : undefined));
+    runKept(src, o.runId!, of, outs.map((e) => e && { ev: whole?.get(e.seq) ?? e, from: 0, data: e.data })).forEach((k, i) => ownParts.set(events[i]!, k));
+  }
   for (const e of events) {
     if (isGap(e)) {
       gaps.push(gapOf(e));
@@ -1062,12 +1166,16 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     } else if (isOutput(e)) {
       const key = sourceKey(e);
       sources.add(key);
-      chunks.push(chunkOf(e));
       let carry = carries.get(key);
       if (!carry) carries.set(key, (carry = lineCarry()));
-      const item: TextItem = { ev: e, key, data: e.data, ...interleaveCut(e.data, carry) };
-      if (clipped && e.seq === o.until) item.clipped = true;
-      items.push(item);
+      for (const [a, b] of ownParts.get(e) ?? [[0, e.data.length]]) {
+        const data = e.data.slice(a, b);
+        chunks.push(chunkOf(e, data));
+        const item: TextItem = { ev: e, key, data, ...interleaveCut(data, carry) };
+        if (a > 0) item.skip = a;
+        if ((clipped && e.seq === o.until) || b < e.data.length) item.clipped = true;
+        items.push(item);
+      }
     } else if (o.commands && e.type === 'run.start' && e.line !== undefined) {
       note(e, `$ ${e.line}`);
     }
@@ -1254,7 +1362,9 @@ function lastLinesBytes(items: TextItem[], n: number): number {
 /**
  * A piece of a tail's text in journal order: an output event's data (`key` its source; `ends` its line
  * ends, and `through` where the projection's interleave cuts it: interleaveCut), or a note (a hole, a
- * command). `clipped`: the data is the event's head only, the range ending inside it (`untilOffset`).
+ * command). `clipped`: the data ends before the event does (the range ends inside it: `untilOffset`; or a shell
+ * Run's plumbing follows it in the event). `skip`: the data begins that many characters into the event (the
+ * plumbing before it is cut).
  * `lines`: a note's lines in the text (a command's line can hold newlines).
  */
 interface TextItem {
@@ -1264,6 +1374,7 @@ interface TextItem {
   ends?: number[];
   through?: number;
   clipped?: true;
+  skip?: number;
   lines?: number;
 }
 
@@ -1280,7 +1391,8 @@ const maxCut = (a: Cut | undefined, b: Cut | undefined): Cut | undefined => (!a 
 function positionOf(items: TextItem[], cut: Cut): Position {
   const it = items[cut.i]!;
   if (it.data === undefined || (cut.c >= it.data.length && !it.clipped)) return { until: it.ev.seq };
-  return { until: it.ev.seq, untilOffset: utf8Length(it.data.slice(0, cut.c)) };
+  const skipped = it.skip ? utf8Length((it.ev as Output).data.slice(0, it.skip)) : 0;
+  return { until: it.ev.seq, untilOffset: skipped + utf8Length(it.data.slice(0, cut.c)) };
 }
 
 /** The first event at or after `cut`. */

@@ -134,7 +134,7 @@ export interface SessionSummary extends SessionHeader {
 }
 
 /** A shell Run whose output may hold the daemon's plumbing, as App.runPlumbing describes it. */
-export type PlumbedRun = Pick<PlumbingOf, 'strategy' | 'nonce' | 'pid'> & { runId: string; line?: string; cols?: number; rows?: number };
+export type PlumbedRun = Pick<PlumbingOf, 'strategy' | 'nonce' | 'pid'> & { runId: string; line?: string };
 
 export interface Caller {
   principal: Principal;
@@ -1329,9 +1329,9 @@ export class App {
    * the session's text as a whole, which no Run renderer cuts for (the compat pack's logs). A Run's
    * own text is cut by the renderers; a Run journaled before the recording has neither, and its
    * marks are found by shape (the house's read of 78c4d6e, #22). `line` is the Run's line, which a
-   * reader that heads each Run with `$ <line>` needs to know how many lines that heading takes; `pid`
-   * the shell that answers for an inline Run, and `cols`/`rows` the size it started at, for a reader
-   * that cuts and projects one Run's output itself (the compat pack's runCommand).
+   * reader that heads each Run with `$ <line>` needs to know how many lines that heading takes, and
+   * `pid` the shell that answers for an inline Run, for a reader that cuts one Run's raw output itself
+   * (the compat pack's runCommand).
    */
   runPlumbing(caller: Caller, o: { session: string; from: Seq; to: Seq }): PlumbedRun[] {
     const s = this.find(caller, o.session, 'observe');
@@ -1351,8 +1351,6 @@ export class App {
       if (r.nonce !== undefined) p.nonce = r.nonce;
       if (r.shellPid !== undefined) p.pid = String(r.shellPid);
       if (r.line !== undefined) p.line = r.line;
-      if (r.cols !== undefined) p.cols = r.cols;
-      if (r.rows !== undefined) p.rows = r.rows;
       out.push(p);
     }
     return out;
