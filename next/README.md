@@ -222,7 +222,9 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   would when a terminal closes. `KillMode=mixed` would SIGKILL everything else left in the cgroup
   on every stop, once termd has exited, and take them. What `process` costs: a termd that does not
   exit within the unit's `TimeoutStopSec` is SIGKILLed alone, and the process Runs it had not yet
-  ended keep running until the next start's recovery ends their groups.
+  ended keep running until the next start's recovery. That ends the groups it can tie to their
+  Runs; a group it cannot tell from a stranger's that reused the id is left running, with a note
+  in the session's history, and with no process listing (no `/proc`, no `ps`) it ends none.
 - **Supervision.** `next/config/com.animalabs.termd.plist` (launchd), `next/config/termd.service`
   (systemd). SIGTERM ends sessions cleanly.
 - **History on disk.** Kept whole by default; `--retention-bytes` and `--retention-days` cap it

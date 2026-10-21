@@ -66,6 +66,11 @@ export interface RegistryOptions {
    * Default: unless the backend is `scripted`, whose pids are not real processes.
    */
   terminateOrphans?: boolean;
+  /**
+   * Tests only: the process listing recovery judges groups by (default: the machine's, listProcesses).
+   * A spec drives the Linux rows (start ticks, boot id) or a listing that stops answering through it.
+   */
+  listProcesses?: () => ProcessRow[] | undefined;
 }
 
 /** Retention as a session records and reports it (G21). */
@@ -339,11 +344,12 @@ interface Slot {
 }
 
 /**
- * A journal opened by recovery, before its in-flight Runs are ended; `last` is the last event the
- * dead daemon wrote. `gone`: past its retention, so its files go — once its Runs' process groups
- * have been ended with every other session's (the house's read of 2c35df8, #22).
+ * A journal opened by recovery, before its in-flight Runs are ended; `last` is the store's newest whole
+ * event, and `lastAliveTs` when the dead daemon was last known alive (see `lastAlive`). `gone`: past its
+ * retention, so its files go — once its Runs' process groups have been ended with every other session's
+ * (the house's read of 2c35df8, #22).
  */
-type Recovering = Omit<Slot, 'cursors' | 'view'> & { retention: SessionRetention; journal: Journal; last: JournalEvent | undefined; gone: boolean };
+type Recovering = Omit<Slot, 'cursors' | 'view'> & { retention: SessionRetention; journal: Journal; last: JournalEvent | undefined; lastAliveTs: number | undefined; gone: boolean };
 
 /** What recovery did with a Run's process group: `text` names it, `left` is true when the group was left running (a reused pgid it could not tie to the Run). */
 type GroupOutcome = { text: string; left: boolean };
@@ -488,8 +494,10 @@ export class SessionRegistry {
     // that, `last` was the gap — so lastAliveTs and the orphan bound became the recovery's own clock,
     // which let a stranger's reused group read as a Run's (a reviewer's read of the fixes for #22
     // comment 6269992150). The store has already cut a torn tail at open, so this is the last whole event;
-    // a header-only file gives undefined, and still reaches endOrphans below.
+    // a header-only file gives undefined, and still reaches endOrphans below. The evidence itself passes
+    // over what an earlier recovery wrote before it too died (see lastAlive).
     const last = store.tail(1)[0];
+    const lastAliveTs = lastAlive(store);
     // The journal is opened before the store is judged empty: a file holding only a rotation header
     // has no last seq, yet the header names Runs still open, whose process groups recovery must end.
     // Age retention had dropped every file but the header-bearing one, so recovery returned here and
@@ -505,11 +513,11 @@ export class SessionRegistry {
     }
     // Nothing runs under this name now: a dead life's command files (command text, env captures) go (jr2-12, G26).
     if (!gone) removeLeftovers(this.opts.dataDir, id, dir);
-    return { id, dir, store, meta, retention, journal, last, gone };
+    return { id, dir, store, meta, retention, journal, last, lastAliveTs, gone };
   }
 
   private finishRecovery(r: Recovering, ended: Map<string, GroupOutcome>): void {
-    const { id, dir, store, meta, retention, journal, last } = r;
+    const { id, dir, store, meta, retention, journal, last, lastAliveTs } = r;
     if (r.gone) {
       // Past its retention: the whole session expires (G21, G26), now that its Runs' groups are ended.
       journal.close();
@@ -537,7 +545,7 @@ export class SessionRegistry {
       // The dead daemon's last evidence, kept on the end: a recovery that could not judge the group (no
       // process listing) leaves the Run a candidate, and the next recovery must bound its group by when
       // the daemon died, not by this recovery's time (comment 6269992150, item 2).
-      if (last?.ts !== undefined) ev.lastAliveTs = last.ts;
+      if (lastAliveTs !== undefined) ev.lastAliveTs = lastAliveTs;
       journal.append(ev);
       lost.add(run.runId);
     }
@@ -590,14 +598,11 @@ export class SessionRegistry {
     const out = new Map<string, GroupOutcome>();
     const enabled = this.opts.terminateOrphans ?? this.opts.backend.kind !== 'scripted';
     if (!enabled || process.platform === 'win32') return out;
-    const candidates = open.flatMap((r) => r.journal.runs.list().filter(mayHoldGroup).map((run) => ({ key: `${r.id}\0${run.runId}`, run, lastTs: r.last?.ts })));
+    const candidates = open.flatMap((r) => r.journal.runs.list().filter(mayHoldGroup).map((run) => ({ key: `${r.id}\0${run.runId}`, run, lastTs: r.lastAliveTs })));
     if (!candidates.length) return out;
-    const procs = listProcesses();
+    const list = this.opts.listProcesses ?? listProcesses;
+    const procs = list();
     if (!procs) return out; // nothing can tell whose a group is: leave every process alone
-    // When we judged (ps/proc start times are relative to now): a group that appears during the grace,
-    // a stranger's reuse of a freed pgid, has only members that started after this (the house's read
-    // of the 36 commits, #22, comment 6269992150).
-    const judgedAt = Date.now();
     const groups = orphanGroups(candidates, procs, { pid: process.pid, pgid: procs.find((p) => p.pid === process.pid)?.pgid });
     // The candidate groups with a living member that are not the Run's: left running, and recorded as such
     // (comment 6269992150) — from pgids and start times they cannot be told from a stranger's group that
@@ -623,41 +628,57 @@ export class SessionRegistry {
         // gone already
       }
     };
-    // Still ours to signal: alive, and holding a member that existed when we judged — not a stranger's
-    // group that took the freed pgid during the grace (every such member started after `judgedAt`). The
-    // deadline is on the monotonic clock, which a wall-clock step cannot move (comment 6269992150).
-    const stillOurs = (gs: number[]): number[] => {
-      // A signal probe first (no listing); then one listing answers both questions for every group — a
-      // living member that is not a zombie, and one from before we judged — instead of two listings a poll,
-      // each a `ps` spawn on macOS (a reviewer's read of the fixes for #22 comment 6269992150).
+    // Still ours to signal: a group that holds a member recovery judged — the same process, by pid and
+    // start (see heldGroups) — or one that joined while such a member lived. Not a wall-clock window
+    // around the judgment, which let a stranger's group formed within its slack pass and a clock step
+    // during the grace misjudge either way; and with no listing, nothing: no SIGKILL goes by pgid alone
+    // (the house's read of the 38 commits, PR #22, comment 6274857431, item 4). The deadline is on the
+    // monotonic clock, which a wall-clock step cannot move (comment 6269992150).
+    let known = new Map([...groups.keys()].map((g) => [g, procs.filter((p) => p.pgid === g && !p.zombie)] as const));
+    // The groups no listing answered for after a signal, and which signal was the last they got.
+    const unchecked = new Map<number, NodeJS.Signals>();
+    const stillOurs = (gs: number[], sent: NodeJS.Signals): number[] => {
+      // A signal probe first (no listing): a group with no process at all is gone.
       const alive = gs.filter(groupAlive);
       if (!alive.length) return alive;
-      const now = listProcesses();
-      if (!now) return alive; // nothing can tell: best effort, as before
-      return alive.filter((g) => now.some((p) => p.pgid === g && !p.zombie && p.startMs <= judgedAt + 1000));
+      const now = list();
+      if (!now) {
+        for (const g of alive) unchecked.set(g, sent);
+        return [];
+      }
+      known = heldGroups(new Map(alive.flatMap((g) => (known.has(g) ? [[g, known.get(g)!] as const] : []))), now);
+      return [...known.keys()];
     };
-    const waitGone = (gs: number[], ms: number): number[] => {
+    const waitGone = (gs: number[], ms: number, sent: NodeJS.Signals): number[] => {
       const until = clocks.monotonic() + ms;
-      let left = stillOurs(gs);
+      let left = stillOurs(gs, sent);
       while (left.length && clocks.monotonic() < until) {
         sleepSync(50);
-        left = stillOurs(left);
+        left = stillOurs(left, sent);
       }
       return left;
     };
     const all = [...groups.keys()];
     for (const g of all) signal(g, 'SIGTERM');
-    const stubborn = waitGone(all, ORPHAN_TERM_MS);
+    const stubborn = waitGone(all, ORPHAN_TERM_MS, 'SIGTERM');
     for (const g of stubborn) signal(g, 'SIGKILL');
-    const survivors = new Set(waitGone(stubborn, ORPHAN_KILL_MS));
+    const survivors = new Set(waitGone(stubborn, ORPHAN_KILL_MS, 'SIGKILL'));
     for (const [g, keys] of groups) {
-      const text = survivors.has(g) ? `process group ${g} survived SIGKILL` : `process group ${g} terminated`;
+      const sent = unchecked.get(g);
+      const text = survivors.has(g)
+        ? `process group ${g} survived SIGKILL`
+        : sent === 'SIGTERM'
+          ? `process group ${g} was sent SIGTERM and not SIGKILL: no process listing answered after it, so whether it ended is not known`
+          : sent
+            ? `process group ${g} was sent SIGKILL: no process listing answered after it, so whether it ended is not known`
+            : `process group ${g} terminated`;
       for (const k of keys) out.set(k, { text, left: false });
     }
     // The drain logs its kills; so does recovery (the house's read of 59f660b, #22).
     this.opts.log?.('warn', 'recovery ended process groups a previous daemon left running', {
-      groups: all.filter((g) => !survivors.has(g)),
+      groups: all.filter((g) => !survivors.has(g) && !unchecked.has(g)),
       survivedSigkill: survivors.size ? [...survivors] : undefined,
+      unchecked: unchecked.size ? [...unchecked.keys()] : undefined,
       sessions: [...new Set([...groups.values()].flat().map((k) => k.slice(0, k.indexOf('\0'))))],
     });
     return out;
@@ -1135,20 +1156,81 @@ export interface OrphanCandidate {
 }
 
 /**
+ * An end a recovery wrote: its time is the recovery's, which says nothing of when the Run's group could
+ * form. Flagged `recoveredEnd` since comment 6269992150; an older recovery (78c4d6e) wrote the same
+ * `lost` end, reason `daemon-restart`, with no flag, so that reason counts too (the house's read of the
+ * 38 commits, PR #22, comment 6274857431, item 2).
+ */
+function recoveryEnded(e: { state: string; reason?: string | undefined; recoveredEnd?: true | undefined }): boolean {
+  return e.recoveredEnd === true || (e.state === 'lost' && /^daemon-restart(;|$)/.test(e.reason ?? ''));
+}
+
+/** What a recovery writes besides its ends — the gap a journal writes when it opens, its notes and judgements, the restart mark — none of it the dead daemon's. */
+function writtenByRecovery(e: JournalEvent): boolean {
+  switch (e.type) {
+    case 'gap':
+      return e.reason === 'torn-write' || e.reason === 'store-failed';
+    case 'run.judged':
+    case 'recovered':
+      return true;
+    case 'note':
+      return e.principal === SYSTEM && e.text.startsWith('recovery:');
+    default:
+      return false;
+  }
+}
+
+/** Events read per page while looking back for the dead daemon's own newest event. */
+const LAST_ALIVE_PAGE = 64;
+
+/**
+ * When the dead daemon was last known alive: the time of the newest whole event it wrote itself. A
+ * recovery that died partway leaves its own events at the tail — the gap its journal wrote opening over a
+ * torn line or a failed store, then one `lost` end per open Run — stamped with its own time, and taken as
+ * the evidence they made the next recovery's bound that recovery's clock. They are passed over, and an
+ * end a recovery wrote carries the evidence that recovery had (`lastAliveTs`), which is taken as it
+ * stands (the house's read of the 38 commits, PR #22, comment 6274857431, item 5). Undefined when nothing
+ * of the dead daemon's remains (a header-only file).
+ */
+function lastAlive(store: FileStore): number | undefined {
+  for (let to: Seq | undefined; ; ) {
+    const page = store.tail(LAST_ALIVE_PAGE, to);
+    for (let i = page.length - 1; i >= 0; i--) {
+      const e = page[i]!;
+      if (e.type === 'run.end' && recoveryEnded(e)) {
+        if (e.lastAliveTs !== undefined) return e.lastAliveTs;
+      } else if (!writtenByRecovery(e)) {
+        return e.ts;
+      }
+    }
+    if (page.length < LAST_ALIVE_PAGE) return undefined;
+    to = page[0]!.seq - 1;
+  }
+}
+
+/**
  * Which of the candidates' process groups recovery signals, from a listing of the machine's
  * processes: per group, the keys of the Runs it belonged to. Pure, so its rules are tested without
  * a signal (the house's read of 2c35df8, #22). Never the daemon's own pid or group, and never a
  * group below 2: `kill(-1)` reaches every process the daemon may signal.
  *
  * A group is the Run's when its leader started with the Run — not before, not after: pids are
- * reused, and `ps` start times are truncated to the second — and the Run has not ended: its own
- * process was reaped before its end was written, so a leader now holds the freed pid. With the
- * leader gone, the kernel keeps a group's id while a member lives, so the members are descendants
- * of whoever led it: the Run's, when none predates the Run and one started before the Run ended —
- * a member that started later descends from one that was there, as a loop's newest child does, so
- * the whole group goes; asking every member to predate the end left such a loop running (the
- * house's read of cc8c909..39787b3, #22). For a Run still in flight, when one predates the dead
- * daemon's last event by a second, so the group is not one formed after the daemon died.
+ * reused — and the Run has not ended: its own process was reaped before its end was written, so a
+ * leader now holds the freed pid. With the leader gone, the kernel keeps a group's id while a member
+ * lives, so the members are descendants of whoever led it: the Run's, when none predates the Run and
+ * one started before the Run ended — a member that started later descends from one that was there, as
+ * a loop's newest child does, so the whole group goes; asking every member to predate the end left
+ * such a loop running (the house's read of cc8c909..39787b3, #22). For a Run still in flight, when one
+ * started before the dead daemon's last event, so the group is not one formed after the daemon died.
+ * An end a recovery wrote bounds the group only by the evidence it recorded (`lastAliveTs`), or by the
+ * leader's ticks; with neither the group is left (comment 6274857431, item 2).
+ *
+ * Starts are compared in ticks where the Run recorded its leader's and the listing is of the same boot
+ * (Linux): no wall-clock frame, 10 ms. The ends and the last event are wall-clock records, compared with
+ * each row's earliest start and its slack: "one started before the Run ended" admits a stranger's group
+ * formed up to the slack after the end — about 25 ms with /proc's rows, a second with `ps`'s whole
+ * seconds (macOS) — and a clock step between the record and the recovery moves the comparison by the
+ * step (comment 6274857431, item 3).
  */
 export function orphanGroups(candidates: OrphanCandidate[], procs: ProcessRow[], self: { pid: number; pgid: number | undefined }): Map<number, string[]> {
   const groups = new Map<number, string[]>();
@@ -1164,30 +1246,65 @@ export function orphanGroups(candidates: OrphanCandidate[], procs: ProcessRow[],
     if (run.bootId !== undefined && listingBoot !== undefined && run.bootId !== listingBoot) continue;
     const started = run.startedAt ?? run.admittedAt;
     // A recovery-written end carries the recovery's time, which is no evidence of when the group could
-    // form: the bound is the dead daemon's last evidence the end recorded, so a reused pgid whose
-    // members started after the daemon died but before the recovery is left alone (comment 6269992150, item 2).
-    const ended = run.endedAt !== undefined && run.recoveredEnd && run.lastAliveTs !== undefined ? Math.min(run.endedAt, run.lastAliveTs) : run.endedAt;
+    // form: the bound is the dead daemon's last evidence the end recorded, and an end that recorded none
+    // bounds nothing (comment 6269992150, item 2; comment 6274857431, item 2).
+    const byRecovery = run.endedAt !== undefined && recoveryEnded(run);
+    const ended = run.endedAt === undefined || !byRecovery ? run.endedAt : run.lastAliveTs !== undefined ? Math.min(run.endedAt, run.lastAliveTs) : undefined;
     const leader = members.find((p) => p.pid === g);
-    const sinceStart = (p: ProcessRow) => p.startMs >= started - 2000;
-    // The leader started with the Run: by ticks when both were recorded (same boot, no wall-clock
-    // frame), else by the wall clock with the ps truncation tolerance (macOS, or an older build).
-    const byTicks = (l: ProcessRow): boolean => run.startTicks !== undefined && l.startTicks !== undefined && l.startTicks === run.startTicks;
-    const leaderStartedWithRun = (l: ProcessRow): boolean => (run.startTicks !== undefined && l.startTicks !== undefined ? byTicks(l) : sinceStart(l) && l.startMs <= started + 1000);
+    // A row's start ticks, when they can be compared with the Run's: both recorded, under the same boot.
+    const ticks = (p: ProcessRow): number | undefined => (run.startTicks !== undefined && run.bootId !== undefined && p.startTicks !== undefined && p.bootId === run.bootId ? p.startTicks : undefined);
+    // Not before the Run: every member descends from its leader, so none started before the leader's tick;
+    // by the wall clock, with the tolerance for a start journaled after the spawn and ps's truncation.
+    const sinceStart = (p: ProcessRow): boolean => {
+      const t = ticks(p);
+      return t !== undefined ? t >= run.startTicks! : p.startMs >= started - 2000;
+    };
+    const byTicks = (l: ProcessRow): boolean => run.startTicks !== undefined && ticks(l) === run.startTicks;
+    // The leader started with the Run: by ticks when both were recorded, else by the wall clock with the
+    // tolerance above (macOS, or an older build).
+    const leaderStartedWithRun = (l: ProcessRow): boolean => (ticks(l) !== undefined ? byTicks(l) : sinceStart(l) && l.startMs <= started + 1000);
+    // Started before `t`, proven: even the row's latest possible start is.
+    const before = (p: ProcessRow, t: number): boolean => p.startMs + (p.startSlackMs ?? 1000) <= t;
     // A present leader after an observed end is a reuse (the Run's process was reaped before its end was
     // written). A recovery-written end observed no exit: a leader whose ticks equal the Run's recorded
     // ticks (same boot, by the guard above) is the Run's own process still alive, and the group is its —
     // the recorded end alone left it running at every restart (a reviewer's read of the fixes for #22
     // comment 6269992150). Without ticks the wall clock cannot say that much, and the end stands.
     const ours = leader
-      ? ended === undefined
+      ? run.endedAt === undefined
         ? leaderStartedWithRun(leader)
-        : run.recoveredEnd === true && byTicks(leader)
-      : ended !== undefined
-        ? members.every(sinceStart) && members.some((p) => p.startMs <= ended)
-        : members.every(sinceStart) && members.some((p) => p.startMs + 1000 <= (lastTs ?? 0));
+        : byRecovery && byTicks(leader)
+      : run.endedAt !== undefined
+        ? ended !== undefined && members.every(sinceStart) && members.some((p) => p.startMs <= ended)
+        : lastTs !== undefined && members.every(sinceStart) && members.some((p) => before(p, lastTs));
     if (ours) groups.set(g, [...(groups.get(g) ?? []), key]);
   }
   return groups;
+}
+
+/** The same process in two listings: the same pid and start — ticks when both rows have them, else the second (`ps`'s resolution). */
+function sameProcess(a: ProcessRow, b: ProcessRow): boolean {
+  if (a.pid !== b.pid) return false;
+  if (a.startTicks !== undefined && b.startTicks !== undefined) return a.startTicks === b.startTicks && a.bootId === b.bootId;
+  return Math.floor(a.startMs / 1000) === Math.floor(b.startMs / 1000);
+}
+
+/**
+ * The groups recovery is still signalling, from a new listing: each of `known`'s that holds one of the
+ * members known for it — the same process, not a new one with a reused pid — mapped to its members now.
+ * A pgid cannot be reused while a member lives, so a group holding a known member is the one judged,
+ * and its other members (a loop's new child) join the known for the next listing; a group whose known
+ * members are all gone cannot be told from a stranger's that reused the id, and is not signalled again
+ * (the house's read of the 38 commits, PR #22, comment 6274857431, item 4). Pure, so its rules are tested
+ * without a signal.
+ */
+export function heldGroups(known: Map<number, ProcessRow[]>, now: ProcessRow[]): Map<number, ProcessRow[]> {
+  const out = new Map<number, ProcessRow[]>();
+  for (const [g, seen] of known) {
+    const members = now.filter((p) => p.pgid === g && !p.zombie);
+    if (members.some((m) => seen.some((k) => sameProcess(k, m)))) out.set(g, members);
+  }
+  return out;
 }
 
 function expired(store: FileStore, retention: SessionRetention, now: number): boolean {

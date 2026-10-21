@@ -52,12 +52,22 @@ export interface DataDirLock {
   release(): void;
 }
 
-/** A process as `ps` (or /proc) reports it: start times have one-second resolution. */
+/** A process as /proc (Linux) or `ps` (elsewhere) reports it. */
 export interface ProcessRow {
   pid: number;
   pgid: number;
-  /** Start time, truncated to the second (ms since the epoch). */
+  /**
+   * The earliest the process can have started (ms since the epoch), in the wall-clock frame of the
+   * listing: it started before `startMs + startSlackMs`. From /proc, its start ticks placed against the
+   * uptime; from `ps`, `lstart` truncated to the second.
+   */
   startMs: number;
+  /**
+   * How far after `startMs` the process may have started: PROC_START_SLACK_MS for a /proc row whose
+   * uptime read, 1000 (whole seconds) for `ps`'s rows and when absent (the house's read of the 38
+   * commits, PR #22, comment 6274857431, item 3).
+   */
+  startSlackMs?: number;
   /**
    * The process's start in clock ticks after boot, read from /proc on Linux (undefined with `ps`,
    * and on macOS): a wall-clock step does not move it, so recovery compares it frame-free against a
@@ -144,42 +154,100 @@ function exists(target: number): boolean {
 /** True while any process belongs to process group `pgid`. */
 export const groupAlive = (pgid: number): boolean => pgid > 1 && exists(-pgid);
 
-/** Linux without a full `ps`: /proc/<pid>/stat's start time (clock ticks after boot) and /proc/stat's btime. */
-function procRows(): ProcessRow[] | undefined {
-  if (process.platform !== 'linux') return undefined;
+/** A clock tick in ms: USER_HZ is 100 on every mainstream Linux ABI. */
+const TICK_MS = 10;
+/**
+ * A /proc row's start is its ticks (10 ms) placed against /proc/uptime (10 ms) read beside the wall
+ * clock: the true start lies within this of the row's earliest (two ticks, and a margin for the reads).
+ * The bounds recovery compares it with are wall-clock records, so a clock step between a record and the
+ * recovery moves the comparison by the step.
+ */
+export const PROC_START_SLACK_MS = 2 * TICK_MS + 5;
+
+/**
+ * Where the process listing reads from: the machine by default. Specs inject their own, which drives the
+ * Linux branch (a /proc tree, its uptime and boot id) on any host (comment 6274857431, item 1).
+ */
+export interface ProcessSource {
+  platform: NodeJS.Platform;
+  /** A /proc file's text; undefined when it cannot be read. */
+  read(file: string): string | undefined;
+  /** The names /proc lists; undefined when it cannot be listed. */
+  entries(): string[] | undefined;
+  /** `ps -A -o pid=,pgid=,stat=,lstart=`'s output; undefined when `ps` does not answer. */
+  ps(): string | undefined;
+  /** The wall clock /proc's uptime is read against. */
+  now(): number;
+  /** This process's pid: a listing without it is no answer. */
+  self: number;
+}
+
+const readFile = (file: string): string | undefined => {
   try {
-    const btime = Number(/^btime (\d+)$/m.exec(fs.readFileSync('/proc/stat', 'utf8'))?.[1]);
-    if (!Number.isFinite(btime)) return undefined;
-    const hz = 100; // USER_HZ: 100 on every mainstream Linux ABI
-    const boot = bootId();
-    const out: ProcessRow[] = [];
-    for (const name of fs.readdirSync('/proc').filter((n) => /^\d+$/.test(n))) {
-      let stat: string;
-      try {
-        stat = fs.readFileSync(`/proc/${name}/stat`, 'utf8');
-      } catch {
-        continue; // gone meanwhile
-      }
-      // The fields after the comm (which may hold spaces and parentheses): state ppid pgrp …; the start
-      // ticks come from the one parser every side uses (statStartTicks), frame-free for recovery.
-      const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-      const pgid = Number(f[2]);
-      const start = statStartTicks(stat);
-      if (Number.isFinite(pgid) && start !== undefined) out.push({ pid: Number(name), pgid, startMs: Math.floor(btime + start / hz) * 1000, startTicks: start, ...(boot !== undefined && { bootId: boot }), zombie: f[0] === 'Z' });
-    }
-    return out;
+    return fs.readFileSync(file, 'utf8');
   } catch {
     return undefined;
   }
+};
+
+const machine: ProcessSource = {
+  platform: process.platform,
+  read: readFile,
+  entries: () => {
+    try {
+      return fs.readdirSync('/proc');
+    } catch {
+      return undefined;
+    }
+  },
+  ps: () => {
+    try {
+      return execFileSync('ps', ['-A', '-o', 'pid=,pgid=,stat=,lstart='], { encoding: 'utf8', timeout: 2000, env: { ...process.env, LC_ALL: 'C', LANG: 'C' }, stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      return undefined; // no `ps`, or one without these columns (BusyBox)
+    }
+  },
+  now: Date.now,
+  self: process.pid,
+};
+
+/**
+ * Linux: /proc/<pid>/stat's start ticks after boot, with the boot id they count from, and a start time
+ * placed against /proc/uptime (10 ms; /proc/stat's btime, whole seconds, when the uptime cannot be read).
+ */
+function procRows(src: ProcessSource): ProcessRow[] | undefined {
+  if (src.platform !== 'linux') return undefined;
+  const names = src.entries();
+  // The wall clock first, then the uptime: a delay between the two reads moves the starts earlier, never later.
+  const now = src.now();
+  const uptime = Number(/^(\d+(?:\.\d+)?)\s/.exec(src.read('/proc/uptime') ?? '')?.[1]);
+  const btime = Number(/^btime (\d+)$/m.exec(src.read('/proc/stat') ?? '')?.[1]);
+  const placed = Number.isFinite(uptime);
+  if (!names || (!placed && !Number.isFinite(btime))) return undefined;
+  const bootMs = placed ? now - uptime * 1000 : btime * 1000;
+  const slack = placed ? PROC_START_SLACK_MS : 1000;
+  const boot = src.read('/proc/sys/kernel/random/boot_id')?.trim() || undefined;
+  const out: ProcessRow[] = [];
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    const stat = src.read(`/proc/${name}/stat`);
+    if (stat === undefined) continue; // gone meanwhile
+    // The fields after the comm (which may hold spaces and parentheses): state ppid pgrp …; the start
+    // ticks come from the one parser every side uses (statStartTicks), frame-free for recovery.
+    const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    const pgid = Number(f[2]);
+    const start = statStartTicks(stat);
+    if (!Number.isFinite(pgid) || start === undefined) continue;
+    // The earliest the process can have started: its tick, less the uptime's own tick when placed by it.
+    const startMs = placed ? Math.floor(bootMs + start * TICK_MS) - TICK_MS : Math.floor(btime + start * (TICK_MS / 1000)) * 1000;
+    out.push({ pid: Number(name), pgid, startMs, startSlackMs: slack, startTicks: start, ...(boot !== undefined && { bootId: boot }), zombie: f[0] === 'Z' });
+  }
+  return out;
 }
 
-function psRows(): ProcessRow[] | undefined {
-  let text: string;
-  try {
-    text = execFileSync('ps', ['-A', '-o', 'pid=,pgid=,stat=,lstart='], { encoding: 'utf8', timeout: 2000, env: { ...process.env, LC_ALL: 'C', LANG: 'C' }, stdio: ['ignore', 'pipe', 'ignore'] });
-  } catch {
-    return undefined; // no `ps`, or one without these columns (BusyBox)
-  }
+function psRows(src: ProcessSource): ProcessRow[] | undefined {
+  const text = src.ps();
+  if (text === undefined) return undefined;
   const rows: ProcessRow[] = [];
   for (const line of text.split('\n')) {
     const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
@@ -191,12 +259,15 @@ function psRows(): ProcessRow[] | undefined {
 }
 
 /**
- * Every process on the machine; undefined when neither `ps` nor /proc answers. A listing
- * without this very process is not an answer either: absence must mean gone.
+ * Every process on the machine; undefined when nothing answers. A listing without this very process
+ * is not an answer either: absence must mean gone. On Linux /proc answers first, since only its rows
+ * carry start ticks and the boot id: with `ps` first, as before, recovery's frame-free checks and its
+ * boot guard never ran there, and its starts were whole seconds (the house's read of the 38 commits,
+ * PR #22, comment 6274857431, item 1). `ps` is the fallback, and the only source elsewhere.
  */
-export function listProcesses(): ProcessRow[] | undefined {
-  const answer = (rows: ProcessRow[] | undefined) => (rows?.some((r) => r.pid === process.pid) ? rows : undefined);
-  return answer(psRows()) ?? answer(procRows());
+export function listProcesses(src: ProcessSource = machine): ProcessRow[] | undefined {
+  const answer = (rows: ProcessRow[] | undefined) => (rows?.some((r) => r.pid === src.self) ? rows : undefined);
+  return answer(procRows(src)) ?? answer(psRows(src));
 }
 
 /** One process: null when it is gone (or a zombie), undefined when nothing can say. */

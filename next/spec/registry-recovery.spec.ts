@@ -13,10 +13,10 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { orphanGroups, SessionRegistry, type AnySession, type HistorySession, type LiveSession, type OrphanCandidate } from '../src/api/registry.js';
+import { heldGroups, orphanGroups, SessionRegistry, type AnySession, type HistorySession, type LiveSession, type OrphanCandidate } from '../src/api/registry.js';
 import type { ScriptedBackend } from '../src/backends/scripted.js';
 import { Journal } from '../src/core/journal.js';
-import { groupAlive, type ProcessRow } from '../src/core/lock.js';
+import { groupAlive, listProcesses, procStart, PROC_START_SLACK_MS, type ProcessRow } from '../src/core/lock.js';
 import type { Session } from '../src/core/session.js';
 import { FileStore } from '../src/core/stores.js';
 import type { JournalEvent, RunInfo } from '../src/core/types.js';
@@ -360,9 +360,11 @@ test('jr2-4: a recovery that could not judge a Run\'s group keeps the dead daemo
   const sel = (c: OrphanCandidate, procs: ProcessRow[]) => [...orphanGroups([c], procs, self).keys()];
   assert.deepEqual(sel(cand({ lastAliveTs: T_death }), [row(4301, T_death + 20_000), row(4302, T_death + 40_000)]), [], 'members started between the death and the first recovery: left alone');
   assert.deepEqual(sel(cand({ lastAliveTs: T_death }), [row(4301, T_death - 1000), row(4302, T_death + 40_000)]), [4242], 'a member that was there before the daemon died: the Run\'s, the later one its descendant');
-  // An end written by an older recovery, before lastAliveTs was recorded: the end time stands as before.
+  // An end a recovery wrote without the evidence: its time is the recovery's, so nothing bounds the group,
+  // and it is left — the end time stood as the bound before (the house's read of the 38 commits, PR #22,
+  // comment 6274857431, item 2).
   const { lastAliveTs: _recorded, ...older } = run;
-  assert.deepEqual(sel({ ...cand({}), run: { ...older, pgid: 4242, endedAt: T_rec1, recoveredEnd: true } }, [row(4301, T_death + 20_000)]), [4242], 'without the recorded evidence the bound falls back to the end');
+  assert.deepEqual(sel({ ...cand({}), run: { ...older, pgid: 4242, endedAt: T_rec1, recoveredEnd: true } }, [row(4301, T_death + 20_000)]), [], 'without the recorded evidence nothing bounds the group');
 });
 
 test('jr2-4: a torn last line does not move the dead daemon\'s last evidence to the recovery\'s clock — lastAliveTs is the last whole event (a reviewer\'s read of the fixes for #22 comment 6269992150)', async () => {
@@ -437,6 +439,191 @@ test('jr2-4: a leader whose ticks equal a Run\'s recorded ticks is the Run\'s ow
   // An observed end means the leader was reaped: a present leader is a reuse whatever its ticks say of a lost pid.
   const { recoveredEnd: _r, ...observed } = run({ bootId: 'boot-A', startTicks: 7777 }).run;
   assert.deepEqual(sel({ key: 's\0r', run: { ...observed, state: 'exited', leftovers: true }, lastTs: T + 5000 }, [leader({ bootId: 'boot-A', startTicks: 7777 })]), [], 'an observed end: the leader is gone, so this one is not the Run\'s');
+});
+
+test('jr2-4: every end a recovery wrote bounds the group only by the evidence it recorded — flagged or as an older recovery wrote it, never by its own time (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 2)', () => {
+  const self = { pid: 500, pgid: 400 };
+  const T_death = 1_000_000;
+  const T_rec = T_death + 60_000; // when a recovery wrote the end
+  const cand = (over: Partial<RunInfo>): OrphanCandidate => ({
+    key: 's\0r',
+    run: { runId: 'r', sessionId: 's', target: 'process', origin: 'self', principal: A, state: 'lost', reason: 'daemon-restart', admittedAt: T_death - 20_010, startedAt: T_death - 20_000, endedAt: T_rec, seq: { admit: 1, start: 2, end: 3 }, attribution: 'exact', pgid: 4242, ...over },
+    lastTs: T_rec + 5000,
+  });
+  const row = (pid: number, startMs: number, over: Partial<ProcessRow> = {}): ProcessRow => ({ pid, pgid: 4242, startMs, zombie: false, ...over });
+  const sel = (c: OrphanCandidate, procs: ProcessRow[]) => [...orphanGroups([c], procs, self).keys()];
+  const reused = [row(4301, T_death + 20_000)]; // a stranger's group formed between the death and the recovery
+  const theRuns = [row(4301, T_death - 10_000)]; // a member that was there before the daemon died
+  // Flagged, without the evidence (the recovery read no last event): the group is left, whoever is in it.
+  assert.deepEqual(sel(cand({ recoveredEnd: true }), reused), [], 'flagged, no evidence: a stranger is not taken');
+  assert.deepEqual(sel(cand({ recoveredEnd: true }), theRuns), [], 'flagged, no evidence: nothing bounds the group, so it is left');
+  // As 78c4d6e's recovery wrote them, unflagged: the reason says whose end it is.
+  for (const reason of ['daemon-restart', 'daemon-restart; process group 4242 terminated']) {
+    assert.deepEqual(sel(cand({ reason }), reused), [], `unflagged "${reason}": not bounded by the recovery's time`);
+    assert.deepEqual(sel(cand({ reason, lastAliveTs: T_death }), theRuns), [4242], `"${reason}" with the evidence: bounded by it`);
+  }
+  // The recorded evidence bounds it: a member from before the death is the Run's, one formed after is not.
+  assert.deepEqual(sel(cand({ recoveredEnd: true, lastAliveTs: T_death }), theRuns), [4242]);
+  assert.deepEqual(sel(cand({ recoveredEnd: true, lastAliveTs: T_death }), reused), []);
+  // Ticks are evidence too: the Run's own leader, still alive, ties the group without a wall-clock bound.
+  const ticks = { bootId: 'boot-A', startTicks: 7777 };
+  assert.deepEqual(sel(cand({ reason: 'daemon-restart', ...ticks }), [row(4242, T_death - 20_000, ticks)]), [4242], 'the leader by its ticks');
+  // An end the live daemon observed (its own shutdown) still bounds by its time.
+  assert.deepEqual(sel(cand({ reason: 'daemon-shutdown', endedAt: T_death }), [row(4301, T_death - 1000)]), [4242], 'an observed lost end');
+});
+
+test('jr2-4: starts are compared at the listing\'s resolution — ticks against the Run\'s ticks, /proc\'s placed starts within their slack, ps\'s whole seconds within the second the docs state (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 3)', () => {
+  const self = { pid: 500, pgid: 400 };
+  const T = 50_000; // the Run's start
+  const E = T + 5500; // its observed end
+  const L = T + 20_000; // the dead daemon's last event
+  const cand = (over: Partial<RunInfo>): OrphanCandidate => ({
+    key: 's\0r',
+    run: { runId: 'r', sessionId: 's', target: 'process', origin: 'self', principal: A, state: 'running', admittedAt: T - 10, startedAt: T, seq: { admit: 1, start: 2 }, attribution: 'exact', pgid: 2001, ...over },
+    lastTs: L,
+  });
+  const ended: Partial<RunInfo> = { state: 'exited', endedAt: E, leftovers: true };
+  const ps = (pid: number, startMs: number): ProcessRow => ({ pid, pgid: 2001, startMs, zombie: false });
+  const proc = (pid: number, startMs: number, over: Partial<ProcessRow> = {}): ProcessRow => ({ pid, pgid: 2001, startMs, startSlackMs: PROC_START_SLACK_MS, zombie: false, ...over });
+  const sel = (c: OrphanCandidate, procs: ProcessRow[]) => [...orphanGroups([c], procs, self).keys()];
+  // After an observed end: a /proc row tells 30 ms after the end from 30 ms before it; ps's whole second
+  // cannot, so a group formed within the second of the end is taken there — the window the docs state.
+  assert.deepEqual(sel(cand(ended), [proc(2101, E + 30)]), [], '/proc: formed 30 ms after the end');
+  assert.deepEqual(sel(cand(ended), [proc(2101, E - 30)]), [2001], '/proc: started 30 ms before it');
+  assert.deepEqual(sel(cand(ended), [ps(2101, Math.floor(E / 1000) * 1000)]), [2001], 'ps: the same second as the end is taken');
+  // In flight: one member must have started before the daemon's last event, at the row's resolution.
+  assert.deepEqual(sel(cand({}), [proc(2101, L - 100)]), [2001], '/proc: 100 ms before the last event is before it');
+  assert.deepEqual(sel(cand({}), [proc(2101, L - 10)]), [], '/proc: within its slack of the last event is not proven');
+  assert.deepEqual(sel(cand({}), [ps(2101, L - 1000)]), [2001], 'ps: the whole second before it');
+  assert.deepEqual(sel(cand({}), [ps(2101, L - 500)]), [], 'ps: a start that may lie after it');
+  // With the Run's ticks recorded (Linux): no member started before its leader's tick, whatever the wall clock says.
+  const ticks: Partial<RunInfo> = { bootId: 'boot-A', startTicks: 7000 };
+  assert.deepEqual(sel(cand(ticks), [proc(2101, T, { bootId: 'boot-A', startTicks: 6990 })]), [], 'a tick before the leader: a stranger, though its wall start passes');
+  assert.deepEqual(sel(cand(ticks), [proc(2101, T - 600_000, { bootId: 'boot-A', startTicks: 7005 })]), [2001], 'after the leader by ticks, across a wall-clock step');
+});
+
+test('jr2-4: before its SIGKILL recovery signals a group only while it holds a member recovery judged, or one that joined while such a member lived (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 4)', () => {
+  const r = (pid: number, pgid: number, startMs: number, over: Partial<ProcessRow> = {}): ProcessRow => ({ pid, pgid, startMs, zombie: false, ...over });
+  const linux = (pid: number, ticks: number, startMs: number) => r(pid, 3001, startMs, { startTicks: ticks, bootId: 'boot-A', startSlackMs: PROC_START_SLACK_MS });
+  const keys = (m: Map<number, ProcessRow[]>) => [...m.keys()];
+  const leader = linux(3001, 7000, 50_000);
+  const child = linux(3002, 7010, 50_100);
+  // The leader still there: held, and the child that joined meanwhile is known from now on.
+  let held = heldGroups(new Map([[3001, [leader]]]), [leader, child]);
+  assert.deepEqual(keys(held), [3001]);
+  assert.deepEqual(held.get(3001)!.map((p) => p.pid), [3001, 3002]);
+  // The leader gone, the child it left: still the group judged (the id cannot be reused while a member lives).
+  held = heldGroups(held, [child]);
+  assert.deepEqual(keys(held), [3001], 'a member that joined while a known one lived');
+  // Every known member gone and the id taken again: a pid never seen, or a known pid reused (other ticks).
+  assert.deepEqual(keys(heldGroups(held, [linux(3050, 8000, 60_000)])), [], 'a stranger\'s group in the reused id');
+  assert.deepEqual(keys(heldGroups(held, [linux(3002, 9999, 50_100)])), [], 'the child\'s pid reused: other ticks');
+  assert.deepEqual(keys(heldGroups(held, [{ ...child, zombie: true }])), [], 'a zombie holds nothing');
+  // A member that started within a second of the judgment is no longer enough by itself: the old window did that.
+  assert.deepEqual(keys(heldGroups(new Map([[3001, [leader]]]), [linux(3060, 7100, 50_900)])), [], 'a stranger formed within the old slack');
+  // ps's rows (macOS): the same pid and start second.
+  const psRow = r(4001, 4001, 50_000);
+  assert.deepEqual(keys(heldGroups(new Map([[4001, [psRow]]]), [r(4001, 4001, 50_000)])), [4001]);
+  assert.deepEqual(keys(heldGroups(new Map([[4001, [psRow]]]), [r(4001, 4001, 52_000)])), [], 'the pid reused two seconds later');
+});
+
+test('jr2-4: with no process listing after the SIGTERM, recovery sends no SIGKILL by pgid alone, and says so (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 4)', { timeout: 15_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'nk');
+  const kids = detachedKids();
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const ready = path.join(dir, 'nk-ready');
+    const stubborn = kids.spawn('/bin/sh', ['-c', "trap '' TERM; printf ready > \"$1\"; sleep 411; :", 'recovery-test', ready]);
+    await until(() => fs.existsSync(ready));
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'nk' });
+    journalProcess(j, 'r1-stubborn', stubborn);
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    // The first listing judges the group; every one after it fails.
+    let calls = 0;
+    const r = rig(dir, { terminateOrphans: true, listProcesses: () => (calls++ === 0 ? listProcesses() : undefined) });
+    const h = hist(r.reg.get('nk'));
+    assert.match(h.run('r1-stubborn').reason ?? '', new RegExp(`process group ${stubborn} was sent SIGTERM and not SIGKILL: no process listing answered`));
+    assert.ok(calls >= 2, 'the recheck asked for a listing');
+    assert.ok(groupAlive(stubborn), 'it ignored the SIGTERM, and no SIGKILL went by pgid alone');
+    await r.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
+test('jr2-4: the dead daemon\'s last evidence passes over what an earlier recovery wrote before it died too — the journal\'s gap at open, and lost ends, whose recorded evidence is taken (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 5)', async () => {
+  const T_death = 1_000_000;
+  const T_rec1 = T_death + 60_000;
+  const evidence = async (id: string, crashedRecovery: (sdir: string) => void) => {
+    const dir = path.join(tmp, `d${++dirs}`);
+    const sdir = path.join(dir, 'sessions', id);
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: id, now: () => T_death });
+    journalProcess(j, 'r1-first', 4242);
+    journalProcess(j, 'r2-second', 4343);
+    j.append({ type: 'output', data: 'tick\n', stream: 'stdout', runId: 'r2-second' });
+    j.close();
+    crashedRecovery(sdir);
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    const r = rig(dir);
+    const run = hist(r.reg.get(id)).run('r2-second');
+    await r.reg.closeAll();
+    return run;
+  };
+  // The first recovery ended one Run, then died: its end, at its own time, is the store's newest event.
+  const partway = await evidence('ends', (sdir) => {
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'ends', now: () => T_rec1 });
+    j.append({ type: 'run.end', runId: 'r1-first', state: 'lost', reason: 'daemon-restart', durationMs: 1, recoveredEnd: true, lastAliveTs: T_death });
+    j.close();
+  });
+  assert.deepEqual([partway.state, partway.lastAliveTs], ['lost', T_death], 'the evidence the first recovery recorded, not its time');
+  // An older recovery's unflagged end carries no evidence: the dead daemon's own events are read past it.
+  const older = await evidence('older', (sdir) => {
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'older', now: () => T_rec1 });
+    j.append({ type: 'run.end', runId: 'r1-first', state: 'lost', reason: 'daemon-restart', durationMs: 1 });
+    j.close();
+  });
+  assert.equal(older.lastAliveTs, T_death);
+  // The first recovery opened the journal over a torn line — which writes a gap at its own time — and died.
+  const torn = await evidence('gap', (sdir) => {
+    const file = path.join(sdir, 'journal.jsonl');
+    fs.writeFileSync(file, fs.readFileSync(file, 'utf8').slice(0, -5));
+    new Journal({ cold: new FileStore(sdir), sessionId: 'gap', now: () => T_rec1 }).close();
+  });
+  assert.equal(torn.lastAliveTs, T_death, 'the gap the journal wrote at open is not the dead daemon\'s');
+});
+
+test('jr2-4 (Linux): recovery ties a group to its Run by the leader\'s start ticks from the machine\'s own listing, where the wall clock would not (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 1)', { timeout: 10_000 }, async (t) => {
+  // With `ps` read first, as before, the machine's rows carried no ticks on Linux and this group was left.
+  if (process.platform !== 'linux') {
+    t.skip(`/proc's start ticks are Linux's: skipped on ${process.platform}`);
+    return;
+  }
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'tk');
+  const kids = detachedKids();
+  try {
+    const sleeper = kids.spawn('sleep', ['412']);
+    await until(() => procStart(sleeper) !== undefined);
+    const start = procStart(sleeper)!;
+    // The Run journaled ten minutes off its leader's start (a clock step since): by the wall clock the leader
+    // came long after the Run and is a reused pid; its ticks say it is the Run's.
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'tk', now: () => Date.now() - 600_000 });
+    j.append({ type: 'run.admit', runId: 'r1-ticks', target: 'process', line: 'sleep 412', principal: A, origin: 'self', queued: false });
+    j.append({ type: 'run.start', runId: 'r1-ticks', cwd: '/', envBasis: 'configured', pid: sleeper, pgid: sleeper, startTicks: start.startTicks, bootId: start.bootId });
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    const rows = listProcesses()!;
+    assert.ok(rows.every((p) => p.startTicks !== undefined && p.bootId === start.bootId), 'the machine\'s listing carries ticks and the boot id');
+    const r = rig(dir, { terminateOrphans: true });
+    assert.equal(hist(r.reg.get('tk')).run('r1-ticks').reason, `daemon-restart; process group ${sleeper} terminated`);
+    await kids.exited(sleeper);
+    assert.equal(kids.kids.find((c) => c.pid === sleeper)!.signalCode, 'SIGTERM');
+    await r.reg.closeAll();
+  } finally {
+    kids.end();
+  }
 });
 
 // ───────────── jr2-12: command files ─────────────

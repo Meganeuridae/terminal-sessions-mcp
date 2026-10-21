@@ -18,7 +18,7 @@ import { SessionRegistry } from '../src/api/registry.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermError } from '../src/core/errors.js';
 import { Journal } from '../src/core/journal.js';
-import { acquireDataDirLock, bootId, LOCK_FILE, procStart, statIsZombie, statStartTicks } from '../src/core/lock.js';
+import { acquireDataDirLock, bootId, listProcesses, LOCK_FILE, PROC_START_SLACK_MS, procStart, statIsZombie, statStartTicks, type ProcessSource } from '../src/core/lock.js';
 
 /**
  * The builtin modules as lock.js sees them: patching a function here and calling syncBuiltinESMExports
@@ -551,4 +551,50 @@ test('items 7 and 8: a directory fsync failing with EIO after the lock is publis
   const reg = withDirFsyncEIO(() => new SessionRegistry({ dataDir: path.join(dir, 'reg'), backend: new ScriptedBackend(), log: (level, text) => void (level === 'warn' && warnings.push(text)) }));
   assert.equal(warnings.filter((w) => /lock is taken but its directory could not be synced/.test(w)).length, 1, JSON.stringify(warnings));
   await reg.closeAll();
+});
+
+test('the process listing takes /proc first on Linux — rows with start ticks, the boot id and a start placed to the tick — and ps only when /proc does not answer, or off Linux (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 1)', () => {
+  // With ps first, as before, a Linux host's rows carried neither ticks nor the boot id, so recovery's
+  // frame-free checks and its boot guard never ran there. The Linux branch is driven through an injected
+  // source, so this runs on every host; the last assertion reads the machine's own /proc on Linux.
+  const stat = (pid: number, pgid: number, ticks: number, state = 'S') => `${pid} (sleep (x) y) ${state} 1 ${pgid} ${pgid} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 ${ticks} 12345678 500`;
+  const now = 1_700_000_000_000;
+  const files: Record<string, string> = {
+    '/proc/uptime': '1000.50 2000.00\n',
+    '/proc/stat': 'cpu  1 2 3 4\nbtime 1699998999\n',
+    '/proc/sys/kernel/random/boot_id': 'boot-A\n',
+    '/proc/77/stat': stat(77, 77, 5000),
+    '/proc/78/stat': stat(78, 77, 5012, 'Z'),
+  };
+  const psText = `   77    77 Ss   ${new Date(now - 950_000).toString().slice(0, 24)}\n   88    88 S    ${new Date(now).toString().slice(0, 24)}\n`;
+  const source = (over: Partial<ProcessSource> = {}): ProcessSource => ({ platform: 'linux', read: (f) => files[f], entries: () => ['77', '78', 'self', 'net'], ps: () => psText, now: () => now, self: 77, ...over });
+  const shape = (rows: ReturnType<typeof listProcesses>) => rows?.map((r) => [r.pid, r.pgid, r.startTicks, r.bootId, r.zombie]);
+  const rows = listProcesses(source())!;
+  assert.deepEqual(shape(rows), [[77, 77, 5000, 'boot-A', false], [78, 77, 5012, 'boot-A', true]], '/proc\'s rows, though ps answered too');
+  // Placed against the uptime: boot was 1000.50 s before now; tick 5000 is 50 s after it; the row says the
+  // earliest the process can have started (a tick earlier) and how far after that it may lie.
+  assert.deepEqual([rows[0]!.startMs, rows[0]!.startSlackMs], [now - 1_000_500 + 50_000 - 10, PROC_START_SLACK_MS]);
+  // No uptime: btime's whole seconds, and their slack.
+  const btimeRows = listProcesses(source({ read: (f) => (f === '/proc/uptime' ? undefined : files[f]) }))!;
+  assert.deepEqual([btimeRows[0]!.startMs, btimeRows[0]!.startSlackMs], [(1_699_998_999 + 50) * 1000, 1000]);
+  // No boot id: rows without it, which recovery compares by the wall clock.
+  assert.equal(listProcesses(source({ read: (f) => (f.endsWith('boot_id') ? undefined : files[f]) }))![0]!.bootId, undefined);
+  // /proc that does not answer — unlistable, or a listing without this process — and off Linux: ps's rows, whole seconds, no ticks.
+  for (const [why, over] of [
+    ['unlistable', { entries: () => undefined }],
+    ['without this process', { self: 88 }],
+    ['off Linux', { platform: 'darwin' }],
+  ] as [string, Partial<ProcessSource>][]) {
+    const ps = listProcesses(source(over));
+    assert.ok(ps?.some((r) => r.pid === 88), `${why}: ps's rows`);
+    assert.ok(ps!.every((r) => r.startTicks === undefined && r.bootId === undefined && r.startSlackMs === undefined), `${why}: no ticks from ps`);
+  }
+  assert.equal(listProcesses(source({ entries: () => undefined, ps: () => undefined })), undefined, 'neither answers');
+  if (process.platform === 'linux') {
+    const real = listProcesses()!;
+    assert.ok(real.some((r) => r.pid === process.pid), 'the machine\'s listing has this process');
+    assert.ok(real.every((r) => r.startTicks !== undefined && r.bootId === bootId() && r.startSlackMs === PROC_START_SLACK_MS), 'the machine\'s rows are /proc\'s');
+  } else {
+    console.log(`# the machine's /proc listing is Linux's: its last assertion is skipped on ${process.platform}`);
+  }
 });

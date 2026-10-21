@@ -13,8 +13,10 @@
  * processes do not survive a restart). A session's shell is hung up as a closing
  * terminal hangs it up: its foreground job ends with it, and a job the shell
  * detached on purpose (nohup, setsid, disown) lives on, as it would there. After
- * a SIGKILL nothing here runs; the next start's recovery ends the process Runs'
- * groups instead. A log stream whose reader went away (EPIPE) is dropped, never
+ * a SIGKILL nothing here runs; the next start's recovery ends instead the process
+ * Runs' groups it can tie to their Runs, leaves running (with a note) a group it
+ * cannot tell from a stranger's that reused the id, and ends none when no process
+ * listing answers. A log stream whose reader went away (EPIPE) is dropped, never
  * retried in a loop (tsg-5).
  *
  * Startup order keeps a second daemon from touching a live one's journals
@@ -720,7 +722,7 @@ async function main(): Promise<void> {
   };
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(sig, () => void shutdown(sig));
   // Last resort on every exit path the process still runs through: no process Run's group survives
-  // it. (A SIGKILL runs nothing; the next start's recovery ends those groups.)
+  // it. (A SIGKILL runs nothing; the next start's recovery ends those it can tie to their Runs.)
   process.on('exit', () => groups.signalAll('SIGKILL'));
 
   // Supervisors may stop us as soon as readiness is visible. Install the drain
