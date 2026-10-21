@@ -10,7 +10,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { Journal } from '../src/core/journal.js';
-import { boundHeader, narrowOutput, RunIndex, type RunOutputRange } from '../src/core/runindex.js';
+import { boundHeader, narrowOutput, RunIndex, type RunOutput, type RunOutputRange } from '../src/core/runindex.js';
 import { FileStore, MemoryStore } from '../src/core/stores.js';
 import type { EventInput, JournalEvent, RunInfo } from '../src/core/types.js';
 
@@ -87,6 +87,19 @@ function build(dir: string, seed: number, events: number): Journal {
   return j;
 }
 
+test('a Run’s output says `older` when output came before what it returns — a maxBytes cut — and not for a hole inside it, which `truncated` says (our read of the house’s fixes for its review of f3750e4, PR #22)', () => {
+  const j = new Journal({ sessionId: 's' });
+  j.append({ type: 'run.admit', runId: 'r1', target: 'process', principal: 'agent:a@test', origin: 'self', queued: false });
+  j.append({ type: 'run.start', runId: 'r1', cwd: '/' });
+  j.append({ type: 'output', data: 'one\n', stream: 'stdout', runId: 'r1' });
+  j.append({ type: 'gap', from: j.lastSeq + 1, to: j.lastSeq + 1, reason: 'store-error' });
+  j.append({ type: 'output', data: 'two\n', stream: 'stdout', runId: 'r1' });
+  const all = j.runs.output(j, 'r1');
+  assert.deepEqual([all.truncated, all.older], [true, undefined], 'a hole inside: truncated, not older');
+  const last = j.runs.output(j, 'r1', { maxBytes: 4 });
+  assert.deepEqual([last.events.length, last.older], [1, true], 'the newest part: older output came before it');
+});
+
 test('jr2-9: RunIndex.output(range) equals narrowOutput(whole output, range) — random ranges over rotation and retention', () => {
   const dir = tmpDir();
   try {
@@ -104,7 +117,10 @@ test('jr2-9: RunIndex.output(range) equals narrowOutput(whole output, range) —
         const from = r.seq.start ?? r.seq.admit;
         const to = r.seq.end ?? j.lastSeq;
         const full = j.range(from, to);
-        assert.deepEqual(whole, { events: full.events.filter((e) => e.type === 'output' && e.runId === r.runId), from, to, truncated: full.gap !== undefined }, `${r.runId} whole`);
+        // Retention took the Run's start: older output existed (`older`), as a hole inside it does not say.
+        const expected: RunOutput = { events: full.events.filter((e) => e.type === 'output' && e.runId === r.runId), from, to, truncated: full.gap !== undefined };
+        if (j.gapAt(from, to)) expected.older = true;
+        assert.deepEqual(whole, expected, `${r.runId} whole`);
         for (let k = 0; k < 25; k++) {
           const span = to - from + 10;
           const pick = () => from - 5 + Math.floor(rand() * span);

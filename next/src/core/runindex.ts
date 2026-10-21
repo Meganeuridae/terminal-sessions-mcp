@@ -72,6 +72,15 @@ export interface RunOutput {
   from: Seq;
   to: Seq;
   truncated: boolean;
+  /**
+   * Output comes before the events returned, or came and is gone: `maxBytes` dropped older events, or
+   * retention took the start of the Run's output (with `since`, even where that lies before it). Unlike
+   * `truncated`, a hole inside the Run does not set it: a reader that asks whether what it was given
+   * begins where the Run's output does (a tail) asks this. A Run's tail across a hole read the hole as
+   * older output, and marked its whole first line as cut and begun before (our read of the house's fixes
+   * for its review of f3750e4, PR #22).
+   */
+  older?: boolean;
   /** With `limit`: output events of the range remain after the last one returned. */
   more?: boolean;
   /**
@@ -125,6 +134,7 @@ export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
     more = true;
   }
   let truncated = o.truncated;
+  let older = o.older === true;
   if (range.maxBytes !== undefined) {
     let bytes = 0;
     let k = events.length;
@@ -140,9 +150,11 @@ export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
       gaps = gaps?.filter((g) => g.to > dropped);
       events = events.slice(k);
       truncated = true;
+      older = true;
     }
   }
   const out: RunOutput = { events, from: o.from, to: range.until !== undefined ? Math.min(o.to, range.until) : o.to, truncated };
+  if (older) out.older = true;
   if (range.limit !== undefined) out.more = more;
   if (gaps?.length) out.gaps = gaps;
   return out;
@@ -219,6 +231,7 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
     else if (!seen.has(g.seq)) gaps.push(g);
   }
   const whole: RunOutput = { events, from, to: hi, truncated: journal.gapAt(from, to) || holed };
+  if (journal.gapAt(from, to)) whole.older = true;
   if (gaps.length) whole.gaps = gaps.sort((a, b) => a.seq - b.seq);
   return narrowOutput(whole, range);
 }

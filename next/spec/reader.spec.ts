@@ -1239,6 +1239,38 @@ test('a read across a stretch the ring dropped while the disk refuses shows the 
   assert.ok(healed.text!.includes(`early-2\n${line}\nlate-`), healed.text);
 });
 
+test('a Run’s tail across a hole marks its first line cut or begun before only when older output precedes the window, not for the hole (our read of the house’s fixes for its review of f3750e4, PR #22)', async () => {
+  // The Run path took the Run's `truncated`, which a hole inside the Run sets too, for "older output exists": a tail
+  // of 2 after the hole marked its whole first line `cutHead` and `begunBefore`, and called the tail truncated.
+  for (const at of ['before the first line', 'between the lines'] as const) {
+    const src = source();
+    const j = src.journal;
+    startRun(j, 'r1');
+    const hole = () => j.append({ type: 'gap', from: j.lastSeq + 1, to: j.lastSeq + 1, reason: 'store-error' });
+    if (at === 'before the first line') hole();
+    out(j, 'one\n', 'stdout', 'r1');
+    if (at === 'between the lines') hole();
+    out(j, 'two\n', 'stdout', 'r1');
+    endRun(j, 'r1');
+    for (const tail of [2, 3]) {
+      const r = await readJournal(src, { runId: 'r1', tail }, { resultBytes: 16384 });
+      const said = `${at}, tail ${tail}: ${JSON.stringify(r.text)} ${JSON.stringify(r.lines)}`;
+      assert.equal(r.lines?.cutHead, undefined, said);
+      assert.equal(r.lines?.begunBefore, undefined, said);
+      // Incomplete exactly when the hole's line is among those shown (e5a55cd's rule).
+      assert.equal(r.truncated, r.text!.includes('missing'), said);
+    }
+  }
+  // Older output before the window still marks a first line begun before it.
+  const src = source();
+  startRun(src.journal, 'r1');
+  out(src.journal, `${'x'.repeat(300_000)}`, 'stdout', 'r1');
+  out(src.journal, 'end\n', 'stdout', 'r1');
+  endRun(src.journal, 'r1');
+  const long = await readJournal(src, { runId: 'r1', tail: 1, maxBytes: 4096 }, { resultBytes: 16384 });
+  assert.equal(long.lines?.cutHead, true, JSON.stringify(long.lines));
+});
+
 test('paging back past a title left open before a hole reaches every line: the title shows nothing, and the row its LF left counts', async () => {
   // `one`, `two` ended by a bare LF, a title the hole leaves open, then the hole: the hole's line starts after a
   // blank row, which the tail had read as `two`, so the page before ended after `one`.

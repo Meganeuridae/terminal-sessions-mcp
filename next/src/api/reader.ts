@@ -1046,12 +1046,12 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       ro = src.runOutput(o.runId, rangeOf(o.since, o.until, { maxBytes: want }));
       got = clip(ro.events);
       const raw = got.reduce((a, e) => a + (isOutput(e) ? countLines(e.data) : 0), 0);
-      if (!ro.truncated || want >= cap || enough(got, raw, true)) break;
+      if (!ro.older || want >= cap || enough(got, raw, true)) break;
       want = Math.min(cap, want * 4);
     }
     end = o.until !== undefined ? Math.min(ro.to, o.until) : ro.to;
     rangeStart = Math.max(rangeStart, ro.from);
-    older = ro.truncated;
+    older = ro.older === true;
     whole = new Map(ro.events.filter(isOutput).map((e) => [e.seq, e]));
     events = [...got, ...(ro.gaps ?? [])].sort((a, b) => a.seq - b.seq);
     // Nothing of the range retained: the hole is the range (the house's read of 1cabc6a, #22), less what a recorded gap already says.
