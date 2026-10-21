@@ -62,12 +62,12 @@ export interface PtyHandle {
    * pager or password tool opens); false when none does. A program bash's rc started is one: it runs
    * in the shell's own process group. (By run, an interactive bash 5.2.37 whose rc printed `$-` and
    * the pgids of programs it started showed monitor mode on, and a program started in the foreground
-   * or with `&` had the shell's pid as its pgid; zsh's and fish's rcs weren't run.) The daemon never
-   * types a reinit while one may be reading. bash's rc's `sleep 301 &` shares the group too but has
-   * /dev/null as its input and does not count. A job started at a prompt has its own group: in the
-   * background it is not the foreground and does not count; in the foreground that group is not the
-   * shell's, and it does (the house's read of the 38 commits, #22 comment 6274841346, item 2; the
-   * house's review of 4f4c067..a8b6f28). A builtin `read` is the shell itself:
+   * or with `&` had the shell's pid as its pgid; zsh's and fish's rcs weren't run.) The gate types no
+   * reinit while it finds such a reader, within the limits below. bash's rc's `sleep 301 &` shares the
+   * group too but has /dev/null as its input and does not count. A job started at a prompt has its own
+   * group: in the background it is not the foreground and does not count; in the foreground that group
+   * is not the shell's, and it does (the house's read of the 38 commits, #22 comment 6274841346, item
+   * 2; the house's review of 4f4c067..a8b6f28). A builtin `read` is the shell itself:
    * inputMode tells `read -n` apart. Undefined when it cannot be told; the gate then does not type
    * (item 1: unknown is not "no reader").
    *
