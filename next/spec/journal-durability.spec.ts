@@ -13,6 +13,7 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { clocks } from '../src/core/clock.js';
 import { SessionRegistry } from '../src/api/registry.js';
+import { readJournal } from '../src/api/reader.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { HIGH_WATER_BLOCK, Journal } from '../src/core/journal.js';
 import { boots } from '../src/core/lock.js';
@@ -1504,6 +1505,29 @@ test('a read that returns none of the events while more remain covers nothing: a
     assert.deepEqual([r.events.length, r.more, r.gaps], [0, true, undefined]);
   }
   j.close();
+});
+
+test('a text read prints a hole wider than a batch once: one joined past MAX_LOST spans events, and every batch it meets lists it', async () => {
+  const dir = tmpDir();
+  try {
+    const first = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+    for (let i = 0; i < 3200; i++) first.append(out(`e${i}\n`));
+    first.close();
+    // A new life inherits 256 holes while the disk refuses; the ring drops their gaps, their holes are lost again
+    // beside the stretch of the dropped gaps' own seqs, and past MAX_LOST the two oldest, 1 and 2600, are joined.
+    const cold = new Flaky(dir);
+    cold.budget = 0;
+    const holes = [1, 2600, ...Array.from({ length: 254 }, (_, k) => 2602 + 2 * k)].map((s) => ({ from: s, to: s, reason: 'store-error' as const, exact: true as const }));
+    const j = new Journal({ hot: new MemoryStore(1), cold, startSeq: first.lastSeq, lost: holes, sessionId: 's' });
+    j.append(out('last\n'));
+    assert.ok(j.gapsWithin(1, j.lastSeq).some((g) => g.from === 1 && g.to === 2600), 'the two oldest holes were joined');
+    const src = { id: 's', journal: j, cols: 80, rows: 24, runOutput: (runId: string, range: Parameters<typeof j.runs.output>[2]) => j.runs.output(j, runId, range), run: (runId: string) => j.runs.get(runId) };
+    const r = await readJournal(src, { since: 0, maxBytes: 4 << 20 }, { resultBytes: 4 << 20 });
+    const listed = [...(r.gaps ?? (r.gap ? [r.gap] : []))].filter((g) => g.from === 1 && g.to === 2600);
+    assert.equal(listed.length, 1, JSON.stringify((r.gaps ?? []).map((g) => [g.from, g.to])));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a catch-up that writes a refused gap and then fails again leaves the gap off unwritten: a new life does not record its hole a second time', () => {

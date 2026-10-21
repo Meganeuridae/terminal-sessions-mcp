@@ -401,6 +401,12 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
    * there is reported, and the inferred one only for what that leaves (uncovered).
    */
   let reported = from - 1;
+  /**
+   * The holes placed so far, by range: a hole wider than a batch (one joined past MAX_LOST spans events) is in each
+   * batch it meets, seated where that batch's cover ends, so by its seat alone a text read printed it once per batch
+   * (the house's review of 4f4c067..a8b6f28, PR #22).
+   */
+  const placed = new Set<string>();
   let done = false;
   return {
     gap,
@@ -423,7 +429,13 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
       const lost = inferred ? minusRanges([inferred], recordedIn(holes)) : [];
       events.unshift(...lost.filter((g) => g.to > reported).map((g) => gapEvent(vouched(journal, { ...g, from: Math.max(g.from, reported + 1) }))));
       const upTo = done ? end : (r.events[r.events.length - 1]?.seq ?? reported);
-      for (const g of holes) if (g.seq > reported && g.seq <= upTo) events.push(g);
+      for (const g of holes) {
+        const range = `${g.from}-${g.to}`;
+        if (g.seq > reported && g.seq <= upTo && !placed.has(range)) {
+          placed.add(range);
+          events.push(g);
+        }
+      }
       events.sort((a, b) => a.seq - b.seq);
       if (events.length) reported = Math.max(reported, done ? end : events[events.length - 1]!.seq);
       if (r.events.length) cursor = r.events[r.events.length - 1]!.seq;
