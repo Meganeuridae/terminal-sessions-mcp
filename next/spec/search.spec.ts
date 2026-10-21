@@ -131,6 +131,26 @@ test('er-5: a real PTY `cat` of 5000 lines: every line is found, whatever the re
 
 // ───────────── er-6 / ux-20: a match's cursor reads from its line ─────────────
 
+test('a match\'s coordinates read and search on from a CSI the source\'s earlier output began, wherever the events split it (our review of the 73 commits through 4860d4c, PR #22)', async () => {
+  // `ESC [ 3 LF` in one event and `1mREADY` in the next: READY's line begins after the LF the CSI executed, and its
+  // coordinates name the second event. Read from there, the CSI's rest showed as `1mREADY`, and a search from there
+  // found no `^READY$`.
+  const data = 'before\n\x1b[3\n1mREADY\nafter\n';
+  for (let cut = 1; cut < data.length; cut++) {
+    const src = source();
+    startRun(src.journal, 'r1');
+    out(src.journal, data.slice(0, cut), 'stdout', 'r1');
+    out(src.journal, data.slice(cut), 'stdout', 'r1');
+    endRun(src.journal, 'r1');
+    const m = (await search(src, { pattern: '^READY$', since: 0 })).matches[0];
+    assert.ok(m, `split at ${cut}: found`);
+    const at = { since: m.cursor, ...(m.offset ? { offset: m.offset } : {}) };
+    const read = await readJournal(src, { runId: 'r1', ...at }, { resultBytes: 4096 });
+    assert.equal(read.text!.split('\n')[0], 'READY', `split at ${cut}: the read`);
+    assert.deepEqual(lines(await search(src, { pattern: '^READY$', ...at, context: 0 })), ['READY'], `split at ${cut}: the search`);
+  }
+});
+
 test('er-6 / ux-20: read since=match.cursor (offset=match.offset) starts at the matching line, even inside a 64 KiB pipe read', async () => {
   const src = source();
   startRun(src.journal, 'r1');

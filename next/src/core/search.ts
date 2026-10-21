@@ -162,9 +162,10 @@ export class LineScanner {
   /**
    * Feed the next event of the range (non-output events are ignored, gaps end
    * every line); from `offset` UTF-8 bytes on for a continuation that starts
-   * inside it (the part before is not scanned).
+   * inside it (the part before is not scanned). `open` is the head of a sequence `offset` falls inside, which the scan
+   * goes on from: one the source's earlier output began, which the caller reads; without it, one begun in the event.
    */
-  feed(ev: JournalEvent, offset = 0): void {
+  feed(ev: JournalEvent, offset = 0, open?: string): void {
     if (this.full) return;
     this.start ??= { cursor: ev.seq - 1, offset };
     if (ev.type === 'gap') {
@@ -176,7 +177,7 @@ export class LineScanner {
     const key = ev.stream === 'pty' ? 'pty' : `p:${ev.runId ?? ''}`;
     const i = indexAtByte(ev.data, offset);
     // A continuation that starts inside a CSI (a line begun after a LF the CSI executed) reads it on from its head.
-    const head = i > 0 && !this.scans.has(key) ? headAt(ev.data, i) : '';
+    const head = this.scans.has(key) ? '' : (open ?? (i > 0 ? headAt(ev.data, i) : ''));
     if (head) this.scans.set(key, { open: head });
     this.take(key, ev.data.slice(i), ev.seq, utf8Length(ev.data.slice(0, i)), ev.stream);
   }

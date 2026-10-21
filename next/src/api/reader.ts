@@ -558,12 +558,13 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
         const key = sourceKey(e);
         let carry = carries.get(key);
         if (!carry) carries.set(key, (carry = lineCarry()));
-        if (from > 0) {
+        if (o.since !== undefined && e.seq === o.since + 1) {
           // A page from an offset inside a sequence a LF ran through (search reports a line that begins after
           // such a LF there) goes on inside it: the sequence's head comes before the page, in the line-end rule
           // and in the projection, so its rest applies as the emulator applied it, not as `1mB` (our read of
-          // the fix for the line-end rule's two remaining cases, PR #22).
-          head = headAt(e.data, from);
+          // the fix for the line-end rule's two remaining cases, PR #22). The sequence can have begun in the
+          // source's earlier output (headBefore).
+          head = headBefore(src, o, e, from);
           if (head) carry.open = head;
         }
         pieces.push({ kind: 'out', ev: e, data, start: utf8Length(e.data.slice(0, from)), bytes: b, ends: lineEnds(data, carry) });
@@ -1060,6 +1061,48 @@ const STATE_LOOKBACK = 1024 * 1024;
  * not, so many small events end it before the bytes do (40,000 events of 8 bytes
  * are 320 KB): state set before them is not applied.
  */
+/**
+ * How far back headBefore reads a source's earlier output for the start of a sequence open where a page begins, in
+ * UTF-16 units and in events: the look back for an unfinished sequence the house's other readers use (4,096), and one
+ * batch of events, since it runs for every page and search that starts at since. A CSI or escape sequence whose open
+ * head runs further back than that, across events, is missed: a read or search from a line inside it shows the
+ * sequence's rest as text, where the matcher, which carries the head whole, read it. Only a malformed sequence is that
+ * long. Reading back until a character an open sequence can't hold would be exact, but an open CSI can hold digits
+ * and line ends, so that would walk back through the whole of a Run that prints numbers (`seq 1 30000`, 169 KB).
+ */
+const HEAD_LOOKBACK = 4096;
+const HEAD_EVENTS = 512;
+
+/**
+ * The head of the CSI or escape sequence open `start` units into `first`, where a page or a search begins (headAt):
+ * one begun earlier in `first`, or in the same source's earlier output, read on across its events, as the matcher
+ * that gave the coordinates read it. A line begun after a LF a CSI in an earlier event executed begins with that CSI's
+ * head: read from its coordinates, `ESC [ 3 LF` then `1mREADY` showed `1mREADY`, and a search from there found no
+ * `^READY$` (our review of the 73 commits through 4860d4c, PR #22). A hole ends every sequence, so the look back
+ * stops at one; it reads at most HEAD_LOOKBACK of the source's output, among the HEAD_EVENTS events before.
+ */
+function headBefore(src: ReadSource, o: { runId?: string | undefined }, first: Output, start: number): string {
+  const key = sourceKey(first);
+  const parts: string[] = [];
+  let units = 0;
+  const take = (events: readonly JournalEvent[]): void => {
+    for (let i = events.length - 1; i >= 0 && units < HEAD_LOOKBACK; i--) {
+      const e = events[i]!;
+      if (isGap(e)) return;
+      if (!isOutput(e) || sourceKey(e) !== key) continue;
+      parts.push(e.data);
+      units += e.data.length;
+    }
+  };
+  if (o.runId !== undefined) {
+    const back = src.runOutput(o.runId, { until: first.seq - 1, maxBytes: HEAD_LOOKBACK });
+    const holeEnd = Math.max(-1, ...(back.gaps ?? []).map((g) => g.to));
+    take(back.events.filter((e) => e.seq > holeEnd));
+  } else if (first.seq > 1) take(src.journal.tail(HEAD_EVENTS, first.seq - 1));
+  const before = parts.reverse().join('');
+  return headAt(before + first.data, before.length + start);
+}
+
 function stateBefore(src: ReadSource, o: ReadOptions, first: Output, start = 0): string {
   const parts: string[] = [];
   let bytes = 0;
@@ -1922,7 +1965,11 @@ export async function searchJournal(src: ReadSource, o: SearchOptions, limits: P
         break outer;
       }
       if (isGap(e)) addHole(gaps, gapOf(e));
-      scanner.feed(e, since !== undefined && e.seq === since + 1 ? (o.offset ?? 0) : 0);
+      if (since !== undefined && e.seq === since + 1) {
+        // The scan goes on inside a sequence its start falls in, one the source's earlier output began included.
+        const offset = o.offset ?? 0;
+        scanner.feed(e, offset, isOutput(e) ? headBefore(src, o, e, indexAtByte(e.data, offset)) : undefined);
+      } else scanner.feed(e, 0);
       firstSeq ??= e.seq;
       lastSeq = e.seq;
       events++;
