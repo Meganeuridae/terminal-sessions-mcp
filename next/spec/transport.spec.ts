@@ -1450,27 +1450,22 @@ test('2f357bd-4: closing a session does not cut a paused subscriber off: it gets
     const viewer = await Client.open(h.port);
     await viewer.request('terminal/subscribe', { session: 'slowview' });
     const from = s.journal.lastSeq;
-    viewer.ws.pause();
     const conn = [...conns(h.server)].find((x) => x !== ownerConn)!;
-    const chunk = 'z'.repeat(8 * 1024);
-    // Write until the follower pauses, not a fixed count: a host whose loopback socket buffers hold
-    // megabytes stays `live` well past 400 chunks (3.2 MB on Linux), so the test's volume must follow
-    // the backpressure, with a bound so a stream that never pauses fails rather than hangs (the house's
-    // read of 78c4d6e, #22).
     const follower = conn.followers.get('slowview')!;
-    // A pause is the socket's only once the loopback buffers are full: a burst of synchronous appends
-    // queues frames the loop has not written yet, which pauses the follower for an instant and drains
-    // without the viewer reading a byte, and a close in that instant found the stream already
-    // delivered (CI's macOS runner on Node 24, and this machine under load). So at least 8 MiB goes
-    // in first, more than the loopback buffers hold, and the pause must hold for 50 ms; the viewer is
-    // paused, so a socket that is really full stays full.
-    for (let i = 0; i < 20_000; i++) {
-      s.journal.append({ type: 'note', text: `${i}:${chunk}`, principal: 'agent:a@test' });
-      if (i >= 1024 && follower.state === 'paused') {
-        await sleep(50);
-        if (follower.state === 'paused') break;
-      } else if (i % 100 === 0) await sleep(1);
-    }
+    // The viewer's socket is corked at the server, which holds what is sent to it as a kernel whose buffers
+    // a viewer that stopped reading has filled holds it, so the follower pauses at the high-water mark and
+    // stays paused. A viewer that stopped reading stood in for it, behind a flood: a burst of synchronous
+    // appends paused the follower for an instant and it drained without the viewer reading a byte, and a
+    // close in that instant found the stream already delivered (CI's macOS runner on Node 24, and this
+    // machine under load; the house's read of 78c4d6e, #22). The rule that answered it, 8 MiB written and
+    // a pause held 50 ms, still leaves Linux room to grow the send buffer after the check, as 2f357bd-3
+    // shows (the house's read of the 40 commits through f3750e4, #22, comment 6310921374).
+    const sock = (conn.ws as unknown as { _socket: net.Socket })._socket;
+    sock.cork();
+    const chunk = 'z'.repeat(8 * 1024);
+    for (let i = 0; i < 1000 && follower.state !== 'paused'; i++) s.journal.append({ type: 'note', text: `${i}:${chunk}`, principal: 'agent:a@test' });
+    // And a backlog behind the pause, which the close must not cut off.
+    for (let i = 0; i < 100; i++) s.journal.append({ type: 'note', text: `behind:${i}:${chunk}`, principal: 'agent:a@test' });
     assert.equal(follower.state, 'paused', 'the follower pauses once the socket and the high-water mark fill');
     const closed = await owner.call('session_close', { session: 'slowview' });
     assert.equal(closed.isError, undefined, closed.text);
@@ -1479,7 +1474,7 @@ test('2f357bd-4: closing a session does not cut a paused subscriber off: it gets
     const last = hist.kind === 'history' ? hist.lastSeq : -1;
     assert.equal(conn.followers.get('slowview'), follower, 'the stream is kept until it has delivered the end');
     assert.equal(follower.ending, true);
-    viewer.ws.resume();
+    sock.uncork();
     const ended = await viewer.next((m) => m.method === 'terminal/closed', 15_000);
     assert.deepEqual(ended.params, { session: 'slowview', reason: 'session-closed' });
     const evs = eventsOf(viewer, 'slowview');

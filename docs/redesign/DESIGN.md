@@ -424,7 +424,9 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   completion settles a moment after its `run.end`, so a later event can be accepted first).
   Refusals and transport errors retain that debt and retry with the same message id;
   elapsed time is not acceptance. A catch-up summary pins the cursor before its oldest
-  covered event until accepted, then settles the individual debts it represents.
+  covered event until accepted, then settles the individual debts it represents. A session's
+  refused lifecycle messages are retried one by one up to 32; past that the oldest fold into
+  one summary, retried in their place, which pins the cursor below them until accepted.
   Cursors are keyed by principal, so they survive connection replacement. Delivery is
   at-least-once; duplicates are detectable by `seq` and `messageId`.
 - **G23.** Tags describe and never authorize. Treatment is the host's. Suggested treatment
@@ -795,7 +797,8 @@ event the message reports — what the `delivered` cursor advances to. A catch-u
 alone, so a pushed summary names the kinds in its text. When ranges were gone it adds `lostFrom`
 and `lostTo`: two scalars, for the same reason, spanning from the first gone range's start to
 the last one's end, so seqs delivered between two ranges lie inside the span; the text names
-each range. Message and event
+each range. A summary of the refused messages folded past G22's retry bound adds
+`refused: true`. Message and event
 ids are node-qualified (`<node>/<session>~<epoch>:<kind>:<seq>`, a digest's with `~<runId>`
 and a screen's with its ordinal after the kind; the epoch is the journal's, so a forgotten name's new journal never reuses an
 id), so two daemons never collide in a host's dedup window. A history boundary
