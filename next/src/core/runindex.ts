@@ -246,6 +246,17 @@ export class RunIndex {
   /** `sessionId` is stamped on every RunInfo. */
   constructor(readonly sessionId: string) {}
 
+  /**
+   * Feed the index from what a store retains, in one streaming pass: run lifecycle events, gaps, and the
+   * Runs rotation headers name — what a journal reads when it opens over the store, so a caller can judge
+   * the store's history before opening a journal, which writes (the house's read of the 33 commits, PR
+   * #22, comment 6307350477; an independent read of the fix).
+   */
+  scanStore(store: { scan(needles: string[], visit: (ev: JournalEvent) => void, onHeader: (h: RotationHeader) => void): void }): this {
+    store.scan(['"type":"run.', '"type":"gap"'], (ev) => this.feed(ev), (h) => this.absorbHeader(h));
+    return this;
+  }
+
   /** Apply one journal event; anything but run lifecycle events is ignored. */
   feed(ev: JournalEvent): void {
     switch (ev.type) {

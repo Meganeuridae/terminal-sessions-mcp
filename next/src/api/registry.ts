@@ -28,7 +28,7 @@ import { clocks } from '../core/clock.js';
 import { err, TermError } from '../core/errors.js';
 import { Journal, type JournalOptions } from '../core/journal.js';
 import { acquireDataDirLock, groupAlive, listProcesses, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
-import type { RunOutput, RunOutputRange } from '../core/runindex.js';
+import { RunIndex, type RunOutput, type RunOutputRange } from '../core/runindex.js';
 import { Session, trustedDir, type SessionOptions } from '../core/session.js';
 import { FileStore, FreeSpaceFloor, MemoryStore, type DiskFloor, type DurableWrite, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
 import { DEFAULT_GEOMETRY, SYSTEM, type ControlPolicy, type Cursors, type JournalEvent, type Principal, type RunInfo, type Seq, type Visibility } from '../core/types.js';
@@ -531,9 +531,10 @@ export class SessionRegistry {
     // comment 6269992150). Past its retention too, the journal is opened: its run index names the
     // process groups to end (the house's read of 2c35df8, #22).
     const journal = new Journal({ hot: this.hotStore(retention), cold: store, sessionId: id, log: this.journalLog(id) });
-    if (!holdsHistory(store, journal)) {
+    if (!holdsHistory(store, journal.runs)) {
       journal.close();
-      // No events and no open Runs: nothing to recover. Past its retention (every file aged out), the files go.
+      // No events, no open Runs and no reservation above them: nothing to recover. Past its retention (every
+      // file aged out), the files go.
       if (gone) this.removeFiles(id, dir);
       return undefined;
     }
@@ -908,25 +909,30 @@ export class SessionRegistry {
       // PR #22, comment 6274857431, item 7). With no history there is nothing to keep, and the default applies.
       const refusal = recordRefusal(id, recorded);
       store = new FileStore(dir, this.storeOptions(id, refusal ? {} : before));
-      jo.cold = store;
-      journal = new Journal(jo);
       // A journal this registry did not surface (recovery could not read it): its owner stands (G18),
       // and a record that cannot be read, or is not there, names none. Whether it holds history is
       // recovery's rule: an event, or a Run still open that only a rotation header names — by events
       // alone, another principal took a header-only journal's open Run, and its record (the house's read
-      // of the 33 commits, PR #22, comment 6307350477, item 6).
-      if (!holdsHistory(store, journal)) {
+      // of the 33 commits, PR #22, comment 6307350477, item 6). It is judged from the store's index, before
+      // a journal is opened over it: a journal writes when it opens (the gap for a reservation it honours)
+      // and when it closes (its reservation), and a refused open wrote both into a journal it did not own
+      // (an independent read of the fix). The journal then takes the index the scan built.
+      const runs = new RunIndex(id).scanStore(store);
+      if (!holdsHistory(store, runs)) {
         if (refusal) store.setRetention(before);
       } else {
         if (refusal) {
-          journal.close();
+          store.close();
           throw refusal;
         }
         if (o.owner !== SYSTEM && (recorded.owner ?? SYSTEM) !== o.owner) {
-          journal.close();
+          store.close();
           throw err('forbidden', `session ${id} belongs to another principal; only its owner may open it again`, { id });
         }
       }
+      jo.runs = runs;
+      jo.cold = store;
+      journal = new Journal(jo);
     }
     // Requested over recorded over daemon defaults (ux-4). Another principal's leftovers are never reused.
     const reuse = recorded.owner === undefined || recorded.owner === o.owner || o.owner === SYSTEM ? recordedOptions(recorded, retention) : undefined;
@@ -1451,12 +1457,16 @@ export function heldGroups(known: Map<number, ProcessRow[]>, now: ProcessRow[]):
 }
 
 /**
- * Whether a session's journal holds history: an event, or a Run still open that only a rotation header
- * names (age retention can leave just the header). One rule for recovery's open and for the open of a
- * journal recovery did not surface (the house's read of the 33 commits, PR #22, comment 6307350477, item 6).
+ * Whether a session's journal holds history: an event, a Run still open that only a rotation header
+ * names (age retention can leave just the header), or a reservation above the files' last seq — seqs
+ * issued that a power loss may have taken, which a journal opened over the store records as a gap. One
+ * rule for recovery's open and for the open of a journal recovery did not surface (the house's read of
+ * the 33 commits, PR #22, comment 6307350477, item 6), judged from the store and its index alone, so the
+ * fallback asks it before a journal is opened over the store (an independent read of the fix).
  */
-function holdsHistory(store: FileStore, journal: Journal): boolean {
-  return store.lastSeq() !== undefined || journal.runs.open().length > 0;
+function holdsHistory(store: FileStore, runs: RunIndex): boolean {
+  const last = store.lastSeq();
+  return last !== undefined || runs.open().length > 0 || (store.highWater()?.reservation?.to ?? 0) > (last ?? 0);
 }
 
 function expired(store: FileStore, retention: SessionRetention, now: number): boolean {

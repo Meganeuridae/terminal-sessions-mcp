@@ -779,6 +779,44 @@ test('G18/G20: a failed start whose old record cannot be written back still fail
   await cleanup(r);
 });
 
+test('G18/G10: a refused open of a journal recovery did not surface leaves its files byte for byte as they were — the journal is opened only once the open is allowed (the house\'s read of the 33 commits, PR #22, comment 6307350477; an independent read of the fix)', async () => {
+  // A journal opened over these files writes: the gap for the reservation it honours, when it opens, and its
+  // reservation, when it closes. The refused opens below wrote both into a journal they did not own.
+  const r = rig();
+  const files = (sdir: string) => Object.fromEntries(fs.readdirSync(sdir).filter((n) => n.startsWith('journal')).sort().map((n) => [n, fs.readFileSync(path.join(sdir, n)).toString('base64')]));
+  /** A crash on another boot: the reservation a block ahead stands, and a journal opened over it records the hole. */
+  const crashed = (sdir: string, meta: Record<string, unknown>) => fs.writeFileSync(path.join(sdir, 'journal.meta.json'), JSON.stringify({ v: 1, ...meta, reserved: 20_000, boot: 'another-boot' }) + '\n', { mode: 0o600 });
+  // One with lines that survived, and one whose every line a power loss took: both are A's history.
+  const withLines = path.join(r.dir, 'sessions', 'held');
+  const j = new Journal({ cold: new FileStore(withLines), sessionId: 'held' });
+  j.append({ type: 'output', data: 'private\r\n', stream: 'pty' });
+  j.close();
+  crashed(withLines, { epoch: (JSON.parse(fs.readFileSync(path.join(withLines, 'journal.meta.json'), 'utf8')) as { epoch: string }).epoch });
+  const linesLost = path.join(r.dir, 'sessions', 'lost');
+  fs.mkdirSync(linesLost, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(linesLost, 'journal.jsonl'), '', { mode: 0o600 });
+  crashed(linesLost, { epoch: 'd'.repeat(16) });
+  for (const [id, sdir] of [['held', withLines], ['lost', linesLost]] as const) {
+    const before = files(sdir);
+    const record = path.join(sdir, 'session.json');
+    fs.writeFileSync(record, JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    await rejectsWith(r.reg.create({ id, owner: B }), 'forbidden');
+    assert.deepEqual(files(sdir), before, `${id}: another principal's refused open`);
+    fs.writeFileSync(record, '{');
+    await assert.rejects(r.reg.create({ id, owner: A }), /cannot be read/);
+    assert.deepEqual(files(sdir), before, `${id}: an unreadable record's refused open`);
+    fs.rmSync(record);
+    await assert.rejects(r.reg.create({ id, owner: A }), /has history but no record/);
+    assert.deepEqual(files(sdir), before, `${id}: a missing record's refused open`);
+    assert.equal(r.reg.get(id), undefined);
+  }
+  // Allowed, the owner's open is the journal's first write: the hole goes on record then.
+  fs.writeFileSync(path.join(linesLost, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+  const s = await r.reg.create({ id: 'lost', owner: A });
+  assert.ok(s.journal.since(0).events.some((e) => e.type === 'gap' && e.from === 1 && e.to === 20_000), 'the owner\'s life records the lost seqs');
+  await cleanup(r);
+});
+
 test('G18: a journal recovery did not surface that holds only a rotation header naming an open Run is history its owner stands on — another principal is refused, and its record is untouched (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 6)', async () => {
   // The registry is already running, so recovery never surfaced this directory; age retention can leave just the header.
   const r = rig();
