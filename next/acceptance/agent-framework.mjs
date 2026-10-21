@@ -183,10 +183,17 @@ try {
     const ctx = context();
     assert.ok(ctx.includes(`${SESSION}: \`${COMMAND}\` → exit 0`), `agent context:\n${ctx.slice(-800)}`);
     assert.match(ctx, /acceptance-output/);
-    const pushes = traces.filter((t) => t.type === 'mcpl:push_event' || t.type === 'mcpl:channels-incoming');
-    assert.ok(pushes.length >= 1, 'delivered through the host lane');
-    // The wake itself, seen from the model's side and apart from any note: an inference call carrying the completion.
-    while (!membrane.calls.length && now() < until) await sleep(50);
+    // On the session's channel, as the open above intends, not as a push event with no channel to answer
+    // into. Any push or batch counted before, so this passed with the channel closed. The traces carry no
+    // Run, only the channels a batch named.
+    const lane = traces.filter((t) => t.type === 'mcpl:push_event' || t.type === 'mcpl:channels-incoming');
+    assert.ok(
+      lane.some((t) => t.type === 'mcpl:channels-incoming' && t.channelIds?.includes(CHANNEL)),
+      `delivered on the session's channel through the host lane: ${lane.map((t) => `${t.type}${t.channelIds ? ` ${t.channelIds.join(',')}` : ''}`).join('; ') || 'nothing through the lane'}`,
+    );
+    // The wake itself, seen from the model's side and apart from any note: an inference call carrying the
+    // completion, with a bound of its own, so a delivery that took most of its wait leaves this one its time.
+    for (const inferenceUntil = now() + 8000; !membrane.calls.length && now() < inferenceUntil; ) await sleep(50);
     assert.ok(membrane.calls.length >= 1, 'an inference call followed the completion');
     assert.ok(JSON.stringify(membrane.calls[0].messages).includes('acceptance-output'), 'the inference call carries the completion');
   });
