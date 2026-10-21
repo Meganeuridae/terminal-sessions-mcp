@@ -8,6 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import type { PtyHandle } from '../src/backends/types.js';
 import { AGENT, hasShell, pgrep, realSession, reap, until } from './fake-shell.js';
 
 const FISH = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find(hasShell) ?? '/usr/bin/fish';
@@ -266,14 +267,28 @@ test('fish: a stopped shell whose empty line a third ^C flushed reads keys again
   // of ours: the advice's input may take two Enters. (fish 3.7 sends no queries; there the spec shows the
   // recovery alone.)
   //
-  // The completions dir is there already, as after any earlier fish start: in a fresh HOME fish 3.7 starts
-  // `python3 create_manpage_completions.py &` while it reads its config, in its own process group with
-  // the terminal as its input, and the reader check rightly takes that for a reader, so no empty line is
-  // typed (CI's Ubuntu runner, fish 3.7.0).
-  const x = await realSession(FISH, { login: false, rc: { '.local/share/fish/generated_completions/.keep': '' } });
+  // The completions dirs are there already, as after any earlier fish start. In a fresh HOME fish starts its
+  // man-page completion generator while it reads its config, in its own process group: fish 3.7 when
+  // `$__fish_user_data_dir/generated_completions` is missing, with the terminal as the generator's input,
+  // which the reader check rightly takes for a reader (CI's Ubuntu runner); fish 4.9 when
+  // `$__fish_cache_dir/generated_completions` is missing, as `sh -c 'c=$(cat) ...'` and a python parsing
+  // every man page, which the reader check then finds in fish's group and inspects with lsof. With only the
+  // first dir the generator ran in every fish 4.9 run of this spec, and the spec failed twice on macOS under
+  // load, its error not kept. With both dirs, fish is alone on its terminal.
+  const x = await realSession(FISH, { login: false, rc: { '.local/share/fish/generated_completions/.keep': '', '.cache/fish/generated_completions/.keep': '' } });
   const pid = x.session.info().pid;
+  const events = () => x.journal.since(0).events;
+  const lastOutputTs = () => events().reduce((t, e) => (e.type === 'output' ? Math.max(t, e.ts) : t), 0);
+  const queued = (id: string) => x.session.run(id).state === 'queued';
   try {
-    await until(() => x.session.shellAvailable().ok, 8000, 'the shell is ready');
+    // Stopped only once fish is at its line editor: its prompt's end mark is in, and the terminal is in the
+    // editor's mode. Availability alone comes at the prompt's start mark, which under load can be some way
+    // ahead of the editor.
+    const pty = (x.session as unknown as { pty: PtyHandle }).pty;
+    await until(() => {
+      const m = pty.inputMode?.();
+      return x.session.shellAvailable().ok && events().some((e) => e.type === 'prompt' && e.phase === 'end') && m !== undefined && !m.canonical && !m.echo;
+    }, 8000, 'fish at its line editor');
     process.kill(pid, 'SIGSTOP');
     const a = x.session.admit({ target: 'shell', line: 'echo first-ran', principal: AGENT });
     assert.ok(a.admitted);
@@ -283,11 +298,16 @@ test('fish: a stopped shell whose empty line a third ^C flushed reads keys again
     const b = x.session.admit({ target: 'shell', line: 'echo second-(math 40+2)', principal: AGENT, queue: true });
     assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
     process.kill(pid, 'SIGCONT');
-    for (let i = 0; i < 3 && x.session.run(b.run.runId).state === 'queued'; i++) {
+    // Each Enter waits for fish's answer to it, and then for the terminal to go quiet past the empty line's
+    // grace, before another is sent: an Enter typed while fish was still slow to answer the one before drew a
+    // prompt behind the queued Run's line once that was written, and discarded it.
+    for (let i = 0; i < 3 && queued(b.run.runId); i++) {
+      const sent = Date.now();
       x.session.input('\n', { principal: AGENT });
-      await until(() => x.session.run(b.run.runId).state !== 'queued', 2000, 'the Run written').catch(() => undefined);
+      await until(() => !queued(b.run.runId) || lastOutputTs() >= sent, 10_000, 'fish answers the Enter');
+      await until(() => !queued(b.run.runId) || Date.now() - lastOutputTs() > 1000, 10_000, 'the terminal quiet after it');
     }
-    const r = await x.session.awaitRun(b.run.runId, 5000);
+    const r = await x.session.awaitRun(b.run.runId, 10_000);
     assert.deepEqual([r.state, r.exit, r.reason], ['exited', 0, undefined], JSON.stringify(r));
     assert.equal((await x.session.runTranscript(r.runId)).text, 'second-42');
   } finally {
