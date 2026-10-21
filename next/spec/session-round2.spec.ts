@@ -962,6 +962,38 @@ test('a Run’s command file whose removal fails when the Run ends is removed at
   assert.ok(!fs.existsSync(failed[0]!), 'close removed it');
 });
 
+test('a line discarded before it started whose command file cannot be removed is said, and removed at close', async () => {
+  // discardPending removes the file at once, so a late read of the line sources nothing (ss-8); a removal that
+  // failed there was dropped with no word, and close never tried again (the house's review of a8b6f28..4860d4c).
+  const h = await harness();
+  h.shell.stop();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const rm = fsc.rmSync;
+  const failed: string[] = [];
+  fsc.rmSync = ((file: fs.PathLike, opts?: fs.RmOptions) => {
+    if (/tsm-cmd-1$/.test(String(file)) && failed.length === 0) {
+      failed.push(String(file));
+      throw fault('EACCES', `permission denied, unlink '${String(file)}'`);
+    }
+    return rm(file, opts);
+  }) as typeof fs.rmSync;
+  syncBuiltinESMExports();
+  try {
+    const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+    assert.ok(c.steps.includes('the line was discarded before it started'), JSON.stringify(c.steps));
+    assert.equal(failed.length, 1, 'the removal at the discard failed');
+    assert.ok(fs.existsSync(failed[0]!), 'the file is still there');
+    assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => e.text.startsWith(`${failed[0]} could not be removed when its Run ended (EACCES`)), 'the failure is said');
+  } finally {
+    fsc.rmSync = rm;
+    syncBuiltinESMExports();
+    h.shell.cont();
+  }
+  await h.session.close();
+  assert.ok(!fs.existsSync(failed[0]!), 'close removed it');
+});
+
 test('a cancel whose empty line cannot be written types none, says so, and takes the shell’s next prompt as its answer', async () => {
   // askForPrompt's fallback when its file cannot be written: no line is typed, and the prompt the stopped
   // shell prints for the ^C when it runs again is the shell's answer.

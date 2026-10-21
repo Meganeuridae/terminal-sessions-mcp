@@ -1239,10 +1239,13 @@ export class Session {
   private discardPending(pending: RunRecord, outcome: { state: 'cancelled' | 'lost'; reason: string }): void {
     if (this.pendingShellRun === pending) this.pendingShellRun = undefined;
     if (pending.tempFile) {
+      // Removed at once, so a late read of the line sources a missing file (ss-8). A removal that fails is
+      // said and left to close, as endRun's is: dropped here, the file stayed with no word (the house's review
+      // of a8b6f28..4860d4c).
       try {
         fs.rmSync(pending.tempFile, { force: true });
-      } catch {
-        // already gone
+      } catch (e) {
+        this.leaveForClose(pending.tempFile, e);
       }
       delete pending.tempFile;
     }
