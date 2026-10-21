@@ -1345,7 +1345,8 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     setImmediate(() => out.handleResponse({ jsonrpc: '2.0', id: req.id!, result } as never));
   });
   const caller = { principal: A, connectionId: connection };
-  const lane = new McplLane(app, caller, out, () => undefined);
+  const logs: string[] = [];
+  const lane = new McplLane(app, caller, out, (line) => logs.push(line));
   const closed: string[] = [];
   const removed: string[] = [];
   if (o.announce !== false) {
@@ -1363,7 +1364,7 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     open: Set<string>;
     registered: Set<string>;
     watched: Map<string, unknown>;
-    states: Map<string, { owed: Set<number>; retries: Map<string, unknown> }>;
+    states: Map<string, { owed: Set<number>; retries: Map<string, { kind: string }>; summaries: Map<string, { folded?: { count: number } }> }>;
     closes: Map<string, number>;
     batch: unknown[];
     flush(): Promise<void>;
@@ -1384,8 +1385,66 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     await registry.closeAll();
     fs.rmSync(dataDir, { recursive: true, force: true });
   };
-  return { registry, app, lane, caller, ctx, sent, refuse, closed, removed, inside, settledRun, close };
+  return { registry, app, lane, caller, ctx, sent, refuse, closed, removed, inside, settledRun, close, logs };
 }
+
+test("refused lifecycle messages are retried one by one up to the bound, the oldest past it folded into one summary retried in their place, which keeps the cursor below them until the host accepts it (the house's read of the 40 commits through f3750e4, #22 comment 6310921374)", { timeout: 60_000 }, async () => {
+  // A host that refused every lifecycle message held a retry entry, its message and a timer for each completion, without bound.
+  const was = McplLane.retryMax;
+  McplLane.retryMax = 4;
+  const f = await bareLane('c-retry-bound');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'rb' });
+    const s = live(f.registry, 'rb');
+    f.refuse.value = true;
+    const st = () => f.inside.states.get('rb')!;
+    const pushed = (id: string) => f.sent.some((m) => m.method === 'push/event' && (m.params as { eventId: string }).eventId === id);
+    /** What stands for the refused completions: each one retried alone, or counted by a summary that folded it. */
+    const accounted = () => {
+      const singles = [...st().retries.values()].filter((r) => r.kind !== 'summary').length;
+      const folded = [...st().summaries.values()].reduce((n, x) => n + (x.folded?.count ?? 0), 0);
+      return { singles, folded, summaries: [...st().summaries.values()].filter((x) => x.folded).length };
+    };
+    const N = 14;
+    const ends: number[] = [];
+    for (let i = 0; i < N; i++) {
+      const r = await f.app.run(f.caller, { session: 'rb', command: `echo rb-${i}`, target: 'process', wait: 0 });
+      await until(() => s.run(r.runId!).seq.end !== undefined, 5000, `Run ${i} to end`);
+      const end = s.run(r.runId!).seq.end!;
+      ends.push(end);
+      // Pushed and refused before the next one ends, so the entries are made in order.
+      const id = `${NODE_NAME}/${s.id}~${s.journal.epoch}:run:${end}`;
+      await until(() => pushed(id) && (st().retries.has(id) || accounted().folded + accounted().singles === i + 1), 5000, `the completion of Run ${i} refused`);
+      const a = accounted();
+      assert.ok(a.singles <= McplLane.retryMax && a.summaries <= 2 && st().retries.size <= McplLane.retryMax + 2, `${i}: ${JSON.stringify(a)}, ${st().retries.size} entries`);
+      assert.equal(a.singles + a.folded, i + 1, `${i}: every refused completion is retried alone or counted by a summary`);
+    }
+    // With 4 retried alone at most, the oldest three of five folded each time: 12 in summaries, the newest 2 alone.
+    assert.equal(accounted().singles, 2);
+    assert.equal(accounted().folded, N - 2);
+    for (const end of ends.slice(0, N - 2)) assert.ok(!st().owed.has(end), 'a folded completion is owed through its summary, not alone');
+    assert.ok(s.cursorsOf(A).delivered < Math.min(...ends), `the cursor stays below the oldest refused completion (delivered ${s.cursorsOf(A).delivered}, first end ${Math.min(...ends)})`);
+    const summaries = f.sent.filter((m) => m.method === 'push/event' && /:summary~refused-/.test((m.params as { eventId: string }).eventId));
+    assert.ok(summaries.length >= 1, 'the summary went out in their place');
+    const last = summaries[summaries.length - 1]!.params as { tags: string[]; origin: Record<string, unknown>; payload: { content: Array<{ text: string }> } };
+    assert.ok(last.tags.includes('terminal:missed'));
+    assert.equal(last.origin.refused, true);
+    assert.match(last.payload.content[0]!.text, /^\[terminal\] rb: \d+ earlier messages refused on delivery and no longer sent one by one \(\d+ completions\) · seq \d+–\d+ · read session=rb since=\d+ as=events$/);
+    assert.ok(f.logs.some((l) => /^the host refused more than 4 lifecycle messages of rb: the oldest 3 are folded into one summary \(\d+ in all, seq \d+–\d+\), retried in their place; they stay owed until the host accepts it$/.test(l)), f.logs.join('\n'));
+    // The host takes messages again: the retries and the summary go, and the cursor passes every completion.
+    const standing = [...st().summaries.keys()];
+    const from = f.sent.length;
+    f.refuse.value = false;
+    await until(() => s.cursorsOf(A).delivered >= Math.max(...ends), 30_000, 'the cursor to pass the last completion');
+    assert.equal(st().retries.size, 0);
+    assert.equal(st().summaries.size, 0);
+    const taken = f.sent.slice(from).filter((m) => m.method === 'push/event').map((m) => m.params as { eventId: string; origin: Record<string, unknown> });
+    assert.equal(standing.reduce((n, id) => n + Number(taken.find((p) => p.eventId === id)?.origin.count ?? 0), 0), N - 2, 'the summaries the host took count every folded completion');
+  } finally {
+    McplLane.retryMax = was;
+    await f.close();
+  }
+});
 
 test("a message held for an open in flight keeps its debt when the session closes during the read, and the host's later refusal keeps it owed", { timeout: 20_000 }, async () => {
   // The reviewer's probe: the exit journaled during the read was owed and held; a catch-up lifted clearTo past

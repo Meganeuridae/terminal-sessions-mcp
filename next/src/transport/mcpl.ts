@@ -45,6 +45,7 @@ import {
   type Picked,
   type ReplaySource,
   type Segment,
+  type SegmentKind,
   type Segmenter,
 } from '../core/segmenter.js';
 import { serviceOutcomeKey, type Session } from '../core/session.js';
@@ -80,7 +81,7 @@ const TAG_ONTOLOGY = {
     'terminal:service-running': { desc: 'A Service with no readiness probe stayed alive through its liveness window', facet: 'lifecycle' },
     'terminal:service-lost': { desc: "A Service's Run ended without an observed exit; its process may still run", facet: 'lifecycle' },
     'terminal:watch': { desc: 'A watch fired (the keyed terminal:watch=<label> names it)', facet: 'lifecycle' },
-    'terminal:missed': { desc: 'Messages owed while you were away that a catch-up did not replay (a count and the cursor to read them)', facet: 'lifecycle' },
+    'terminal:missed': { desc: 'Messages owed that were not delivered one by one: while you were away, past what a catch-up replays, or refused on delivery past the retry bound (a count and the cursor to read them)', facet: 'lifecycle' },
     'terminal:pattern': { desc: 'The firing watch matched a pattern', facet: 'watch' },
     'terminal:silence': { desc: 'The firing watch saw output stop', facet: 'watch' },
     'terminal:idle': { desc: 'The firing watch saw the shell become available', facet: 'watch' },
@@ -225,10 +226,13 @@ interface LaneState {
   owed: Set<Seq>;
   /** Message ids whose delivery awaits the host's answer. A summary and an event can share a seq. */
   inflight: Map<string, Seq>;
-  /** Failed lifecycle deliveries remain owed, with their original stable message id. */
-  retries: Map<string, { seq: Seq; attempt: number; timer?: NodeJS.Timeout | undefined }>;
-  /** A summary pins at its oldest event until accepted, then settles the individual debts it covers. */
-  summaries: Map<string, { from: Seq; covered: Set<Seq> }>;
+  /** Failed lifecycle deliveries remain owed, with their original stable message id; past `McplLane.retryMax` the oldest fold into a summary. */
+  retries: Map<string, { seq: Seq; kind: SegmentKind; attempt: number; timer?: NodeJS.Timeout | undefined }>;
+  /**
+   * A summary pins at its oldest event until accepted, then settles the individual debts it covers. One
+   * that `folded` refused messages stands for them: they are no longer owed one by one.
+   */
+  summaries: Map<string, { from: Seq; covered: Set<Seq>; folded?: Omitted }>;
   /** Messages withheld while a synchronous call may still return them (G28): key (runId, or `runId:service=status@seq`) → since, on the monotonic clock. */
   held: Map<string, { since: number; seq?: Seq; timer?: NodeJS.Timeout | undefined }>;
   /** Everything up to here is settled for this principal except what is owed: `delivered` may advance to it. */
@@ -315,6 +319,8 @@ export class McplLane {
   private disposed = false;
   /** Warns, once, when the host has sent no grant this long after initializing: the connection is then on the core tools with no deliveries, and the log should say so rather than look like a profile. */
   static grantWarnMs = 5000;
+  /** Refused lifecycle messages of one session retried one by one at most (see `foldRetries`). */
+  static retryMax = 32;
   private grantTimer: NodeJS.Timeout | undefined;
 
   constructor(
@@ -1074,9 +1080,16 @@ export class McplLane {
     if (seg.seq <= t.cursorsOf(this.me).delivered) return this.settleSegment(t, seg, 'accepted');
     this.sent.delete(id);
     if (!seg.lifecycle) return;
-    this.owe(st, seg.seq);
+    // A summary pins the cursor by its own entry, and one folded into a later summary is not sent again.
+    if (seg.kind === 'summary') {
+      if (!st.summaries.has(id)) return;
+    } else this.owe(st, seg.seq);
     let r = st.retries.get(id);
-    if (!r) st.retries.set(id, (r = { seq: seg.seq, attempt: 0 }));
+    if (!r) {
+      st.retries.set(id, (r = { seq: seg.seq, kind: seg.kind, attempt: 0 }));
+      this.foldRetries(t, st);
+      if (!st.retries.has(id)) return;
+    }
     if (r.timer) return;
     const retry = r;
     retry.timer = setTimeout(() => {
@@ -1084,6 +1097,50 @@ export class McplLane {
       if (!this.disposed && this.carries(t.id)) this.deliver(t, seg, { released: true });
     }, Math.min(30_000, 500 * 2 ** Math.min(retry.attempt++, 6)));
     retry.timer.unref?.();
+  }
+
+  /**
+   * At most `McplLane.retryMax` refused lifecycle messages of a session are retried one by one. Past it,
+   * all but the newest half are folded into one summary, retried in their place, which says how many of
+   * each and where to read them: a host that refused every lifecycle message held a retry entry, its
+   * message and a backed-off timer for every Run's end and Service change, without bound (the house's
+   * read of the 40 commits through f3750e4, #22 comment 6310921374). What is folded is not settled: the
+   * summary pins the cursor below its oldest message until the host accepts it (G22), and the log says
+   * so. A summary folded before and not in flight is folded into the new one, so a session keeps one.
+   */
+  private foldRetries(t: Target, st: LaneState): void {
+    const singles = [...st.retries].filter(([, r]) => r.kind !== 'summary');
+    const keep = Math.floor(McplLane.retryMax / 2);
+    if (singles.length <= McplLane.retryMax) return;
+    const o: Omitted = { count: 0, from: Number.POSITIVE_INFINITY, to: 0, kinds: {} };
+    const add = (x: Omitted): void => {
+      o.count += x.count;
+      o.from = Math.min(o.from, x.from);
+      o.to = Math.max(o.to, x.to);
+      for (const [k, n] of Object.entries(x.kinds)) o.kinds[k] = (o.kinds[k] ?? 0) + n;
+    };
+    const drop = (id: string): void => {
+      const r = st.retries.get(id);
+      if (r?.timer) clearTimeout(r.timer);
+      st.retries.delete(id);
+    };
+    for (const [id, r] of singles.slice(0, singles.length - keep)) {
+      drop(id);
+      st.owed.delete(r.seq);
+      add({ count: 1, from: r.seq, to: r.seq, kinds: { [r.kind]: 1 } });
+    }
+    const fresh = o.count;
+    for (const [id, summary] of st.summaries) {
+      if (!summary.folded || st.inflight.has(id)) continue;
+      add(summary.folded);
+      st.summaries.delete(id);
+      drop(id);
+      this.sent.delete(id);
+    }
+    const seg = this.summary(t, o, undefined, { refused: true });
+    st.summaries.set(qualify(seg.messageId), { from: o.from, covered: new Set(), folded: o });
+    this.log(`the host refused more than ${McplLane.retryMax} lifecycle messages of ${t.id}: the oldest ${fresh} are folded into one summary (${o.count} in all, seq ${o.from}–${o.to}), retried in their place; they stay owed until the host accepts it`, 'warn');
+    this.deliver(t, seg);
   }
 
   // ───────────── delivery ─────────────
@@ -1400,11 +1457,12 @@ export class McplLane {
    * retention, a torn write's or a failed store's hole too (a reviewer's read of the fixes for #22). At
    * least one of the two is given.
    */
-  private summary(t: Target, o: Omitted | undefined, lost: LifecycleScan['lost']): Segment {
+  private summary(t: Target, o: Omitted | undefined, lost: LifecycleScan['lost'], how: { refused?: boolean } = {}): Segment {
     const names: Record<string, string> = { run: 'completions', service: 'service changes', watch: 'watch firings', 'session-exit': 'shell exits', recovered: 'restarts', 'needs-input': 'input prompts' };
     const gaps = lost ?? [];
     const parts: string[] = [];
-    if (o) parts.push(`${o.count} earlier message${o.count > 1 ? 's' : ''} while you were away not replayed (${Object.entries(o.kinds).map(([k, n]) => `${n} ${names[k] ?? k}`).join(', ')}) · seq ${o.from}–${o.to}`);
+    const why = how.refused ? 'refused on delivery and no longer sent one by one' : 'while you were away not replayed';
+    if (o) parts.push(`${o.count} earlier message${o.count > 1 ? 's' : ''} ${why} (${Object.entries(o.kinds).map(([k, n]) => `${n} ${names[k] ?? k}`).join(', ')}) · seq ${o.from}–${o.to}`);
     if (gaps.length) parts.push(`seq ${goneText(gaps)} gone, with whatever happened then`);
     const to = o?.to ?? gaps[gaps.length - 1]!.to;
     const since = o ? Math.max(0, o.from - 1) : gaps[gaps.length - 1]!.to;
@@ -1413,12 +1471,14 @@ export class McplLane {
     // span, from the first gap's start to the last gap's end, so seqs delivered between two gaps lie inside it; the
     // text names each gap, and DESIGN §10.2 says so for hosts (the house's read of the 38 commits, #22, comment 6274773484).
     if (gaps.length) Object.assign(metadata, { lostFrom: gaps[0]!.from, lostTo: gaps[gaps.length - 1]!.to });
+    if (how.refused) metadata.refused = true;
     return {
       kind: 'summary',
       lifecycle: true,
       seq: to,
       ts: Date.now(),
-      messageId: segmentId(t.id, t.journal, 'summary', to),
+      // Its own id: a catch-up's summary can end at the same seq, and so can a later fold, which may name more.
+      messageId: segmentId(t.id, t.journal, 'summary', to, how.refused ? `refused-${o!.from}` : undefined),
       tags: ['terminal:missed'],
       // `as=events`: a plain read projects text, which has no exit statuses or service changes in it (the house's read of 2f357bd, #22).
       head: `[terminal] ${t.id}: ${parts.join(' · ')} · read session=${t.id} since=${since} as=events`,
