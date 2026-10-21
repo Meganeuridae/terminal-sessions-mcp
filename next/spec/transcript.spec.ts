@@ -9,6 +9,7 @@ import { persistentState } from '../src/core/screen.js';
 import { project, transcript } from '../src/core/transcript.js';
 import type { ProjectChunk } from '../src/core/transcript.js';
 import { lineEnds, stripEscapes, unfinishedSequence } from '../src/core/text.js';
+import xterm from '@xterm/headless';
 
 const MB = 1024 * 1024;
 const text = async (chunks: ProjectChunk[], cols = 40, rows = 10) => (await project(chunks, { cols, rows })).text;
@@ -565,4 +566,31 @@ test('the line-end rule reads strings as the emulator does: CAN and SUB end one,
   }
   assert.equal(unfinishedSequence('a\x1b]0;my\x18'), 'a\x1b]0;my\x18'.length, 'CAN ended it');
   assert.equal(unfinishedSequence('a\u009d0;my'), 1, 'a C1 OSC open at the end');
+});
+
+test('a string ends where the emulator ends it: BEL ends an OSC only, any C1 control ends a string, and an SOS, PM or APC ends at a code point from U+00A0', async () => {
+  // text.ts ended every string at BEL, read on past a C1 control, and read an SOS, PM or APC on past U+00E9: the emulator
+  // shows `A ESC _ pay BEL B` as `A` and its payload was text, hid `B` after `A ESC ] 0 ; ti U+009B 31m`, and showed the
+  // text after an APC's `é`. What the grammar keeps as text is what the emulator shows, for every string kind, both
+  // introducer forms, and each ender (a C1 control that moves the cursor, U+0084 and U+0085, moves it, so it stays out).
+  const shown = async (data: string) => {
+    const t = new xterm.Terminal({ cols: 40, rows: 4, allowProposedApi: true, logLevel: 'off' });
+    await new Promise<void>((r) => t.write(data, r));
+    const rows: string[] = [];
+    for (let y = 0; y < 4; y++) rows.push(t.buffer.active.getLine(y)!.translateToString(true));
+    t.dispose();
+    return rows.join('');
+  };
+  const kinds = ['\x1b]0;', '\x1bPq', '\x1bX', '\x1b^', '\x1b_', '\u009d0;', '\u0090q', '\u0098', '\u009e', '\u009f'];
+  const enders = ['\x07', '\u009c', '\u009b31m', '\u0080', '\u0099', '\u009d0;', '\u00e9', '\u00a0', '\u{1f600}', '\x18'];
+  for (const intro of kinds)
+    for (const ender of enders) {
+      const data = `A${intro}pay${ender}B\x1b\\C`;
+      assert.equal(stripEscapes(data).text, await shown(data), JSON.stringify(data));
+    }
+  // The line-end rule skips what the emulator holds as payload, and only that.
+  assert.deepEqual(lineEnds('A\x1b_pay\x07B\r\nC\x1b\\D\r\n'), [15], 'a BEL inside an APC: its LF is payload');
+  assert.deepEqual(lineEnds('A\x1b]0;ti\u009b31mB\r\nC\r\n'), [13, 16], 'U+009B ended the title: its LF ends a line');
+  assert.deepEqual(lineEnds('A\x1bXpay\u00e9B\r\nC\r\n'), [9, 12], 'U+00E9 ended the SOS');
+  assert.deepEqual(lineEnds('A\x1b]0;t\u00e9t\r\nB\x07\r\n'), [13], 'an OSC holds U+00E9 as payload');
 });

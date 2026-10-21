@@ -132,6 +132,17 @@ export const isStringStart = (data: string, i: number): boolean => {
   return C1_STRING.has(c) || (c === 0x1b && /[\]PX^_]/.test(data[i + 1] ?? ''));
 };
 
+/**
+ * What could end the control string beginning at `data[i]` (isStringStart), as sequenceEnd ends it,
+ * for a reader that looks only at new data for its end: ST, BEL, CAN, SUB, ESC and every other C1
+ * control, and in an SOS, PM or APC any code point from U+00A0 too.
+ */
+export const stringCloser = (data: string, i: number): RegExp => {
+  const c = data.charCodeAt(i);
+  const k = c === 0x1b ? data.charCodeAt(i + 1) + 0x40 : c;
+  return k === 0x98 || k === 0x9e || k === 0x9f ? /[\x07\x18\x1a\x1b\x80-\uffff]/ : /[\x07\x18\x1a\x1b\x80-\x9f]/;
+};
+
 /** The introducers, for finding the next one. */
 const INTRODUCER = /[\x1b\x90\x98\x9b\x9d-\x9f]/g;
 
@@ -235,24 +246,33 @@ const SEQUENCE_LOOKBACK = 4096;
 
 /**
  * Index after the control sequence starting at `data[e]` (ESC, the C1 CSI, or a C1 string's
- * introducer), or undefined when it does not end within `data`. A string ends at BEL or ST, or, as
- * the emulator ends it, where CAN or SUB aborts it or a new sequence's ESC abandons it (those three
- * are not part of it); the C1 introducers open the strings and CSI as their ESC forms do (an
- * independent read of the fix for the house's read of the 33 commits, #22, comment 6307350650: the
- * emulator ended `ESC ] 0 ; my CAN` at the CAN, and opened an OSC at U+009D, where this read on).
+ * introducer), or undefined when it does not end within `data`. A string ends where the pinned
+ * emulator ends it: at ST (`ESC \` or U+009C); at BEL only when it is an OSC, since in a DCS, SOS,
+ * PM or APC a BEL is payload; where CAN or SUB aborts it, a new sequence's ESC abandons it, or any
+ * other C1 control ends it, which then acts (U+009B opens a CSI, U+0090 a DCS, and so on); and an
+ * SOS, PM or APC where a code point from U+00A0 abandons it, that code point with it. Those that end
+ * it and act are not part of it. The C1 introducers open the strings and CSI as their ESC forms do
+ * (an independent read of the fix for the house's read of the 33 commits, #22, comment 6307350650:
+ * the emulator ended `ESC ] 0 ; my CAN` at the CAN, and opened an OSC at U+009D, where this read
+ * on; and a reviewer's read of the fixes for #22: a BEL inside an APC ended it here and not there,
+ * so the APC's payload was text, and a U+009B inside a title opened a CSI there and was payload here).
  */
 export function sequenceEnd(data: string, e: number): number | undefined {
   let i = e + 1;
   const c0 = data.charCodeAt(e);
   let kind: 'csi' | 'string' | 'esc';
+  // The string's own introducer, as its C1 form: OSC (U+009D), DCS (U+0090), SOS, PM, APC.
+  let str = c0;
   if (c0 === 0x9b) kind = 'csi';
   else if (C1_STRING.has(c0)) kind = 'string';
   else {
     const c1 = data[i];
     if (c1 === undefined) return undefined;
     if (c1 === '[') kind = 'csi';
-    else if (c1 === ']' || c1 === 'P' || c1 === 'X' || c1 === '^' || c1 === '_') kind = 'string';
-    else kind = 'esc';
+    else if (c1 === ']' || c1 === 'P' || c1 === 'X' || c1 === '^' || c1 === '_') {
+      kind = 'string';
+      str = c1.charCodeAt(0) + 0x40;
+    } else kind = 'esc';
     i++;
     if (kind === 'esc') {
       // ESC, intermediates (0x20–0x2f), then one final byte (0x30–0x7e). With no intermediate the
@@ -272,13 +292,21 @@ export function sequenceEnd(data: string, e: number): number | undefined {
     }
     return undefined;
   }
-  // OSC, DCS, SOS, PM, APC: to BEL or ST, or where CAN or SUB aborts it.
+  // OSC, DCS, SOS, PM, APC: to ST, BEL for an OSC, or where something else ends it.
+  const osc = str === 0x9d;
+  const opaque = str === 0x98 || str === 0x9e || str === 0x9f; // SOS, PM, APC
   for (; i < data.length; i++) {
     const c = data.charCodeAt(i);
-    if (c === 0x07 || c === 0x9c) return i + 1;
+    if (c === 0x07) {
+      if (osc) return i + 1;
+      continue;
+    }
+    if (c === 0x9c) return i + 1;
+    if (c >= 0x80 && c <= 0x9f) return i; // any other C1 control ends the string, and acts
     if (c === 0x18 || c === 0x1a) return i;
     if (c === 0x1b && data[i + 1] === '\\') return i + 2;
     if (c === 0x1b && i + 1 < data.length) return i; // a new sequence abandons the string
+    if (opaque && c >= 0xa0) return i + (isHigh(c) && i + 1 < data.length && isLow(data.charCodeAt(i + 1)) ? 2 : 1);
   }
   return undefined;
 }

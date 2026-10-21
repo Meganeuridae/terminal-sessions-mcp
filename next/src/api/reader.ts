@@ -72,7 +72,7 @@ import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
 import { persistentState } from '../core/screen.js';
 import { minusRanges } from '../core/ranges.js';
 import { lineBytes } from '../core/stores.js';
-import { countLines, cutTail, headIndex, indexAtByte, isIntroducer, isStringStart, lineCarry, lineEnds, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length, type LineCarry } from '../core/text.js';
+import { countLines, cutTail, headIndex, indexAtByte, isIntroducer, isStringStart, lineCarry, lineEnds, safeCut, sequenceEnd, stringCloser, stripEscapes, unfinishedSequence, utf8Length, type LineCarry } from '../core/text.js';
 import { interleaveCut, project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
 
@@ -418,25 +418,27 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   let exhausted = false;
   // A control sequence left open where collecting would stop is collected to its end (within
   // OPEN_SEQUENCE_BYTES), so no page has to end inside it. A control string (an OSC carrying a
-  // clipboard) can be long: once one is found open, only an event that could end it (BEL, ST,
-  // ESC, CAN, SUB) or a hole makes the check run again (the house's read of 1cabc6a, #22).
-  let openString: number | undefined; // pieces checked so far, while a control string is open
-  const closer = /[\x07\x18\x1a\x1b\x9c]/;
+  // clipboard) can be long: once one is found open, only an event that could end it (stringCloser:
+  // ST, BEL, ESC, CAN, SUB, another C1 control, and in an SOS, PM or APC a code point from U+00A0)
+  // or a hole makes the check run again (the house's read of 1cabc6a, #22).
+  // While a control string is open: the pieces checked so far, and what could end it.
+  let openString: { checked: number; closer: RegExp } | undefined;
   /** Per source, what its pieces left unfinished for the line-end rule (lineEnds). */
   const carries = new Map<string, LineCarry>();
   const full = () => {
     if (bytes <= maxBytes) return false;
     if (bytes > maxBytes + OPEN_SEQUENCE_BYTES) return true;
-    if (openString !== undefined) {
-      if (!pieces.slice(openString).some((q) => q.kind === 'gap' || closer.test(q.data))) {
-        openString = pieces.length;
+    const open = openString;
+    if (open !== undefined) {
+      if (!pieces.slice(open.checked).some((q) => q.kind === 'gap' || open.closer.test(q.data))) {
+        open.checked = pieces.length;
         return false;
       }
       openString = undefined;
     }
     const at = openSequence(pieces);
     if (at === undefined) return true;
-    if (isControlString(pieces, at)) openString = pieces.length;
+    if (isControlString(pieces, at)) openString = { checked: pieces.length, closer: stringCloser((pieces[at.j] as OutPiece).data, at.at) };
     return false;
   };
   outer: for (;;) {
