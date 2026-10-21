@@ -1209,7 +1209,7 @@ export class Session {
   private onPromptProbeLost(ms: number): void {
     this.promptProbeTimer = undefined;
     const probe = this.promptProbe;
-    if (!probe || probe.started || this.closed) return;
+    if (!probe || probe.started || this.closing) return;
     this.note(`the empty line typed after a cancel's ^C did not start within ${ms} ms of the shell's prompt: it was lost (a ^C after it flushed it, or a program read it), and the shell counts as available again at that prompt`);
     this.dropPromptProbe();
     if (this.shellState === 'busy' && !this.currentShellRun && !this.pendingShellRun) this.shellState = 'idle';
