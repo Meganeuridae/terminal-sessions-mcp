@@ -187,6 +187,8 @@ interface RunRecord extends RunInfo {
   cancelRequested?: boolean;
   /** Output positions seen so far for marker-strategy scanning. */
   markerTail?: string;
+  /** A marker Run's start mark was seen, and `shellPid` is the pid it named: bound once, as history binds it. */
+  markerStarted?: boolean;
   /** Whether the end-marker probe was typed (marker and inline strategies, after an aborting ^C). */
   probed?: boolean;
   /** The reason a process Run ends with when the daemon tears it down (close, shell exit). */
@@ -236,7 +238,7 @@ const REPLIES_KEPT = 8;
 /** What a note says when the reinit gate after `exec bash` gives up: the recovery that loads the integration with the session's key. */
 const REINIT_RECOVERY = 'Shell commands are unavailable until it loads: once the shell shows its own prompt, send ` . "$TSM_BASH_RC" reinit typed` with input to load it, or open a new session';
 const publicRun = (r: RunRecord): RunInfo => {
-  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, startedMono: _sm, ...info } = r;
+  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, markerStarted: _ms, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, startedMono: _sm, ...info } = r;
   return { ...info, seq: { ...info.seq } };
 };
 
@@ -2369,8 +2371,13 @@ export class Session {
     // The start mark names the shell that ran the file; a probe answer from any other pid is a reader
     // the Run started, in the shell's own process group, that took the probe (an independent read of
     // the fixes for #22): not the shell back.
-    const started = startMark(run.markerNonce!).exec(window);
-    if (started) run.shellPid = Number(started[1]);
+    // Bound at the first start mark only, as history binds it: a later one, printed by a reader that saw
+    // the nonce in the probe's line, does not move it (an independent read of the fixes for #22).
+    const started = run.markerStarted ? null : startMark(run.markerNonce!).exec(window);
+    if (started) {
+      run.shellPid = Number(started[1]);
+      run.markerStarted = true;
+    }
     const answer = run.probed ? [...window.matchAll(new RegExp(probeMark(run.markerNonce!).source, 'g'))].find((m) => m[1] === String(run.shellPid)) : undefined;
     const probe = answer?.index ?? -1;
     if (exit && (probe === -1 || exit.index < probe)) {

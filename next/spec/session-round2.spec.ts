@@ -663,6 +663,33 @@ test('a marker Run whose probe is answered after a cancel that returned with it 
   await h.session.close();
 });
 
+test('a marker Run binds its shell’s pid at the first start mark: a later start mark naming another pid, and that pid’s probe answer, end nothing', async () => {
+  // A reader the Run started, in the shell's own process group, sees the nonce in the probe's line and may print a start
+  // mark of its own, then answer the probe as itself. Re-bound at every start mark, the pid moved to the reader's, and its
+  // answer ended the Run while the reader held the terminal (an independent read of the fixes for #22).
+  const h = await harness({ marks: 'none', setup: (s) => s.on('sleep 30', () => ({ hang: true })) });
+  await until(() => h.session.shellAvailable().ok, 3000, 'the shell is ready');
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted, JSON.stringify(a));
+  await until(() => h.shell.executed.includes('sleep 30'), 2000, 'the file ran and printed its start mark');
+  // With job control off the Run's processes stay in the shell's own group, which holds the terminal.
+  h.pty.foregroundPgid = h.pty.pid;
+  h.shell.stop();
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.equal(c.state, 'running', JSON.stringify(c));
+  assert.ok(c.steps.includes('end-marker probe'), JSON.stringify(c.steps));
+  const nonce = h.session.run(a.run.runId).nonce!;
+  const stranger = h.pty.pid + 1000;
+  h.pty.emit(`the reader's own output, long enough that the shell's start mark is no longer in what the scan carries\r\n`);
+  h.pty.emit(`<<<START:${nonce}:${stranger}>>>\r\n<<<PROBE:${nonce}:${stranger}>>>\r\n`);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(h.session.run(a.run.runId).state, 'running', 'a stranger’s start mark and answer end nothing');
+  h.shell.cont(); // the shell itself: the ^C, then its own answer
+  const r = await h.session.awaitRun(a.run.runId, 2000);
+  assert.notEqual(r.state, 'running', JSON.stringify(r));
+  await h.session.close();
+});
+
 test('the gate’s limit: a read -e in the shell itself passes it and takes the empty line, and the grace at the shell’s next prompt frees it', async () => {
   // Nothing the daemon reads tells a readline-mode read in the shell, as a DEBUG trap of the user's may run,
   // from the prompt's editor: the same mode, and no process but the shell (the house's review of
