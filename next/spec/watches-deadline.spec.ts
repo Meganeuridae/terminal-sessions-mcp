@@ -10,43 +10,6 @@ import type { JournalEvent } from '../src/core/types.js';
 import { clocks } from '../src/core/clock.js';
 import { WatchManager, type WaitResult, type WatchHost } from '../src/core/watches.js';
 
-test('silence rechecks its deadline when the timer wakes before the quiet duration has passed, and a wall-clock step neither delays nor hastens it', async (t) => {
-  // After arming, the monotonic clock falls 40 ms behind the timer: the first wake, at 100 ms, sees
-  // 60 ms of quiet and re-arms for the remainder.
-  const real = performance.now.bind(performance);
-  let lag = 0;
-  t.mock.method(clocks, 'monotonic', () => real() - lag);
-  const journal = new Journal();
-  const host: WatchHost = { journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
-  const manager = new WatchManager(host);
-  const firingsOf = (id: string) => journal.since(0).events.filter((e) => e.type === 'watch.fired' && e.watchId === id);
-  try {
-    const early = manager.add({ silenceMs: 100 }, 'agent:a@test');
-    lag = 40;
-    await sleep(120);
-    assert.equal(firingsOf(early.watchId).length, 0, 'an early wake must not certify silence');
-    lag = 0;
-    await sleep(80);
-    assert.equal(firingsOf(early.watchId).length, 1, 're-armed for the remainder, then fired');
-    const hit = firingsOf(early.watchId)[0];
-    assert.ok(hit?.type === 'watch.fired');
-    assert.match(hit.match ?? "", /^no output for 1\d\dms$/);
-    // The wall clock steps back two seconds right after arming: silence still fires on time (the
-    // previous version re-armed for the size of the step, so a watch waited 2.1 s for 100 ms of quiet).
-    const stepped = manager.add({ silenceMs: 100 }, 'agent:a@test');
-    const wall = Date.now();
-    t.mock.method(Date, 'now', () => wall - 2000);
-    await sleep(160);
-    assert.equal(firingsOf(stepped.watchId).length, 1, 'fired within 160 ms despite the step');
-    const hit2 = firingsOf(stepped.watchId)[0];
-    assert.ok(hit2?.type === 'watch.fired');
-    assert.match(hit2.match ?? "", /^no output for 1[0-5]\dms$/);
-  } finally {
-    manager.dispose();
-    journal.close();
-  }
-});
-
 // ───────────── the house's read of 3eade8a (#22): watches ─────────────
 
 const A = 'agent:a@test';
@@ -408,16 +371,17 @@ test('clipped survives when a hit is completed by flush or at stream end, and re
   }
 });
 
-test('silence rechecks its deadline deterministically under mock timers, beside the mocked monotonic clock (the house\'s read of the 36 commits, #22)', (t) => {
-  // The real-scheduling version above can fail under a 40–60 ms event-loop stall; this one drives the
-  // timers and the monotonic clock together, so the recheck-on-early-wake is deterministic.
+test('silence rechecks its deadline when the timer wakes before the quiet duration has passed, and a wall-clock step neither delays nor hastens it, under mock timers beside the mocked monotonic clock (the house\'s read of the 36 commits, #22)', (t) => {
+  // The timers and the monotonic clock are driven together, so nothing here waits on the scheduler: a
+  // version on real timers, with sleeps and bounds on the reported quiet, failed correct code under load
+  // (the house's read of f3750e4..4f4c067 over our fixes, #22).
   let vnow = 0;
   t.mock.method(clocks, 'monotonic', () => vnow);
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const journal = new Journal();
   const host: WatchHost = { journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
   const manager = new WatchManager(host);
-  const firingsOf = (id: string) => journal.since(0).events.filter((e) => e.type === 'watch.fired' && (e as Extract<JournalEvent, { type: 'watch.fired' }>).watchId === id);
+  const firingsOf = (id: string) => journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'watch.fired' }> => e.type === 'watch.fired' && e.watchId === id);
   try {
     const w = manager.add({ silenceMs: 100 }, A);
     // The 100 ms timer wakes, but only 60 ms of monotonic time has passed: it re-arms for the remainder.
@@ -428,6 +392,16 @@ test('silence rechecks its deadline deterministically under mock timers, beside 
     vnow = 100;
     t.mock.timers.tick(40);
     assert.equal(firingsOf(w.watchId).length, 1, 're-armed, then fired');
+    assert.equal(firingsOf(w.watchId)[0]!.match, 'no output for 100ms');
+    // The wall clock steps back two seconds right after arming: silence still fires when 100 ms of quiet has
+    // passed (a version that re-armed for the size of the step waited 2.1 s for 100 ms of quiet).
+    const stepped = manager.add({ silenceMs: 100 }, A);
+    const wall = Date.now();
+    t.mock.method(Date, 'now', () => wall - 2000);
+    vnow += 100;
+    t.mock.timers.tick(100);
+    assert.equal(firingsOf(stepped.watchId).length, 1, 'fired on time despite the step');
+    assert.equal(firingsOf(stepped.watchId)[0]!.match, 'no output for 100ms');
   } finally {
     manager.dispose();
     journal.close();
