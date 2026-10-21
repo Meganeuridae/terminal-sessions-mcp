@@ -303,6 +303,17 @@ test('the cancel probe answers with the token the Run’s line set: a shell that
     // The variable is not exported: a shell the line's shell starts has none of it.
     const nested = runScript(shell, `${line}\n${shell} -c '${inlineProbe(n, fish).trimStart().replace(/'/g, `'\\''`)}'\n`);
     assert.match(nested, new RegExp(`<<<PROBE:${n}:\\d+:>>>\n$`), `${shell}: a nested shell: ${JSON.stringify(nested)}`);
+    // A subshell keeps the shell's `$$` and the variable: the probe names the pid of the process that evaluates it,
+    // the shell's in the shell and the subshell's own in a subshell (the house's review of a8b6f28..4860d4c, PR #22).
+    // A command follows the subshell: zsh runs a `( … )` that ends a `-c` script in the shell's own process, with no
+    // fork, and there the probe rightly names the shell (zsh 5.9, CI's and by run).
+    if (!fish) {
+      const sub = runScript(shell, `${line}\necho "shell=$$"\n${inlineProbe(n, fish)}\n( ${inlineProbe(n, fish).trimStart()} )\n:\n`);
+      const m = new RegExp(`shell=(\\d+)\n<<<PROBE:${n}:(\\d+):${n}>>>\n<<<PROBE:${n}:(\\d+):${n}>>>\n$`).exec(sub);
+      assert.ok(m, `${shell}: ${JSON.stringify(sub)}`);
+      assert.equal(m[2], m[1], `${shell}: the shell names itself`);
+      assert.notEqual(m[3], m[1], `${shell}: a subshell names its own pid, not the shell's`);
+    }
   }
 });
 

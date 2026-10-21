@@ -25,7 +25,7 @@ test('the marks the session prints are the marks the grammar parses: start with 
   assert.equal(exitMark('n0ff').exec('x\n<<<EXIT:n0ff:-1>>>\n')![1], '-1');
   assert.equal(probeMark('n0ff').exec('<<<PROBE:n0ff>>>')![1], undefined, 'the marker strategy’s answer from before it named a pid');
   assert.match(printed(inlineProbe('n0ff', false)), /<<<PROBE:n0ff:%s:%s>>>/, 'the typed probe prints the pid and the token');
-  assert.match(inlineProbe('n0ff', false), /"\$\$" "\$\{__tsm_r-}"$/, 'posix: the token from the variable, unset-safe');
+  assert.match(inlineProbe('n0ff', false), /"\$\(exec \/bin\/sh -c 'echo \$PPID'\)" "\$\{__tsm_r-}"$/, 'posix: the evaluating process\'s pid, which a subshell does not share, and the token from the variable, unset-safe');
   assert.match(inlineProbe('n0ff', true), /\$fish_pid "\$__tsm_r"$/);
   const own = probeMark('n0ff').exec('<<<PROBE:n0ff:77:n0ff>>>')!;
   assert.deepEqual([own[1], own[2]], ['77', 'n0ff'], 'the inline strategy names the shell and its token');

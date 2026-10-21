@@ -147,9 +147,16 @@ const EVALUATING_PID = `"$(exec /bin/sh -c 'echo $PPID')"`;
  * marker): a marker of its own, with the Run's nonce, the pid of the shell that runs it, and the
  * token the Run's own line set in that shell (its nonce again). A nested shell the Run started
  * prints its own pid and an empty token: pids alone repeat across PID namespaces (`docker run -it
- * … sh` is pid 1), the variable does not travel (the house's read of 39787b3, #22).
+ * … sh` is pid 1), the variable does not travel (the house's read of 39787b3, #22). The pid is the
+ * evaluating process's (EVALUATING_PID), as the marker probe's is: a subshell keeps both the shell's
+ * `$$` and the unexported token, and with job control off a subshell of the Run that evaluated what it
+ * read answered as the declared shell, so the Run ended cancelled and the next Run ran inside the
+ * subshell (the house's review of a8b6f28..4860d4c, PR #22, by run with a declared dash). Its child is
+ * the declared shell's `/bin/sh`, on that shell's host, which may be a container or another machine:
+ * where it has none, the pid prints empty, the answer is no probe mark, and a cancel there cannot end
+ * by the probe.
  */
-export const inlineProbe = (nonce: string, fish: boolean): string => ` printf '<<<PRO''BE:${nonce}:%s:%s>>>\\n' ${fish ? '$fish_pid "$__tsm_r"' : '"$$" "$\{__tsm_r-}"'}`;
+export const inlineProbe = (nonce: string, fish: boolean): string => ` printf '<<<PRO''BE:${nonce}:%s:%s>>>\\n' ${fish ? '$fish_pid "$__tsm_r"' : `${EVALUATING_PID} "$\{__tsm_r-}"`}`;
 /** Text as one word for a POSIX shell or fish: single-quoted, each quote in it closed, escaped and reopened. */
 export const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 const COMMAND_FILE = 'tsm-cmd-';
