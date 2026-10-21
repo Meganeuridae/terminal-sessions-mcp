@@ -1359,6 +1359,7 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     watched: Map<string, unknown>;
     states: Map<string, { owed: Set<number>; retries: Map<string, unknown> }>;
     startCatchUp(sessions: string[]): Promise<void>;
+    deliver(t: Session, seg: unknown, opts: { released: true }): void;
   };
   /** A Run whose outcome counts as returned by its call: once settled, nothing of it is held or owed. */
   const settledRun = async (session: string, command: string): Promise<string> => {
@@ -1544,6 +1545,100 @@ test("a name forgotten and re-created while its channel's history is read: the g
     await sleep(200);
     const controls = f.sent.filter((m) => m.method === 'channels/incoming').flatMap((m) => (m.params as { messages: Array<{ tags: string[] }> }).messages).filter((x) => x.tags.includes('terminal:control'));
     assert.equal(controls.length, 0, "the gone life's seat change never reached the new session's channel");
+  } finally {
+    await f.close();
+  }
+});
+
+// ───────────── a reviewer's read of the fixes for #22 ─────────────
+
+/** The seat changes that went out on channels, by message id. */
+const channelControls = (sent: Msg[]): string[] =>
+  sent
+    .filter((m) => m.method === 'channels/incoming')
+    .flatMap((m) => (m.params as { messages: Array<{ messageId: string; tags: string[] }> }).messages)
+    .filter((x) => x.tags.includes('terminal:control'))
+    .map((x) => x.messageId);
+
+test("a close sent while an open channel's history is paged back stands, and the open or close that comes last decides", { timeout: 20_000 }, async () => {
+  // A page read of a channel already open made no opening, so the close during it had nothing to mark, and
+  // the read's return reopened the channel the host had closed.
+  const f = await bareLane('c-close-page');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'cp', visibility: 'shared' });
+    const one = await f.settledRun('cp', 'echo one');
+    const s = live(f.registry, 'cp');
+    const page = () => f.lane.handle('channels/open', { channelId: 'terminal:cp', history: { limit: 5 } }, f.ctx) as Promise<{ history?: unknown[] }>;
+    await f.lane.handle('channels/open', { channelId: 'terminal:cp' }, f.ctx);
+    assert.equal(f.inside.open.has('terminal:cp'), true, 'open');
+    let hold = holdTranscripts(s, one);
+    let paging = page();
+    await hold.reached;
+    assert.deepEqual(await f.lane.handle('channels/close', { channelId: 'terminal:cp' }, f.ctx), { closed: true });
+    hold.release();
+    const res = await paging;
+    hold.restore();
+    assert.ok(Array.isArray(res.history), 'the page read still answers with its page');
+    assert.equal(f.inside.open.has('terminal:cp'), false, 'and leaves the channel closed');
+    // An open after the close opens it; a close and then an open during a later read leave it open.
+    await page();
+    assert.equal(f.inside.open.has('terminal:cp'), true, 'a later open opens it');
+    hold = holdTranscripts(s, one);
+    paging = page();
+    await hold.reached;
+    await f.lane.handle('channels/close', { channelId: 'terminal:cp' }, f.ctx);
+    await f.lane.handle('channels/open', { channelId: 'terminal:cp' }, f.ctx);
+    hold.release();
+    await paging;
+    hold.restore();
+    assert.equal(f.inside.open.has('terminal:cp'), true, 'the open after the close stands');
+  } finally {
+    await f.close();
+  }
+});
+
+test("a re-created name's open never joins the forgotten life's opening, and the old life's removal landing late leaves the new life's opening and follow alone", { timeout: 20_000 }, async () => {
+  // The new life's open joined the gone life's opening by name; a removal landing after the re-creation dropped
+  // the opening by name, the new life's messages with it, and letGo unfollowed whatever life the name had then.
+  const f = await bareLane('c-late-removal', { removals: 'manual' });
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'lr', visibility: 'shared' });
+    const one = await f.settledRun('lr', 'echo one');
+    const old = live(f.registry, 'lr');
+    const oldHold = holdTranscripts(old, one);
+    const oldOpen = f.lane.handle('channels/open', { channelId: 'terminal:lr', history: { limit: 5 } }, f.ctx);
+    await oldHold.reached;
+    old.journal.append({ type: 'control', controller: null, by: A, how: 'release' }); // the gone life's message
+    await until(() => (f.inside.opening.get('terminal:lr')?.held.size ?? 0) >= 1, 3000, 'held for the opening channel');
+    await f.app.sessionClose(f.caller, { session: 'lr', forget: true });
+    await until(() => f.removed.includes('lr'), 3000, 'the name forgotten');
+    await f.app.sessionOpen(f.caller, { id: 'lr', visibility: 'shared' });
+    const two = await f.settledRun('lr', 'echo two');
+    const s2 = live(f.registry, 'lr');
+    const newHold = holdTranscripts(s2, two);
+    const newOpen = f.lane.handle('channels/open', { channelId: 'terminal:lr', history: { limit: 5 } }, f.ctx);
+    await newHold.reached;
+    s2.journal.append({ type: 'control', controller: null, by: A, how: 'release' }); // the new life's message
+    const held = () => [...(f.inside.opening.get('terminal:lr')?.held.keys() ?? [])];
+    await until(() => held().some((id) => id.includes(`~${s2.journal.epoch}:`)), 3000, "the new life's message held for its opening");
+    assert.ok(held().every((id) => id.includes(`~${s2.journal.epoch}:`)), `the new life's opening is its own: ${held().join(', ')}`);
+    await f.lane.sessionRemoved('lr'); // the old life's removal, landing late
+    assert.equal(held().length, 1, "the new life's opening keeps what it held");
+    assert.equal((f.inside.watched.get('lr') as { session: Session } | undefined)?.session, s2, 'the new life is still followed');
+    oldHold.release();
+    await assert.rejects(oldOpen, (e: Error & { code?: number }) => e.code === -32023);
+    oldHold.restore();
+    newHold.release();
+    await newOpen;
+    newHold.restore();
+    assert.equal(f.inside.open.has('terminal:lr'), true, "the new life's channel is open");
+    await until(() => channelControls(f.sent).length >= 1, 3000, "the new life's seat change on its channel");
+    // A gone life's late message (a draining segmenter's, a hold that ran out) goes a closed channel's way, not on the open channel.
+    const late = { kind: 'run', lifecycle: true, seq: 999, ts: Date.now(), messageId: `lr~${old.journal.epoch}:run:999`, tags: ['terminal:control'], head: '[terminal] lr: late', metadata: {}, interested: [] };
+    f.inside.deliver(old, late, { released: true });
+    await sleep(100);
+    const ids = channelControls(f.sent);
+    assert.deepEqual(ids.filter((id) => !id.includes(`~${s2.journal.epoch}:`)), [], `only the new life's messages reached its channel: ${ids.join(', ')}`);
   } finally {
     await f.close();
   }

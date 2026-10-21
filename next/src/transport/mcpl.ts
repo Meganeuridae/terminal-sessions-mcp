@@ -238,12 +238,16 @@ interface LaneState {
 /** A session as delivery sees it: the live Session of one life, or history; either keeps the principal's cursors (G22). */
 type Target = Session | HistorySession;
 
-/** An open of a channel reading its history (see `McplLane.opening`): the messages held for it, by id (the catch-up and the live path can both bring one), and how many such reads are under way. */
+/**
+ * An open of a channel reading its history (see `McplLane.opening`): the lineage it reads, the messages
+ * held for it, by id (the catch-up and the live path can both bring one), and how many such reads are
+ * under way. The lineage is the name's run index, as for `LaneState`: a channel's history runs on across
+ * the lives of one lineage (G30), and a forgotten name's successor starts another.
+ */
 interface Opening {
+  lineage: object;
   held: Map<string, { t: Target; seg: Segment }>;
   opens: number;
-  /** The host closed the channel while it was read: the close stands, and the open leaves the channel closed. */
-  closed?: true;
 }
 
 /**
@@ -291,6 +295,8 @@ export class McplLane {
    * that ended during it, and the opener never heard of it (the house's read of 78c4d6e, #22).
    */
   private readonly opening = new Map<string, Opening>();
+  /** How many closes each channel has had on this connection: an open that saw the count change during its history read leaves the channel closed (see `closeChannel`). */
+  private readonly closes = new Map<string, number>();
   private readonly registered = new Set<string>();
   /** Session id → the life followed, its segmenter, and the subscriptions. */
   private readonly watched = new Map<string, { session: Session; segmenter: Segmenter; off: () => void }>();
@@ -565,15 +571,18 @@ export class McplLane {
     await this.letGo(sessionId);
     const id = channelId(sessionId);
     // An open of the gone life's channel still reading history holds that life's messages: they go
-    // nowhere, and a name re-created meanwhile starts an opening of its own, where a second open had
-    // joined the old one and sent its messages on the new session's channel (the house's read of the 38 commits (PR #22, comment 6274370651)).
-    this.opening.delete(id);
+    // nowhere (the house's read of the 38 commits (PR #22, comment 6274370651)). Only the gone
+    // lineage's opening goes: dropped by name, a removal that landed after the name was re-created
+    // dropped the new life's opening and what it held (a reviewer's read of the fixes for #22).
+    const p = this.opening.get(id);
+    if (p && p.lineage !== this.lineageOf(sessionId)) this.opening.delete(id);
     if (this.app.registry.get(sessionId)) return; // re-created meanwhile: sessionCreated announced it (mcpl-10)
     const st = this.states.get(sessionId);
     if (st) for (const h of st.held.values()) if (h.timer) clearTimeout(h.timer);
     if (st) for (const r of st.retries.values()) if (r.timer) clearTimeout(r.timer);
     this.states.delete(sessionId);
     this.open.delete(id);
+    this.closes.delete(id);
     if (this.registered.delete(id) && this.channelsOn()) this.out.notify('channels/changed', { removed: [id] });
   }
 
@@ -615,7 +624,8 @@ export class McplLane {
     // From here the channel is opening until `finishOpening`, the one way out that opens it; every
     // other way out abandons the opening, or the channel stayed opening for good, with every message
     // for it held and its owed seqs pinning the cursor (a reviewer's read of the fixes for #22 comment 6270045466).
-    const pending = limit > 0 ? this.beginOpening(id) : undefined;
+    const closes = this.closes.get(id) ?? 0;
+    const pending = limit > 0 ? this.beginOpening(id, t) : undefined;
     try {
       if (limit > 0) {
         const r = await replayNewest(this.sourceOf(s), before !== undefined ? { limit, before } : { limit });
@@ -628,9 +638,12 @@ export class McplLane {
         if (this.app.registry.get(sid) !== s) throw new RpcError(UNKNOWN_CHANNEL, `session ${sid} was closed or replaced while its history was read; nothing was opened`, { channelId: id });
         res.history = r.segments.map((seg) => this.message(t, seg));
         if (r.truncated) res.historyTruncated = true;
-        // The host closed the channel during the read (see `closeChannel`): the close stands. The page
-        // is still the open's answer; nothing is attached, followed or opened.
-        if (pending?.closed) return res;
+        // The host closed the channel during the read (see `closeChannel`): the close stands, whether
+        // the channel was opening or already open and paging back. The page is still the open's answer;
+        // nothing is attached, followed or opened. Judged by the opening alone, a page read of an open
+        // channel had none, and its return reopened a channel the host had closed (a reviewer's read
+        // of the fixes for #22).
+        if ((this.closes.get(id) ?? 0) !== closes) return res;
       }
       if (s.kind === 'live') {
         // §9: the owner's connection takes a free seat; everyone else observes. Opening never starts a
@@ -655,11 +668,17 @@ export class McplLane {
     return this.open.has(id) || this.opening.has(id);
   }
 
-  /** An open of the channel begins reading its history (see `opening`); a channel already open needs no hold. */
-  private beginOpening(id: string): Opening | undefined {
+  /**
+   * An open of the channel begins reading its history (see `opening`); a channel already open needs no
+   * hold. An opening of another lineage is a forgotten name's, whose own open fails when its read
+   * returns: what it held goes nowhere, as `sessionRemoved` drops it, and this open starts its own
+   * rather than joining it and sending that life's messages on the channel the name now names (the
+   * house's read of the 38 commits (PR #22, comment 6274370651)).
+   */
+  private beginOpening(id: string, t: Target): Opening | undefined {
     if (this.open.has(id)) return undefined;
     let p = this.opening.get(id);
-    if (!p) this.opening.set(id, (p = { held: new Map(), opens: 0 }));
+    if (p?.lineage !== t.journal.runs) this.opening.set(id, (p = { lineage: t.journal.runs, held: new Map(), opens: 0 }));
     p.opens++;
     return p;
   }
@@ -693,9 +712,10 @@ export class McplLane {
     // a closed channel's way, and the open leaves the channel closed when its read returns. Answered
     // from `open` alone, the close said false and the returning open undid it, while the host kept the
     // close as standing, so a reconnect dropped a channel this connection still delivered on (the house's read of the 38 commits (PR #22, comment 6274370651)).
+    // Every open whose read is under way sees the close by the count, an open channel's page read too.
+    this.closes.set(id, (this.closes.get(id) ?? 0) + 1);
     const p = this.opening.get(id);
     if (p) {
-      p.closed = true;
       this.opening.delete(id);
       for (const h of p.held.values()) this.deliver(h.t, h.seg, { released: true });
     }
@@ -816,9 +836,16 @@ export class McplLane {
     });
   }
 
-  /** Deliver what the followed life's segmenter still owes (mcpl-6), then stop following that life — only that one (mcpl-10). */
+  /**
+   * Deliver what the followed life's segmenter still owes (mcpl-6), then stop following that life — only
+   * that one (mcpl-10), and never the live life the registry holds for the name now: a close or removal
+   * that lands after the name began a new life is an older life's, and letting go by name unfollowed the
+   * new one (a reviewer's read of the fixes for #22).
+   */
   private async letGo(sessionId: string): Promise<{ session: Session } | undefined> {
     const w = this.watched.get(sessionId);
+    const now = this.app.registry.get(sessionId);
+    if (w && now?.kind === 'live' && now.session === w.session) return undefined;
     if (w) await w.segmenter.drained();
     await this.flush();
     if (w && this.watched.get(sessionId) === w) {
@@ -835,13 +862,23 @@ export class McplLane {
     return journalSource({ id: entry.id, journal: entry.journal, owner: entry.owner });
   }
 
+  /** The name's lineage now (see `LaneState`): the run index of the life or history the registry holds for it; undefined when the name is gone. */
+  private lineageOf(sessionId: string): object | undefined {
+    const entry = this.app.registry.get(sessionId);
+    return entry ? targetOf(entry).journal.runs : undefined;
+  }
+
+  /** Is `t` of its name's lineage now? Only such a target's messages go on the name's channel, are held for its opening, or are retried. */
+  private current(t: Target): boolean {
+    return this.lineageOf(t.id) === t.journal.runs;
+  }
+
   /** This name's bookkeeping; a journal of another lineage (an old life of a forgotten name) gets a detached one. */
   private stateOf(t: Target): LaneState {
     const lineage = t.journal.runs;
     const cur = this.states.get(t.id);
     if (cur?.lineage === lineage) return cur;
-    const entry = this.app.registry.get(t.id);
-    const current = entry ? (entry.kind === 'live' ? entry.session.journal.runs : entry.journal.runs) : undefined;
+    const current = this.lineageOf(t.id);
     const st: LaneState = { lineage, owed: new Set(), inflight: new Map(), retries: new Map(), summaries: new Map(), held: new Map(), clearTo: 0 };
     if (current !== undefined && current !== lineage) return st;
     if (cur) {
@@ -973,8 +1010,7 @@ export class McplLane {
    * Back off to 30s on a persistently rejecting host, and recheck policy on every attempt. */
   private retry(t: Target, seg: Segment): void {
     if (this.disposed) return;
-    const entry = this.app.registry.get(t.id);
-    if (!entry || targetOf(entry).journal.runs !== t.journal.runs) return;
+    if (!this.current(t)) return;
     const st = this.stateOf(t);
     const id = qualify(seg.messageId);
     st.inflight.delete(id);
@@ -1061,13 +1097,18 @@ export class McplLane {
     // Never a principal's own note back to it (mcpl-14).
     if (seg.kind === 'note' && seg.author === this.me) return this.settleSegment(t, seg, 'not-owed');
     const cid = channelId(t.id);
+    // The name's channel carries the name's lineage only: a forgotten name's late message (a draining
+    // segmenter's, a hold that ran out) goes a closed channel's way, never on the channel or into the
+    // opening of the session re-created under the name (the house's read of the 38 commits (PR #22,
+    // comment 6274370651); a reviewer's read of the fixes for #22).
+    const ours = this.current(t);
     // An open of the channel is reading its history: held until the open completes or fails (see `opening`).
-    const opening = this.open.has(cid) ? undefined : this.opening.get(cid);
-    if (opening) {
+    const opening = !ours || this.open.has(cid) ? undefined : this.opening.get(cid);
+    if (opening?.lineage === t.journal.runs) {
       if (!opening.held.has(id)) opening.held.set(id, { t, seg });
       return;
     }
-    if (this.open.has(cid) && this.enabled('terminal.channels', 'channels.incoming')) {
+    if (ours && this.open.has(cid) && this.enabled('terminal.channels', 'channels.incoming')) {
       const msg = this.message(t, seg);
       this.remember(msg.messageId);
       st.inflight.set(id, seg.seq);
@@ -1172,10 +1213,11 @@ export class McplLane {
     this.batchTimer = undefined;
     const items = this.batch.splice(0);
     if (!items.length) return;
-    // A reduction or a close since they were queued binds (SPEC §6.7, mcpl-19): those are routed again.
+    // A reduction or a close since they were queued binds (SPEC §6.7, mcpl-19), and so does a forgotten
+    // name's lineage (see `deliver`): those are routed again.
     const send: typeof items = [];
     for (const i of items) {
-      if (this.open.has(channelId(i.t.id)) && this.enabled('terminal.channels', 'channels.incoming')) send.push(i);
+      if (this.current(i.t) && this.open.has(channelId(i.t.id)) && this.enabled('terminal.channels', 'channels.incoming')) send.push(i);
       else {
         this.stateOf(i.t).inflight.delete(i.msg.messageId);
         this.sent.delete(i.msg.messageId);
