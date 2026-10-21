@@ -1495,7 +1495,18 @@ test('a stretch gap the disk refused, then the ring dropped, is one hole to gaps
     const holes = j.gapsWithin(1, j.lastSeq).filter((g) => g.from === 11 && g.to === 38);
     assert.equal(holes.length, 1, JSON.stringify(j.gapsWithin(1, j.lastSeq).map((g) => [g.from, g.to, g.seq])));
     assert.equal(holes[0]!.seq, 38, 'seated where the hole ends, as a read finds it');
-    j.close();
+    // A new life of the name, given the holes this one leaves unrecorded and its run index (as the registry's new
+    // life is), records the hole again beside the index's copy of the refused gap: still one hole.
+    j.seal();
+    const lost = j.unrecorded();
+    assert.ok(lost.some((h) => h.from === 11 && h.to === 38), 'the hole is one this life leaves unrecorded');
+    cold.budget = Number.POSITIVE_INFINITY;
+    const next = new Journal({ hot: new MemoryStore(1500), cold, runs: j.runs, startSeq: j.lastSeq, lost, sessionId: 's' });
+    const recorded = gaps(onDisk(dir)).filter((g) => g[0] === 11 && g[1] === 38).length;
+    assert.equal(recorded, 1, 'the new life recorded it');
+    const again = next.gapsWithin(1, next.lastSeq).filter((g) => g.from === 11 && g.to === 38);
+    assert.equal(again.length, 1, JSON.stringify(next.gapsWithin(1, next.lastSeq).map((g) => [g.from, g.to, g.seq])));
+    next.close();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
