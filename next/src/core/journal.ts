@@ -611,6 +611,10 @@ export class Journal {
           caught++;
         }
       } catch (e) {
+        // A gap this catch-up wrote before the disk refused again is on disk: it leaves `unwritten`, or a new life
+        // given the holes this one holds (unrecorded) recorded it a second time (the house's review of the 77
+        // commits through 4f4c067, PR #22).
+        this.unwritten = this.unwritten.filter((g) => g.seq > this.persisted);
         this.coldFailed(e);
         return false;
       }

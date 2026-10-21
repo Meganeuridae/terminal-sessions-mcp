@@ -1470,3 +1470,27 @@ test('a stretch gap the disk refused, then the ring dropped, is one hole to gaps
   }
 });
 
+test('a catch-up that writes a refused gap and then fails again leaves the gap off unwritten: a new life does not record its hole a second time', () => {
+  const dir = tmpDir();
+  try {
+    const { cold, j } = refusedStretch(dir);
+    const held = j.since(0).events.filter((e) => e.type === 'output' && e.seq > cold.lastSeq()!).length;
+    cold.budget = held; // the stretch's gap is refused: unwritten
+    j.retryCold();
+    cold.budget = 0;
+    for (let i = 0; i < 2; i++) j.append(out(`c${i}`)); // the ring keeps the refused gap
+    cold.budget = 1; // the next catch-up writes the gap, then fails
+    j.retryCold();
+    assert.deepEqual(gaps(onDisk(dir)).filter((g) => g[0] === 11 && g[1] === 38).length, 1, 'the gap is on disk');
+    assert.deepEqual(j.unrecorded().filter((h) => h.from === 11 && h.to === 38), [], 'and no longer a hole the journal holds unrecorded');
+    j.seal();
+    j.retryCold(); // the registry's one more try for a new life: the disk still refuses
+    const lost = j.unrecorded();
+    cold.budget = Number.POSITIVE_INFINITY;
+    const next = new Journal({ hot: new MemoryStore(1500), cold, runs: j.runs, startSeq: j.lastSeq, lost, sessionId: 's' });
+    assert.equal(gaps(onDisk(dir)).filter((g) => g[0] === 11 && g[1] === 38).length, 1, 'recorded once');
+    next.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
