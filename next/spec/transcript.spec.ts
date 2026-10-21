@@ -810,3 +810,13 @@ test('a boundary after a cursor moved up starts the next segment below every row
   assert.deepEqual(await read(['line1\r\nline2\r\n\x1b[2AX\r\n']), ['Xine1', 'line2'], 'with no boundary, as the terminal shows it');
   assert.deepEqual(await read(['one\r\n\r\n\r\n\x1b[2A', { hole: true }, 'two\r\n']), ['one', 'two'], 'blank rows below the cursor are no text');
 });
+
+test('a boundary on the alternate screen, after the cursor moved up, scrolls the frame’s top row away rather than writing over a row, and says nothing of it', async () => {
+  // A reviewer's read of the fixes for #22: no spec put a boundary after an alternate-screen frame. freshLine goes past the
+  // frame's last row, which is the screen's, and the alternate screen keeps no scrollback, so the top row goes; the next
+  // segment's own line end there scrolls another. Nothing is written over, and the loss isn't reported.
+  const frame = '\x1b[?1049h\x1b[H' + ['f1', 'f2', 'f3', 'f4', 'f5'].map((r, i) => `\x1b[${i + 1};1H${r}`).join('') + '\x1b[2;1H';
+  const p = await project([frame, { hole: true }, 'X\r\n'], { cols: 20, rows: 5 });
+  assert.deepEqual(p.text.split('\n'), ['f3', 'f4', 'f5', 'X']);
+  assert.deepEqual([p.truncated, p.omittedInputBytes], [false, 0]);
+});

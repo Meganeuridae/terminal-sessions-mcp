@@ -371,8 +371,9 @@ class Projector {
    * leaves it mid-redraw, one line end took the next segment onto the row below, and it wrote over that row's
    * text (`line1`, then `Xine2`: a reviewer's read of the fixes for #22). A full-screen program's frame is rows
    * below the cursor too: on the alternate screen, which keeps no scrollback, the line end past its last row
-   * scrolls the frame's top row away, where before the next segment wrote over the row below the cursor; neither
-   * keeps the frame whole, and a redraw of the whole frame repairs either.
+   * scrolls the frame's top row away, where before the next segment wrote over the row below the cursor. Neither
+   * keeps the frame whole, neither is reported (the projection isn't `truncated`, and no input is omitted), and
+   * only the program's own repaint of the whole frame brings the row back (a reviewer's read of the fixes for #22).
    */
   get freshLine(): string {
     const b = this.term.buffer.active;
