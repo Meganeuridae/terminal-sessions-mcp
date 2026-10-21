@@ -228,6 +228,9 @@ const PROMPT_DRAWN_WAIT_MS = 3000;
  */
 const EDITOR_SETTLE_READS = 4;
 const EDITOR_SETTLE_STEP_MS = 50;
+/** The signals a close sends a shell's job (doClose's hangups and kill, reapJob's TERM), and the statuses a shell reports for a job they killed. */
+const CLOSE_SIGNALS = new Set(['SIGHUP', 'SIGTERM', 'SIGKILL']);
+const CLOSE_STATUSES = new Set([...CLOSE_SIGNALS].map((s) => 128 + os.constants.signals[s as 'SIGHUP']));
 /** The newest replies to the shell's terminal queries kept for resendReplies. */
 const REPLIES_KEPT = 8;
 /** What a note says when the reinit gate after `exec bash` gives up: the recovery that loads the integration with the session's key. */
@@ -631,6 +634,8 @@ export class Session {
   private readonly teardowns = new Set<Promise<void>>();
   private closeReason: string | undefined;
   private closing: Promise<void> | undefined;
+  /** Set when close() begins, before its first hangup: an end read from then on is the close's (endRun). */
+  private closeBegun = false;
   /** Set when close() resolves: nothing is journaled after that. */
   private closed = false;
 
@@ -1363,7 +1368,8 @@ export class Session {
     // In-flight shell Runs cannot report an end mark now (G3: never invent an exit).
     // The reason carries how the shell itself ended, which is often the clue: a
     // shell that exits under a Run with the Run's own failing status had `set -e` on.
-    const reason = this.closeReason ?? this.shellExitedReason();
+    // During a close the Run ends with the close's reason, as it does when its end mark is read first (endRun).
+    const reason = this.closeReason ?? (this.closeBegun ? 'session-closed' : this.shellExitedReason());
     for (const r of [this.pendingShellRun, this.currentShellRun]) {
       if (r && !isTerminal(r.state)) this.endRun(r, { state: 'lost', reason });
     }
@@ -1402,6 +1408,7 @@ export class Session {
   }
 
   private async doClose(opts: { graceful?: boolean; timeoutMs?: number; reason?: string }): Promise<void> {
+    this.closeBegun = true;
     if (opts.reason !== undefined) this.closeReason = opts.reason;
     if (this.shellState !== 'exited') {
       const exited = new Promise<void>((resolve) => {
@@ -1601,6 +1608,17 @@ export class Session {
 
   private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; leftovers?: boolean; pipeStatus?: number[] }): void {
     if (isTerminal(run.state)) return;
+    const killedByClose = (outcome.exit !== undefined && CLOSE_STATUSES.has(outcome.exit)) || (outcome.signal !== undefined && CLOSE_SIGNALS.has(outcome.signal));
+    if (outcome.state === 'exited' && run.target === 'shell' && this.closeBegun && killedByClose) {
+      // An end read after the close began, with the status of a job one of the close's signals killed, is
+      // the close's doing: its hangup ended the job, and bash can print the 129 the job left before it
+      // exits itself. Taken as the Run's own end, a Run the close cut short read as a command that failed
+      // (CI on #22: mcpl-6 at a93da10, mcpl-2/m2-4 at 9f2952d). It ends lost, as it does when the shell's
+      // exit comes first, and the status the shell printed is noted. Any other status is the Run's own:
+      // an end mark still unread when the close began says how a command that finished first ended.
+      this.note(`${run.runId}: its end (exit ${outcome.exit ?? outcome.signal}) was read after the session began to close, with the status of a job the close's signals killed; the close cut it short`);
+      outcome = { state: 'lost', reason: this.closeReason ?? 'session-closed' };
+    }
     const endedAt = this.now();
     const durationMs = this.elapsedMs(run);
     const reason = outcome.reason ?? (outcome.state !== 'exited' ? run.endReason : undefined);

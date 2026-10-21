@@ -909,6 +909,60 @@ test('ss-6: close sends SIGTERM, then SIGKILL, to a foreground job that survived
   assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => e.text.includes(`process group ${job}`) && /SIGTERM, then SIGKILL/.test(e.text)));
 });
 
+test('a Run the close cut short is lost, though the shell reports its job’s end before it exits, and a Run that finished first keeps its own end', async () => {
+  // bash, hung up with its job, can print the end mark with 129 before it exits itself. Read first, that
+  // mark made the Run exited 129, and its completion read as a command that failed (CI on #22: mcpl-6 at
+  // a93da10, mcpl-2/m2-4 at 9f2952d).
+  for (const marks of ['rich', 'none'] as const) {
+    for (const reason of [undefined, 'daemon-shutdown']) {
+      const h = await harness({ marks });
+      const a = await h.session.admitWhenAvailable({ target: 'shell', line: 'sleep 30', principal: AGENT });
+      assert.ok(a.admitted);
+      await until(() => h.shell.busy && h.session.run(a.run.runId).state === 'running', 2000, 'the Run running');
+      const hangup = h.pty.kill.bind(h.pty);
+      h.pty.kill = (sig) => {
+        if (sig === 'SIGHUP') h.shell.finishHung(129); // the job's end, reported before the shell exits
+        hangup(sig);
+      };
+      await h.session.close(reason !== undefined ? { reason } : {});
+      const r = h.session.run(a.run.runId);
+      assert.deepEqual([r.state, r.reason, r.exit], ['lost', reason ?? 'session-closed', undefined], `${marks}, ${reason}: ${JSON.stringify(r)}`);
+      assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /its end \(exit 129\) was read after the session began to close/.test(e.text)), 'the status the shell printed is said');
+    }
+  }
+  // A Run that finished before the close, its end mark unread when the close began, keeps its own end:
+  // 0, or a status the program chose. Only the status of a job the close's signals killed is the close's.
+  for (const exit of [0, 2]) {
+    const h = await harness();
+    const a = await h.session.admitWhenAvailable({ target: 'shell', line: 'sleep 30', principal: AGENT });
+    assert.ok(a.admitted);
+    await until(() => h.shell.busy && h.session.run(a.run.runId).state === 'running', 2000, 'the Run running');
+    let mark = '';
+    const emit = h.pty.emit.bind(h.pty);
+    h.pty.emit = (data) => {
+      mark += data; // the shell printed it; the session has not read it yet
+    };
+    h.shell.finishHung(exit);
+    h.pty.emit = emit;
+    const hangup = h.pty.kill.bind(h.pty);
+    h.pty.kill = (sig) => {
+      if (sig === 'SIGHUP' && mark) h.pty.emit(mark); // read once the close has begun, before the shell exits
+      mark = '';
+      hangup(sig);
+    };
+    await h.session.close();
+    const r = h.session.run(a.run.runId);
+    assert.deepEqual([r.state, r.exit, r.reason], ['exited', exit, undefined], `exit ${exit}: ${JSON.stringify(r)}`);
+  }
+  // Without the end mark first, the shell's exit ends it lost with the same reason.
+  const h = await harness();
+  const a = await h.session.admitWhenAvailable({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted);
+  await until(() => h.session.run(a.run.runId).state === 'running', 2000, 'the Run running');
+  await h.session.close();
+  assert.deepEqual([h.session.run(a.run.runId).state, h.session.run(a.run.runId).reason], ['lost', 'session-closed']);
+});
+
 test('ss-10: a process group outliving its leader writes unattributed output; cancel of the ended Run and close still reach the group', async () => {
   const h = await harness();
   let proc!: ScriptedProcess;
