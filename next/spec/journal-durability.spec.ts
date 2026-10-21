@@ -1746,6 +1746,51 @@ test('a file fsync the disk refuses keeps the failed mark: the store refuses the
   }
 });
 
+test('a directory fsync the disk refuses after the files sync keeps the failed mark too: the store refuses the clear and says so once, and the clear lands once the directory syncs', (t) => {
+  let mono = 0;
+  t.mock.method(clocks, 'monotonic', () => mono);
+  const dir = tmpDir();
+  const realFsync = fsc.fsyncSync;
+  let refuseDir = false;
+  fsc.fsyncSync = ((fd: number) => {
+    const st = fsc.fstatSync(fd);
+    if (refuseDir && st.isDirectory() && st.ino === fs.statSync(dir).ino) throw Object.assign(new Error('EIO: i/o error, fsync'), { code: 'EIO' });
+    return realFsync(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  const said: string[] = [];
+  try {
+    const cold = new Flaky(dir, { log: (level, text) => said.push(`${level}: ${text}`) });
+    const j = new Journal({ hot: new MemoryStore(1500), cold, sessionId: 's' });
+    for (let i = 0; i < 10; i++) j.append(out(`ok${i}`));
+    cold.budget = 0;
+    for (let i = 0; i < 40; i++) j.append(out(`a-${i}-${'z'.repeat(40)}`));
+    assert.equal(peekReservation(dir)?.failed, true, 'the mark is failed on disk');
+    // The disk takes events again and syncs the files, but refuses the store's directory: the clear is refused.
+    cold.calls.length = 0;
+    refuseDir = true;
+    cold.budget = Number.POSITIVE_INFINITY;
+    j.retryCold();
+    mono += 1000;
+    j.append(out('during'));
+    assert.ok(cold.calls.includes('sync') && !cold.calls.includes('clear'), cold.calls.join(' → '));
+    assert.equal(peekReservation(dir)?.failed, true, 'still failed on disk');
+    const refused = said.filter((l) => l.startsWith('warn: ') && l.includes("the journal's files could not be synced before its failed mark is cleared"));
+    assert.equal(refused.length, 1, said.join(' | '));
+    assert.match(refused[0]!, /EIO/);
+    // The directory syncs again: the next try clears the mark.
+    refuseDir = false;
+    mono += 1000;
+    j.append(out('after'));
+    assert.equal(peekReservation(dir)?.failed, undefined, `cleared: ${cold.calls.join(' → ')}`);
+    j.close();
+  } finally {
+    fsc.fsyncSync = realFsync;
+    syncBuiltinESMExports();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a lowering write refused as the journal closes is said: the next start may count seqs it never issued among those lost', () => {
   const dir = tmpDir();
   try {
