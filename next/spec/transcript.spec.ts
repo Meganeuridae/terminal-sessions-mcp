@@ -531,6 +531,10 @@ test('a tail names its first line’s source wherever the cut falls: past the so
   const cut = await project(long, { cols: 80, rows: 24, label: sourceLabel, maxLines: 10, maxInputBytes: 40 });
   assert.deepEqual(cut.text.split('\n'), ['[run r1]', 'a2-long-long-long', 'a3', '[terminal]', 'p2']);
   assert.equal(cut.omittedInputBytes, 'p1\r\na1-long-long-long\n'.length + '[terminal]\n'.length, 'the restored header is no input omitted');
+  // A restored header is a header to the line count too: a tail of 2 counted it as a line of output and cut it
+  // again (our read of the house's fixes for its review of f3750e4, PR #22).
+  const two = await project(long, { cols: 80, rows: 24, label: sourceLabel, maxLines: 2, maxInputBytes: 40 });
+  assert.deepEqual(two.text.split('\n'), ['[run r1]', 'a3', '[terminal]', 'p2']);
 });
 
 test('a held line cut for the byte budget drops what was emitted before it: a title’s payload after a whole line keeps only the tail', async () => {

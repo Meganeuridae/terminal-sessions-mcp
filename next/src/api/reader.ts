@@ -84,7 +84,7 @@ import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
 import { persistentState } from '../core/screen.js';
 import { minusRanges } from '../core/ranges.js';
 import { lineBytes } from '../core/stores.js';
-import { countLines, cutTail, headIndex, indexAtByte, isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length, type LineCarry } from '../core/text.js';
+import { countLines, cutTail, headAt, headIndex, indexAtByte, isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length, type LineCarry } from '../core/text.js';
 import { interleaveCut, project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type Hole, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
 
@@ -439,6 +439,8 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   let exhausted = false;
   /** Per source, what its pieces left unfinished for the line-end rule (lineEnds). */
   const carries = new Map<string, LineCarry>();
+  /** The head of the CSI or escape sequence that `offset` falls inside (headAt), which the page goes on from. */
+  let head = '';
   // A control sequence left open where collecting would stop is collected to its end (within
   // OPEN_SEQUENCE_BYTES), so no page has to end inside it. Whether some source's output ends inside one
   // is what its line carry holds, at no cost per event: a scan of the collected output for an open
@@ -474,6 +476,14 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
         const key = sourceKey(e);
         let carry = carries.get(key);
         if (!carry) carries.set(key, (carry = lineCarry()));
+        if (from > 0) {
+          // A page from an offset inside a sequence a LF ran through (search reports a line that begins after
+          // such a LF there) goes on inside it: the sequence's head comes before the page, in the line-end rule
+          // and in the projection, so its rest applies as the emulator applied it, not as `1mB` (our read of
+          // the fix for the line-end rule's two remaining cases, PR #22).
+          head = headAt(e.data, from);
+          if (head) carry.open = head;
+        }
         pieces.push({ kind: 'out', ev: e, data, start: utf8Length(e.data.slice(0, from)), bytes: b, ends: lineEnds(data, carry) });
         bytes += b;
       }
@@ -498,7 +508,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // Lasting terminal state set before the page (a scroll region, the alternate screen, modes)
   // still applies to it: a page deep in apt's output keeps apt's scroll region (§6 rule 7, er-2).
   const firstOut = pieces.find((q): q is OutPiece => q.kind === 'out');
-  const state = firstOut && o.since !== undefined ? stateBefore(src, o, firstOut.ev, firstOut.start) : '';
+  const state = firstOut && o.since !== undefined ? stateBefore(src, o, firstOut.ev, firstOut.start) + head : '';
   let budget = maxBytes;
   let chosen = choose(pieces, budget, hold, journal);
   const continued = (c: Chosen) => open || scanCut || c.taken < pieces.length || c.nextOffset !== undefined;
@@ -1187,19 +1197,32 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     const p = await project(chunks, opts);
     return p.text === '' ? [] : p.text.split('\n');
   };
+  // The header lines naming the sources (§6 rule 6) are no line of output: `tail: N` counts output lines, as the
+  // projection's maxLines does, and headers come extra (an independent read of the fix for the house's read of
+  // the 33 commits, #22, comment 6307350650: "3 of 1 lines", and a tail of 5 across two sources showed 4).
+  const headers = new Set([...sources].map((k) => sourceHeader(k === 'pty' ? { stream: 'pty' } : { stream: 'stdout', ...(k.slice(2) ? { runId: k.slice(2) } : {}) })));
   // maxBytes drops whole lines from the head, keeping at least the last `keepLines`; a line over it keeps its end.
+  // The header naming the first line kept stays with it, wherever it sat, as the projection keeps it (c050928),
+  // and the byte cut leaves room for it: dropped for bytes, or cut away with the head of a line longer than the
+  // cap, it left that line nobody's, and counted as a line dropped ahead of it, it hid that the line had lost its
+  // head (`tail: 3` over a Run's line longer than the cap read `zzz…`, unnamed, with no cutHead: our read of the
+  // house's fixes for its review of f3750e4, PR #22). `kept` is then the lines after it, and `drop` counts the
+  // lines of output dropped.
   const fit = (lines: string[], keepLines: number) => {
     let bytes = utf8Length(lines.join('\n'));
     const cutByBytes = bytes > maxBytes;
     let drop = 0;
     while (lines.length - drop > Math.max(1, keepLines) && bytes > maxBytes) bytes -= utf8Length(lines[drop++]!) + 1;
     const kept = lines.slice(drop);
-    return { kept, drop, cutByBytes, tail: cutTail(kept.join('\n'), maxBytes) };
+    let named: string | undefined;
+    if (multi) {
+      if (kept.length > 1 && headers.has(kept[0]!)) named = kept.shift();
+      else for (let h = drop - 1; h >= 0 && named === undefined; h--) if (headers.has(lines[h]!)) named = lines[h];
+    }
+    const tail = cutTail(kept.join('\n'), named === undefined ? maxBytes : Math.max(1, maxBytes - utf8Length(named) - 1));
+    const text = named === undefined ? tail.text : `${named}\n${tail.text}`;
+    return { kept, drop: outputLines(lines.slice(0, drop)), cutByBytes, tail: { cut: tail.cut, text } };
   };
-  // The header lines naming the sources (§6 rule 6) are no line of output: `tail: N` counts output lines, as the
-  // projection's maxLines does, and headers come extra (an independent read of the fix for the house's read of
-  // the 33 commits, #22, comment 6307350650: "3 of 1 lines", and a tail of 5 across two sources showed 4).
-  const headers = new Set([...sources].map((k) => sourceHeader(k === 'pty' ? { stream: 'pty' } : { stream: 'stdout', ...(k.slice(2) ? { runId: k.slice(2) } : {}) })));
   const outputLines = (kept: string[]) => (multi ? kept.filter((l) => !headers.has(l)).length : kept.length);
   let all = await projectTail(n);
   let shown = fit(all, 1);

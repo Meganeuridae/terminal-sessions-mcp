@@ -858,9 +858,13 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
   // A cut inside a source's data keeps the header naming that source: the tail budget, cutInput and
   // cutToLastNewlines each dropped the segments before the cut, its header among them, and the first
   // lines kept were nobody's (a reviewer's read of the fixes for #22). The header is no input omitted.
+  // It counts as a header for keepLines too: the tail budget dropped it inside `segments`, before the
+  // headers were gathered, so a tail of 2 counted it as a line of output and cut it again (our read of the
+  // house's fixes for its review of f3750e4, PR #22).
   const first = segs[0];
   if (first?.named) {
     segs.unshift(first.named);
+    headers.add(first.named.data.slice(0, -1));
     omitted -= first.named.bytes;
   }
   // A segment that begins inside a CSI is fed that CSI's head first (rule 6), as no input.

@@ -1271,6 +1271,41 @@ test('a Run’s tail across a hole marks its first line cut or begun before only
   assert.equal(long.lines?.cutHead, true, JSON.stringify(long.lines));
 });
 
+test('a tail whose first line the byte cap cuts keeps the header naming its source, and says the line lost its head, for every count asked', async () => {
+  // The byte fit dropped the header ahead of a line longer than the cap and counted it as a line dropped ahead
+  // of it: `tail: 3` and the compat pack's `tail: 54` read `zzz…`, nobody's, with no cutHead; `tail: 2` lost the
+  // header in the projection (our read of the house's fixes for its review of f3750e4, PR #22).
+  const src = source();
+  out(src.journal, 'p1\r\n');
+  startRun(src.journal, 'rx');
+  out(src.journal, 'a1\na2\na3\n', 'stdout', 'rx');
+  out(src.journal, 'p2\r\n');
+  out(src.journal, `HEAD-${'z'.repeat(1_200_000)}-TAIL\n`, 'stdout', 'rx');
+  out(src.journal, 'p3\r\n');
+  for (const tail of [2, 3, 54]) {
+    const r = await readJournal(src, { tail, commands: true, maxBytes: 1024 * 1024 }, { resultBytes: 16384 });
+    const lines = r.text!.split('\n');
+    const said = `tail ${tail}: ${JSON.stringify(lines.map((l) => l.slice(0, 12)))} ${JSON.stringify(r.lines)}`;
+    assert.equal(lines[0], '[run rx]', said);
+    assert.ok(lines[1]!.startsWith('zzz') && lines[1]!.endsWith('-TAIL'), said);
+    assert.deepEqual(lines.slice(2), ['[terminal]', 'p3'], said);
+    assert.equal(r.lines?.cutHead, true, said);
+    assert.ok(Buffer.byteLength(r.text!) <= 1024 * 1024, said);
+  }
+});
+
+test('a page read from an offset inside a CSI that a LF ran through applies the CSI’s head: search’s match reads on as the line it matched', async () => {
+  // `A ESC [ 3 LF 1mB here`: the LF is executed inside the CSI, and `1m` ends it. Search reports `B here` with an
+  // offset inside the CSI, and the page from there showed `1mB here` (the fix that taught the line-end rule a CSI a LF runs through).
+  const src = source();
+  out(src.journal, 'start\r\n');
+  out(src.journal, 'A\x1b[3\n1mB here\r\nafter\r\n');
+  const m = (await searchJournal(src, { pattern: 'B here', since: 0 })).matches[0]!;
+  assert.ok(m.offset !== undefined && m.offset > 0, JSON.stringify(m));
+  const page = await readJournal(src, { since: m.cursor, offset: m.offset }, { resultBytes: 16384 });
+  assert.equal(page.text, 'B here\nafter');
+});
+
 test('paging back past a title left open before a hole reaches every line: the title shows nothing, and the row its LF left counts', async () => {
   // `one`, `two` ended by a bare LF, a title the hole leaves open, then the hole: the hole's line starts after a
   // blank row, which the tail had read as `two`, so the page before ended after `one`.
