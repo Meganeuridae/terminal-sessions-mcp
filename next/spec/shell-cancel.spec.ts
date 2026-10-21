@@ -364,6 +364,35 @@ test('/bin/dash: G29 (core-6): a ^C that aborts the marker echo is resolved once
   }
 });
 
+test('/bin/dash: a marker Run cancelled across a stopped shell, whose ^\\ flushed the end-marker probe, is probed again, and its end is observed once the shell is back', { skip: !hasShell('/bin/dash') }, async () => {
+  // The shell stopped across the cancel (standing in for one not yet scheduled): ^C, the probe, then ^\\,
+  // whose tty flush took the probe unread, and nothing probed again. The Run stayed running for good (the
+  // house's review of the 40 commits through 4f4c067, by run).
+  const x = await realSession('/bin/dash');
+  const pid = x.session.info().pid;
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'the shell is ready');
+    assert.equal(x.session.integration, 'none');
+    process.kill(pid, 'SIGSTOP');
+    const a = x.session.admit({ target: 'shell', line: 'echo first-$((6*7))', principal: AGENT });
+    assert.ok(a.admitted);
+    const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 300 });
+    assert.deepEqual(c.steps.filter((s) => s === 'end-marker probe').length, 2, JSON.stringify(c.steps));
+    assert.ok(c.steps.indexOf('^\\') < c.steps.lastIndexOf('end-marker probe'), 'the second probe after the ^\\');
+    process.kill(pid, 'SIGCONT');
+    const ra = await x.session.awaitRun(a.run.runId, 5000);
+    // ss-5: the probe's $? is its own line's; the Run's exit stays unobserved (G2, G3).
+    assert.deepEqual([ra.state, ra.reason], ['lost', 'exit-unobserved'], JSON.stringify(ra));
+  } finally {
+    try {
+      process.kill(pid, 'SIGCONT');
+    } catch {
+      // gone
+    }
+    await x.close();
+  }
+});
+
 for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
   test(`${shell}: G19 close: what the shell forked outside any job ends with it; a pending command substitution does not stall the hangup (core-17: no timer outlives close)`, async () => {
     const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;

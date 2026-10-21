@@ -2541,6 +2541,13 @@ export class Session {
       this.typeSignal(run, 'SIGQUIT', principal);
       steps.push('^\\');
       await this.awaitRun(runId, grace);
+      // The ^\'s tty flush takes a probe the shell had not read yet (a shell stopped across the cancel):
+      // with none left, the Run stayed running and the shell busy for good (the house's review of the 40
+      // commits through 4f4c067, by run on dash). One more probe, once the shell's group holds the terminal.
+      if (run.state === 'running' && run.probed) {
+        run.probed = false;
+        await this.probeMarker(run, grace, steps);
+      }
     }
     // Then the terminal's foreground process group, when it is known and is a job —
     // never the shell itself (the daemon never kills the shell to cancel a job).
