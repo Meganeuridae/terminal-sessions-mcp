@@ -1231,7 +1231,10 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       }
       cursor = fetched[0]!.seq - 1;
       const sofar = [...parts].reverse().flat();
-      if (bytes >= cap || examined >= MAX_SCAN || enough(seated(sofar, sofar[0]!.seq), raw, cursor > (o.since ?? 0))) {
+      // Nothing so far is never enough: a tail ending at offset 0 of the journal's first event clips its only batch
+      // to nothing, and seating it read `sofar[0]` (an independent read of the fixes for the review of the 40
+      // commits, PR #22).
+      if (bytes >= cap || examined >= MAX_SCAN || (sofar.length > 0 && enough(seated(sofar, sofar[0]!.seq), raw, cursor > (o.since ?? 0)))) {
         older = cursor > (o.since ?? 0);
         break;
       }

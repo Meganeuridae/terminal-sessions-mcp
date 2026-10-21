@@ -1707,3 +1707,15 @@ test('a tail over many Runs reads what the sources left open in one walk back, a
   assert.ok(r.text!.endsWith('r199 two'), r.text!.slice(-40));
   assert.ok(calls < 1000, `${calls} batches read`);
 });
+
+test("a tail that ends at offset 0 of the journal's first event is empty (an independent read of the fixes for the review of the 40 commits, PR #22)", async () => {
+  // Clipped to nothing, the walk's only batch was seated by its first event, which it doesn't have: a TypeError.
+  const src = source();
+  const first = out(src.journal, 'abc\r\n');
+  out(src.journal, 'def\r\n');
+  const r = await readJournal(src, { tail: 5, until: first, untilOffset: 0 }, { resultBytes: 16384 });
+  assert.equal(r.text, '');
+  assert.equal(r.lines?.returned, 0);
+  const next = await readJournal(src, { tail: 5, until: first, untilOffset: 2 }, { resultBytes: 16384 });
+  assert.equal(next.text, 'ab');
+});
