@@ -494,6 +494,16 @@ test('a trace a shell writes past the typed line’s redirect is named by the Ru
   // bash given a BASH_XTRACEFD traces the probe's pid, a command substitution, on the line before the probe's own trace.
   const bashProbe = `^C\r\n$ ${markerProbe(N).trimStart()}\r\n++ exec /bin/sh -c 'echo $PPID'\r\n+ printf '%s:%s>>>\\n' '<<<PROBE:${N}' 4242\r\n<<<PROBE:${N}:4242>>>\r\n$ `;
   assert.equal(cutPlumbing(`${echo}${mark}out\r\n${bashProbe}`, marker), 'out\r\n^C\r\n', 'the probe’s pid substitution’s trace too');
+  // zsh's trace drops the `exec` precommand: `+zsh:4> /bin/sh -c 'echo $PPID'` (zsh 5.9, where its trace gets past the redirect).
+  const zshProbe = `^C\r\n$ ${markerProbe(N, 'zsh').trimStart()}\r\n+zsh:4> /bin/sh -c 'echo $PPID'\r\n+zsh:4> printf '%s:%s>>>\\n' '<<<PROBE:${N}' 4242\r\n<<<PROBE:${N}:4242>>>\r\n$ `;
+  assert.equal(cutPlumbing(`${echo}${mark}out\r\n${zshProbe}`, marker), 'out\r\n^C\r\n', 'zsh’s trace of the substitution');
+  if (fs.existsSync('/bin/zsh')) {
+    // As zsh traces it where it traces the probe at all, in an eval (a reader the Run started, say).
+    const traced = runMerged('/bin/zsh', `set -x; eval ${shellQuote(markerProbe(N, 'zsh').trim())}`).replace(/^\+zsh:1> eval .*\n/, '').replace(/\n/g, '\r\n');
+    assert.match(traced, /> \/bin\/sh -c 'echo \$PPID'\r\n/, `zsh's own shape: ${JSON.stringify(traced)}`);
+    const own = `<<<START:${N}:${probeMark(N).exec(traced)![1]}>>>\r\n`;
+    assert.equal(cutPlumbing(`${echo}${own}out\r\n^C\r\n$ ${markerProbe(N, 'zsh').trimStart()}\r\n${traced}$ `, marker), 'out\r\n^C\r\n', `zsh’s own trace: ${JSON.stringify(traced)}`);
+  }
   // Not traces: the echo that printed the mark in earlier builds traced as the mark itself, and the guess at that trace's head
   // cut a program's own line that ended in `echo `; another Run's nonce names nothing.
   assert.equal(cutPlumbing(`${echo}${mark}+ echo ${end}`, marker), '+ echo ', 'a program’s `+ echo ` before the mark');

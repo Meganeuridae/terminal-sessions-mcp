@@ -690,5 +690,10 @@ function markTraceStart(text: string, to: number, nonce: string, prefix: string 
   }
   return cut;
 }
-/** The trace of the command substitution that gives the marker probe its pid (EVALUATING_PID). */
-const PID_TRACE = /exec \/bin\/sh -c '?echo \$PPID'?\n$/;
+/**
+ * The trace of the command substitution that gives the marker probe its pid (EVALUATING_PID): bash's
+ * keeps the `exec` (`++ exec /bin/sh -c 'echo $PPID'`), zsh's drops the precommand (`+zsh:4> /bin/sh -c
+ * 'echo $PPID'`), which this missed, and that line stayed in a cancelled Run's result (an independent
+ * read of the fixes for #22).
+ */
+const PID_TRACE = /(?:exec )?\/bin\/sh -c '?echo \$PPID'?\n$/;
