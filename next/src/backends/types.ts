@@ -59,11 +59,12 @@ export interface PtyHandle {
    * Could a process other than the shell read the terminal right now? Only the terminal's foreground
    * process group can: true when that group is not the shell's, or when a member of it other than the
    * shell holds the terminal on its input (descriptor 0) or on a descriptor above 2 (the /dev/tty a
-   * pager or password tool opens); false when none does. A program an rc started is one — job control
-   * is off while the rc runs, so it shares the shell's group — and the daemon never types a reinit
-   * while one may be reading. An rc's `sleep 301 &` shares the group too but has /dev/null as its
-   * input and does not count, nor does a job started at a prompt, which has its own group (the house's
-   * read of the 38 commits, #22 comment 6274841346, item 2). A builtin `read` is the shell itself:
+   * pager or password tool opens); false when none does. A program an rc started is one — it runs in
+   * the shell's own process group (in bash 5.2.37's rc `$-` showed monitor mode on, and a program it
+   * started, in the foreground or with `&`, had the shell's pid as its pgid) — and the daemon never
+   * types a reinit while one may be reading. An rc's `sleep 301 &` shares the group too but has
+   * /dev/null as its input and does not count, nor does a job started at a prompt, which has its own
+   * group (the house's read of the 38 commits, #22 comment 6274841346, item 2). A builtin `read` is the shell itself:
    * inputMode tells `read -n` apart. Undefined when it cannot be told; the gate then does not type
    * (item 1: unknown is not "no reader").
    *
