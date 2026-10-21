@@ -1622,10 +1622,12 @@ export class Session {
 
   private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; leftovers?: boolean; pipeStatus?: number[]; shellBack?: boolean }): void {
     if (isTerminal(run.state)) return;
-    // A signal the close has already sent: a status of 128 plus it, or the signal itself. Only those: the close
-    // sends SIGTERM to a job (reapJob) only once the shell is gone, and SIGKILL to the job, the shell's group
-    // and the shell at once, so no shell reports a job either killed, and a 137 or 143 read during a close is
-    // the Run's own (the house's review of 4f4c067..a8b6f28, PR #22).
+    // A signal the close has already sent: a status of 128 plus it, or the signal itself. Only those: a status
+    // the close hasn't sent the signal for is the Run's own. In practice that leaves the hangup's 129, since the
+    // close sends SIGTERM to a job (reapJob) only once the shell is gone, and SIGKILL to the job, the shell's
+    // group and the shell at once, so a shell seldom lives to report a job either killed; when one does, after
+    // that signal, its status is the close's like the hangup's (the house's review of 4f4c067..a8b6f28, PR #22,
+    // and of a8b6f28..4860d4c).
     const sentByClose = [...this.closeSignalsSent].find((s) => (outcome.exit !== undefined && outcome.exit === 128 + os.constants.signals[s]) || outcome.signal === s);
     if (outcome.state === 'exited' && run.target === 'shell' && this.closeBegun && sentByClose !== undefined) {
       // An end read after the close began, with the status of a job a signal the close had sent killed, is

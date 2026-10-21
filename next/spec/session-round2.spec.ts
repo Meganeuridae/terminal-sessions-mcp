@@ -1122,6 +1122,26 @@ test('a Run the close cut short is lost, though the shell reports its job’s en
     const r = h.session.run(a.run.runId);
     assert.deepEqual([r.state, r.exit, r.reason], ['exited', exit, undefined], `exit ${exit}: ${JSON.stringify(r)}`);
   }
+  // After the close has sent SIGKILL (a close that isn't graceful sends it first), a 137 read before the shell
+  // dies is the close's, as the hangup's 129 is (the house's review of a8b6f28..4860d4c).
+  {
+    const h = await harness();
+    const a = await h.session.admitWhenAvailable({ target: 'shell', line: 'sleep 30', principal: AGENT });
+    assert.ok(a.admitted);
+    await until(() => h.shell.busy && h.session.run(a.run.runId).state === 'running', 2000, 'the Run running');
+    const kill = h.pty.kill.bind(h.pty);
+    let sent = '';
+    h.pty.kill = (sig) => {
+      sent += `${sig} `;
+      if (sig === 'SIGKILL') h.shell.finishHung(137); // the job's end, printed as the shell is killed
+      kill(sig);
+    };
+    await h.session.close({ graceful: false });
+    assert.match(sent, /^SIGKILL/, sent);
+    const r = h.session.run(a.run.runId);
+    assert.deepEqual([r.state, r.reason, r.exit], ['lost', 'session-closed', undefined], JSON.stringify(r));
+    assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /its end \(exit 137\) was read after the session began to close, with the status of the SIGKILL the close had sent/.test(e.text)), 'the status is said');
+  }
   // Without the end mark first, the shell's exit ends it lost with the same reason.
   const h = await harness();
   const a = await h.session.admitWhenAvailable({ target: 'shell', line: 'sleep 30', principal: AGENT });
