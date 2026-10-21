@@ -1005,3 +1005,29 @@ test("compat's logs keep a program's line that an unanswered probe was typed ont
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("searchLogs judges a probe answered as tailLogs does: an answered probe's prompt line is no hit, whatever context is asked (an independent read of the fixes for the review of 4f4c067..a8b6f28, PR #22)", async () => {
+  // The hit's line judged alone could not see the answer on the next line, so the prompt the probe was typed after was
+  // returned as a hit.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'compat-search-probe-'));
+  const backend = fakeShellBackend((sh) => { sh.on(/^echo /, (line) => ({ output: `${line.slice(5)}\r\n`, exit: 0 })); }, { marks: 'none' });
+  const registry = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true });
+  const app = new App({ registry, defaultWaitMs: 2000 });
+  const C: Caller = { principal: 'agent:a@test', connectionId: 'cs' };
+  const compat = toolsFor('compat');
+  const call = async (name: string, args: Record<string, unknown>) => JSON.parse((await callTool(name, args, { app, caller: C, resultText: 'json' }, compat)).text);
+  try {
+    await call('runCommand', { session: 'sq', command: 'echo hello' });
+    const live = registry.get('sq');
+    if (live?.kind !== 'live') throw new Error('no live session');
+    live.session.journal.append({ type: 'output', data: `\r\nmyhost$ ${markerProbe('n1nce')}\r\n<<<PROBE:n1nce:4242>>>\r\nmyhost$ ok\r\n`, stream: 'pty' });
+    for (const context of [0, 1, 3]) {
+      const hits = (await call('searchLogs', { session: 'sq', pattern: 'myhost', context })) as Array<{ line: string; context: string[] }>;
+      assert.deepEqual(hits.map((h) => h.line), ['myhost$ ok'], `context ${context}: ${JSON.stringify(hits)}`);
+      assert.ok(hits[0]!.context.length <= 2 * context + 1, `context ${context}: ${JSON.stringify(hits[0]!.context)}`);
+    }
+  } finally {
+    await registry.closeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

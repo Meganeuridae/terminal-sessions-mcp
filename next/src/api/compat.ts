@@ -186,7 +186,9 @@ const PROBE_ECHO = probeEcho();
  * answered goes from its own start (and the space before it), and the head of its first line stays, since a program
  * read it after whatever it had printed there: struck whole, a program's `Continue? [y/N] ` went with it, which the
  * cutter keeps (an independent read of the fixes for the review of the 40 commits, PR #22). A head of 0 is the line
- * struck whole.
+ * struck whole. An answer counts when it is in `lines`: until the text read holds it (not yet in the journal, or past
+ * a page's bound), the echo's head stays, and a later read that holds it strikes the line whole; a caller judging one
+ * line passes the lines after it too (searchLogs).
  */
 function probeLines(lines: string[]): Map<number, number> {
   const struck = new Map<number, number>();
@@ -223,7 +225,8 @@ function probeLines(lines: string[]): Map<number, number> {
 
 /**
  * Log lines with the plumbing removed, each with its index in `lines`; a line that held nothing else
- * is dropped, and so is every line a probe's echo spans (probeLines). A start mark cut takes its
+ * is dropped, and so are the lines a probe's echo spans, but for an unanswered probe's first line, whose head before
+ * the echo stays (probeLines). A start mark cut takes its
  * line's end with it: the Run starts at the mark (run.start follows it), so the `$ <command>` heading
  * the reader puts there comes before the mark's line ends, and that end showed as an empty line
  * under the heading, which takes as many lines as the Run's line holds: one was assumed, and under a
@@ -792,8 +795,10 @@ export const COMPAT_TOOLS: ToolDef[] = [
     async run(ctx, a) {
       const session = a.session as string;
       const context = typeof a.context === 'number' && a.context >= 0 ? Math.floor(a.context) : 3;
-      // 1.x searched case-insensitively, up to 100 matches (atc-9).
-      const r = await ctx.app.search(ctx.caller, { session, pattern: a.pattern as string, flags: 'i', context, limit: 100 });
+      // 1.x searched case-insensitively, up to 100 matches (atc-9). The scan takes a line of context at least: a probe's
+      // answer comes on the line after its echo, and a hit's line judged alone kept an answered probe's prompt as a hit,
+      // where tailLogs strikes it (an independent read of the fixes for the review of 4f4c067..a8b6f28, PR #22).
+      const r = await ctx.app.search(ctx.caller, { session, pattern: a.pattern as string, flags: 'i', context: Math.max(context, 1), limit: 100 });
       const re = compileUserRegex(a.pattern as string, 'i');
       const out: Array<Record<string, unknown>> = [];
       // The plumbing of the Runs the scan covered, by their nonces (a program line in a mark's shape is shown).
@@ -801,9 +806,12 @@ export const COMPAT_TOOLS: ToolDef[] = [
       for (const m of r.matches) {
         // A match inside the daemon's own plumbing is not one 1.x would have shown (the house's read of 1cabc6a, #22):
         // the line is kept when what remains of it still matches.
-        const line = keptLines([m.line], p)[0]?.[0] ?? null;
+        // The lines around the hit judged together, then cut back to the context asked for.
+        const at = m.before.length;
+        const near = keptLines([...m.before, m.line, ...m.after], p);
+        const line = near.find(([, i]) => i === at)?.[0] ?? null;
         if (line === null || (line !== m.line && !re.test(line))) continue;
-        out.push({ lineNumber: m.lineNumber, line, context: withoutPlumbingLines([...m.before, m.line, ...m.after], p), seq: m.seq });
+        out.push({ lineNumber: m.lineNumber, line, context: near.filter(([, i]) => Math.abs(i - at) <= context).map(([l]) => l), seq: m.seq });
       }
       const notes: string[] = [];
       if (r.bounded) notes.push(`older output was not searched (the search covers the last 50,000 journal events); read {"session": "${session}", "tail": 200, "until": ${r.scanned[0] - 1}} shows what came before`);
