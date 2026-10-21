@@ -6,10 +6,13 @@
  * in the session and found three readers parsing the old ones; its read of 39787b3 found the
  * history cutter working by shape alone, so a program line in a mark's shape cut real output.
  *
- * Shapes: the inline start marker `<<<START:nonce:pid>>>` (a declared shell's Run names the
- * shell's pid), the end marker `<<<EXIT:nonce:status>>>` (both strategies), and the end-marker
- * probe typed after a ^C: `<<<PROBE:nonce>>>` under the marker strategy, and inline
- * `<<<PROBE:nonce:pid:token>>>`, where the token is the Run's nonce again, printed from a shell
+ * Shapes: the start marker `<<<START:nonce:pid>>>` (both strategies name the shell's pid: a
+ * declared shell's typed line prints it, and a marker Run's command file from its first line), the
+ * end marker `<<<EXIT:nonce:status>>>` (both strategies), and the end-marker probe typed after a ^C:
+ * `<<<PROBE:nonce:pid>>>` under the marker strategy, with the pid of the shell that ran it, which
+ * ends the Run only when it is the pid the start marker named (an earlier build's probe, which
+ * journals keep, printed none: `<<<PROBE:nonce>>>`), and
+ * inline `<<<PROBE:nonce:pid:token>>>`, where the token is the Run's nonce again, printed from a shell
  * variable the Run's own line set — a nested shell, with another pid or the same one in another
  * PID namespace, has no such variable and answers with an empty token (the house's read of
  * 39787b3, #22). The typed lines that print them spell each word split (`EXI""T`, `STAR''T`,
