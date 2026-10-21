@@ -166,6 +166,44 @@ test('a service reads a process Run’s pipes as one source, as a read shows the
   n.dispose();
 });
 
+test('a line both readings complete at one event, begun at one place, is one line: matched once, as its pipe wrote it, the journal and the service saying the same', () => {
+  // `FATAL: db crashed` on stdout, a stderr `x`, then stdout's LF: read as `FATAL: db crashedx` and, by stdout, as
+  // `FATAL: db crashed`. Told apart by their text, the line was counted twice: the read's journaled with its `x`, and
+  // the pipe's held as the service's evidence (an independent read of the fixes for the house's review of
+  // 4f4c067..a8b6f28, PR #22).
+  const f = fake('process');
+  const m = f.monitor({ fail: { pattern: 'FATAL: [a-z]+ crashed' } });
+  f.start();
+  f.out('FATAL: db crashed', 'stdout');
+  f.out('x', 'stderr');
+  f.out('\n', 'stdout');
+  f.out('\n', 'stderr');
+  assert.equal(m.status, 'unhealthy');
+  assert.equal(m.info().repeats, undefined, 'one line, not two');
+  const journaled = f.journal.since(0).events.filter((e) => e.type === 'service' && e.status === 'unhealthy');
+  assert.deepEqual(journaled.map((e) => (e.type === 'service' ? e.evidence : '')), ['FATAL: db crashed'], 'as stdout wrote it, no byte of stderr glued on');
+  assert.equal(m.info().evidence, 'FATAL: db crashed', 'the service says the line the journal does');
+  m.dispose();
+  // One line, either reading: a fail match in one wins over a ready match in the other.
+  const g = fake('process');
+  const n = g.monitor({ ready: { pattern: 'listening$' }, fail: { pattern: 'FATAL$' } });
+  g.start();
+  g.out('ok listening', 'stdout');
+  g.out(' FATAL', 'stderr');
+  g.out('\n', 'stdout');
+  assert.equal(n.status, 'unhealthy', 'stdout wrote `ok listening`, and the line read `ok listening FATAL`');
+  n.dispose();
+  // m2-21's two lines that begin at one place but end at different events stay two: the ready line as stdout wrote it passes.
+  const h = fake('process');
+  const o = h.monitor({ ready: { pattern: 'listening on \\d+' } });
+  h.start();
+  h.out('Server listen', 'stdout');
+  h.out('warn: deprecated\n', 'stderr');
+  h.out('ing on 8080\n', 'stdout');
+  assert.equal(o.status, 'ready');
+  o.dispose();
+});
+
 test('a quiet prompt is offered by both readings and matched once: as a read shows it, or as its own pipe wrote it', async () => {
   const f = fake('process');
   const m = f.monitor({ fail: { pattern: '^Password:' } }, { partialAfterMs: 30 });

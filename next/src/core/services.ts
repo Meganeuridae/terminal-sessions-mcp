@@ -68,6 +68,9 @@ export interface ServiceDeps {
 
 type Condition = 'pattern' | 'tcp' | 'alive';
 
+/** Where a line began (SplitLine.begun), as a key: the two readings' lines that began at one place are one line. */
+const startOf = (line: SplitLine): string => (line.begun ? `${line.begun.at}:${line.begun.offset}` : `?${line.text}`);
+
 /** One reading of a service Run's output (ServiceMonitor.lines and .pipes): its splitter, the seq it was last fed, and the pipe it reads alone. */
 interface Reading {
   splitter: LineSplitter;
@@ -104,8 +107,8 @@ export class ServiceMonitor {
    */
   private readonly pipes = new Map<OutputStream, Reading>();
   /**
-   * The lines offered at the latest output event, by text, and whether one matched: a line both readings read alike
-   * at one event is matched once, so its evidence and a fail line's count name one line.
+   * The quiet prompts offered at the latest event a reading was fed, by where each began, and whether one matched: the
+   * two readings' prompt that began at one place is one line, matched once.
    */
   private offered: { seq: Seq; lines: Map<string, boolean> } = { seq: 0, lines: new Map() };
   /** A fail-pattern line was seen and no ready-pattern line since. */
@@ -206,12 +209,23 @@ export class ServiceMonitor {
     if (ev.type === 'output' && ev.runId === this.runId) {
       // After readiness the ready pattern matters only as the answer to a fail line.
       if (!this.failRe && (!this.readyRe || this.met.has('pattern'))) return;
-      // A pattern matches a line as a read shows it, or as its own pipe wrote it: the one source first, then the
-      // pipe's, a line both read alike at one event matched once (the house's review of 4f4c067..a8b6f28, #22,
-      // comment 6323055715, question 3).
-      for (const line of this.feed(this.source(), ev)) this.once(ev.seq, line);
-      if (ev.stream === 'pty') return;
-      for (const line of this.feed(this.pipe(ev.stream), ev)) this.once(ev.seq, line);
+      // A pattern matches a line as a read shows it, or as its own pipe wrote it (the house's review of
+      // 4f4c067..a8b6f28, #22, comment 6323055715, question 3). The two readings' lines that this event completes and
+      // that began at one place are one line, matched once, as its pipe wrote it first: by text, `FATAL: db crashed`
+      // on stdout, a stderr `x` and stdout's LF were two lines, counted twice, the read's `FATAL: db crashedx`
+      // journaled and the pipe's held as the evidence.
+      const read = this.feed(this.source(), ev);
+      const own = new Map<string, SplitLine>();
+      if (ev.stream !== 'pty') for (const line of this.feed(this.pipe(ev.stream), ev)) own.set(startOf(line), line);
+      for (const line of read) {
+        const twin = own.get(startOf(line));
+        if (!twin) this.onLine(line);
+        else {
+          own.delete(startOf(line));
+          this.onLine(twin, line);
+        }
+      }
+      for (const line of own.values()) this.onLine(line);
     } else if (ev.type === 'run.start' && ev.runId === this.runId) {
       this.onStarted();
     } else if (ev.type === 'run.end' && ev.runId === this.runId) {
@@ -227,22 +241,23 @@ export class ServiceMonitor {
     }
   }
 
-  /** Feed one reading an output event: the one source takes the event's stream as the source of what it reads. */
+  /** Feed one reading an output event: the one source takes the event's stream as the source of what it reads; each line says where it began. */
   private feed(r: Reading, ev: EventOf<'output'>): SplitLine[] {
     r.seq = ev.seq;
-    return r.splitter.feed(ev.data, r.pipe === undefined ? ev.stream : undefined);
+    return r.splitter.feed(ev.data, r.pipe === undefined ? ev.stream : undefined, ev.seq);
   }
 
-  /** A line one reading offered at `seq`: matched unless the other reading offered it alike there, and then as that was. */
+  /** A quiet prompt one reading offered after event `seq`: matched unless the other's that began at the same place was, and then as that was. */
   private once(seq: Seq, line: SplitLine): boolean {
     if (seq !== this.offered.seq) this.offered = { seq, lines: new Map() };
-    const had = this.offered.lines.get(line.text);
+    const at = startOf(line);
+    const had = this.offered.lines.get(at);
     if (had !== undefined) {
-      this.offered.lines.delete(line.text);
+      this.offered.lines.delete(at);
       return had;
     }
     const matched = this.onLine(line);
-    this.offered.lines.set(line.text, matched);
+    this.offered.lines.set(at, matched);
     return matched;
   }
 
@@ -266,26 +281,34 @@ export class ServiceMonitor {
   }
 
   /**
-   * One line of the Run's output, as a read shows it or as its own pipe wrote it; true when a pattern matched it. A fail
-   * match wins over a ready match on the same line. The evidence names the line, whichever reading it is: m2-21's says
-   * `Server listening on 8080`.
+   * One line of the Run's output, as a read shows it or as its own pipe wrote it, or as both when the two began at one
+   * place (`texts`, the pipe's first); true when a pattern matched it. A fail match wins over a ready match on the same
+   * line, in either reading; the evidence is the first reading that matched. It names the line, whichever reading it
+   * is: m2-21's says `Server listening on 8080`.
    */
-  private onLine(line: SplitLine): boolean {
+  private onLine(...texts: SplitLine[]): boolean {
     if (this.disposed || ended(this.statusValue)) return false;
     // Matched on the line's head within the pattern's match window, as watches and search are
     // (the house's read of ed4ecac, #22: a long pattern on a 64 KiB line held the thread for seconds),
     // and on the head the splitter kept of a line longer than MAX_LINE; the evidence says when only
     // the head was looked at.
-    const text = line.text;
-    const evidenceOf = (clipped: boolean) => (clipped || line.cut ? `${text.trim()} (${headOnlyText()})` : text.trim());
-    const fail = this.failRe ? testBounded(this.failRe, text) : undefined;
-    if (fail?.matched) {
-      this.onFail(evidenceOf(fail.clipped));
+    const evidenceOf = (line: SplitLine, clipped: boolean) => (clipped || line.cut ? `${line.text.trim()} (${headOnlyText()})` : line.text.trim());
+    const first = (re: RegExp | undefined) => {
+      if (!re) return undefined;
+      for (const line of texts) {
+        const t = testBounded(re, line.text);
+        if (t.matched) return evidenceOf(line, t.clipped);
+      }
+      return undefined;
+    };
+    const fail = first(this.failRe);
+    if (fail !== undefined) {
+      this.onFail(fail);
       return true;
     }
-    const ready = this.readyRe ? testBounded(this.readyRe, text) : undefined;
-    if (ready?.matched) {
-      this.onReadyLine(evidenceOf(ready.clipped));
+    const ready = first(this.readyRe);
+    if (ready !== undefined) {
+      this.onReadyLine(ready);
       return true;
     }
     return false;
