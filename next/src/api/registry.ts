@@ -611,7 +611,9 @@ export class SessionRegistry {
     // told from a stranger's reuse of the id (comment 6269992150); a Run that had ended before the daemon
     // died left its group behind (`leftovers`), and it outlived the Run; a Run recovery itself ended `lost`
     // just now went with its group — not "outlived …, which had ended", which the first wording said of
-    // both (the house's read of cc8c909..39787b3, #22).
+    // both (the house's read of cc8c909..39787b3, #22). So did a Run an earlier recovery ended lost without
+    // judging its group: that end observed no exit, and its group is judged as the in-flight Run's was
+    // (comment 6323055715, question 6).
     for (const run of journal.runs.list()) {
       const outcome = run.endedAt !== undefined ? ended.get(`${id}\0${run.runId}`) : undefined;
       if (!outcome) continue;
@@ -620,7 +622,9 @@ export class SessionRegistry {
           ? `recovery: ${outcome.text} · ${run.runId}`
           : lost.has(run.runId)
             ? `recovery: ${outcome.text} with ${run.runId}, which recovery ended lost`
-            : `recovery: ${outcome.text}; it outlived ${run.runId}, which had ended`;
+            : recoveryEnded(run)
+              ? `recovery: ${outcome.text} with ${run.runId}, which an earlier recovery ended lost`
+              : `recovery: ${outcome.text}; it outlived ${run.runId}, which had ended`;
         journal.append({ type: 'note', text, principal: SYSTEM });
       }
       // A Run that had ended before the daemon died (leftovers) keeps its own end: the judgement is
@@ -1448,9 +1452,12 @@ function lastAlive(store: FileStore): number | undefined {
  * a loop's newest child does, so the whole group goes; asking every member to predate the end left
  * such a loop running (the house's read of cc8c909..39787b3, #22). For a Run still in flight, when one
  * started before the dead daemon's last event, so the group is not one formed after the daemon died.
- * An end a recovery wrote bounds the group only by the evidence it recorded (`lastAliveTs`), compared as
- * the in-flight rule compares the last event, or by the leader's ticks; with neither the group is left
- * (comment 6274857431, item 2; comment 6307350477, item 5).
+ * An end a recovery wrote observed no exit, so the Run is judged as the in-flight Run it was: a present
+ * leader by whether it started with the Run, by ticks where both are recorded and else by the wall clock
+ * (the house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715, question 6). With the leader gone
+ * such an end bounds the group only by the evidence it recorded (`lastAliveTs`), compared as the in-flight
+ * rule compares the last event; without it the group is left (comment 6274857431, item 2; comment
+ * 6307350477, item 5).
  *
  * Starts are compared in ticks where the Run recorded its leader's and the listing is of the same boot
  * (Linux): no wall-clock frame, 10 ms. The ends and the last event are wall-clock records, compared with
@@ -1493,10 +1500,12 @@ export function orphanGroups(candidates: OrphanCandidate[], procs: ProcessRow[],
     // Started before `t`, proven: even the row's latest possible start is.
     const before = (p: ProcessRow, t: number): boolean => p.startMs + (p.startSlackMs ?? 1000) <= t;
     // A present leader after an observed end is a reuse (the Run's process was reaped before its end was
-    // written). A recovery-written end observed no exit: a leader whose ticks equal the Run's recorded
-    // ticks (same boot, by the guard above) is the Run's own process still alive, and the group is its —
-    // the recorded end alone left it running at every restart (a reviewer's read of the fixes for #22
-    // comment 6269992150). Without ticks the wall clock cannot say that much, and the end stands.
+    // written). A recovery-written end observed no exit, so its leader is judged as an in-flight Run's: one
+    // that started with the Run is the Run's own process still alive, and the group is its — the recorded
+    // end alone left it running at every restart (a reviewer's read of the fixes for #22 comment
+    // 6269992150). By ticks where both are recorded; without them (macOS, or a Run recorded without ticks)
+    // by the wall clock, as the in-flight rule judges, where ticks alone left such a leader running at
+    // every later recovery (comment 6323055715, question 6).
     // With the leader gone, a member must have started before the bound: an observed end by its earliest
     // start (the window the docs state), the dead daemon's last event by its latest — and a recovery-written
     // end's bound is that same evidence, so it is compared as the in-flight rule compares it; by the
@@ -1504,9 +1513,7 @@ export function orphanGroups(candidates: OrphanCandidate[], procs: ProcessRow[],
     // read of the 33 commits, PR #22, comment 6307350477, item 5).
     const startedBefore = (p: ProcessRow, t: number): boolean => (run.endedAt !== undefined && !byRecovery ? p.startMs <= t : before(p, t));
     const ours = leader
-      ? run.endedAt === undefined
-        ? leaderStartedWithRun(leader)
-        : byRecovery && byTicks(leader)
+      ? (run.endedAt === undefined || byRecovery) && leaderStartedWithRun(leader)
       : run.endedAt !== undefined
         ? ended !== undefined && members.every(sinceStart) && members.some((p) => startedBefore(p, ended))
         : lastTs !== undefined && members.every(sinceStart) && members.some((p) => startedBefore(p, lastTs));

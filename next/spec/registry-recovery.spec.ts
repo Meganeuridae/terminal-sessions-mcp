@@ -436,8 +436,15 @@ test('jr2-4: a leader whose ticks equal a Run\'s recorded ticks is the Run\'s ow
   // A recovery that could not list processes ended the Run lost; the next one finds the leader itself alive, by ticks.
   assert.deepEqual(sel(run({ bootId: 'boot-A', startTicks: 7777 }), [leader({ bootId: 'boot-A', startTicks: 7777 })]), [1001], 'the Run\'s own process: ended, not left at every restart');
   assert.deepEqual(sel(run({ bootId: 'boot-A', startTicks: 7777 }), [leader({ bootId: 'boot-A', startTicks: 9999 })]), [], 'different ticks: a reused pid');
-  // Without ticks the wall clock cannot tell the Run's process from a reuse: the recorded end stands.
-  assert.deepEqual(sel(run({}), [leader({})]), [], 'no ticks: a leader after a recorded end is a stranger');
+  // Without ticks to compare (macOS, a Run recorded without them, or a listing from ps) the leader is judged
+  // as an in-flight Run's is, by the wall clock: ticks alone left the Run's own live leader at every later
+  // recovery (the house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715, question 6).
+  assert.deepEqual(sel(run({}), [leader({})]), [1001], 'no ticks: a leader that started with the Run is its own process');
+  assert.deepEqual(sel(run({ bootId: 'boot-A', startTicks: 7777 }), [leader({})]), [1001], 'ticks on the Run, none on the row: the wall clock');
+  assert.deepEqual(sel(run({}), [leader({ startMs: T + 30_000 })]), [], 'no ticks: a leader that started after the Run is a reuse');
+  assert.deepEqual(sel(run({}), [leader({ startMs: T - 10_000 })]), [], 'no ticks: nor one that started before it');
+  const { recoveredEnd: _flag, ...unflagged } = run({}).run;
+  assert.deepEqual(sel({ key: 's\0r', run: { ...unflagged, reason: 'daemon-restart' }, lastTs: T + 5000 }, [leader({})]), [1001], 'an older recovery\'s unflagged end, by its reason');
   // An observed end means the leader was reaped: a present leader is a reuse whatever its ticks say of a lost pid.
   const { recoveredEnd: _r, ...observed } = run({ bootId: 'boot-A', startTicks: 7777 }).run;
   assert.deepEqual(sel({ key: 's\0r', run: { ...observed, state: 'exited', leftovers: true }, lastTs: T + 5000 }, [leader({ bootId: 'boot-A', startTicks: 7777 })]), [], 'an observed end: the leader is gone, so this one is not the Run\'s');
@@ -564,9 +571,8 @@ test('jr2-4: a recovery with no process listing ends no group and says so — a 
   const kids = detachedKids();
   try {
     fs.mkdirSync(dir, { recursive: true });
-    // Both groups leaderless (the leader exited, its child lives on), so the next recovery ties them to
-    // their Runs by the wall clock on every host; a live leader under an end recovery wrote is told by
-    // start ticks only, which macOS has none of.
+    // Both groups leaderless (the leader exited, its child lives on): the next recovery ties them to their
+    // Runs by their members' starts against the dead daemon's last event.
     const inFlight = kids.spawn('/bin/sh', ['-c', 'sleep 412 & exit 0']);
     const leftover = kids.spawn('/bin/sh', ['-c', 'sleep 413 & exit 0']);
     // Each shell forks its sleep before it exits, so the Runs' times are taken after both have: taken right
@@ -624,13 +630,51 @@ const logBook = () => {
 };
 const notesOf = (h: HistorySession) => h.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'note' }> => e.type === 'note').map((e) => e.text);
 
+test('jr2-4: a live leader under an end a recovery wrote without judging its group, recorded without ticks, is judged as the in-flight Run it was and ended by the next recovery that can list processes, not left at every later one (the house\'s review of 4f4c067..a8b6f28, PR #22, comment 6323055715, question 6)', { timeout: 20_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'nw');
+  const kids = detachedKids();
+  try {
+    // The Run's own process leads its group and lives on; its start records no ticks, as on macOS or from an
+    // older build, so only the wall clock can tie the leader to the Run.
+    const g = kids.spawn('/bin/sh', ['-c', 'exec sleep 416']);
+    const ts = Date.now();
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'nw', now: () => ts });
+    journalProcess(j, 'r1-lead', g);
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    // A recovery with no process listing ends the Run lost and leaves its group a candidate.
+    const r1 = rig(dir, { terminateOrphans: true, listProcesses: () => undefined });
+    const first = hist(r1.reg.get('nw')).run('r1-lead');
+    assert.deepEqual([first.state, first.recoveredEnd, first.groupJudged, first.startTicks], ['lost', true, undefined, undefined]);
+    assert.ok(groupAlive(g), 'nothing was signalled');
+    await r1.reg.closeAll();
+    // The next recovery lists processes: the leader started with the Run, so the group is the Run's and goes.
+    const r2 = rig(dir, { terminateOrphans: true });
+    const h2 = hist(r2.reg.get('nw'));
+    assert.equal(h2.run('r1-lead').groupJudged, true, 'judged');
+    assert.ok(notesOf(h2).includes(`recovery: process group ${g} terminated with r1-lead, which an earlier recovery ended lost`), JSON.stringify(notesOf(h2)));
+    const said = notesOf(h2).filter((t) => t.includes(`process group ${g}`)).length;
+    // The leader is this test's own child, a zombie until the loop reaps it: wait for its exit, not its group.
+    await kids.exited(g);
+    await r2.reg.closeAll();
+    // Judged once: a third recovery adds no note.
+    const r3 = rig(dir, { terminateOrphans: true });
+    assert.equal(notesOf(hist(r3.reg.get('nw'))).filter((t) => t.includes(`process group ${g}`)).length, said, 'no note from a third recovery');
+    await r3.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
+
 test('jr2-4: a group recovery signalled, with no listing answering after it, is not judged — its Run stays a candidate, and the next recovery that can list processes ends the group (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 1)', { timeout: 20_000 }, async () => {
   const dir = path.join(tmp, `d${++dirs}`);
   const sdir = path.join(dir, 'sessions', 'nu');
   const kids = detachedKids();
   try {
-    // Leaderless, so the next recovery ties it to the Run by the wall clock on every host (a live leader under
-    // an end a recovery wrote is told by start ticks only); its member ignores SIGTERM.
+    // Leaderless, so the next recovery ties it to the Run by its member's start against the dead daemon's last
+    // event; its member ignores SIGTERM.
     const g = kids.spawn('/bin/sh', ['-c', "trap '' TERM; sleep 414 & exit 0"]);
     await kids.exited(g);
     let ts = Date.now();
