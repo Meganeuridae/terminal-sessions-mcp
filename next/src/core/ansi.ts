@@ -216,7 +216,11 @@ export interface SplitLine {
   text: string;
   /** The line was longer than MAX_LINE: this is its head, and the rest was dropped. */
   cut?: true;
-  /** The `source` `feed` was given with the chunk holding the first character the line shows (a process Run's pipe). */
+  /**
+   * The `source` `feed` was given with the chunk holding the first character written to the line that shows (a
+   * process Run's pipe): as written, so a character a later backspace or cursor move writes over keeps its pipe
+   * (stdout's `ab`, then stderr's `BS BS cd`, shows `cd` and names stdout).
+   */
   from?: string;
   /** The line shows characters from chunks of different sources: both of a process Run's pipes. */
   mixed?: true;
