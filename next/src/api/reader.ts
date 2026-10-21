@@ -289,14 +289,22 @@ const vouched = (journal: Journal, g: GapInfo): GapInfo => (g.exact === undefine
  * apart from other holes, and no event or result gains a mark.
  */
 function addHole(gaps: GapInfo[], g: GapInfo): void {
-  const same = gaps.find((h) => h.reason === g.reason && h.from <= g.to && g.from <= h.to);
-  if (!same) {
+  // Every entry of its reason that the hole meets merges with it: one recorded range can span several the reads
+  // showed (lost-range compaction), and merged into the first alone, it left the others beside it (our read of
+  // the 40 commits, PR #22).
+  const meets = (h: GapInfo) => h.reason === g.reason && h.from <= g.to && g.from <= h.to;
+  const same = gaps.filter(meets);
+  if (!same.length) {
     gaps.push(g);
     return;
   }
-  same.from = Math.min(same.from, g.from);
-  same.to = Math.max(same.to, g.to);
-  if (!g.exact) delete same.exact;
+  const into = same[0]!;
+  for (const h of [g, ...same.slice(1)]) {
+    into.from = Math.min(into.from, h.from);
+    into.to = Math.max(into.to, h.to);
+    if (!h.exact) delete into.exact;
+  }
+  for (const h of same.slice(1)) gaps.splice(gaps.indexOf(h), 1);
 }
 
 /** Report the holes a result spans: the first as `gap`, all of them as `gaps` when there are several. */

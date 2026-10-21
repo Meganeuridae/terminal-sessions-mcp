@@ -1526,3 +1526,18 @@ test('an events tail stops walking back once it holds the events it returns (our
   assert.deepEqual(r.events!.map((e) => e.seq), Array.from({ length: 10 }, (_, i) => 29_991 + i));
   assert.ok(calls <= 2, `${calls} batches read`);
 });
+
+test('search reports a hole once when its recorded range spans several the reads showed (our read of the 40 commits, PR #22)', async () => {
+  // Before the store heals, reads show a lost stretch in pieces; the catch-up's record can span more than one of
+  // them. Merged into the first alone, the second stood beside it, and the hole was reported twice.
+  const src = source();
+  out(src.journal, 'one\r\n');
+  src.journal.append({ type: 'gap', from: 5, to: 5, reason: 'store-error' });
+  src.journal.append({ type: 'gap', from: 8, to: 8, reason: 'store-error' });
+  out(src.journal, 'two\r\n');
+  src.journal.append({ type: 'gap', from: 4, to: 9, reason: 'store-error' });
+  out(src.journal, 'three\r\n');
+  const r = await searchJournal(src, { pattern: 'two', since: 0 });
+  const holes = r.gaps ?? (r.gap ? [r.gap] : []);
+  assert.deepEqual(holes.map((g) => [g.from, g.to, g.reason]), [[4, 9, 'store-error']], JSON.stringify(holes));
+});
