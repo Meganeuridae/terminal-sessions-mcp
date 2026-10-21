@@ -92,10 +92,18 @@ for (const bash of ['/bin/bash', ...(BASH5 ? [BASH5] : [])]) {
       x.session.input('sh -c "exit 42"\r', { principal: AGENT });
       await until(() => x.session.listRuns().some((r) => r.origin === 'agent' && r.state === 'exited'), 3000, 'typed Run');
       assert.equal(x.session.listRuns().find((r) => r.origin === 'agent')!.exit, 42, 'the typed line is a Run with its own exit');
-      const cleared = await run(x, 'cat $HOME/hook.log | wc -l');
-      const before = Number(cleared.text.trim());
+      // A count that isn't a number says what the Run was and what the terminal showed: once in two macOS 22 runs of
+      // one tree, the second count's text was no number, and the assertion gave only NaN (antra's run 39681219219).
+      const count = async () => {
+        const r = await run(x, 'cat $HOME/hook.log | wc -l');
+        // The journal's last events, the output with the marks and Run events among it, as the session saw them.
+        const seen = x.journal.since(0).events.slice(-60).map((e) => (e.type === 'output' ? `${e.seq} ${JSON.stringify(e.data)}` : `${e.seq} ${JSON.stringify(e).slice(0, 160)}`));
+        assert.match(r.text, /^\s*\d+\s*$/, `the count's Run: ${JSON.stringify({ state: r.state, exit: r.exit, reason: r.reason, text: r.text })}\n${seen.join('\n')}`);
+        return Number(r.text.trim());
+      };
+      const before = await count();
       await run(x, 'true');
-      assert.equal(Number((await run(x, 'cat $HOME/hook.log | wc -l')).text.trim()), before, 'the user emptied PROMPT_COMMAND: their hook stays gone');
+      assert.equal(await count(), before, 'the user emptied PROMPT_COMMAND: their hook stays gone');
     } finally {
       await x.close();
     }
