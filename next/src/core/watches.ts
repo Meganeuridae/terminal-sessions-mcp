@@ -17,20 +17,24 @@
  * Every pattern compiles on the linear-time engine, and a bad one is refused
  * with invalid_argument when the watch or wait is created.
  *
- * Quiet is measured on the monotonic clock. Every output event the manager saw arrive is
- * stamped as it arrives (the newest 8,192 are kept), so a silence measured from an earlier
- * output, a stream's quiet partial line or an ended Run's last output is as exact as one
- * measured from arming; only output from before the manager existed, or older than the stamps
- * kept, takes its age from the journal's wall-clock time, clamped at zero (the house's read of
- * 3eade8a, #22: a forward step of 10 s certified 5 s of silence in 1 ms; and of the 38 commits
- * after 78c4d6e: a Run's other stream and an ended Run's last output were aged on the wall clock).
+ * Quiet is measured on the monotonic clock. The newest output of each stream of each Run, and
+ * of the session outside Runs, is stamped as it arrives and kept while the Run lives, then for
+ * the newest 1,024 ended Runs. Every age a wait takes is of such an output (a Run's last output,
+ * the session's last output, a stream's partial line), so a silence measured from earlier output
+ * is as exact as one measured from arming, however much other Runs print meanwhile; only output
+ * from before the manager existed, or the last output of an older ended Run, takes its age from
+ * the journal's wall-clock time, clamped at zero (the house's read of 3eade8a, #22: a forward
+ * step of 10 s certified 5 s of silence in 1 ms; of the 38 commits after 78c4d6e: a Run's other
+ * stream and an ended Run's last output were aged on the wall clock; and of the 33 commits after
+ * 94ac8c0, comment 6307351806: a stamp for every event, the newest 8,192 kept, let a quiet live
+ * Run's stamp go once other Runs printed 8,192 events, and cost about 1.6 µs per event).
  */
 import { randomBytes } from 'node:crypto';
 import { compileLinePattern, PARTIAL_QUIET_MS, StreamMatcher } from './ansi.js';
 import { clocks, MAX_TIMER_MS, timerMs } from './clock.js';
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
-import type { EventOf, IntegrationLevel, JournalEvent, Principal, RunInfo, Seq } from './types.js';
+import type { EventOf, IntegrationLevel, JournalEvent, OutputStream, Principal, RunInfo, Seq } from './types.js';
 
 export type WatchKind = 'pattern' | 'silence' | 'idle';
 
@@ -315,8 +319,16 @@ interface WatchRecord extends WatchInfo {
   lastFiredMono?: number | undefined;
 }
 
-/** How many output events keep their arrival stamp: enough for every live partial line and every ended Run's last output a wait may age (the house's read of the 38 commits, #22). */
-const STAMPS_KEPT = 8192;
+/** When a stream's newest output arrived, on the monotonic clock. */
+interface Stamp {
+  seq: Seq;
+  at: number;
+}
+/** The newest output of each stream of one Run, or of the session outside Runs. */
+type Newest = Partial<Record<OutputStream, Stamp>>;
+
+/** How many ended Runs keep their last output's stamp, for a silence wait answering for one: more than the 1,000 ended Runs a session holds in memory. */
+const ENDED_STAMPED = 1024;
 
 export class WatchManager {
   private readonly watches = new Map<string, WatchRecord>();
@@ -324,27 +336,57 @@ export class WatchManager {
   private counter = 0;
   /** Waits in flight, so closing the session ends them at once (m2-24). */
   private readonly waits = new Set<(reason: string) => void>();
-  /** When each output event arrived, on the monotonic clock, by seq; the oldest stamps go as new ones come. */
-  private readonly stamps = new Map<Seq, number>();
+  /** Each live Run's newest output by stream, the session's outside Runs under '': held until the Run's end, however much other Runs print. */
+  private readonly live = new Map<string, Newest>();
+  /** The same for the newest ENDED_STAMPED ended Runs, moved here at each Run's end. */
+  private readonly ended = new Map<string, Newest>();
 
   constructor(private readonly host: WatchHost) {
     this.off = host.journal.subscribe((ev) => {
       if (ev.type === 'watch.fired') return;
-      if (ev.type === 'output') {
-        // Every output event is stamped, not only a Run's newest: a process Run's other stream and
-        // an ended Run's last output are aged too, by a wait replaying a quiet partial line or a
-        // silence wait answering for an ended Run (the house's read of the 38 commits, #22).
-        this.stamps.set(ev.seq, clocks.monotonic());
-        if (this.stamps.size > STAMPS_KEPT) this.stamps.delete(this.stamps.keys().next().value!);
-      }
+      if (ev.type === 'output') this.stamp(ev);
+      else if (ev.type === 'run.end') this.retire(ev.runId);
       for (const w of [...this.watches.values()]) w.predicate.feed(ev);
     });
   }
 
-  /** How long ago an output event arrived: exact when it was stamped on arrival, else (from before the manager existed, or older than the stamps kept) the journal's wall-clock age, clamped at zero. */
+  /**
+   * One clock read and one lookup per output event, the stream's stamp updated in place: each stream
+   * of each Run is stamped, not only a Run's newest output, since a process Run's other stream is aged
+   * too, by a wait replaying a quiet partial line (the house's read of the 38 commits, #22).
+   */
+  private stamp(ev: EventOf<'output'>): void {
+    const key = ev.runId ?? '';
+    let newest = this.live.get(key) ?? this.ended.get(key);
+    if (!newest) this.live.set(key, (newest = {}));
+    const at = clocks.monotonic();
+    const s = newest[ev.stream];
+    if (s) {
+      s.seq = ev.seq;
+      s.at = at;
+    } else newest[ev.stream] = { seq: ev.seq, at };
+  }
+
+  /** A Run's end moves its stamps among the ended Runs', where a silence wait answering for it finds its last output's. */
+  private retire(runId: string): void {
+    const newest = this.live.get(runId);
+    if (!newest) return;
+    this.live.delete(runId);
+    this.ended.set(runId, newest);
+    if (this.ended.size > ENDED_STAMPED) this.ended.delete(this.ended.keys().next().value!);
+  }
+
+  /**
+   * How long ago an output event arrived: exact when it is its stream's newest, as every output a wait
+   * ages is, else (from before the manager existed, or an older ended Run's) the journal's wall-clock
+   * age, clamped at zero.
+   */
   private ageOf(ev: JournalEvent): number {
-    const at = this.stamps.get(ev.seq);
-    if (at !== undefined) return Math.max(0, Math.round(clocks.monotonic() - at));
+    if (ev.type === 'output') {
+      const key = ev.runId ?? '';
+      const s = (this.live.get(key) ?? this.ended.get(key))?.[ev.stream];
+      if (s?.seq === ev.seq) return Math.max(0, Math.round(clocks.monotonic() - s.at));
+    }
     return Math.max(0, Date.now() - ev.ts);
   }
 

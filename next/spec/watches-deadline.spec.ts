@@ -7,7 +7,7 @@ import { TermError } from '../src/core/errors.js';
 import { Journal } from '../src/core/journal.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { clocks } from '../src/core/clock.js';
-import { WatchManager, type WatchHost } from '../src/core/watches.js';
+import { WatchManager, type WaitResult, type WatchHost } from '../src/core/watches.js';
 
 test('silence rechecks its deadline when the timer wakes before the quiet duration has passed, and a wall-clock step neither delays nor hastens it', async (t) => {
   // After arming, the monotonic clock falls 40 ms behind the timer: the first wake, at 100 ms, sees
@@ -108,6 +108,35 @@ test('an ended Run’s last output and a stream’s quiet partial line keep thei
     const hit = await f.manager.waitFor({ pattern: 'password:', runId: 'p' }, 5000, 0);
     assert.equal(hit.matched, true);
     assert.ok(performance.now() - t0 >= 150, `the partial line waited its delay instead of being flushed as stale: ${(performance.now() - t0).toFixed(0)} ms`);
+  } finally {
+    f.close();
+  }
+});
+
+test('a quiet live Run keeps its last output’s stamp however much another Run prints, and keeps it past its end (the house’s read of the 33 commits, #22, comment 6307351806)', async (t) => {
+  // Every output event was stamped and the newest 8,192 kept: once another Run printed 8,192 events,
+  // a quiet live Run's last output had no stamp, its age came from the wall clock, and a forward
+  // step of 10 s certified 10 s of quiet at once. The ended Run's age is checked the same way.
+  const f = bare();
+  try {
+    f.startRun('r');
+    f.out('waiting for input\n', 'r');
+    f.startRun('p', 'process');
+    const flood = () => {
+      for (let i = 0; i < 9000; i++) f.out(`${i}\n`, 'p', 'stdout');
+    };
+    flood();
+    const wall = Date.now();
+    t.mock.method(Date, 'now', () => wall + 10_000);
+    const quietOf = (w: WaitResult) => Number(/no output for (\d+)ms/.exec(String(w.match))?.[1]);
+    const live = await f.manager.waitFor({ silenceMs: 200, runId: 'r' }, 5000);
+    assert.equal(live.matched, true, JSON.stringify(live));
+    assert.ok(quietOf(live) < 5000, `the live Run's last output is aged on the monotonic clock: ${live.match}`);
+    f.journal.append({ type: 'run.end', runId: 'r', state: 'exited', exit: 0, durationMs: 1 });
+    flood();
+    const ended = await f.manager.waitFor({ silenceMs: 200, runId: 'r' }, 5000);
+    assert.equal(ended.matched, true, JSON.stringify(ended));
+    assert.ok(quietOf(ended) < 5000, `the ended Run's last output is aged on the monotonic clock: ${ended.match}`);
   } finally {
     f.close();
   }

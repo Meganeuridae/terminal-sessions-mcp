@@ -2,7 +2,7 @@
 
 > 2.0 lives in `next/`, beside the 1.x code this package has shipped so far. Both are in the
 > package: `termd`, `tsm` and `tsm-shim` are 2.0; `terminal-sessions-mcp`, `session-server`,
-> `session-gui` and `session-cli` are 1.x, unchanged. The design discussion is
+> `session-gui` and `session-cli` are 1.x, whose code 2.0 does not change. The design discussion is
 > [antra-tess/terminal-sessions-mcp#11](https://github.com/antra-tess/terminal-sessions-mcp/pull/11).
 
 Persistent terminal sessions for agents and humans: a daemon that keeps shells alive,
