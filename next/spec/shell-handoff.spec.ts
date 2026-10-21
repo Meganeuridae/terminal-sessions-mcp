@@ -76,14 +76,19 @@ setTimeout(() => {
 }
 
 test('a startup rc replacing the shell with a reader never becomes ready through a timer', async () => {
-  // The order is the daemon's own (grace, then cap, then the rc's exec), with room for a slow runner:
-  // a hello later than the grace reads as no integration and an available shell, which is not what
-  // this test is about (a 100 ms grace failed it once on a macOS runner).
-  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': 'sleep 3; exec /bin/cat\n' }, integrationGraceMs: 1000, startupCapMs: 2000 });
+  // The order is the daemon's own (grace, then cap, then the rc's exec). The rc execs only once the spec
+  // writes a gate after the cap has resolved `start`, where a fixed `sleep 3` set the order before (the
+  // house's review of the 40 commits through 4f4c067). The hello against the grace is the shell's own
+  // startup and keeps its room for a slow runner: a hello later than the grace reads as no integration
+  // and an available shell, which is not what this test is about (a 100 ms grace failed it once on a
+  // macOS runner).
+  const gate = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-handoff-gate-')), 'gate');
+  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': `while [ ! -e '${gate}' ]; do sleep 0.05; done; exec /bin/cat\n` }, integrationGraceMs: 1000, startupCapMs: 2000 });
   try {
     // The cap resolves `start` at 2 s whatever the shell has done by then; on a loaded machine
     // bash may not have reached its rc yet, and the session is still `starting` (never `idle`).
     assert.notEqual(x.session.info().state, 'idle');
+    fs.writeFileSync(gate, '');
     await until(() => x.session.info().state !== 'starting', 10_000);
     assert.equal(x.session.info().state, 'unavailable');
     assert.deepEqual(x.session.shellAvailable(), { ok: false, reason: 'shell-unavailable' });
