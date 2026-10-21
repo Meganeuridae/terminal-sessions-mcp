@@ -89,22 +89,34 @@ test('two-byte ESC sequences end after their one final byte; intermediates still
   assert.equal(sequenceEnd('\x1b[?1h\x1b=', 5), 7, 'xterm turns keypad mode on with CSI ?1h ESC =');
 });
 
-test('a tail cut never starts inside a control sequence, a surrogate pair or a CRLF: it moves earlier, by at most the sequence it would have split', () => {
-  // The house's read of 78c4d6e (#22): `tailStart` over 1,000 A and `ESC [ 31 m Hello` with 8 bytes kept `31mHello`.
+test('a tail cut never starts inside a control sequence, a surrogate pair or a CRLF: it moves forward past it, so the budget holds and no payload shows', () => {
+  // The house's read of 78c4d6e (#22): `tailStart` over 1,000 A and `ESC [ 31 m Hello` with 8 bytes kept `31mHello`; and of the
+  // 38 commits after it (comment 6274773484): the cut then moved back and kept 58 bytes of a 30-byte budget.
   const red = `${'A'.repeat(1000)}\x1b[31mHello`;
-  assert.equal(red.slice(tailStart(red, 8)), '\x1b[31mHello');
-  assert.equal(cutTail(red, 8).text, '\x1b[31mHello');
-  // An OSC 8 link cut at 40 showed the link's tail as text.
+  assert.equal(red.slice(tailStart(red, 8)), 'Hello', 'past the sequence, not back to its start');
+  assert.deepEqual(cutTail(red, 8), { text: 'Hello', cut: true });
+  // An OSC 8 link cut at 40 showed the link's tail as text; the kept tail now begins after the link's opening string.
   const link = `${'x'.repeat(200)}\x1b]8;;https://example.com/a/very/long/link\x1b\\link\x1b]8;;\x1b\\ tail`;
-  const at40 = link.slice(tailStart(link, 40));
-  assert.ok(at40.startsWith('\x1b]8;;https://example.com/a/very/long/link\x1b\\'), JSON.stringify(at40));
-  assert.equal(unfinishedSequence(link.slice(0, tailStart(link, 40))), tailStart(link, 40), 'the dropped head ends at no open sequence');
-  // A pair and a CRLF at the cut.
+  assert.equal(link.slice(tailStart(link, 40)), 'link\x1b]8;;\x1b\\ tail');
+  const short = `${'a'.repeat(40)}\x1b]8;;https://example.com/a/very/long/link\x1b\\link\x1b]8;;\x1b\\ tail`;
+  assert.ok(Buffer.byteLength(cutTail(short, 30).text) <= 30, `at most the budget: ${Buffer.byteLength(cutTail(short, 30).text)} bytes`);
+  // A long control string (an OSC 52 clipboard, its base64 wrapped with newlines as GNU base64 wraps it) is looked back
+  // through whole: a tail of 100 or of 3,000 bytes never begins inside its payload, and a newline in the payload begins no line.
+  const payload = Array.from({ length: 80 }, () => 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODk='.slice(0, 76)).join('\n');
+  const clip = `${'A'.repeat(500)}\x1b]52;c;${payload}\x07after the clipboard\nlast line`;
+  for (const budget of [100, 3000]) {
+    const at = tailStart(clip, budget);
+    assert.ok(at >= clip.indexOf('\x07') + 1, `budget ${budget}: the tail begins after the string, not in it (${JSON.stringify(clip.slice(at, at + 12))})`);
+    assert.ok(Buffer.byteLength(clip.slice(at)) <= budget, `budget ${budget} holds`);
+  }
+  assert.equal(clip.slice(tailStart(clip, 100)), 'last line', 'the line boundary after the string is still preferred');
+  // A pair and a CRLF at the cut move forward too.
   const pair = `${'a'.repeat(100)}😀b`;
   assert.equal(pair.slice(tailStart(pair, 5)), '😀b');
+  assert.equal(pair.slice(tailStart(pair, 3)), 'b', 'half the budget of a pair is none of it');
   const crlf = `${'a'.repeat(100)}\r\nb`;
-  assert.equal(crlf.slice(tailStart(crlf, 2)), '\r\nb');
-  // The line-boundary rule still applies after the safe cut.
+  assert.equal(crlf.slice(tailStart(crlf, 2)), 'b');
+  // The line-boundary rule still applies after the move.
   const lines = `${'a'.repeat(100)}\n\x1b[1mb\nc`;
   assert.equal(lines.slice(tailStart(lines, 12)), '\x1b[1mb\nc');
 });

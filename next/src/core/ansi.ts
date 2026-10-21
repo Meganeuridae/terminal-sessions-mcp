@@ -7,26 +7,52 @@
  */
 import { err } from './errors.js';
 import { compileUserRegex, execBounded } from './regex.js';
-import { sequenceEnd, unfinishedSequence } from './text.js';
+import { safeCut, sequenceEnd } from './text.js';
 
 /**
- * A move past the end of what a line holds pads it with blanks when the next character is
- * written, as a terminal does up to its width; with no width here, this many cells at most.
+ * The longest line a StreamMatcher holds: a longer one is matched on its first MAX_LINE, the hit says
+ * `clipped`, and the rest of the line is dropped. Also the farthest column a cursor move can carry
+ * `cleanLine`'s cursor to: a terminal's width bounds a move; with no width here, this does.
  */
-const MOVE_PAST_END = 1024;
+export const MAX_LINE = 64 * 1024;
 
 /** The in-line controls `cleanLine` applies: erase in line (K), cursor back (D), forward (C), to a column (G). */
 const LINE_CONTROL = /^(?:\x1b\[|\x9b)([0-9;]*)([KDCG])$/;
 
 /**
+ * The widths the emulator gives characters: xterm's built-in Unicode 6 table (Markus Kuhn's wcwidth),
+ * since the transcript and the screen load no other. Zero cells for a combining or enclosing mark,
+ * a format character and a Hangul medial vowel or final consonant; two for the East Asian wide and
+ * fullwidth ranges; one for everything else, emoji included (the table predates their wide form).
+ * Marks added to Unicode since 5.0, which the table predates, read as zero cells here and one there.
+ */
+const ZERO_WIDTH = /^[\p{Mn}\p{Me}\u0600-\u0603\u06dd\u06de\u070f\u1160-\u11ff\u1734\u200b-\u200f\u202a-\u202e\u2060-\u2063\u206a-\u206f\u302e\u302f\ufeff\ufff9-\ufffb\u{1d173}-\u{1d17a}\u{e0001}\u{e0020}-\u{e007f}]$/u;
+const WIDE = /^[\u1100-\u115f\u2329\u232a\u2e80-\u303e\u3040-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6\u{20000}-\u{2fffd}\u{30000}-\u{3fffd}]$/u;
+
+/** The cells one character takes on a terminal row, as the emulator lays it out: none, one or two. */
+export function cellWidth(ch: string): 0 | 1 | 2 {
+  // Nothing below U+0300, where the combining marks begin, is zero-width or wide: most text skips the two tests.
+  if (ch.charCodeAt(0) < 0x300) return 1;
+  return ZERO_WIDTH.test(ch) ? 0 : WIDE.test(ch) ? 2 : 1;
+}
+
+/**
  * One line of output as a reader sees it, rendered as the transcript renders a row: a cursor over
- * a row of cells, to which a carriage return (column 0), a backspace (one cell left), erase in line
- * (`ESC [ K` to the end, `1K` to the start, `2K` the whole row), and cursor back, forward and
- * to-column moves (`ESC [ n D`, `n C`, `n G`) apply; every other sequence is dropped (the house's
- * read of 78c4d6e, #22: `Progress: 100%\r\x1b[KDone` read `Doneress: 100%` where the transcript
- * shows `Done`). So `ABCDE\rXY` reads `XYCDE`, `abcdef\x1b[3DXY` reads `abcXYf`, `abc\x1b[5Cz` reads
- * `abc     z`, and a spinner's `|\b/\b-\b\\` reads its last frame. Trailing blanks stay (a pattern
- * may anchor on them); a display trims them. Search, watches and the segmenter read lines through
+ * a row of cells, to which a carriage return (column 0), a backspace (one cell left), a tab (the
+ * next tab stop, every eight cells), erase in line (`ESC [ K` to the end, `1K` to the start, `2K`
+ * the whole row), and cursor back, forward and to-column moves (`ESC [ n D`, `n C`, `n G`) apply;
+ * every other sequence is dropped (the house's read of 78c4d6e, #22: `Progress: 100%\r\x1b[KDone`
+ * read `Doneress: 100%` where the transcript shows `Done`). A wide character takes two cells and a
+ * combining mark none, as on the row, so a move lands where the transcript's cursor would, and
+ * overwriting half a wide character blanks it whole (the house's read of the 38 commits, #22,
+ * comment 6274773484: `ab\tc\x1b[2Dz` read `abzc` against the row's `ab     zc`, `日本\x1b[1Dx`
+ * read `日x` against `日 x`). So `ABCDE\rXY` reads `XYCDE`, `abcdef\x1b[3DXY` reads `abcXYf`,
+ * `abc\x1b[5Cz` reads `abc     z`, and a spinner's `|\b/\b-\b\\` reads its last frame. A move
+ * past the end of what the row holds pads with blanks when the next character is written, as a
+ * terminal does up to its width; with no width here, no move carries the cursor past MAX_LINE, or
+ * past the row's end once the row is longer, so the row grows by at most what is written (the same
+ * read: a move and a write repeated grew a line to eight million cells). Trailing blanks stay (a pattern may
+ * anchor on them); a display trims them. Search, watches and the segmenter read lines through
  * this one function (the house's read of 3eade8a, #22). The overwrites are applied on the raw
  * text, sequences skipped by `sequenceEnd`, so no character stands in for a backspace: a U+E000 in
  * the output is text (the house's read of 39787b3, #22, found it taken for one). A sequence left
@@ -34,9 +60,17 @@ const LINE_CONTROL = /^(?:\x1b\[|\x9b)([0-9;]*)([KDCG])$/;
  * read: `ready\x1b]0;title` read `ready]0;title`).
  */
 export function cleanLine(raw: string): string {
+  // A wide character's second cell holds '' (its continuation); a combining mark joins the cell before it.
   const cells: string[] = [];
   let col = 0;
-  const moveTo = (c: number) => (col = Math.max(0, Math.min(c, cells.length + MOVE_PAST_END)));
+  const moveTo = (c: number) => (col = Math.max(0, Math.min(c, Math.max(cells.length, MAX_LINE))));
+  // Blank one cell; the other half of a wide character goes with it, as the emulator clears both.
+  const blank = (k: number) => {
+    if (k >= cells.length) return;
+    if (cells[k] === '' && k > 0) cells[k - 1] = ' ';
+    else if (cells[k + 1] === '') cells[k + 1] = ' ';
+    cells[k] = ' ';
+  };
   for (let i = 0; i < raw.length; ) {
     const c = raw.charCodeAt(i);
     if (c === 0x1b || c === 0x9b) {
@@ -47,8 +81,10 @@ export function cleanLine(raw: string): string {
         const n = Number(m[1]!.split(';')[0]);
         const arg = Number.isFinite(n) ? n : 0;
         if (m[2] === 'K') {
-          if (arg === 0) cells.length = Math.min(cells.length, col);
-          else if (arg === 1) for (let k = 0; k <= col && k < cells.length; k++) cells[k] = ' ';
+          if (arg === 0) {
+            if (cells[col] === '' && col > 0) cells[col - 1] = ' ';
+            cells.length = Math.min(cells.length, col);
+          } else if (arg === 1) for (let k = 0; k <= col; k++) blank(k);
           else if (arg === 2) cells.length = 0;
         } else if (m[2] === 'D') moveTo(col - Math.max(1, arg));
         else if (m[2] === 'C') moveTo(col + Math.max(1, arg));
@@ -59,20 +95,35 @@ export function cleanLine(raw: string): string {
     }
     if (c === 0x0d) col = 0;
     else if (c === 0x08) col = Math.max(0, col - 1);
-    else if ((c >= 0x20 && c !== 0x7f) || c === 0x09 || c === 0x0a) {
+    else if (c === 0x09) moveTo(((col >> 3) + 1) << 3);
+    else if ((c >= 0x20 && c !== 0x7f) || c === 0x0a) {
       const ch = String.fromCodePoint(raw.codePointAt(i)!);
-      while (cells.length < col) cells.push(' ');
-      cells[col++] = ch;
       i += ch.length;
+      const w = cellWidth(ch);
+      if (w === 0 && col > 0) {
+        // A combining mark or a joiner composes with the character before the cursor; at column 0
+        // there is none, and the emulator gives the mark a cell of its own.
+        let k = Math.max(0, col - 1);
+        if (cells[k] === '' && k > 0) k--;
+        while (cells.length < k) cells.push(' '); // after a move past the end: the cells it crossed are blanks
+        cells[k] = (cells[k] ?? ' ') + ch;
+        continue;
+      }
+      while (cells.length < col) cells.push(' ');
+      // Overwriting either half of a wide character blanks the other half.
+      if (cells[col] === '' && col > 0) cells[col - 1] = ' ';
+      if (cells[col + 1] === '') cells[col + 1] = ' ';
+      cells[col++] = ch;
+      if (w === 2) {
+        if (cells[col + 1] === '') cells[col + 1] = ' ';
+        cells[col++] = '';
+      }
       continue;
     }
     i++;
   }
   return cells.join('');
 }
-
-/** The longest line a StreamMatcher holds: a longer one is matched on its first MAX_LINE, the hit says `clipped`, and the rest of the line is dropped. */
-export const MAX_LINE = 64 * 1024;
 
 /** How long a stream must be quiet before its unterminated line (a prompt like `Password:`) is matched. */
 export const PARTIAL_QUIET_MS = 500;
@@ -173,15 +224,19 @@ export class LineSplitter {
     return out;
   }
 
-  /** Append to the unterminated line, keeping only its first MAX_LINE (cut before a sequence the cut would split). */
+  /**
+   * Append to the unterminated line, keeping only its first MAX_LINE. The cut lands on a safe
+   * boundary: never inside a control sequence or a surrogate pair (the house's read of the 38
+   * commits, #22, comment 6274773484: a head ended in a lone high surrogate).
+   */
   private add(part: string): void {
     if (this.cut || !part) return;
     if (this.raw.length + part.length <= MAX_LINE) {
       this.raw += part;
       return;
     }
-    const head = this.raw + part.slice(0, MAX_LINE - this.raw.length);
-    this.raw = head.slice(0, unfinishedSequence(head));
+    const head = this.raw + part.slice(0, MAX_LINE - this.raw.length + 1);
+    this.raw = head.slice(0, safeCut(head, MAX_LINE));
     this.cut = true;
   }
 

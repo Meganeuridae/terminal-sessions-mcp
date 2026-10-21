@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { cleanLine, compileLinePattern, LineSplitter, MAX_LINE, StreamMatcher, type LineMatch } from '../src/core/ansi.js';
 import { LINEAR_REGEX, MIN_WINDOW, matchWindow } from '../src/core/regex.js';
 import { TermError } from '../src/core/errors.js';
+import { transcript } from '../src/core/transcript.js';
 import { sleep } from './testhost.js';
 
 const matcher = (pattern: string, opts?: ConstructorParameters<typeof StreamMatcher>[1]) => new StreamMatcher(compileLinePattern(pattern), opts);
@@ -57,8 +58,8 @@ test('cleanLine applies overwrites on the raw text: a U+E000 in the output is te
   assert.equal(cleanLine('ABCDE\rXY'), 'XYCDE');
   assert.equal(cleanLine('|\b/\b-\b\\'), '\\', 'a spinner reads its last frame');
   assert.equal(cleanLine('\x1b[31mred\x1b[0m\rX\x1b(B'), 'Xed', 'sequences are skipped, charset designations whole');
-  assert.equal(cleanLine('a\x00b\x7fc\td'), 'abc\td', 'other controls go, a tab stays');
-  assert.equal(cleanLine('😀\bx'), 'x', 'a backspace steps over a whole code point');
+  assert.equal(cleanLine('a\x00b\x7fc\td'), 'abc     d', 'other controls go, a tab moves to the next stop');
+  assert.equal(cleanLine('😀\bx'), 'x', 'a backspace steps over a whole code point (an emoji is one cell in the emulator\'s table)');
   assert.equal(cleanLine('text\r\r'), 'text');
 });
 
@@ -78,7 +79,43 @@ test('cleanLine renders a line as the transcript does: erase in line and in-line
   assert.equal(cleanLine('\x9b3Dq'), 'q', 'the C1 CSI form too');
   // Moves that are not in-line, and every other sequence, are dropped without effect.
   assert.equal(cleanLine('ab\x1b[2Acd\x1b[?25l\x1b[1;1Hef'), 'abcdef');
-  assert.equal(cleanLine(`a\x1b[${10 ** 9}Cb`).length <= 2 + 1024 + 1, true, 'a move far past the end pads a bounded number of cells');
+  assert.ok(cleanLine(`a\x1b[${10 ** 9}Cb`).length <= MAX_LINE + 2, 'a move far past the end pads a bounded number of cells');
+  // The bound is the line's, not each move's: a move and a write repeated grew a line to eight million cells (the house's
+  // read of the 38 commits, #22, comment 6274773484).
+  const crawl = cleanLine('\x1b[1024Cx'.repeat(8000));
+  assert.ok(crawl.length <= MAX_LINE + 8000 + 1, `${crawl.length} cells`);
+  assert.ok(crawl.endsWith('x'));
+});
+
+test('cleanLine lays characters out as the transcript does: a tab to the next tab stop, a wide character over two cells, a combining mark in none', () => {
+  // The house's read of the 38 commits (#22, comment 6274773484): `ab\tc\x1b[2Dz` read `abzc` where the row shows `ab     zc`,
+  // and `日本\x1b[1Dx` read `日x` against `日 x`.
+  assert.equal(cleanLine('a\tb'), 'a       b');
+  assert.equal(cleanLine('ab\tc\x1b[2Dz'), 'ab     zc');
+  assert.equal(cleanLine('abcdefgh\tx'), 'abcdefgh        x', 'a tab at a stop goes to the next one');
+  assert.equal(cleanLine('日本\x1b[1Dx'), '日 x', 'overwriting half a wide character blanks it whole');
+  assert.equal(cleanLine('日本\x1b[3Dx'), ' x本', 'the other half too');
+  assert.equal(cleanLine('ab日\rxyz'), 'xyz ', 'a wide character half overwritten leaves a blank in its other half (trailing blanks stay)');
+  assert.equal(cleanLine('日本'), '日本');
+  assert.equal(cleanLine('a日b\x1b[2D\x1b[K'), 'a ', 'erase to the end from inside a wide character takes it whole: its first half is a blank');
+  assert.equal(cleanLine('Cafe\u0301\x1b[1Dx'), 'Cafx', 'the mark composes with its base, so the cursor is one cell on');
+  assert.equal(cleanLine('e\u0301'), 'e\u0301');
+  assert.equal(cleanLine('\u0301x'), '\u0301x', 'a mark with nothing before it takes a cell of its own, as in the emulator');
+  assert.equal(cleanLine('\u0301\u0301x'), '\u0301\u0301x', 'and the next mark composes with it');
+  assert.equal(cleanLine('ab\x1b[3C\u0301z'), 'ab   \u0301z', 'a mark after a move past the end sits on a blank cell, the cells before it blanks');
+  assert.equal(cleanLine('😀x\x1b[1Dy'), '😀y');
+  assert.equal(cleanLine('ab\x1b[1Gx'), 'xb');
+});
+
+test('cleanLine and the transcript agree on a row: tabs, wide and fullwidth characters, emoji, combining marks, overwrites and erases', async () => {
+  // The transcript is the emulator's own rendering (xterm, its built-in Unicode 6 widths); cleanLine is checked against it
+  // directly, so the two cannot drift apart (the house's read of the 38 commits, #22, comment 6274773484).
+  const rows = ['a\tb', 'ab\tc\x1b[2Dz', 'abcdefgh\tx', '日本\x1b[1Dx', '日本\x1b[3Dx', 'ab日\rxyz', 'a日b\x1b[2D\x1b[K', 'x日\x1b[2D\x1b[1Kz', 'Ａ\x1b[1Dx',
+    '한국\x1b[2Dx', '😀\bx', '😀x\x1b[1Dy', 'Cafe\u0301\x1b[1Dx', '\u0301x', '\u0301\u0301x', '日\u0301x', 'ab\x1b[3C\u0301z', '〮x\x1b[1Dy', 'abc\x1b[5Cz', 'Progress: 100%\r\x1b[KDone'];
+  for (const row of rows) {
+    const shown = (await transcript([{ data: `${row}\r\n`, stream: 'pty' }], { cols: 200 })).replace(/\n$/, '');
+    assert.equal(cleanLine(row).trimEnd(), shown, JSON.stringify(row));
+  }
 });
 
 test('cleanLine drops every escape sequence proper, including charset designations (`tput sgr0` is ESC ( B ESC [ m), and an unfinished one takes its payload with it', () => {
@@ -188,4 +225,10 @@ test('m2-10: lines are bounded — a line longer than MAX_LINE is matched on its
   const split = new LineSplitter();
   const head = 'a'.repeat(MAX_LINE - 2) + '\x1b[31mb'.repeat(2) + '\n';
   assert.equal(split.feed(head)[0]!.text, 'a'.repeat(MAX_LINE - 2));
+  // Nor inside a surrogate pair: a head of 65,535 x and an emoji ended in a lone high surrogate (the house's read of the
+  // 38 commits, #22, comment 6274773484).
+  const pair = new LineSplitter().feed('x'.repeat(MAX_LINE - 1) + '😀' + 'y'.repeat(10) + '\n')[0]!;
+  assert.equal(pair.cut, true);
+  assert.equal(pair.text, 'x'.repeat(MAX_LINE - 1), 'the pair that would be split is dropped whole');
+  assert.ok(!/[\ud800-\udfff]$/.test(pair.text));
 });

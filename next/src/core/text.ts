@@ -62,8 +62,9 @@ export function tailIndex(text: string, maxBytes: number): number {
 }
 
 /**
- * Keep at most `maxBytes` UTF-8 bytes from the end of `text`. The kept text
- * starts just after a newline when the first newline in it lies in its first half.
+ * Keep at most `maxBytes` UTF-8 bytes from the end of `text` (never more: the cut moves forward,
+ * see `tailStart`). The kept text starts just after a newline when the first newline in it lies
+ * in its first half.
  */
 export function cutTail(text: string, maxBytes: number): { text: string; cut: boolean } {
   const start = tailStart(text, maxBytes);
@@ -75,16 +76,41 @@ export function cutTail(text: string, maxBytes: number): { text: string; cut: bo
  * boundary after a newline that lies in the first half of them, so a torn first line is dropped
  * only when it costs at most half the budget; a newline that is the text's last character begins
  * no line and never moves the start. The start never falls inside a control sequence, a surrogate
- * pair or a CRLF (`safeCut`: it moves earlier, by at most the sequence it would have split), so the
- * kept tail begins with no half of an escape shown as text (the house's read of 78c4d6e, #22: a cut
- * inside `ESC [ 31 m` kept `31mHello`, and one inside an OSC 8 link kept the link's tail). The one
- * rule for every tail cut: results, pages, the segmenter's bodies and the transcript's input.
+ * pair or a CRLF, so the kept tail begins with no half of an escape shown as text (the house's read
+ * of 78c4d6e, #22: a cut inside `ESC [ 31 m` kept `31mHello`, and one inside an OSC 8 link the
+ * link's tail). It moves *forward*, past the sequence it would have started inside, never back to
+ * its start: the budget holds, and a long control string (an OSC 52 clipboard, whose base64 may
+ * hold newlines) is looked back through whole, however long (the house's read of the 38 commits,
+ * #22, comment 6274773484: a cut moved back kept 58 bytes of a 30-byte budget, and one inside a
+ * 6,000-character OSC 52 began in its payload). What the forward move drops renders nothing: a
+ * payload is not text. The one rule for every tail cut: results, pages, the segmenter's bodies and
+ * the transcript's input.
  */
 export function tailStart(text: string, maxBytes: number): number {
   if (utf8Length(text) <= maxBytes) return 0;
-  const start = safeCut(text, tailIndex(text, Math.max(0, maxBytes)));
-  const nl = text.indexOf('\n', start);
+  const start = pastSequence(text, tailIndex(text, Math.max(0, maxBytes)));
+  // The line boundary preferred is a real one: a newline inside a control string begins no line.
+  let nl = text.indexOf('\n', start);
+  while (nl !== -1 && nl + 1 < text.length) {
+    const inside = enclosingSequence(text, nl + 1, Number.POSITIVE_INFINITY);
+    if (!inside) break;
+    nl = text.indexOf('\n', inside.end ?? text.length);
+  }
   return nl !== -1 && nl + 1 < text.length && utf8Length(text.slice(start, nl + 1)) <= maxBytes / 2 ? nl + 1 : start;
+}
+
+/**
+ * `index` moved forward to a point that splits nothing: past the control sequence it lies inside
+ * (looked for through the whole text before it), past the low half of a surrogate pair, past the
+ * LF of a CRLF. Never earlier, so a tail cut keeps its budget.
+ */
+function pastSequence(text: string, index: number): number {
+  let i = Math.min(index, text.length);
+  const inside = enclosingSequence(text, i, Number.POSITIVE_INFINITY);
+  if (inside) i = inside.end ?? text.length;
+  if (i > 0 && i < text.length && isLow(text.charCodeAt(i)) && isHigh(text.charCodeAt(i - 1))) i++;
+  if (i > 0 && i < text.length && text[i - 1] === '\r' && text[i] === '\n') i++;
+  return i;
 }
 
 /** How many newlines `s` holds. */
@@ -175,6 +201,44 @@ export function sequenceEnd(data: string, e: number): number | undefined {
   return undefined;
 }
 
+/** The last `ch` in `s`, -1 when none: the forward search proves absence far faster than the backward one. */
+const lastOf = (s: string, ch: string): number => (s.indexOf(ch) === -1 ? -1 : s.lastIndexOf(ch));
+
+/**
+ * The last ESC or C1 CSI in `data[from..i]` (-1 when none), by native searches over that window
+ * alone: a tail cut may look back through megabytes of plain text, and a cut with a bounded lookback
+ * must not pay for the whole text. The C1 form is looked for only after the nearest ESC.
+ */
+function introducerBefore(data: string, i: number, from: number): number {
+  if (i < from) return -1;
+  const window = data.slice(from, i + 1);
+  const esc = lastOf(window, '\x1b');
+  const csi = lastOf(esc === -1 ? window : window.slice(esc + 1), '\x9b');
+  return csi !== -1 ? from + esc + 1 + csi : esc === -1 ? -1 : from + esc;
+}
+
+/**
+ * The control sequence `data[index]` lies inside, if any, found by looking back at most `lookback`
+ * units for its start: where it starts, and where it ends (undefined when it is unfinished).
+ */
+function enclosingSequence(data: string, index: number, lookback: number): { start: number; end: number | undefined } | undefined {
+  const from = Math.max(0, index - lookback);
+  let st: number | undefined;
+  for (let e = introducerBefore(data, index - 1, from); e !== -1; e = introducerBefore(data, e - 1, from)) {
+    const ch = data.charCodeAt(e);
+    if (ch === 0x1b && data[e + 1] === '\\') {
+      // A string terminator (ST): the string it ends began earlier, and is judged there; a point
+      // between its two bytes is inside the string, or inside the ST alone when no start is found.
+      if (e + 1 >= index) st = e;
+      continue;
+    }
+    const end = sequenceEnd(data, e);
+    if (end === undefined || end > index) return { start: e, end };
+    break;
+  }
+  return st === undefined ? undefined : { start: st, end: st + 2 };
+}
+
 /**
  * The largest index `c <= index` at which `data` can be cut without splitting a
  * control sequence, a surrogate pair, or a CR from the LF after it, so each part
@@ -184,19 +248,8 @@ export function safeCut(data: string, index: number, lookback = SEQUENCE_LOOKBAC
   let c = Math.max(0, Math.min(index, data.length));
   if (c === 0 || c === data.length) return c;
   // Inside a control sequence: cut before it.
-  const from = Math.max(0, c - lookback);
-  for (let e = c - 1; e >= from; e--) {
-    const ch = data.charCodeAt(e);
-    if (ch !== 0x1b && ch !== 0x9b) continue;
-    if (ch === 0x1b && data[e + 1] === '\\') {
-      // A string terminator (ST): the string it ends began earlier, and is judged there.
-      if (e + 1 >= c) c = e; // the cut splits the ST itself
-      continue;
-    }
-    const end = sequenceEnd(data, e);
-    if (end === undefined || end > c) c = e;
-    break;
-  }
+  const inside = enclosingSequence(data, c, lookback);
+  if (inside) c = inside.start;
   if (c > 0 && isLow(data.charCodeAt(c)) && isHigh(data.charCodeAt(c - 1))) c--;
   if (c > 0 && data[c - 1] === '\r' && data[c] === '\n') c--;
   return c;

@@ -752,6 +752,9 @@ test('a prompt with a combining mark is found at the cursor; needs-input does no
   assert.equal(promptLine(snap([decomposed, ''], 5, 0)), decomposed);
   assert.equal(promptLine(snap(['Café crème? ', ''], 13, 0)), 'Café crème?');
   assert.equal(columnIndex('日本語?', 7), 4, 'wide characters take two cells');
+  // The emulator's table gives an emoji one cell; the segmenter's own table gave it two and cut the row one character short
+  // (the house's read of the 38 commits, #22, comment 6274773484, on the width table cleanLine now shares).
+  assert.equal(columnIndex('😀 ok?', 5), '😀 ok?'.length, 'an emoji is one cell, as the screen lays it out');
   const src = fakeSource();
   const seg = new Segmenter(src, { needsInputMs: 30 });
   startRun(src, 'bar');

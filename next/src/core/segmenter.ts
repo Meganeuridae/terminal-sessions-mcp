@@ -18,7 +18,7 @@
  * (HISTORY_MAX_EVENTS) and says when it stopped short; a catch-up that starts
  * inside a retention gap says what range is gone.
  */
-import { cleanLine } from './ansi.js';
+import { cellWidth, cleanLine } from './ansi.js';
 import { clocks } from './clock.js';
 import type { Journal } from './journal.js';
 import type { RunOutput } from './runindex.js';
@@ -176,21 +176,19 @@ export function promptLine(snap: ScreenSnapshot): string | undefined {
   return prev && ASKS.test(prev) ? prev : undefined;
 }
 
-/** Zero-width marks and joiners; wide (two-cell) East Asian and emoji ranges, as the emulator lays them out. */
-const ZERO_WIDTH = /^[\p{M}​-‍️]$/u;
-const WIDE = /^[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦\u{1f300}-\u{1f64f}\u{1f900}-\u{1f9ff}\u{20000}-\u{3fffd}]$/u;
-
 /**
  * The index in a screen row's text of the cell column `x`. A combining mark takes no cell and a
  * wide character two, so a column is not a string index: `Café?` written decomposed, with the
  * cursor after it, was sliced one character short and read as no prompt (the house's read of 3eade8a, #22).
+ * The widths are the emulator's (`cellWidth`, the table `cleanLine` lays a row out by).
  */
 export function columnIndex(row: string, x: number): number {
   let col = 0;
   let i = 0;
   for (const ch of row) {
-    if (col >= x && !ZERO_WIDTH.test(ch)) break;
-    col += ZERO_WIDTH.test(ch) ? 0 : WIDE.test(ch) ? 2 : 1;
+    const w = cellWidth(ch);
+    if (col >= x && w > 0) break;
+    col += w;
     i += ch.length;
   }
   return i;
