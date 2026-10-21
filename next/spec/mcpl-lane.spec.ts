@@ -2110,10 +2110,13 @@ test("a catch-up's summary of a lost range covers the debts in it, so completion
       await until(() => s.run(r.runId!).seq.end !== undefined, 10_000, `${command} to end`);
       return s.run(r.runId!).seq.end!;
     };
+    // Until retention has taken an owed completion: how many Runs that takes depends on the platform's event sizes
+    // (a Linux run.start carries startTicks and bootId), so the spec counts what was taken, not Runs.
     const owedFirst: number[] = [];
-    for (let i = 0; i < 25; i++) owedFirst.push(await ended(`echo rc-${i}`));
-    const gone = owedFirst.filter((seq) => seq < (s.journal.oldestSeq ?? 1));
-    assert.ok(gone.length > 0, `retention took some owed completions before any catch-up (oldest ${s.journal.oldestSeq})`);
+    const goneNow = () => owedFirst.filter((seq) => seq < (s.journal.oldestSeq ?? 1));
+    for (let i = 0; i < 400 && (owedFirst.length < 25 || goneNow().length < 1); i++) owedFirst.push(await ended(`echo rc-${i}`));
+    const gone = goneNow();
+    assert.ok(gone.length > 0, `retention took some owed completions before any catch-up (oldest ${s.journal.oldestSeq}, ${owedFirst.length} Runs)`);
     // The host takes the replayed completions and refuses the summary of the rest.
     const eventId = (req: { params?: unknown }) => (req.params as { eventId?: string } | undefined)?.eventId ?? '';
     f.refuse.value = true;
@@ -2271,14 +2274,16 @@ test("a catch-up's summary of a lost range leaves out a debt a held message stil
     await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT.filter((c) => c !== 'pushEvents') }, f.ctx);
     await f.app.sessionOpen(f.caller, { id: 'rh', retention: { maxBytes: 16 * 1024 } });
     const s = live(f.registry, 'rh');
+    // Until retention has taken two owed completions, however many Runs the platform's event sizes need.
     const ends: number[] = [];
-    for (let i = 0; i < 25; i++) {
+    const goneNow = () => ends.filter((seq) => seq < (s.journal.oldestSeq ?? 1));
+    for (let i = 0; i < 400 && (ends.length < 25 || goneNow().length < 2); i++) {
       const r = await f.app.run(f.caller, { session: 'rh', command: `echo rh-${i}`, target: 'process', wait: 0 });
       await until(() => s.run(r.runId!).seq.end !== undefined, 10_000, `Run ${i} to end`);
       ends.push(s.run(r.runId!).seq.end!);
     }
-    const gone = ends.filter((seq) => seq < (s.journal.oldestSeq ?? 1));
-    assert.ok(gone.length >= 2, `retention took at least two owed completions (${JSON.stringify(gone)}; oldest ${s.journal.oldestSeq})`);
+    const gone = goneNow();
+    assert.ok(gone.length >= 2, `retention took at least two owed completions (${JSON.stringify(gone)}; oldest ${s.journal.oldestSeq}, ${ends.length} Runs)`);
     st().held.set('rh-held', { since: performance.now(), seq: gone[0]! });
     f.late.value = true;
     await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
