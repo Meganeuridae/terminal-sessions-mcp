@@ -404,6 +404,11 @@ export class LineSplitter {
     return out;
   }
 
+  /** The unterminated line as it would be offered now, whether or not it was spent; undefined when it shows nothing. */
+  peek(): SplitLine | undefined {
+    return this.current();
+  }
+
   /** Stop the quiet timer; nothing is offered afterwards. */
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);

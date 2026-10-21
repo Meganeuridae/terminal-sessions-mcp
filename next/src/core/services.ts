@@ -71,10 +71,12 @@ type Condition = 'pattern' | 'tcp' | 'alive';
 /** A place in a Run's output (where a line began or ended: SplitLine.begun, .ended), as a key; the line's text when it has none. */
 const placeOf = (p: Begun | undefined, line: SplitLine): string => (p ? `${p.at}:${p.offset}` : `?${line.text}`);
 
-/** One reading of a service Run's output (ServiceMonitor.lines and .pipes): its splitter, the seq it was last fed, and the pipe it reads alone. */
+/** Lines in the order their ends came: by event, then by offset in it; a line with no end after those with one. */
+const endOrder = (a: Begun | undefined, b: Begun | undefined): number => (a && b ? a.at - b.at || a.offset - b.offset : a ? -1 : b ? 1 : 0);
+
+/** One reading of a service Run's output (ServiceMonitor.lines and .pipes): its splitter, and the pipe it reads alone. */
 interface Reading {
   splitter: LineSplitter;
-  seq: Seq;
   pipe?: OutputStream;
 }
 
@@ -107,10 +109,11 @@ export class ServiceMonitor {
    */
   private readonly pipes = new Map<OutputStream, Reading>();
   /**
-   * The quiet prompts offered at the latest event a reading was fed, by where each began, and whether one matched: the
-   * two readings' prompt that began at one place is one line, matched once.
+   * The quiet prompts tested, by where each began (placeOf), and whether one matched: a prompt and its twin, the
+   * other reading's line that began at the same place, are one line, matched once. Kept while a reading holds the line
+   * open (prunePrompts).
    */
-  private offered: { seq: Seq; lines: Map<string, boolean> } = { seq: 0, lines: new Map() };
+  private readonly prompted = new Map<string, boolean>();
   /** A fail-pattern line was seen and no ready-pattern line since. */
   private failed = false;
   private started = false;
@@ -219,17 +222,21 @@ export class ServiceMonitor {
       // complete are other lines: m2-21's `Server listening on 8080`, stdout's own, ended by stdout's LF after the
       // read ended `Server listenwarn: deprecated` at stderr's.
       const read = this.feed(this.source(), ev);
-      const own = new Map<string, SplitLine>();
-      if (ev.stream !== 'pty') for (const line of this.feed(this.pipe(ev.stream), ev)) own.set(placeOf(line.ended, line), line);
-      for (const line of read) {
-        const twin = own.get(placeOf(line.ended, line));
-        if (!twin) this.onLine(line);
-        else {
-          own.delete(placeOf(line.ended, line));
-          this.onLine(twin, line);
-        }
-      }
-      for (const line of own.values()) this.onLine(line);
+      const own = ev.stream !== 'pty' ? this.feed(this.pipe(ev.stream), ev) : [];
+      // The event's lines are taken in the order their ends came, the read's and the pipe's interleaved: handled the
+      // read's first, stdout's `FATAL` ended by its LF after stderr's ended the read's `FATALx`, then stdout's `READY`,
+      // left FATAL in force after READY (our review of the 73 commits through 4860d4c, PR #22).
+      const twins = new Map(own.map((line) => [placeOf(line.ended, line), line]));
+      const lines: SplitLine[][] = read.map((line) => {
+        const twin = twins.get(placeOf(line.ended, line));
+        if (!twin) return [line];
+        twins.delete(placeOf(line.ended, line));
+        return [twin, line];
+      });
+      for (const line of twins.values()) lines.push([line]);
+      lines.sort((x, y) => endOrder(x[0]!.ended, y[0]!.ended));
+      for (const texts of lines) this.onLines(texts);
+      this.prunePrompts();
     } else if (ev.type === 'run.start' && ev.runId === this.runId) {
       this.onStarted();
     } else if (ev.type === 'run.end' && ev.runId === this.runId) {
@@ -247,28 +254,52 @@ export class ServiceMonitor {
 
   /** Feed one reading an output event: the one source takes the event's stream as the source of what it reads; each line says where it began. */
   private feed(r: Reading, ev: EventOf<'output'>): SplitLine[] {
-    r.seq = ev.seq;
     return r.splitter.feed(ev.data, r.pipe === undefined ? ev.stream : undefined, ev.seq);
   }
 
-  /** A quiet prompt one reading offered after event `seq`: matched unless the other's that began at the same place was, and then as that was. */
-  private once(seq: Seq, line: SplitLine): boolean {
-    if (seq !== this.offered.seq) this.offered = { seq, lines: new Map() };
+  /**
+   * A completed line, as one reading or both wrote it (`texts`, the pipe's first): matched unless it is a quiet prompt
+   * already matched, whose reading spent it while the other's went on to complete it.
+   */
+  private onLines(texts: SplitLine[]): void {
+    if (texts.some((line) => this.prompted.get(placeOf(line.begun, line)))) return;
+    this.onLine(...texts);
+  }
+
+  /**
+   * A quiet prompt `r` offered: tested together with its twin, the other reading's open line that began where it did,
+   * both texts at once (the pipe's first), as a completed pair is, and matched once. Taken alone, the first offer's
+   * verdict stood for its twin's different text: stderr's `Password: ` was never tested when the read's `Passxword: `
+   * had failed. Told apart by the seq each reading was last fed, one prompt counted twice when the other pipe wrote in
+   * between (our review of the 73 commits through 4860d4c, PR #22).
+   */
+  private once(r: Reading, line: SplitLine): boolean {
     const at = placeOf(line.begun, line);
-    const had = this.offered.lines.get(at);
-    if (had !== undefined) {
-      this.offered.lines.delete(at);
-      return had;
-    }
-    const matched = this.onLine(line);
-    this.offered.lines.set(at, matched);
+    if (this.prompted.get(at)) return true;
+    const twin = this.readings().find((o) => o !== r && placeOf(o.splitter.peek()?.begun, line) === at)?.splitter.peek();
+    const matched = twin ? (r.pipe !== undefined ? this.onLine(line, twin) : this.onLine(twin, line)) : this.onLine(line);
+    this.prompted.set(at, matched);
     return matched;
   }
 
-  /** A reading of the Run's output, and the seq it was last fed: a quiet prompt it offers is one at that event. */
+  /** A prompt's entry goes once no reading holds its line open. */
+  private prunePrompts(): void {
+    if (this.prompted.size === 0) return;
+    const open = new Set(this.readings().flatMap((o) => {
+      const line = o.splitter.peek();
+      return line?.begun ? [placeOf(line.begun, line)] : [];
+    }));
+    for (const at of this.prompted.keys()) if (!open.has(at)) this.prompted.delete(at);
+  }
+
+  private readings(): Reading[] {
+    return [...(this.lines ? [this.lines] : []), ...this.pipes.values()];
+  }
+
+  /** A reading of the Run's output: a quiet prompt it offers is matched once with its twin's. */
   private reading(pipe?: OutputStream): Reading {
-    const r: Reading = { splitter: undefined as never, seq: 0, ...(pipe !== undefined ? { pipe } : {}) };
-    const opts: ConstructorParameters<typeof LineSplitter>[0] = { onPartial: (line) => this.once(r.seq, line) };
+    const r: Reading = { splitter: undefined as never, ...(pipe !== undefined ? { pipe } : {}) };
+    const opts: ConstructorParameters<typeof LineSplitter>[0] = { onPartial: (line) => this.once(r, line) };
     if (this.partialAfterMs !== undefined) opts.partialAfterMs = this.partialAfterMs;
     r.splitter = new LineSplitter(opts);
     return r;
@@ -285,8 +316,9 @@ export class ServiceMonitor {
   }
 
   /**
-   * One line of the Run's output, as a read shows it or as its own pipe wrote it, or as both when the two began at one
-   * place (`texts`, the pipe's first); true when a pattern matched it. A fail match wins over a ready match on the same
+   * One line of the Run's output, as a read shows it or as its own pipe wrote it, or as both (`texts`, the pipe's
+   * first): two completed lines that one line end completes, or a quiet prompt and the other reading's open line that
+   * began where it did; true when a pattern matched it. A fail match wins over a ready match on the same
    * line, in either reading; the evidence is the first reading that matched. It names the line, whichever reading it
    * is: m2-21's says `Server listening on 8080`.
    */

@@ -241,6 +241,51 @@ test('a quiet prompt is offered by both readings and matched once: as a read sho
   n.dispose();
 });
 
+test('a quiet prompt is tested with its twin, the other reading\'s line begun where it did (our review of the 73 commits through 4860d4c, PR #22)', async () => {
+  // stderr `Pass`, stdout `x`, stderr `word: `: the read's prompt `Passxword: ` and stderr's `Password: ` began at one
+  // place. The first offer's verdict stood for the other's text, so a pattern only stderr's text matches was never tried.
+  for (const which of ['fail', 'ready'] as const) {
+    const f = fake('process');
+    const spec: ServiceSpec = which === 'fail' ? { fail: { pattern: '^Password: ?$' } } : { ready: { pattern: '^Password: ?$' } };
+    const m = f.monitor(spec, { partialAfterMs: 30 });
+    f.start();
+    f.out('Pass', 'stderr');
+    f.out('x', 'stdout');
+    f.out('word: ', 'stderr');
+    await until(() => m.status === (which === 'fail' ? 'unhealthy' : 'ready'), 2000, `${which} on stderr's own prompt`);
+    assert.equal(m.info().evidence, 'Password:', 'as stderr wrote it');
+    m.dispose();
+  }
+});
+
+test('a quiet prompt both readings hold is counted once, however the readings were last fed (our review of the 73 commits through 4860d4c, PR #22)', async () => {
+  // stderr's `Password: `, then a stdout SGR while it is quiet: the readings were last fed at different events, and the
+  // prompt counted twice.
+  const g = fake('process');
+  const n = g.monitor({ fail: { pattern: '^Password:' } }, { partialAfterMs: 30 });
+  g.start();
+  g.out('Password: ', 'stderr');
+  g.out('\x1b[0m', 'stdout');
+  await until(() => n.status === 'unhealthy', 2000, 'the prompt matched once quiet');
+  await sleep(100);
+  assert.equal(n.info().repeats, undefined, 'one prompt, one match');
+  n.dispose();
+});
+
+test('a service\'s lines are taken in the order their ends came, the read\'s and a pipe\'s interleaved (our review of the 73 commits through 4860d4c, PR #22)', () => {
+  // stdout `FATAL`, stderr `x` and its LF (the read's `FATALx` ends), then stdout's LF, `READY` and LF: stdout's FATAL
+  // ends before READY. The read's lines were all taken first, READY before FATAL, and the service ended unhealthy.
+  const f = fake('process');
+  const m = f.monitor({ ready: { pattern: '^READY$' }, fail: { pattern: '^FATAL$' } });
+  f.start();
+  f.out('FATAL', 'stdout');
+  f.out('x\n', 'stderr');
+  f.out('\nREADY\n', 'stdout');
+  assert.equal(m.status, 'ready');
+  assert.deepEqual(f.statuses(), ['starting', 'unhealthy', 'ready']);
+  m.dispose();
+});
+
 test('m2-5/m2-10: service patterns go through the linear-time engine and are checked before anything starts', () => {
   const bad = (spec: ServiceSpec) => assert.throws(() => validateServiceSpec(spec), (e: unknown) => e instanceof TermError && e.code === 'invalid_argument');
   bad({ ready: { pattern: '(unclosed' } });
