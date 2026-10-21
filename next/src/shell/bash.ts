@@ -411,9 +411,16 @@ __tsm_word_in() {
 # When the line installs $1 as PROMPT_COMMAND, an ordinary run of $1 before that install ran with our
 # hook still in place (the DEBUG trap stands aside while PROMPT_COMMAND is intact), so it never
 # reached this branch. The run that does reach it at the next prompt is the installed value's, which
-# the heal must close. So only an ordinary run of $1 that comes AFTER the last install of it is the
-# line's own here: a run-then-install line (cmd; then PROMPT_COMMAND="cmd") has none, and its Run ends
-# at the next prompt instead of staying busy for good (the house's read, #22 comment 6269901528).
+# the heal must close. So only an ordinary run of $1 that comes after an install of it is the line's
+# own here: a run-then-install line (cmd; then PROMPT_COMMAND="cmd") has none, and its Run ends at the
+# next prompt instead of staying busy for good (the house's read, #22 comment 6269901528).
+#
+# The search starts after the FIRST install-shaped text, not the last: text alone cannot tell a real
+# assignment from one inside quotes (echo 'PROMPT_COMMAND="cmd"'), and a quoted one after the line's
+# own run of cmd hid that run, so the heal closed the Run while the line went on (the house's read of
+# the 38 commits, #22 comment 6274841346). Of the two errors an ambiguous line can cause, a late close
+# only holds the next Run until a prompt; an early one types the next Run into a running command. The
+# late side remains for quoted install-shaped text before a real run-then-install.
 __tsm_line_has() {
   local __t=$__tsm_line_text __h __v __q __val __inst= __suf= __dq=\\" __sq=\\'
   while :; do
@@ -426,9 +433,10 @@ __tsm_line_has() {
     __v=$\{__v#?}
     case $__v in *"$__q"*) __val=$\{__v%%"$__q"*}; __v=$\{__v#*"$__q"} ;; *) __val=$__v; __v= ;; esac
     # Did this assignment install $1 as (a command of) PROMPT_COMMAND? The suffix is what the line
-    # runs after it; the last such install wins.
-    case " $__val " in *[[:space:]\\;\\(\\{\\&\\|]"$1"[[:space:]\\;\\)\\}\\&\\|]*) __inst=1; __suf=$__v ;; esac
-    case "$__val " in "$1"[[:space:]\\;\\)\\}\\&\\|]*) __inst=1; __suf=$__v ;; esac
+    # runs after it; the first such install bounds the search (see above).
+    case " $__val " in *[[:space:]\\;\\(\\{\\&\\|]"$1"[[:space:]\\;\\)\\}\\&\\|]*) __inst=1 ;; esac
+    case "$__val " in "$1"[[:space:]\\;\\)\\}\\&\\|]*) __inst=1 ;; esac
+    if [ -n "$__inst" ]; then __suf=$__v; break; fi
     __t=$__h$__v
   done
   if [ -n "$__inst" ]; then __t=$__suf; fi

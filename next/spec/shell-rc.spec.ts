@@ -308,23 +308,31 @@ test('/bin/zsh: a plugin that replaces the line-init widget after startup does n
   }
 });
 
-test('/bin/bash: a typed line that sets PROMPT_COMMAND and runs one of its commands stays busy while it runs', { skip: !hasShell('/bin/bash') }, async () => {
-  // The line's own `history -a` matches the PROMPT_COMMAND it just set; the heal must not mistake it
-  // for the prompt's own and close the Run, leaving the session idle while `sleep 3` runs on (the
-  // house's read, #22 comment 6264958172). A daemon `.`-sourced Run is unaffected (DEBUG suspended).
-  const x = await realSession('/bin/bash', { login: false });
-  try {
-    x.session.input('PROMPT_COMMAND="history -a"; history -a; sleep 3\n', { principal: AGENT });
-    await until(() => x.session.listRuns().some((r) => r.origin === 'agent'), 3000, 'run started');
-    await new Promise((r) => setTimeout(r, 1200));
-    assert.equal(x.session.info().state, 'busy', 'busy while the typed command sleeps');
-    await until(() => x.session.listRuns().every((r) => r.state === 'exited' || r.state === 'lost'), 6000, 'ended');
-    assert.ok(x.session.listRuns().some((r) => r.origin === 'agent' && r.state === 'exited'), 'the typed Run ended exited');
-    assert.equal((await x.run('echo back')).text.trim(), 'back');
-  } finally {
-    await x.close();
-  }
-});
+for (const [how, line] of [
+  ['', 'PROMPT_COMMAND="history -a"; history -a; sleep 3'],
+  [', with install-shaped text quoted later in the line', `PROMPT_COMMAND="history -a"; history -a; sleep 3; echo 'PROMPT_COMMAND="history -a"' > /dev/null; echo typed-$((40+2))`],
+] as const) {
+  test(`/bin/bash: a typed line that sets PROMPT_COMMAND and runs one of its commands stays busy while it runs${how}`, { skip: !hasShell('/bin/bash') }, async () => {
+    // The line's own `history -a` matches the PROMPT_COMMAND it just set; the heal must not mistake it
+    // for the prompt's own and close the Run, leaving the session idle while `sleep 3` runs on (the
+    // house's read, #22 comment 6264958172). A daemon `.`-sourced Run is unaffected (DEBUG suspended).
+    // The quoted assignment after the run read as the line's last install, which hid the line's own
+    // `history -a` before it: the Run closed at once (the house's read of the 38 commits, #22 comment
+    // 6274841346).
+    const x = await realSession('/bin/bash', { login: false });
+    try {
+      x.session.input(`${line}\n`, { principal: AGENT });
+      await until(() => x.session.listRuns().some((r) => r.origin === 'agent'), 3000, 'run started');
+      await new Promise((r) => setTimeout(r, 1200));
+      assert.equal(x.session.info().state, 'busy', 'busy while the typed command sleeps');
+      await until(() => x.session.listRuns().every((r) => r.state === 'exited' || r.state === 'lost'), 6000, 'ended');
+      assert.ok(x.session.listRuns().some((r) => r.origin === 'agent' && r.state === 'exited'), 'the typed Run ended exited');
+      assert.equal((await x.run('echo back')).text.trim(), 'back');
+    } finally {
+      await x.close();
+    }
+  });
+}
 
 for (const line of ['PROMPT_COMMAND="history -a"', 'PROMPT_COMMAND="if true; then history -a; fi"', 'echo x; PROMPT_COMMAND="history -a"']) {
   test(`/bin/bash: a typed line ending in a PROMPT_COMMAND assignment (${line}) is closed at the next prompt, and the next Run goes on`, { skip: !hasShell('/bin/bash') }, async () => {
