@@ -341,6 +341,13 @@ interface Slot {
   meta: Meta;
   cursors: CursorBook;
   view: LiveEntry | HistoryEntry;
+  /**
+   * Recovery left a Run's process group unjudged (no process listing answered): the name's history, and
+   * with it the Run's record of its group, is neither aged nor removed by `expire` — in this life or a new
+   * one — until the next recovery, which judges it when it can list processes (the house's read of the
+   * 33 commits, PR #22, comment 6307350477, item 3).
+   */
+  awaitsJudgement?: true;
 }
 
 /**
@@ -349,15 +356,17 @@ interface Slot {
  * retention, so its files go — once its Runs' process groups have been ended with every other session's
  * (the house's read of 2c35df8, #22).
  */
-type Recovering = Omit<Slot, 'cursors' | 'view'> & { retention: SessionRetention; journal: Journal; last: JournalEvent | undefined; lastAliveTs: number | undefined; gone: boolean };
+type Recovering = Omit<Slot, 'cursors' | 'view' | 'awaitsJudgement'> & { retention: SessionRetention; journal: Journal; last: JournalEvent | undefined; lastAliveTs: number | undefined; gone: boolean };
 
 /**
- * What recovery did with a Run's process group: `text` names it, `left` is true when the group was left
- * running (a reused pgid it could not tie to the Run, or no process listing to tell by), and `unjudged`
- * when nothing judged it (no listing): the Run then stays a candidate, so a later recovery that can list
- * processes judges the group, bounded by the dead daemon's last evidence.
+ * What recovery did with a Run's process group: `text` names it, absent when there is nothing to say (a
+ * listing showed the group had no process left); `left` is true when the group was left running (a reused
+ * pgid it could not tie to the Run, a group whose tied processes are gone while another holds it, or no
+ * process listing to tell by); and `unjudged` when nothing judged it (no listing, before the signal or
+ * after it): the Run then stays a candidate, so a later recovery that can list processes judges the group,
+ * bounded by the dead daemon's last evidence.
  */
-type GroupOutcome = { text: string; left: boolean; unjudged?: true };
+type GroupOutcome = { text?: string; left: boolean; unjudged?: true };
 
 /** A name whose record cannot be read has no known owner: nobody may reopen it until the record is repaired or the session removed. */
 const UNOWNED: Principal = 'unknown';
@@ -465,7 +474,8 @@ export class SessionRegistry {
    * journal in memory. Runs still open are ended `lost` — after the process
    * groups the dead daemon left running have been terminated, all sessions'
    * together, within about 2.5 s (jr2-4). A session past its retention is
-   * removed only after that: its Runs' groups are ended like any other's.
+   * removed only after that: its Runs' groups are ended like any other's, and
+   * one whose groups no process listing judged is kept until a recovery does.
    */
   private recover(): void {
     // One damaged directory must not keep the daemon from starting; the daemon reports these.
@@ -517,25 +527,31 @@ export class SessionRegistry {
     // comment 6269992150). Past its retention too, the journal is opened: its run index names the
     // process groups to end (the house's read of 2c35df8, #22).
     const journal = new Journal({ hot: this.hotStore(retention), cold: store, sessionId: id, log: this.journalLog(id) });
-    if (store.lastSeq() === undefined && !journal.runs.open().length) {
+    if (!holdsHistory(store, journal)) {
       journal.close();
       // No events and no open Runs: nothing to recover. Past its retention (every file aged out), the files go.
       if (gone) this.removeFiles(id, dir);
       return undefined;
     }
-    // Nothing runs under this name now: a dead life's command files (command text, env captures) go (jr2-12, G26).
-    if (!gone) removeLeftovers(this.opts.dataDir, id, dir);
+    // Nothing runs under this name now: a dead life's command files (command text, env captures) go (jr2-12,
+    // G26) — from a session past its retention too, which is kept when its Runs' groups go unjudged.
+    removeLeftovers(this.opts.dataDir, id, dir);
     return { id, dir, store, meta, retention, journal, last, lastAliveTs, gone };
   }
 
   private finishRecovery(r: Recovering, ended: Map<string, GroupOutcome>): void {
     const { id, dir, store, meta, retention, journal, last, lastAliveTs } = r;
-    if (r.gone) {
+    // A Run whose group no listing judged: removed, the session would leave a later recovery that can
+    // list processes nothing naming the group, which the README says such a recovery judges (the
+    // house's read of the 33 commits, PR #22, comment 6307350477, item 3).
+    const unjudged = journal.runs.list().some((run) => ended.get(`${id}\0${run.runId}`)?.unjudged);
+    if (r.gone && !unjudged) {
       // Past its retention: the whole session expires (G21, G26), now that its Runs' groups are ended.
       journal.close();
       this.removeFiles(id, dir);
       return;
     }
+    if (r.gone) this.opts.log?.('warn', "a session past its retention is kept: no process listing answered, so its Runs' process groups are not judged; a recovery that can list processes judges them, and the session expires after that", { session: id });
     // Every Run in flight when the daemon died — running, starting, queued, or named only by a
     // rotation header because its admission rotated out — is `lost`, never `running` (G3, G20). The
     // end is marked `recoveredEnd` (its time is the recovery's), and `groupJudged` once recovery has
@@ -549,7 +565,7 @@ export class SessionRegistry {
         runId: run.runId,
         state: 'lost',
         // A group left running is recorded in a note, not in the Run's reason: it was not the Run's to end.
-        reason: outcome && !outcome.left ? `daemon-restart; ${outcome.text}` : 'daemon-restart',
+        reason: outcome?.text !== undefined && !outcome.left ? `daemon-restart; ${outcome.text}` : 'daemon-restart',
         durationMs: Math.max(0, now - (run.startedAt ?? run.admittedAt)),
         recoveredEnd: true,
       };
@@ -571,12 +587,14 @@ export class SessionRegistry {
     for (const run of journal.runs.list()) {
       const outcome = run.endedAt !== undefined ? ended.get(`${id}\0${run.runId}`) : undefined;
       if (!outcome) continue;
-      const text = outcome.left
-        ? `recovery: ${outcome.text} · ${run.runId}`
-        : lost.has(run.runId)
-          ? `recovery: ${outcome.text} with ${run.runId}, which recovery ended lost`
-          : `recovery: ${outcome.text}; it outlived ${run.runId}, which had ended`;
-      journal.append({ type: 'note', text, principal: SYSTEM });
+      if (outcome.text !== undefined) {
+        const text = outcome.left
+          ? `recovery: ${outcome.text} · ${run.runId}`
+          : lost.has(run.runId)
+            ? `recovery: ${outcome.text} with ${run.runId}, which recovery ended lost`
+            : `recovery: ${outcome.text}; it outlived ${run.runId}, which had ended`;
+        journal.append({ type: 'note', text, principal: SYSTEM });
+      }
       // A Run that had ended before the daemon died (leftovers) keeps its own end: the judgement is
       // recorded as its own event, which the run index folds into groupJudged, so a later restart does
       // not judge the group again with another note and warning (a reviewer's read of the fixes for #22
@@ -596,7 +614,7 @@ export class SessionRegistry {
     const owner = refusal ? UNOWNED : meta.owner ?? SYSTEM;
     const cursors = new CursorBook(path.join(dir, 'cursors.json'), this.opts.log);
     const view = new HistoryEntry(id, journal, owner, meta.visibility ?? 'private', meta.closedAt !== undefined, retention, recordedOptions(meta, retention), cursors);
-    this.slots.set(id, { id, dir, store, meta, cursors, view });
+    this.slots.set(id, { id, dir, store, meta, cursors, view, ...(unjudged && { awaitsJudgement: true as const }) });
   }
 
   /**
@@ -618,12 +636,16 @@ export class SessionRegistry {
     const groups = orphanGroups(candidates, procs, { pid: process.pid, pgid: procs.find((p) => p.pid === process.pid)?.pgid });
     // The candidate groups with a living member that are not the Run's: left running, and recorded as such
     // (comment 6269992150) — from pgids and start times they cannot be told from a stranger's group that
-    // reused the id, so leaving them is the right default, but it is no longer silent.
+    // reused the id, so leaving them is the right default, but it is no longer silent. A group the listing
+    // shows without a process is judged gone, with nothing to say: unjudged, a later restart whose listing
+    // showed a stranger in the pgid wrote "left running" to the history and warned (the house's read of the
+    // 33 commits, PR #22, comment 6307350477, item 4).
     const leftKeys = new Map<string, number>();
     for (const { key, run } of candidates) {
       const g = run.pgid;
-      if (g === undefined || groups.has(g) || !procs.some((p) => p.pgid === g && !p.zombie)) continue;
-      leftKeys.set(key, g);
+      if (g === undefined || groups.has(g)) continue;
+      if (procs.some((p) => p.pgid === g && !p.zombie)) leftKeys.set(key, g);
+      else out.set(key, { left: false });
     }
     for (const [key, g] of leftKeys) out.set(key, { text: `process group ${g} left running (it cannot be told apart from a stranger's group that reused the id)`, left: true });
     if (leftKeys.size) {
@@ -649,6 +671,10 @@ export class SessionRegistry {
     let known = new Map([...groups.keys()].map((g) => [g, procs.filter((p) => p.pgid === g && !p.zombie)] as const));
     // The groups no listing answered for after a signal, and which signal was the last they got.
     const unchecked = new Map<number, NodeJS.Signals>();
+    // The groups whose processes recovery tied to the Run are gone while the group still holds one it cannot
+    // tie (a TERM trap's new process, or a stranger's in a reused id), and the last signal they got: left
+    // running, not "terminated" (the house's read of the 33 commits, PR #22, comment 6307350477, item 2).
+    const untied = new Map<number, NodeJS.Signals>();
     const stillOurs = (gs: number[], sent: NodeJS.Signals): number[] => {
       // A signal probe first (no listing): a group with no process at all is gone.
       const alive = gs.filter(groupAlive);
@@ -659,6 +685,7 @@ export class SessionRegistry {
         return [];
       }
       known = heldGroups(new Map(alive.flatMap((g) => (known.has(g) ? [[g, known.get(g)!] as const] : []))), now);
+      for (const g of alive) if (!known.has(g) && now.some((p) => p.pgid === g && !p.zombie)) untied.set(g, sent);
       return [...known.keys()];
     };
     const waitGone = (gs: number[], ms: number, sent: NodeJS.Signals): number[] => {
@@ -677,20 +704,27 @@ export class SessionRegistry {
     const survivors = new Set(waitGone(stubborn, ORPHAN_KILL_MS, 'SIGKILL'));
     for (const [g, keys] of groups) {
       const sent = unchecked.get(g);
-      const text = survivors.has(g)
-        ? `process group ${g} survived SIGKILL`
+      const strayed = untied.get(g);
+      // A group no listing answered for after its signal is not known to have ended: the Run stays a
+      // candidate, as with no listing at all, so a later recovery that can list processes judges the group
+      // (the house's read of the 33 commits, PR #22, comment 6307350477, item 1).
+      const outcome: GroupOutcome = survivors.has(g)
+        ? { text: `process group ${g} survived SIGKILL`, left: false }
         : sent === 'SIGTERM'
-          ? `process group ${g} was sent SIGTERM and not SIGKILL: no process listing answered after it, so whether it ended is not known`
+          ? { text: `process group ${g} was sent SIGTERM and not SIGKILL: no process listing answered after it, so whether it ended is not known`, left: false, unjudged: true }
           : sent
-            ? `process group ${g} was sent SIGKILL: no process listing answered after it, so whether it ended is not known`
-            : `process group ${g} terminated`;
-      for (const k of keys) out.set(k, { text, left: false });
+            ? { text: `process group ${g} was sent SIGKILL: no process listing answered after it, so whether it ended is not known`, left: false, unjudged: true }
+            : strayed
+              ? { text: `process group ${g} left running: it was sent ${strayed}, and the processes recovery tied to the Run are gone, but the group still holds one recovery cannot tie to it (a new process, or a stranger's that reused the id)`, left: true }
+              : { text: `process group ${g} terminated`, left: false };
+      for (const k of keys) out.set(k, outcome);
     }
     // The drain logs its kills; so does recovery (the house's read of 59f660b, #22).
     this.opts.log?.('warn', 'recovery ended process groups a previous daemon left running', {
-      groups: all.filter((g) => !survivors.has(g) && !unchecked.has(g)),
+      groups: all.filter((g) => !survivors.has(g) && !unchecked.has(g) && !untied.has(g)),
       survivedSigkill: survivors.size ? [...survivors] : undefined,
       unchecked: unchecked.size ? [...unchecked.keys()] : undefined,
+      leftRunning: untied.size ? [...untied.keys()] : undefined,
       sessions: [...new Set([...groups.values()].flat().map((k) => k.slice(0, k.indexOf('\0'))))],
     });
     return out;
@@ -827,6 +861,7 @@ export class SessionRegistry {
     const retention = this.retentionFor(o.retention, prev?.meta.retention);
     const jo: JournalOptions = { hot: this.hotStore(retention), sessionId: id, log: this.journalLog(id) };
     let store: FileStore;
+    let journal: Journal;
     let recorded: Meta;
     // The retention the history is kept under until this life has started: the store takes the one
     // asked for only then. Applied before the start, a reopen asking for less pruned files the
@@ -844,6 +879,8 @@ export class SessionRegistry {
       jo.runs = old.runs;
       jo.startSeq = old.lastSeq;
       recorded = prev.meta;
+      jo.cold = store;
+      journal = new Journal(jo);
     } else {
       recorded = readMeta(dir);
       before = this.retentionFor(undefined, recorded.retention);
@@ -853,23 +890,26 @@ export class SessionRegistry {
       // PR #22, comment 6274857431, item 7). With no history there is nothing to keep, and the default applies.
       const refusal = recordRefusal(id, recorded);
       store = new FileStore(dir, this.storeOptions(id, refusal ? {} : before));
+      jo.cold = store;
+      journal = new Journal(jo);
       // A journal this registry did not surface (recovery could not read it): its owner stands (G18),
-      // and a record that cannot be read, or is not there, names none.
-      if (store.lastSeq() === undefined) {
+      // and a record that cannot be read, or is not there, names none. Whether it holds history is
+      // recovery's rule: an event, or a Run still open that only a rotation header names — by events
+      // alone, another principal took a header-only journal's open Run, and its record (the house's read
+      // of the 33 commits, PR #22, comment 6307350477, item 6).
+      if (!holdsHistory(store, journal)) {
         if (refusal) store.setRetention(before);
       } else {
         if (refusal) {
-          store.close();
+          journal.close();
           throw refusal;
         }
         if (o.owner !== SYSTEM && (recorded.owner ?? SYSTEM) !== o.owner) {
-          store.close();
+          journal.close();
           throw err('forbidden', `session ${id} belongs to another principal; only its owner may open it again`, { id });
         }
       }
     }
-    jo.cold = store;
-    const journal = new Journal(jo);
     // Requested over recorded over daemon defaults (ux-4). Another principal's leftovers are never reused.
     const reuse = recorded.owner === undefined || recorded.owner === o.owner || o.owner === SYSTEM ? recordedOptions(recorded, retention) : undefined;
     const options = this.resolveOptions(o, reuse, retention);
@@ -957,7 +997,7 @@ export class SessionRegistry {
       journal.seal();
       if (prev || journal.lastSeq > 0) {
         const view = new HistoryEntry(id, journal, kept.owner ?? o.owner, kept.visibility ?? options.visibility, kept.closedAt !== undefined, before, recordedOptions(kept, before), cursors);
-        this.slots.set(id, { id, dir, store, meta: kept, cursors, view });
+        this.slots.set(id, { id, dir, store, meta: kept, cursors, view, ...(prev?.awaitsJudgement && { awaitsJudgement: true as const }) });
       } else {
         store.close();
       }
@@ -974,7 +1014,7 @@ export class SessionRegistry {
       }
     }
     store.setRetention(retention);
-    this.slots.set(id, { id, dir, store, meta, cursors, view: new LiveEntry(session, () => integ?.cleanup(), retention, options) });
+    this.slots.set(id, { id, dir, store, meta, cursors, view: new LiveEntry(session, () => integ?.cleanup(), retention, options), ...(prev?.awaitsJudgement && { awaitsJudgement: true as const }) });
     this.emit({ type: 'created', id });
     return session;
   }
@@ -1115,11 +1155,16 @@ export class SessionRegistry {
    * is past its `maxAgeMs` — the hot ring, and the active file too (rotated, then
    * dropped) — live or not; and each history entry whose newest event is past
    * its `maxAgeMs` is removed. The daemon calls this periodically; recovery
-   * applies the same rule at startup. Returns the removed ids.
+   * applies the same rule at startup. A name whose Runs' process groups
+   * recovery could not judge is left as it is. Returns the removed ids.
    */
   async expire(now = Date.now()): Promise<string[]> {
     const removed: string[] = [];
     for (const slot of [...this.slots.values()]) {
+      // Kept whole, in every life of the name until the daemon restarts, and not aged either: aging would
+      // drop the events that name the Run's process group, which the next recovery needs to judge it (the
+      // house's read of the 33 commits, PR #22, comment 6307350477, item 3).
+      if (slot.awaitsJudgement) continue;
       const gone = slot.view.kind === 'history' && expired(slot.store, slot.view.retention, now);
       if (!gone) {
         (slot.view.kind === 'live' ? slot.view.session.journal : slot.view.journal).expire(now);
@@ -1294,8 +1339,9 @@ function lastAlive(store: FileStore): number | undefined {
  * a loop's newest child does, so the whole group goes; asking every member to predate the end left
  * such a loop running (the house's read of cc8c909..39787b3, #22). For a Run still in flight, when one
  * started before the dead daemon's last event, so the group is not one formed after the daemon died.
- * An end a recovery wrote bounds the group only by the evidence it recorded (`lastAliveTs`), or by the
- * leader's ticks; with neither the group is left (comment 6274857431, item 2).
+ * An end a recovery wrote bounds the group only by the evidence it recorded (`lastAliveTs`), compared as
+ * the in-flight rule compares the last event, or by the leader's ticks; with neither the group is left
+ * (comment 6274857431, item 2; comment 6307350477, item 5).
  *
  * Starts are compared in ticks where the Run recorded its leader's and the listing is of the same boot
  * (Linux): no wall-clock frame, 10 ms. The ends and the last event are wall-clock records, compared with
@@ -1342,13 +1388,19 @@ export function orphanGroups(candidates: OrphanCandidate[], procs: ProcessRow[],
     // ticks (same boot, by the guard above) is the Run's own process still alive, and the group is its —
     // the recorded end alone left it running at every restart (a reviewer's read of the fixes for #22
     // comment 6269992150). Without ticks the wall clock cannot say that much, and the end stands.
+    // With the leader gone, a member must have started before the bound: an observed end by its earliest
+    // start (the window the docs state), the dead daemon's last event by its latest — and a recovery-written
+    // end's bound is that same evidence, so it is compared as the in-flight rule compares it; by the
+    // earliest start, a stranger's group formed within the slack of the daemon's death passed (the house's
+    // read of the 33 commits, PR #22, comment 6307350477, item 5).
+    const startedBefore = (p: ProcessRow, t: number): boolean => (run.endedAt !== undefined && !byRecovery ? p.startMs <= t : before(p, t));
     const ours = leader
       ? run.endedAt === undefined
         ? leaderStartedWithRun(leader)
         : byRecovery && byTicks(leader)
       : run.endedAt !== undefined
-        ? ended !== undefined && members.every(sinceStart) && members.some((p) => p.startMs <= ended)
-        : lastTs !== undefined && members.every(sinceStart) && members.some((p) => before(p, lastTs));
+        ? ended !== undefined && members.every(sinceStart) && members.some((p) => startedBefore(p, ended))
+        : lastTs !== undefined && members.every(sinceStart) && members.some((p) => startedBefore(p, lastTs));
     if (ours) groups.set(g, [...(groups.get(g) ?? []), key]);
   }
   return groups;
@@ -1377,6 +1429,15 @@ export function heldGroups(known: Map<number, ProcessRow[]>, now: ProcessRow[]):
     if (members.some((m) => seen.some((k) => sameProcess(k, m)))) out.set(g, members);
   }
   return out;
+}
+
+/**
+ * Whether a session's journal holds history: an event, or a Run still open that only a rotation header
+ * names (age retention can leave just the header). One rule for recovery's open and for the open of a
+ * journal recovery did not surface (the house's read of the 33 commits, PR #22, comment 6307350477, item 6).
+ */
+function holdsHistory(store: FileStore, journal: Journal): boolean {
+  return store.lastSeq() !== undefined || journal.runs.open().length > 0;
 }
 
 function expired(store: FileStore, retention: SessionRetention, now: number): boolean {

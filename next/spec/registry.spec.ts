@@ -15,7 +15,30 @@ import * as path from 'node:path';
 import { SessionRegistry, type AnySession, type HistorySession, type LiveSession, type RegistryChange } from '../src/api/registry.js';
 
 /** node:fs as stores.js sees it: a patch here plus syncBuiltinESMExports reaches its `import * as fs` bindings. */
-const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync };
+const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync; renameSync: typeof fs.renameSync };
+/**
+ * Every rename into a file named `name` while `fn` runs is counted, and refused with EIO while `refuse()`
+ * says so: writeDurably renames its temporary into place, so a count is a count of writes, and a refusal
+ * is a write that did not happen.
+ */
+async function renamesInto<T>(name: string, fn: (count: () => number) => Promise<T> | T, refuse: () => boolean = () => false): Promise<T> {
+  const real = fsc.renameSync;
+  let n = 0;
+  fsc.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+    if (path.basename(String(to)) === name) {
+      if (refuse()) throw Object.assign(new Error('EIO: i/o error, rename'), { code: 'EIO' });
+      n++;
+    }
+    return real(from, to);
+  }) as typeof fs.renameSync;
+  syncBuiltinESMExports();
+  try {
+    return await fn(() => n);
+  } finally {
+    fsc.renameSync = real;
+    syncBuiltinESMExports();
+  }
+}
 /** A directory fsync that fails with EIO while `fn` runs (file fsyncs still work). */
 function withDirFsyncEIO<T>(fn: () => T): T {
   const real = fsc.fsyncSync;
@@ -688,20 +711,91 @@ test('cursors written while their directory cannot be synced are logged once, no
   const file = path.join(r.dir, 'sessions', 'cur', 'cursors.json');
   const readOf = () => (JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, { read: number }>)[A]!.read;
   const said = () => warnings.filter((w) => /cursors are written but their directory could not be synced/.test(w)).length;
-  // dispose() flushes the cursors; the directory fsync fails after the rename.
-  withDirFsyncEIO(() => {
-    h.markRead(A, 5);
-    reg.dispose();
-  });
-  assert.equal(readOf(), 5, 'the file holds the cursors: they were written');
-  assert.equal(said(), 1, 'the sync failure is logged');
-  withDirFsyncEIO(() => {
-    h.markRead(A, 6);
-    reg.dispose();
-  });
-  assert.equal(readOf(), 6, 'a later change is still written');
-  assert.equal(said(), 1, 'but the failure is said once, and nothing is rewritten in a loop');
+  // The writes are counted while the directory fsync fails throughout: counted by warnings, with the EIO
+  // lasting one dispose each, the test passed with a flush that rescheduled itself after every unsynced
+  // write (the house's read of the 33 commits, PR #22, comment 6307350477, item 8).
+  await renamesInto('cursors.json', (writes) =>
+    withDirFsyncEIO(() => {
+      // dispose() flushes the cursors; the directory fsync fails after the rename.
+      h.markRead(A, 5);
+      reg.dispose();
+      assert.equal([readOf(), writes()].join(), '5,1', 'the file holds the cursors: they were written once');
+      assert.equal(said(), 1, 'the sync failure is logged');
+      // Nothing changed: an unsynced write left nothing to write again, at a flush or a timer's.
+      reg.dispose();
+      reg.dispose();
+      assert.equal(writes(), 1, 'nothing is rewritten while the directory still cannot be synced');
+      h.markRead(A, 6);
+      reg.dispose();
+      assert.equal([readOf(), writes()].join(), '6,2', 'a later change is still written, once');
+      assert.equal(said(), 1, 'and the failure is said once');
+    }),
+  );
   await cleanup(r2, r);
+});
+
+test('G18/G20: a new life\'s record that cannot be written before its start does not keep the session from starting, and the record is written once it has (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 9)', async () => {
+  const warnings: string[] = [];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-registry-'));
+  const { backend, shells } = scripted();
+  const reg = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), log: (level, text) => void (level === 'warn' && warnings.push(text)) });
+  const r: Rig = { dir, backend, shells, reg, changes: [] };
+  await reg.ensure({ id: 'pre', owner: A, visibility: 'shared' });
+  await reg.close('pre');
+  const file = path.join(dir, 'sessions', 'pre', 'session.json');
+  // Only the first write, the one before the start, is refused.
+  let attempts = 0;
+  await renamesInto('session.json', () => reg.ensure({ id: 'pre', owner: A, visibility: 'private' }), () => attempts++ === 0);
+  live(reg.get('pre'));
+  assert.equal(attempts, 2, 'the record was tried before the start and after it');
+  assert.ok(warnings.some((w) => w.startsWith("the new life's record could not be written before its start") && w.includes('EIO')), JSON.stringify(warnings));
+  const rec = JSON.parse(fs.readFileSync(file, 'utf8')) as { visibility: string; closedAt?: number };
+  assert.deepEqual([rec.visibility, rec.closedAt], ['private', undefined], 'started, the record is the new life\'s');
+  await cleanup(r);
+});
+
+test('G18/G20: a failed start whose old record cannot be written back still fails with the start\'s own error, and the entry is the old life\'s (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 9)', async () => {
+  const warnings: string[] = [];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-registry-'));
+  const { backend, shells } = scripted();
+  const reg = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), log: (level, text) => void (level === 'warn' && warnings.push(text)) });
+  const r: Rig = { dir, backend, shells, reg, changes: [] };
+  await reg.ensure({ id: 'back', owner: A, visibility: 'shared' });
+  await reg.close('back');
+  const file = path.join(dir, 'sessions', 'back', 'session.json');
+  // The record before the start is written; the start fails, and from then on the disk refuses the record.
+  let refusing = false;
+  const spawn = backend.spawnShell.bind(backend);
+  backend.spawnShell = () => {
+    refusing = true;
+    throw new Error('spawn failed');
+  };
+  await renamesInto('session.json', () => rejectsWith(reg.ensure({ id: 'back', owner: A, visibility: 'private' }), 'Error: spawn failed'), () => refusing);
+  backend.spawnShell = spawn;
+  assert.ok(warnings.some((w) => w.startsWith('a new life failed to start and the old record could not be written back') && w.includes('EIO')), JSON.stringify(warnings));
+  assert.deepEqual([hist(reg.get('back')).visibility, hist(reg.get('back')).closed], ['shared', true], 'in memory, the entry is the old life\'s');
+  const rec = JSON.parse(fs.readFileSync(file, 'utf8')) as { visibility: string; closedAt?: number };
+  assert.deepEqual([rec.visibility, rec.closedAt], ['private', undefined], 'on disk, what the refused write-back left: the attempt\'s record');
+  await cleanup(r);
+});
+
+test('G18: a journal recovery did not surface that holds only a rotation header naming an open Run is history its owner stands on — another principal is refused, and its record is untouched (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 6)', async () => {
+  // The registry is already running, so recovery never surfaced this directory; age retention can leave just the header.
+  const r = rig();
+  const sdir = path.join(r.dir, 'sessions', 'hdronly');
+  fs.mkdirSync(sdir, { recursive: true, mode: 0o700 });
+  const openRun = { runId: 'r1-header', sessionId: 'hdronly', target: 'shell', origin: 'self', principal: A, state: 'running', admittedAt: Date.now(), seq: { admit: 1, start: 2 }, attribution: 'temporal', line: 'echo private-line' };
+  fs.writeFileSync(path.join(sdir, 'journal.jsonl'), JSON.stringify({ header: { v: 1, openRuns: [openRun] } }) + '\n', { mode: 0o600 });
+  const record = JSON.stringify({ owner: A, visibility: 'private' });
+  fs.writeFileSync(path.join(sdir, 'session.json'), record, { mode: 0o600 });
+  await rejectsWith(r.reg.create({ id: 'hdronly', owner: B }), 'forbidden');
+  assert.equal(r.reg.get('hdronly'), undefined, 'no life of it for B');
+  assert.equal(fs.readFileSync(path.join(sdir, 'session.json'), 'utf8'), record, 'the record still names its owner');
+  // With no record beside it, the owner is not known: nobody's.
+  fs.rmSync(path.join(sdir, 'session.json'));
+  await assert.rejects(r.reg.create({ id: 'hdronly', owner: B }), /has history but no record/);
+  assert.equal(fs.existsSync(path.join(sdir, 'session.json')), false, 'and no record was written for B');
+  await cleanup(r);
 });
 
 test('a session record written while its directory cannot be synced is said once per name, like the cursors and the lock, not at every write (a reviewer\'s read of the fixes for #22, comment 6274603516)', async () => {

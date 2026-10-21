@@ -545,6 +545,9 @@ test('jr2-4: with no process listing after the SIGTERM, recovery sends no SIGKIL
     const r = rig(dir, { terminateOrphans: true, listProcesses: () => (calls++ === 0 ? listProcesses() : undefined) });
     const h = hist(r.reg.get('nk'));
     assert.match(h.run('r1-stubborn').reason ?? '', new RegExp(`process group ${stubborn} was sent SIGTERM and not SIGKILL: no process listing answered`));
+    // Not known to have ended, so not judged: stamped judged, a later recovery left the group alone (the
+    // house's read of the 33 commits, PR #22, comment 6307350477, item 1).
+    assert.equal(h.run('r1-stubborn').groupJudged, undefined, 'the Run stays a candidate');
     assert.ok(calls >= 2, 'the recheck asked for a listing');
     assert.ok(groupAlive(stubborn), 'it ignored the SIGTERM, and no SIGKILL went by pgid alone');
     await r.reg.closeAll();
@@ -564,20 +567,26 @@ test('jr2-4: a recovery with no process listing ends no group and says so — a 
     // start ticks only, which macOS has none of.
     const inFlight = kids.spawn('/bin/sh', ['-c', 'sleep 412 & exit 0']);
     const leftover = kids.spawn('/bin/sh', ['-c', 'sleep 413 & exit 0']);
-    let ts = Date.now();
+    // Each shell forks its sleep before it exits, so the Runs' times are taken after both have: taken right
+    // after the spawns, a fork a tenth of a second late started after the leftover's journaled end, and the
+    // next recovery left that group running (the house's read of the 33 commits, PR #22, comment 6307350477,
+    // item 10).
     await kids.exited(inFlight);
     await kids.exited(leftover);
+    let ts = Date.now();
     assert.ok(groupAlive(inFlight) && groupAlive(leftover), 'the children keep their leaderless groups alive');
     const j = new Journal({ cold: new FileStore(sdir), sessionId: 'nq', now: () => ts });
     journalProcess(j, 'r1-flight', inFlight);
     journalProcess(j, 'r2-ended', leftover);
     j.append({ type: 'run.end', runId: 'r2-ended', state: 'exited', exit: 0, durationMs: 5, leftovers: true });
     // The dead daemon lived on after starting the Runs: its last event, the evidence the next recovery
-    // bounds the groups by, is later than ps's whole-second starts and their slack.
-    ts += 2000;
+    // bounds the groups by, is a second after the forks — past ps's whole-second starts and their slack —
+    // and the daemon died before the recovery ran, so the recovery's own end does not come before it.
+    ts += 1000;
     j.append({ type: 'output', data: 'still here\r\n', stream: 'pty', runId: 'r1-flight', attribution: 'temporal' });
     j.close();
     fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    await until(() => Date.now() > ts, 3000, "the dead daemon's last event to be in the past");
     const warnings: Array<{ text: string; fields: Record<string, unknown> | undefined }> = [];
     const r = rig(dir, { terminateOrphans: true, listProcesses: () => undefined, log: (level, text, fields) => void (level === 'warn' && warnings.push({ text, fields })) });
     const h = hist(r.reg.get('nq'));
@@ -597,10 +606,183 @@ test('jr2-4: a recovery with no process listing ends no group and says so — a 
     await r.reg.closeAll();
     // The next recovery can list processes: it judges both groups by the dead daemon's evidence and ends them.
     const r2 = rig(dir, { terminateOrphans: true });
-    assert.ok(!groupAlive(inFlight) && !groupAlive(leftover), 'the next recovery ended both groups');
+    const h2 = hist(r2.reg.get('nq'));
+    assert.deepEqual([h2.run('r1-flight').groupJudged, h2.run('r2-ended').groupJudged], [true, true], 'both judged');
+    await until(() => !groupAlive(inFlight) && !groupAlive(leftover), 3000, 'the next recovery to have ended both groups');
     await r2.reg.closeAll();
   } finally {
     kids.end();
+  }
+});
+
+/** A daemon log that keeps what it is told, for the recovery tests that read it. */
+const logBook = () => {
+  const lines: Array<{ level: string; text: string; fields: Record<string, unknown> | undefined }> = [];
+  return { lines, log: (level: 'warn' | 'info', text: string, fields?: Record<string, unknown>) => void lines.push({ level, text, fields }) };
+};
+const notesOf = (h: HistorySession) => h.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'note' }> => e.type === 'note').map((e) => e.text);
+
+test('jr2-4: a group recovery signalled, with no listing answering after it, is not judged — its Run stays a candidate, and the next recovery that can list processes ends the group (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 1)', { timeout: 20_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'nu');
+  const kids = detachedKids();
+  try {
+    // Leaderless, so the next recovery ties it to the Run by the wall clock on every host (a live leader under
+    // an end a recovery wrote is told by start ticks only); its member ignores SIGTERM.
+    const g = kids.spawn('/bin/sh', ['-c', "trap '' TERM; sleep 414 & exit 0"]);
+    await kids.exited(g);
+    let ts = Date.now();
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'nu', now: () => ts });
+    journalProcess(j, 'r1-term', g);
+    ts += 1000; // the dead daemon's last event: past ps's whole-second start and its slack
+    j.append({ type: 'output', data: 'still here\r\n', stream: 'pty', runId: 'r1-term', attribution: 'temporal' });
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    await until(() => Date.now() > ts, 3000, "the dead daemon's last event to be in the past");
+    // The first listing judges the group the Run's; none answers after the SIGTERM.
+    let calls = 0;
+    const r = rig(dir, { terminateOrphans: true, listProcesses: () => (calls++ === 0 ? listProcesses() : undefined) });
+    const first = hist(r.reg.get('nu')).run('r1-term');
+    assert.match(first.reason ?? '', new RegExp(`process group ${g} was sent SIGTERM and not SIGKILL: no process listing answered`));
+    assert.equal(first.groupJudged, undefined, 'whether it ended is not known: not judged');
+    assert.ok(groupAlive(g), 'it ignored the SIGTERM');
+    await r.reg.closeAll();
+    const r2 = rig(dir, { terminateOrphans: true });
+    assert.equal(hist(r2.reg.get('nu')).run('r1-term').groupJudged, true, 'the next recovery judged it');
+    await until(() => !groupAlive(g), 3000, 'the next recovery to have ended the group');
+    await r2.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
+test('jr2-4: a group whose processes recovery tied to the Run are gone, while it still holds one recovery cannot tie, is reported left running, not terminated (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 2)', { timeout: 15_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'tr');
+  const kids = detachedKids();
+  try {
+    // The group is real, so the signal and the probe reach it, and it ignores SIGTERM; the listings are the
+    // test's: the first shows the Run's leader, every later one only a process recovery never saw — as when
+    // a TERM trap starts a new member and the leader exits.
+    const g = kids.spawn('/bin/sh', ['-c', "trap '' TERM; exec sleep 415"]);
+    await until(() => groupAlive(g));
+    const ts = Date.now();
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'tr', now: () => ts });
+    journalProcess(j, 'r1-trap', g);
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    const leader: ProcessRow = { pid: g, pgid: g, startMs: ts, zombie: false };
+    const newcomer: ProcessRow = { pid: g + 100_000, pgid: g, startMs: ts + 60_000, zombie: false };
+    let calls = 0;
+    const book = logBook();
+    const r = rig(dir, { terminateOrphans: true, listProcesses: () => (calls++ === 0 ? [leader] : [newcomer]), log: book.log });
+    const h = hist(r.reg.get('tr'));
+    const run1 = h.run('r1-trap');
+    assert.deepEqual([run1.state, run1.reason], ['lost', 'daemon-restart'], 'not "terminated" in its reason');
+    assert.equal(run1.groupJudged, true, 'a listing judged it');
+    const notes = notesOf(h);
+    assert.ok(notes.some((t) => t.startsWith(`recovery: process group ${g} left running: it was sent SIGTERM`) && t.endsWith('· r1-trap')), JSON.stringify(notes));
+    assert.ok(!notes.some((t) => t.includes('terminated')), JSON.stringify(notes));
+    const ended = book.lines.find((l) => l.text === 'recovery ended process groups a previous daemon left running');
+    assert.ok(ended, JSON.stringify(book.lines));
+    assert.deepEqual([ended.fields!['groups'], ended.fields!['leftRunning']], [[], [g]], 'the log lists it as left running, not among the groups recovery ended');
+    assert.ok(groupAlive(g), 'and nothing was sent after the SIGTERM');
+    await r.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
+test('jr2-4/G21: a session past its age whose Runs\' groups no listing judged is kept — at recovery and by expire — until a recovery that can list processes judges them, and expires after that (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 3)', { timeout: 15_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'aged2');
+  const kids = detachedKids();
+  try {
+    // A real leaderless group (the signal and the probe reach it); the dead daemon ran a minute ago, past the
+    // session's age of a second, and the second recovery's listing shows the group's member at a start
+    // within the Run's life, before the daemon's last event.
+    const g = kids.spawn('/bin/sh', ['-c', 'sleep 416 & exit 0']);
+    await kids.exited(g);
+    const T = Date.now() - 60_000;
+    let ts = T;
+    const j = new Journal({ cold: new FileStore(sdir, { maxAgeMs: 1000 }), sessionId: 'aged2', now: () => ts });
+    journalProcess(j, 'r1-aged', g);
+    ts = T + 5000;
+    j.append({ type: 'output', data: 'still here\r\n', stream: 'pty', runId: 'r1-aged', attribution: 'temporal' });
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', retention: { maxAgeMs: 1000 } }), { mode: 0o600 });
+    const book = logBook();
+    const r = rig(dir, { terminateOrphans: true, listProcesses: () => undefined, log: book.log });
+    // Removed here, a later recovery that can list had nothing naming the group.
+    const h = hist(r.reg.get('aged2'));
+    assert.equal(h.run('r1-aged').groupJudged, undefined);
+    assert.ok(fs.existsSync(sdir), 'its files stay');
+    assert.ok(book.lines.some((l) => l.level === 'warn' && l.text.startsWith('a session past its retention is kept') && l.fields?.['session'] === 'aged2'), JSON.stringify(book.lines));
+    assert.deepEqual(await r.reg.expire(Date.now() + 3_600_000), [], 'expire keeps it while its groups are unjudged');
+    assert.ok(fs.readdirSync(sdir).includes('journal.jsonl') && hist(r.reg.get('aged2')).run('r1-aged').pgid === g, 'with the Run that names the group');
+    assert.ok(groupAlive(g));
+    await r.reg.closeAll();
+    const member: ProcessRow = { pid: g + 100_000, pgid: g, startMs: T + 1000, zombie: false };
+    const r2 = rig(dir, { terminateOrphans: true, listProcesses: () => [member] });
+    assert.equal(hist(r2.reg.get('aged2')).run('r1-aged').groupJudged, true, 'the recovery that can list judged it');
+    await until(() => !groupAlive(g), 3000, 'the group to be ended');
+    assert.deepEqual(await r2.reg.expire(Date.now() + 10_000), ['aged2'], 'judged, it expires');
+    assert.equal(fs.existsSync(sdir), false);
+    await r2.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
+test('jr2-4: a group a working listing shows gone is judged — no note — so a later restart that finds a stranger in its pgid writes nothing and warns of nothing (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 4)', { timeout: 10_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'gj');
+  const kids = detachedKids();
+  try {
+    // A group that has really ended (no signal can reach anything of it); the listings are the test's.
+    const g = kids.spawn('true', []);
+    await kids.exited(g);
+    await until(() => !groupAlive(g));
+    const T = Date.now() - 60_000;
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'gj', now: () => T });
+    journalProcess(j, 'r1-gone', g);
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    const r = rig(dir, { terminateOrphans: true, listProcesses: () => [] });
+    const h = hist(r.reg.get('gj'));
+    assert.deepEqual([h.run('r1-gone').state, h.run('r1-gone').reason, h.run('r1-gone').groupJudged], ['lost', 'daemon-restart', true], 'gone, judged, nothing to say');
+    assert.ok(!notesOf(h).some((t) => t.includes(String(g))), JSON.stringify(notesOf(h)));
+    await r.reg.closeAll();
+    const stranger: ProcessRow = { pid: g + 100_000, pgid: g, startMs: Date.now(), zombie: false };
+    const book = logBook();
+    const r2 = rig(dir, { terminateOrphans: true, listProcesses: () => [stranger], log: book.log });
+    assert.ok(!notesOf(hist(r2.reg.get('gj'))).some((t) => t.includes('left running')), JSON.stringify(notesOf(hist(r2.reg.get('gj')))));
+    assert.ok(!book.lines.some((l) => l.text.startsWith('recovery left process groups')), JSON.stringify(book.lines));
+    await r2.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
+test('jr2-4: an end a recovery wrote is bounded by the evidence it recorded as the in-flight rule is — a member proven to have started before it, not one that may have started after (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 5)', () => {
+  const self = { pid: 500, pgid: 400 };
+  const L = 1_000_000; // the dead daemon's last event
+  const cand = (over: Partial<RunInfo>): OrphanCandidate => ({
+    key: 's\0r',
+    run: { runId: 'r', sessionId: 's', target: 'process', origin: 'self', principal: A, state: 'running', admittedAt: L - 20_010, startedAt: L - 20_000, seq: { admit: 1, start: 2 }, attribution: 'exact', pgid: 2001, ...over },
+    lastTs: L,
+  });
+  const inFlight = cand({});
+  const byRecovery = cand({ state: 'lost', reason: 'daemon-restart', recoveredEnd: true, endedAt: L + 60_000, lastAliveTs: L, seq: { admit: 1, start: 2, end: 3 } });
+  const proc = (startMs: number): ProcessRow => ({ pid: 2101, pgid: 2001, startMs, startSlackMs: PROC_START_SLACK_MS, zombie: false });
+  const ps = (startMs: number): ProcessRow => ({ pid: 2101, pgid: 2001, startMs, zombie: false });
+  const sel = (c: OrphanCandidate, procs: ProcessRow[]) => [...orphanGroups([c], procs, self).keys()];
+  for (const [name, c] of [['in flight', inFlight], ['ended by a recovery', byRecovery]] as const) {
+    // 10 ms before the last event with 25 ms of slack: it may have started after the daemon died.
+    assert.deepEqual(sel(c, [proc(L - 10)]), [], `${name}: a /proc start within its slack of the last event`);
+    assert.deepEqual(sel(c, [proc(L - 100)]), [2001], `${name}: a /proc start proven before it`);
+    assert.deepEqual(sel(c, [ps(L - 500)]), [], `${name}: a ps start that may lie after it`);
+    assert.deepEqual(sel(c, [ps(L - 1000)]), [2001], `${name}: ps's whole second before it`);
   }
 });
 
