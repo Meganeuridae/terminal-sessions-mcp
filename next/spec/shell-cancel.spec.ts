@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { PtyHandle } from '../src/backends/types.js';
-import { AGENT, hasShell, pgrep, realSession, reap, until } from './fake-shell.js';
+import { AGENT, hasShell, pgrep, realSession, reap, stopWhileWaiting, until } from './fake-shell.js';
 
 const FISH = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find(hasShell) ?? '/usr/bin/fish';
 /**
@@ -166,7 +166,9 @@ test('/bin/bash: a stopped shell whose empty line a third ^C flushed is back onc
   const pid = x.session.info().pid;
   try {
     await until(() => x.session.shellAvailable().ok, 5000, 'the shell is ready');
-    process.kill(pid, 'SIGSTOP');
+    // Stopped while still writing its prompt, bash takes the pending ^C outside its wait for input, draws no prompt
+    // for it and waits for a key, as zsh does in the spec below (stopWhileWaiting).
+    await stopWhileWaiting(pid);
     const a = x.session.admit({ target: 'shell', line: 'echo first-ran', principal: AGENT });
     assert.ok(a.admitted);
     const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 200 });

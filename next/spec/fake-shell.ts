@@ -607,6 +607,44 @@ export const pgrep = (pattern: string): number[] => {
     throw e;
   }
 };
+/**
+ * SIGSTOP a shell while it waits for terminal input, not partway through a system call it makes as it draws its
+ * prompt. The session counts a shell ready at its prompt's end mark, which it can read before the shell's write of
+ * that prompt returns. Stopped in that write, bash took a ^C pending at SIGCONT outside its wait for input, and
+ * readline 8.2 then handled it without the event hook that throws bash to a new prompt (rl_getc calls the hook only
+ * when the wait itself is interrupted), so it waited for a key. By run on Linux x86_64 with bash 5.2.37 under load,
+ * stopped in pselect6 the stopped-shell cancel spec's steps passed 154 times of 154, and the two that stalled were
+ * both stopped in write (CI on #22 failed the spec at 9f2952d and 3ad4183). On Linux the shell is stopped, the system call it
+ * stopped in is read from /proc and compared with the one it sleeps in while waiting, and it is continued and stopped
+ * again until they agree. Elsewhere, with no /proc, it is stopped at once.
+ */
+export async function stopWhileWaiting(pid: number, attempts = 50): Promise<void> {
+  const proc = (f: string): string | undefined => {
+    try {
+      return fs.readFileSync(`/proc/${pid}/${f}`, 'utf8').trim();
+    } catch {
+      return undefined;
+    }
+  };
+  const call = () => proc('syscall')?.split(' ')[0];
+  if (call() === undefined) {
+    process.kill(pid, 'SIGSTOP');
+    return;
+  }
+  // Asleep in the select or poll a line editor waits in. Not wait_woken: a read of the terminal sleeps there, but so
+  // does a write to a full one, which is the state this stop must miss (by run on Linux 6.18: `cat` reading and `head`
+  // writing a full pty both showed wait_woken; Gideon-2613's read of this helper).
+  const waiting = () => /^(do_select|do_sys_poll|poll_schedule_timeout)/.test(proc('wchan') ?? '');
+  for (let i = 0; i < attempts; i++) {
+    await until(waiting, 5000, 'the shell to wait for input');
+    const waitsIn = call();
+    process.kill(pid, 'SIGSTOP');
+    await until(() => /^T/.test(proc('stat')?.split(') ')[1] ?? ''), 2000, 'the shell to stop');
+    if (waitsIn !== undefined && waitsIn !== 'running' && call() === waitsIn) return;
+    process.kill(pid, 'SIGCONT');
+  }
+  throw new Error(`the shell was never stopped in its wait for input in ${attempts} attempts`);
+}
 export const reap = (pattern: string) => {
   try {
     execFileSync('pkill', ['-9', '-f', pattern]);
