@@ -206,11 +206,14 @@ const TRANSCRIPT_INPUT_CHARS = 4 * 1024 * 1024;
 /** Daemon lines remembered after their Run was declared lost before it started. */
 const MAX_ORPHAN_LINES = 32;
 /**
- * Prompts a cancel's empty line may wait behind before its pre-execution mark (askForPrompt): one for the
- * pending ^C (bash, zsh), one for a line the shell read before the ^C. Past them the line is taken as
- * lost and the shell as back.
+ * How long a prompt waits for the pre-execution mark of the empty line a cancel typed (askForPrompt). A
+ * line still queued in the tty is read as soon as the prompt is drawn, so past this the line is taken as
+ * lost (a later ^C flushed it, or a program read it) and the shell as back at that prompt. Counting
+ * prompts instead never ended the wait when no further prompt came (the house's review of the 40 commits
+ * through f3750e4, PR #22 comment 6310921374, question 1). A late run of the line is still known by its
+ * file (probeLine), and a Run written behind it waits for it.
  */
-const PROMPT_PROBE_PROMPTS = 2;
+const PROMPT_PROBE_GRACE_MS = 300;
 /** What a note says when the reinit gate after `exec bash` gives up: the recovery that loads the integration with the session's key. */
 const REINIT_RECOVERY = 'Shell commands are unavailable until it loads: once the shell shows its own prompt, send ` . "$TSM_BASH_RC" reinit typed` with input to load it, or open a new session';
 const publicRun = (r: RunRecord): RunInfo => {
@@ -547,13 +550,13 @@ export class Session {
   /** Daemon lines whose Run ended before its C: a later C with that line is their late execution. */
   private readonly orphanLines = new Map<string, RunRecord>();
   /**
-   * The empty line a cancel typed to learn when the shell is back (askForPrompt): its file, whether its
-   * pre-execution mark came (the mark's line holds the file's quoted path), and the prompts seen before
-   * it. The shell is busy until the prompt after the mark — or after PROMPT_PROBE_PROMPTS prompts without
-   * it, when the line was lost (a later ^C flushed it, a program read it), so that it cannot hold the
-   * shell for good.
+   * The empty line a cancel typed to learn when the shell is back (askForPrompt): its file, and whether its
+   * pre-execution mark came (the mark's line holds the file's quoted path). The shell is busy until the
+   * prompt after the mark; a prompt not followed by the mark within PROMPT_PROBE_GRACE_MS
+   * (promptProbeTimer) frees it too, the line lost.
    */
-  private promptProbe: { path: string; started: boolean; prompts: number } | undefined;
+  private promptProbe: { path: string; started: boolean } | undefined;
+  private promptProbeTimer: NodeJS.Timeout | undefined;
   /**
    * The last empty line's quoted file and its place in the write order: its start after the session gave
    * up on it is not a person's command, and a Run written after it waits behind it (onPreExec).
@@ -894,6 +897,9 @@ export class Session {
         // The shell is at its line editor — but only after a prompt start (a B from a PS1
         // alone, with the hooks broken, is not the integration's first prompt).
         if (this.sawPromptStart) this.markReady();
+        // The editor reads a queued line only once the prompt is drawn (a PS1 with a command
+        // substitution takes its time): the empty line's grace runs from here.
+        if (this.promptProbeTimer) this.armPromptProbeGrace();
         return;
       case 'C':
         return this.onPreExec();
@@ -1112,12 +1118,14 @@ export class Session {
     }
     if (this.currentShellRun && isTerminal(this.currentShellRun.state)) this.currentShellRun = undefined;
     // The empty line a cancel typed (askForPrompt): the prompt after its pre-execution mark says the
-    // shell is back; a prompt before it (the ^C's own, or one that ends a line read before it) does not.
+    // shell is back. A prompt before that mark (the ^C's own, or one that ends a line read before the ^C)
+    // is followed at once by the line, which the editor reads as soon as the prompt is drawn; without the
+    // mark within the grace the line was lost, and the shell is back at this prompt (onPromptProbeLost).
+    // Counting prompts kept the shell busy for good when no other came (the house's review of the 40
+    // commits through f3750e4, #22 comment 6310921374, question 1).
     const probe = this.promptProbe;
-    if (probe && (probe.started || ++probe.prompts > PROMPT_PROBE_PROMPTS)) {
-      if (!probe.started) this.note(`the empty line typed after a cancel's ^C did not run within ${PROMPT_PROBE_PROMPTS} prompts; the shell counts as available again at this one`);
-      this.dropPromptProbe();
-    }
+    if (probe?.started) this.dropPromptProbe();
+    else if (probe) this.armPromptProbeGrace();
     if (this.shellState !== 'exited') this.shellState = this.currentShellRun || this.pendingShellRun || this.promptProbe ? 'busy' : 'idle';
     if (!this.ready && !this.readyTimer) {
       // The prompt is being printed; a shell is only truly at its line editor once it
@@ -1149,6 +1157,29 @@ export class Session {
       this.notifyAvailable();
     }, TYPEAHEAD_GRACE_MS);
     this.typeaheadTimer.unref();
+  }
+
+  /** (Re)start the empty line's grace at a prompt that came before its pre-execution mark (see onPromptStart). */
+  private armPromptProbeGrace(): void {
+    clearTimeout(this.promptProbeTimer);
+    this.promptProbeTimer = setTimeout(() => this.onPromptProbeLost(), PROMPT_PROBE_GRACE_MS);
+    this.promptProbeTimer.unref();
+  }
+
+  /**
+   * The shell's prompt was not followed by the empty line's pre-execution mark: the line is gone (a ^C
+   * typed after it flushed it, or a program read it), and the shell is back at that prompt. Were the
+   * line read later still, its mark names its file (onPreExec), and a Run written meanwhile waits for it.
+   */
+  private onPromptProbeLost(): void {
+    this.promptProbeTimer = undefined;
+    const probe = this.promptProbe;
+    if (!probe || probe.started || this.closed) return;
+    this.note(`the empty line typed after a cancel's ^C did not start within ${PROMPT_PROBE_GRACE_MS} ms of the shell's prompt: it was lost (a ^C after it flushed it, or a program read it), and the shell counts as available again at that prompt`);
+    this.dropPromptProbe();
+    if (this.shellState === 'busy' && !this.currentShellRun && !this.pendingShellRun) this.shellState = 'idle';
+    this.drainQueue();
+    this.notifyAvailable();
   }
 
   /**
@@ -1190,7 +1221,11 @@ export class Session {
     if (line !== undefined && probeLine !== undefined && line.includes(probeLine.file)) {
       // The empty line a cancel typed (askForPrompt): not a Run. The prompt after it frees the shell.
       this.shellState = 'busy';
-      if (this.promptProbe) this.promptProbe.started = true;
+      if (this.promptProbe) {
+        this.promptProbe.started = true;
+        clearTimeout(this.promptProbeTimer);
+        this.promptProbeTimer = undefined;
+      }
       this.probeLine = undefined;
       // Run late, after the session gave up on it and wrote a Run's line behind it: that line is next
       // in the tty's queue, and the empty line's own prompt must not discard it, as a line typed ahead
@@ -1310,7 +1345,7 @@ export class Session {
     this.pty.signalGroup?.(this.pty.pid, 'SIGKILL');
     for (const r of this.queue.splice(0)) this.endRun(r, { state: 'lost', reason: this.closeReason ?? 'shell-exited-before-start' });
     this.teardownProcessGroups();
-    for (const t of [this.graceTimer, this.settleTimer, this.capTimer, this.editingTimer, this.typeaheadTimer]) clearTimeout(t);
+    for (const t of [this.graceTimer, this.settleTimer, this.capTimer, this.editingTimer, this.typeaheadTimer, this.promptProbeTimer]) clearTimeout(t);
     if (this.integrationLevel === 'unknown') this.integrationLevel = 'none';
     this.markReady();
     for (const w of this.availabilityWaiters.splice(0)) w();
@@ -1389,7 +1424,7 @@ export class Session {
     // nor do the members of their groups that outlived the leader (ss-10).
     this.teardownProcessGroups();
     await Promise.allSettled([...this.teardowns]);
-    for (const t of [this.graceTimer, this.settleTimer, this.readyTimer, this.capTimer, this.editingTimer, this.typeaheadTimer, this.seatReserved?.timer]) clearTimeout(t);
+    for (const t of [this.graceTimer, this.settleTimer, this.readyTimer, this.capTimer, this.editingTimer, this.typeaheadTimer, this.promptProbeTimer, this.seatReserved?.timer]) clearTimeout(t);
     this.seatReserved = undefined;
     this.cleanupTempFiles();
     await this.screen.settled();
@@ -2494,7 +2529,7 @@ export class Session {
     }
     const src = sourceLine(file, this.flavor);
     this.extraTempFiles.add(file);
-    this.promptProbe = { path: file, started: false, prompts: 0 };
+    this.promptProbe = { path: file, started: false };
     this.probeLine = { file: shellQuote(file), order: ++this.writeOrder };
     this.pty.write(`${CLEAR_LINE_KEYS}${src}\n`);
     return true;
@@ -2508,6 +2543,8 @@ export class Session {
    */
   private dropPromptProbe(): void {
     const probe = this.promptProbe;
+    clearTimeout(this.promptProbeTimer);
+    this.promptProbeTimer = undefined;
     if (!probe) return;
     this.promptProbe = undefined;
     try {

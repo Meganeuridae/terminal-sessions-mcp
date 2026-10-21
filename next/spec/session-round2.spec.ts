@@ -440,10 +440,10 @@ test('after a cancel whose ^C a line read before it outlived, the prompt that en
 });
 
 test('an empty line that runs only after the session gave it up does not discard the Run written behind it', async () => {
-  // Past PROMPT_PROBE_PROMPTS prompts without the empty line's pre-execution mark, the session gives it up
-  // and writes the queued Run's line, which waits behind the unread empty line. When that line ran at last,
+  // A prompt not followed by the empty line's pre-execution mark within the grace gives the line up, and
+  // the queued Run's line is written, waiting behind the unread empty line. When that line ran at last,
   // its own prompt discarded the pending Run (no-pre-execution-mark), and the Run's line then ran with its
-  // file gone: item 1 again, behind a third prompt (an independent read of the fix for #22 comment
+  // file gone: item 1 again, behind a later prompt (an independent read of the fix for #22 comment
   // 6307351617).
   const h = await harness({ quietEmptyInterrupt: true });
   h.shell.pause(); // nothing typed is read until resume()
@@ -453,16 +453,42 @@ test('an empty line that runs only after the session gave it up does not discard
   assert.deepEqual([c.state, c.steps.at(-1)], ['cancelled', 'an empty line, whose prompt says the shell is back'], JSON.stringify(c));
   const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
   assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
-  // Three prompts before the shell reads the empty line: the session gives it up and writes the Run's line.
-  for (let i = 0; i < 3; i++) h.pty.emit(h.shell.mark('133;A') + '$ ' + h.shell.mark('133;B'));
-  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /did not run within 2 prompts/.test(e.text)), 'the give-up is said');
-  assert.equal(h.session.run(b.run.runId).state, 'starting', 'written behind the unread empty line');
+  // A prompt the shell does not read the empty line after: the session gives it up and writes the Run's line.
+  h.pty.emit(h.shell.mark('133;A') + '$ ' + h.shell.mark('133;B'));
+  assert.deepEqual(h.session.shellAvailable(), { ok: false, reason: 'prompt-pending' }, 'a prompt came: the grace runs');
+  await until(() => h.session.run(b.run.runId).state === 'starting', 2000, 'the Run’s line written after the grace');
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /did not start within \d+ ms of the shell's prompt: it was lost/.test(e.text)), 'the give-up is said');
   h.shell.resume(); // the empty line runs (its file gone) and prompts; then the Run's line runs
   const rb = await h.session.awaitRun(b.run.runId, 2000);
   assert.deepEqual([rb.state, rb.exit, rb.reason], ['exited', 0, undefined], JSON.stringify(rb));
   assert.equal((await h.session.runTranscript(rb.runId)).text, 'hello');
   assert.ok(!ofType(h.journal.since(0).events, 'note').some((e) => /ran late/.test(e.text)), 'no line ran without its file');
   assert.deepEqual(h.session.listRuns().map((x) => x.runId), [a.run.runId, b.run.runId], 'the empty line is no Run');
+  await h.session.close();
+});
+
+// ───────────── question 1 of #22 comment 6310921374: the cancel's empty line ─────────────
+
+test('a stopped shell whose empty line a third ^C flushed is back at the prompt it prints for the ^C once it runs, and the Run admitted after the cancel runs', async () => {
+  // The house's first shape, by run with bash 5.2.37 (and here with bash 3.2): the shell stopped across
+  // the cancel, and a ^C typed after the empty line flushed it from the tty. The shell prints one prompt,
+  // for the ^C, and no other: counting two prompts left the Run admitted after the cancel queued for good.
+  const h = await harness();
+  h.shell.stop();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.deepEqual([c.state, c.steps.at(-1)], ['cancelled', 'an empty line, whose prompt says the shell is back'], JSON.stringify(c));
+  h.session.input('\x03', { principal: AGENT }); // the third ^C, after the empty line
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  h.shell.cont(); // the prompt for the ^C; the empty line is gone
+  assert.equal(h.session.run(b.run.runId).state, 'queued', 'not at the ^C’s prompt itself: a queued line would be read now');
+  const rb = await h.session.awaitRun(b.run.runId, 3000);
+  assert.deepEqual([rb.state, rb.exit, rb.reason], ['exited', 0, undefined], JSON.stringify(rb));
+  assert.equal((await h.session.runTranscript(rb.runId)).text, 'hello');
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /did not start within \d+ ms of the shell's prompt: it was lost/.test(e.text)), 'the lost line is said');
+  assert.equal(h.shell.typed.length, 1, 'only the Run’s line reached the shell');
   await h.session.close();
 });
 

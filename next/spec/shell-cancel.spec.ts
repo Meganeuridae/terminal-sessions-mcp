@@ -140,6 +140,36 @@ test('/bin/bash: a cancel whose two ^C a DEBUG trap of the user’s ignores, bef
   }
 });
 
+// The house's review of the 40 commits through f3750e4 (#22 comment 6310921374, question 1), by run with
+// bash 5.2.37: two shapes in which the cancel's empty line never ran and the shell stayed busy for good.
+test('/bin/bash: a stopped shell whose empty line a third ^C flushed is back once it prints its prompt for the ^C, and the Run admitted after the cancel runs', { skip: !hasShell('/bin/bash') }, async () => {
+  const x = await realSession('/bin/bash', { login: false });
+  const pid = x.session.info().pid;
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'the shell is ready');
+    process.kill(pid, 'SIGSTOP');
+    const a = x.session.admit({ target: 'shell', line: 'echo first-ran', principal: AGENT });
+    assert.ok(a.admitted);
+    const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 200 });
+    assert.deepEqual([c.state, c.steps.at(-1)], ['cancelled', 'an empty line, whose prompt says the shell is back'], JSON.stringify(c));
+    x.session.input('\x03', { principal: AGENT }); // the third ^C, after the empty line: the tty flushes it
+    const b = x.session.admit({ target: 'shell', line: 'echo second-$((40+2))', principal: AGENT, queue: true });
+    assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+    process.kill(pid, 'SIGCONT');
+    const r = await x.session.awaitRun(b.run.runId, 8000);
+    assert.deepEqual([r.state, r.exit, r.reason], ['exited', 0, undefined], JSON.stringify(r));
+    assert.equal((await x.session.runTranscript(r.runId)).text, 'second-42');
+    assert.ok(x.journal.since(0).events.some((e) => e.type === 'note' && /did not start within \d+ ms of the shell's prompt: it was lost/.test(e.text)), 'the lost line is said');
+  } finally {
+    try {
+      process.kill(pid, 'SIGCONT');
+    } catch {
+      // gone
+    }
+    await x.close();
+  }
+});
+
 test('/bin/bash: G29 (tg-12): a process cancel signals the group until it is empty, even after the leader exits', async () => {
   const x = await realSession('/bin/bash');
   try {
