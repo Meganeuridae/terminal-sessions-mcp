@@ -106,9 +106,11 @@ test('a tail of a marker Run shows its last lines without the end mark, and pagi
   assert.equal(last.text, lines.slice(-3).join('\n'));
   for (const tail of [1, 2, 5]) {
     const pages = await pagesBack(src, { runId: 'r1', tail });
-    const seen = pages.flatMap((p) => (p.text ? p.text.split('\n') : []));
+    // Oldest page first: the pages join to the Run's lines, each once and in order. A set of them, sorted, let a
+    // page repeated or out of order pass (our read of the 40 commits, PR #22).
+    const seen = [...pages].reverse().flatMap((p) => (p.text ? p.text.split('\n') : []));
     assert.ok(!seen.some(plumbing), `tail ${tail}: ${JSON.stringify(seen.filter(plumbing))}`);
-    assert.deepEqual([...new Set(seen)].sort(), [...lines].sort(), `tail ${tail}: every line, and nothing else`);
+    assert.deepEqual(seen, lines, `tail ${tail}: every line once, in order, and nothing else`);
   }
 });
 
