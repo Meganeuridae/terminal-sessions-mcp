@@ -1987,6 +1987,8 @@ test("a note budget whose first count failed counts again at the next note, and 
     assert.equal(((await publish('after it')) as { delivered: boolean }).delivered, true, 'the next note counts again and goes in');
     assert.deepEqual(notes(s), ['an earlier note', 'after it']);
     assert.equal(f.inside.budgetOf(s.journal).retained.length, 2, 'each note counted once: the failed count left nothing counted twice');
+    const budget = f.inside.budgetOf(s.journal) as unknown as { retained: Array<[number, number]>; bytes: number };
+    assert.equal(budget.bytes, budget.retained.reduce((n, [, b]) => n + b, 0), "the byte count is the retained notes' bytes: the failed count's went with its entries (the house's read of 4f4c067, #22)");
   } finally {
     await f.close();
   }
