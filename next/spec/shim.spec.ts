@@ -821,6 +821,8 @@ interface Unit {
   /** systemd only: whether systemd says the unit needs a daemon-reload, and the unit's file. */
   needReload?: boolean;
   fragment?: string;
+  /** systemd only: the unit's drop-ins, as `DropInPaths` lists them. */
+  dropIn?: string;
 }
 
 /** The two supervisors' answers for a loaded unit: a launchd job's `print` and a systemd unit's `show`, with the same command line and environment. */
@@ -842,7 +844,7 @@ function unitStub(u: Unit): Stub {
     `UnsetEnvironment=${(u.unset ?? []).join(' ')}`,
     `NeedDaemonReload=${u.needReload ? 'yes' : 'no'}`,
     `FragmentPath=${u.fragment ?? ''}`,
-    'DropInPaths=',
+    `DropInPaths=${u.dropIn ?? ''}`,
   ];
   // `systemctl --user show termd …` asks about the unit; `systemctl --user show --property=Environment`, the manager.
   const manager = u.managerFails ? "echo 'Failed to connect to bus: No medium found' >&2; exit 1" : `printf '%s\\n' ${q(`Environment=${words(Object.entries(u.managerEnv ?? {}))}`)}`;
@@ -1060,6 +1062,13 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   fs.writeFileSync(edited, '[Service]\n');
   // Edited after its termd started, and read since by a daemon-reload: newer than any process here.
   fs.utimesSync(edited, new Date(Date.now() + 600_000), new Date(Date.now() + 600_000));
+  // A unit file older than any process here, beside a drop-in edited since (the house's read of the 17 commits over our fixes, #22).
+  const unedited = path.join(tmp, 'unedited-termd.service');
+  fs.writeFileSync(unedited, '[Service]\n');
+  fs.utimesSync(unedited, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
+  const dropIn = path.join(tmp, 'termd.service.d-edited.conf');
+  fs.writeFileSync(dropIn, '[Service]\n');
+  fs.utimesSync(dropIn, new Date(Date.now() + 600_000), new Date(Date.now() + 600_000));
   const cases: Case[] = [
     { name: 'shared-data-dir-with-spaces-in-argv', when: true, stub: (dataDir) => unitStub({ port: 3101, dataDir }), dataDir: spaced('argv'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup argv with spaces, which a termd for port \d+ started here would use too/ },
     { name: 'shared-data-dir-with-spaces-in-environment', when: true, stub: (dataDir) => unitStub({ port: 3101, env: { TSM_DATA_DIR: dataDir } }), dataDir: spaced('env'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup env with spaces, which a termd/ },
@@ -1119,6 +1128,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // One that cannot be asked leaves the text, and the note says when the text may have changed since it started.
     { name: 'running-unit-needs-a-daemon-reload', when: linux, stub: (dataDir) => unitStub({ port: 3101, needReload: true, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /\(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"; the unit's text may have changed since that termd started: systemd says the unit needs a daemon-reload\) serves port 3101 out of the data dir/ },
     { name: 'running-unit-file-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: edited, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+edited-termd\.service is newer than its start\) serves port 3101 out of the data dir/ },
+    { name: 'running-unit-drop-in-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: unedited, dropIn, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+termd\.service\.d-edited\.conf is newer than its start\) serves port 3101 out of the data dir/ },
     // This user's live termd whose environment reads EACCES: unknown, not the manager's (which here names the shim's own data dir).
     { name: 'running-termd-alive-and-unreadable', when: sealed !== undefined, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir }, mainPid: sealed! }), expect: 'unknown', says: /the systemd user unit termd's running termd, pid \d+, is this user's, and its environment could not be read \(EACCES\); its running termd could not be asked: .*, so its port and data dir are unknown/ },
     // An env prefix is environment, as env applies it: read as arguments, these units were $HOME/.tsm.

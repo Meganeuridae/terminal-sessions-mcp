@@ -339,7 +339,7 @@ test("a running termd is asked for its data dir on the port its title names, and
     await new Promise((r) => server.close(r));
   }
   assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, ...proven }), { error: `nothing listens on port ${port}` });
-  // Linux shows a process's title in its cmdline, as termd sets it; elsewhere `ps` shows the start arguments.
+  // Linux shows a process's title in its cmdline, as termd sets it; only a systemd unit's termd is asked, so only Linux's /proc is read.
   if (process.platform === 'linux') {
     const child = spawn(process.execPath, ['-e', "process.title = 'termd --port 4321'; console.log('ready'); setTimeout(() => {}, 30_000)"], { stdio: ['ignore', 'pipe', 'ignore'] });
     try {
@@ -349,7 +349,7 @@ test("a running termd is asked for its data dir on the port its title names, and
       child.kill();
     }
   }
-  assert.match(JSON.stringify(titlePort(process.pid)), /its title is not a termd's with a port/);
+  assert.match(JSON.stringify(titlePort(process.pid)), process.platform === 'linux' ? /its title is not a termd's with a port/ : /its title cannot be read/);
 });
 
 test("the ask has one deadline for the whole exchange and reads at most 1 MiB, however the answer trickles in (a reviewer's read of the fixes for #22)", async () => {

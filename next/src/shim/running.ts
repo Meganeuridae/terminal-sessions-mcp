@@ -12,24 +12,23 @@
  * termd that requires one tells the shim too; an unproven listener never sees it. Where whose the socket
  * is cannot be shown, termd is not asked, and the shim reads the unit's text.
  */
-import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import { clocks } from '../core/clock.js';
 
-/** The port a running termd's title names, as Linux shows the title in /proc/<pid>/cmdline (else `ps`); or why there is none. */
+/**
+ * The port a running termd's title names, as Linux shows the title in /proc/<pid>/cmdline; or why there is
+ * none. Only a systemd unit's termd is asked, so only Linux's /proc is read: the `ps` it fell back to reads
+ * the same /proc there (the house's read of the 17 commits over our fixes, #22).
+ */
 export function titlePort(pid: number): number | { error: string } {
-  let title: string | undefined;
+  let title: string;
   try {
     title = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean).join(' ');
   } catch {
-    try {
-      title = execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 1500, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    } catch {
-      return { error: 'its title cannot be read' };
-    }
+    return { error: 'its title cannot be read' };
   }
   const m = /^termd --port (\d+)$/.exec(title.trim());
   const port = m ? Number(m[1]) : NaN;
@@ -47,6 +46,9 @@ export interface AskOptions {
 
 /** The most of /health's answer read: past it, the answer is not taken. */
 const HEALTH_MAX_BYTES = 1 << 20;
+
+/** How long a connection termd has yet to accept is looked up again (see connectionOf). */
+const ACCEPT_WAIT_MS = 1000;
 
 /**
  * What the termd on `port` says its data dir is, over /health, from a connection shown to be `pid`'s.
@@ -128,8 +130,9 @@ function health(host: string, port: number, pid: number, o: AskOptions, ms: numb
  * read as termd's, and the shim sent it its credential (a reviewer's run of the fixes for #22, on Ubuntu
  * 24.04). An IPv4 connection's server side is in tcp, or in tcp6 as a ::ffff: address when the listener is
  * an IPv6 socket; more than one line for it is refused. The accepted socket has an inode only once termd
- * accepts it, so the lookup is tried again, for at most a second. Elsewhere whose a socket is cannot be
- * shown, and the answer is not taken.
+ * accepts it, so the lookup is tried again every 10 ms for at most a second on the monotonic clock: counted
+ * as 100 tries, a loaded host's slow reads stretched it past the second (the house's read of the 17 commits
+ * over our fixes, #22). Elsewhere whose a socket is cannot be shown, and the answer is not taken.
  */
 export async function connectionOf(socket: net.Socket, pid: number): Promise<string | undefined> {
   if (process.platform !== 'linux') return 'this system does not show whose a socket is';
@@ -143,7 +146,8 @@ export async function connectionOf(socket: net.Socket, pid: number): Promise<str
         { table: '/proc/net/tcp6', local: procAddress(`::ffff:${remoteAddress}`, port, true), remote: procAddress(`::ffff:${localAddress}`, localPort, true) },
       ];
   if (wanted.some((w) => w.local === undefined || w.remote === undefined)) return `the connection's addresses are not read here (${remoteAddress}, ${localAddress})`;
-  for (let tries = 0; tries < 100 && !socket.destroyed; tries++) {
+  const giveUp = clocks.monotonic() + ACCEPT_WAIT_MS;
+  while (!socket.destroyed) {
     const inodes: string[] = [];
     for (const w of wanted) {
       let text: string;
@@ -176,6 +180,7 @@ export async function connectionOf(socket: net.Socket, pid: number): Promise<str
       });
       return owned ? undefined : `the socket that answered on port ${port} is not its`;
     }
+    if (clocks.monotonic() >= giveUp) break;
     await new Promise((r) => setTimeout(r, 10));
   }
   return `the socket that answered on port ${port} was not found accepted`;
