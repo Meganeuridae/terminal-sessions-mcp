@@ -53,8 +53,10 @@
  *   store failure appears in the text as a `[… N journal events missing …]`
  *   line where it was lost ("up to N" when the count is a bound: `gapNote`),
  *   and in `gap` (and `gaps`, when a page spans more than one). Every result —
- *   text or events, page or tail — reports the holes it spans the same way,
- *   and `describeGap` is the one wording of why.
+ *   text or events, page or tail, a session's or a Run's — reports every hole
+ *   that meets the seqs it covers, once and where the hole is, whether the gap
+ *   event that records it lies in the result, past it or on another page, and
+ *   `describeGap` is the one wording of why.
  * - `tail: N` gives the last N lines of the range (the session, a Run with
  *   `runId`, bounded by `since` and `until`, which `untilOffset` can place inside
  *   an event), up to `maxBytes`. N counts lines of output and notes (a hole's,
@@ -309,8 +311,10 @@ function addHole(gaps: GapInfo[], g: GapInfo): void {
 
 /** Report the holes a result spans: the first as `gap`, all of them as `gaps` when there are several. */
 function withGapInfo<R extends { gap?: GapInfo; gaps?: GapInfo[] }>(r: R, gaps: GapInfo[]): R {
-  if (gaps.length) r.gap = gaps[0]!;
-  if (gaps.length > 1) r.gaps = gaps;
+  // In seq order, as the text shows them: a result of each kind lists one page's holes alike.
+  const ordered = gaps.length > 1 ? [...gaps].sort((a, b) => a.from - b.from) : gaps;
+  if (ordered.length) r.gap = ordered[0]!;
+  if (ordered.length > 1) r.gaps = ordered;
   return r;
 }
 
@@ -332,7 +336,9 @@ const chunkOf = (e: Output, data = e.data): ProjectChunk => ({ data, stream: e.s
 /** `ends`: the line ends in `data` (lineEnds), read from the page's start, which lies outside every control sequence. */
 /** `kept`: in a shell Run's page, the parts of `data` that are the Run's own (runKept); absent when all of it is. */
 type OutPiece = { kind: 'out'; ev: Output; data: string; start: number; bytes: number; ends: number[]; kept?: Array<[number, number]> };
-type Piece = OutPiece | { kind: 'gap'; seq: Seq; gap: GapInfo; atStart?: true };
+/** A hole's piece; `atStart`: inferred at the range's start (retention), with no event seated at `seq`. */
+type GapPiece = { kind: 'gap'; seq: Seq; gap: GapInfo; atStart?: true };
+type Piece = OutPiece | GapPiece;
 
 /** The range a read or search walks: events after a cursor, in batches, up to an end. */
 interface Walk {
@@ -362,10 +368,10 @@ const gapEvent = (g: GapInfo): Gap => ({ type: 'gap', seq: g.to, ts: Date.now(),
  * reason (the house's read of 78c4d6e, #22). A recorded range can lie inside the inferred one: a
  * store-error gap is issued after the events caught up from the ring, so once retention takes those
  * too, the inferred hole runs past the recorded range on both sides, and both pieces are kept. The
- * recorded gaps are the ones the result returns, not every one fetched: a page that stops before the
- * recorded event reports the whole hole, rather than leaving part of it to a later page (the house's
- * read of the 38 commits, #22, comment 6274935728, items 3 and 4). Each part is counted exactly where
- * the journal's history vouches for it (`vouched`).
+ * recorded gaps are the holes the result reports, each seated where it is, whichever page holds its
+ * event (the house's read of the 38 commits, #22, comment 6274935728, items 3 and 4, and its review of
+ * f3750e4..4f4c067, comment 6315636412, question 5). Each part is counted exactly where the journal's
+ * history vouches for it (`vouched`).
  */
 const uncovered = (journal: Journal, gap: GapInfo, recorded: Iterable<GapInfo>): GapInfo[] => minusRanges([gap], recorded).map((g) => vouched(journal, g));
 
@@ -390,8 +396,11 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
   } else if (first.gap) gap = { ...first.gap };
   // The hole is left whole here: each result takes from it what the recorded gaps it returns report (uncovered).
   if (o.until !== undefined) end = Math.min(end, o.until);
-  /** Holes have been reported through this seq. */
-  let reported = gap?.to ?? from - 1;
+  /**
+   * Holes have been reported through this seq. Not through the inferred one at the start: a hole the journal knows
+   * there is reported, and the inferred one only for what that leaves (uncovered).
+   */
+  let reported = from - 1;
   let done = false;
   return {
     gap,
@@ -402,19 +411,20 @@ function walk(src: ReadSource, o: { runId?: string | undefined; since?: Seq | un
       const resumed = pending === undefined;
       pending = undefined;
       if (!r.more || r.events.length === 0) done = true;
-      const events: JournalEvent[] = [...r.events];
+      // A batch's holes are its `gaps`, every hole that meets the seqs it covers, each seated where it is, for a
+      // session's reads as for a Run's; not the gap events it holds, which may name a hole elsewhere, and miss one
+      // recorded past the batch or past `until` (the house's review of f3750e4..4f4c067, PR #22, comment 6315636412,
+      // question 5). Each is placed among the events once; after the last one, they reach to the range's end.
+      const events: JournalEvent[] = r.events.filter((e) => !isGap(e));
+      const holes = r.gaps ?? [];
       // Events gone since the walk began (retention while a search yielded) are a hole, not a seam
       // to join lines across: a gap event stands where they were (the house's read of 1cabc6a, #22).
       const inferred = !resumed ? undefined : 'truncated' in r ? retentionGap(journal, (cursor ?? 0) + 1, Math.min(end, events[0] ? events[0].seq - 1 : end)) : r.gap;
-      const lost = inferred ? minusRanges([inferred], recordedIn([...events, ...('gaps' in r ? (r.gaps ?? []) : [])])) : [];
+      const lost = inferred ? minusRanges([inferred], recordedIn(holes)) : [];
       events.unshift(...lost.filter((g) => g.to > reported).map((g) => gapEvent(vouched(journal, { ...g, from: Math.max(g.from, reported + 1) }))));
-      if ('gaps' in r && r.gaps) {
-        // A Run's output is filtered to its own events: its holes come apart and are placed among
-        // them, each once; after its last output they reach to the range's end.
-        const upTo = done ? end : (events[events.length - 1]?.seq ?? reported);
-        for (const g of r.gaps) if (g.seq > reported && g.seq <= upTo) events.push(g);
-        events.sort((a, b) => a.seq - b.seq);
-      }
+      const upTo = done ? end : (r.events[r.events.length - 1]?.seq ?? reported);
+      for (const g of holes) if (g.seq > reported && g.seq <= upTo) events.push(g);
+      events.sort((a, b) => a.seq - b.seq);
       if (events.length) reported = Math.max(reported, done ? end : events[events.length - 1]!.seq);
       if (r.events.length) cursor = r.events[r.events.length - 1]!.seq;
       return events;
@@ -534,6 +544,16 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // Whether events of the range remain after everything collected (the scan stopped early).
   const scanCut = !exhausted;
   const rangeEnd = exhausted ? Math.max(lastExamined, w.end) : lastExamined;
+  // The hole inferred at the page's start, less what the holes the journal knows there say, each part where it lies
+  // among them: a recorded hole is seated where it is, inside the inferred one, and its line goes in seq order.
+  const lead = pieces[0];
+  if (lead?.kind === 'gap' && lead.atStart) {
+    const known = pieces.flatMap((q) => (q.kind === 'gap' && !q.atStart ? [q.gap] : []));
+    let k = 1;
+    while (pieces[k]?.kind === 'gap' && (pieces[k] as GapPiece).seq <= lead.gap.to) k++;
+    const parts: GapPiece[] = uncovered(journal, lead.gap, known).map((g) => ({ kind: 'gap', seq: g.to, gap: g, atStart: true }));
+    pieces.splice(0, k, ...[...parts, ...(pieces.slice(1, k) as GapPiece[])].sort((a, b) => a.seq - b.seq));
+  }
 
   // Fit: choose input for at most `budget` bytes, project, and take less input while
   // the text is over maxBytes (never cut the head of a head-first page: er-1, ux-1).
@@ -544,7 +564,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const firstOut = pieces.find((q): q is OutPiece => q.kind === 'out');
   const state = firstOut && o.since !== undefined ? stateBefore(src, o, firstOut.ev, firstOut.start) + head : '';
   let budget = maxBytes;
-  let chosen = choose(pieces, budget, hold, journal);
+  let chosen = choose(pieces, budget, hold);
   const continued = (c: Chosen) => open || scanCut || c.taken < pieces.length || c.nextOffset !== undefined;
   const projectChosen = (c: Chosen) => projectPage(c, geometry, maxBytes, continued(c), state, firstOut);
   let p = await projectChosen(chosen);
@@ -552,7 +572,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     // Scale by what the projected part of the input produced.
     const projected = Math.max(1, chosen.inputBytes - p.omitted);
     budget = Math.max(1, Math.floor(projected * Math.min(1, maxBytes / Math.max(1, p.textBytes)) * 0.9));
-    const next = choose(pieces, budget, hold, journal);
+    const next = choose(pieces, budget, hold);
     if (next.inputBytes >= chosen.inputBytes) break;
     chosen = next;
     p = await projectChosen(chosen);
@@ -562,7 +582,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // with what follows it, so no page reads as empty text that stood for a line.
   const collected = pieces.reduce((a, q) => a + (q.kind === 'out' ? q.bytes : 0), 0);
   for (let grow = 0; grow < 3 && p.text === '' && chosen.inputBytes > 0 && chosen.inputBytes < collected; grow++) {
-    const next = choose(pieces, Math.min(collected, chosen.inputBytes + maxBytes), hold, journal);
+    const next = choose(pieces, Math.min(collected, chosen.inputBytes + maxBytes), hold);
     if (next.inputBytes <= chosen.inputBytes) break;
     chosen = next;
     p = await projectChosen(chosen);
@@ -834,7 +854,7 @@ function safeBefore(pieces: Piece[], pos: Pos): Pos {
  * line end. When everything fits and the range may go on (`hold`), a control
  * sequence left unfinished at the end waits for the next page, where its end is.
  */
-function choose(pieces: Piece[], budget: number, hold: boolean, journal: Journal): Chosen {
+function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
   const out = (i: number) => (pieces[i]?.kind === 'out' ? (pieces[i] as OutPiece) : undefined);
   let used = 0;
   let k = 0;
@@ -926,13 +946,10 @@ function choose(pieces: Piece[], budget: number, hold: boolean, journal: Journal
   const lastBySource = new Map<string, { ended: boolean; tail: string }>();
   const sources = new Set<string>();
   const c: Chosen = { chunks, labelled: false, inputBytes: 0, taken: end, gaps: [], midLine: false, held };
-  const recorded = taken.flatMap((pc) => (pc.kind === 'gap' && !pc.atStart ? [pc.gap] : []));
   for (const pc of taken) {
     if (pc.kind === 'gap') {
-      for (const g of pc.atStart ? uncovered(journal, pc.gap, recorded) : [pc.gap]) {
-        chunks.push({ note: gapNote(g) });
-        c.gaps.push(g);
-      }
+      chunks.push({ note: gapNote(pc.gap) });
+      c.gaps.push(pc.gap);
       if (!pc.atStart) c.lastSeq = pc.seq;
       lastBySource.clear(); // a hole ends every line
       continue;
@@ -1157,7 +1174,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     events = [...got, ...(ro.gaps ?? [])].sort((a, b) => a.seq - b.seq);
     // Nothing of the range retained: the hole is the range (the house's read of 1cabc6a, #22), less what a recorded gap already says.
     const inferred = ro.truncated && ro.events.length === 0 ? retentionGap(journal, rangeStart, end) : undefined;
-    if (inferred) events.unshift(...uncovered(journal, inferred, recordedIn(events)).map(gapEvent));
+    if (inferred) events = [...events, ...uncovered(journal, inferred, recordedIn(events)).map(gapEvent)].sort((a, b) => a.seq - b.seq);
   } else {
     // Walk back from the end until the lines, the byte cap, the event bound, `since` or retention stops it.
     end = o.until !== undefined ? Math.min(o.until, journal.lastSeq) : journal.lastSeq;
@@ -1167,17 +1184,29 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     let examined = 0;
     const parts: JournalEvent[][] = [];
     older = false;
+    /** What retention took of the range's start, when the walk reached it. */
+    let inferred: GapInfo | undefined;
+    /** The walk reached the range's start: the window covers the seqs from there. */
+    let reached = false;
+    // The window's events with its holes, every one that meets the seqs it covers, each where it is (Journal.holesIn),
+    // in place of the gap events it holds, as the pages have them (the house's review of f3750e4..4f4c067, PR #22,
+    // comment 6315636412, question 5): a tail with `until` inside a hole showed none of it.
+    const seated = (evs: JournalEvent[], from: Seq): JournalEvent[] => {
+      const holes = journal.holesIn(from, end, evs);
+      const rest = evs.filter((e) => !isGap(e));
+      return holes.length ? [...rest, ...holes].sort((a, b) => a.seq - b.seq) : rest;
+    };
     for (;;) {
-      if (o.since !== undefined && cursor <= o.since) break;
+      if (o.since !== undefined && cursor <= o.since) {
+        reached = true;
+        break;
+      }
       const fetched = journal.tail(512, cursor).filter((e) => o.since === undefined || e.seq > o.since);
       if (fetched.length === 0) {
-        // The range's start: what retention took of it is a hole, all of it when nothing is retained,
-        // less what the gap events the window holds already record.
-        const inferred = retentionGap(journal, (o.since ?? 0) + 1, cursor);
-        if (inferred) {
-          older = true;
-          parts.push(uncovered(journal, inferred, recordedIn(parts.flat())).map(gapEvent));
-        }
+        // The range's start: what retention took of it is a hole, all of it when nothing is retained.
+        inferred = retentionGap(journal, (o.since ?? 0) + 1, cursor);
+        if (inferred) older = true;
+        reached = true;
         break;
       }
       const batch = clip(fetched);
@@ -1189,12 +1218,16 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
         bytes += e.data.length;
       }
       cursor = fetched[0]!.seq - 1;
-      if (bytes >= cap || examined >= MAX_SCAN || enough([...parts].reverse().flat(), raw, cursor > (o.since ?? 0))) {
+      const sofar = [...parts].reverse().flat();
+      if (bytes >= cap || examined >= MAX_SCAN || enough(seated(sofar, sofar[0]!.seq), raw, cursor > (o.since ?? 0))) {
         older = cursor > (o.since ?? 0);
         break;
       }
     }
-    events = parts.reverse().flat();
+    const window = parts.reverse().flat();
+    events = seated(window, reached ? rangeStart : (window[0]?.seq ?? end + 1));
+    // Less what the window's holes already record, each part where it lies among them.
+    if (inferred) events = [...events, ...uncovered(journal, inferred, recordedIn(events)).map(gapEvent)].sort((a, b) => a.seq - b.seq);
   }
   if (o.as === 'events') {
     // The newest events whose stored lines fit `maxBytes` (at least one), at most n and 2,000; fewer
@@ -1470,13 +1503,16 @@ function opensBefore(src: ReadSource, o: ReadOptions, evs: JournalEvent[]): Map<
   let left = want.size;
   let cursor = (evs[0]?.seq ?? 1) - 1;
   let examined = 0;
-  walk: while (left > 0 && cursor > 0 && examined < MAX_SCAN) {
+  // A hole ends every sequence open before it: the walk stops at the last hole before the window, where the hole is,
+  // not at a gap event, which may name a hole elsewhere (as a Run's look-back does, openBefore).
+  const holeEnd = Math.max(0, ...src.journal.gapsWithin(1, cursor).map((g) => Math.min(g.to, cursor)));
+  walk: while (left > 0 && cursor > holeEnd && examined < MAX_SCAN) {
     const batch = src.journal.tail(512, cursor);
     if (batch.length === 0) break;
     examined += batch.length;
     for (let i = batch.length - 1; i >= 0; i--) {
       const e = batch[i]!;
-      if (isGap(e)) break walk;
+      if (e.seq <= holeEnd) break walk;
       if (!isOutput(e)) continue;
       const key = sourceKey(e);
       const had = bytes.get(key) ?? 0;

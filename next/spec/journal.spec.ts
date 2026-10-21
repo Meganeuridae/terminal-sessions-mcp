@@ -843,6 +843,41 @@ test('lost stretches stay in seq order when two refused gaps of a catch-up are d
   assert.equal(recorded.filter((g) => g.from >= refused[0]!).length, 1, 'the stretch from the first refused gap on is one');
 });
 
+test('a journal read reports every hole that meets the seqs it covers, wherever the hole\'s gap event lies: past `to`, past the page, or nowhere yet', () => {
+  // With 11–38 lost, `range(5, 20)` returned 5..10 and no gap, before the heal and after it recorded the gap at seq 51:
+  // a read reported a hole only as a gap event seated within it (the house's review of f3750e4..4f4c067, PR #22,
+  // comment 6315636412, question 5).
+  const cold = new FlakyStore();
+  cold.broken = false;
+  const j = new Journal({ hot: new MemoryStore(1500), cold });
+  for (let i = 1; i <= 10; i++) j.append(out(`line ${i}`));
+  cold.broken = true;
+  for (let i = 11; i <= 50; i++) j.append(out(`line ${i} ${'z'.repeat(40)}`));
+  const held = j.tail(1000).find((e) => e.type === 'output' && e.seq > 10)!.seq;
+  const holes = (r: { gaps?: JournalEvent[] }) => r.gaps?.map((g) => (g.type === 'gap' ? [g.seq, g.from, g.to, g.reason] : []));
+  const seqs = (r: { events: JournalEvent[] }) => r.events.map((e) => e.seq);
+  for (const when of ['before the heal', 'after it']) {
+    const inside = j.range(5, 20);
+    assert.deepEqual(seqs(inside), [5, 6, 7, 8, 9, 10], when);
+    assert.deepEqual(holes(inside), [[20, 11, held - 1, 'store-error']], `${when}: a read that ends inside the hole reports it, seated at its own end`);
+    const page = j.since(0, 12);
+    assert.deepEqual(holes(page), [[held - 1, 11, held - 1, 'store-error']], `${when}: a page reports it where it is`);
+    assert.deepEqual(holes(j.range(held, held + 3)), undefined, `${when}: a read wholly after it does not`);
+    if (when === 'before the heal') {
+      cold.broken = false;
+      assert.equal(j.retryCold(), true);
+    }
+  }
+  // The page that holds the recorded gap's own event does not report the hole: it lies wholly before what that page covers.
+  const recorded = j.since(held).events.find((e) => e.type === 'gap')!;
+  assert.ok(recorded.seq > 50, 'recorded past every page above');
+  const tailPage = j.since(recorded.seq - 1);
+  assert.ok(tailPage.events.some((e) => e.seq === recorded.seq));
+  assert.equal(tailPage.gaps, undefined);
+  // pages() carries each page's holes.
+  assert.deepEqual([...j.pages(0, 12)].flatMap((p) => holes(p) ?? []), [[held - 1, 11, held - 1, 'store-error']]);
+});
+
 test('a rotation header the disk refused is written before the new file’s first event, so the open Run survives retention', () => {
   const dir = tmpDir();
   const cjs = createRequire(import.meta.url)('node:fs') as typeof fs;

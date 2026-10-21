@@ -890,6 +890,29 @@ test('a raw tail counts a crash’s hole as up to its range, as a read does', as
   await call('killSession', { session: 'crashhole', graceful: false });
 });
 
+test('question 5: a raw and a clean tail mark a hole where it lies, though its gap was recorded after the lines that follow it', async () => {
+  // The catch-up records a hole when the disk takes writes again, after what followed the hole: the raw tail marked the
+  // hole where its gap event sat, after `after-1` and `after-2` (the house's review of f3750e4..4f4c067, PR #22, comment
+  // 6315636412, question 5).
+  await call('runCommand', { session: 'latehole', command: 'echo before-hole' });
+  const live = registry.get('latehole');
+  assert.ok(live?.kind === 'live');
+  const j = live.session.journal;
+  const a = j.append({ type: 'note', text: 'n', principal: 'agent:a@test' }).seq; // the seqs the hole stands for
+  const b = j.append({ type: 'note', text: 'n', principal: 'agent:a@test' }).seq;
+  j.append({ type: 'output', data: 'after-1\r\n', stream: 'pty' });
+  j.append({ type: 'output', data: 'after-2\r\n', stream: 'pty' });
+  j.append({ type: 'gap', from: a, to: b, reason: 'store-error', exact: true });
+  j.append({ type: 'output', data: 'last\r\n', stream: 'pty' });
+  for (const raw of [true, false]) {
+    const tail = lines(await call('tailLogs', { session: 'latehole', lines: 50, raw }));
+    const at = tail.findIndex((l) => /journal events missing/.test(l));
+    assert.ok(at > tail.findIndex((l) => l.includes('before-hole')) && at < tail.indexOf('after-1'), `raw ${raw}: the hole between before-hole and after-1: ${JSON.stringify(tail)}`);
+    assert.equal(tail.filter((l) => /journal events missing/.test(l)).length, 1, `raw ${raw}: once`);
+  }
+  await call('killSession', { session: 'latehole', graceful: false });
+});
+
 test('tailLogs counts lines of output across two sources, and the page its cut note advises meets its first line', async () => {
   // An independent read of the fix for the house's read of the 33 commits (#22, comment 6307350650): the tail kept
   // the last 6 lines of text, headers among them, so 3 lines of output showed; and the page of what came before was

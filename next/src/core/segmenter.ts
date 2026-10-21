@@ -583,7 +583,7 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
     if (kept.length > Math.max(64, keep * 4)) trim();
   };
 
-  // The holes the journal recorded as gap events, and those only a page's read reported.
+  // The holes the journal knows, and those only a page's read inferred.
   const recorded: Gone[] = [];
   const inferred: Gone[] = [];
   for (const page of src.journal.pages(since, SCAN_PAGE)) {
@@ -591,14 +591,16 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
     // the later page that starts inside it, and dropping it moved the catch-up past the hole with no
     // notice (the house's read of the 36 commits, #22, comment 6269992150).
     if (page.gap) inferred.push({ from: page.gap.from, to: page.gap.to, reason: page.gap.reason });
+    // Every hole that meets the seqs the page covers, wherever its gap event lies: a later page, past `end` (the
+    // store healed while this scan read, the house's read of the 33 commits, #22, comment 6307351104), or nowhere
+    // yet (a stretch still lost). The gap events a page holds may name holes elsewhere, and are not read for this
+    // (the house's review of f3750e4..4f4c067, PR #22, comment 6315636412, question 5).
+    for (const g of page.gaps ?? []) recorded.push({ from: g.from, to: g.to, reason: g.reason });
     const events = page.events;
     if (!events.length) break;
     for (const ev of events) {
       if (ev.seq > end) break;
-      // A hole the journal recorded as an event: a failing store's, once it recovered, which no page
-      // reports as a gap then, since the events after it are on disk again.
-      if (ev.type === 'gap') recorded.push({ from: ev.from, to: ev.to, reason: ev.reason });
-      else if (LIFE_EVENTS.has(ev.type)) {
+      if (LIFE_EVENTS.has(ev.type)) {
         tentative = [];
         lost = { principals: [], count: 0 };
       } else if (ev.type === 'run.end') {
@@ -627,11 +629,6 @@ export async function scanLifecycle(src: ReplaySource, since: Seq, opts: { keep?
   }
   for (const t of tentative) commit(t);
   trim();
-  // A hole the store healed while this scan read: the journal records it as a gap event issued after
-  // `end`, which the scan does not read, and the pages it read across the hole after the heal reported
-  // none; the next scan clips the range to its own span. The journal's index of gap events names it
-  // wherever its event sits (the house's read of the 33 commits, #22, comment 6307351104).
-  for (const g of src.journal.runs.gapsWithin(since + 1, end)) if (g.seq > end) recorded.push({ from: g.from, to: g.to, reason: g.reason });
   const out: LifecycleScan = { picked: kept, end };
   if (omitted) out.omitted = omitted;
   const gones = goneRanges(recorded, inferred, since + 1, end);

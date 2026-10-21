@@ -383,7 +383,9 @@ test('a page keeps a gap when its hole meets the seqs it covers and drops it whe
   o();
   j.append({ type: 'run.end', runId, state: 'exited', exit: 0, durationMs: 1 });
   const runWhole = j.runs.output(j, runId);
-  assert.deepEqual(runWhole.gaps?.map((g) => g.seq), [seat]);
+  // Seated where its hole ends, not where its event was written (the house's review of f3750e4..4f4c067, question 5).
+  assert.ok(seat > hole[1]!);
+  assert.deepEqual(runWhole.gaps?.map((g) => g.seq), [hole[1]]);
   for (const range of [{ limit: 3 }, { maxBytes: 6 }, { maxBytes: 12 }, { since: before[1]!, limit: 2 }] as RunOutputRange[]) {
     assert.deepEqual(j.runs.output(j, runId, range), narrowOutput(runWhole, range), JSON.stringify(range));
   }

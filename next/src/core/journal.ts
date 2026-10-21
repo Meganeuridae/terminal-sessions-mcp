@@ -41,7 +41,7 @@
  */
 import { clocks, timerMs } from './clock.js';
 import { boots } from './lock.js';
-import { RunIndex } from './runindex.js';
+import { distinctGaps, RunIndex } from './runindex.js';
 import { minusRanges } from './ranges.js';
 import { lineBytes, MemoryStore, newEpoch, type JournalStore, type Reservation } from './stores.js';
 import type { EventInput, EventOf, GapReason, Hole, JournalEvent, Seq } from './types.js';
@@ -57,6 +57,15 @@ export interface ReadResult {
    * at all reports its range too, under the reason of a hole the journal knows that holds it.
    */
   gap?: Hole;
+  /**
+   * Every hole that meets the seqs this result covers — from the read's start to its last event when `more`, else
+   * to its end — as one gap event each (distinctGaps), seated at the last seq of the hole the result covers: where
+   * the hole is, whether its own event lies among `events`, past them, past `to`, or on another page. A gap event
+   * among `events` whose hole lies wholly outside the seqs covered is none of them. Absent when there is none. A
+   * read that ended inside a hole, or a page whose hole was recorded later, read as complete (the house's review
+   * of f3750e4..4f4c067, PR #22, comment 6315636412, question 5); a Run's output reports its holes so already.
+   */
+  gaps?: GapEvent[];
   /** Cursor to continue from: the last returned seq, or the requested start when nothing was returned. */
   nextCursor: Seq;
   /** True when more retained events exist beyond `limit`. */
@@ -704,9 +713,9 @@ export class Journal {
 
   /**
    * Every retained event after `cursor`, oldest first, in pages of at most `pageSize` (`since`
-   * repeated to the end); a hole comes as its gap event, in the page where it lies (the house's read
-   * of 3eade8a, #22). The one loop for the readers that go to the end; a first page that holds only
-   * a gap is yielded for it.
+   * repeated to the end); each page's `gaps` reports every hole that meets the seqs it covers, where
+   * the hole lies (the house's read of 3eade8a, #22, and its review of f3750e4..4f4c067, question 5).
+   * The one loop for the readers that go to the end; a first page that holds only a gap is yielded for it.
    */
   *pages(cursor: Seq, pageSize = Number.POSITIVE_INFINITY): Generator<ReadResult, void, undefined> {
     for (;;) {
@@ -783,15 +792,24 @@ export class Journal {
     // again, and a new life records an inherited hole once more, so a Run's read showed it twice; past MAX_LOST, the
     // hole lost again is joined into a wider stretch, which then holds it (the house's review of the 77 commits
     // through 4f4c067, PR #22). Two ranges that only partly overlap are both kept.
-    if (all.length < 2) return all;
-    const kept = new Set<GapEvent>();
-    let reach = Number.NEGATIVE_INFINITY;
-    for (const g of [...all].sort((a, b) => a.from - b.from || b.to - a.to || a.seq - b.seq)) {
-      if (g.to <= reach) continue; // inside one already kept
-      kept.add(g);
-      reach = g.to;
-    }
-    return kept.size === all.length ? all : all.filter((g) => kept.has(g));
+    return distinctGaps(all);
+  }
+
+  /**
+   * The holes that meet [from, covered], each once and seated at the last seq of it the range covers (ReadResult.gaps):
+   * those the journal knows (gapsWithin), and any gap event among `events` that meets the range, which a store's
+   * index may not hold.
+   */
+  holesIn(from: Seq, covered: Seq, events: readonly JournalEvent[] = []): GapEvent[] {
+    if (covered < from) return [];
+    const meets = (g: GapEvent) => g.to >= from && g.from <= covered;
+    const listed = events.filter((e): e is GapEvent => e.type === 'gap' && meets(e));
+    const known = this.gapsWithin(from, covered);
+    // Never later than its own event: a line claiming its own seq or later ones is not the journal's (the run index
+    // leaves it out), and stays where it was written.
+    const seat = (g: GapEvent) => Math.min(g.to, covered, g.seq);
+    const seated = distinctGaps(listed.length ? [...known, ...listed] : known).map((g) => (g.seq === seat(g) ? g : { ...g, seq: seat(g) }));
+    return seated.sort((a, b) => a.seq - b.seq);
   }
 
   /**
@@ -860,6 +878,8 @@ export class Journal {
     const last = events[events.length - 1];
     const result: ReadResult = { events, nextCursor: last ? last.seq : cursor, more };
     if (gap && gap.to >= gap.from) result.gap = gap;
+    const holes = this.holesIn(from, more ? last!.seq : end, events);
+    if (holes.length) result.gaps = holes;
     return result;
   }
 

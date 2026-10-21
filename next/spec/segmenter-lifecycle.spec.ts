@@ -974,7 +974,7 @@ test('a hole the store heals while a scan reads is named by that scan: its gap e
 test('a scan clips each gone range to the seqs it covers, names a hole reported twice once, and keeps each range\'s reason', async () => {
   // The house's read of the 38 commits (#22, comment 6274773484): a page's gap was copied whole, and the lane pinned its
   // summary at the last gap's end, which can lie past the scan's end when the ring drops events during a paged scan.
-  let page: { events: JournalEvent[]; gap?: { from: number; to: number; reason: 'retention' }; nextCursor: number; more: boolean } = { events: [], gap: { from: 1, to: 150, reason: 'retention' }, nextCursor: 0, more: false };
+  let page: { events: JournalEvent[]; gap?: { from: number; to: number; reason: 'retention' }; gaps?: JournalEvent[]; nextCursor: number; more: boolean } = { events: [], gap: { from: 1, to: 150, reason: 'retention' }, nextCursor: 0, more: false };
   const journal = { lastSeq: 100, runs: { gapsWithin: () => [] }, *pages() { yield page; } } as unknown as Journal;
   const src = { id: 's', journal, owner: A, state: 'idle', cwd: undefined, controller: null, run: () => { throw new Error('run_not_found'); }, runText: async () => ({ text: '', truncated: false, seq: [0, 0], nextCursor: 0 }) } as unknown as ReplaySource;
   assert.deepEqual((await scanLifecycle(src, 0)).lost, [{ from: 1, to: 100, reason: 'retention' }], 'clipped to the scan’s end');
@@ -983,7 +983,9 @@ test('a scan clips each gone range to the seqs it covers, names a hole reported 
   // The recorded reason holds where the journal recorded the hole, and a page, which cannot tell why, says retention only for
   // the rest, as a read does: every range was called past retention (a reviewer's read of the fixes for #22).
   const gap = (seq: number, from: number, to: number, reason: 'store-failed' | 'torn-write' = 'store-failed'): JournalEvent => ({ type: 'gap', seq, ts: 0, from, to, reason });
-  page = { events: [gap(31, 10, 30), gap(91, 80, 90), gap(92, 1, 4), gap(93, 91, 92, 'torn-write'), { type: 'note', seq: 95, ts: 0, text: 'x' } as JournalEvent], gap: { from: 6, to: 20, reason: 'retention' }, nextCursor: 95, more: false };
+  // A page's holes are its `gaps`, as the journal reports them: every hole that meets the seqs it covers.
+  const known = [gap(31, 10, 30), gap(91, 80, 90), gap(92, 1, 4), gap(93, 91, 92, 'torn-write')];
+  page = { events: [...known, { type: 'note', seq: 95, ts: 0, text: 'x' } as JournalEvent], gaps: known, gap: { from: 6, to: 20, reason: 'retention' }, nextCursor: 95, more: false };
   assert.deepEqual((await scanLifecycle(src, 5)).lost, [
     { from: 6, to: 9, reason: 'retention' },
     { from: 10, to: 30, reason: 'store-failed' },
