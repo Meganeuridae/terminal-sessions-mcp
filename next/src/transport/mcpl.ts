@@ -1466,7 +1466,7 @@ export class McplLane {
       if (st.inflight.has(id)) continue;
       st.summaries.delete(id);
       // Its own seq goes too, or it stays owed when retention has taken it, or it was a gap's end the new scan
-      // finds grown: nothing then has its seq to settle it (Ambrose-2449's read). The scan re-owes an event still there.
+      // finds grown: nothing then has its seq to settle it (a reviewer's read of the retirement, #22). The scan re-owes an event still there.
       if (summary.owes !== undefined) st.owed.delete(summary.owes);
       const r = st.retries.get(id);
       if (r?.timer) clearTimeout(r.timer);
