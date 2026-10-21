@@ -1,7 +1,7 @@
 /** api-20: UTF-8-safe cutting (src/core/text.ts) for byte-capped results (G11). */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cutTail, executedIn, headIndex, indexAtByte, isStringStart, lineCarry, lineEnds, tailIndex, tailStart, utf8Length, safeCut, sequenceEnd, sequenceHead, stripEscapes, unfinishedSequence } from '../src/core/text.js';
+import { cutTail, executedIn, headAt, headIndex, indexAtByte, isStringStart, lineCarry, lineEnds, tailIndex, tailStart, utf8Length, safeCut, sequenceEnd, sequenceHead, stripEscapes, unfinishedSequence } from '../src/core/text.js';
 
 const bytes = (s: string) => Buffer.byteLength(s);
 const clean = (s: string) => !s.includes('�') && Buffer.from(s).toString() === s;
@@ -257,4 +257,11 @@ test('the heads of a CSI holding many line feeds cost its length, not its square
   assert.equal(sequenceHead(`\x1b[${'1;'.repeat(40)}!`, 0, 83), '\x1b[!', 'DECSTR keeps its `!`');
   assert.equal(sequenceHead(`\x9b${'1;'.repeat(40)} $`, 0, 83), '\x9b $', 'both intermediates, as written');
   assert.equal(sequenceHead(`\x1b(${' '.repeat(70)}`, 0, 72), `\x1b${' '.repeat(8)}`, 'an escape sequence in its intermediates: the last eight');
+  // A line begun after a LF a CSI executes goes on inside the CSI however far back it began in the event: looked for 4096
+  // units back, the head of a 6,000-unit CSI was '', and its rest `4mB` read as text (our review of the 40 commits through
+  // 4f4c067, PR #22).
+  for (const n of [100, 3000]) {
+    const data = `A\x1b[${'1;'.repeat(n)}\n4mB`;
+    assert.equal(headAt(data, data.indexOf('\n') + 1), '\x1b[0', `a CSI of ${2 * n + 2} units`);
+  }
 });

@@ -251,9 +251,14 @@ function csiStep(st: CsiState, c: number): CsiState {
   return 1;
 }
 
-/** The head of the CSI or escape sequence that `data[index]` lies inside (sequenceHead), '' when none does or it is a control string. */
+/**
+ * The head of the CSI or escape sequence that `data[index]` lies inside (sequenceHead), '' when none does or it is a control
+ * string. Its start is looked for through the whole of `data`, a whole event as its callers hold it: looked for 4096 units
+ * back, a line begun after a LF that a 6,000-unit CSI executed read the CSI's rest as text (our review of the 40 commits
+ * through 4f4c067, PR #22).
+ */
 export function headAt(data: string, index: number): string {
-  const inside = enclosingSequence(data, index, SEQUENCE_LOOKBACK);
+  const inside = enclosingSequence(data, index, Number.POSITIVE_INFINITY);
   return inside && !isStringStart(data, inside.start) ? sequenceHead(data, inside.start, index) : '';
 }
 
