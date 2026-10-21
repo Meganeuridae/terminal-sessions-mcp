@@ -18,7 +18,7 @@ import { SessionRegistry } from '../src/api/registry.js';
 import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermError } from '../src/core/errors.js';
 import { Journal } from '../src/core/journal.js';
-import { acquireDataDirLock, bootId, listProcesses, LOCK_FILE, PROC_START_SLACK_MS, procStart, statIsZombie, statStartTicks, type ProcessSource } from '../src/core/lock.js';
+import { acquireDataDirLock, bootId, listProcesses, LOCK_FILE, parseProcStat, PROC_START_SLACK_MS, procStart, readProcStat, type ProcessSource } from '../src/core/lock.js';
 
 /**
  * The builtin modules as lock.js sees them: patching a function here and calling syncBuiltinESMExports
@@ -308,25 +308,37 @@ test('jr2-2: a wall-clock step back does not take the lock from a live daemon (t
   }
 });
 
-test('the /proc stat parser counts fields after the last ")" (a comm with spaces and parentheses), and procStart reads a live pid frame-free on Linux (the house\'s read of the 36 commits, #22, item 4)', () => {
+/** A /proc/<pid>/stat line after its comm, as the kernel writes it: state S, pgrp 1234, tpgid 4321, start ticks 98765. */
+const STAT_TAIL = 'S 1 1234 1234 0 4321 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 12345678 500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0';
+
+test('the one /proc stat parser counts fields after the last ")" (a comm with spaces and parentheses): state, process group, foreground group and start ticks (the house\'s read of the 36 commits, PR #22, comment 6269992150, item 4; a reviewer\'s read of the fixes for #22)', () => {
   // Field 22 (starttime) sits at index 19 after the comm; a comm like "my (odd) comm" must not shift it.
-  const after = 'S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 12345678 500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0';
-  assert.equal(statStartTicks(`1234 (my (odd) comm) ${after}`), 98765);
-  assert.equal(statStartTicks(`1234 (node) ${after}`), 98765);
-  assert.equal(statStartTicks('garbage'), undefined);
-  assert.equal(statStartTicks('1234 (x) S 1'), undefined, 'too few fields');
-  if (process.platform === 'linux') {
-    const self = procStart(process.pid);
-    assert.ok(self, 'our own start reads');
-    assert.equal(self.startTicks, statStartTicks(fs.readFileSync('/proc/self/stat', 'utf8')), 'the same parser, the same unit');
-    assert.equal(self.bootId, fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim());
-    assert.equal(bootId(), self.bootId, 'read once, cached');
-    assert.equal(procStart(2_147_483_000), undefined, 'a pid that is not there');
-  } else {
-    assert.equal(procStart(process.pid), undefined);
-    assert.equal(bootId(), undefined);
-    console.log(`# procStart is Linux-only: the /proc read is skipped on ${process.platform}`);
-  }
+  const fields = { state: 'S', pgrp: 1234, tpgid: 4321, startTicks: 98765 };
+  assert.deepEqual(parseProcStat(`1234 (my (odd) comm) ${STAT_TAIL}`), fields);
+  assert.deepEqual(parseProcStat(`1234 (node) ${STAT_TAIL}\n`), fields);
+  assert.deepEqual(parseProcStat(`1 (init) ${STAT_TAIL.replace(' 4321 ', ' -1 ')}`), { ...fields, tpgid: -1 }, 'no terminal: tpgid -1');
+  assert.equal(parseProcStat('garbage'), undefined);
+  assert.equal(parseProcStat('1234 (x) S 1'), undefined, 'too few fields');
+  // readProcStat reads /proc/<pid>/stat through the parser: what the lock, procStart, the listing and the backend's foreground and reader checks call.
+  const files: Record<string, string> = { '/proc/1234/stat': `1234 (a) b) ${STAT_TAIL}` };
+  assert.deepEqual(readProcStat(1234, (f) => files[f]), fields);
+  assert.equal(readProcStat(77, (f) => files[f]), undefined, 'gone');
+  assert.equal(readProcStat(0, () => assert.fail('no read for pid 0')), undefined);
+});
+
+test('Linux: procStart reads a live pid frame-free through the same parser, and the boot id once (the house\'s read of the 36 commits, PR #22, comment 6269992150, item 4)', { skip: process.platform !== 'linux' ? `/proc is Linux's: skipped on ${process.platform}` : false }, () => {
+  const self = procStart(process.pid);
+  assert.ok(self, 'our own start reads');
+  assert.equal(self.startTicks, parseProcStat(fs.readFileSync('/proc/self/stat', 'utf8'))?.startTicks, 'the same parser, the same unit');
+  assert.equal(self.zombie, false);
+  assert.equal(self.bootId, fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim());
+  assert.equal(bootId(), self.bootId, 'read once, cached');
+  assert.equal(procStart(2_147_483_000), undefined, 'a pid that is not there');
+});
+
+test('off Linux there is no frame-free start: procStart and the boot id answer nothing', { skip: process.platform === 'linux' ? 'Linux has them' : false }, () => {
+  assert.equal(procStart(process.pid), undefined);
+  assert.equal(bootId(), undefined);
 });
 
 test('a filesystem without hard links: a link() refused with EPERM falls back to the exclusive write of the synced content, and the handle says so (a reviewer\'s read of the fixes for #22 comment 6269992150)', () => {
@@ -354,7 +366,7 @@ test('a filesystem without hard links: a link() refused with EPERM falls back to
 
 // ───────────── the house's read of the 38 commits (PR #22, comment 6274603516): two holders ─────────────
 
-test('item 1: a lock naming this pid that this process did not write is a predecessor\'s, taken over — "self" means the content this process wrote (the house\'s read of the 38 commits, #22)', () => {
+test('a lock naming this pid that this process did not write is a predecessor\'s, taken over — "self" means the content this process wrote (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 1)', () => {
   const dir = dataDir();
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, LOCK_FILE);
@@ -372,7 +384,7 @@ test('item 1: a lock naming this pid that this process did not write is a predec
   assert.equal(fs.existsSync(file), false, 'ours to release');
 });
 
-test('item 2: the no-hard-links fallback takes the lock only if termd.lock still holds its own record after the write — a taker that read it empty wins alone (the house\'s read of the 38 commits, #22)', () => {
+test('the no-hard-links fallback takes the lock only if termd.lock still holds its own record after the write — a taker that read it empty wins alone (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 2)', () => {
   const dir = dataDir();
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, LOCK_FILE);
@@ -406,7 +418,7 @@ test('item 2: the no-hard-links fallback takes the lock only if termd.lock still
   }
 });
 
-test('item 4: an EEXIST from a link that took effect (NFS) is this attempt\'s take when termd.lock holds its record: registered and released, not left behind (the house\'s read of the 38 commits, #22)', () => {
+test('an EEXIST from a link that took effect (NFS) is this attempt\'s take when termd.lock holds its record: registered and released, not left behind (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 4)', () => {
   const dir = dataDir();
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, LOCK_FILE);
@@ -421,14 +433,12 @@ test('item 4: an EEXIST from a link that took effect (NFS) is this attempt\'s ta
   assert.equal(fs.existsSync(file), false, 'released, so a clean exit leaves no lock naming a dead pid');
 });
 
-test('item 5: a zombie holder is gone — its stat still has the start ticks and kill(pid, 0) succeeds, but state Z is exited (the house\'s read of the 38 commits, #22)', async () => {
-  const after = 'S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 12345678 500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0';
-  assert.equal(statIsZombie(`1234 (node) ${after}`), false);
-  assert.equal(statIsZombie(`1234 (my (odd) comm) ${after.replace(/^S/, 'Z')}`), true);
-  if (process.platform !== 'linux') {
-    console.log(`# a real zombie needs /proc: the holder check is skipped on ${process.platform}`);
-    return;
-  }
+test('a zombie\'s stat reads state Z after any comm, which the lock and the listing count as gone (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 5)', () => {
+  assert.equal(parseProcStat(`1234 (node) ${STAT_TAIL}`)?.state, 'S');
+  assert.equal(parseProcStat(`1234 (my (odd) comm) ${STAT_TAIL.replace(/^S/, 'Z')}`)?.state, 'Z');
+});
+
+test('Linux: a zombie holder is gone — its stat still has the start ticks and kill(pid, 0) succeeds, but state Z is exited (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 5)', { skip: process.platform !== 'linux' ? `a real zombie needs /proc: skipped on ${process.platform}` : false }, async () => {
   const dir = dataDir();
   fs.mkdirSync(dir, { recursive: true });
   const holder = path.join(dir, 'holder.mjs');
@@ -439,7 +449,7 @@ test('item 5: a zombie holder is gone — its stat still has the start ticks and
     for (let i = 0; i < 200 && !fs.existsSync(path.join(dir, LOCK_FILE)); i++) await new Promise((r) => setTimeout(r, 25));
     await new Promise((r) => setTimeout(r, 400));
     const pid = readLock(dir).pid;
-    assert.equal(statIsZombie(fs.readFileSync(`/proc/${pid}/stat`, 'utf8')), true, 'the holder is a zombie');
+    assert.equal(parseProcStat(fs.readFileSync(`/proc/${pid}/stat`, 'utf8'))?.state, 'Z', 'the holder is a zombie');
     const lock = acquireDataDirLock(dir);
     assert.equal(lock.tookOver?.pid, pid, 'taken over: a zombie holds nothing');
     lock.release();
@@ -448,7 +458,7 @@ test('item 5: a zombie holder is gone — its stat still has the start ticks and
   }
 });
 
-test('item 6: a liveness check that cannot answer keeps the holder — an unknown is not stale (the house\'s read of the 38 commits, #22)', async () => {
+test('a liveness check that cannot answer keeps the holder — an unknown is not stale (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 6)', async () => {
   const dir = dataDir();
   fs.mkdirSync(dir, { recursive: true });
   // A live holder (not termd) whose lock the wall clock reads as a pid reuse (its startedAt is long past):
@@ -478,11 +488,7 @@ test('item 6: a liveness check that cannot answer keeps the holder — an unknow
   }
 });
 
-test('Linux: only the frame-free branch decides — a live holder whose lock\'s start ticks or boot id differ from its own is a reused pid, taken over (the house\'s read of the 38 commits, #22)', async () => {
-  if (process.platform !== 'linux') {
-    console.log(`# start ticks and the boot id are Linux's: the frame-free decision is skipped on ${process.platform}`);
-    return;
-  }
+test('Linux: only the frame-free branch decides — a live holder whose lock\'s start ticks or boot id differ from its own is a reused pid, taken over (the house\'s read of the 38 commits, PR #22, comment 6274603516)', { skip: process.platform !== 'linux' ? `start ticks and the boot id are Linux's: skipped on ${process.platform}` : false }, async () => {
   const dir = dataDir();
   fs.mkdirSync(dir, { recursive: true });
   // A live holder with nothing in its command line to keep it off the frame-free branch's verdict.
@@ -541,7 +547,7 @@ test('the lock is written whole and fsynced before it is published: a link that 
   }
 });
 
-test('items 7 and 8: a directory fsync failing with EIO after the lock is published is reported on the handle and logged once by the registry; the lock is held (the house\'s read of the 38 commits, #22)', async () => {
+test('a directory fsync failing with EIO after the lock is published is reported on the handle and logged once by the registry; the lock is held (the house\'s read of the 38 commits, PR #22, comment 6274603516, items 7 and 8)', async () => {
   const dir = dataDir();
   const lock = withDirFsyncEIO(() => acquireDataDirLock(dir));
   assert.equal(lock.unsynced, true, 'held, and the directory sync failure is reported');
@@ -556,18 +562,17 @@ test('items 7 and 8: a directory fsync failing with EIO after the lock is publis
 test('the process listing takes /proc first on Linux — rows with start ticks, the boot id and a start placed to the tick — and ps only when /proc does not answer, or off Linux (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 1)', () => {
   // With ps first, as before, a Linux host's rows carried neither ticks nor the boot id, so recovery's
   // frame-free checks and its boot guard never ran there. The Linux branch is driven through an injected
-  // source, so this runs on every host; the last assertion reads the machine's own /proc on Linux.
+  // source, so this runs on every host; the machine's own /proc is the next test's, on Linux.
   const stat = (pid: number, pgid: number, ticks: number, state = 'S') => `${pid} (sleep (x) y) ${state} 1 ${pgid} ${pgid} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 ${ticks} 12345678 500`;
   const now = 1_700_000_000_000;
   const files: Record<string, string> = {
     '/proc/uptime': '1000.50 2000.00\n',
     '/proc/stat': 'cpu  1 2 3 4\nbtime 1699998999\n',
-    '/proc/sys/kernel/random/boot_id': 'boot-A\n',
     '/proc/77/stat': stat(77, 77, 5000),
     '/proc/78/stat': stat(78, 77, 5012, 'Z'),
   };
   const psText = `   77    77 Ss   ${new Date(now - 950_000).toString().slice(0, 24)}\n   88    88 S    ${new Date(now).toString().slice(0, 24)}\n`;
-  const source = (over: Partial<ProcessSource> = {}): ProcessSource => ({ platform: 'linux', read: (f) => files[f], entries: () => ['77', '78', 'self', 'net'], ps: () => psText, now: () => now, self: 77, ...over });
+  const source = (over: Partial<ProcessSource> = {}): ProcessSource => ({ platform: 'linux', read: (f) => files[f], entries: () => ['77', '78', 'self', 'net'], ps: () => psText, now: () => now, bootId: () => 'boot-A', self: 77, ...over });
   const shape = (rows: ReturnType<typeof listProcesses>) => rows?.map((r) => [r.pid, r.pgid, r.startTicks, r.bootId, r.zombie]);
   const rows = listProcesses(source())!;
   assert.deepEqual(shape(rows), [[77, 77, 5000, 'boot-A', false], [78, 77, 5012, 'boot-A', true]], '/proc\'s rows, though ps answered too');
@@ -578,7 +583,7 @@ test('the process listing takes /proc first on Linux — rows with start ticks, 
   const btimeRows = listProcesses(source({ read: (f) => (f === '/proc/uptime' ? undefined : files[f]) }))!;
   assert.deepEqual([btimeRows[0]!.startMs, btimeRows[0]!.startSlackMs], [(1_699_998_999 + 50) * 1000, 1000]);
   // No boot id: rows without it, which recovery compares by the wall clock.
-  assert.equal(listProcesses(source({ read: (f) => (f.endsWith('boot_id') ? undefined : files[f]) }))![0]!.bootId, undefined);
+  assert.equal(listProcesses(source({ bootId: () => undefined }))![0]!.bootId, undefined);
   // /proc that does not answer — unlistable, or a listing without this process — and off Linux: ps's rows, whole seconds, no ticks.
   for (const [why, over] of [
     ['unlistable', { entries: () => undefined }],
@@ -590,11 +595,24 @@ test('the process listing takes /proc first on Linux — rows with start ticks, 
     assert.ok(ps!.every((r) => r.startTicks === undefined && r.bootId === undefined && r.startSlackMs === undefined), `${why}: no ticks from ps`);
   }
   assert.equal(listProcesses(source({ entries: () => undefined, ps: () => undefined })), undefined, 'neither answers');
-  if (process.platform === 'linux') {
-    const real = listProcesses()!;
-    assert.ok(real.some((r) => r.pid === process.pid), 'the machine\'s listing has this process');
-    assert.ok(real.every((r) => r.startTicks !== undefined && r.bootId === bootId() && r.startSlackMs === PROC_START_SLACK_MS), 'the machine\'s rows are /proc\'s');
-  } else {
-    console.log(`# the machine's /proc listing is Linux's: its last assertion is skipped on ${process.platform}`);
+  // The uptime is read on both sides of the wall clock: the later read places the boot (starts at their
+  // earliest), and the 80 ms between the reads widens the slack. Read once, after the clock, a stall
+  // between the clock and that read moved the starts earlier than the slack covered (a reviewer's read
+  // of the fixes for #22).
+  const uptimes = ['1000.50 2000.00\n', '1000.58 2000.00\n'];
+  let reads = 0;
+  const stalled = listProcesses(source({ read: (f) => (f === '/proc/uptime' ? uptimes[Math.min(reads++, 1)] : files[f]) }))!;
+  assert.equal(reads, 2, 'two uptime reads per listing');
+  assert.deepEqual([stalled[0]!.startMs, stalled[0]!.startSlackMs], [now - 1_000_580 + 50_000 - 10, PROC_START_SLACK_MS + 80]);
+  // The true start lies within the row's window wherever the clock's read fell between the two uptime reads.
+  for (const upAtClock of [1000.5, 1000.54, 1000.58]) {
+    const trueStart = now - upAtClock * 1000 + 50_000;
+    assert.ok(stalled[0]!.startMs <= trueStart && trueStart <= stalled[0]!.startMs + stalled[0]!.startSlackMs!, `uptime ${upAtClock} at the clock's read`);
   }
+});
+
+test('Linux: the machine\'s own listing is /proc\'s — every row with start ticks, the boot id read once, and the /proc slack', { skip: process.platform !== 'linux' ? `the machine's /proc is Linux's: skipped on ${process.platform}` : false }, () => {
+  const real = listProcesses()!;
+  assert.ok(real.some((r) => r.pid === process.pid), 'the machine\'s listing has this process');
+  assert.ok(real.every((r) => r.startTicks !== undefined && r.bootId === bootId() && r.startSlackMs! >= PROC_START_SLACK_MS), 'the machine\'s rows are /proc\'s');
 });

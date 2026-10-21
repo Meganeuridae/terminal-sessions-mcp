@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import * as pty from 'node-pty';
 import { err } from '../core/errors.js';
 import { processLaunch, shellLaunch, viaBash } from '../core/launch.js';
-import { procStart } from '../core/lock.js';
+import { procStart, readProcStat } from '../core/lock.js';
 import type { ExecutionBackend, ForegroundInfo, ProcessHandle, PtyExit, PtyHandle, SpawnProcessOptions, SpawnShellOptions } from './types.js';
 
 const signalName = (n: number | undefined): string | undefined => {
@@ -17,26 +17,16 @@ const signalName = (n: number | undefined): string | undefined => {
 /** After the leader exits, how long to let its pipes drain before reporting the exit. */
 const DRAIN_MS = 200;
 
-/** `/proc/<pid>/stat`'s process group and the terminal's foreground group; undefined when it cannot be read. */
-function procGroups(pid: number): { pgrp: number; tpgid: number } | undefined {
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    // pid (comm) state ppid pgrp session tty_nr tpgid …; comm may contain spaces.
-    const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    return { pgrp: Number(f[2]), tpgid: Number(f[5]) };
-  } catch {
-    return undefined;
-  }
-}
-
 /**
  * The shell's process group and the terminal's foreground group (tcgetpgrp), read
- * synchronously: `/proc/<pid>/stat` on Linux, `ps` elsewhere (about 2 ms on macOS).
+ * synchronously: `/proc/<pid>/stat` on Linux, through the one parser of that line the lock and
+ * recovery use (readProcStat; a reviewer's read of the fixes for #22), `ps` elsewhere (about
+ * 2 ms on macOS).
  */
 function readForeground(pid: number): ForegroundInfo | undefined {
   try {
     if (process.platform === 'linux') {
-      const g = procGroups(pid);
+      const g = readProcStat(pid);
       return g && g.pgrp > 0 && g.tpgid > 0 ? { shellPgid: g.pgrp, foregroundPgid: g.tpgid } : undefined;
     }
     const out = execFileSync('ps', ['-o', 'pgid=,tpgid=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 }).trim().split(/\s+/);
@@ -130,7 +120,7 @@ function otherReader(pid: number, tty: string | undefined): boolean | undefined 
 }
 
 function otherReaderProc(pid: number, tty: string): boolean | undefined {
-  const shell = procGroups(pid);
+  const shell = readProcStat(pid);
   if (!shell) return undefined;
   if (shell.tpgid !== shell.pgrp) return true;
   const members = procGroupMembers(pid, shell.tpgid);
@@ -167,7 +157,7 @@ function procGroupMembers(pid: number, pgrp: number): number[] | undefined {
       return undefined;
     }
     if (candidates.length > MAX_INSPECTED * 8) return undefined;
-    for (const c of candidates) if (c !== pid && procGroups(c)?.pgrp === pgrp) members.push(c);
+    for (const c of candidates) if (c !== pid && readProcStat(c)?.pgrp === pgrp) members.push(c);
     return members;
   }
   const seen = new Set<number>();
@@ -176,7 +166,7 @@ function procGroupMembers(pid: number, pgrp: number): number[] | undefined {
     if (seen.has(c)) continue;
     seen.add(c);
     if (seen.size > MAX_INSPECTED) return undefined;
-    if (procGroups(c)?.pgrp === pgrp) members.push(c);
+    if (readProcStat(c)?.pgrp === pgrp) members.push(c);
     candidates.push(...(children(c) ?? []));
   }
   return members;

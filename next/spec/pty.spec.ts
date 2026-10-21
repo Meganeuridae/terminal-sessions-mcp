@@ -380,7 +380,6 @@ test('/bin/bash: a process Run that leaves a child in the background says so (le
       assert.equal(start.bootId, fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(), 'and the boot id they count from');
     } else {
       assert.deepEqual([start.startTicks, start.bootId], [undefined, undefined]);
-      console.log(`# run.start carries no start ticks on ${process.platform}: the frame-free check is Linux-only and is skipped`);
     }
     const c = await session.cancel(r.runId, AGENT);
     assert.ok(c.steps.length > 0, JSON.stringify(c));

@@ -327,7 +327,7 @@ test('jr2-4: on Linux recovery compares process starts frame-free — a boot id 
   assert.deepEqual(sel(run({}), [row({ startMs: T })]), [1001], 'wall-clock fallback when ticks are absent');
 });
 
-test('jr2-4: a recovery that could not judge a Run\'s group keeps the dead daemon\'s last evidence on the lost end, and the next recovery bounds the group by it, not by the first recovery\'s time (the house\'s read of the 36 commits, #22, item 2)', async () => {
+test('jr2-4: a recovery that could not judge a Run\'s group keeps the dead daemon\'s last evidence on the lost end, and the next recovery bounds the group by it, not by the first recovery\'s time (the house\'s read of the 36 commits, PR #22, comment 6269992150, item 2)', async () => {
   // First recovery, unable to judge (the scripted backend disables endOrphans, which leaves the same
   // journal a missing process listing does: a lost end with no groupJudged). The dead daemon's last
   // event is the Run's start, at T_death.

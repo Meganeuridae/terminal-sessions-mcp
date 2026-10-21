@@ -63,9 +63,9 @@ export interface ProcessRow {
    */
   startMs: number;
   /**
-   * How far after `startMs` the process may have started: PROC_START_SLACK_MS for a /proc row whose
-   * uptime read, 1000 (whole seconds) for `ps`'s rows and when absent (the house's read of the 38
-   * commits, PR #22, comment 6274857431, item 3).
+   * How far after `startMs` the process may have started: PROC_START_SLACK_MS plus the time between the
+   * listing's two uptime reads for a /proc row whose uptime read, 1000 (whole seconds) for `ps`'s rows
+   * and when absent (the house's read of the 38 commits, PR #22, comment 6274857431, item 3).
    */
   startSlackMs?: number;
   /**
@@ -80,35 +80,63 @@ export interface ProcessRow {
   zombie: boolean;
 }
 
+const readFile = (file: string): string | undefined => {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return undefined;
+  }
+};
+
 let bootIdCache: { value: string | undefined } | undefined;
 
-/** The machine's boot id (Linux), read once per daemon from /proc/sys/kernel/random/boot_id, trimmed. Undefined elsewhere or when unreadable. */
+/**
+ * The machine's boot id (Linux), read once per daemon from /proc/sys/kernel/random/boot_id, trimmed:
+ * the lock, procStart and the machine's process listing all take it from here (a reviewer's read of
+ * the fixes for #22 comment 6274857431). Undefined elsewhere or when unreadable.
+ */
 export function bootId(): string | undefined {
   if (bootIdCache) return bootIdCache.value;
-  let value: string | undefined;
-  if (process.platform === 'linux') {
-    try {
-      const id = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-      value = id.length ? id : undefined;
-    } catch {
-      value = undefined;
-    }
-  }
-  bootIdCache = { value };
-  return value;
+  const id = process.platform === 'linux' ? readFile('/proc/sys/kernel/random/boot_id')?.trim() : undefined;
+  bootIdCache = { value: id || undefined };
+  return bootIdCache.value;
+}
+
+/** What the lock, recovery and the backend read from one /proc/<pid>/stat line. */
+export interface ProcStat {
+  /** Field 3: R, S, D, … ; Z is exited and not yet reaped, which the lock and recovery count as gone (comment 6274603516). */
+  state: string;
+  /** Field 5: the process group. */
+  pgrp: number;
+  /** Field 8: the foreground process group of the process's terminal (-1 without one). */
+  tpgid: number;
+  /** Field 22: the start, in clock ticks after boot. */
+  startTicks: number;
 }
 
 /**
- * The start time, in clock ticks after boot, from one /proc/<pid>/stat line (field 22). The comm field
- * (2) may hold spaces and parentheses, so the fields are counted after the last ')' (the house's read
- * of the 36 commits, #22, comment 6269992150, item 4). Undefined when the line does not parse.
+ * One /proc/<pid>/stat line's fields. The comm (field 2) may hold spaces and parentheses, so the
+ * fields are counted after the last ')' (the house's read of the 36 commits, #22, comment 6269992150,
+ * item 4). The one parser of that line: the lock, procStart, the process listing and the backend's
+ * foreground and reader checks all read through it, so none counts the fields its own way (a
+ * reviewer's read of the fixes for #22 comments 6274603516 and 6274857431). Undefined when the line
+ * does not parse.
  */
-export function statStartTicks(stat: string): number | undefined {
+export function parseProcStat(stat: string): ProcStat | undefined {
   const close = stat.lastIndexOf(')');
   if (close === -1) return undefined;
-  // pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads itrealvalue starttime …
-  const start = Number(stat.slice(close + 2).split(' ')[19]);
-  return Number.isFinite(start) ? start : undefined;
+  // state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads itrealvalue starttime …
+  const f = stat.slice(close + 2).split(' ');
+  const state = f[0];
+  const [pgrp, tpgid, startTicks] = [Number(f[2]), Number(f[5]), Number(f[19])];
+  if (!state || !Number.isInteger(pgrp) || !Number.isInteger(tpgid) || !Number.isInteger(startTicks)) return undefined;
+  return { state, pgrp, tpgid, startTicks };
+}
+
+/** `pid`'s /proc/<pid>/stat fields (Linux's /proc); undefined when it is gone, unreadable or does not parse. */
+export function readProcStat(pid: number, read: (file: string) => string | undefined = readFile): ProcStat | undefined {
+  const stat = pid > 0 ? read(`/proc/${pid}/stat`) : undefined;
+  return stat === undefined ? undefined : parseProcStat(stat);
 }
 
 /**
@@ -118,22 +146,10 @@ export function statStartTicks(stat: string): number | undefined {
  * the lock compare it. Undefined off Linux, when the pid is gone, or when either part is unreadable.
  */
 export function procStart(pid: number): { startTicks: number; bootId: string; zombie: boolean } | undefined {
-  if (process.platform !== 'linux' || !(pid > 0)) return undefined;
+  if (process.platform !== 'linux') return undefined;
   const id = bootId();
-  if (id === undefined) return undefined;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const startTicks = statStartTicks(stat);
-    return startTicks === undefined ? undefined : { startTicks, bootId: id, zombie: statIsZombie(stat) };
-  } catch {
-    return undefined;
-  }
-}
-
-/** Whether one /proc/<pid>/stat line's state (field 3, after the comm) is Z: exited and not yet reaped, so gone for the lock and recovery (comment 6274603516). */
-export function statIsZombie(stat: string): boolean {
-  const close = stat.lastIndexOf(')');
-  return close !== -1 && stat.slice(close + 2).split(' ')[0] === 'Z';
+  const stat = id === undefined ? undefined : readProcStat(pid);
+  return id === undefined || stat === undefined ? undefined : { startTicks: stat.startTicks, bootId: id, zombie: stat.state === 'Z' };
 }
 
 /** Block the thread: only for startup paths bounded to a few seconds, before the daemon serves anyone. */
@@ -158,9 +174,10 @@ export const groupAlive = (pgid: number): boolean => pgid > 1 && exists(-pgid);
 const TICK_MS = 10;
 /**
  * A /proc row's start is its ticks (10 ms) placed against /proc/uptime (10 ms) read beside the wall
- * clock: the true start lies within this of the row's earliest (two ticks, and a margin for the reads).
- * The bounds recovery compares it with are wall-clock records, so a clock step between a record and the
- * recovery moves the comparison by the step.
+ * clock: the true start lies within this of the row's earliest (two ticks, and a margin for rounding),
+ * plus the time between the listing's two uptime reads, which its rows add. The bounds recovery
+ * compares it with are wall-clock records, so a clock step between a record and the recovery moves the
+ * comparison by the step.
  */
 export const PROC_START_SLACK_MS = 2 * TICK_MS + 5;
 
@@ -178,17 +195,11 @@ export interface ProcessSource {
   ps(): string | undefined;
   /** The wall clock /proc's uptime is read against. */
   now(): number;
+  /** The boot id the rows count their ticks from; the machine's is read once (bootId). */
+  bootId(): string | undefined;
   /** This process's pid: a listing without it is no answer. */
   self: number;
 }
-
-const readFile = (file: string): string | undefined => {
-  try {
-    return fs.readFileSync(file, 'utf8');
-  } catch {
-    return undefined;
-  }
-};
 
 const machine: ProcessSource = {
   platform: process.platform,
@@ -208,6 +219,7 @@ const machine: ProcessSource = {
     }
   },
   now: Date.now,
+  bootId,
   self: process.pid,
 };
 
@@ -218,29 +230,30 @@ const machine: ProcessSource = {
 function procRows(src: ProcessSource): ProcessRow[] | undefined {
   if (src.platform !== 'linux') return undefined;
   const names = src.entries();
-  // The wall clock first, then the uptime: a delay between the two reads moves the starts earlier, never later.
+  // The uptime is read on both sides of the wall clock, so the uptime at the clock's read lies between
+  // the two: the boot is placed by the later read, which puts every start at its earliest, and the time
+  // between the reads widens the slack. Read once, after the clock, a stall between the clock and that
+  // read moved the starts earlier than the slack covered, leaning towards reading a stranger's start as
+  // before a Run's last event (a reviewer's read of the fixes for #22 comment 6274857431).
+  const uptime = () => Number(/^(\d+(?:\.\d+)?)\s/.exec(src.read('/proc/uptime') ?? '')?.[1]);
+  const upBefore = uptime();
   const now = src.now();
-  const uptime = Number(/^(\d+(?:\.\d+)?)\s/.exec(src.read('/proc/uptime') ?? '')?.[1]);
+  const upAfter = uptime();
   const btime = Number(/^btime (\d+)$/m.exec(src.read('/proc/stat') ?? '')?.[1]);
-  const placed = Number.isFinite(uptime);
+  const placed = Number.isFinite(upBefore) && Number.isFinite(upAfter);
   if (!names || (!placed && !Number.isFinite(btime))) return undefined;
-  const bootMs = placed ? now - uptime * 1000 : btime * 1000;
-  const slack = placed ? PROC_START_SLACK_MS : 1000;
-  const boot = src.read('/proc/sys/kernel/random/boot_id')?.trim() || undefined;
+  const bootMs = placed ? now - upAfter * 1000 : btime * 1000;
+  // Uptimes have two decimals: the difference rounds to whole milliseconds exactly.
+  const slack = placed ? PROC_START_SLACK_MS + Math.max(0, Math.round((upAfter - upBefore) * 1000)) : 1000;
+  const boot = src.bootId();
   const out: ProcessRow[] = [];
   for (const name of names) {
     if (!/^\d+$/.test(name)) continue;
-    const stat = src.read(`/proc/${name}/stat`);
-    if (stat === undefined) continue; // gone meanwhile
-    // The fields after the comm (which may hold spaces and parentheses): state ppid pgrp …; the start
-    // ticks come from the one parser every side uses (statStartTicks), frame-free for recovery.
-    const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    const pgid = Number(f[2]);
-    const start = statStartTicks(stat);
-    if (!Number.isFinite(pgid) || start === undefined) continue;
+    const stat = readProcStat(Number(name), src.read);
+    if (stat === undefined) continue; // gone meanwhile, or not a line this parser reads
     // The earliest the process can have started: its tick, less the uptime's own tick when placed by it.
-    const startMs = placed ? Math.floor(bootMs + start * TICK_MS) - TICK_MS : Math.floor(btime + start * (TICK_MS / 1000)) * 1000;
-    out.push({ pid: Number(name), pgid, startMs, startSlackMs: slack, startTicks: start, ...(boot !== undefined && { bootId: boot }), zombie: f[0] === 'Z' });
+    const startMs = placed ? Math.floor(bootMs + stat.startTicks * TICK_MS) - TICK_MS : Math.floor(btime + stat.startTicks * (TICK_MS / 1000)) * 1000;
+    out.push({ pid: Number(name), pgid: stat.pgrp, startMs, startSlackMs: slack, startTicks: stat.startTicks, ...(boot !== undefined && { bootId: boot }), zombie: stat.state === 'Z' });
   }
   return out;
 }
