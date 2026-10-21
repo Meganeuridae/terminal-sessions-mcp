@@ -1173,9 +1173,12 @@ export class Segmenter {
       buf = buf.slice(safeCut(buf, cr !== -1 && buf.length - cr - 1 <= CARRY_MAX ? cr + 1 : buf.length - CARRY_MAX));
       // Inside a string the line-end rule holds open, whose introducer lay further back than safeCut looks, the
       // cut kept only its payload, which then read as the line's text (a clipboard's base64 in the digest: a
-      // reviewer's read of the fixes for #22). The kept carry begins at the string's introducer again.
+      // reviewer's read of the fixes for #22). The kept carry begins at the string's introducer again, with
+      // what the carry holds of a DCS's state after it (its final byte read, or its parameters' state), and
+      // without a last ESC, which the kept text ends with already.
       if (w.scan.open && unfinishedSequence(buf, Number.POSITIVE_INFINITY) === buf.length) {
-        buf = w.scan.open.slice(0, w.scan.open.charCodeAt(0) === 0x1b ? 2 : 1) + buf;
+        const open = w.scan.open;
+        buf = (open.length > 1 && open.endsWith('\x1b') ? open.slice(0, -1) : open) + buf;
       }
     }
     w.carry = buf;

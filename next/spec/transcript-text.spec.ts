@@ -204,3 +204,24 @@ test('a LF a CSI executes ends a line: lineEnds reports it with the head the nex
   assert.equal(t.slice(tailStart(t, 10)), '\x1b[3\nCB\nend');
   assert.equal(t.slice(tailStart(t, 9)), 'end');
 });
+
+test('a DCS before its final byte ends at a code point from U+00A0, taken with it, as the emulator abandons it; a CSI as well (an independent read of the house’s fixes for #22)', () => {
+  // Cyrillic read as Latin-1 and written again: `А` is U+00D0 U+0090, a C1 DCS introducer then a code point from U+00A0.
+  const mojibake = `${Buffer.from('Анна', 'utf8').toString('latin1')}\r\nline2\r\nline3\r\n`;
+  assert.equal(stripEscapes(mojibake).text, 'Ð½Ð½Ð°\nline2\nline3\n', 'it read `Ð`, the rest a DCS waiting for its ST');
+  assert.equal(lineEnds(mojibake).length, 3);
+  assert.equal(sequenceEnd('\x90éx', 0), 2, 'the code point goes with it');
+  assert.equal(sequenceEnd('\x1bP1;2 éx', 0), 7, 'after parameters and an intermediate');
+  assert.equal(sequenceEnd('\x90\n\x7féx', 0), 4, 'C0 controls and DEL before it are ignored, and leave it waiting');
+  assert.equal(sequenceEnd('\x90\u{1F600}x', 0), 3, 'both halves of a pair');
+  assert.equal(sequenceEnd('\x90qéx\x1b\\', 0), 6, 'after its final byte a code point is payload');
+  assert.equal(sequenceEnd('\x1bP1?éx\x1b\\', 0), 8, 'a misplaced byte set it to ignore the rest: payload too');
+  assert.equal(sequenceEnd('\x1b[1éxm', 0), 4, 'a CSI: the emulator shows `xm`');
+  assert.equal(stripEscapes('A\x1b[1éxmB').text, 'AxmB');
+  // Split across events, the carry keeps what the DCS has read, so the next event reads on in that state.
+  for (const [first, rest, ends] of [['A\x90', 'éx\nnext\n', [2, 7]], ['A\x901;', 'éx\n', [2]], ['A\x90q', 'éx\nstill payload\n\x1b\\after\n', [24]], ['A\x1bP1?', 'é\n\x1b\\\n', [4]]] as const) {
+    const carry = lineCarry();
+    lineEnds(first, carry);
+    assert.deepEqual(lineEnds(rest, carry), ends, JSON.stringify([first, rest]));
+  }
+});

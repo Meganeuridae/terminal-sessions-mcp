@@ -136,6 +136,16 @@ test('a LF a CSI executes ends a line, and the next line reads the CSI on: its r
   assert.deepEqual((await readJournal(two, { tail: 3 }, { resultBytes: 16384 })).text!.split('\n'), ['[terminal]', 'A', '[run r1]', 'r1', '[terminal]', 'B here']);
 });
 
+test('Cyrillic read as Latin-1 and written again is searchable: the DCS its `А` opens ends at its next character, as the emulator ends it, wherever the events split it (an independent read of the house’s fixes for #22)', async () => {
+  const data = `${Buffer.from('Анна', 'utf8').toString('latin1')}\r\nline2\r\nline3\r\nline4\r\n`;
+  for (let cut = 0; cut < data.length; cut++) {
+    const src = source();
+    if (cut) out(src.journal, data.slice(0, cut));
+    out(src.journal, data.slice(cut));
+    assert.deepEqual(lines(await search(src, { pattern: '^line3$', since: 0 })), ['line3'], `split at ${cut}`);
+  }
+});
+
 // ───────────── jr2-10 / m2-25: a scan pages, and says so ─────────────
 
 test('jr2-10 / m2-25: a scan that hits its budget says more, and continuing from nextCursor finds what lies beyond', async () => {

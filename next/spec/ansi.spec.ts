@@ -272,6 +272,12 @@ const INSIDE = [
   'A\x1b(\r\nBx\r\n',
   'A\x1b\x1b[31mB\r\n',
   'A\x1b\r\n]0;title\x07B\r\n',
+  // A DCS before its final byte, and a CSI, end at a code point from U+00A0, which goes with them (an independent read of the house's fixes for #22).
+  `${Buffer.from('Анна', 'utf8').toString('latin1')}\r\nline2\r\n`,
+  'A\x901;2 \u00e9xB\r\nnext\r\n',
+  'A\x90q\u00e9xB\x1b\\C\r\nnext\r\n',
+  'A\x1bP1?\u00e9xB\x1b\\C\r\nnext\r\n',
+  'A\x1b[1\u00e9xmB\r\n',
 ];
 
 test('cleanLine applies the controls a sequence executes where they stand, then what the sequence does, as the transcript does', async () => {
@@ -283,7 +289,7 @@ test('cleanLine applies the controls a sequence executes where they stand, then 
   assert.equal(cleanLine('ABC\x1b[\bDX'), 'AXC', 'a backspace, then a move one cell left');
 });
 
-test('a LF a CSI or an escape sequence executes ends a line for a watch, and the next line reads the sequence on: as the transcript shows it, however the output is split', async () => {
+test('a LF a CSI or an escape sequence executes ends a line for a watch, and the next line reads the sequence on; a sequence a code point abandons ends there: as the transcript shows it, however the output is split', async () => {
   for (const data of INSIDE) {
     const rows = (await transcript([{ data, stream: 'pty' }], { cols: 80 })).split('\n').filter((l) => l !== '');
     for (let cut = 0; cut < data.length; cut++) {

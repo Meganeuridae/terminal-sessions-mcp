@@ -272,7 +272,7 @@ export function lineEnds(data: string, carry: LineCarry = lineCarry(), max = Num
         if (str) {
           // Open to the end of the data: its introducer, and a last ESC that may begin a string's terminator.
           const body = t[at] === '\x1b' ? escKind(t, at) + 1 : at + 1;
-          carry.open = (t[at] === '\x1b' ? `\x1b${t[body - 1]}` : t[at]!) + (t.length > body && t.endsWith('\x1b') ? '\x1b' : '');
+          carry.open = (t[at] === '\x1b' ? `\x1b${t[body - 1]}` : t[at]!) + stringState(t, at, body) + (t.length > body && t.endsWith('\x1b') ? '\x1b' : '');
         } else if (ends.length < max) carry.open = sequenceHead(t, at, t.length);
         break;
       }
@@ -353,8 +353,11 @@ const charUnits = (data: string, k: number): number => (isHigh(data.charCodeAt(k
  * emulator ends it: at ST (`ESC \` or U+009C); at BEL only when it is an OSC, since in a DCS, SOS,
  * PM or APC a BEL is payload; where CAN or SUB aborts it, a new sequence's ESC abandons it, or any
  * other C1 control ends it, which then acts (U+009B opens a CSI, U+0090 a DCS, and so on); and an
- * SOS, PM or APC where a code point from U+00A0 abandons it, that code point with it. Those that end
- * it and act are not part of it. The C1 introducers open the strings and CSI as their ESC forms do
+ * SOS, PM or APC where a code point from U+00A0 abandons it, that code point with it, as it abandons a
+ * DCS that has not had its final byte yet (unless a misplaced byte set it to ignore the rest): Cyrillic
+ * read as Latin-1 and written again (`А` as U+00D0 U+0090) opened a DCS at its second character that
+ * the emulator ended at the next, and this read on to an ST, so its text and line ends were lost (an
+ * independent read of the house's fixes for #22). Those that end it and act are not part of it. The C1 introducers open the strings and CSI as their ESC forms do
  * (an independent read of the fix for the house's read of the 33 commits, #22, comment 6307350650:
  * the emulator ended `ESC ] 0 ; my CAN` at the CAN, and opened an OSC at U+009D, where this read
  * on; and a reviewer's read of the fixes for #22: a BEL inside an APC ended it here and not there,
@@ -419,6 +422,9 @@ export function sequenceEnd(data: string, e: number): number | undefined {
   // OSC, DCS, SOS, PM, APC: to ST, BEL for an OSC, or where something else ends it.
   const osc = str === 0x9d;
   const opaque = str === 0x98 || str === 0x9e || str === 0x9f; // SOS, PM, APC
+  // A DCS before its final byte: the state its parameter bytes leave it in (as a CSI's); undefined once it
+  // has its final byte and the rest is payload, and for every other string.
+  let params: CsiState | undefined = str === 0x90 ? 0 : undefined;
   for (; i < data.length; i++) {
     const c = data.charCodeAt(i);
     if (c === 0x07) {
@@ -430,9 +436,31 @@ export function sequenceEnd(data: string, e: number): number | undefined {
     if (c === 0x18 || c === 0x1a) return i;
     if (c === 0x1b && data[i + 1] === '\\') return i + 2;
     if (c === 0x1b && i + 1 < data.length) return i; // a new sequence abandons the string
-    if (opaque && c >= 0xa0) return i + (isHigh(c) && i + 1 < data.length && isLow(data.charCodeAt(i + 1)) ? 2 : 1);
+    if (opaque && c >= 0xa0) return i + charUnits(data, i);
+    if (params === undefined) continue;
+    if (c >= 0xa0 && params !== 3) return i + charUnits(data, i);
+    if (c >= 0x40 && c <= 0x7e) params = undefined;
+    else if (c >= 0x20 && c <= 0x3f) params = csiStep(params, c);
   }
   return undefined;
+}
+
+/**
+ * What the carry of a control string open at the end of `data` holds after its introducer (lineEnds): for a
+ * DCS, what its bytes from `from` on leave it in, so the next data reads on in the same state (a final byte
+ * once it has one, its payload following; else a parameter, an intermediate, or the state ignoring the rest,
+ * as sequenceHead shortens a CSI's); nothing for any other string.
+ */
+function stringState(data: string, at: number, from: number): string {
+  const c = data.charCodeAt(at);
+  if ((c === 0x1b ? data.charCodeAt(from - 1) + 0x40 : c) !== 0x90) return '';
+  let st: CsiState = 0;
+  for (let k = from; k < data.length; k++) {
+    const b = data.charCodeAt(k);
+    if (b >= 0x40 && b <= 0x7e) return 'p';
+    if (b >= 0x20 && b <= 0x3f) st = csiStep(st, b);
+  }
+  return ['', '0', ' ', '0?'][st]!;
 }
 
 /** The last `ch` in `s`, -1 when none: the forward search proves absence far faster than the backward one. */
