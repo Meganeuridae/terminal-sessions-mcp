@@ -1135,13 +1135,19 @@ function rawPage(src: ReadSource, o: ReadOptions, maxBytes: number, run: RunInfo
   const note = (g: GapInfo) => {
     text += `${(text === '' ? o.since !== undefined : !text.endsWith('\n')) ? '\n' : ''}${gapNote(g)}\n`;
   };
-  // A hole the page infers at its start (retention) is reported beside its events, not among them: its note leads.
+  // A hole the page infers at its start (retention) is reported beside its events, not among them. Its parts are noted
+  // where the seqs they stand for fall among the events, as a text page has them: all of them first, ahead of a
+  // recorded gap that lies between two of them, printed the notes out of order (an independent read of the fixes for
+  // the review of the 40 commits, PR #22).
   const recorded = new Set(events.filter(isGap).map((e) => `${e.from}:${e.to}`));
-  for (const g of page.gaps ?? (page.gap ? [page.gap] : [])) if (!recorded.has(`${g.from}:${g.to}`)) note(g);
+  const inferred = (page.gaps ?? (page.gap ? [page.gap] : [])).filter((g) => !recorded.has(`${g.from}:${g.to}`)).sort((a, b) => a.to - b.to);
+  let k = 0;
   events.forEach((e, i) => {
+    while (k < inferred.length && inferred[k]!.to < e.seq) note(inferred[k++]!);
     if (isGap(e)) note(gapOf(e));
     else if (isOutput(e)) text += kept[i]?.map(([a, b]) => e.data.slice(a, b)).join('') ?? e.data;
   });
+  while (k < inferred.length) note(inferred[k++]!);
   return { ...page, text };
 }
 

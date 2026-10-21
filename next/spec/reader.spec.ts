@@ -1751,3 +1751,19 @@ test('a batch of gap events that adds nothing new does not end a read or a searc
   const found = await searchJournal(src, { pattern: 'after', since: 0 });
   assert.equal(found.matches.length, 1);
 });
+
+test("a raw page notes the parts of a retention hole in order among the gaps it records (an independent read of the fixes for the review of the 40 commits, PR #22)", async () => {
+  // A recorded hole inside what retention took splits the inferred hole in two; both parts were noted ahead of it.
+  const j = new Journal({ sessionId: 's', hot: new MemoryStore(600) });
+  const src = source({ journal: j });
+  for (let i = 0; i < 60; i++) out(j, `line ${i}\r\n`);
+  j.append({ type: 'gap', from: 5, to: 8, reason: 'store-error' });
+  out(j, 'tail\r\n');
+  const notes = (t: string) => t.split('\n').filter((l) => l.startsWith('[…')).map((l) => /seq (\d+)–(\d+)/.exec(l)!.slice(1).map(Number));
+  const raw = await readJournal(src, { since: 0, as: 'raw', maxBytes: 1 << 20 }, { resultBytes: 1 << 20 });
+  const text = await readJournal(src, { since: 0, maxBytes: 1 << 20 }, { resultBytes: 1 << 20 });
+  const order = notes(raw.text!);
+  assert.equal(order.length, 3, raw.text!.slice(0, 300));
+  assert.deepEqual(order.slice(0, 2), [[1, 4], [5, 8]]);
+  assert.deepEqual(order, notes(text.text!), 'as a text page orders them');
+});
