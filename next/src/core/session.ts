@@ -220,6 +220,8 @@ const PROMPT_PROBE_GRACE_MS = 300;
  */
 const EDITOR_SETTLE_READS = 4;
 const EDITOR_SETTLE_STEP_MS = 50;
+/** The newest replies to the shell's terminal queries kept for resendReplies. */
+const REPLIES_KEPT = 8;
 /** What a note says when the reinit gate after `exec bash` gives up: the recovery that loads the integration with the session's key. */
 const REINIT_RECOVERY = 'Shell commands are unavailable until it loads: once the shell shows its own prompt, send ` . "$TSM_BASH_RC" reinit typed` with input to load it, or open a new session';
 const publicRun = (r: RunRecord): RunInfo => {
@@ -569,6 +571,8 @@ export class Session {
    * up on it is not a person's command, and a Run written after it waits behind it (onPreExec).
    */
   private probeLine: { file: string; order: number } | undefined;
+  /** The replies the screen wrote to the shell's terminal queries since its last command ended, the newest REPLIES_KEPT (resendReplies). */
+  private replies: string[] = [];
   private readonly queue: RunRecord[] = [];
   /**
    * Declared shells (§8.1): the Run in flight in front of each program — keyed by the Run whose
@@ -700,8 +704,9 @@ export class Session {
     // G25: the daemon's emulator is the sole responder to terminal queries.
     this.screen.onReply((reply) => {
       if (this.shellState === 'exited' || this.closed) return;
-      this.pty.write(reply);
-      this.append({ type: 'input', data: reply, principal: SYSTEM, kind: 'protocol-reply' });
+      this.writeReply(reply);
+      this.replies.push(reply);
+      if (this.replies.length > REPLIES_KEPT) this.replies.shift();
     });
     this.screen.onMode((alt) => this.append({ type: 'screen.mode', alt }));
     // §6 backpressure: when the daemon's own emulator falls behind, stop reading the PTY until
@@ -1299,6 +1304,8 @@ export class Session {
 
   private onCommandEnd(exit: number | undefined, pipeStatus?: number[]): void {
     this.declareIntegration('basic');
+    // The prompt drawn next sends its own queries; what the command was answered is its own (resendReplies).
+    this.replies = [];
     const run = this.currentShellRun;
     if (run && run.strategy === 'marker') return; // its marker ends it
     if (run && run.state === 'running') {
@@ -2487,6 +2494,7 @@ export class Session {
       // 6307351617, item 1). It stays busy until the shell shows it is back, which askForPrompt asks.
       this.discardPending(run, { state: 'cancelled', reason: 'cancelled-before-start' });
       steps.push('the line was discarded before it started');
+      this.resendReplies();
       const asked = await this.askForPrompt();
       const discarded = `${runId}: no mark followed two ^C; the line was discarded before it started`;
       if (asked === 'typed') {
@@ -2610,6 +2618,30 @@ export class Session {
     } catch (e) {
       this.note(`the empty line's file ${probe.path} could not be removed (${errMessage(e)}); it is removed with the session's other files`);
     }
+  }
+
+  /**
+   * A ^C's tty flush discards the input the shell has not read, the daemon's replies to its terminal
+   * queries with it. fish 4.9 sends queries with each prompt and reads no key until the DA1 reply
+   * comes: stopped across a cancel, whose empty line a later ^C flushed, it read nothing more, an Enter
+   * included, until the session closed (found by run on macOS while answering the house's review of the
+   * 40 commits through f3750e4, #22 comment 6310921374, question 1). So the replies written since the shell's last command ended go
+   * again after the ^Cs of a cancel that drew no mark, ahead of its empty line, and after any ^C while the
+   * shell has not answered it. A shell that read them already gets them twice: fish ignores a reply it
+   * did not ask for; bash and zsh, whose prompts send no queries unless a theme does, would show one in
+   * the editor, which a daemon line's clear keys empty.
+   */
+  private resendReplies(): void {
+    for (const reply of this.replies) this.writeReply(reply);
+  }
+
+  private resendRepliesWhileUnanswered(): void {
+    if (this.promptProbe && !this.promptProbe.started) this.resendReplies();
+  }
+
+  private writeReply(reply: string): void {
+    this.pty.write(reply);
+    this.append({ type: 'input', data: reply, principal: SYSTEM, kind: 'protocol-reply' });
   }
 
   private requireCancel(run: RunRecord, principal: Principal, asOwner: boolean): void {
@@ -2812,6 +2844,7 @@ export class Session {
       this.noteEditing(data);
     }
     this.pty.write(data);
+    if (data.includes('\x03')) this.resendRepliesWhileUnanswered();
     // Send the user's clearing keys before giving a waiting declared Run its turn.
     const layer = this.layers.at(-1);
     if (layer) queueMicrotask(() => this.drainDeclared(layer.within));
@@ -2916,6 +2949,7 @@ export class Session {
     if (c !== undefined) {
       this.append(ev);
       this.pty.write(c);
+      if (name === 'SIGINT') this.resendRepliesWhileUnanswered();
       return;
     }
     const fg = this.pty.foreground?.();

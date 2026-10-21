@@ -10,6 +10,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { AGENT, hasShell, pgrep, realSession, reap, until } from './fake-shell.js';
 
+const FISH = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find(hasShell) ?? '/usr/bin/fish';
+
 for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
   test(`${shell}: G29 (core-4, tg-6): cancelling a queued Run leaves the Run ahead running and never runs the line`, async () => {
     const x = await realSession(shell);
@@ -242,6 +244,42 @@ trap __k1_trap DEBUG
     assert.match(output(), /trap-read:\[yes\]/, 'the trap read the person’s answer, not a daemon line');
     assert.doesNotMatch(output(), /first-42/, 'the cancelled line’s command never ran');
   } finally {
+    await x.close();
+  }
+});
+
+test('fish: a stopped shell whose empty line a third ^C flushed reads keys again after the continue, since the replies its prompt waits for go again', { skip: !hasShell(FISH) }, async () => {
+  // fish 4.9 sends terminal queries with its prompt and reads no key until the DA1 reply comes. The ^Cs
+  // flushed the daemon's replies with the unread input, and fish then read nothing, an Enter included,
+  // until the session closed (found by run while answering question 1 of #22 comment 6310921374). The
+  // first prompt fish draws after the interrupt runs none of its event handlers, so it carries no marks
+  // of ours: the advice's input may take two Enters.
+  const x = await realSession(FISH, { login: false });
+  const pid = x.session.info().pid;
+  try {
+    await until(() => x.session.shellAvailable().ok, 8000, 'the shell is ready');
+    process.kill(pid, 'SIGSTOP');
+    const a = x.session.admit({ target: 'shell', line: 'echo first-ran', principal: AGENT });
+    assert.ok(a.admitted);
+    const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 200 });
+    assert.deepEqual([c.state, c.steps.at(-1)], ['cancelled', 'an empty line, whose prompt says the shell is back'], JSON.stringify(c));
+    x.session.input('\x03', { principal: AGENT });
+    const b = x.session.admit({ target: 'shell', line: 'echo second-(math 40+2)', principal: AGENT, queue: true });
+    assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+    process.kill(pid, 'SIGCONT');
+    for (let i = 0; i < 3 && x.session.run(b.run.runId).state === 'queued'; i++) {
+      x.session.input('\n', { principal: AGENT });
+      await until(() => x.session.run(b.run.runId).state !== 'queued', 2000, 'the Run written').catch(() => undefined);
+    }
+    const r = await x.session.awaitRun(b.run.runId, 5000);
+    assert.deepEqual([r.state, r.exit, r.reason], ['exited', 0, undefined], JSON.stringify(r));
+    assert.equal((await x.session.runTranscript(r.runId)).text, 'second-42');
+  } finally {
+    try {
+      process.kill(pid, 'SIGCONT');
+    } catch {
+      // gone
+    }
     await x.close();
   }
 });

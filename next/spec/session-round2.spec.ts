@@ -602,6 +602,40 @@ test('a prompt that comes while the terminal is read is the shell’s answer: no
   await h.session.close();
 });
 
+test('the replies to the shell’s terminal queries since its last command go again after a cancel’s ^Cs, ahead of its empty line, and after a ^C while it has not answered', async () => {
+  // A ^C's tty flush took the daemon's replies with the input the shell had not read: fish 4.9, which reads
+  // no key until its DA1 reply comes, then read nothing more (found by run while answering question 1 of
+  // #22 comment 6310921374).
+  const DA1 = /\x1b\[\?[\d;]+c/g;
+  const h = await harness();
+  const first = h.session.admit({ target: 'shell', line: 'sleep 1', principal: AGENT });
+  assert.ok(first.admitted);
+  h.pty.emit('\x1b[c'); // a query during the command: its reply is the command's
+  await h.session.screen.settled();
+  h.shell.finishHung(0);
+  assert.equal((await h.session.awaitRun(first.run.runId, 2000)).state, 'exited');
+  h.shell.stop();
+  h.pty.emit('\x1b[c'); // the query the prompt drawn after it sent, unread when the shell stopped
+  await h.session.screen.settled();
+  const reply = h.pty.written.match(DA1)?.at(-1);
+  assert.ok(reply, 'the screen answered the query');
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.equal(c.steps.at(-1), 'an empty line, whose prompt says the shell is back', JSON.stringify(c));
+  const afterCancel = h.pty.written.slice(h.pty.written.lastIndexOf('\x03') + 1);
+  assert.deepEqual(afterCancel.match(DA1), [reply], 'the prompt’s reply once, not the command’s');
+  assert.ok(afterCancel.indexOf(reply) < afterCancel.indexOf('tsm-cmd-'), 'ahead of the empty line');
+  h.session.input('\x03', { principal: AGENT }); // a ^C typed after the empty line, while the shell has not answered
+  assert.deepEqual(h.pty.written.slice(h.pty.written.lastIndexOf('\x03') + 1).match(DA1), [reply], 'again after that ^C');
+  h.shell.cont();
+  await until(() => h.session.shellAvailable().ok, 2000, 'back at the shell’s prompt');
+  const n = h.pty.written.length;
+  h.session.input('\x03', { principal: AGENT }); // a ^C at a prompt that answered: nothing goes again
+  assert.doesNotMatch(h.pty.written.slice(n), DA1);
+  await h.session.close();
+});
+
 test('an empty line whose file cannot be removed at its prompt still frees the shell, and the Run admitted after the cancel runs', async () => {
   // The empty line's file goes inside the prompt's own handling (dropPromptProbe). An unlink that threw
   // there (EACCES on the command directory, say) ended that handling before the shell's state was set:
