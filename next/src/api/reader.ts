@@ -1203,17 +1203,21 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const holes = new Set<string>();
   /** Per source, what its last event left unfinished for the line-end rule (lineEnds); a note ends it all, as the projection's CAN does. */
   const carries = new Map<string, LineCarry>();
-  // A window that begins inside a control string its source left open reads as the output did: the string goes
-  // on, its payload's LFs end no line, and the projection shows none of it (openBefore). A note ahead of the
-  // window's first output ends the string first.
-  if (older && firstOut && events.find((e) => isOutput(e) || endsSequences(e, o)) === firstOut) {
-    const open = openBefore(src, o, firstOut);
-    if (open) {
-      chunks.push(chunkOf(firstOut, open));
-      carries.set(sourceKey(firstOut), { open });
-    }
-  }
+  // A window that begins inside a control string a source left open reads as the output did: the string goes
+  // on, its payload's LFs end no line, and the projection shows none of it (openBefore). So for every source, at
+  // its first output in the window, seeded just ahead of it: seeded for the first source alone, another's title
+  // left open showed its payload as lines (our read of the 40 commits, PR #22). A note ahead of a source's first
+  // output ends the string first.
+  let noted = false;
+  const seed = (e: Output, key: string) => {
+    if (!older || noted || sources.has(key)) return;
+    const open = openBefore(src, o, e);
+    if (!open) return;
+    chunks.push(chunkOf(e, open));
+    carries.set(key, { open });
+  };
   const note = (e: JournalEvent, text: string) => {
+    noted = true;
     chunks.push({ note: text });
     // A command's line can hold newlines: each of its lines is a line of the text, none with a head to cut.
     // Only its first line can begin the lines shown (wholeNote; a byte cut that drops lines sets `cutHead`
@@ -1241,6 +1245,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       note(e, line);
     } else if (isOutput(e)) {
       const key = sourceKey(e);
+      seed(e, key);
       sources.add(key);
       let carry = carries.get(key);
       if (!carry) carries.set(key, (carry = lineCarry()));
@@ -1416,19 +1421,21 @@ function openBefore(src: ReadSource, o: ReadOptions, first: Output): string {
 
 /**
  * The line ends (lineEnds) a tail's window holds, each source read with its own carry and a hole ending them all;
- * when older output precedes the window, its first source starts with what that output left open (openBefore).
+ * when older output precedes the window, each source's first output in it, ahead of any note, starts with what that
+ * source left open before it (openBefore).
  */
 function windowEnds(src: ReadSource, o: ReadOptions, evs: JournalEvent[], olderBefore: boolean): number {
   const carries = new Map<string, LineCarry>();
-  const first = evs.find((e) => isOutput(e) || endsSequences(e, o));
-  if (olderBefore && first && isOutput(first)) carries.set(sourceKey(first), { open: openBefore(src, o, first) });
+  let noted = false;
   let count = 0;
   for (const e of evs) {
-    if (endsSequences(e, o)) carries.clear();
-    else if (isOutput(e)) {
+    if (endsSequences(e, o)) {
+      carries.clear();
+      noted = true;
+    } else if (isOutput(e)) {
       const key = sourceKey(e);
       let carry = carries.get(key);
-      if (!carry) carries.set(key, (carry = lineCarry()));
+      if (!carry) carries.set(key, (carry = olderBefore && !noted ? { open: openBefore(src, o, e) } : lineCarry()));
       count += lineEnds(e.data, carry).length;
     }
   }

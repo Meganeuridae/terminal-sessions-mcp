@@ -1558,3 +1558,19 @@ test("a Run's tail after a hole is not read as inside a string left open before 
     assert.deepEqual(r.text!.split('\n'), want, JSON.stringify(r.lines));
   }
 });
+
+test("a tail's window reads each source's string left open before it as that string, not only the first source's (our read of the 40 commits, PR #22)", async () => {
+  // The pty's title, open before the window; a Run's 600 lines; then the pty's payload, its BEL and a line. Seeded for
+  // the window's first source alone, the pty's payload showed as two lines of output.
+  const src = source();
+  out(src.journal, 'p0\r\n\x1b]0;pty-title ');
+  startRun(src.journal, 'r1');
+  for (let i = 0; i < 600; i++) out(src.journal, `r-line ${i}\r\n`, 'stdout', 'r1');
+  out(src.journal, 'payload-one\npayload-two\n\x07p-after\r\n');
+  for (const tail of [3, 5]) {
+    const r = await readJournal(src, { tail }, { resultBytes: 16384 });
+    const lines = r.text!.split('\n');
+    assert.ok(!lines.some((l) => l.includes('payload')), `tail ${tail}: ${JSON.stringify(lines)}`);
+    assert.equal(lines[lines.length - 1], 'p-after');
+  }
+});
