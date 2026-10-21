@@ -145,9 +145,11 @@ const completions = (runId: string) => deliveries.filter((d) => d.text.includes(
 let fences = 0
 const fence = async (after: string) => {
   const text = `fence ${++fences}`
+  // As a whole word: by its text alone, `fence 1` matched `fence 10`.
+  const word = new RegExp(`\\b${text}\\b`)
   const answer = (await observer.publish(`terminal:${SESSION}`, text)) as { delivered?: boolean } | undefined
   if (answer?.delivered !== true) fail(`the observer's fence after ${after} answered ${JSON.stringify(answer)}`)
-  await waitFor(() => deliveries.some((d) => d.text.includes(text)), 10_000, `the publisher receiving the observer's fence after ${after}`)
+  await waitFor(() => deliveries.some((d) => word.test(d.text)), 10_000, `the publisher receiving the observer's fence after ${after}`)
 }
 
 try {
@@ -161,18 +163,23 @@ try {
     if (names.length !== 10 || !names.includes('run') || !names.includes('input') || !names.includes('session_declare_shell')) fail(`tools: ${names.join(',')}`)
   })
 
-  const opened = await call('session_open', { session: SESSION, visibility: 'shared', cwd: tmp })
-  if (opened.isError) fail(opened.text)
-  // The channel registers with the observer's host a moment after session_open, and an open names a
-  // registered channel: retried until it is, as the framework check retries its channel_open.
-  for (const until = now() + 10_000; ; await sleep(100)) {
-    try {
-      await observer.openChannel(`terminal:${SESSION}`)
-      break
-    } catch (e) {
-      if (now() > until) throw e
+  await check("the session opens, and the observer opens its channel", async () => {
+    const opened = await call('session_open', { session: SESSION, visibility: 'shared', cwd: tmp })
+    if (opened.isError) fail(opened.text)
+    // The channel registers with the observer's host a moment after session_open, and an open names a
+    // registered channel: the bridge's refusal of a channel it doesn't know yet is retried until it is, as
+    // the framework check retries its channel_open. Any other failure is this check's at once, named: retried
+    // and then thrown outside a check, it ended the run with no verdict (the house's read of the 40 commits
+    // over our fixes, #22).
+    for (const until = now() + 10_000; ; await sleep(100)) {
+      try {
+        await observer.openChannel(`terminal:${SESSION}`)
+        break
+      } catch (e) {
+        if ((e as { kind?: string }).kind !== 'unknown' || now() > until) fail(`the observer's open of terminal:${SESSION}: ${(e as Error).message}`)
+      }
     }
-  }
+  })
 
   // The Run ends when this file appears in the session's cwd, and the check creates it once the
   // reconnect has been shown: a Run that slept 1.5 s raced the reconnect's own waits (3 s, then
