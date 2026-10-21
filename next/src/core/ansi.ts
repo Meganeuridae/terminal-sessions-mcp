@@ -7,7 +7,7 @@
  */
 import { err } from './errors.js';
 import { compileUserRegex, execBounded } from './regex.js';
-import { lineCarry, lineEnds, safeCut, sequenceEnd, type LineCarry } from './text.js';
+import { isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, type LineCarry } from './text.js';
 
 /**
  * The longest line a StreamMatcher holds: a longer one is matched on its first MAX_LINE, the hit says
@@ -104,7 +104,7 @@ export function cleanLine(raw: string): string {
   };
   for (let i = 0; i < raw.length; ) {
     const c = raw.charCodeAt(i);
-    if (c === 0x1b || c === 0x9b) {
+    if (isIntroducer(c)) {
       const end = sequenceEnd(raw, i);
       if (end === undefined) break;
       const m = LINE_CONTROL.exec(raw.slice(i, end));
@@ -137,7 +137,7 @@ export function cleanLine(raw: string): string {
     if (c === 0x0d) col = 0;
     else if (c === 0x08) col = Math.max(0, col - 1);
     else if (c === 0x09) moveTo(((col >> 3) + 1) << 3);
-    else if ((c >= 0x20 && c !== 0x7f) || c === 0x0a) {
+    else if ((c >= 0x20 && c !== 0x7f && !(c >= 0x80 && c <= 0x9f)) || c === 0x0a) {
       const ch = String.fromCodePoint(raw.codePointAt(i)!);
       i += ch.length;
       const w = cellWidth(ch);

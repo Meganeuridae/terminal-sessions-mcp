@@ -1519,7 +1519,7 @@ class NoteBudget {
   }
 }
 
-/** Gone ranges in seq order, each run of one reason named once in a read's words: `1–100, 150–226 (past retention), 300–310 (a torn write)`. */
+/** Gone ranges in seq order, each run of one reason named once in a read's words: `1–100, 150–226 (past retention), 300–310 (a crash cut the journal short)`. */
 function goneText(gaps: ReadonlyArray<Gone>): string {
   const runs: Array<{ reason: GapReason; ranges: string[] }> = [];
   for (const g of gaps) {

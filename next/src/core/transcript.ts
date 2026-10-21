@@ -86,7 +86,7 @@ import xterm from '@xterm/headless';
 import type { IBuffer, Terminal as TerminalType } from '@xterm/headless';
 import { persistentState } from './screen.js';
 import { DEFAULT_GEOMETRY } from './types.js';
-import { headIndex, lineCarry, lineEnds, sequenceEnd, tailStart, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
+import { headIndex, isIntroducer, lineCarry, lineEnds, sequenceEnd, tailStart, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
 
 const { Terminal } = xterm;
 
@@ -414,7 +414,7 @@ function batchEnd(data: string, from: number, budget: number, cols: number): num
   while (i < limit) {
     const c = data.charCodeAt(i);
     let next = i + 1;
-    if (c === 0x1b || c === 0x9b) {
+    if (isIntroducer(c)) {
       const e = sequenceEnd(data, i);
       if (e === undefined) return i > from ? i : data.length;
       if (i > from) safe = i;
@@ -432,7 +432,7 @@ function batchEnd(data: string, from: number, budget: number, cols: number): num
       // No safe point: printable text can be split anywhere between characters; at least one unit goes.
       return i > from ? i : next;
     }
-    if (c === 0x0a || c === 0x1b || c === 0x9b) safe = next;
+    if (c === 0x0a || isIntroducer(c)) safe = next;
     i = next;
   }
   // At the cap, not inside a sequence (a straddling one moved `i` past it) and not inside a pair.
@@ -473,31 +473,35 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     budget!.omitted += bytes;
     if (budget!.keep === 'tail') budget!.state = persistentState(budget!.state + persistentState(data));
   };
-  // Per source, the introducer of a sequence a tail cut left open, and whether an ESC that may begin its terminator was held back.
-  const open = new Map<string, { intro: string; esc: boolean }>();
+  /**
+   * Sources whose sequence still open a tail cut moved past: the rest of it goes as it arrives. What
+   * the sequence is comes from the source's line-end carry, the one record of what its data left
+   * unfinished, which a note ends as it ends the carry: a cut's open sequence kept dropping a source's
+   * output after a hole (an independent read of the fix for the house's read of the 33 commits, #22,
+   * comment 6307350650: `head `, a 12 KB OSC 52, a note and two lines showed only the note).
+   */
+  const dropping = new Set<string>();
   /** Note the sequence a tail cut of `data` at `cut` moved past, if it is unfinished. */
   const leaveOpen = (key: string, data: string, cut: number) => {
-    const u = unfinishedSequence(data, Number.POSITIVE_INFINITY);
-    if (u >= cut) return;
-    const intro = data.slice(u, u + (data.charCodeAt(u) === 0x9b ? 1 : 2));
-    open.set(key, { intro, esc: u + intro.length < data.length && data.endsWith('\x1b') });
+    if (unfinishedSequence(data, Number.POSITIVE_INFINITY) < cut) dropping.add(key);
   };
-  /** `data` without the rest of the sequence a cut left open for `key`: what goes is omitted. */
-  const skipOpen = (key: string, data: string): string => {
-    const o = open.get(key);
-    if (!o || !data) return data;
-    const joined = `${o.intro}${o.esc ? '\x1b' : ''}${data}`;
-    const end = sequenceEnd(joined, 0);
+  /**
+   * `data` without the rest of the sequence a cut left open for `key`, read on from `before`, what the
+   * source's data before it left unfinished (its carry): what goes is omitted. An ESC held back from
+   * the string that a new sequence's start turned out to be comes back with it.
+   */
+  const skipOpen = (key: string, data: string, before: string): string => {
+    if (!dropping.has(key) || !data) return data;
+    const end = sequenceEnd(before + data, 0);
     if (end === undefined) {
-      o.esc = data.endsWith('\x1b');
-      const gone = o.esc ? data.slice(0, -1) : data;
-      drop(gone, utf8Length(gone));
+      drop(data, utf8Length(data));
       return '';
     }
-    open.delete(key);
-    const gone = joined.slice(o.intro.length, end);
+    dropping.delete(key);
+    if (end < before.length) return before.slice(end) + data;
+    const gone = data.slice(0, end - before.length);
     if (gone) drop(gone, utf8Length(gone));
-    return joined.slice(end);
+    return data.slice(end - before.length);
   };
   const emit = (key: string, pipe: boolean, info: SourceInfo | undefined, data: string) => {
     const bytes = utf8Length(data);
@@ -547,6 +551,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     if (typeof ch !== 'string' && 'note' in ch) {
       flush();
       carries.clear();
+      dropping.clear();
       const n = `${ch.note}\n`;
       emit(`n:${notes++}`, true, undefined, n);
       continue;
@@ -558,8 +563,9 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     // Line ends are read over the whole chunk, as the stream wrote it, before a tail cut's leftover is skipped.
     let carry = carries.get(key);
     if (!carry) carries.set(key, (carry = lineCarry()));
+    const before = carry.open;
     const { through } = interleaveCut(c.data, carry);
-    const data = skipOpen(key, c.data);
+    const data = skipOpen(key, c.data, before);
     if (!data) continue;
     let h = held.get(key);
     if (!h) {
@@ -603,7 +609,8 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     emit(key, pipe, h.info, h.full ? h.data : h.data + data.slice(0, nl + 1));
     // Re-inserted, so the held ends keep the order in which they began.
     held.delete(key);
-    h.data = skipOpen(key, data.slice(nl + 1));
+    // The line ends outside every sequence, so nothing a cut left open reaches past it.
+    h.data = data.slice(nl + 1);
     h.bytes = utf8Length(h.data);
     h.full = false;
     if (h.data) held.set(key, h);
@@ -769,17 +776,15 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
           slice = performance.now();
         }
       }
-      // The next source starts on a fresh line (rule 6). A note or header is never part of any
-      // source: a control sequence the output before it left open (its end lost with the events a
-      // gap stands for) must not take the note as its payload, so CAN ends anything in progress
-      // first (the house's read of ed4ecac, #22).
+      // The next source starts on a fresh line (rule 6). No segment takes the next as a payload: a
+      // control sequence a segment left open (its end lost with the events a gap stands for, or a held
+      // line's at the end of the range) is ended by CAN first, before a note, a header or another
+      // source's output alike (the house's read of ed4ecac, #22; an independent read of the fix for the
+      // house's read of the 33 commits, #22, comment 6307350650: a title held open at the range's end
+      // took a Run's held line, unlabelled).
       if (s + 1 < segs.length) {
-        const cancel = segs[s + 1]!.key.startsWith('n:') ? '\x18' : '';
-        const fresh = pr.cursorX > 0 ? '\r\n' : '';
-        if (cancel || fresh) {
-          await pr.feed(cancel + fresh);
-          await pr.afterBatch();
-        }
+        await pr.feed(`\x18${pr.cursorX > 0 ? '\r\n' : ''}`);
+        await pr.afterBatch();
       }
     }
     let lines = pr.finish(opts.open === true);

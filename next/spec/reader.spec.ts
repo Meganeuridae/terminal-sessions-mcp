@@ -756,7 +756,8 @@ test('78c4d6e 17: a recovery hole recorded as a store-failed gap event at the he
   const text = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
   assert.deepEqual(text.gap, { from: 1, to: 4, reason: 'store-failed' });
   assert.equal(text.gaps, undefined);
-  assert.equal(text.text, '[… 4 journal events missing (seq 1–4: the journal store never took them) …]\nkept');
+  // A crash's hole is counted as up to its range (the store-failed seqs may never have been issued).
+  assert.equal(text.text, '[… up to 4 journal events missing (seq 1–4: the journal store never took them) …]\nkept');
   const tail = await readJournal(src, { tail: 5 }, { resultBytes: 16384 });
   assert.deepEqual(tail.gap, { from: 1, to: 4, reason: 'store-failed' });
   assert.equal(tail.gaps, undefined);
@@ -1146,11 +1147,13 @@ test('a crash’s hole is counted as up to its range: most of it may be seqs nev
   out(src.journal, 'after\r\n');
   const r = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
   assert.equal(r.text, 'before\n[… up to 9997 journal events missing (seq 2–9998: a crash cut the journal short) …]\nafter');
-  // Every other reason counts what is gone, and one seq is one event.
+  // So is the range the store never took when the daemon died first; every other reason counts what is
+  // gone, and one seq is one event.
   const other = source();
   other.journal.append({ type: 'gap', from: 1, to: 3, reason: 'store-error' });
   other.journal.append({ type: 'gap', from: 5, to: 5, reason: 'torn-write' });
-  assert.equal((await readJournal(other, { since: 0 }, { resultBytes: 16384 })).text, '[… 3 journal events missing (seq 1–3: the journal store failed) …]\n[… 1 journal event missing (seq 5–5: a crash cut the journal short) …]');
+  other.journal.append({ type: 'gap', from: 7, to: 9, reason: 'store-failed' });
+  assert.equal((await readJournal(other, { since: 0 }, { resultBytes: 16384 })).text, '[… 3 journal events missing (seq 1–3: the journal store failed) …]\n[… 1 journal event missing (seq 5–5: a crash cut the journal short) …]\n[… up to 3 journal events missing (seq 7–9: the journal store never took them) …]');
 });
 
 test('paging back past a title left open before a hole reaches every line: the title shows nothing, and the row its LF left counts', async () => {
@@ -1165,4 +1168,16 @@ test('paging back past a title left open before a hole reaches every line: the t
     const text = pages.map((p) => p.text).join('\n');
     for (const l of ['one', 'two']) assert.ok(text.includes(l), `tail ${tail}: ${l} in ${JSON.stringify(pages.map((p) => p.text))}`);
   }
+});
+
+test('search reads a C1 OSC as a string and a CAN as its end, as the projection does', async () => {
+  // The cleaner and the line-end rule share text.ts's grammar: a U+009D OSC's LF ended a line, and its payload
+  // was text; a string CAN ended read on.
+  const c1 = source();
+  out(c1.journal, 'a\u009d0;my\ntitle\u0007b\r\n');
+  assert.deepEqual((await searchJournal(c1, { pattern: '^ab$', since: 0 })).matches.map((m) => m.line), ['ab']);
+  assert.equal((await searchJournal(c1, { pattern: 'title', since: 0 })).matches.length, 0, 'the payload is not text');
+  const can = source();
+  out(can.journal, 'a\x1b]0;my\x18\nb\r\n');
+  assert.deepEqual((await searchJournal(can, { pattern: '^b$', since: 0 })).matches.map((m) => m.line), ['b']);
 });

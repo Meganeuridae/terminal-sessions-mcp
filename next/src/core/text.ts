@@ -111,8 +111,8 @@ function pastSequence(text: string, index: number): number {
 }
 
 /**
- * What a stream's data left unfinished for `lineEnds`: the introducer of a control string still open,
- * and an ESC that may begin its terminator; or a lone ESC that may begin one.
+ * What a stream's data left unfinished for `lineEnds`: the introducer of the control sequence still
+ * open at its end, and, after a string's, an ESC that may begin its terminator; empty when none is.
  */
 export interface LineCarry {
   open: string;
@@ -120,29 +120,45 @@ export interface LineCarry {
 
 export const lineCarry = (): LineCarry => ({ open: '' });
 
-/** The introducers of the control strings (OSC, DCS, SOS, PM, APC), after ESC. */
-const STRING_START = /[\]PX^_]/;
+/** The C1 introducers of the control strings: DCS, SOS, OSC, PM, APC (U+0090, U+0098, U+009D–U+009F). */
+const C1_STRING = new Set([0x90, 0x98, 0x9d, 0x9e, 0x9f]);
+
+/** Whether `c` begins a control sequence: ESC, the C1 CSI, or a C1 control string's introducer. */
+export const isIntroducer = (c: number): boolean => c === 0x1b || c === 0x9b || C1_STRING.has(c);
+
+/** Whether a control string (OSC, DCS, SOS, PM, APC) begins at `data[i]`: ESC and its second byte, or the C1 form. */
+export const isStringStart = (data: string, i: number): boolean => {
+  const c = data.charCodeAt(i);
+  return C1_STRING.has(c) || (c === 0x1b && /[\]PX^_]/.test(data[i + 1] ?? ''));
+};
+
+/** The introducers, for finding the next one. */
+const INTRODUCER = /[\x1b\x90\x98\x9b\x9d-\x9f]/g;
 
 /**
  * The indices of `data`'s LFs that end lines (with `cr`, its CRs too), at most `max` of them: every
  * one outside a control string (OSC, DCS, SOS, PM, APC), whose payload the terminal does not execute,
- * so a LF in a window title ends no line. Strings end as `sequenceEnd` reads them. `carry` is what the
- * stream's data before this left unfinished, and is updated, so a string open across events is read
- * whole; a new stream, or one after a hole, starts with a fresh carry. The one rule for every reader of
- * lines: the reader's pages and tails, search, the projection's interleave and its cuts, `tailStart`,
- * the segmenter's lines and the watches' (the house's read of the 33 commits, #22, comment
- * 6307350650, item 2, and an independent read of the fix: only the tail kept it, and a page, a search
- * and the projection split a title in two).
+ * so a LF in a window title ends no line. Strings and other sequences end as `sequenceEnd` reads them.
+ * `carry` is what the stream's data before this left unfinished, and is updated, so a sequence open
+ * across events is read whole; a new stream, or one after a hole, starts with a fresh carry. The one
+ * rule for every reader of lines: the reader's pages and tails, search, the projection's interleave
+ * and its cuts, `tailStart`, the segmenter's lines and the watches' (the house's read of the 33
+ * commits, #22, comment 6307350650, item 2, and an independent read of the fix: only the tail kept it,
+ * and a page, a search and the projection split a title in two).
  */
 export function lineEnds(data: string, carry: LineCarry = lineCarry(), max = Number.POSITIVE_INFINITY, cr = false): number[] {
   const t = carry.open + data;
   const skip = carry.open.length;
   carry.open = '';
   const ends: number[] = [];
-  // The next ESC, LF and CR at or after `i`, each searched for again only once `i` passes it: a redraw
-  // flood of sequences with few line ends would otherwise search to the far line end once per sequence.
+  // The next introducer, LF and CR at or after `i`, each searched for again only once `i` passes it: a
+  // redraw flood of sequences with few line ends would otherwise search to the far line end once per sequence.
   let i = 0;
-  let esc = t.indexOf('\x1b');
+  const nextIntroducer = (from: number): number => {
+    INTRODUCER.lastIndex = from;
+    return INTRODUCER.exec(t)?.index ?? -1;
+  };
+  let at = nextIntroducer(0);
   let lf = t.indexOf('\n');
   let ret = cr ? t.indexOf('\r') : -1;
   const advance = () => {
@@ -151,20 +167,17 @@ export function lineEnds(data: string, carry: LineCarry = lineCarry(), max = Num
   };
   while (ends.length < max) {
     const nl = lf === -1 ? ret : ret === -1 ? lf : Math.min(lf, ret);
-    if (esc !== -1 && (nl === -1 || esc < nl)) {
-      if (esc + 1 === t.length) {
-        carry.open = '\x1b';
+    if (at !== -1 && (nl === -1 || at < nl)) {
+      const e = sequenceEnd(t, at);
+      if (e === undefined) {
+        // Open to the end of the data: its introducer, and a last ESC that may begin a string's terminator.
+        const intro = t.slice(at, at + (t.charCodeAt(at) === 0x1b ? 2 : 1));
+        carry.open = intro + (isStringStart(t, at) && t.length > at + intro.length && t.endsWith('\x1b') ? '\x1b' : '');
         break;
       }
-      if (STRING_START.test(t[esc + 1]!)) {
-        const e = sequenceEnd(t, esc);
-        if (e === undefined) {
-          carry.open = t.slice(esc, esc + 2) + (t.length > esc + 2 && t.endsWith('\x1b') ? '\x1b' : '');
-          break;
-        }
-        i = e;
-      } else i = esc + 1;
-      esc = t.indexOf('\x1b', i);
+      // A string's payload is skipped whole; any other sequence's line feeds still execute.
+      i = isStringStart(t, at) ? e : at + 1;
+      at = nextIntroducer(i);
       advance();
       continue;
     }
@@ -184,8 +197,8 @@ export function countLines(s: string): number {
 }
 
 /**
- * Output with its control sequences and control characters (other than tab and newline; DEL
- * included) removed, and where each kept character came from, for cuts in the raw text. The sequences are read by
+ * Output with its control sequences and control characters (other than tab and newline; DEL and
+ * the C1 controls included) removed, and where each kept character came from, for cuts in the raw text. The sequences are read by
  * `sequenceEnd`, one grammar with `safeCut` and `unfinishedSequence`: a charset designation such as
  * `ESC ( B` goes whole (the house's read of ed4ecac, #22: a two-byte rule left its `B`). An
  * unfinished sequence takes the rest of the text with it.
@@ -195,13 +208,13 @@ export function stripEscapes(s: string): { text: string; map: number[] } {
   let text = '';
   for (let i = 0; i < s.length; ) {
     const c = s.charCodeAt(i);
-    if (c === 0x1b || c === 0x9b) {
+    if (isIntroducer(c)) {
       const end = sequenceEnd(s, i);
       if (end === undefined) break;
       i = end;
       continue;
     }
-    if ((c < 0x20 && c !== 0x09 && c !== 0x0a) || c === 0x7f) {
+    if ((c < 0x20 && c !== 0x09 && c !== 0x0a) || (c >= 0x7f && c <= 0x9f)) {
       i++;
       continue;
     }
@@ -221,14 +234,19 @@ export function stripEscapes(s: string): { text: string; map: number[] } {
 const SEQUENCE_LOOKBACK = 4096;
 
 /**
- * Index after the control sequence starting at `data[e]` (ESC, or C1 CSI), or
- * undefined when it does not end within `data`.
+ * Index after the control sequence starting at `data[e]` (ESC, the C1 CSI, or a C1 string's
+ * introducer), or undefined when it does not end within `data`. A string ends at BEL or ST, or, as
+ * the emulator ends it, where CAN or SUB aborts it or a new sequence's ESC abandons it (those three
+ * are not part of it); the C1 introducers open the strings and CSI as their ESC forms do (an
+ * independent read of the fix for the house's read of the 33 commits, #22, comment 6307350650: the
+ * emulator ended `ESC ] 0 ; my CAN` at the CAN, and opened an OSC at U+009D, where this read on).
  */
 export function sequenceEnd(data: string, e: number): number | undefined {
   let i = e + 1;
   const c0 = data.charCodeAt(e);
   let kind: 'csi' | 'string' | 'esc';
   if (c0 === 0x9b) kind = 'csi';
+  else if (C1_STRING.has(c0)) kind = 'string';
   else {
     const c1 = data[i];
     if (c1 === undefined) return undefined;
@@ -254,10 +272,11 @@ export function sequenceEnd(data: string, e: number): number | undefined {
     }
     return undefined;
   }
-  // OSC, DCS, SOS, PM, APC: to BEL or ST.
+  // OSC, DCS, SOS, PM, APC: to BEL or ST, or where CAN or SUB aborts it.
   for (; i < data.length; i++) {
     const c = data.charCodeAt(i);
     if (c === 0x07 || c === 0x9c) return i + 1;
+    if (c === 0x18 || c === 0x1a) return i;
     if (c === 0x1b && data[i + 1] === '\\') return i + 2;
     if (c === 0x1b && i + 1 < data.length) return i; // a new sequence abandons the string
   }
@@ -268,16 +287,18 @@ export function sequenceEnd(data: string, e: number): number | undefined {
 const lastOf = (s: string, ch: string): number => (s.indexOf(ch) === -1 ? -1 : s.lastIndexOf(ch));
 
 /**
- * The last ESC or C1 CSI in `data[from..i]` (-1 when none), by native searches over that window
- * alone: a tail cut may look back through megabytes of plain text, and a cut with a bounded lookback
- * must not pay for the whole text. The C1 form is looked for only after the nearest ESC.
+ * The last introducer (ESC, or a C1 one: isIntroducer) in `data[from..i]` (-1 when none), by native
+ * searches over that window alone: a tail cut may look back through megabytes of plain text, and a
+ * cut with a bounded lookback must not pay for the whole text. The C1 forms are looked for only after
+ * the nearest ESC.
  */
 function introducerBefore(data: string, i: number, from: number): number {
   if (i < from) return -1;
   const window = data.slice(from, i + 1);
   const esc = lastOf(window, '\x1b');
-  const csi = lastOf(esc === -1 ? window : window.slice(esc + 1), '\x9b');
-  return csi !== -1 ? from + esc + 1 + csi : esc === -1 ? -1 : from + esc;
+  const after = esc === -1 ? window : window.slice(esc + 1);
+  const c1 = Math.max(...['\x9b', '\x90', '\x98', '\x9d', '\x9e', '\x9f'].map((ch) => lastOf(after, ch)));
+  return c1 !== -1 ? from + esc + 1 + c1 : esc === -1 ? -1 : from + esc;
 }
 
 /**
@@ -326,12 +347,12 @@ export function unfinishedSequence(data: string, lookback = SEQUENCE_LOOKBACK): 
   const from = Math.max(0, data.length - lookback);
   for (let e = data.length - 1; e >= from; e--) {
     const ch = data.charCodeAt(e);
-    if (ch !== 0x1b && ch !== 0x9b) continue;
+    if (!isIntroducer(ch)) continue;
     if (ch === 0x1b && data[e + 1] === '\\') continue; // an ST: the string it ends is judged at its start
     if (ch === 0x1b && e === data.length - 1) {
       // A lone ESC at the end may be the first half of an ST: then the string before it is what is open.
       const earlier = unfinishedSequence(data.slice(0, e), lookback);
-      return earlier < e && /[\]PX^_]/.test(data[earlier + 1] ?? '') ? earlier : e;
+      return earlier < e && isStringStart(data, earlier) ? earlier : e;
     }
     return sequenceEnd(data, e) === undefined ? e : data.length;
   }

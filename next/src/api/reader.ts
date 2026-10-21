@@ -71,7 +71,7 @@ import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
 import { persistentState } from '../core/screen.js';
 import { minusRanges } from '../core/ranges.js';
 import { lineBytes } from '../core/stores.js';
-import { countLines, cutTail, headIndex, indexAtByte, lineCarry, lineEnds, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length, type LineCarry } from '../core/text.js';
+import { countLines, cutTail, headIndex, indexAtByte, isIntroducer, isStringStart, lineCarry, lineEnds, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length, type LineCarry } from '../core/text.js';
 import { interleaveCut, project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
 
@@ -239,15 +239,17 @@ const OPEN_SEQUENCE_BYTES = 1024 * 1024;
 const FIT_ATTEMPTS = 6;
 
 /**
- * The line a hole leaves in text (G11); the compat pack's raw tail marks its holes with it too. A crash's
- * hole is counted as "up to": numbering resumes above the reservation the journal had synced, so most of
- * its range may be seqs never issued, up to 10,000 of them, and "9997 journal events missing" overstated
+ * The line a hole leaves in text (G11); the compat pack's raw tail marks its holes with it too. A hole a
+ * crash left (`torn-write`, and `store-failed` when the daemon died before the disk took the events) is
+ * counted as "up to": numbering resumes above the reservation the journal had synced, so most of its
+ * range may be seqs never issued, up to 10,000 of them, and "9997 journal events missing" overstated
  * what was lost (an independent read of the fix for the house's read of the 33 commits, #22, comment
  * 6307350650).
  */
 export function gapNote(g: GapInfo): string {
   const n = g.to - g.from + 1;
-  const count = g.reason === 'torn-write' && n > 1 ? `up to ${n} journal events` : `${n} journal event${n === 1 ? '' : 's'}`;
+  const upTo = (g.reason === 'torn-write' || g.reason === 'store-failed') && n > 1;
+  const count = upTo ? `up to ${n} journal events` : `${n} journal event${n === 1 ? '' : 's'}`;
   return `[… ${count} missing (seq ${g.from}–${g.to}: ${describeGap(g.reason)}) …]`;
 }
 
@@ -409,7 +411,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // clipboard) can be long: once one is found open, only an event that could end it (BEL, ST,
   // ESC) or a hole makes the check run again (the house's read of 1cabc6a, #22).
   let openString: number | undefined; // pieces checked so far, while a control string is open
-  const closer = /[\x07\x1b\x9c]/;
+  const closer = /[\x07\x18\x1a\x1b\x9c]/;
   /** Per source, what its pieces left unfinished for the line-end rule (lineEnds). */
   const carries = new Map<string, LineCarry>();
   const full = () => {
@@ -596,8 +598,7 @@ function sourceForward(pieces: Piece[], j: number): { text: string; locate(i: nu
 
 /** Whether the sequence starting at `at` is a control string (OSC, DCS, SOS, PM, APC), judged by its second byte when it is at hand. */
 function isControlString(pieces: Piece[], at: Pos): boolean {
-  const d = (pieces[at.j] as OutPiece).data;
-  return d.charCodeAt(at.at) === 0x1b && /[\]PX^_]/.test(d[at.at + 1] ?? '');
+  return isStringStart((pieces[at.j] as OutPiece).data, at.at);
 }
 
 /**
@@ -614,7 +615,7 @@ function throughLineEnd(pieces: Piece[], pos: Pos): Pos {
   while (i < limit) {
     const c = d.charCodeAt(i);
     if (c === 0x20 || c === 0x09 || c === 0x0d) i++;
-    else if (c === 0x1b || c === 0x9b) {
+    else if (isIntroducer(c)) {
       const e = sequenceEnd(d, i);
       if (e === undefined) return pos;
       i = e;
@@ -712,7 +713,7 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
     if (first !== -1 && (cut ? cut.j < first || (cut.j === first && cut.at === 0) : end <= first)) {
       const fwd = sourceForward(pieces, first);
       const c0 = fwd.text.charCodeAt(0);
-      const e = c0 === 0x1b || c0 === 0x9b ? sequenceEnd(fwd.text, 0) : 0;
+      const e = isIntroducer(c0) ? sequenceEnd(fwd.text, 0) : 0;
       if (e === undefined) {
         // It does not end in what was collected: all of it, or up to the hole that ends it.
         const hole = pieces.findIndex((q, i) => i > first && q.kind === 'gap');
@@ -800,7 +801,7 @@ function onlyControls(d: string): boolean {
   let i = 0;
   while (i < d.length) {
     const c = d.charCodeAt(i);
-    const e = c === 0x0d ? i + 1 : c === 0x1b || c === 0x9b ? sequenceEnd(d, i) : undefined;
+    const e = c === 0x0d ? i + 1 : isIntroducer(c) ? sequenceEnd(d, i) : undefined;
     if (e === undefined) return false;
     i = e;
   }

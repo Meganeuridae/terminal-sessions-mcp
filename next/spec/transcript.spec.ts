@@ -8,6 +8,7 @@ import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { persistentState } from '../src/core/screen.js';
 import { project, transcript } from '../src/core/transcript.js';
 import type { ProjectChunk } from '../src/core/transcript.js';
+import { lineEnds, stripEscapes, unfinishedSequence } from '../src/core/text.js';
 
 const MB = 1024 * 1024;
 const text = async (chunks: ProjectChunk[], cols = 40, rows = 10) => (await project(chunks, { cols, rows })).text;
@@ -523,4 +524,45 @@ test('a held line cut for the byte budget drops what was emitted before it: a ti
   const read = async (chunks: string[]) => (await project(chunks, { cols: 80, rows: 24, maxInputBytes: 4096 })).text;
   assert.equal(await read(['head\r\n', `\x1b]52;c;${pay}`, 'tail-of-payload\x07 after']), ' after');
   assert.equal(await read([`head\r\n\x1b]52;c;${pay}tail-of-payload\x07 after`]), ' after', 'as in one chunk');
+});
+
+test('no source’s output is taken by another’s unfinished string: a title holding a LF, an OSC 52 over reads, and held ends at the range’s end', async () => {
+  // The interleave cut a source at its last LF inside a title, and the string left open took the next source's
+  // bytes as its payload: the Run's line was lost, labelled or not. Held ends flushed at the range's end with no
+  // line end at all lost the Run's text too. Each case, with and without headers.
+  const pty = (data: string): ProjectChunk => ({ data, stream: 'pty' });
+  const run = (data: string): ProjectChunk => ({ data, stream: 'stdout', runId: 'r2' });
+  for (const label of [undefined, sourceLabel]) {
+    const read = async (chunks: ProjectChunk[]) => (await project(chunks, { cols: 80, rows: 10, ...(label ? { label } : {}) })).text.split('\n').filter((l) => !/^\[(terminal|run r2)\]$/.test(l));
+    const named = label ? 'labelled' : 'plain';
+    assert.deepEqual(await read([pty('hello\r\n\x1b]0;my\ntitle\x07world'), run('proc line\n'), pty('\r\n')]), ['hello', 'proc line', 'world'], named);
+    assert.deepEqual(await read([pty('copy:\x1b]52;c;QUJD\nREVG\n'), run('build ok\n'), pty('SElK\x07 done\r\n')]), ['build ok', 'copy: done'], named);
+    assert.deepEqual(await read([pty('p1\r\n\x1b]0;tit'), run('RUN-UNFIN')]), ['p1', 'RUN-UNFIN'], named);
+  }
+});
+
+test('a tail cut’s open sequence stops dropping a source’s output at a hole: the note ends it', async () => {
+  // `head `, a 12 KB OSC 52 a 4 KiB tail budget cut into, a note, then two lines: only the note showed, the
+  // lines after the hole dropped as the string's rest.
+  const pay = 'QUJD'.repeat(3000);
+  const chunks: ProjectChunk[] = [{ data: `head \x1b]52;c;${pay}`, stream: 'pty' }, { note: '[a hole]' }, { data: 'after the gap\r\nnext line', stream: 'pty' }];
+  assert.equal((await project(chunks, { cols: 80, rows: 10, maxInputBytes: 4096 })).text, '[a hole]\nafter the gap\nnext line');
+  assert.equal((await project(chunks, { cols: 80, rows: 10 })).text, 'head\n[a hole]\nafter the gap\nnext line', 'without a budget');
+});
+
+test('the line-end rule reads strings as the emulator does: CAN and SUB end one, and the C1 introducers open one', async () => {
+  // text.ts read `ESC ] 0 ; my CAN` as still open, so the LF after it was no line end and the rest payload; and
+  // knew no C1 string introducer, so the LF inside a U+009D OSC ended a line.
+  for (const [data, text, ends, stripped] of [
+    ['a\x1b]0;my\x18\nb\r\n', 'a\n b', [8, 11], 'a\nb\n'],
+    ['a\x1b]0;my\x1a\nb\r\n', 'a\n b', [8, 11], 'a\nb\n'],
+    ['a\u009d0;my\ntitle\u0007b\r\n', 'ab', [15], 'ab\n'],
+    ['a\u0090q;x\ny\u009cb\r\n', 'ab', [10], 'ab\n'],
+  ] as const) {
+    assert.equal((await project([{ data, stream: 'pty' }], { cols: 80, rows: 10 })).text, text, JSON.stringify(data));
+    assert.deepEqual(lineEnds(data), [...ends], JSON.stringify(data));
+    assert.equal(stripEscapes(data).text, stripped, JSON.stringify(data));
+  }
+  assert.equal(unfinishedSequence('a\x1b]0;my\x18'), 'a\x1b]0;my\x18'.length, 'CAN ended it');
+  assert.equal(unfinishedSequence('a\u009d0;my'), 1, 'a C1 OSC open at the end');
 });
