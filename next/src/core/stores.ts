@@ -471,12 +471,15 @@ function sizeOf(file: string): number {
  * An in-memory index of each file's first and last seq lets a range read open
  * only the files that overlap it, bisect within the first by byte offset, and
  * stop at its end; a tail read walks the newest file backwards. Opening a store
- * reads only the head and tail of each file, and changes no content: a torn tail
- * is cut, and a new epoch written, by the store's first write, so an open the
- * caller refuses after looking at the store leaves it as it was (an independent
- * read of the fix for the house's read of the 33 commits, PR #22, comment
- * 6307349700). It does make an older build's files owner-only (G26), and drops a
- * rotated file that holds nothing.
+ * given no retention reads only the head and tail of each file, and changes no
+ * content: a torn tail is cut, and a new epoch written, by the store's first write,
+ * so an open the caller refuses after looking at the store leaves it as it was (an
+ * independent read of the fix for the house's read of the 33 commits, PR #22,
+ * comment 6307349700). It does make an older build's files owner-only (G26), and
+ * drops a rotated file that holds nothing. Given retention (`maxBytes`,
+ * `maxAgeMs`), the open applies it at once and prunes what is past it, so a caller
+ * that may refuse the store opens it with none and sets it afterwards
+ * (setRetention), as the registry does.
  */
 export class FileStore implements JournalStore {
   readonly kind = 'file';
