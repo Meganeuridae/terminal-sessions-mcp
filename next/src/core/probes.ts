@@ -21,7 +21,11 @@ export interface TcpTarget {
  */
 export interface ServiceSpec {
   ready?: {
-    /** Regex over the Run's output lines, per stream, as `search` reads them (a prompt with no newline counts once quiet). */
+    /**
+     * Regex over the Run's output lines: a pattern matches a line as a read shows it, a process Run's stdout and stderr
+     * as one source, as `search` and watches read them, or as its own pipe wrote it (m2-21). A prompt with no newline
+     * counts once quiet.
+     */
     pattern?: string;
     /** A TCP port that must accept a connection. */
     tcp?: TcpTarget;

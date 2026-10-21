@@ -24,7 +24,7 @@ import { headOnlyText, testBounded } from './regex.js';
 import type { Journal } from './journal.js';
 import { timerMs } from './clock.js';
 import { describeSpec, hasReadinessProbe, LIVENESS_MS, tcpConnect, type Connect, type ServiceSpec, type TcpTarget } from './probes.js';
-import type { JournalEvent, OutputStream, Principal, RunInfo, Seq, ServiceStatus } from './types.js';
+import type { EventOf, JournalEvent, OutputStream, Principal, RunInfo, Seq, ServiceStatus } from './types.js';
 
 export type { ServiceStatus } from './types.js';
 
@@ -68,6 +68,13 @@ export interface ServiceDeps {
 
 type Condition = 'pattern' | 'tcp' | 'alive';
 
+/** One reading of a service Run's output (ServiceMonitor.lines and .pipes): its splitter, the seq it was last fed, and the pipe it reads alone. */
+interface Reading {
+  splitter: LineSplitter;
+  seq: Seq;
+  pipe?: OutputStream;
+}
+
 /** TCP poll interval while starting (ms). */
 const TCP_POLL_MS = 250;
 
@@ -85,8 +92,22 @@ export class ServiceMonitor {
   private readonly needed = new Set<Condition>();
   private readonly readyRe: RegExp | undefined;
   private readonly failRe: RegExp | undefined;
-  /** One line splitter per stream of the Run (m2-21): pty, or stdout and stderr of a process Run. */
-  private readonly streams = new Map<OutputStream, LineSplitter>();
+  /**
+   * The Run's lines as a read shows them (§6 rule 6): the pty, or a process Run's stdout and stderr as one source, as
+   * search and watches read them, so a pattern written from a line someone read or watched matches that line.
+   */
+  private lines: Reading | undefined;
+  /**
+   * Each pipe's lines as it wrote them (m2-21): a ready line on stdout that stderr's output broke in two (`Server
+   * listen`, a stderr line, then `ing on 8080`) still passes, and a fail line at the start of stderr's output is at
+   * a line start, whatever stdout held. Bounded as the source's are: MAX_LINE, and a quiet prompt offered.
+   */
+  private readonly pipes = new Map<OutputStream, Reading>();
+  /**
+   * The lines offered at the latest output event, by text, and whether one matched: a line both readings read alike
+   * at one event is matched once, so its evidence and a fail line's count name one line.
+   */
+  private offered: { seq: Seq; lines: Map<string, boolean> } = { seq: 0, lines: new Map() };
   /** A fail-pattern line was seen and no ready-pattern line since. */
   private failed = false;
   private started = false;
@@ -185,7 +206,12 @@ export class ServiceMonitor {
     if (ev.type === 'output' && ev.runId === this.runId) {
       // After readiness the ready pattern matters only as the answer to a fail line.
       if (!this.failRe && (!this.readyRe || this.met.has('pattern'))) return;
-      for (const line of this.splitter(ev.stream).feed(ev.data)) this.onLine(line);
+      // A pattern matches a line as a read shows it, or as its own pipe wrote it: the one source first, then the
+      // pipe's, a line both read alike at one event matched once (the house's review of 4f4c067..a8b6f28, #22,
+      // comment 6323055715, question 3).
+      for (const line of this.feed(this.source(), ev)) this.once(ev.seq, line);
+      if (ev.stream === 'pty') return;
+      for (const line of this.feed(this.pipe(ev.stream), ev)) this.once(ev.seq, line);
     } else if (ev.type === 'run.start' && ev.runId === this.runId) {
       this.onStarted();
     } else if (ev.type === 'run.end' && ev.runId === this.runId) {
@@ -201,18 +227,49 @@ export class ServiceMonitor {
     }
   }
 
-  private splitter(stream: OutputStream): LineSplitter {
-    let s = this.streams.get(stream);
-    if (!s) {
-      const opts: ConstructorParameters<typeof LineSplitter>[0] = { onPartial: (line) => this.onLine(line) };
-      if (this.partialAfterMs !== undefined) opts.partialAfterMs = this.partialAfterMs;
-      s = new LineSplitter(opts);
-      this.streams.set(stream, s);
-    }
-    return s;
+  /** Feed one reading an output event: the one source takes the event's stream as the source of what it reads. */
+  private feed(r: Reading, ev: EventOf<'output'>): SplitLine[] {
+    r.seq = ev.seq;
+    return r.splitter.feed(ev.data, r.pipe === undefined ? ev.stream : undefined);
   }
 
-  /** One line of the Run's output; true when a pattern matched it. A fail match wins over a ready match on the same line. */
+  /** A line one reading offered at `seq`: matched unless the other reading offered it alike there, and then as that was. */
+  private once(seq: Seq, line: SplitLine): boolean {
+    if (seq !== this.offered.seq) this.offered = { seq, lines: new Map() };
+    const had = this.offered.lines.get(line.text);
+    if (had !== undefined) {
+      this.offered.lines.delete(line.text);
+      return had;
+    }
+    const matched = this.onLine(line);
+    this.offered.lines.set(line.text, matched);
+    return matched;
+  }
+
+  /** A reading of the Run's output, and the seq it was last fed: a quiet prompt it offers is one at that event. */
+  private reading(pipe?: OutputStream): Reading {
+    const r: Reading = { splitter: undefined as never, seq: 0, ...(pipe !== undefined ? { pipe } : {}) };
+    const opts: ConstructorParameters<typeof LineSplitter>[0] = { onPartial: (line) => this.once(r.seq, line) };
+    if (this.partialAfterMs !== undefined) opts.partialAfterMs = this.partialAfterMs;
+    r.splitter = new LineSplitter(opts);
+    return r;
+  }
+
+  private source(): Reading {
+    return (this.lines ??= this.reading());
+  }
+
+  private pipe(stream: OutputStream): Reading {
+    let r = this.pipes.get(stream);
+    if (!r) this.pipes.set(stream, (r = this.reading(stream)));
+    return r;
+  }
+
+  /**
+   * One line of the Run's output, as a read shows it or as its own pipe wrote it; true when a pattern matched it. A fail
+   * match wins over a ready match on the same line. The evidence names the line, whichever reading it is: m2-21's says
+   * `Server listening on 8080`.
+   */
   private onLine(line: SplitLine): boolean {
     if (this.disposed || ended(this.statusValue)) return false;
     // Matched on the line's head within the pattern's match window, as watches and search are
@@ -351,7 +408,8 @@ export class ServiceMonitor {
   private stopTimers(): void {
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
-    for (const s of this.streams.values()) s.dispose();
+    this.lines?.splitter.dispose();
+    for (const r of this.pipes.values()) r.splitter.dispose();
   }
 
   private setStatus(status: ServiceStatus, evidence: string, cause?: UnhealthyCause): void {

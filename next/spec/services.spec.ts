@@ -3,7 +3,7 @@
  * The monitor's rules against a journal driven by hand (no PTY), then the same
  * rules end to end against real bash and real processes: no probe never means
  * ready (m2-1, atc-7), a lost Run is `lost` (m2-6), fail beats health (m2-15),
- * one message per transition (m2-16), per-stream matching (m2-21).
+ * one message per transition (m2-16), per-stream matching (m2-21) beside the one source a read shows.
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -141,6 +141,50 @@ test('m2-21: ready and fail patterns keep a line buffer per stream, so interleav
   f.out('ERROR on stderr\n', 'stderr');
   assert.equal(m.status, 'unhealthy', '^ERROR is the start of the stderr line, whatever stdout holds');
   m.dispose();
+});
+
+test('a service reads a process Run’s pipes as one source, as a read shows them, and each pipe’s own lines too, matching a line both read alike once (the house’s review of 4f4c067..a8b6f28, #22, comment 6323055715, question 3)', () => {
+  // A pattern written from a line someone read: `listening on ` on stdout then `8080` and a LF on stderr is the line
+  // `listening on 8080` to a read, a watch and search, and matched per pipe it was never a line.
+  const f = fake('process');
+  const m = f.monitor({ ready: { pattern: '^listening on 8080$' } });
+  f.start();
+  f.out('listening on ', 'stdout');
+  f.out('8080\n', 'stderr');
+  assert.equal(m.status, 'ready');
+  assert.equal(m.info().evidence, 'listening on 8080');
+  m.dispose();
+  // A fail line on one pipe, read alike by the source and by its pipe, is one line: counted once.
+  const g = fake('process');
+  const n = g.monitor({ fail: { pattern: '^ERROR' } });
+  g.start();
+  g.out('ERROR: first\n', 'stderr');
+  g.out('ERROR: second\n', 'stderr');
+  assert.equal(n.status, 'unhealthy');
+  assert.equal(n.info().repeats, 1, 'the second line once, not twice');
+  assert.equal(n.info().evidence, 'ERROR: second', 'the line as both readings read it');
+  n.dispose();
+});
+
+test('a quiet prompt is offered by both readings and matched once: as a read shows it, or as its own pipe wrote it', async () => {
+  const f = fake('process');
+  const m = f.monitor({ fail: { pattern: '^Password:' } }, { partialAfterMs: 30 });
+  f.start();
+  f.out('Password: ', 'stderr');
+  await until(() => m.status === 'unhealthy', 2000, 'the prompt matched once quiet');
+  await sleep(100);
+  assert.equal(m.info().repeats, undefined, 'one prompt, one match');
+  m.dispose();
+  // A prompt only its pipe holds whole: stdout's `Pass` then stderr's line then `word: ` is `Password: ` to stdout alone.
+  const g = fake('process');
+  const n = g.monitor({ fail: { pattern: '^Password:' } }, { partialAfterMs: 30 });
+  g.start();
+  g.out('Pass', 'stdout');
+  g.out('noise\n', 'stderr');
+  g.out('word: ', 'stdout');
+  await until(() => n.status === 'unhealthy', 2000, 'the prompt as stdout wrote it');
+  assert.equal(n.info().evidence, 'Password:');
+  n.dispose();
 });
 
 test('m2-5/m2-10: service patterns go through the linear-time engine and are checked before anything starts', () => {

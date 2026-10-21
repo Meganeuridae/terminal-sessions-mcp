@@ -99,7 +99,10 @@ compatibility tools do not take one (1.x had none) and ignore one passed to them
 
 The patterns of `search`, `watch`, `wait_for` and a service's readiness and failure probes match
 one output line at a time, as the terminal shows it: escape sequences are gone, and a tab is the
-spaces up to the next tab stop (every eight columns). So `key\tvalue` does not match a line
+spaces up to the next tab stop (every eight columns). A process Run's stdout and stderr are one
+source, as a read shows them, so a line can hold both. A service's probe pattern matches a line as
+a read shows it, or as its own pipe wrote it, so a ready line that stderr's output broke in two
+still counts. So `key\tvalue` does not match a line
 printed with a tab; `key\s+value` does. A line longer than the pattern's match window is matched
 on its head only, and the result, or the notice, says so. 1.x's `searchLogs` matched a tab as
 `\t`; the compat tool of that name reads lines as the others do.
