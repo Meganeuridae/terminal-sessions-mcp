@@ -10,7 +10,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { Journal } from '../src/core/journal.js';
-import { boundHeader, narrowOutput, RunIndex, type RunOutput, type RunOutputRange } from '../src/core/runindex.js';
+import { boundHeader, distinctGaps, narrowOutput, RunIndex, type RunOutput, type RunOutputRange } from '../src/core/runindex.js';
 import { FileStore, MemoryStore } from '../src/core/stores.js';
 import type { EventInput, JournalEvent, RunInfo } from '../src/core/types.js';
 
@@ -403,4 +403,13 @@ test('a page keeps a gap when its hole meets the seqs it covers and drops it whe
   k.append({ type: 'output', data: 'yy', stream: 'stdout', runId });
   k.append({ type: 'run.end', runId, state: 'exited', exit: 0, durationMs: 1 });
   assert.deepEqual([k.runs.output(k, runId).gaps, k.runs.output(k, runId).truncated], [undefined, false]);
+});
+
+test('distinctGaps keeps both of two holes that only partly overlap, leaves out one inside another, and lists them in seq order (the house\'s review of 4f4c067..a8b6f28, PR #22)', () => {
+  const gap = (from: number, to: number, seq: number) => ({ type: 'gap', from, to, reason: 'store-error', seq, ts: 0 }) as Extract<JournalEvent, { type: 'gap' }>;
+  const a = gap(1, 10, 10);
+  const b = gap(5, 15, 15);
+  const c = gap(20, 30, 30);
+  const inside = gap(22, 25, 25);
+  assert.deepEqual(distinctGaps([inside, c, b, a]), [a, b, c]);
 });
