@@ -191,3 +191,16 @@ test('read’s status says when a tail reached back past the lines asked for, to
   assert.match(r.text, / · 2 of 1 lines, back to the line written last · earlier: read tail=1 until=3 untilOffset=8 · next: since=4\]$/);
   assert.doesNotMatch(renderRead({ ...base, lines: { requested: 2, returned: 2 } }, 'transcript').text, /back to/);
 });
+
+test("search and wait_for name a process Run line's pipe, and `mixed` when it holds both, in their text (an independent read of the fixes for the review of the 40 commits, PR #22)", async () => {
+  const search = async (res: SearchResult) => callTool('search', { session: 's', pattern: 'x' }, ctx(stub({ search: async () => res })), TOOLS);
+  const hit = (line: string, cursor: number, more: Record<string, unknown> = {}) => ({ seq: cursor + 1, lineNumber: 1, line, before: [], after: [], cursor, ...more });
+  const r = { session: 's', matches: [hit('both', 7, { stream: 'stderr', mixed: true }), hit('out', 9, { stream: 'stdout' }), hit('pty', 11)], scanned: [1, 12], more: false, bounded: false } as SearchResult;
+  const lines = (await search(r)).text.split('\n').filter((l) => l.startsWith('> '));
+  assert.deepEqual(lines, ['> both   [stderr · mixed · read since=7]', '> out   [stdout · read since=9]', '> pty   [read since=11]']);
+  const wait = async (w: Record<string, unknown>) => (await callTool('wait_for', { session: 's', pattern: 'x' }, ctx(stub({ waitFor: async () => w })), TOOLS)).text;
+  const base = { session: 's', matched: true, kind: 'pattern', line: 'boom', seq: 7, elapsedMs: 12, nextCursor: 8 };
+  assert.equal(await wait({ ...base, stream: 'stderr', mixed: true }), '[pattern matched after 12ms: boom · stderr · mixed · seq 7]');
+  assert.equal(await wait({ ...base, stream: 'stdout' }), '[pattern matched after 12ms: boom · stdout · seq 7]');
+  assert.equal(await wait(base), '[pattern matched after 12ms: boom · seq 7]');
+});

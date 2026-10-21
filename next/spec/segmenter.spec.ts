@@ -310,3 +310,17 @@ test('a marker Run whose command file never ran shows its partial line once the 
   const shown = out.filter((s) => s.kind === 'output' && s.body).at(-1)!.body!;
   assert.equal(shown, 'login as: deploy\nPassword:', 'the echo still dropped');
 });
+
+test("a watch segment names a process Run line's pipe, and `mixed` when it holds both (an independent read of the fixes for the review of the 40 commits, PR #22)", () => {
+  const src = fakeSource();
+  const seg = new Segmenter(src);
+  const out = collect(seg);
+  src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 3, match: 'ERROR', line: 'ERROR: both', stream: 'stderr', mixed: true });
+  src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 5, match: 'ERROR', line: 'ERROR: out', stream: 'stdout' });
+  src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 7, match: 'ERROR', line: 'ERROR: pty' });
+  assert.equal(out.length, 3);
+  assert.ok(out[0]!.head.includes('matched: ERROR: both (stderr, mixed) · read since=2'), out[0]!.head);
+  assert.ok(out[1]!.head.includes('matched: ERROR: out (stdout) · read since=4'), out[1]!.head);
+  assert.ok(out[2]!.head.includes('matched: ERROR: pty · read since=6'), out[2]!.head);
+  seg.dispose();
+});
