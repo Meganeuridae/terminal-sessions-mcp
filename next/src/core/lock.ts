@@ -427,16 +427,18 @@ function holderLive(h: LockHolder, current: string, file: string, src: ProcessSo
 }
 
 /**
- * The refusal. Given the takeover guard (its path and what it holds), the advice is to remove the guard:
- * without it the next start takes over or creates the lock as usual, where a termd.lock removed instead
- * leaves the guard to keep out every later takeover, and every start on a filesystem without hard links.
+ * The refusal. Given the takeover guard (its path, what it holds, or why it cannot be listed), the advice is
+ * to remove the guard, a directory (`rm -r`): without it the next start takes over or creates the lock as
+ * usual. A termd.lock removed instead leaves the guard, which keeps out every later takeover, and every start
+ * on a filesystem without hard links, for as long as an entry in it cannot be judged or its owner lives; a
+ * guard whose owners are all gone is broken by the next start that meets it.
  */
-const lockedError = (dataDir: string, file: string, h: LockHolder | undefined, why: string, guard?: { path: string; entries: string[] }) =>
-  err('data_dir_locked', `data dir ${dataDir} is in use by ${why}; one daemon per data dir (${guard ? `remove ${guard.path} only if no termd is starting` : `remove ${file} only if no termd is running`})`, {
+const lockedError = (dataDir: string, file: string, h: LockHolder | undefined, why: string, guard?: { path: string; entries: string[]; error?: string }) =>
+  err('data_dir_locked', `data dir ${dataDir} is in use by ${why}; one daemon per data dir (${guard ? `rm -r ${guard.path} only if no termd is starting` : `remove ${file} only if no termd is running`})`, {
     dataDir,
     lockFile: file,
     ...(h ? { pid: h.pid, hostname: h.hostname, startedAt: h.startedAt } : {}),
-    ...(guard ? { guard: guard.path, guardEntries: guard.entries } : {}),
+    ...(guard ? { guard: guard.path, guardEntries: guard.entries, ...(guard.error ? { guardError: guard.error } : {}) } : {}),
   });
 
 /**
@@ -818,15 +820,31 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
     sleepSync(10);
   }
   // The attempts ran out: on a guard they kept (a live owner, an entry they cannot read, one still being
-  // written), on a torn lock still young, or on a lock that kept changing under them. A guard still there
-  // is named, with what it holds, since it can be what kept them out and termd.lock's record says nothing of it.
+  // written, or a guard they cannot list), on a torn lock still young, or on a lock that kept changing under
+  // them. A guard still there is named, with what it holds, since it can be what kept them out and
+  // termd.lock's record says nothing of it.
+  const holder = parseHolder(readRaw(file) ?? '');
   const guard = guardPath(file);
-  let entries: string[] | undefined;
+  let entries: string[] = [];
   try {
     entries = fs.readdirSync(guard);
-  } catch {
-    // no guard (or none this start can list): the lock's record is all there is to name
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') throw lockedError(dataDir, file, holder, 'another termd starting at the same time');
+    // A file at the guard's path, or a guard this start cannot list, keeps out every takeover just the same.
+    throw lockedError(dataDir, file, holder, `a takeover guard, ${guard}, that this start cannot list (${code ?? (e as Error).message})`, { path: guard, entries: [], error: code ?? (e as Error).message });
   }
-  const held = entries === undefined ? '' : `, behind its takeover guard ${guard}, ${entries.length ? `held by ${entries.map((n) => (isOwnerName(n) ? `pid ${n.slice(0, n.indexOf('.'))}` : `an entry named ${n}`)).join(', ')}` : 'with no owner in it yet'}`;
-  throw lockedError(dataDir, file, parseHolder(readRaw(file) ?? ''), `another termd starting at the same time${held}`, entries && { path: guard, entries });
+  // Each owner by its pid, and whether a process has that pid now, read once: a guard's pid is another termd
+  // starting only while it runs.
+  const seenNow = entries.map((n) => {
+    const pid = isOwnerName(n) ? Number(n.slice(0, n.indexOf('.'))) : undefined;
+    return { n, pid, running: pid !== undefined && exists(pid) };
+  });
+  const holding = `holding ${seenNow.map((e) => (e.pid !== undefined ? `pid ${e.pid} (${e.running ? 'running' : 'not running'})` : `an entry named ${e.n}`)).join(', ')}`;
+  const why = !entries.length
+    ? `a takeover guard, ${guard}, with no owner in it yet`
+    : seenNow.some((e) => e.running)
+      ? `another termd starting at the same time, behind its takeover guard ${guard}, ${holding}`
+      : `a takeover guard, ${guard}, ${holding}`;
+  throw lockedError(dataDir, file, holder, why, { path: guard, entries });
 }
