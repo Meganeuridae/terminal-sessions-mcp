@@ -435,7 +435,8 @@ const lockedError = (dataDir: string, file: string, h: LockHolder | undefined, w
 
 /**
  * Write `raw` to `target`, created exclusively, owner-only and fsynced. For an attempt's temp, written
- * before it is linked or renamed into place, no reader ever sees it empty or torn. The fallback without
+ * before it is linked or renamed into place, no reader ever sees it empty or torn; the guard's owner file
+ * is written the same way, so after a crash it holds the whole record or reads as torn. The fallback without
  * hard links calls this on `termd.lock` itself, which a reader can see empty until the write lands: that
  * fallback writes under the guard, so a taker never compares it then (the house's read of the 33 commits,
  * PR #22, comment 6307349700, items 1 and 9).
@@ -463,11 +464,18 @@ const rmTemp = (tmp: string) => {
 /** An attempt's temp beside the lock: `termd.lock.<pid>.<nonce>.tmp`, holding that attempt's whole record. */
 const isAttemptTemp = (name: string) => name.startsWith(`${LOCK_FILE}.`) && /^\d+\.[0-9a-f]+\.tmp$/.test(name.slice(LOCK_FILE.length + 1));
 
+/** Whether the process a record names is still its writer, by holderLive; verdicts are kept in `seen`, by record, for one acquire. */
+function recordLive(h: LockHolder, raw: string, where: string, src: ProcessSource, seen: Map<string, boolean>): boolean {
+  let live = seen.get(raw);
+  if (live === undefined) seen.set(raw, (live = holderLive(h, raw, where, src) !== 'stale'));
+  return live;
+}
+
 /**
  * Whether another live process has a lock attempt in flight here. Every attempt writes and syncs its
  * temp before it links, creates in place, or takes the guard, and the temp goes only when the attempt is
  * done: removed, or renamed into place as a taker's last act under the guard. So a process inside the
- * guard has one until it has nothing left to do there. Verdicts are kept in `seen` for one acquire.
+ * guard has one until it has nothing left to do there.
  */
 function attemptInFlight(file: string, src: ProcessSource, seen: Map<string, boolean>): boolean {
   let names: string[];
@@ -487,39 +495,149 @@ function attemptInFlight(file: string, src: ProcessSource, seen: Map<string, boo
     }
     const h = raw === undefined ? undefined : parseHolder(raw);
     if (raw === undefined || !h || h.pid === process.pid) continue; // finished meanwhile, a write cut short, or ours
-    let live = seen.get(raw);
-    if (live === undefined) seen.set(raw, (live = holderLive(h, raw, tmp, src) !== 'stale'));
-    if (live) return true;
+    if (recordLive(h, raw, tmp, src, seen)) return true;
   }
   return false;
 }
 
+/** An ownerless guard, or a guard entry without a whole record, is judged by its age past this, beside the attempt scan. */
+const GUARD_STALE_MS = 5000;
+
+/** A guard's owner file: `<pid>.<nonce>`, the attempt's own pid and nonce, holding the attempt's record. */
+interface GuardOwner {
+  name: string;
+  raw: string;
+}
+const isOwnerName = (name: string) => /^\d+\.[0-9a-f]+$/.test(name);
+
+const olderThan = (p: string, ms: number) => {
+  try {
+    return Date.now() - fs.statSync(p).mtimeMs > ms;
+  } catch {
+    return false; // gone meanwhile
+  }
+};
+
+/** Remove a guard only while it is empty: rmdir refuses one holding any file, so a guard with an owner in it is never removed. */
+function rmdirIfEmpty(guard: string): void {
+  try {
+    fs.rmdirSync(guard);
+  } catch {
+    // an owner is in it, or it is gone meanwhile
+  }
+}
+
+/** Leave the guard: this attempt's owner file by its own name, then the guard if that left it empty. */
+function leaveGuard(guard: string, mine: string): void {
+  try {
+    fs.unlinkSync(mine);
+  } catch {
+    // gone already
+  }
+  rmdirIfEmpty(guard);
+}
+
 /**
- * Run `fn` holding the lock's guard (an exclusive mkdir beside it); undefined when another process holds
- * it. The takers' compare-and-rename and the fallback's create-in-place run under it, so neither ever
- * meets the other halfway. A guard is broken only when it is old and no live process other than this one
- * has an attempt in flight: broken on its age alone, a holder stopped inside it lost it while still about
- * to rename, and two processes held the lock (the house's read of the 33 commits, PR #22, comment
- * 6307349700, item 1). A guard a crashed process left goes once that process is gone, by the one starter
- * that finds no other attempt; two starters that each find the other's wait or refuse, which is recoverable.
+ * Write this attempt's owner file into the guard it just made, and say whether it is inside: only when
+ * its file is the one owner there. A guard removed while still empty, between this start's mkdir and its
+ * owner file, leaves the file nowhere (ENOENT) or in a later start's guard. Each start looks only once its
+ * own file is in, so of two that share a guard the one that looks second sees the other and backs off
+ * (both do, when both look after both files are in), removing its own file and nothing else.
  */
-function underGuard<T>(file: string, src: ProcessSource, seen: Map<string, boolean>, fn: () => T): T | undefined {
+function placeOwner(guard: string, mine: string, raw: string): boolean {
+  try {
+    writeSyncedTemp(mine, raw);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false; // no guard to be in, and nothing of ours to remove
+    leaveGuard(guard, mine);
+    throw e;
+  }
+  let alone = false;
+  try {
+    alone = fs.readdirSync(guard).every((n) => n === path.basename(mine) || !isOwnerName(n));
+  } catch {
+    // cannot look: not inside
+  }
+  if (!alone) leaveGuard(guard, mine);
+  return alone;
+}
+
+/**
+ * Whether a guard entry's owner is gone. An owner file is judged by its record, as the lock's holder is,
+ * whatever its age: a holder stopped inside keeps its guard however long the stop (the house's review of
+ * the 40 commits through f3750e4, PR #22, comment 6310921374, question 3). An entry without a whole record
+ * (an owner between its create and its write, one a crash tore, a stray file) is judged as an ownerless
+ * guard is: a live owner still writing has its attempt in flight.
+ */
+function entryGone(entry: string, file: string, src: ProcessSource, seen: Map<string, boolean>): boolean {
+  let raw: string | undefined;
+  try {
+    raw = readRaw(entry);
+  } catch {
+    return false; // cannot read it: kept (refusing is recoverable)
+  }
+  if (raw === undefined) return false; // removed meanwhile, by its owner or another breaker
+  const h = isOwnerName(path.basename(entry)) ? parseHolder(raw) : undefined;
+  if (!h) return olderThan(entry, GUARD_STALE_MS) && !attemptInFlight(file, src, seen);
+  return !recordLive(h, raw, entry, src, seen);
+}
+
+/**
+ * A guard another start holds: remove it only when every owner in it is gone, each owner's file by its
+ * own name, then the guard by rmdir. Removing whatever stood at the guard's path, a breaker whose check
+ * straddled another breaker's removal and a third start's mkdir deleted that start's fresh guard, and a
+ * holder stopped past the guard's age lost it while still inside: two starts inside at once (comment
+ * 6310921374, question 3). Now a breaker that judged an owner gone removes that owner's file or nothing,
+ * and goes on to the guard only when it emptied it itself. A guard with no owner file (a start between its
+ * mkdir and its owner file, a crash there, or an earlier build's) is broken as every guard was before: when
+ * it is old and no live process other than this one has an attempt in flight (comment 6307349700, item 1).
+ */
+function breakGuard(file: string, guard: string, src: ProcessSource, seen: Map<string, boolean>): void {
+  let names: string[];
+  try {
+    names = fs.readdirSync(guard);
+  } catch {
+    return; // gone meanwhile, or cannot look
+  }
+  if (!names.length) {
+    if (olderThan(guard, GUARD_STALE_MS) && !attemptInFlight(file, src, seen)) rmdirIfEmpty(guard);
+    return;
+  }
+  const entries = names.map((n) => path.join(guard, n));
+  if (!entries.every((e) => entryGone(e, file, src, seen))) return;
+  for (const e of entries) {
+    try {
+      fs.unlinkSync(e);
+    } catch {
+      return; // another breaker removed it: what stands at the guard's path now is not what was judged
+    }
+  }
+  rmdirIfEmpty(guard);
+}
+
+/**
+ * Run `fn` holding the lock's guard (an exclusive mkdir beside it, with the attempt's owner file in it);
+ * undefined when another start holds it. The takers' compare-and-rename and the fallback's create-in-place
+ * run under it, so neither ever meets the other halfway. Each start is inside only while its own owner
+ * file is the guard's one owner; a guard holding an owner is never removed, and an owner's file is
+ * removed only by that owner or by a breaker that judged that owner gone, so two starts are never inside
+ * at once. A guard a crashed start left goes as soon as a start finds its owner gone.
+ */
+function underGuard<T>(file: string, owner: GuardOwner, src: ProcessSource, seen: Map<string, boolean>, fn: () => T): T | undefined {
   const guard = `${file}.takeover`;
   try {
     fs.mkdirSync(guard, { mode: 0o700 });
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-    try {
-      if (Date.now() - fs.statSync(guard).mtimeMs > 5000 && !attemptInFlight(file, src, seen)) fs.rmSync(guard, { recursive: true, force: true });
-    } catch {
-      // gone meanwhile
-    }
+    breakGuard(file, guard, src, seen);
     return undefined;
   }
+  const mine = path.join(guard, owner.name);
+  if (!placeOwner(guard, mine, owner.raw)) return undefined;
   try {
     return fn();
   } finally {
-    fs.rmSync(guard, { recursive: true, force: true });
+    leaveGuard(guard, mine);
   }
 }
 
@@ -530,9 +648,9 @@ function underGuard<T>(file: string, src: ProcessSource, seen: Map<string, boole
  * #22, comment 6269992150). Returns false when the guard is held or the file changed meanwhile (the
  * caller starts over and judges again); `tmp` is then left for the caller to remove.
  */
-function takeOver(file: string, staleRaw: string, tmp: string, src: ProcessSource, seen: Map<string, boolean>): boolean {
+function takeOver(file: string, staleRaw: string, tmp: string, owner: GuardOwner, src: ProcessSource, seen: Map<string, boolean>): boolean {
   return (
-    underGuard(file, src, seen, () => {
+    underGuard(file, owner, src, seen, () => {
       if (readRaw(file) !== staleRaw) return false;
       fs.renameSync(tmp, file);
       return true; // the caller syncs the directory once the take is registered, so a sync error never orphans a held lock
@@ -585,6 +703,8 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
     const me: LockHolder = { pid: process.pid, startedAt: Date.now(), hostname: os.hostname(), nonce: randomBytes(8).toString('hex'), ...(self && { startTicks: self.startTicks, bootId: self.bootId }) };
     const raw = JSON.stringify(me) + '\n';
     const tmp = `${file}.${process.pid}.${me.nonce}.tmp`;
+    // The guard's owner file for this attempt: the same pid, nonce and record as its temp.
+    const owner: GuardOwner = { name: `${process.pid}.${me.nonce}`, raw };
     try {
       writeSyncedTemp(tmp, raw);
     } catch (e) {
@@ -615,7 +735,7 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
           // An exclusive ('wx') create of the same content, fsynced, under the guard: a taker compares
           // only while holding it, so none reads this file empty mid-write and renames over it later.
           // The read-back still decides: the take is this attempt's only if the file holds its record.
-          made = underGuard(file, src, seen, () => {
+          made = underGuard(file, owner, src, seen, () => {
             try {
               writeSyncedTemp(file, raw);
             } catch (e2) {
@@ -675,7 +795,7 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
         throw lockedError(dataDir, file, holder, `termd pid ${holder.pid}${holder.hostname !== os.hostname() ? ` (written on host ${holder.hostname})` : ''}`);
       }
     }
-    if (takeOver(file, current, tmp, src, seen)) return publish(holder ?? {});
+    if (takeOver(file, current, tmp, owner, src, seen)) return publish(holder ?? {});
     rmTemp(tmp);
     sleepSync(10);
   }

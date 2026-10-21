@@ -760,3 +760,192 @@ test('a live holder whose /proc stat cannot be read is kept: a listing that leav
     sleeper.kill('SIGKILL');
   }
 });
+
+// ───────────── the house's review of the 40 commits through f3750e4 (PR #22, comment 6310921374, question 3): the guard carries its owner ─────────────
+
+const guardOf = (dir: string) => path.join(dir, `${LOCK_FILE}.takeover`);
+const record = (pid: number, nonce: string, startedAt = Date.now()) => JSON.stringify({ pid, startedAt, hostname: os.hostname(), nonce }) + '\n';
+/** A lock whose holder is long gone, so a start takes it over under the guard. */
+const staleLock = (dir: string) => {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, LOCK_FILE), record(999_999, 'stale', Date.now() - 60_000));
+};
+/** A stop of seconds, without waiting them out. */
+const aged = (p: string) => {
+  const old = new Date(Date.now() - 10_000);
+  fs.utimesSync(p, old, old);
+};
+const noLinks = () => {
+  throw Object.assign(new Error('EPERM: operation not permitted, link'), { code: 'EPERM' });
+};
+
+test('inside the guard, its owner file names the attempt by pid and nonce and holds its record; a guard whose owner is gone is broken at once, one whose owner lives is kept however old (the house\'s review of the 40 commits through f3750e4, PR #22, comment 6310921374, question 3)', () => {
+  // Inside: the fallback without hard links writes termd.lock under the guard, where the guard is looked at.
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, LOCK_FILE);
+  let inside: string[][] | undefined;
+  const realOpen = fsc.openSync;
+  fsc.openSync = ((p: fs.PathLike, ...rest: unknown[]) => {
+    if (String(p) === file && inside === undefined) inside = fs.readdirSync(guardOf(dir)).map((n) => [n, fs.readFileSync(path.join(guardOf(dir), n), 'utf8')]);
+    return (realOpen as (...a: unknown[]) => number)(p, ...rest);
+  }) as typeof fs.openSync;
+  syncBuiltinESMExports();
+  let lock;
+  try {
+    lock = acquireDataDirLock(dir, { link: noLinks });
+  } finally {
+    fsc.openSync = realOpen;
+    syncBuiltinESMExports();
+  }
+  const raw = fs.readFileSync(file, 'utf8');
+  assert.deepEqual(inside, [[`${process.pid}.${(JSON.parse(raw) as { nonce: string }).nonce}`, raw]], 'one owner: this attempt, with its whole record');
+  assert.equal(fs.existsSync(guardOf(dir)), false, 'left as it was entered');
+  lock.release();
+
+  // A guard a crashed start left, its owner gone: broken at once, though it is fresh.
+  const dead = dataDir();
+  staleLock(dead);
+  fs.mkdirSync(guardOf(dead));
+  fs.writeFileSync(path.join(guardOf(dead), '999999.0123456789abcdef'), record(999_999, '0123456789abcdef'));
+  const over = acquireDataDirLock(dead);
+  assert.equal(over.tookOver?.pid, 999_999, 'taken over without waiting out the guard\'s age');
+  assert.equal(fs.existsSync(guardOf(dead)), false);
+  over.release();
+
+  // A guard whose owner lives (our parent, the test runner), old and with no attempt in flight: a holder
+  // stopped after its rename, its temp gone. Kept, by a taker and by the fallback alike.
+  const live = dataDir();
+  staleLock(live);
+  const owner = path.join(guardOf(live), `${process.ppid}.abcdef0123456789`);
+  fs.mkdirSync(guardOf(live));
+  fs.writeFileSync(owner, record(process.ppid, 'abcdef0123456789'));
+  aged(owner);
+  aged(guardOf(live));
+  for (const opts of [{}, { link: noLinks }]) {
+    assert.throws(() => acquireDataDirLock(live, opts), locked, `refused ${JSON.stringify(Object.keys(opts))}: the guard's owner lives`);
+    assert.deepEqual(fs.readdirSync(guardOf(live)), [path.basename(owner)], 'the guard and its owner are kept');
+    assert.equal(readLock(live).pid, 999_999, 'and the lock is untouched');
+  }
+
+  // An owner file without a whole record (a start between its create and its write, or a crash there):
+  // judged as an ownerless guard is, kept while a live attempt is in flight and broken once none is.
+  const torn = dataDir();
+  staleLock(torn);
+  const tornOwner = path.join(guardOf(torn), `${process.ppid}.1111111111111111`);
+  fs.mkdirSync(guardOf(torn));
+  fs.writeFileSync(tornOwner, '');
+  aged(tornOwner);
+  aged(guardOf(torn));
+  const attempt = path.join(torn, `${LOCK_FILE}.${process.ppid}.1111111111111111.tmp`);
+  fs.writeFileSync(attempt, record(process.ppid, '1111111111111111'));
+  assert.throws(() => acquireDataDirLock(torn), locked, 'its writer may still be writing');
+  fs.rmSync(attempt);
+  const afterTorn = acquireDataDirLock(torn);
+  assert.equal(afterTorn.tookOver?.pid, 999_999);
+  afterTorn.release();
+});
+
+/** Child source that patches the builtins before it loads the lock: `fsc` and the unpatched `realWrite` are in scope for stallUntil. */
+const patched = (patch: string, run: string) => `
+  import { createRequire, syncBuiltinESMExports } from 'node:module';
+  const fsc = createRequire(import.meta.url)('node:fs');
+  const realWrite = fsc.writeSync;
+  ${patch}
+  syncBuiltinESMExports();
+  const { acquireDataDirLock } = await import(${JSON.stringify(LOCK_JS)});
+  try { ${run}; console.log('won'); }
+  catch (e) { console.log(e.code === 'data_dir_locked' ? 'refused' : 'error ' + e.message); }
+  setInterval(() => {}, 1000);
+`;
+const outcomeRe = /^(won|refused|error)/;
+/** A directory's names; undefined once it is gone. */
+const ls = (dir: string) => (fs.existsSync(dir) ? fs.readdirSync(dir) : undefined);
+
+test('a breaker whose check straddles another breaker\'s removal and a third start\'s mkdir removes nothing of the new guard: one holder (the house\'s review of the 40 commits through f3750e4, PR #22, comment 6310921374, question 3)', async () => {
+  const dir = dataDir();
+  staleLock(dir);
+  const file = path.join(dir, LOCK_FILE);
+  const guard = guardOf(dir);
+  // A guard a crash left: its owner is gone, and it is old, so it is broken by either rule.
+  fs.mkdirSync(guard);
+  fs.writeFileSync(path.join(guard, '999999.0123456789abcdef'), record(999_999, '0123456789abcdef'));
+  aged(path.join(guard, '999999.0123456789abcdef'));
+  aged(guard);
+  const goX = path.join(tmp, `goX-${dirs}`);
+  const goZ = path.join(tmp, `goZ-${dirs}`);
+  // X: judges the crashed guard gone, then stops before it removes anything there.
+  const x = child(
+    patched(
+      `let stopped = false;
+      for (const fn of ['unlinkSync', 'rmSync', 'rmdirSync']) {
+        const real = fsc[fn];
+        fsc[fn] = (p, ...rest) => {
+          const s = String(p);
+          if (!stopped && (s === ${JSON.stringify(guard)} || s.startsWith(${JSON.stringify(guard + path.sep)}))) { stopped = true; ${stallUntil('breaking', goX)} }
+          return real(p, ...rest);
+        };
+      }`,
+      `acquireDataDirLock(${JSON.stringify(dir)})`,
+    ),
+  );
+  let z: ReturnType<typeof child> | undefined;
+  try {
+    await x.line(/^breaking$/);
+    // Y: another breaker removes the crashed guard meanwhile.
+    fs.rmSync(guard, { recursive: true, force: true });
+    // Z: a third start makes a guard of its own and is inside it, about to rename onto the stale lock.
+    z = child(patched(`const realRename = fsc.renameSync; fsc.renameSync = (from, to) => { if (String(to) === ${JSON.stringify(file)}) { ${stallUntil('renaming', goZ)} } return realRename(from, to); };`, `acquireDataDirLock(${JSON.stringify(dir)})`));
+    await z.line(/^renaming$/);
+    const zGuard = ls(guard);
+    fs.writeFileSync(goX, ''); // X goes on with the removal it judged
+    await x.line(outcomeRe);
+    const afterX = ls(guard);
+    fs.writeFileSync(goZ, '');
+    await z.line(outcomeRe);
+    const outcomes = [x, z].map((c) => c.lines.find((l) => outcomeRe.test(l)));
+    assert.deepEqual(outcomes, ['refused', 'won'], 'one holder: X waited on a live owner, then refused');
+    assert.equal(readLock(dir).pid, z.proc.pid, 'termd.lock names the one holder');
+    assert.deepEqual(afterX, zGuard, 'Z\'s guard stood while Z was inside it');
+    assert.match(zGuard?.join() ?? '', new RegExp(`^${z.proc.pid}\\.[0-9a-f]+$`), 'owned by Z');
+  } finally {
+    x.proc.kill('SIGKILL');
+    z?.proc.kill('SIGKILL');
+  }
+});
+
+test('a holder stopped for seconds between its rename and leaving the guard keeps it, and its release removes only its own (the house\'s review of the 40 commits through f3750e4, PR #22, comment 6310921374, question 3)', async () => {
+  const dir = dataDir();
+  staleLock(dir);
+  const file = path.join(dir, LOCK_FILE);
+  const guard = guardOf(dir);
+  const goH = path.join(tmp, `goH-${dirs}`);
+  // H: takes the stale lock over, and stops right after its rename, still inside the guard, its temp gone.
+  const h = child(patched(`const realRename = fsc.renameSync; fsc.renameSync = (from, to) => { const r = realRename(from, to); if (String(to) === ${JSON.stringify(file)}) { ${stallUntil('renamed', goH)} } return r; };`, `acquireDataDirLock(${JSON.stringify(dir)})`));
+  let x: ReturnType<typeof child> | undefined;
+  try {
+    await h.line(/^renamed$/);
+    const hGuard = fs.readdirSync(guard);
+    for (const n of hGuard) aged(path.join(guard, n));
+    aged(guard);
+    // X: a start without hard links, which goes for the guard whatever the lock holds; it says when it is inside.
+    x = child(patched(`const realOpen = fsc.openSync; fsc.openSync = (p, flags, ...rest) => { if (String(p) === ${JSON.stringify(file)} && flags === 'wx') realWrite(1, 'inside\\n'); return realOpen(p, flags, ...rest); };`, `acquireDataDirLock(${JSON.stringify(dir)}, { link: () => { throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); } })`));
+    await x.line(outcomeRe);
+    assert.deepEqual(x.lines.filter((l) => l !== 'refused'), [], 'X never entered the guard H is inside');
+    assert.equal(x.lines.find((l) => outcomeRe.test(l)), 'refused');
+    assert.deepEqual(fs.readdirSync(guard), hGuard, 'H\'s guard is kept, however old');
+    // Should anything else stand there by the time H leaves (an earlier build's breaker, a hand removal and
+    // another start's guard), H's release leaves it.
+    fs.rmSync(guard, { recursive: true, force: true });
+    fs.mkdirSync(guard);
+    fs.writeFileSync(path.join(guard, `${process.ppid}.abcdef0123456789`), record(process.ppid, 'abcdef0123456789'));
+    fs.writeFileSync(goH, '');
+    await h.line(outcomeRe);
+    assert.equal(h.lines.find((l) => outcomeRe.test(l)), 'won');
+    assert.deepEqual(fs.readdirSync(guard), [`${process.ppid}.abcdef0123456789`], 'the other guard and its owner are left');
+    assert.equal(readLock(dir).pid, h.proc.pid);
+  } finally {
+    h.proc.kill('SIGKILL');
+    x?.proc.kill('SIGKILL');
+  }
+});
