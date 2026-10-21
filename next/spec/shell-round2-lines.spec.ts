@@ -2,12 +2,16 @@
  * Real shells, second review: daemon lines that never merge with what the line editor
  * holds (ss-1), PROMPT_COMMAND emptied, unset or turned into an array (ss-3, ss-9), the
  * marker strategy after an aborted line (ss-5), fish's first Run as marks appear (ss-12),
- * and a key that never reaches a reader (atc-3). Every shell runs with a fake HOME.
+ * the marker strategy's start mark, and a key that never reaches a reader (atc-3). Every
+ * shell runs with a fake HOME.
  *
  * bash >= 5.1 is not on macOS: set TSM_TEST_BASH5 to a bash 5 binary to run its tests.
  */
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { AGENT, hasShell, realSession, until, type Real } from './fake-shell.js';
 import { sleep } from './testhost.js';
 
@@ -137,18 +141,48 @@ test('fish: ss-12: the first Run of a none-to-rich transition keeps its output',
     assert.equal(x.session.integration, 'none');
     const r = await run(x, 'echo first; echo second', 8000);
     // The shell was still starting when the line was typed: the terminal echoed it, then fish printed its banner and
-    // showed the line again at its first prompt. The marker strategy has no start marker to cut up to, and a line in
-    // the typed line's shape after output is the program's (`history 1` prints it), so those lines stay above the
-    // output; the output itself and the end marker are what the rule must get right.
+    // showed the line again at its first prompt. The command file's first line prints the Run's start mark after all
+    // of that, and the output is cut up to it (the house's read of the 33 commits, #22, comment 6307351104, item 6).
     assert.deepEqual([r.state, r.exit], ['exited', 0]);
-    assert.ok(r.text.endsWith('first\nsecond'), JSON.stringify(r.text));
-    assert.ok(!r.text.includes('<<<EXIT'), 'the end marker is cut');
+    assert.equal(r.text, 'first\nsecond');
     await until(() => x.session.integration === 'rich', 3000, 'rich');
     assert.equal((await run(x, 'echo third')).text, 'third');
   } finally {
     await x.close();
   }
 });
+
+// The marker strategy's start mark (the house's read of the 33 commits, #22, comment 6307351104, items 3, 6 and 9, and its
+// answer 2), in dash and in bash run as sh, a readline sh with `fc` as macOS's /bin/sh is (dash has no `fc`).
+const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-marker-start-'));
+after(() => fs.rmSync(markerDir, { recursive: true, force: true }));
+const bashAsSh = path.join(markerDir, 'sh');
+fs.symlinkSync('/bin/bash', bashAsSh);
+const slowRc = path.join(markerDir, 'slow.rc');
+fs.writeFileSync(slowRc, 'sleep 1\necho "Welcome, slow shell"\n');
+for (const [name, shell] of [...(hasShell('/bin/dash') ? [['dash', '/bin/dash']] : []), ['bash as sh', bashAsSh]] as const) {
+  test(`${name}: the marker strategy cuts at the start mark its command file prints: a still-starting shell's banner and second echo, the typed line's and the end mark's traces under set -x${name === 'dash' ? '' : ', and nothing before a history line with the echo off'}`, async () => {
+    // $ENV runs before the first prompt, and a shell without integration takes the line at once: it is typed while the
+    // shell sleeps, echoed by the terminal, then the banner, then (bash) the prompt shows it again.
+    const x = await realSession(shell, { env: { ENV: slowRc } });
+    try {
+      assert.equal(x.session.integration, 'none');
+      assert.equal((await run(x, 'echo first; echo second', 8000)).text, 'first\nsecond', 'item 6');
+      // Item 9: no `+ command . <file>` at the head, no dangling `+ echo ` at the end, in the Run that turns tracing on and after.
+      assert.match((await run(x, 'set -x; echo on')).text, /^\++ echo on\non$/);
+      assert.match((await run(x, 'echo traced')).text, /^\++ echo traced\ntraced$/);
+      await run(x, 'set +x');
+      if (name !== 'dash') {
+        // Item 3: `fc -l -1` prints the typed line, with the Run's nonce, after output began; what came before it stays.
+        await run(x, 'stty -echo');
+        assert.match((await run(x, 'echo out-1; fc -l -1; echo out-2')).text, /^out-1\n.*EXI""T.*\nout-2$/);
+        await run(x, 'stty echo');
+      }
+    } finally {
+      await x.close();
+    }
+  });
+}
 
 for (const shell of SHELLS) {
   const name = shell.split('/').pop()!;

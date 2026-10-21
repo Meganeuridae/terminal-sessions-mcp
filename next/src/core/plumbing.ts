@@ -71,8 +71,14 @@ const redrawn = (s: string): string => {
 };
 /** A mark's word as the typed lines spell it, split by two quotes (`EXI""T`), each piece as it may be redrawn. */
 const splitWord = (a: string, b: string): string => `${redrawn(a)}\\s*(?:${redrawn('""')}|${redrawn("''")})\\s*${redrawn(b)}`;
-/** The echo of a typed line that runs a Run: the wrapper's end marker or the inline start marker, split. */
-const wrapperEcho = (nonce: string): RegExp => new RegExp(`${redrawn('<<<')}\\s*(?:${splitWord('EXI', 'T')}|${splitWord('STAR', 'T')})\\s*:\\s*${redrawn(nonce)}\\s*:`, 'g');
+/**
+ * The echo of a typed line that runs a Run: the wrapper's end marker, through the end of the marker
+ * strategy's typed line (a redraw that broke it after the nonce's colon left `$?>>>"` at the head of
+ * the result: the house's read of the 33 commits, #22, comment 6307351104), or the inline start
+ * marker, split.
+ */
+const wrapperEcho = (nonce: string): RegExp =>
+  new RegExp(`${redrawn('<<<')}\\s*(?:${splitWord('EXI', 'T')}\\s*:\\s*${redrawn(nonce)}\\s*:(?:\\s*(?:${MARKER_RESTS.map(redrawn).join('|')}))?|${splitWord('STAR', 'T')}\\s*:\\s*${redrawn(nonce)}\\s*:)`, 'g');
 
 /**
  * The end-marker probe the marker strategy types after a ^C: a marker of its own, split so echoes
@@ -114,10 +120,36 @@ export function sourceLine(file: string, flavor: ShellFlavor, nonce?: string): s
   const run = flavor === 'fish' ? (marker ? ` source ${shellQuote(file)}` : ` eval (__tsm_collect ${shellQuote(file)} $status)`) : ` ${marker && flavor === 'posix' ? 'command .' : '.'} ${shellQuote(file)}`;
   return marker ? `${run}; echo "<<<EXI""T:${nonce}:${flavor === 'fish' ? '$status' : '$?'}>>>"` : run;
 }
+/**
+ * The first line of a marker Run's command file: it prints the Run's start mark, so the cutter has
+ * a bound that lands after whatever the shell printed before it ran the file (the typed line's echo,
+ * a still-starting shell's banner and its second echo, a redraw's pieces), and that no program's line
+ * can stand in for: with the echo alone, a history line with the echo off (`fc -l -1`) was taken for
+ * it and the output before it went (the house's read of the 33 commits, #22, comment 6307351104, and
+ * its answer 2). Printed from the file, the typed line, its echo and its history entry stay as they
+ * are. The status the shell had is kept for the body (`$?` after `false` is still 1; a subshell only
+ * when it is not 0), restored in an AND-OR list's first place so `set -e` never ends the shell on it,
+ * and the group's stderr goes to /dev/null so `set -x` traces none of it in dash and bash (zsh and
+ * fish write their traces elsewhere). fish has no `$?` to restore with `exit`: a function returns it.
+ * It adds one line, so a message that names a line of the body names the next one.
+ */
+export function markerStartLine(nonce: string, flavor: ShellFlavor): string {
+  return flavor === 'fish'
+    ? `begin; set -g __tsm_q $status; printf '<<<STAR''T:%s:%s>>>\\n' ${nonce} $fish_pid; function __tsm_rs; return $argv[1]; end; __tsm_rs $__tsm_q; end 2>/dev/null`
+    : `{ __tsm_q=$?; printf '<<<STAR''T:%s:%s>>>\\n' ${nonce} "$$"; [ "$__tsm_q" = 0 ] || (exit "$__tsm_q") && :; } 2>/dev/null`;
+}
 /** Where a builder's line holds the nonce, to split it there: no builder types this character. */
 const AT_NONCE = '\0';
 /** Where a source line holds its command file's path: no builder types it, and quoting leaves it as it is. */
 const AT_FILE = '\u0001';
+/** What the marker strategy's typed line holds after its end mark's nonce and colon, for each flavor (`$?>>>"`, `$status>>>"`). */
+const MARKER_RESTS = [...new Set((['posix', 'zsh', 'fish'] as const).map((f) => sourceLine(AT_FILE, f, AT_NONCE).split(AT_NONCE)[1]!.slice(1)))];
+/**
+ * Under `set -x`, the trace of the typed line that ran a command file (`+ command . /tmp/x/tsm-cmd-3`,
+ * fish's `> source …`); group 1 is the trace's prefix, PS4 as the shell expanded it. The trace does not
+ * quote the path, where the typed line, and so its echo, does.
+ */
+const RUN_TRACE = new RegExp(`(?:^|\\n)([^\\n]*?)(?:command \\.|\\.|source) /[^\\s']*/${literal(COMMAND_FILE)}\\d+\\r?(?=\\n|$)`);
 /** A command file's path as a source line quotes it: any directory, then the file's name. */
 const QUOTED_FILE = `'(?:[^'\\n]|'\\\\'')*/${literal(COMMAND_FILE)}\\d+'`;
 /**
@@ -196,18 +228,22 @@ export interface PlumbingOf {
  * A shell Run's output without the daemon's plumbing, the one rule for the live transcript and
  * for history. Under `rich` nothing is cut: the output runs from the pre-execution mark to the
  * end mark, and the marks are not output. Under `basic` the first line is the echo of the typed
- * line. Under `marker` and `inline` the marks carry the Run's nonce, and the cut is by it: the
- * echo of the typed line (the lines echoing it without a break: typed ahead of the prompt it
- * echoes twice, and a redraw shows it in pieces), under `marker` from its first line wherever it
- * is, with everything before it, and otherwise at the output's head; under `inline` everything
- * through the start-marker line (the output begins right after `>>>`), whatever a slow shell
- * printed between the echo and the marker included (a login banner, its first prompt showing the
- * line again); and everything from the end marker on, or from the probe answer the session
- * accepted. A later line in the echo's shape is the program's. The marker strategy has no start
- * marker, so a shell that prints its banner and shows the typed line again before it runs it
- * (one still starting when the line was typed) leaves those lines in its first Run; and with the
- * terminal's echo off, a program line in the echo's shape with the Run's own nonce (`history 1`)
- * is taken for the echo, and what preceded it goes with it. Before that
+ * line. Under `marker` and `inline` the marks carry the Run's nonce, and the cut is by it:
+ * everything through the start mark's line, which the inline strategy's typed line prints and the
+ * marker strategy's command file prints from its first line (markerStartLine), so whatever the
+ * shell printed before it ran the Run goes, the echo of the typed line and a slow shell's banner and
+ * second echo included, and a later line in the echo's shape is the program's; with a recorded nonce
+ * the mark is the Run's own wherever an echo-shaped line falls (the house's read of the 33 commits,
+ * #22, comment 6307351104: with the echo off, `fc -l -1` printed the typed line after the output had
+ * begun, and the rule that let it stand for the echo cut what came before it). A marker Run whose
+ * file never ran (a program read the typed line) has no start mark, and its echo is cut by today's
+ * rule: the lines echoing the typed line without a break (typed ahead of the prompt it echoes twice,
+ * and a redraw shows it in pieces), from its first line wherever it is, with everything before it;
+ * a still-starting shell's second echo then stays, and with the echo off a program's line in the
+ * echo's shape is taken for it. Without a recorded nonce, the echo is cut at the output's head, and
+ * a start mark only when no echo comes before it. Everything from the end marker on goes, or from the
+ * probe answer the session accepted; and under `set -x`, the end mark's own trace, when the typed
+ * line's trace before the start mark shows the shell was tracing (the same read). Before that
  * end, every line of each probe's echo and every rejected answer's line is struck on its own, and the
  * output between them stays: a probe the session rejected (answered by a nested shell: its pid is
  * not the one the start marker named, or its token is not the Run's) is not an end (the house's
@@ -231,16 +267,21 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   let pid: string | undefined = of.pid;
   const echoes = [...text.matchAll(wrapperEcho(nonce))].map((m) => [m.index, m.index + m[0].length] as const);
   const start = startMark(nonce).exec(text);
-  if (start && (echoes.length === 0 || echoes[0]![0] < start.index)) {
-    // An inline Run's output begins after its start marker: what the text holds before it is the
-    // shell's, not the Run's (the typed line's echo, a banner or prompt a slow shell printed after
-    // the line was typed, the pieces' acknowledgements), and a line in the echo's shape after the
-    // marker is the program's (`history 1` prints the typed line with the Run's own nonce, and the
-    // rule that took the last such line for the echo cut everything before it: the house's read of
-    // 78c4d6e, #22, comment 6269901528).
+  const own = of.nonce !== undefined && (of.strategy === 'marker' || of.strategy === 'inline');
+  // Set when a marker Run's start mark bounds its output: the prefix of the typed line's trace before
+  // the mark, when the shell was tracing (set -x), or null.
+  let trace: string | null | undefined;
+  if (start && (own || echoes.length === 0 || echoes[0]![0] < start.index)) {
+    // The Run's output begins after its start marker: what the text holds before it is the shell's,
+    // not the Run's (the typed line's echo, a banner or prompt a slow shell printed after the line
+    // was typed, a redraw's pieces, the inline pieces' acknowledgements), and a line in the echo's
+    // shape after the marker is the program's (`history 1` prints the typed line with the Run's own
+    // nonce, and the rule that took the last such line for the echo cut everything before it: the
+    // house's read of 78c4d6e, #22, comment 6269901528).
     pid = start[1];
     const nl = text.indexOf('\n', start.index + start[0].length);
     from = nl === -1 ? text.length : nl + 1;
+    if (of.strategy === 'marker') trace = RUN_TRACE.exec(text.slice(0, start.index))?.[1] ?? null;
   } else {
     // The typed line's echo, and the lines that follow it without a break, which are more of it: the
     // same line echoed again (typed ahead of its prompt), or the pieces of a redraw, which can split
@@ -254,8 +295,8 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     // with no nonce recorded an echo-shaped line further on may be another Run's that a program
     // printed. A truncated read began after the echo. A line in the echo's shape after output is the
     // program's (`history 1` prints the typed line with the Run's own nonce), and a shell still
-    // starting when the line was typed shows it again after its banner, which the marker strategy,
-    // with no start marker, cannot tell from the program's: those lines stay in its first Run.
+    // starting when the line was typed shows it again after its banner, which a marker Run whose
+    // file never ran, with no start mark to cut to, cannot tell from the program's: those lines stay.
     const first = echoes[0];
     const anywhere = of.strategy === 'marker' && !of.truncated;
     const headEnd = text.indexOf('\n') === -1 ? text.length : text.indexOf('\n');
@@ -278,6 +319,15 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     return [s, e === -1 ? rest.length : e + 1];
   };
   let to = exitMark(nonce).exec(rest)?.index ?? rest.length;
+  if (trace !== undefined) {
+    // Tracing, the shell prints the end mark's echo (`+ echo <<<EXIT:…:0>>>`, bash quoting the word)
+    // before the mark itself, and the first mark ends the Run: that trace's head is plumbing too. Its
+    // prefix is the one the typed line's trace showed, or, in the Run that turned tracing on, PS4's
+    // default at a line's start.
+    const before = rest.slice(0, to);
+    const tail = trace !== null ? [`${trace}echo '`, `${trace}echo `].find((t) => before.endsWith(t)) : /(?:^|\n)(\+ echo '?)$/.exec(before)?.[1];
+    if (tail) to -= tail.length;
+  }
   const struck: Array<[number, number]> = [];
   for (const m of rest.matchAll(probeAnswer(nonce))) {
     if (m.index >= to) break;

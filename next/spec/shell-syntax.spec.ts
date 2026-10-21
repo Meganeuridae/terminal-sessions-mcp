@@ -11,6 +11,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { processLaunch, shellLaunch } from '../src/core/launch.js';
+import { markerStartLine } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { prepareIntegration } from '../src/shell/integration.js';
 import { hasShell } from './fake-shell.js';
@@ -69,5 +70,15 @@ test('the process launcher and the lines typed for a declared shell parse in sh,
       fs.writeFileSync(file, inlineLines(body, 'abcd1234', true).join('\n') + '\n');
       parses(FISH, ['--no-execute', file], `fish inline lines (${body.length} chars)`);
     }
+  }
+});
+
+test('the first line of a marker Run’s command file parses in sh, dash, bash and zsh, and fish’s in fish', () => {
+  // The start mark the command file prints (the house's answer 2 on the 33 commits, #22, comment 6307351985).
+  for (const shell of ['/bin/sh', '/bin/dash', '/bin/bash', '/bin/zsh'].filter(hasShell)) parses(shell, ['-n', '-c', markerStartLine('abcd1234', shell.endsWith('zsh') ? 'zsh' : 'posix')], 'the start line');
+  if (FISH) {
+    const file = path.join(tmp, 'start-line.fish');
+    fs.writeFileSync(file, `${markerStartLine('abcd1234', 'fish')}\n`);
+    parses(FISH, ['--no-execute', file], 'fish’s start line');
   }
 });

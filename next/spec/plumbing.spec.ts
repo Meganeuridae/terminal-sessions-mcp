@@ -3,7 +3,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
-import { ackMark, commandFile, cutPlumbing, exitMark, goneMark, inlineProbe, inlineTypedLine, markerProbe, nonceOf, probeEcho, probeMark, shellQuote, sourceLine, sourceLineEcho, startMark } from '../src/core/plumbing.js';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { ackMark, commandFile, cutPlumbing, exitMark, goneMark, inlineProbe, inlineTypedLine, markerProbe, markerStartLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLine, sourceLineEcho, startMark } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { journalRunText } from '../src/core/segmenter.js';
 import type { RunOutput } from '../src/core/runindex.js';
@@ -201,7 +203,8 @@ test('under the marker strategy the echo begins at the Run’s first wrapper ech
   // Lines after the echo region are the program's, the echo's shape included.
   assert.equal(cutPlumbing(`banner\n${typed(N)}before-2\n  502 ${typed(N).trim()}\n<<<EXIT:${N}:0>>>\n`, marker), `before-2\n  502 ${typed(N).trim()}\n`);
   // A shell still starting when the line was typed shows it again after its banner: that second echo is in the echo's shape
-  // after output, which the rule cannot tell from a program's, so it stays (the marker strategy has no start marker to cut to).
+  // after output, which the rule cannot tell from a program's, so it stays when no start mark bounds the output (a journal
+  // from before the command file printed one; the next test has the mark).
   assert.equal(cutPlumbing(`${typed(N)}Welcome to fish\n$ ${typed(N)}first\n<<<EXIT:${N}:0>>>\n`, marker), `Welcome to fish\n$ ${typed(N)}first\n`);
   // A read that began after the Run's start holds no echo of its own: an echo-shaped line there is the program's.
   assert.equal(cutPlumbing(`tail of out\n  502 ${typed(N).trim()}\nmore\n`, { ...marker, truncated: true }), `tail of out\n  502 ${typed(N).trim()}\nmore\n`);
@@ -369,4 +372,70 @@ test('no pattern the grammar builds backtracks: every typed line, cut anywhere a
   }
   // Seconds each on the old pattern; a millisecond or two now, and the bound leaves room for a loaded machine.
   assert.ok(worst.ms < 250, `${worst.what}: ${Math.round(worst.ms)} ms`);
+});
+
+test('under the marker strategy the start mark the command file prints bounds the output: whatever came before it is the shell’s, an echo-shaped line after it is the program’s', () => {
+  // The house's read of the 33 commits (#22, comment 6307351104), items 3, 6 and 8, and its answer 2.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  const mark = `<<<START:${N}:4242>>>\r\n`;
+  // 3: with the echo off nothing echoes before the mark, and `fc -l -1` prints the typed line after the output began: the
+  // rule that let it stand for the echo returned `out-2` alone.
+  const fc = `6\t${typed(N).trim()}`;
+  assert.equal(cutPlumbing(`sh-3.2$ ${mark}out-1\r\n${fc}\r\nout-2\r\n<<<EXIT:${N}:0>>>\r\nsh-3.2$ `, marker), `out-1\r\n${fc}\r\nout-2\r\n`);
+  // 6: a shell still starting when the line was typed prints its banner and shows the line again, all before the mark.
+  assert.equal(cutPlumbing(`${typed(N)}Welcome, slow shell\r\nsh-3.2$ ${typed(N)}${mark}first\r\n<<<EXIT:${N}:0>>>\r\n`, marker), 'first\r\n');
+  // 8: a redraw that broke the typed line after the nonce's colon left `$?>>>"` at the head.
+  const brokenAfterColon = typed(N).replace(`${N}:`, `${N}:\r\n`);
+  assert.equal(cutPlumbing(`${brokenAfterColon}${mark}out\r\n<<<EXIT:${N}:0>>>\r\n`, marker), 'out\r\n');
+  // A file that never ran prints no mark: the echo is cut by the rule that held before, through the end of the typed line.
+  assert.equal(cutPlumbing(`${brokenAfterColon}read by a program\r\n<<<EXIT:${N}:0>>>\r\n`, marker), 'read by a program\r\n');
+  assert.equal(cutPlumbing(`${typed(N).replace('$?', '$\r\n?')}read by a program\r\n`, marker), 'read by a program\r\n', 'broken later in the rest');
+  // Another Run's start mark is no bound: the echo rule holds.
+  assert.equal(cutPlumbing(`${typed(N)}<<<START:0badf00d:4242>>>\r\nout\r\n`, marker), '<<<START:0badf00d:4242>>>\r\nout\r\n');
+});
+
+test('under set -x the plumbing’s traces go: the typed line’s, before the start mark, and the end mark’s own, by the prefix the typed line’s trace showed or PS4’s default', () => {
+  // The house's read of the 33 commits (#22, comment 6307351104), item 9: dash traced the chained echo as a whole end mark, so
+  // the result kept `+ command . <file>` at its head and ended in a dangling `+ echo `.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  const mark = `<<<START:${N}:4242>>>\r\n`;
+  const file = '/tmp/tsm-501/abc/tsm-cmd-1';
+  assert.equal(cutPlumbing(`${typed(N)}+ command . ${file}\r\n${mark}+ echo hi\r\nhi\r\n+ echo <<<EXIT:${N}:0>>>\r\n`, marker), '+ echo hi\r\nhi\r\n', 'dash');
+  assert.equal(cutPlumbing(`${typed(N)}+ command . ${file}\r\n+ . ${file}\r\n${mark}++ echo hi\r\nhi\r\n+ echo '<<<EXIT:${N}:0>>>'\r\n`, marker), '++ echo hi\r\nhi\r\n', 'bash, which quotes the word');
+  assert.equal(cutPlumbing(`${typed(N)}[t] command . ${file}\r\n${mark}partial[t] echo <<<EXIT:${N}:0>>>\r\n`, marker), 'partial', 'a PS4 of the user’s own, after output with no newline');
+  assert.equal(cutPlumbing(`${typed(N)}${mark}+ echo on\r\non\r\n+ echo '<<<EXIT:${N}:0>>>'\r\n`, marker), '+ echo on\r\non\r\n', 'the Run that turned tracing on');
+  assert.equal(cutPlumbing(`${typed(N)}${mark}say echo <<<EXIT:${N}:0>>>\r\n`, marker), 'say echo ', 'not tracing: a program’s line ending in `echo ` stays');
+});
+
+test('the marker strategy’s start line prints the Run’s start mark with the shell’s pid, keeps the status the shell had for the body, ends no shell under set -e, and traces nothing in dash and bash', () => {
+  // The house's answer 2 on the 33 commits (#22, comment 6307351985): `$?` after `false` is still 1 in the body.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-start-line-'));
+  try {
+    const fish = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find((p) => fs.existsSync(p));
+    const shells = [
+      { shell: '/bin/dash', flavor: 'posix' as const, dot: 'command .', status: '$?', traces: true },
+      { shell: '/bin/bash', flavor: 'posix' as const, dot: 'command .', status: '$?', traces: true },
+      { shell: '/bin/zsh', flavor: 'zsh' as const, dot: '.', status: '$?', traces: false },
+      { shell: fish, flavor: 'fish' as const, dot: 'source', status: '$status', traces: false },
+    ].filter((x): x is typeof x & { shell: string } => x.shell !== undefined && fs.existsSync(x.shell));
+    assert.ok(shells.length >= 2);
+    for (const { shell, flavor, dot, status, traces } of shells) {
+      const file = path.join(dir, `${path.basename(shell)}-${commandFile(1)}`);
+      fs.writeFileSync(file, `${markerStartLine(N, flavor)}\necho "body sees ${status}"\n`);
+      const run = (head: string) => execFileSync(shell, ['-c', `${head}${dot} ${shellQuote(file)}; echo "<<<EXIT:${N}:${status}>>>"`], { encoding: 'utf8' });
+      const out = run('false; ');
+      const m = startMark(N).exec(out);
+      assert.ok(m && /^\d+$/.test(m[1]!), `${shell}: the mark, with a pid: ${out}`);
+      assert.match(out, /body sees 1\n<<<EXIT:[^:]+:0>>>/, `${shell}: the body saw the earlier status`);
+      assert.match(run('true; '), /body sees 0/, shell);
+      if (flavor !== 'fish') assert.match(run('set -e; ! true; '), /body sees 1\n<<<EXIT/, `${shell}: set -e kept the shell`);
+      if (traces) {
+        const traced = execFileSync(shell, ['-c', `exec 2>&1; set -x; false; ${dot} ${shellQuote(file)}`], { encoding: 'utf8' });
+        const after = traced.slice(traced.indexOf('<<<START'));
+        assert.doesNotMatch(after, /__tsm_q|exit|\[/, `${shell}: nothing of the start line is traced after the mark: ${after}`);
+      }
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

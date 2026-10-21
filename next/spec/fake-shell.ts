@@ -236,14 +236,19 @@ export class FakeShell {
     // C/D for it: `.` is a simple command, whatever the file holds).
     const src = /^\s*(?:command \.|\.|source|eval \(__tsm_collect) '((?:[^']|'\\'')*)'(?: \$status\))?(.*)$/.exec(typedLine);
     let tail = '';
+    let startMark = '';
     if (src && src[1] !== undefined) {
       const file = src[1].replace(/'\\''/g, "'");
       tail = src[2] ?? '';
       try {
         // The daemon ends a command file with a line capturing the pipeline's statuses (shell tools 3);
         // a real shell runs it and returns with the command's status. The fake drops it and runs the text.
-        line = fs
-          .readFileSync(file, 'utf8')
+        // Under the marker strategy the file begins with a line printing the Run's start mark
+        // (plumbing.ts markerStartLine): the fake prints the mark, as a shell running the file does.
+        const text = fs.readFileSync(file, 'utf8');
+        const start = /^.*printf '<<<STAR''T:%s:%s>>>\\n' ([0-9a-f]+) .*\n/.exec(text);
+        if (start) startMark = `<<<START:${start[1]}:${this.pty.pid}>>>\r\n`;
+        line = (start ? text.slice(start[0].length) : text)
           .replace(/\n\n(?:__tsm_st=\$\? __tsm_ps=.*; return \$__tsm_st|set -g __tsm_pst \$pipestatus \$status; __tsm_setst .*)\n$/, '\n')
           .replace(/\n$/, '');
       } catch {
@@ -263,6 +268,7 @@ export class FakeShell {
         return;
       }
     }
+    if (startMark) this.pty.emit(startMark);
     this.executed.push(line);
     const h = this.handlers.find((x) => (typeof x.match === 'string' ? x.match === line : x.match.test(line)));
     const result: FakeCommandResult = h ? h.handler(line, this) : line.trim() === '' ? { exit: 0 } : { output: `fake: ${line.split(' ')[0]}: command not found\r\n`, exit: 127 };
