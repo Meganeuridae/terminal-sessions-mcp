@@ -18,6 +18,15 @@ import type { JournalEvent } from '../src/core/types.js';
 
 const A = 'agent:a@test';
 
+/**
+ * A tag from this run's pid for the sleeps the spec finds and kills by command line. `ps` and `pkill` see every
+ * process of the user, so on a host where several runs of this suite go at once (the house's shared VPS) a fixed
+ * `sleep 30.75` was another run's as well: one run could take the other's live orphan for its own, and fail its check
+ * that recovery ended it, and a cleanup could kill what wasn't its own (the house's review of 4f4c067..a8b6f28, PR #22;
+ * as shell-cancel's 8200a27).
+ */
+const TAG = String(process.pid % 10000).padStart(4, '0');
+
 const alive = (needle: string): boolean => {
   try {
     return execFileSync('ps', ['-axo', 'command='], { encoding: 'utf8' }).split('\n').some((l) => l.trim() === needle);
@@ -45,11 +54,11 @@ await session.waitAvailable(2000);
 const two = await shell('echo marker-two');
 await session.awaitRun(two, 5000);
 await session.waitAvailable(2000);
-const slow = await shell('sleep 31.25');
+const slow = await shell('sleep 31.${TAG}');
 for (let i = 0; i < 100 && session.run(slow).state !== 'running'; i++) await new Promise((r) => setTimeout(r, 20));
 const queued = session.admit({ target: 'shell', line: 'echo never-ran', principal: P, queue: true });
 const proc = session.admit({ target: 'process', line: 'sleep 2', principal: P });
-const orphan = session.admit({ target: 'process', line: 'sleep 30.75', principal: P });
+const orphan = session.admit({ target: 'process', line: 'sleep 30.${TAG}', principal: P });
 for (let i = 0; i < 100 && session.run(orphan.run.runId).state !== 'running'; i++) await new Promise((r) => setTimeout(r, 20));
 // A Run that ends at once, leaving background work that keeps starting processes in its group. The
 // daemon dies more than a second after the Run ended, so the loop's newest child — whose start ps
@@ -106,7 +115,7 @@ test('tg-11/G20: after a SIGKILLed daemon, every admitted Run is terminal and ea
     const orphan = h.run(ids.orphan!);
     if (orphan.pgid !== undefined) {
       assert.equal(orphan.reason, `daemon-restart; process group ${orphan.pgid} terminated`);
-      assert.equal(alive('sleep 30.75'), false, 'the orphan was terminated at recovery');
+      assert.equal(alive(`sleep 30.${TAG}`), false, 'the orphan was terminated at recovery');
       // Its note says the group went with the Run recovery ended, not that it outlived a Run that had ended (the house's read of cc8c909..39787b3, #22).
       assert.ok(notes.includes(`recovery: process group ${orphan.pgid} terminated with ${ids.orphan}, which recovery ended lost`), JSON.stringify(notes));
       assert.ok(!notes.some((t) => t.includes(`outlived ${ids.orphan}`)), JSON.stringify(notes));
@@ -146,7 +155,7 @@ test('tg-11/G20: after a SIGKILLed daemon, every admitted Run is terminal and ea
       }
     }
     // The shell's foreground job dies with the PTY; clean up anyway so a failure leaves nothing behind.
-    for (const leftover of ['sleep 31.25', 'sleep 30.75']) {
+    for (const leftover of [`^sleep 31\\.${TAG}$`, `^sleep 30\\.${TAG}$`]) {
       try {
         execFileSync('pkill', ['-f', leftover]);
       } catch {
