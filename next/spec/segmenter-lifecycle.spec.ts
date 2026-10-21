@@ -499,18 +499,25 @@ test('segments go out in seq order: a note journaled while a completion settles 
       ['note', note.seq],
     ],
   );
-  // Two completions settling: the one whose text is slow still goes first.
+  // Two completions settling: the one whose text is slow still goes first. The segmenter asks for both texts at once, and the
+  // wait is for the fast one's to have come back while the slow one's is pending: after a fixed sleep, nothing out could mean
+  // nothing had been asked for yet (a reviewer's read of the fixes for #22).
   out.length = 0;
   let slow = true;
+  const asked = new Set<string>();
+  const answered = new Set<string>();
   src.runTranscript = async (runId) => {
+    asked.add(runId);
     if (runId === 'slow') while (slow) await sleep(5);
+    answered.add(runId);
     return { text: `output of ${runId}`, truncated: false, seq: [1, 2], nextCursor: 2 };
   };
   startRun(src, 'slow');
   startRun(src, 'fast');
   endRun(src, 'slow');
   endRun(src, 'fast');
-  await sleep(150);
+  await until(() => asked.has('slow') && answered.has('fast'), 5000, "the fast one's text back while the slow one's is pending");
+  await sleep(50);
   assert.equal(out.length, 0, 'the fast one waits behind the slow one');
   slow = false;
   await seg.drained();
