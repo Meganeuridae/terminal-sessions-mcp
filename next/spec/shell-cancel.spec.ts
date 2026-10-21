@@ -6,6 +6,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { AGENT, hasShell, pgrep, realSession, reap, until } from './fake-shell.js';
 
 for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
@@ -113,15 +115,20 @@ for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
 
 test('/bin/bash: a cancel whose two ^C a DEBUG trap of the user’s ignores, before the start mark, keeps the shell busy until it is back, and a Run admitted right after the cancel still runs', { skip: !hasShell('/bin/bash') }, async () => {
   // The integration's DEBUG hook runs the user's trap before it prints the start mark; here that trap
-  // is a subshell that ignores ^C, for daemon lines only (the house's second way to reach item 1).
-  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': `trap 'case $BASH_COMMAND in *tsm-cmd*) ( trap "" INT; sleep 1 ) ;; esac' DEBUG\n` } });
+  // is a subshell that ignores ^C, for daemon lines only (the house's second way to reach item 1). The
+  // trap leaves a file when it is entered, and the cancel waits for it: sent before the shell read the
+  // line, the ^C would discard it unread and pass on the ordinary path. The trap's 3 s outlast the
+  // cancel's three 200 ms waits, so its two ^C draw no mark.
+  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': `trap 'case $BASH_COMMAND in *tsm-cmd*) : > "$HOME/in-trap"; ( trap "" INT; sleep 3 ) ;; esac' DEBUG\n` } });
   const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
   try {
     await until(() => x.session.shellAvailable().ok, 5000, 'the shell is ready');
     const a = x.session.admit({ target: 'shell', line: 'echo first-$((6*7))', principal: AGENT });
     assert.ok(a.admitted);
+    await until(() => fs.existsSync(path.join(x.home, 'in-trap')), 5000, 'the shell to enter the trap');
     const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 200 });
     assert.deepEqual([c.state, c.escalation], ['cancelled', undefined], JSON.stringify(c));
+    assert.deepEqual(c.steps, ['^C', '^C', 'the line was discarded before it started', 'an empty line, whose prompt says the shell is back'], 'the two ^C drew no mark');
     const b = x.session.admit({ target: 'shell', line: 'echo second-$((40+2))', principal: AGENT, queue: true });
     assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
     const r = await x.session.awaitRun(b.run.runId, 10_000);
