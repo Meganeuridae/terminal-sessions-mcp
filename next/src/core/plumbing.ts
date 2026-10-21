@@ -104,8 +104,8 @@ const FLAVORS = ['posix', 'zsh', 'fish'] as const;
 /**
  * A command the marker strategy types after the shell's own, in a group whose `set -x` trace dash,
  * bash and zsh write, on a typed line, to the group's stderr, here nowhere. fish writes its trace past
- * any redirect: the marks are printf-built so that no trace holds a whole mark, and the cutter names
- * fish's trace by the Run's nonce (markTraceStart).
+ * any redirect, and so does bash given a BASH_XTRACEFD: the marks are printf-built so that no trace
+ * holds a whole mark, and the cutter names that trace by the Run's nonce (markTraceStart).
  */
 const untraced = (command: string, flavor: ShellFlavor): string => (flavor === 'fish' ? command : `{ ${command}; } 2>/dev/null`);
 /**
@@ -179,7 +179,9 @@ const legacySourceLine = (file: string, flavor: ShellFlavor, nonce: string): str
  * POSIX expands it into an eval that unsets it before the restore, a subshell only when it is not 0;
  * zsh keeps it local to a function; fish, whose source gives the file a scope of its own, erases it
  * from a function that sees the file's (`-S`), and the function erases itself. dash and bash trace
- * none of the line under `set -x` (the group's stderr is /dev/null); zsh and fish trace a sourced
+ * none of the line under `set -x` (the group's stderr is /dev/null), unless a BASH_XTRACEFD sends
+ * bash's trace past the redirect, when the restore's eval, unset and test are traced after the mark
+ * and stay in the output (a reviewer's read of the fixes for #22); zsh and fish trace a sourced
  * file's commands whatever their stderr, so each runs the mark from a function with its trace off,
  * traced only up to the call, before the mark, and zsh's AND-OR list ends in an empty group, which it
  * does not trace (a block's end, and a `:`, were traced after the mark). It adds one line, so a

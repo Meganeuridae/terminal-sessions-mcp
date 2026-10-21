@@ -610,8 +610,11 @@ shell's banner and second echo) goes, and a line in the echo's shape after it is
 program's; a file that never ran prints no mark, and its echo is cut by the echo rule. The
 extra first line means a shell's own error messages name a line of the body one later than
 written. No shell traces any of the start line after the mark; dash, bash and zsh trace neither
-the end mark nor the probe, and fish's traces of them are cut by the nonce. Both strategies produce identical result
-shapes.
+the end mark nor the probe, and fish's traces of them are cut by the nonce. A `BASH_XTRACEFD` is the
+exception: bash then writes its trace past the groups' redirects, so under `set -x` the start line's
+restore is traced after the mark and stays in the output, and the end mark's trace is cut by the
+nonce from its line's start, unless the typed line's trace gave a prefix that stands just before it,
+taking a last line of output that has no line end with it. Both strategies produce identical result shapes.
 
 *Declared shell* (inline strategy). After `ssh host`, `sudo -i`, `docker exec -it … bash`, a
 nested shell, or an `exec` into a shell without our integration, the program in front of the
