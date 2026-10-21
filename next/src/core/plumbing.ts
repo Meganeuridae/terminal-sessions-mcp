@@ -17,7 +17,7 @@
  * (markerProbe, inlineProbe), and the cutter matches their echo from the same text; so is the line
  * that runs a Run's command file (sourceLine), whose echo the compat pack's logs find from it.
  */
-import { stripEscapes } from './text.js';
+import { isIntroducer, sequenceEnd, stripEscapes } from './text.js';
 import type { RunStrategy } from './types.js';
 
 const NONCE = '[^:>\\s]+';
@@ -234,6 +234,52 @@ export interface PlumbingOf {
 }
 
 /**
+ * The text the cutter finds its marks in: `raw` without escape sequences, as stripEscapes reads it,
+ * stripped in pieces that each begin where one of the marks the cutter looks for begins in the raw
+ * (the Run's start, end and probe marks, and the typed lines' split mark words), so no control string
+ * left open before a mark runs over it. The live session finds the marks in the raw output and starts
+ * and ends the Run by them; a banner's lone U+009E (CP1252's `ž` read as Latin-1, a C1 string
+ * introducer to the emulator and to stripEscapes), or an OSC a banner never closed, opened a string
+ * that hid the start mark from the cut, which then kept every line, plumbing included, and one
+ * opened in the body hid the end mark, which stayed in the result (an independent read of the fix
+ * for the house's read of the 33 commits, #22, comment 6307351104). What a piece holds after such a
+ * string is hidden as the emulator hides it, but its line ends stay in the text, so a line the cutter
+ * strikes whole (a probe's echo) takes no line of output before it along; the cut through the mark
+ * leaves the string's opening on the other side, so what comes after it shows as the emulator shows
+ * the Run's output alone.
+ */
+function stripAtMarks(raw: string, nonce: string): { text: string; map: number[] } {
+  const marks = new RegExp(`<<<(?:(?:START|EXIT|PROBE):${nonce}[:>]|EXI""T:|STAR''T:|PRO""BE:|PRO''BE:)`, 'g');
+  const at = [...raw.matchAll(marks)].map((m) => m.index).filter((i) => i > 0);
+  if (!at.length) return stripEscapes(raw);
+  let text = '';
+  const map: number[] = [];
+  const bounds = [0, ...at, raw.length];
+  for (let k = 0; k + 1 < bounds.length; k++) {
+    const slice = raw.slice(bounds[k], bounds[k + 1]);
+    const piece = stripEscapes(slice);
+    text += piece.text;
+    for (const i of piece.map) map.push(i + bounds[k]!);
+    if (k + 2 === bounds.length) break;
+    // Where stripEscapes stopped: past what it kept, the first sequence that does not end in the piece.
+    let open = piece.map.length ? piece.map[piece.map.length - 1]! + 1 : 0;
+    while (open < slice.length) {
+      if (!isIntroducer(slice.charCodeAt(open))) open++;
+      else {
+        const end = sequenceEnd(slice, open);
+        if (end === undefined) break;
+        open = end;
+      }
+    }
+    for (let i = slice.indexOf('\n', open); i !== -1; i = slice.indexOf('\n', i + 1)) {
+      text += '\n';
+      map.push(i + bounds[k]!);
+    }
+  }
+  return { text, map };
+}
+
+/**
  * A shell Run's output without the daemon's plumbing, the one rule for the live transcript and
  * for history. Under `rich` nothing is cut: the output runs from the pre-execution mark to the
  * end mark, and the marks are not output. Under `basic` the first line is the echo of the typed
@@ -260,8 +306,8 @@ export interface PlumbingOf {
  * leaves only its echo behind, with what the program printed after it still output (the house's
  * read of 78c4d6e, #22: the cut moved back to that echo and the output after it was gone).
  * Without a recorded nonce the same shapes are found with any nonce, which can take a program
- * line in a mark's shape for one. The cut is found on the text without escape sequences and
- * made in the raw.
+ * line in a mark's shape for one. The cut is found on the text without escape sequences
+ * (stripAtMarks) and made in the raw.
  */
 export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   if (of.strategy === 'rich') return raw;
@@ -271,7 +317,7 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     return nl === -1 ? '' : raw.slice(nl + 1);
   }
   const nonce = of.nonce ?? NONCE;
-  const { text, map } = stripEscapes(raw);
+  const { text, map } = stripAtMarks(raw, nonce);
   let from = 0;
   let pid: string | undefined = of.pid;
   const echoes = [...text.matchAll(wrapperEcho(nonce))].map((m) => [m.index, m.index + m[0].length] as const);
@@ -360,15 +406,19 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   // only the line where it began kept the rest (the house's read of the 38 commits, #22, comment
   // 6274773484). A probe nothing answered leaves only its echo, and what was printed after it stays.
   for (const m of rest.matchAll(probeEcho(of.nonce))) if (m.index < to) struck.push([lineOf(m.index)[0], lineOf(m.index + m[0].length - 1)[1]]);
-  const kept: Array<[number, number]> = [];
+  // Each kept piece, and whether it ends where a struck line begins.
+  const kept: Array<[number, number, boolean]> = [];
   let pos = 0;
   for (const [s, e] of struck.sort((a, b) => a[0] - b[0])) {
     if (s >= to) break;
-    if (s > pos) kept.push([pos, s]);
+    if (s > pos) kept.push([pos, s, true]);
     pos = Math.max(pos, e);
   }
-  if (pos < to) kept.push([pos, to]);
+  if (pos < to) kept.push([pos, to, false]);
   // Each raw piece begins right after the last plumbing character before it, so an escape that
-  // opens the output (a colour set before its first character) stays with it.
-  return kept.map(([s, e]) => raw.slice((from + s) === 0 ? 0 : map[from + s - 1]! + 1, map[from + e] ?? raw.length)).join('');
+  // opens the output (a colour set before its first character) stays with it. One that ends where a
+  // struck line begins ends right after the line end before it: a line struck whole begins there,
+  // and its head can lie in a string the output left open, which the text does not hold
+  // (stripAtMarks), where ending at the line's first character in the text kept that head.
+  return kept.map(([s, e, atLine]) => raw.slice(from + s === 0 ? 0 : map[from + s - 1]! + 1, atLine ? map[from + e - 1]! + 1 : (map[from + e] ?? raw.length))).join('');
 }

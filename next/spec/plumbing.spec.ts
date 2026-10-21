@@ -8,6 +8,7 @@ import * as path from 'node:path';
 import { ackMark, commandFile, cutPlumbing, exitMark, goneMark, inlineProbe, inlineTypedLine, markerProbe, markerStartLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLine, sourceLineEcho, startMark } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { journalRunText } from '../src/core/segmenter.js';
+import { transcript } from '../src/core/transcript.js';
 import type { RunOutput } from '../src/core/runindex.js';
 import type { RunInfo } from '../src/core/types.js';
 
@@ -438,4 +439,29 @@ test('the marker strategy’s start line prints the Run’s start mark with the 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('the cut finds a Run’s marks where the live session finds them, whatever string a banner or the body left open: a lone C1 string introducer, an OSC never closed', async () => {
+  // An independent read of the fix for the house's read of the 33 commits (#22, comment 6307351104): the stripped text opens a
+  // string at U+0090, U+0098 and U+009D–U+009F as the emulator does, and CP1252 text read as Latin-1 holds them (`ž` is U+009E,
+  // `Ÿ` U+009F, `˜` U+0098). The session found the marks in the raw output and ended the Run by them; the cut, reading the
+  // stripped text, did not see them, kept every line with the plumbing, and showed `Welcome Ko`.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  const inline = { strategy: 'inline' as const, nonce: N };
+  const mark = `<<<START:${N}:4242>>>\r\n`;
+  const end = `<<<EXIT:${N}:0>>>\r\n`;
+  for (const banner of ['Welcome Ko\u009eel\r\n', 'MOTD \u009fx\r\n', 'Welcome \x1b]0;never closed\r\n']) {
+    const what = JSON.stringify(banner);
+    assert.equal(cutPlumbing(`${typed(N)}${banner}$ ${typed(N)}${mark}body\r\n${end}$ `, marker), 'body\r\n', `marker: ${what}`);
+    assert.equal(cutPlumbing(`typed\r\n${banner}${mark}body\r\n${end}remote$ `, inline), 'body\r\n', `inline: ${what}`);
+  }
+  // A string the body opened with no ESC after it: the end mark is still the end, and none of it stays in the raw cut, which
+  // shows as the emulator shows it.
+  const opened = cutPlumbing(`${typed(N)}${mark}Ko\u009eel\r\nmore\r\n${end}$ `, marker);
+  assert.equal(opened, 'Ko\u009eel\r\nmore\r\n');
+  assert.equal(await transcript([{ data: opened, stream: 'pty' }]), 'Ko');
+  assert.equal(cutPlumbing(`typed\r\n${mark}out \x1b]0;title\r\n${end}`, inline), 'out \x1b]0;title\r\n', 'an OSC the body left open');
+  // Under such a string, a probe's echo is still struck on its own line, the output before it kept, and the accepted answer ends it.
+  const probe = `^C\r\n$${inlineProbe(N, false)}\r\n<<<PROBE:${N}:4242:${N}>>>\r\nremote$ `;
+  assert.equal(cutPlumbing(`typed\r\n${mark}out\u009e left open\r\n${probe}`, inline), 'out\u009e left open\r\n^C\r\n');
 });
