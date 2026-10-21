@@ -82,6 +82,12 @@ const splitWord = (a: string, b: string): string => `${redrawn(a)}\\s*(?:${redra
  */
 const wrapperEcho = (nonce: string): RegExp =>
   new RegExp(`${redrawn('<<<')}\\s*(?:${splitWord('EXI', 'T')}\\s*:\\s*${redrawn(nonce)}(?:\\s*(?:${MARKER_RESTS.map(redrawn).join('|')}))?|${splitWord('STAR', 'T')}\\s*:\\s*${redrawn(nonce)}\\s*:)`, 'g');
+/**
+ * The echo of the line typed to run the Run with this nonce, as the cut finds it, for a reader that sees
+ * a marker or inline Run's output a line at a time and drops what the cut drops (the segmenter's
+ * running digests).
+ */
+export const runEcho = (nonce: string): RegExp => new RegExp(wrapperEcho(nonce).source);
 
 /** How the session's own shell runs a typed line: POSIX (bash, dash, an unknown sh), zsh, or fish. */
 export type ShellFlavor = 'posix' | 'zsh' | 'fish';

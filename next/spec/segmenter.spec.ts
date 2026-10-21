@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Journal } from '../src/core/journal.js';
+import { sourceLine } from '../src/core/plumbing.js';
 import { liveSource, renderPicked, scanLifecycle, Segmenter, type Segment, type SegmentSource } from '../src/core/segmenter.js';
 import type { RunInfo, ScreenSnapshot } from '../src/core/types.js';
 import { sleep, until } from './testhost.js';
@@ -230,4 +231,25 @@ test('a Run’s progress digest reads a LF inside a window title as no line end,
   await until(() => out.some((s) => s.kind === 'output' && s.body), 5000, 'a digest with lines');
   const digest = out.find((s) => s.kind === 'output' && s.body);
   assert.equal(digest?.body, 'AAABBB\nnext', JSON.stringify(out.map((s) => [s.kind, s.body])));
+});
+
+test('a marker Run’s progress digest shows neither the typed line’s echo nor its start mark: what the cut drops, the digest drops', async (t) => {
+  // The house's review of the 40 commits through f3750e4 (PR #22, comment 6310921374): a marker Run's running digests showed
+  // `<<<START:…>>>` beside the echo they already showed, until later lines pushed them out.
+  const src = fakeSource();
+  const seg = new Segmenter(src, { runSettleMs: 5, cadenceMs: 40, screenQuietMs: 20 });
+  t.after(() => seg.dispose());
+  const out = collect(seg);
+  const nonce = 'a1b2c3d4';
+  src.runs.set('r1', { runId: 'r1', sessionId: 's1', target: 'shell', origin: 'agent', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'exact', line: 'make', strategy: 'marker', nonce });
+  src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/w', strategy: 'marker', nonce });
+  // A slow shell: the echo first, a digest while the file has not run yet, then its banner and the start mark.
+  src.journal.append({ type: 'output', data: `sh$ ${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce)}\r\n`, stream: 'pty', runId: 'r1' });
+  src.journal.append({ type: 'output', data: `Welcome\r\nsh$ ${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce).slice(0, 30)}`, stream: 'pty', runId: 'r1' });
+  await until(() => out.some((s) => s.kind === 'output'), 5000, 'a digest before the start mark');
+  const early = out.filter((s) => s.kind === 'output').at(-1)!;
+  assert.doesNotMatch(early.body ?? '', /EXI|tsm-cmd|command \./, `before the mark: ${JSON.stringify(early.body)}`);
+  src.journal.append({ type: 'output', data: `${sourceLine('/tmp/tsm-501/ab/tsm-cmd-1', 'posix', nonce).slice(30)}\r\n<<<START:${nonce}:4242>>>\r\nbuilding 1\r\nbuilding 2\r\nhalf`, stream: 'pty', runId: 'r1' });
+  await until(() => out.some((s) => s.kind === 'output' && /building/.test(s.body ?? '')), 5000, 'a digest after the start mark');
+  assert.equal(out.filter((s) => s.kind === 'output').at(-1)!.body, 'building 1\nbuilding 2\nhalf');
 });

@@ -22,7 +22,7 @@ import { cellWidth, cleanLine } from './ansi.js';
 import { clocks } from './clock.js';
 import type { Journal } from './journal.js';
 import type { RunOutput } from './runindex.js';
-import { cutPlumbing } from './plumbing.js';
+import { cutPlumbing, runEcho, startMark } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
 import { lineCarry, lineEnds, safeCut, tailStart, unfinishedSequence, type LineCarry } from './text.js';
 import { headOnlyText } from './regex.js';
@@ -761,6 +761,14 @@ interface RunWatch {
   /** What the Run's output left unfinished for the line-end rule (lineEnds). */
   scan: LineCarry;
   /**
+   * A marker or inline Run's start mark, until it arrives, and the echo of the line typed to run it:
+   * the digests drop what the cut drops, everything through the start mark's line (the typed line's
+   * echo, a still-starting shell's banner), and meanwhile the echo. They showed the echo and the mark
+   * until later lines pushed them out (the house's review of the 40 commits through f3750e4, PR #22,
+   * comment 6310921374).
+   */
+  preamble?: { start: RegExp; echo: RegExp } | undefined;
+  /**
    * (seq, bytes through it) checkpoints, for "new since your last read" without reading the
    * journal. Bytes *through* an event, and the newest mark always kept: with "bytes before" and
    * every other mark dropped, a read whose mark was gone counted from a later one and came up
@@ -974,7 +982,7 @@ export class Segmenter {
   private onEvent(ev: JournalEvent): void {
     switch (ev.type) {
       case 'run.start':
-        this.track(ev.runId);
+        this.track(ev.runId, ev);
         this.recentStarts.push({ seq: ev.seq, runId: ev.runId });
         if (this.recentStarts.length > 32) this.recentStarts.shift();
         return;
@@ -1045,7 +1053,8 @@ export class Segmenter {
     this.settling.set(ev.seq, e);
   }
 
-  private track(runId: string): RunWatch | undefined {
+  /** `start`, the Run's run.start, when the watch begins with the Run: a marker or inline Run's plumbing comes first in its output. */
+  private track(runId: string, start?: EventOf<'run.start'>): RunWatch | undefined {
     if (this.running.has(runId) || this.disposing) return undefined;
     const run = runOf(this.s, runId);
     // The digests count the Run's elapsed time on the monotonic clock, so a step neither stops it nor jumps it
@@ -1054,6 +1063,7 @@ export class Segmenter {
     // clamped to zero while the result said minutes (a reviewer's read of the fixes for #22).
     const startMono = clocks.monotonic() - (this.s.runDurationMs(runId) ?? 0);
     const w: RunWatch = { runId, startMono, pipes: run?.target === 'process', bytes: 0, bytesAtLeast: false, bytesAtLastDigest: 0, lines: [], carry: '', scan: lineCarry(), marks: [] };
+    if ((start?.strategy === 'marker' || start?.strategy === 'inline') && start.nonce !== undefined) w.preamble = { start: startMark(start.nonce), echo: runEcho(start.nonce) };
     this.running.set(runId, w);
     w.timer = setInterval(() => this.digest(w), this.o.cadenceMs);
     return w;
@@ -1118,11 +1128,19 @@ export class Segmenter {
     const nl = ends.length ? ends[ends.length - 1]! : -1;
     if (nl !== -1) {
       const fresh: string[] = [];
+      let first = 0;
+      const mark = w.preamble?.start.exec(buf.slice(0, nl));
+      if (mark) {
+        // Everything through the start mark's line is the shell's.
+        first = ends.findIndex((e) => e >= mark.index + mark[0].length) + 1;
+        w.lines = [];
+        w.preamble = undefined;
+      }
       // Only the newest lines can survive, so read back from the end until there are enough.
-      for (let k = ends.length - 1; k >= 0 && fresh.length < DIGEST_LINES; k--) {
+      for (let k = ends.length - 1; k >= first && fresh.length < DIGEST_LINES; k--) {
         const start = k > 0 ? ends[k - 1]! : -1;
         const line = cleanLine(buf.slice(start + 1, ends[k])).trimEnd();
-        if (line) fresh.push(line);
+        if (line && !w.preamble?.echo.test(line)) fresh.push(line);
       }
       this.pushLines(w, fresh.reverse());
       buf = buf.slice(nl + 1);
@@ -1157,7 +1175,8 @@ export class Segmenter {
     // the watch goes with the Run, and nothing is lost, since the completion renders the Run's text
     // from the journal, not from these lines (the house's read of the 38 commits, #22, comment 6274773484).
     // The line-end rule's own record says so too, whatever a cut left of the sequence in the carry.
-    const partial = w.scan.open || unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
+    // Before a marker or inline Run's start mark, a partial line is the typed line's echo or the mark, as likely as not.
+    const partial = w.scan.open || w.preamble || unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
     const tail = (partial ? [...w.lines, partial] : w.lines).slice(-DIGEST_LINES).join('\n');
     const seq = this.s.journal.lastSeq;
     const elapsed = Math.max(0, Math.round(clocks.monotonic() - w.startMono));
