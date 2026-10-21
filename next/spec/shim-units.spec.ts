@@ -35,8 +35,9 @@ const launchctlPrint = (o: { argv?: string[]; env?: Record<string, string> }) =>
     '}',
   ].join('\n');
 
+/** A unit's `systemctl show` text, with the user manager's environment carrying HOME, as the shim's query of it does. */
 const systemd = (argv: string[], environment = ''): UnitText => {
-  const u = systemctlUnit(execStart(argv), environment);
+  const u = systemctlUnit(execStart(argv), environment, { manager: `HOME=${os.homedir()}` });
   assert.ok(u, 'the ExecStart is read');
   return u;
 };
@@ -175,4 +176,24 @@ test("a unit's environment starts from the user manager's, which Environment= ov
   assert.equal(unitDataDir(read([], '', { manager: 'TSM_DATA_DIR=/srv/x', unset: 'TSM_DATA_DIR' })), path.join(os.homedir(), '.tsm'));
   assert.equal(unitPort(read([], 'TSM_PORT=4200', { manager: 'TSM_PORT=4100', unset: 'TSM_PORT=4100' })), '4200');
   assert.equal(unitPort(read([], '', { manager: 'TSM_PORT=4100', unset: 'TSM_PORT=4100' })), '3101');
+});
+
+test("a unit's data dir is resolved from the HOME its environment gives termd, which the launcher starts in, and a ${HOME} it takes away is unknown (the house's read of the 40 commits over our fixes, #22)", () => {
+  // systemd 255, transient user units: Environment=HOME=<dir> ran `${HOME}/x` as <dir>/x with HOME=<dir>,
+  // and UnsetEnvironment=HOME ran it as /x with HOME unset. Taken from this shim's home, both were read wrong.
+  const read = (argv: string[], environment: string, more: { manager?: string; unset?: string }) => {
+    const u = systemctlUnit(execStart(argv), environment, more);
+    assert.ok(u, 'the ExecStart is read');
+    return u;
+  };
+  const manager = 'HOME=/home/a';
+  assert.equal(unitDataDir(read(['--port', '3101'], '', { manager })), '/home/a/.tsm', "the manager's HOME");
+  assert.equal(unitDataDir(read(['--data-dir', 'rel/d'], '', { manager })), '/home/a/rel/d');
+  assert.equal(unitDataDir(read(['--data-dir', 'rel/d'], 'HOME=/srv/t', { manager })), '/srv/t/rel/d', "the unit's own HOME");
+  assert.equal(unitDataDir(read([], 'HOME=/srv/t', { manager })), '/srv/t/.tsm');
+  assert.equal(systemctlUnit(execStart(['--data-dir', '${HOME}/x']), '', { manager, unset: 'HOME' }), undefined, 'a ${HOME} the unit takes away is unknown, not this shim\'s home');
+  // launchd: a job's own HOME is the one its launcher starts in.
+  const launchd = launchctlUnit(launchctlPrint({ argv: ['--data-dir', 'rel/d'], env: { HOME: '/srv/l' } }));
+  assert.ok(launchd);
+  assert.equal(unitDataDir(launchd), '/srv/l/rel/d');
 });

@@ -107,8 +107,10 @@ export function systemctlUnit(execStart: string, environment: string, more: { ma
   for (const w of m[1]!.split(' ')) {
     let unknown = false;
     const x = w.replace(/\$\{(\w+)\}|\$/g, (all, name: string | undefined) => {
-      // A file may set any variable, HOME too.
-      const v = name === undefined || unreadEnv ? undefined : (env[name] ?? (name === 'HOME' ? os.homedir() : undefined));
+      // A file may set any variable, HOME too. HOME is in the manager's environment; one the unit's takes
+      // away (UnsetEnvironment=HOME) systemd expands to nothing, where this shim's own home was put in (the
+      // house's read of the 40 commits over our fixes, #22; systemd 255, probed with transient user units).
+      const v = name === undefined || unreadEnv ? undefined : env[name];
       if (v === undefined) unknown = true;
       return v ?? all;
     });
@@ -192,17 +194,20 @@ export function unitPort(u: UnitText): string | Unknown {
  * unset, as for termd), else termd's default; unknown when the unit names the flag without a value,
  * since nothing then says which dir it is, or names no flag and has an environment source not read
  * here (see `systemctlUnit`). termd resolves the value from its working
- * directory, this user's $HOME (the launcher starts there), and expands nothing, so neither does
- * this: a supervisor's own expansions are made where its text is read (systemctlUnit). Expanded
- * here, a unit's `--data-dir ~/x` read as $HOME/x while termd used $HOME/~/x, since neither systemd
- * nor launchd expands `~` (the house's read of the 40 commits, #22).
+ * directory, the $HOME the unit's environment gives it (the launcher starts there), and expands nothing,
+ * so neither does this: a supervisor's own expansions are made where its text is read (systemctlUnit).
+ * Expanded here, a unit's `--data-dir ~/x` read as $HOME/x while termd used $HOME/~/x, since neither
+ * systemd nor launchd expands `~` (the house's read of the 40 commits, #22). The home is the unit's,
+ * else this shim's: taken from this shim alone, a unit setting Environment=HOME was read in another
+ * directory than its termd's, and a shim run under another HOME refused a start against its own data
+ * dir (the house's read of the 40 commits over our fixes, #22).
  */
 export function unitDataDir(u: UnitText): string | Unknown {
   const arg = unitArg(u, '--data-dir');
   if (arg === null) return { unknown: 'names --data-dir without a value' };
   if (arg === undefined && u.unreadEnv) return { unknown: `names no --data-dir and reads ${u.unreadEnv}, which may set TSM_DATA_DIR` };
   const named = arg ?? setting('TSM_DATA_DIR', u.env);
-  const home = os.homedir();
+  const home = setting('HOME', u.env) ?? os.homedir();
   if (named === undefined) return path.join(home, '.tsm');
   return path.resolve(home, named);
 }
