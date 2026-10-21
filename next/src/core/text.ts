@@ -175,13 +175,18 @@ export function sequenceText(data: string, start: number, end: number): string {
  */
 const HEAD_MAX = 64;
 
+/** The most intermediates a shortened head keeps (HeadReader). */
+const INTERMEDIATES_MAX = 8;
+
 /**
  * The part of the CSI or escape sequence beginning at `data[start]` that lies before `upto`, its
  * executed C0 controls and DEL taken out: what a piece of text that begins at `upto`, inside the
  * sequence, begins with to be read as the sequence goes on. A head longer than HEAD_MAX is shortened
- * to its introducer, a CSI's private marker, and what keeps the parser's state (a parameter, an
- * intermediate, or the state that ignores the rest), so it dispatches as the same family of control
- * (`CSI ? … h` a private mode, not SM), and only its parameters can read differently.
+ * to its introducer, a CSI's private marker, and what keeps the parser's state (a parameter, its
+ * intermediates as written, or the state that ignores the rest), so it dispatches as the same family
+ * of control (`CSI ? … h` a private mode, not SM; `CSI … ! p` DECSTR, not the `CSI SP p` that an
+ * intermediate shortened to a space dispatched as: our review of the 40 commits through 4f4c067), and
+ * only its parameters can read differently.
  */
 export function sequenceHead(data: string, start: number, upto: number): string {
   return new HeadReader(data, start).at(upto);
@@ -206,8 +211,8 @@ class HeadReader {
   private st: CsiState = 0;
   /** A CSI's private marker: its first parameter byte, when that is one of `<=>?`. */
   private priv = '';
-  /** An escape sequence has had an intermediate. */
-  private intermediate = false;
+  /** The intermediates read so far, as written: the last INTERMEDIATES_MAX of them, since no control has more than two. */
+  private inter = '';
 
   constructor(private readonly data: string, start: number) {
     this.pos = start;
@@ -226,11 +231,12 @@ class HeadReader {
       else if (this.csi > 0) {
         if (k === this.csi && c >= 0x3c && c <= 0x3f) this.priv = d[this.pos]!;
         this.st = csiStep(this.st, c);
-      } else if (c >= 0x20 && c <= 0x2f) this.intermediate = true;
+        if (this.st === 2) this.inter = (this.inter + d[this.pos]).slice(-INTERMEDIATES_MAX);
+      } else if (c >= 0x20 && c <= 0x2f) this.inter = (this.inter + d[this.pos]).slice(-INTERMEDIATES_MAX);
     }
     if (this.n <= HEAD_MAX) return this.text;
-    if (this.csi === 0) return this.intermediate ? '\x1b ' : '\x1b';
-    return (this.csi === 1 ? '\x9b' : '\x1b[') + this.priv + ['', '0', ' ', '0?'][this.st]!;
+    if (this.csi === 0) return `\x1b${this.inter}`;
+    return (this.csi === 1 ? '\x9b' : '\x1b[') + this.priv + ['', '0', this.inter, '0?'][this.st]!;
   }
 }
 

@@ -247,9 +247,14 @@ test('the heads of a CSI holding many line feeds cost its length, not its square
     lineEnds(data, lineCarry(), Number.POSITIVE_INFINITY, false, inside);
     for (const [at, head] of inside) assert.equal(head, sequenceHead(data, 0, at), `${JSON.stringify(data)} at ${at}`);
   }
-  // Past 64 bytes a head keeps its introducer, its private marker and its parser's state.
+  // Past 64 bytes a head keeps its introducer, its private marker, its intermediates and its parser's state.
   assert.equal(sequenceHead(`\x1b[?${'1;'.repeat(40)}1049`, 0, 89), '\x1b[?0', 'a private mode, not SM');
   assert.equal(sequenceHead(`\x1b[${'1;'.repeat(40)} `, 0, 83), '\x1b[ ', 'an intermediate');
   assert.equal(sequenceHead(`\x1b[${'1;'.repeat(40)}?`, 0, 83), '\x1b[0?', 'ignoring the rest');
-  assert.equal(sequenceHead(`\x1b(${' '.repeat(70)}`, 0, 72), '\x1b ', 'an escape sequence in its intermediates');
+  // An intermediate is part of the control's name: `CSI ! p` is DECSTR, a soft reset, and `CSI SP p` nothing. Shortened to a
+  // space, a long DECSTR's head left insert mode set where the whole sequence reset it (our review of the 40 commits through
+  // 4f4c067, PR #22).
+  assert.equal(sequenceHead(`\x1b[${'1;'.repeat(40)}!`, 0, 83), '\x1b[!', 'DECSTR keeps its `!`');
+  assert.equal(sequenceHead(`\x9b${'1;'.repeat(40)} $`, 0, 83), '\x9b $', 'both intermediates, as written');
+  assert.equal(sequenceHead(`\x1b(${' '.repeat(70)}`, 0, 72), `\x1b${' '.repeat(8)}`, 'an escape sequence in its intermediates: the last eight');
 });
