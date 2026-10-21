@@ -565,7 +565,17 @@ export class McplLane {
     if (w) this.releaseUnsettled(w.session, w.session.journal.lastSeq);
     const id = channelId(sessionId);
     const s = this.app.registry.get(sessionId);
-    if (s && this.registered.has(id) && this.channelsOn()) this.out.notify('channels/changed', { updated: [this.descriptorFor(s)] });
+    if (!s || !this.registered.has(id) || !this.channelsOn()) return;
+    // The name may hold another life by now, which this principal may not see: the server announces a
+    // created session only to those who may observe it, and an update here described another principal's
+    // private session to this host (the house's read of the 40 commits, #22). Its channel goes instead.
+    if (this.app.can(this.me, s, 'observe')) this.out.notify('channels/changed', { updated: [this.descriptorFor(s)] });
+    else this.unregisterUnseen(id);
+  }
+
+  /** A registered channel whose name now holds a session this principal may not observe: it is removed. */
+  private unregisterUnseen(id: string): void {
+    if (this.registered.delete(id) && this.channelsOn()) this.out.notify('channels/changed', { removed: [id] });
   }
 
   /** A session and its journal are gone (`forget`, retention). A name opened again meanwhile is a different session and stays. */
@@ -578,7 +588,13 @@ export class McplLane {
     // dropped the new life's opening and what it held (a reviewer's read of the fixes for #22).
     const p = this.opening.get(id);
     if (p && p.lineage !== this.lineageOf(sessionId)) this.opening.delete(id);
-    if (this.app.registry.get(sessionId)) return; // re-created meanwhile: sessionCreated announced it (mcpl-10)
+    const now = this.app.registry.get(sessionId);
+    if (now) {
+      // Re-created meanwhile: sessionCreated announced it (mcpl-10), when this principal may observe it. A
+      // life it may not observe was never announced, and the gone life's channel stayed registered.
+      if (!this.app.can(this.me, now, 'observe')) this.unregisterUnseen(id);
+      return;
+    }
     const st = this.states.get(sessionId);
     if (st) for (const h of st.held.values()) if (h.timer) clearTimeout(h.timer);
     if (st) for (const r of st.retries.values()) if (r.timer) clearTimeout(r.timer);
@@ -1482,13 +1498,23 @@ class NoteBudget {
   /** Count the notes the journal still retains: once, in pages, before the first note of this daemon life. */
   seed(journal: Journal): Promise<void> {
     if (!this.seeded) {
-      this.seeded = (async () => {
+      const seeding = (async () => {
         for (const page of journal.pages((journal.oldestSeq ?? 1) - 1, NOTE_SCAN_PAGE)) {
           for (const ev of page.events) if (ev.type === 'note') this.record(ev.seq, lineBytes(ev));
           if (!page.more) return;
           await new Promise((r) => setImmediate(r));
         }
       })();
+      this.seeded = seeding;
+      // A count that failed is forgotten with what it had counted, so the next note counts again: kept, one
+      // page that could not be read refused every later note on the lineage until the daemon restarted (the
+      // house's read of the 40 commits, #22). Nothing else records meanwhile, since every note awaits this.
+      seeding.catch(() => {
+        if (this.seeded !== seeding) return;
+        this.seeded = undefined;
+        this.retained.length = 0;
+        this.bytes = 0;
+      });
     }
     return this.seeded;
   }

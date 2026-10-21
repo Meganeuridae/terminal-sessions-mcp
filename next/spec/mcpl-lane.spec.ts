@@ -1800,3 +1800,87 @@ test("a batch queued for a forgotten life's open channel never goes on the chann
     await f.close();
   }
 });
+
+// ───────────── the house's read of the 40 commits (PR #22) ─────────────
+
+test("a closed or forgotten channel whose name another principal re-created as private is removed for this host, never described", { timeout: 20_000 }, async () => {
+  // The server announces a created session only to a connection that may observe it, but a close to every one:
+  // sessionClosed read the name again after its drain and sent this host an update describing B's private
+  // session, and sessionRemoved returned early on the re-created name and left the channel registered.
+  for (const how of ['closed', 'removed'] as const) {
+    const f = await bareLane(`c-unseen-${how}`, { announce: false });
+    try {
+      const id = `u${how[0]}`;
+      await f.app.sessionOpen(f.caller, { id, visibility: 'shared' });
+      f.lane.sessionCreated(id); // the server's announcement to A, who may observe it
+      assert.equal(f.inside.registered.has(`terminal:${id}`), true);
+      await f.app.sessionClose(f.caller, { session: id, forget: true });
+      await f.app.sessionOpen({ principal: B, connectionId: 'b' }, { id, visibility: 'private' }); // never announced to A
+      f.sent.length = 0;
+      if (how === 'closed') await f.lane.sessionClosed(id);
+      else await f.lane.sessionRemoved(id);
+      const changes = f.sent.filter((m) => m.method === 'channels/changed').map((m) => m.params as { updated?: Array<{ id: string }>; removed?: string[] });
+      assert.deepEqual(changes.flatMap((c) => c.updated ?? []), [], `no update describes B's private session (${how})`);
+      assert.deepEqual(changes.flatMap((c) => c.removed ?? []), [`terminal:${id}`], `the channel is removed for A (${how})`);
+      assert.equal(f.inside.registered.has(`terminal:${id}`), false);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+test("a note budget whose first count failed counts again at the next note, and a lane disposed during the count publishes nothing", { timeout: 20_000 }, async () => {
+  // NoteBudget.seed kept its first count's promise whether it resolved or failed: one page that could not be
+  // read refused every later note on the lineage until the daemon restarted.
+  const f = await bareLane('c-seed-fails');
+  try {
+    const publish = (text: string) => f.lane.handle('channels/publish', { channelId: 'terminal:sf', content: [{ type: 'text', text }] }, f.ctx);
+    const notes = (s: Session) => s.journal.since(0).events.flatMap((e) => (e.type === 'note' ? [e.text] : []));
+    await f.app.sessionOpen(f.caller, { id: 'sf', visibility: 'shared', retention: { maxBytes: 64 * 1024 } });
+    const s = live(f.registry, 'sf');
+    f.app.note(f.caller, { session: 'sf', text: 'an earlier note' }); // counted only by the seed
+    // The count fails after it has counted its first page (Ambrose-2449's shape: failing before any page,
+    // it had nothing to forget, and the spec passed with the counts kept).
+    const journal = s.journal as Journal & { pages: Journal['pages'] };
+    const pages = journal.pages.bind(journal);
+    let failures = 1;
+    journal.pages = function* (...a: Parameters<Journal['pages']>) {
+      const it = pages(...a);
+      const first = it.next();
+      if (first.done) return;
+      if (failures-- > 0) {
+        yield { ...first.value, more: true };
+        throw new Error('EIO: the second page could not be read');
+      }
+      yield first.value;
+      yield* it;
+    } as Journal['pages'];
+    await assert.rejects(publish('during the failure'), /EIO: the second page could not be read/);
+    assert.equal(((await publish('after it')) as { delivered: boolean }).delivered, true, 'the next note counts again and goes in');
+    assert.deepEqual(notes(s), ['an earlier note', 'after it']);
+    assert.equal(f.inside.budgetOf(s.journal).retained.length, 2, 'each note counted once: the failed count left nothing counted twice');
+  } finally {
+    await f.close();
+  }
+  // The re-check after the count covers a lane disposed while it ran.
+  const g = await bareLane('c-seed-disposed');
+  try {
+    await g.app.sessionOpen(g.caller, { id: 'sd', visibility: 'shared', retention: { maxBytes: 64 * 1024 } });
+    const s = live(g.registry, 'sd');
+    const budget = g.inside.budgetOf(s.journal);
+    let release = () => undefined as void;
+    const gate = new Promise<void>((r) => (release = r));
+    const seed = budget.seed.bind(budget);
+    budget.seed = async (j) => {
+      await gate;
+      return seed(j);
+    };
+    const pending = g.lane.handle('channels/publish', { channelId: 'terminal:sd', content: [{ type: 'text', text: 'never' }] }, g.ctx);
+    g.lane.dispose();
+    release();
+    await assert.rejects(pending, /the connection closed while the session's notes were counted; nothing was published/);
+    assert.deepEqual(s.journal.since(0).events.filter((e) => e.type === 'note'), []);
+  } finally {
+    await g.close();
+  }
+});
