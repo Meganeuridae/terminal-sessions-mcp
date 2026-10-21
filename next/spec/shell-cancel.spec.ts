@@ -11,6 +11,13 @@ import * as path from 'node:path';
 import { AGENT, hasShell, pgrep, realSession, reap, until } from './fake-shell.js';
 
 const FISH = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find(hasShell) ?? '/usr/bin/fish';
+/**
+ * A tag from this run's pid for the sleeps the specs find and kill by command line. pgrep and pkill see
+ * every process of the user, so on a host where several runs of this suite go at once (the house's shared
+ * VPS) a fixed `sleep 97.25` was another run's as well: one run saw the other's sleep as outliving its
+ * session, and a reap killed what wasn't its own.
+ */
+const TAG = String(process.pid % 10000).padStart(4, '0');
 
 for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
   test(`${shell}: G29 (core-4, tg-6): cancelling a queued Run leaves the Run ahead running and never runs the line`, async () => {
@@ -296,16 +303,16 @@ test('fish: a stopped shell whose empty line a third ^C flushed reads keys again
 test('/bin/bash: G29 (tg-12): a process cancel signals the group until it is empty, even after the leader exits', async () => {
   const x = await realSession('/bin/bash');
   try {
-    // `&` jobs of a non-interactive sh ignore SIGINT: the leader dies, 301.25 stays.
-    const a = x.session.admit({ target: 'process', argv: ['/bin/sh', '-c', 'sleep 301.25 & sleep 302.25; wait'], principal: AGENT });
+    // `&` jobs of a non-interactive sh ignore SIGINT: the leader dies, 301.TAG stays.
+    const a = x.session.admit({ target: 'process', argv: ['/bin/sh', '-c', `sleep 301.${TAG} & sleep 302.${TAG}; wait`], principal: AGENT });
     assert.ok(a.admitted);
     await x.session.awaitRun(a.run.runId, 300);
     // (Anchored: `pgrep -f` would also match the `sh -c` command line that contains it.)
-    assert.equal(pgrep('^sleep 301\\.25').length, 1);
+    assert.equal(pgrep(`^sleep 301\\.${TAG}$`).length, 1);
     const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 300 });
     assert.equal(c.state, 'cancelled');
     assert.deepEqual(c.steps, ['SIGINT → process group', 'SIGTERM → process group']);
-    assert.deepEqual(pgrep('^sleep 301\\.25'), [], 'no member of the group survived');
+    assert.deepEqual(pgrep(`^sleep 301\\.${TAG}$`), [], 'no member of the group survived');
     // A process Run's stdin is /dev/null: a reader sees EOF instead of hanging (core-12).
     const cat = x.session.admit({ target: 'process', argv: ['/bin/sh', '-c', 'cat; echo cat-done'], principal: AGENT });
     assert.ok(cat.admitted);
@@ -321,13 +328,13 @@ test('/bin/bash: G29 (tg-12): a process cancel signals the group until it is emp
     assert.equal(rb.signal, undefined);
   } finally {
     await x.close();
-    reap('sleep 30[12].25');
+    reap(`^sleep 30[12]\\.${TAG}$`);
   }
 });
 
 test('/bin/bash: G19/G29 (core-11): close waits for a process Run that ignores SIGINT; nothing outlives the session', async () => {
   const x = await realSession('/bin/bash');
-  const a = x.session.admit({ target: 'process', argv: ['/bin/sh', '-c', "trap '' INT; exec sleep 97.25"], principal: AGENT });
+  const a = x.session.admit({ target: 'process', argv: ['/bin/sh', '-c', `trap '' INT; exec sleep 97.${TAG}`], principal: AGENT });
   assert.ok(a.admitted);
   await x.session.awaitRun(a.run.runId, 300);
   const n = x.journal.lastSeq;
@@ -335,13 +342,13 @@ test('/bin/bash: G19/G29 (core-11): close waits for a process Run that ignores S
   try {
     assert.equal(x.session.run(a.run.runId).state, 'cancelled');
     assert.equal(x.session.run(a.run.runId).reason, 'session-closed');
-    assert.deepEqual(pgrep('sleep 97.25'), [], 'the process did not outlive the session');
+    assert.deepEqual(pgrep(`^sleep 97\\.${TAG}$`), [], 'the process did not outlive the session');
     const after = x.journal.lastSeq;
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(x.journal.lastSeq, after, 'nothing is journaled after close resolves');
     assert.ok(after > n);
   } finally {
-    reap('sleep 97.25');
+    reap(`^sleep 97\\.${TAG}$`);
   }
 });
 
@@ -403,7 +410,7 @@ for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
     // A command substitution's child is in the shell's own process group; bash defers
     // its hangup until that child ends.
     const x = await realSession(shell);
-    const a = await x.session.admitWhenAvailable({ target: 'shell', line: ': $(sleep 32.75)', principal: AGENT });
+    const a = await x.session.admitWhenAvailable({ target: 'shell', line: `: $(sleep 32.${TAG})`, principal: AGENT });
     assert.ok(a.admitted);
     await x.session.awaitRun(a.run.runId, 300);
     const t0 = Date.now();
@@ -414,16 +421,16 @@ for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
     // One that ignores the hangup does not outlive the session either.
     const y = await realSession(shell);
     try {
-      const b = await y.session.admitWhenAvailable({ target: 'shell', line: ": $(trap '' HUP; sleep 33.75)", principal: AGENT });
+      const b = await y.session.admitWhenAvailable({ target: 'shell', line: `: $(trap '' HUP; sleep 33.${TAG})`, principal: AGENT });
       assert.ok(b.admitted);
       await y.session.awaitRun(b.run.runId, 300);
-      assert.equal(pgrep('^sleep 33\\.75').length, 1);
+      assert.equal(pgrep(`^sleep 33\\.${TAG}$`).length, 1);
       await y.session.close({ timeoutMs: 800 });
-      assert.deepEqual(pgrep('^sleep 3[23]\\.75'), [], 'nothing the shell forked outlived it');
+      assert.deepEqual(pgrep(`^sleep 3[23]\\.${TAG}$`), [], 'nothing the shell forked outlived it');
       assert.equal(y.session.run(b.run.runId).state, 'lost');
     } finally {
       await y.close();
-      reap('sleep 3[23].75');
+      reap(`^sleep 3[23]\\.${TAG}$`);
     }
   });
 }
