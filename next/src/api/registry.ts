@@ -921,6 +921,8 @@ export class SessionRegistry {
       before = prev.view.retention;
       jo.runs = old.runs;
       jo.startSeq = old.lastSeq;
+      // What it lost below the files' last seq, which only it knew of (an independent read of the fixes for the review of f3750e4, PR #22).
+      jo.lost = old.unrecorded();
       jo.cold = store;
       journal = new Journal(jo);
     } else {

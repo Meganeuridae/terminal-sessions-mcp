@@ -362,6 +362,47 @@ test('api-15/G19: a live session whose shell exited is replaced for its owner; a
   await cleanup(r);
 });
 
+test('a new life takes over what the life before it lost below the files\' last seq: it shows the stretch, and records it once the disk takes writes', async () => {
+  // The new journal's own hole starts above the files' last seq, and the stretch below it, lost after a catch-up that
+  // failed partway, was known to the old life alone (an independent read of the fixes for the review of f3750e4, PR #22).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-registry-'));
+  const { backend } = scripted();
+  const reg = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true, defaultCwd: os.tmpdir(), memoryBytes: 600 });
+  const append = FileStore.prototype.append;
+  let budget = Number.POSITIVE_INFINITY;
+  FileStore.prototype.append = function (this: FileStore, ev: JournalEvent) {
+    if (budget-- <= 0) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+    return append.call(this, ev);
+  };
+  try {
+    const old = (await reg.ensure({ id: 'x', owner: A })).session;
+    const fill = (tag: string) => {
+      for (let i = 0; i < 20; i++) old.journal.append({ type: 'output', data: `${tag}-${i}-${'z'.repeat(40)}\n`, stream: 'pty' });
+    };
+    const before = old.journal.lastSeq;
+    budget = 0;
+    fill('a');
+    budget = 2;
+    old.journal.retryCold(); // two caught up, then refused
+    budget = 0;
+    fill('b');
+    const first = old.journal.since(before).events.find((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap')!;
+    assert.ok(first && first.from === before + 1, JSON.stringify(first));
+    backend.ptys[0]!.exit({ exitCode: 0 });
+    const life = (await reg.ensure({ id: 'x', owner: A })).session;
+    assert.notEqual(life, old);
+    assert.equal(life.journal.holeWithin(first.from, first.to), true, 'the new life shows it');
+    budget = Number.POSITIVE_INFINITY;
+    assert.equal(life.journal.retryCold(), true);
+    const recorded = life.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap' && e.seq > first.to);
+    assert.ok(recorded.some((g) => g.from === first.from && g.to === first.to && g.exact === true), JSON.stringify(recorded.map((g) => [g.seq, g.from, g.to])));
+    await reg.closeAll();
+  } finally {
+    FileStore.prototype.append = append;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('G21: retention is explicit per session, recorded, reported, and kept by a new life', async () => {
   const r = rig();
   const s = (await r.reg.ensure({ id: 'ret', owner: A, retention: { maxBytes: 128 * 1024, maxAgeMs: 3_600_000 } })).session;

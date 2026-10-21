@@ -33,12 +33,16 @@
  * written as a `store-error` gap at the catch-up; until then every read (a
  * range, a tail) shows that stretch where it is, as the gap the catch-up will
  * write, never joining what the disk holds to what the ring holds across it.
+ * A new life of a name takes over the stretches the life before it lost, and a
+ * start after a stop while the disk refused records a jump in the files' seqs
+ * that no gap covers: seqs are dense, so the jump is a lost stretch.
  * A gap says whether its count is exact (`exact`): where the journal opens, it
  * knows which seqs of a hole were issued.
  */
 import { clocks, timerMs } from './clock.js';
 import { boots } from './lock.js';
 import { RunIndex } from './runindex.js';
+import { minusRanges } from './ranges.js';
 import { lineBytes, MemoryStore, newEpoch, type JournalStore, type Reservation } from './stores.js';
 import type { EventInput, EventOf, GapReason, Hole, JournalEvent, Seq } from './types.js';
 
@@ -71,6 +75,11 @@ export interface JournalOptions {
   sessionId?: string;
   /** A run index to continue — a new life of a name. Otherwise one is built by streaming the stores once. */
   runs?: RunIndex;
+  /**
+   * A new life of a name: the holes the life before it holds that no file records (its `unrecorded()`). Those
+   * below the files' last seq are this journal's to record; the rest lie inside the hole it opens above them.
+   */
+  lost?: readonly Hole[];
   /** Where to say that the cold store stopped taking writes, and that writing resumed (the daemon's log). */
   log?: ((level: 'warn' | 'info', text: string) => void) | undefined;
 }
@@ -96,18 +105,21 @@ interface LostRange {
   from: Seq;
   to: Seq;
   reason: GapReason;
-  /** Every seq of it was issued (the gap's `exact`): false only for an opening hole carried here, or for ranges joined past MAX_LOST. */
+  /** Every seq of it was issued (the gap's `exact`): false only for a hole whose count is a bound carried here, or for ranges joined past MAX_LOST. */
   exact: boolean;
   /** When it was found lost: the time its gap bears in a read before the catch-up records it. */
   ts: number;
 }
 
 /**
- * Lost stretches kept apart at most. A new one begins only after a catch-up that wrote part of the ring and was
- * refused again (at most one a second, backing off to 30 s); past this the oldest two are joined, and the joined
- * range counts as a bound, since the disk holds the events between them.
+ * Lost stretches kept apart at most. A new one begins after a catch-up that wrote part of the ring and was refused
+ * again (at most one a second, backing off to 30 s), or at a start, from what the life before handed over or a jump
+ * in the files; past this the oldest two are joined, and the joined range counts as a bound, since the disk holds
+ * the events between them.
  */
 const MAX_LOST = 256;
+/** Events read per page when a start looks for jumps in the files' seqs. */
+const JUMP_PAGE = 4096;
 
 const RETRY_MIN_MS = 1000;
 const RETRY_MAX_MS = 30_000;
@@ -133,9 +145,9 @@ export const HIGH_WATER_BLOCK = 10_000;
  * keeps the hole on this boot until the gap lands, and lets a later stop read as one that lost nothing; a
  * second write, after the gap, made every start over a hole cost two (the house's 5af8f68; a reviewer's
  * read of it: 200 journals reopened after a power loss in 3.7 s instead of 2.0 s). The registry's expiry
- * passes no `accounted`, and reads one written on this boot as covering nothing.
+ * passes retention's floor, since the files it judges hold no event.
  */
-export function reservationHonoured(r: Reservation, accounted = Number.POSITIVE_INFINITY): boolean {
+export function reservationHonoured(r: Reservation, accounted: Seq): boolean {
   if (r.failed === true || r.boot === undefined) return true;
   const boot = boots.current();
   return boot === undefined || boot !== r.boot || accounted < r.to - HIGH_WATER_BLOCK;
@@ -234,6 +246,16 @@ export class Journal {
     if (!opts.runs) this.index();
     // Below what the stores hold now, retention has taken the files, and the gaps they recorded with them.
     this.runs.knownFrom ??= this.oldestSeq ?? accounted + 1;
+    // Stretches inside the files that no file records: what the life before this one lost below their last seq,
+    // which the hole this journal opens does not reach (an independent read of the fixes for the review of f3750e4, PR #22: after a catch-up
+    // that failed partway, a new life read 3 then 19, and nothing ever recorded 4–18); and, after a stop while the
+    // disk refused, a jump in the files' seqs that no recorded gap covers. Seqs are dense, so a jump is a stretch
+    // the ring dropped before a catch-up wrote what followed it, every seq of it issued. (One exception: a hole a
+    // start opened whose gap the ring dropped as well; its seqs are counted as if all were issued.)
+    for (const h of opts.lost ?? []) {
+      if (h.from <= accounted) this.addLost({ from: h.from, to: Math.min(h.to, accounted), reason: h.reason, exact: h.exact === true, ts: this.now() });
+    }
+    if (known === undefined && r?.failed === true) for (const j of this.jumps()) this.addLost(j);
     this.cold?.setRotationHeader?.((maxBytes) => this.runs.header(maxBytes));
     // Likewise a crash that cut the event after the last complete line (G11); a hole covers that event.
     const torn = this.cold?.takeTornTail?.() ?? false;
@@ -249,6 +271,8 @@ export class Journal {
       // is in the file (reservationHonoured).
       this.append(gapEvent(accounted + 1, this.seq, hole && !crash ? 'store-failed' : 'torn-write', exact));
     }
+    // With the disk taking writes, the stretches found inside the files are recorded now; else at the catch-up.
+    if (this.lost.length && this.coldError === null) this.recordLost();
   }
 
   /**
@@ -330,15 +354,60 @@ export class Journal {
     // the first seq the disk refused is the gap's), so `lost` stays in seq order.
     for (const g of this.unwritten.splice(0)) {
       if (g.seq > droppedTo) this.unwritten.push(g);
-      else if (g.seq > this.persisted) this.lost.push({ from: g.from, to: g.to, reason: g.reason, exact: g.exact === true, ts: g.ts });
+      else if (g.seq > this.persisted) this.addLost({ from: g.from, to: g.to, reason: g.reason, exact: g.exact === true, ts: g.ts });
     }
     const last = this.lost[this.lost.length - 1];
     if (last && last.to === from - 1 && last.reason === 'store-error') last.to = droppedTo;
-    else this.lost.push({ from, to: droppedTo, reason: 'store-error', exact: true, ts: this.now() });
+    else this.addLost({ from, to: droppedTo, reason: 'store-error', exact: true, ts: this.now() });
+  }
+
+  /**
+   * Add a lost stretch where it lies in seq order: two refused gaps of a catch-up the ring drops in separate
+   * calls come lower than a stretch added between them, and the join below, `floor` and the next stretch's
+   * start read `lost` as ordered (an independent read of the fixes for the review of f3750e4, PR #22).
+   */
+  private addLost(r: LostRange): void {
+    let i = this.lost.length;
+    while (i > 0 && this.lost[i - 1]!.from > r.from) i--;
+    this.lost.splice(i, 0, r);
     if (this.lost.length > MAX_LOST) {
       const [a, b] = this.lost.splice(0, 2) as [LostRange, LostRange];
       this.lost.unshift({ from: a.from, to: b.to, reason: 'store-error', exact: false, ts: a.ts });
     }
+  }
+
+  /** Issue the gaps of every lost stretch, now that the disk takes writes, and forget them. */
+  private recordLost(): void {
+    const lost = this.lost;
+    this.lost = [];
+    for (const r of lost) this.issue(gapEvent(r.from, r.to, r.reason, r.exact));
+  }
+
+  /**
+   * The jumps in the cold store's seqs that neither a recorded gap nor a known lost stretch covers. A full read of
+   * the files, so done only at a start that finds the reservation marked failed: a stop while the disk refused is
+   * the only one that can leave a jump unrecorded.
+   */
+  private jumps(): LostRange[] {
+    const found: LostRange[] = [];
+    let prev: Seq | undefined;
+    for (let next = this.cold?.oldestSeq(); next !== undefined; ) {
+      const page = this.cold!.read(next, undefined, JUMP_PAGE);
+      for (const e of page) {
+        if (prev !== undefined && e.seq > prev + 1) found.push({ from: prev + 1, to: e.seq - 1, reason: 'store-error', exact: true, ts: e.ts });
+        prev = e.seq;
+      }
+      next = page.length < JUMP_PAGE ? undefined : page[page.length - 1]!.seq + 1;
+    }
+    if (!found.length) return found;
+    return minusRanges(found, [...this.runs.gapsWithin(found[0]!.from, found[found.length - 1]!.to), ...this.lost]);
+  }
+
+  /** The holes this journal holds that no file records: its lost stretches, and the holes of gap events the disk never took. What a new life of the name takes over (JournalOptions.lost). */
+  unrecorded(): Hole[] {
+    const holes: Hole[] = this.lost.map((r) => ({ from: r.from, to: r.to, reason: r.reason, ...(r.exact && { exact: true as const }) }));
+    for (const g of this.unwritten) holes.push({ from: g.from, to: g.to, reason: g.reason, ...(g.exact && { exact: true as const }) });
+    return holes;
   }
 
   private persist(event: JournalEvent): void {
@@ -467,8 +536,7 @@ export class Journal {
       const missing = lost.map((r) => `${r.from}–${r.to}`).join(', ');
       this.log?.('info', `history is being written to disk again: ${caught} events caught up${lost.length ? `; seqs ${missing} were lost from memory meanwhile (gaps record them)` : ''}`);
       // Even a sealed journal records what its ring lost, under the next seqs (the next life numbers after them).
-      this.lost = [];
-      for (const r of lost) this.issue(gapEvent(r.from, r.to, r.reason, r.exact));
+      this.recordLost();
       if (this.coldError === null && this.persisted >= this.seq) {
         this.markRetryAt = 0; // the disk takes writes again: the reservation's `failed` goes now, not at a throttle's deadline
         // A sealed journal issues nothing after this: its reservation goes back to exactly its last seq. Left a
@@ -604,7 +672,7 @@ export class Journal {
    * ended, which only the range's own events said nothing of (the house's read of cc8c909..39787b3, #22).
    */
   holeWithin(from: Seq, to: Seq): boolean {
-    return this.runs.gapsWithin(from, to).length > 0 || this.lost.some((r) => r.to >= from && r.from <= to);
+    return this.gapsWithin(from, to).length > 0;
   }
 
   /**

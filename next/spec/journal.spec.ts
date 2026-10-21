@@ -720,6 +720,128 @@ test('a hole the journal opened with is recorded at the catch-up even when the r
   assert.deepEqual(gapsOf(cold.read()), want, 'the catch-up recorded both');
 });
 
+/** A file store that takes `budget.n` more appends, then refuses each as a full disk does. */
+class Budgeted extends FileStore {
+  constructor(dir: string, readonly budget: { n: number }) {
+    super(dir);
+  }
+  override append(event: JournalEvent): void {
+    if (this.budget.n-- <= 0) throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+    super.append(event);
+  }
+}
+
+/** A journal over `cold` that lost two stretches apart: 4–18, then 21–38, a catch-up having written 19 and 20 between them. */
+function lostTwice(cold: Budgeted): Journal {
+  const j = new Journal({ hot: new MemoryStore(600), cold, sessionId: 's' });
+  for (let i = 0; i < 3; i++) j.append(out(`ok${i}\n`));
+  cold.budget.n = 0;
+  for (let i = 0; i < 20; i++) j.append(out(`a-${i}-${'z'.repeat(40)}\n`));
+  cold.budget.n = 2;
+  j.retryCold();
+  cold.budget.n = 0;
+  for (let i = 0; i < 20; i++) j.append(out(`b-${i}-${'z'.repeat(40)}\n`));
+  return j;
+}
+const holesOf = (evs: JournalEvent[]) => evs.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap').map((g) => [g.from, g.to, g.reason, g.exact]);
+
+test('a new life takes over the stretches the life before it lost below the files\' last seq, shows them, and records them', () => {
+  // Its own hole starts above the files' last seq: a stretch the life before lost below it, after a catch-up that
+  // failed partway, was forgotten. since(0) read 3 then 19, holeWithin(5, 10) said no, and after the heal and a
+  // restart nothing recorded 4–18 (an independent read of the fixes for the review of f3750e4, PR #22).
+  const dir = tmpDir();
+  try {
+    const cold = new Budgeted(dir, { n: Number.POSITIVE_INFINITY });
+    const old = lostTwice(cold);
+    assert.deepEqual(holesOf(old.since(0).events), [[4, 18, 'store-error', true], [21, 38, 'store-error', true]]);
+    old.seal();
+    old.retryCold(); // the registry's one more try: still refused
+    const life = new Journal({ hot: new MemoryStore(600), cold, sessionId: 's', startSeq: old.lastSeq, runs: old.runs, lost: old.unrecorded() });
+    assert.deepEqual(holesOf(life.since(0).events), [[4, 18, 'store-error', true], [21, old.lastSeq, 'store-failed', true]]);
+    assert.equal(life.holeWithin(5, 10), true);
+    assert.deepEqual(life.range(5, 10).gap, { from: 5, to: 10, reason: 'store-error', exact: true });
+    assert.equal(life.gapAt(5, 10), true);
+    cold.budget.n = Number.POSITIVE_INFINITY;
+    assert.equal(life.retryCold(), true);
+    life.close();
+    const later = new Journal({ cold: new FileStore(dir) });
+    assert.deepEqual(holesOf(later.since(0).events), [[21, old.lastSeq, 'store-failed', true], [4, 18, 'store-error', true]], 'both recorded, in the order the new life wrote them');
+    later.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a start after a daemon crash while the disk refused records a jump in the files\' seqs that no gap covers, every seq of it issued; a start over a healthy store reads no file for it', () => {
+  // Seqs are dense: a file that holds 3 then 19 lost 4–18. Nothing else records the stretch when the daemon died
+  // with it in memory (an independent read of the fixes for the review of f3750e4, PR #22, its question 2).
+  const dir = tmpDir();
+  try {
+    const cold = new Budgeted(dir, { n: Number.POSITIVE_INFINITY });
+    const died = lostTwice(cold); // no seal: the daemon dies
+    assert.equal(cold.highWater()?.reservation?.failed, true);
+    const again = new Journal({ cold: new FileStore(dir) });
+    const holes = holesOf(again.since(0).events);
+    assert.deepEqual(holes[0], [21, holes[0]![1], 'store-failed', undefined], 'the hole above the files, up to the reservation');
+    assert.deepEqual(holes.slice(1), [[4, 18, 'store-error', true]], 'and the jump inside them, recorded at once');
+    assert.ok((holes[0]![1] as number) >= died.lastSeq);
+    again.close();
+    // A store whose reservation is not marked failed holds no jump that went unrecorded: its start reads no event.
+    class Reads extends FileStore {
+      reads = 0;
+      override read(from?: number, to?: number, limit?: number): JournalEvent[] {
+        this.reads++;
+        return super.read(from, to, limit);
+      }
+    }
+    const store = new Reads(dir);
+    const healthy = new Journal({ cold: store });
+    assert.equal(store.reads, 0);
+    healthy.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('lost stretches stay in seq order when two refused gaps of a catch-up are dropped in separate calls, so the catch-up records them in order and the stretch after them stays one', () => {
+  // The second gap's hole came after a stretch added between the two drops (an independent read of the fixes for the review of f3750e4, PR #22).
+  let budget = Number.POSITIVE_INFINITY;
+  class Budget extends MemoryStore {
+    override append(e: JournalEvent): void {
+      if (budget-- <= 0) throw new Error('ENOSPC: no space left on device, write');
+      super.append(e);
+    }
+  }
+  const cold = new Budget();
+  const j = new Journal({ hot: new MemoryStore(1200), cold });
+  j.append(out('kept\n'));
+  budget = 0;
+  for (let i = 0; i < 20; i++) j.append(out(`a-${i}-${'z'.repeat(40)}\n`));
+  budget = 2;
+  j.retryCold();
+  budget = 0;
+  for (let i = 0; i < 20; i++) j.append(out(`b-${i}-${'z'.repeat(40)}\n`));
+  // The catch-up writes what the ring holds, then the disk refuses its two gaps.
+  budget = j.tail(1000).filter((e) => e.type === 'output' && e.seq > cold.lastSeq()!).length;
+  j.retryCold();
+  const refused = j.tail(1000).filter((e) => e.type === 'gap' && e.seq > cold.lastSeq()!).map((e) => e.seq);
+  assert.equal(refused.length, 2, 'two refused gaps in the ring');
+  // The refused gap event itself, not a read-time gap a lost stretch shows, which is seated at its own last seq.
+  const holds = (seq: number) => j.tail(1000).some((e) => e.seq === seq && e.type === 'gap' && e.to < e.seq);
+  let separately = false;
+  for (let n = 0; n < 200 && holds(refused[1]!); n++) {
+    j.append(out('x'));
+    if (!holds(refused[0]!) && holds(refused[1]!)) separately = true;
+  }
+  assert.ok(separately, 'the ring dropped the first gap before the second');
+  budget = Number.POSITIVE_INFINITY;
+  assert.equal(j.retryCold(), true);
+  const recorded = cold.read().filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap' && e.seq > refused[1]!);
+  const froms = recorded.map((g) => g.from);
+  assert.deepEqual(froms, [...froms].sort((a, b) => a - b), `recorded in order: ${JSON.stringify(recorded.map((g) => [g.from, g.to]))}`);
+  assert.equal(recorded.filter((g) => g.from >= refused[0]!).length, 1, 'the stretch from the first refused gap on is one');
+});
+
 test('a rotation header the disk refused is written before the new file’s first event, so the open Run survives retention', () => {
   const dir = tmpDir();
   const cjs = createRequire(import.meta.url)('node:fs') as typeof fs;
