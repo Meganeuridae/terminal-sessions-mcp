@@ -1,8 +1,9 @@
 /**
  * Search over a journal range (§11 `search`): a regex over output lines with
  * control sequences stripped, each match anchored at the `seq` of the event
- * that completed its line, with lines of context, and the cursor that reads
- * from the start of that line.
+ * that completed its line (a line a gap ends, at the gap; one still open where
+ * the scan ends, at the scan's last event), with lines of context, and the
+ * cursor that reads from the start of that line.
  *
  * Lines are a matching projection, stated exactly here (§6 names search as
  * built from raw output and the transcript; this is the part that runs over
@@ -61,7 +62,7 @@ import { headAt, indexAtByte, isStringStart, lineCarry, lineEnds, showsCharacter
 import type { JournalEvent, OutputStream, Seq } from './types.js';
 
 export interface SearchMatch {
-  /** The event that completed the line. */
+  /** The event that completed the line; for a line a gap ended, the gap; for one still open where the scan ended, the scan's last event. */
   seq: Seq;
   /** 1-based line number within the scanned range. */
   lineNumber: number;

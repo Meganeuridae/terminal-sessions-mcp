@@ -416,6 +416,16 @@ test('jr2-10 / jr2-11: a scan reports the holes it spans: past retention at its 
   h.journal.append({ type: 'gap', from: 2, to: 2, reason: 'torn-write' });
   out(h.journal, 'second half\r\n');
   assert.deepEqual(lines(await search(h, { pattern: 'half', since: 0 })), ['first half ', 'second half']);
+  // Where each line is anchored: one an event completes, at that event; one a gap ends, at the gap; one still
+  // open where the scan ends, at the scan's last event, here a note (the house's read of a8b6f28..4860d4c, #22).
+  const a = source();
+  out(a.journal, 'cut half ');
+  const gap = a.journal.append({ type: 'gap', from: 2, to: 2, reason: 'torn-write' }).seq;
+  const whole = out(a.journal, 'whole half\r\n');
+  out(a.journal, 'open half');
+  const last = a.journal.append({ type: 'note', text: 'after', principal: 'human:test' }).seq;
+  const anchored = (await search(a, { pattern: 'half', since: 0 })).matches.map((m) => [m.line, m.seq]);
+  assert.deepEqual(anchored, [['cut half ', gap], ['whole half', whole], ['open half', last]]);
 });
 
 test('search without since scans a bounded recent window and says so', async () => {

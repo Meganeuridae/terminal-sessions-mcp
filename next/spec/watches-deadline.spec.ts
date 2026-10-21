@@ -321,6 +321,24 @@ test('a pattern watch says when it matched a line on its head only', async () =>
   }
 });
 
+test('a line a flush completes names the event its last output came in, for a watch and a wait (the house\'s read of a8b6f28..4860d4c, #22)', async () => {
+  // A line an event completes names that event; a line its Run's end completes has no completing event, and
+  // `at` and `seq` say the event its last output came in, not the Run's end.
+  const f = bare();
+  try {
+    f.startRun('p', 'process');
+    const w = f.manager.add({ pattern: 'tail', runId: 'p' }, A);
+    const last = f.out('the tail', 'p', 'stdout').seq; // no newline
+    const end = f.journal.append({ type: 'run.end', runId: 'p', state: 'exited', exit: 0, durationMs: 1 }).seq;
+    for (const t0 = performance.now(); !f.firings(w.watchId).length && performance.now() - t0 < 2000; ) await sleep(10);
+    assert.deepEqual([f.firings(w.watchId)[0]?.at, end], [last, last + 1], "the watch names the last output, not the Run's end");
+    const wait = await f.manager.waitFor({ pattern: 'tail', runId: 'p' }, 300, 0);
+    assert.deepEqual([wait.matched, wait.seq], [true, last], 'a replaying wait says the same');
+  } finally {
+    f.close();
+  }
+});
+
 test('clipped survives when a hit is completed by flush or at stream end, and reaches wait_for (the house\'s read of the 36 commits, #22)', async () => {
   const pat = `${'.'.repeat(999)}0`;
   const clippedLine = `${'x'.repeat(999)}0${'y'.repeat(20_000)}`;

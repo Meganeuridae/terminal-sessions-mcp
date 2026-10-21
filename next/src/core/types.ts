@@ -77,8 +77,9 @@ export type EventInput =
   | { type: 'service'; runId: string; status: ServiceStatus; probe: string; principal: Principal; name?: string; evidence?: string; exit?: number }
   /**
    * A Watch fired (§4); `principal` set it; `at` is the event that satisfied it, for a pattern the event that completed
-   * the line. A pattern's `cursor` and `offset` say where the line began, as search's match does: read `since=cursor`,
-   * `offset`, to read it whole, its head in earlier events included.
+   * the line, or for a line a flush completed (a Run's end, the session's exit, a hole, a partial line left quiet) the
+   * event its last output came in. A pattern's `cursor` and `offset` say where the line began, as search's match
+   * does: read `since=cursor`, `offset`, to read it whole, its head in earlier events included.
    */
   /** `clipped`: the line was longer than the pattern's match window and matched on its head. */
   | { type: 'watch.fired'; watchId: string; label: string; kind: 'pattern' | 'silence' | 'idle'; principal: Principal; at: Seq; match?: string; line?: string; cursor?: Seq; offset?: number; clipped?: boolean; stream?: 'stdout' | 'stderr'; mixed?: boolean; suppressed?: number }

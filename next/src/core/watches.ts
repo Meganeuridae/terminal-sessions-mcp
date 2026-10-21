@@ -81,7 +81,11 @@ export interface WaitResult {
   stream?: 'stdout' | 'stderr';
   /** The line holds output from both of the Run's pipes. */
   mixed?: boolean;
-  /** Journal position of the event that satisfied the wait: for a pattern, the event that completed the line. */
+  /**
+   * Journal position of the event that satisfied the wait: for a pattern, the event that completed the line, or for a
+   * line a flush completed (a Run's end, the session's exit, a hole, a partial line left quiet) the event its last
+   * output came in.
+   */
   seq?: Seq;
   /**
    * A pattern's line: where it began, as search's match names its line, so `read since=<cursor> offset=<offset>`
@@ -159,9 +163,9 @@ const endText = (r: { runId: string; state: string; exit?: number; signal?: stri
 
 /**
  * What a predicate fires with: the match and its line, where in the journal (`seq` the event that completed the line,
- * `cursor` and `offset` where it began, as search's match names it), whether the line was matched on its head only
- * (longer than the pattern's match window), and for a process Run's line its first character's pipe and whether it
- * holds both.
+ * or for a line a flush completed the event its last output came in; `cursor` and `offset` where it began, as
+ * search's match names it), whether the line was matched on its head only (longer than the pattern's match window),
+ * and for a process Run's line its first character's pipe and whether it holds both.
  */
 type Hit = { match?: string; line?: string; seq: Seq; cursor?: Seq; offset?: number; clipped?: boolean; stream?: 'stdout' | 'stderr'; mixed?: boolean };
 
