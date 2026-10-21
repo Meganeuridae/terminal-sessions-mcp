@@ -642,15 +642,25 @@ test('a LF a CSI executes is a line end the interleave may cut at: the source’
   assert.deepEqual((await project(['A\x1b[3\n', run('r1\n'), '1mB'], { cols: 40 })).text.split('\n'), ['A', '', 'r1', 'B']);
   assert.deepEqual((await project(['A\x1b[3\r\n', run('r1\n'), '1mB'], { cols: 40 })).text.split('\n'), ['A', 'r1', 'B']);
   assert.deepEqual((await project(['A\x1b[3\r\n', run('r1\n'), 'CB'], { cols: 40, label: sourceLabel })).text.split('\n'), ['[terminal]', 'A', '[run r1]', 'r1', '[terminal]', '   B']);
-  // Every byte budget and both ends: no cut leaves the CSI's rest as text.
+  // Every byte budget and both ends: no cut leaves the CSI's rest as text, and what is kept is the whole's own start or end,
+  // so a budget that lost a line, or `B`, fails too (our review of the 40 commits through 4f4c067, PR #22: absence alone
+  // was checked).
   const chunks: ProjectChunk[] = ['A\x1b[3\r\n', run('r1\n'), '1mB\r\n', run('r2\n'), 'p3\r\n'];
+  const whole = (await project(chunks, { cols: 40 })).text;
+  assert.equal(whole, 'A\nr1\nB\nr2\np3');
   for (let max = 0; max <= 40; max++) {
     for (const keep of ['head', 'tail'] as const) {
       const p = await project(chunks, { cols: 40, maxInputBytes: max, keep });
       assert.ok(!/1m|\[3/.test(p.text), `budget ${max}, ${keep}: ${JSON.stringify(p.text)}`);
+      assert.ok(keep === 'head' ? whole.startsWith(p.text) : whole.endsWith(p.text), `budget ${max}, ${keep}: ${JSON.stringify(p.text)} is the whole's ${keep}`);
+      if (max >= 21) assert.equal(p.text, whole, `budget ${max}, ${keep}: everything fits`);
     }
   }
-  for (let maxLines = 1; maxLines <= 5; maxLines++) assert.ok(!/1m/.test((await project(chunks, { cols: 40, maxLines })).text), `maxLines ${maxLines}`);
+  for (let maxLines = 1; maxLines <= 5; maxLines++) {
+    const { text } = await project(chunks, { cols: 40, maxLines });
+    assert.ok(!/1m/.test(text), `maxLines ${maxLines}`);
+    assert.equal(text, whole.split('\n').slice(-maxLines).join('\n'), `maxLines ${maxLines}: the last lines`);
+  }
 });
 
 test('a tail cut inside the rest of a CSI a LF split keeps what the CSI set (our review of the 40 commits through 4f4c067, PR #22)', async () => {
