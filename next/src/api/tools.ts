@@ -305,10 +305,10 @@ const READ_OUTPUT: Schema = {
       type: 'object',
       properties: {
         requested: { type: 'integer' },
-        returned: { type: 'integer' },
+        returned: { type: 'integer', description: 'Fewer than requested without truncated: the range holds no more. More: with several sources, the lines reach back to the line written last.' },
         cutHead: { type: 'boolean' },
         begunBefore: { type: 'boolean', description: 'With cutHead: the first line may have begun before the lines read, in the page before; head then reads it on from where that page ends, not from its head.' },
-        before: { type: 'object', description: 'Pass beside tail for what came before: until, and untilOffset when the lines begin inside an event.', properties: { until: { type: 'integer' }, untilOffset: { type: 'integer' } }, required: ['until'] },
+        before: { type: 'object', description: 'Where what came before ends: pass its until as until, and its untilOffset, when given (the lines begin inside an event), as untilOffset, beside the same tail.', properties: { until: { type: 'integer' }, untilOffset: { type: 'integer' } }, required: ['until'] },
         head: { type: 'object', description: 'With cutHead: a head-first read (since, offset) from where the page before ends, which shows the first line from its head (with begunBefore, on from there).', properties: { since: { type: 'integer' }, offset: { type: 'integer' } }, required: ['since'] },
       },
       required: ['requested', 'returned'],
@@ -567,7 +567,8 @@ export const TOOLS: ToolDef[] = [
     description:
       "Read a session's history as text (default) or as journal events. `since: N` pages forward from a cursor — the " +
       'result says `more` and gives the next cursor, so nothing is read twice or skipped. `runId` pages through one ' +
-      "command's full output the same way. `tail: N` gives the last N lines (also of one Run with `runId`); its `lines.before`, passed with the same tail, reads what came before. Every result carries `nextCursor`; " +
+      "command's full output the same way. `tail: N` gives the last N lines (also of one Run with `runId`); for what came before, pass its " +
+      '`lines.before.until` as `until`, and its `lines.before.untilOffset`, when given, as `untilOffset`, with the same tail. Every result carries `nextCursor`; ' +
       'when a page ends inside a large output event it also carries `nextOffset` — pass both back (`since`, `offset`). ' +
       'Use `screen` for what the terminal shows right now; use `search` to find a pattern in history.',
     inputSchema: {
@@ -577,7 +578,7 @@ export const TOOLS: ToolDef[] = [
         since: { type: 'integer', minimum: 0, description: 'Page forward from this cursor (exclusive).' },
         offset: { type: 'integer', minimum: 0, description: 'With since: continue inside the event after since (a result’s nextOffset).' },
         until: { type: 'integer', minimum: 0, description: 'Stop at this cursor (inclusive).' },
-        untilOffset: { type: 'integer', minimum: 0, description: 'With tail and until: stop inside the event at until, after this many of its bytes (a tail result’s lines.before).' },
+        untilOffset: { type: 'integer', minimum: 0, description: 'With tail and until: stop inside the event at until, after this many of its bytes (a tail result’s lines.before.untilOffset).' },
         tail: { type: 'integer', minimum: 1, maximum: 10000, description: 'The last N lines of output.' },
         runId: { type: 'string', description: "One Run's output, paged from its start (combine with since)." },
         as: { type: 'string', enum: ['text', 'events'] },

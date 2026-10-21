@@ -355,7 +355,7 @@ test('78c4d6e 15 and 16: launch carries tailLogs’ cut note, and the advised pa
   await call('killSession', { session: 'cutnote', graceful: false });
 });
 
-test('78c4d6e: searchLogs reports the holes it spanned and the lines it matched on their head only', async () => {
+test('78c4d6e: searchLogs reports the holes it spanned and the lines it searched on their head only', async () => {
   await call('runCommand', { session: 'snotes', command: 'echo findme-here' });
   const live = registry.get('snotes');
   assert.ok(live?.kind === 'live');
@@ -367,7 +367,7 @@ test('78c4d6e: searchLogs reports the holes it spanned and the lines it matched 
   const out = (await call('searchLogs', { session: 'snotes', pattern: 'findme' })) as unknown as Array<{ line?: string; note?: string }>;
   const note = out.find((m) => m.note !== undefined)?.note;
   assert.ok(note && /missing/.test(note), `the hole is noted: ${JSON.stringify(out)}`);
-  assert.match(note!, /1 line longer than the match window, matched on its head only/);
+  assert.match(note!, /1 line longer than the match window, searched on its head only/);
   assert.ok(out.some((m) => m.line?.startsWith('findme-long ')), 'the long line still matched on its head');
 });
 

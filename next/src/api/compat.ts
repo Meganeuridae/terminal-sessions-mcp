@@ -737,7 +737,7 @@ export const COMPAT_TOOLS: ToolDef[] = [
       const notes: string[] = [];
       if (r.bounded) notes.push(`older output was not searched (the search covers the last 50,000 journal events); read {"session": "${session}", "tail": 200, "until": ${r.scanned[0] - 1}} shows what came before`);
       if (r.more) notes.push(`more matches exist (stopped by ${r.stoppedBy ?? 'the 100-match limit'})`);
-      // What the scan did not see, in the core search's words (tools.ts renderSearch): holes it spanned, lines matched on their head only.
+      // What the scan did not see, in the core search's words (tools.ts renderSearch): holes it spanned, lines searched on their head only.
       const gaps = gapsText(r);
       if (gaps) notes.push(`output is missing where the search looked: ${gaps}`);
       const clipped = clippedText(r.clippedLines);

@@ -18,13 +18,13 @@ const A: Caller = { principal: 'agent:a@test', connectionId: 'ct' };
 const stub = (methods: Record<string, unknown> = {}) => methods as unknown as App;
 const ctx = (app: App, resultText: ResultText = 'transcript', notifications?: boolean) => ({ app, caller: A, resultText, ...(notifications === undefined ? {} : { notifications }) });
 
-test('search: the status line names the gap the scan spanned and the lines it matched on their head only', async () => {
+test('search: the status line names the gap the scan spanned and the lines it searched on their head only', async () => {
   const r: SearchResult = { session: 's', matches: [], scanned: [1, 4], more: false, bounded: false, gap: { from: 2, to: 40, reason: 'retention' }, clippedLines: 1 };
   const search = async (res: SearchResult, mode: ResultText = 'transcript') => callTool('search', { session: 's', pattern: 'needle' }, ctx(stub({ search: async () => res }), mode), TOOLS);
   const one = await search(r);
-  assert.equal(one.text, '(no matches)\n[search s · 0 matches · scanned seq 1–4 · gap 2–40 (past retention) · 1 line longer than the match window, matched on its head only]');
+  assert.equal(one.text, '(no matches)\n[search s · 0 matches · scanned seq 1–4 · gap 2–40 (past retention) · 1 line longer than the match window, searched on its head only]');
   const several: SearchResult = { session: 's', matches: [], scanned: [1, 9], more: false, bounded: false, gaps: [{ from: 2, to: 3, reason: 'store-error' }, { from: 5, to: 5, reason: 'retention' }], clippedLines: 3 };
-  assert.match((await search(several)).text, /scanned seq 1–9 · 2 gaps: gap 2–3 \(the journal store failed\), gap 5–5 \(past retention\) · 3 lines longer than the match window, matched on their head only\]$/);
+  assert.match((await search(several)).text, /scanned seq 1–9 · 2 gaps: gap 2–3 \(the journal store failed\), gap 5–5 \(past retention\) · 3 lines longer than the match window, searched on their head only\]$/);
   const clean = await search({ session: 's', matches: [], scanned: [1, 4], more: false, bounded: false });
   assert.equal(clean.text, '(no matches)\n[search s · 0 matches · scanned seq 1–4]');
   assert.equal((JSON.parse((await search(r, 'json')).text) as SearchResult).clippedLines, 1, 'json mode is the envelope');
@@ -149,4 +149,30 @@ test('renderRead: a Run tail’s advice names the Run and the tail’s since, an
   const page = renderRead({ ...base, truncated: false, more: true }, 'transcript', { since: 3, until: 40 });
   assert.equal(page.text, 'xyz\n[read s run r1-ab seq 7–9 · next: since=9 · more: read since=9 until=40 runId=r1-ab]');
   for (const r of [run, begun, page]) validate(r.structured, TOOLS.find((t) => t.name === 'read')!.outputSchema!);
+});
+
+// ───────────── the house's read of the 33 commits (#22, comment 6307350650) ─────────────
+
+test('the 33 commits 3: read’s description says to pass lines.before’s until and untilOffset, which read takes, not lines.before itself', () => {
+  const read = TOOLS.find((t) => t.name === 'read')!;
+  assert.doesNotMatch(read.description, /lines\.before`, passed/, 'read has no argument that takes lines.before whole');
+  assert.match(read.description, /`lines\.before\.until` as `until`, and its `lines\.before\.untilOffset`, when given, as `untilOffset`, with the same tail/);
+  const props = (read.inputSchema as { properties: Record<string, { description?: string }> }).properties;
+  assert.equal(props.before, undefined);
+  assert.match(props.untilOffset!.description!, /lines\.before\.untilOffset/);
+});
+
+test('the 33 commits 8: the read tool hands the request’s range to the status line, so its advice keeps since, until and the Run', async () => {
+  // The advice tests called renderRead with a range directly; dropping it at the tool's call site left every test green.
+  const asked: Array<Record<string, unknown>> = [];
+  const read = (r: ReadResult) => async (_c: Caller, o: Record<string, unknown>) => {
+    asked.push(o);
+    return r;
+  };
+  const base: ReadResult = { session: 's', runId: 'r1-ab', seq: [7, 9], nextCursor: 9, more: false, truncated: false, text: 'xyz' };
+  const tail = await callTool('read', { session: 's', runId: 'r1-ab', tail: 2, since: 3 }, ctx(stub({ read: read({ ...base, lines: { requested: 2, returned: 2, before: { until: 7, untilOffset: 12 } } }) })), TOOLS);
+  assert.equal(tail.text, 'xyz\n[read s run r1-ab seq 7–9 · 2 of 2 lines · earlier: read tail=2 until=7 untilOffset=12 since=3 runId=r1-ab · next: since=9]');
+  const page = await callTool('read', { session: 's', runId: 'r1-ab', since: 3, until: 40 }, ctx(stub({ read: read({ ...base, more: true }) })), TOOLS);
+  assert.equal(page.text, 'xyz\n[read s run r1-ab seq 7–9 · next: since=9 · more: read since=9 until=40 runId=r1-ab]');
+  assert.deepEqual(asked.map((o) => [o.since, o.until, o.tail, o.runId]), [[3, undefined, 2, 'r1-ab'], [3, 40, undefined, 'r1-ab']]);
 });

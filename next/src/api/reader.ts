@@ -51,10 +51,14 @@
  *   returned: fewer returned without `truncated` means the range holds no more;
  *   `truncated` means `maxBytes`, retention, the scan bound or the projection's
  *   input cap cut lines (or a line's head) that were asked for. `lines.before`
- *   is where a tail of what came before ends, exactly where the lines shown
- *   begin, and `lines.head` reads a first line shown without its head from its
- *   head, or, when that line began before the lines read (`lines.begunBefore`),
- *   on from where the page before ends. As events, the tail is the newest N events whose stored lines fit
+ *   is where a tail of what came before ends, right where the lines shown
+ *   begin, every line the text leaves out whole in it, and `lines.head` reads a
+ *   first line shown without its head from its head, or, when that line began
+ *   before the lines read (`lines.begunBefore`), on from where the page before
+ *   ends. With more than one source, an unfinished line is shown after lines
+ *   other sources wrote after it began (rule 6); when the lines asked for would
+ *   leave out the line written last, the tail reaches back to it, returning more
+ *   lines than asked for. As events, the tail is the newest N events whose stored lines fit
  *   `maxBytes`. `commands` heads each Run's output in a text tail with
  *   `$ <line>` where it started (the 1.x log shape the compat pack serves).
  */
@@ -100,7 +104,7 @@ export function gapsText(r: { gap?: GapInfo; gaps?: GapInfo[] }): string | undef
   return r.gap ? one(r.gap) : undefined;
 }
 
-/** Lines a search matched on their head only, being longer than the pattern's match window (G11), in the one wording of it (headOnlyText); undefined when none. */
+/** Lines a search scanned on their head only, being longer than the pattern's match window (G11), matched or not, in the one wording of it (headOnlyText); undefined when none. */
 export function clippedText(n: number | undefined): string | undefined {
   return n ? headOnlyText(n) : undefined;
 }
@@ -129,9 +133,11 @@ export interface ReadResult {
   oldestSeq?: Seq;
   /**
    * Tail reads: lines asked for and returned. Fewer returned without `truncated`: the range holds no
-   * more. `before`: where a tail of what came before ends — pass it whole beside `tail` (`until`, and
-   * `untilOffset` when the lines shown begin inside an event), so the two pages meet with nothing in
-   * neither and following it again pages further back; absent when nothing of the range came before.
+   * more; more: lines of other sources reach back to the line written last (see the module comment).
+   * `before`: where a tail of what came before ends — pass its `until`, and its `untilOffset` when
+   * present (the lines shown begin inside an event), as `until` and `untilOffset` beside the same
+   * `tail`, so the two pages meet with nothing in neither and following it again pages further back;
+   * absent when nothing of the range came before.
    * `cutHead`: the first line returned is missing its head (the byte cap, the input cap or the
    * window's start cut it), and `head` is a head-first read (`since`, `offset`) from where the page
    * before ends, which shows that line from its head (the house's reads of 78c4d6e and of the 38
@@ -166,7 +172,7 @@ export interface SearchResult {
   /** Output the scan spans that is not retained (the first such hole). */
   gap?: GapInfo;
   gaps?: GapInfo[];
-  /** Lines longer than the pattern's match window: matched on their head only (G11). */
+  /** Lines scanned that were longer than the pattern's match window, matched or not: searched on their head only (G11). */
   clippedLines?: number;
 }
 
@@ -175,7 +181,7 @@ export interface ReadOptions {
   /** With `since`: UTF-8 bytes of the output event after `since` already read (a result's `nextOffset`). */
   offset?: number;
   until?: Seq;
-  /** With a text `tail` and `until`: the range ends inside the output event `until`, after this many of its UTF-8 bytes (a tail's `lines.before`). */
+  /** With a text `tail` and `until`: the range ends inside the output event `until`, after this many of its UTF-8 bytes (a tail's `lines.before.untilOffset`). */
   untilOffset?: number;
   tail?: number;
   runId?: string;
@@ -365,7 +371,7 @@ export async function readJournal(src: ReadSource, o: ReadOptions, defaults: { r
   const run = o.runId !== undefined ? (src.run?.(o.runId) ?? journal.runs.get(o.runId)) : undefined;
   const geometry = { cols: run?.cols ?? src.cols, rows: run?.rows ?? src.rows ?? DEFAULT_GEOMETRY.rows };
   if (o.untilOffset !== undefined && (o.tail === undefined || o.until === undefined || o.as === 'events')) {
-    throw err('invalid_argument', 'untilOffset goes with a text tail and until: pass a tail result’s lines.before as it is');
+    throw err('invalid_argument', 'untilOffset goes with a text tail and until: pass a tail result’s lines.before.until and lines.before.untilOffset as until and untilOffset, beside tail');
   }
   if (o.tail !== undefined) return res(await tailRead(src, o, maxBytes, geometry));
   if (o.as === 'events') return res(eventsPage(src, o, maxBytes));
@@ -962,7 +968,6 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   }
   const chunks: ProjectChunk[] = [];
   const sources = new Set<string>();
-  const outs: Output[] = [];
   /** What the text is made of, in order: output, and the notes (a hole, a command); where the lines shown begin is counted over it. */
   const items: TextItem[] = [];
   // The lasting state set before the window (a scroll region, the alternate screen) applies to it.
@@ -972,67 +977,100 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     if (state) chunks.push(chunkOf(firstOut, state));
   }
   const notes = new Set<string>();
+  /** Per source, a control string its last event left open (lineEndsOf); a note ends them all, as the projection's CAN does. */
+  const carries = new Map<string, { open: string }>();
   const note = (e: JournalEvent, text: string) => {
     chunks.push({ note: text });
     notes.add(text);
     items.push({ ev: e });
+    carries.clear();
   };
   for (const e of events) {
     if (isGap(e)) {
       gaps.push(gapOf(e));
       note(e, gapNote(gapOf(e)));
     } else if (isOutput(e)) {
-      outs.push(e);
-      sources.add(sourceKey(e));
+      const key = sourceKey(e);
+      sources.add(key);
       chunks.push(chunkOf(e));
-      items.push({ ev: e, key: sourceKey(e), data: e.data });
+      let carry = carries.get(key);
+      if (!carry) carries.set(key, (carry = { open: '' }));
+      const item: TextItem = { ev: e, key, data: e.data, ends: lineEndsOf(e.data, carry) };
+      if (clipped && e.seq === o.until) item.clipped = true;
+      items.push(item);
     } else if (o.commands && e.type === 'run.start' && e.line !== undefined) {
       note(e, `$ ${e.line}`);
     }
   }
-  const opts: Parameters<typeof project>[1] = { cols: geometry.cols, rows: geometry.rows, maxInputBytes: cap, keep: 'tail', maxLines: n };
-  if (sources.size > 1) opts.label = label;
-  const p = await project(chunks, opts);
-  // maxBytes drops whole lines from the head; a single line over it keeps its end.
-  let bytes = utf8Length(p.text);
-  const cutByBytes = bytes > maxBytes;
-  let drop = 0;
-  const lines = p.text === '' ? [] : p.text.split('\n');
-  while (lines.length - drop > 1 && bytes > maxBytes) bytes -= utf8Length(lines[drop++]!) + 1;
-  const kept = lines.slice(drop);
-  const tail = cutTail(kept.join('\n'), maxBytes);
-  const text = tail.text;
+  const multi = sources.size > 1;
+  const projectTail = async (maxLines: number): Promise<string[]> => {
+    const opts: Parameters<typeof project>[1] = { cols: geometry.cols, rows: geometry.rows, maxInputBytes: cap, keep: 'tail', maxLines };
+    if (multi) opts.label = label;
+    const p = await project(chunks, opts);
+    return p.text === '' ? [] : p.text.split('\n');
+  };
+  // maxBytes drops whole lines from the head, keeping at least the last `keepLines`; a line over it keeps its end.
+  const fit = (lines: string[], keepLines: number) => {
+    let bytes = utf8Length(lines.join('\n'));
+    const cutByBytes = bytes > maxBytes;
+    let drop = 0;
+    while (lines.length - drop > Math.max(1, keepLines) && bytes > maxBytes) bytes -= utf8Length(lines[drop++]!) + 1;
+    const kept = lines.slice(drop);
+    return { kept, drop, cutByBytes, tail: cutTail(kept.join('\n'), maxBytes) };
+  };
+  let all = await projectTail(n);
+  let shown = fit(all, 1);
   // Fewer lines than asked is truncation only when older output was cut (by the walk's bounds, or
   // retention). So is the head of a line asked for that lies past what was projected: past the input
   // cap, or past the start of a window that older output precedes — one line longer than the cap is
   // such a line, and comes back cut with `truncated` set (the house's read of 1cabc6a, #22).
-  const inputBytes = outs.reduce((a, e) => a + utf8Length(e.data), 0);
-  const reach = lastLinesBytes(outs, n);
+  const inputBytes = items.reduce((a, it) => a + (it.data === undefined ? 0 : utf8Length(it.data)), 0);
+  const reach = lastLinesBytes(items, n);
   const headCut = reach > cap || (older && reach >= inputBytes);
-  const truncated = cutByBytes || (kept.length < n && older) || headCut;
-  const counts: NonNullable<ReadResult['lines']> = { requested: n, returned: kept.length };
   let first = end;
-  if (kept.length > 0 && items.length > 0) {
+  let before: Position | undefined;
+  let cut: Cut | undefined;
+  if (shown.kept.length > 0 && items.length > 0) {
     // The header lines naming the sources (§6 rule 6) are no line of output.
     const headers = new Set([...sources].map((k) => (k === 'pty' ? '[terminal]' : `[run ${k.slice(2) || '?'}]`)));
-    const shown = sources.size > 1 ? kept.filter((l) => !headers.has(l)).length : kept.length;
-    const at = startOf(items, shown, sources.size > 1);
-    first = at?.seq ?? items[0]!.ev.seq;
-    // Where a tail of what came before ends: right where the lines shown begin; at the window's start when
-    // they reach back to it, and nothing when that is the range's start (see ReadResult.lines).
-    const from = at?.position ?? { until: endBefore(items[0]!.ev) };
-    if (at || (older && from.until >= rangeStart)) counts.before = from;
-    // The first line returned is cut when the byte cap cut it, or when its head lies past what was
-    // projected (and no line was dropped ahead of it, and it is no note): a line dropped for bytes alone
-    // set `truncated`, and said nothing of which line was cut (the house's read of the 38 commits, #22,
-    // comment 6274935728, item 1). Its head is read head-first from where the page before ends. When the
-    // lines shown reach back to the window's start and older output precedes it, that is where the
-    // window starts, not where the line does: the read goes on from there (`begunBefore`).
-    if (tail.cut || (drop === 0 && headCut && !notes.has(kept[0]!))) {
-      counts.cutHead = true;
-      if (!at && older) counts.begunBefore = true;
-      counts.head = from.untilOffset !== undefined ? { since: from.until - 1, offset: from.untilOffset } : { since: from.until };
+    const outputLines = (kept: string[]) => (multi ? kept.filter((l) => !headers.has(l)).length : kept.length);
+    const display = new Display(items, multi);
+    cut = display.cutBefore(display.shownFrom(outputLines(shown.kept)));
+    if (cut && cmpCut(cut, display.end) >= 0) {
+      // Every line the text leaves out must lie before where the page before ends, and that page must end
+      // before this one does. Unfinished lines shown after a line another source wrote later (rule 6) can
+      // leave the line written last out of the text, and then no such place exists: following `before`
+      // returned this page again, or two pages in turn, and lines between were never reached (the house's
+      // read of the 33 commits, #22, comment 6307350650, item 1). The text then reaches back to the line
+      // written last, more lines than asked for; the byte cap drops none of them whole, and a cut at their head is read on by `head`.
+      const z = display.lastWritten();
+      if (z.lines > all.length) all = await projectTail(Math.max(n, z.lines));
+      shown = fit(all, z.lines);
+      cut = display.cutBefore(z.at);
     }
+    // Where a tail of what came before ends: right where the lines shown begin, so that every line the text
+    // leaves out is whole in it; at the window's start when they reach back to it, and nothing when that is
+    // the range's start (see ReadResult.lines).
+    first = cut ? seqAfter(items, cut) : items[0]!.ev.seq;
+    const from = cut ? positionOf(items, cut) : { until: endBefore(items[0]!.ev) };
+    if (cut || (older && from.until >= rangeStart)) before = from;
+  }
+  const { kept, drop, cutByBytes, tail } = shown;
+  const text = tail.text;
+  const truncated = cutByBytes || (kept.length < n && older) || headCut;
+  const counts: NonNullable<ReadResult['lines']> = { requested: n, returned: kept.length };
+  if (before) counts.before = before;
+  // The first line returned is cut when the byte cap cut it, or when its head lies past what was
+  // projected (and no line was dropped ahead of it, and it is no note): a line dropped for bytes alone
+  // set `truncated`, and said nothing of which line was cut (the house's read of the 38 commits, #22,
+  // comment 6274935728, item 1). Its head is read head-first from where the page before ends. When the
+  // lines shown reach back to the window's start and older output precedes it, that is where the
+  // window starts, not where the line does: the read goes on from there (`begunBefore`).
+  if (kept.length > 0 && items.length > 0 && (tail.cut || (drop === 0 && headCut && !notes.has(kept[0]!)))) {
+    const from = before ?? { until: endBefore(items[0]!.ev) };
+    counts.cutHead = true;
+    if (!cut && older) counts.begunBefore = true;
+    counts.head = from.untilOffset !== undefined ? { since: from.until - 1, offset: from.untilOffset } : { since: from.until };
   }
   const r: Omit<ReadResult, 'session'> = { text, seq: [first, end], nextCursor: end, more: false, truncated, lines: counts };
   if (clipped) {
@@ -1043,31 +1081,253 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   return withGapInfo(r, gaps);
 }
 
-/** UTF-8 bytes from the end of the output back to where its last `n` lines begin (by raw line ends); all of it when it holds no more lines. */
-function lastLinesBytes(outs: Output[], n: number): number {
+/** UTF-8 bytes from the end of the output back to where its last `n` lines begin (by line ends, lineEndsOf); all of it when it holds no more lines. */
+function lastLinesBytes(items: TextItem[], n: number): number {
+  const outs = items.filter((it) => it.data !== undefined);
   let bytes = 0;
   let seen = 0;
   for (let k = outs.length - 1; k >= 0; k--) {
-    const d = outs[k]!.data;
+    const { data, ends } = outs[k]!;
+    let e = ends!.length - 1;
     // The LF that ends the last line begins no line.
-    let i = d.length;
-    if (k === outs.length - 1 && d.endsWith('\n')) i--;
-    for (;;) {
-      const nl = d.lastIndexOf('\n', i - 1);
-      if (nl === -1) break;
-      if (++seen >= n) return bytes + utf8Length(d.slice(nl + 1));
-      i = nl;
-    }
-    bytes += utf8Length(d);
+    if (k === outs.length - 1 && ends![e] === data!.length - 1) e--;
+    for (; e >= 0; e--) if (++seen >= n) return bytes + utf8Length(data!.slice(ends![e]! + 1));
+    bytes += utf8Length(data!);
   }
   return bytes;
 }
 
-/** A piece of a tail's text in journal order: an output event's data (`key` its source), or a note (a hole, a command). */
+/**
+ * A piece of a tail's text in journal order: an output event's data (`key` its source; `ends` the LFs
+ * in it that end lines), or a note (a hole, a command). `clipped`: the data is the event's head only,
+ * the range ending inside it (`untilOffset`).
+ */
 interface TextItem {
   ev: JournalEvent;
   key?: string;
   data?: string;
+  ends?: number[];
+  clipped?: true;
+}
+
+/** The introducers of the control strings (OSC, DCS, SOS, PM, APC), after ESC. */
+const STRING_START = /[\]PX^_]/;
+
+/**
+ * The indices of `data`'s LFs that end lines: every LF outside a control string. A string's payload is
+ * not executed, so a LF in an OSC's title ends no line; counted as one, it put a cut line's head hint
+ * inside the OSC, and the head-first read began with its payload (the house's read of the 33 commits,
+ * #22, comment 6307350650, item 2). Strings end as `sequenceEnd` reads them. `carry` holds what the
+ * source's last event left unfinished (a string's introducer, and an ESC that may begin its
+ * terminator; or a lone ESC), so a string open across events is read whole; it is updated.
+ */
+function lineEndsOf(data: string, carry: { open: string }): number[] {
+  const t = carry.open + data;
+  const skip = carry.open.length;
+  carry.open = '';
+  const ends: number[] = [];
+  let i = 0;
+  let esc = t.indexOf('\x1b');
+  for (;;) {
+    const nl = t.indexOf('\n', i);
+    if (esc !== -1 && (nl === -1 || esc < nl)) {
+      if (esc + 1 === t.length) {
+        carry.open = '\x1b';
+        break;
+      }
+      if (STRING_START.test(t[esc + 1]!)) {
+        const e = sequenceEnd(t, esc);
+        if (e === undefined) {
+          carry.open = t.slice(esc, esc + 2) + (t.length > esc + 2 && t.endsWith('\x1b') ? '\x1b' : '');
+          break;
+        }
+        i = e;
+      } else i = esc + 1;
+      esc = t.indexOf('\x1b', i);
+      continue;
+    }
+    if (nl === -1) break;
+    ends.push(nl - skip);
+    i = nl + 1;
+  }
+  return ends;
+}
+
+/** A point in a tail's items: after item `i`'s first `c` characters of data (a note's `c` is 1: the note itself). */
+interface Cut {
+  i: number;
+  c: number;
+}
+
+const cmpCut = (a: Cut, b: Cut): number => a.i - b.i || a.c - b.c;
+const maxCut = (a: Cut | undefined, b: Cut | undefined): Cut | undefined => (!a ? b : !b ? a : cmpCut(a, b) >= 0 ? a : b);
+
+/** The `until` (and `untilOffset`) of a page that ends at `cut`. */
+function positionOf(items: TextItem[], cut: Cut): Position {
+  const it = items[cut.i]!;
+  if (it.data === undefined || (cut.c >= it.data.length && !it.clipped)) return { until: it.ev.seq };
+  return { until: it.ev.seq, untilOffset: utf8Length(it.data.slice(0, cut.c)) };
+}
+
+/** The first event at or after `cut`. */
+const seqAfter = (items: TextItem[], cut: Cut): Seq => {
+  const it = items[cut.i]!;
+  return it.data !== undefined && cut.c < it.data.length ? it.ev.seq : (items[cut.i + 1]?.ev.seq ?? it.ev.seq);
+};
+
+/** Whether an unfinished line counts as a line of a tail's text: with one source, only with something in it (`blankCounts`: spaces too, as before a note); with several, any. */
+function shows(frag: string, blankCounts: boolean, multi: boolean): boolean {
+  if (multi) return frag.length > 0;
+  const text = stripEscapes(frag).text;
+  return blankCounts ? text.length > 0 : /\S/.test(text);
+}
+
+/** Whether the cursor is at column 0 after the LF at `data[nl]`: a CR before it, past blank lines, says so; anything else printed leaves it further on. `before` is the line's text from earlier events; `start` the column at its start. */
+function col0After(data: string, nl: number, before: string | undefined, start: boolean): boolean {
+  let k = nl - 1;
+  while (k >= 0 && data[k] === '\n') k--;
+  if (k >= 0) return data[k] === '\r';
+  return before ? before.endsWith('\r') : start;
+}
+
+/**
+ * Lines of a tail's text as the projection orders them (§6 rule 6), one unit per line or per event's
+ * lines: `lines` in the text (a header's included), `shown` of them output, and where a page of what came
+ * before must end to hold the unit's first `k` lines whole (`item`'s k-th line end, or `at`; none for a header).
+ */
+interface Unit {
+  lines: number;
+  shown: number;
+  at?: Cut;
+  item?: TextItem;
+  i?: number;
+}
+
+const unitCut = (u: Unit, k: number): Cut | undefined => (u.item ? { i: u.i!, c: u.item.ends![k - 1]! + 1 } : u.at);
+const lastCut = (u: Unit): Cut | undefined => unitCut(u, u.lines);
+
+/**
+ * The display a tail's text is cut from, to find where the lines shown begin (`before`). It follows the
+ * projection (§6 rule 6): an event's lines go out at its last LF, with what its source held before them;
+ * an unfinished line is held until its source ends it, and the held ones follow, in the order they began,
+ * before a note and at the end; each change of source is headed when the page holds several, and starts on
+ * a fresh line, where a LF that left the cursor short of column 0 leaves a blank line (a pty without its
+ * CRs). A line ends at a LF outside a control string (lineEndsOf); a note is a line of its own.
+ *
+ * The lines shown are the text's last ones, and a page of what came before ends after the last byte of
+ * every line the text leaves out, so each of those is whole in it (cutBefore); a shown line begun before
+ * that point shows its head again there. Every doubt counts as a line (a fragment that may show nothing,
+ * trailing blank lines the projection drops, a LF that may have left the cursor at column 0), which only
+ * makes that page repeat a line, never skip one. A full-screen frame, which makes lines of no LF (rule 5),
+ * is the one exception.
+ */
+class Display {
+  readonly units: Unit[] = [];
+  /** `prefix[u]`: the greatest cut of units before `u`. */
+  private readonly prefix: Array<Cut | undefined> = [undefined];
+  /** The end of the items: the last byte written. */
+  readonly end: Cut;
+
+  constructor(items: TextItem[], multi: boolean) {
+    const units = this.units;
+    const held = new Map<string, { data: string; at: Cut }>();
+    let last: string | undefined;
+    let lineEnded = false;
+    let col0 = true;
+    let lf: Cut | undefined;
+    /** The last segment ended inside a control string, short of a line end (a row its source may go on with). */
+    let openRow: Cut | undefined;
+    const segment = (key: string, source: boolean) => {
+      const row = openRow;
+      openRow = undefined;
+      if (key === last) return;
+      // A row left open is a line once another segment starts on a fresh line after it (a doubt: counted).
+      if (row) units.push({ lines: 1, shown: 1, at: row });
+      else if (last !== undefined && lineEnded && !col0) units.push({ lines: 1, shown: 1, at: lf! });
+      if (multi && source) units.push({ lines: 1, shown: 0 });
+      last = key;
+    };
+    const flush = (blankCounts: boolean) => {
+      for (const [key, h] of held) {
+        segment(key, true);
+        units.push({ lines: 1, shown: shows(h.data, blankCounts, multi) ? 1 : 0, at: h.at });
+        lineEnded = false;
+        col0 = h.data.endsWith('\r');
+      }
+      held.clear();
+    };
+    items.forEach((it, i) => {
+      if (it.data === undefined) {
+        flush(true);
+        segment(`n:${i}`, false);
+        units.push({ lines: 1, shown: 1, at: { i, c: 1 } });
+        lineEnded = col0 = true;
+        lf = { i, c: 1 };
+        return;
+      }
+      const key = it.key!;
+      const h = held.get(key);
+      const nl = it.data.lastIndexOf('\n');
+      if (nl === -1) {
+        if (h) {
+          h.data += it.data;
+          h.at = { i, c: it.data.length };
+        } else held.set(key, { data: it.data, at: { i, c: it.data.length } });
+        return;
+      }
+      const start = last === key ? col0 : true;
+      segment(key, true);
+      const ends = it.ends!;
+      if (ends.length) units.push({ lines: ends.length, shown: ends.length, item: it, i });
+      lineEnded = ends[ends.length - 1] === nl;
+      if (lineEnded) {
+        lf = { i, c: nl + 1 };
+        // A pipe's LF is a CRLF (rule 6).
+        col0 = key !== 'pty' || col0After(it.data, nl, h?.data, start);
+      } else {
+        // The event's last LF lies in a control string: what went out up to it is a row its line has not
+        // ended, which its source goes on with, or another segment starts after on a fresh line.
+        openRow = { i, c: nl + 1 };
+      }
+      held.delete(key);
+      if (nl + 1 < it.data.length) held.set(key, { data: it.data.slice(nl + 1), at: { i, c: it.data.length } });
+    });
+    flush(false);
+    if (openRow) units.push({ lines: 1, shown: 1, at: openRow });
+    for (const u of units) this.prefix.push(maxCut(this.prefix[this.prefix.length - 1], lastCut(u)));
+    const lastItem = items[items.length - 1]!;
+    this.end = { i: items.length - 1, c: lastItem.data?.length ?? 1 };
+  }
+
+  /** Where the last `count` lines of output begin: unit `u`, past its first `keep` lines. */
+  shownFrom(count: number): { u: number; keep: number } {
+    let need = count;
+    if (need <= 0) return { u: this.units.length, keep: 0 };
+    for (let u = this.units.length - 1; u >= 0; u--) {
+      const x = this.units[u]!;
+      if (x.shown >= need) return { u, keep: x.lines - need };
+      need -= x.shown;
+    }
+    return { u: 0, keep: 0 };
+  }
+
+  /** Where a page holding every line before `at` whole ends; undefined when none comes before. */
+  cutBefore(at: { u: number; keep: number }): Cut | undefined {
+    return maxCut(this.prefix[at.u], at.keep > 0 ? unitCut(this.units[at.u]!, at.keep) : undefined);
+  }
+
+  /** Where the line written last begins in the display, and the text's lines from there to the end. */
+  lastWritten(): { at: { u: number; keep: number }; lines: number } {
+    let u = this.units.findIndex((x) => {
+      const c = lastCut(x);
+      return c !== undefined && cmpCut(c, this.end) === 0;
+    });
+    if (u === -1) u = this.units.length - 1;
+    const keep = this.units[u]!.lines - 1;
+    let lines = 1;
+    for (let v = u + 1; v < this.units.length; v++) lines += this.units[v]!.lines;
+    return { at: { u, keep }, lines };
+  }
 }
 
 /**
@@ -1080,65 +1340,6 @@ const endBefore = (e: JournalEvent): Seq => (isGap(e) && e.to >= e.seq - 1 ? e.f
 interface Position {
   until: Seq;
   untilOffset?: number;
-}
-
-/**
- * Where the last `k` lines of a tail's text begin: the position right after the last line not shown
- * ends (where a tail of what came before them ends), and the first event at it; undefined when the
- * lines reach back to the window's start. Exact, so that following `before` again and again pages
- * back through one large event instead of returning the same page (the house's read of the 38
- * commits, #22, comment 6274935728, item 2).
- *
- * Lines are counted by their ends, in the order the projection gives them (§6 rule 6): a line ends at
- * its LF; a note (a hole, a command) is a line of its own, and first ends the lines it finds unfinished;
- * the lines still unfinished at the end come last. With more than one source, a line another source's
- * lines interleave is shown whole after them (held until its LF), so its start can lie before the
- * position; a page of what came before then ends with that part again, and nothing falls in neither
- * page. Every doubt counts toward the end (a fragment that may show nothing counted as a line, trailing
- * blank lines the projection drops), which only makes the page before repeat a line, never skip one.
- * A full-screen frame, which makes lines of no LF (rule 5), is the one exception.
- */
-function startOf(items: TextItem[], k: number, multi: boolean): { position: Position; seq: Seq } | undefined {
-  // With one source, a fragment shows only with something in it; with several, any fragment is counted.
-  const shows = (frag: string, blankCounts: boolean) => (multi ? frag.length > 0 : blankCounts ? stripEscapes(frag).text.length > 0 : /\S/.test(stripEscapes(frag).text));
-  // A forward pass: what each note ends, and what is left unfinished at the end, by source.
-  const open = new Map<string, string>();
-  const endedAt = new Map<number, number>();
-  items.forEach((it, i) => {
-    if (it.data === undefined) {
-      endedAt.set(i, [...open.values()].filter((f) => shows(f, true)).length);
-      open.clear();
-      return;
-    }
-    const nl = it.data.lastIndexOf('\n');
-    open.set(it.key!, nl === -1 ? (open.get(it.key!) ?? '') + it.data : it.data.slice(nl + 1));
-  });
-  // The shown lines still to pass, from the end, once the unfinished ones (the last lines) are counted.
-  let left = Math.max(0, k - [...open.values()].filter((f) => shows(f, false)).length);
-  const after = (i: number): Seq => items[i + 1]?.ev.seq ?? items[i]!.ev.seq;
-  for (let i = items.length - 1; i >= 0; i--) {
-    const { ev, data } = items[i]!;
-    if (data === undefined) {
-      // The note's own line ends last, after the fragments it ended.
-      if (left === 0) return { position: { until: ev.seq }, seq: after(i) };
-      left--;
-      const ended = endedAt.get(i)!;
-      if (left < ended) return { position: { until: endBefore(ev) }, seq: ev.seq };
-      left -= ended;
-      continue;
-    }
-    for (let j = data.length; ; ) {
-      const nl = data.lastIndexOf('\n', j - 1);
-      if (nl === -1) break;
-      if (left === 0) {
-        if (nl + 1 === data.length) return { position: { until: ev.seq }, seq: after(i) };
-        return { position: { until: ev.seq, untilOffset: utf8Length(data.slice(0, nl + 1)) }, seq: ev.seq };
-      }
-      left--;
-      j = nl;
-    }
-  }
-  return undefined;
 }
 
 // ───────────── search ─────────────

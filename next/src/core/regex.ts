@@ -162,14 +162,15 @@ export function testBounded(re: RegExp, text: string): { matched: boolean; clipp
 }
 
 /**
- * The one wording of a `clipped` hit: a line longer than the pattern's match window, matched on its
- * head only. Without `n`, the one line a watch, a service's probe or wait_for matched; with it, the
- * count of such lines a search scanned. Search, wait_for and the watch and service notices said it
- * three ways (a reviewer's read of the fixes for #22).
+ * The one wording of a `clipped` line: longer than the pattern's match window, so only its head was
+ * searched. Without `n`, the one line a watch, a service's probe or wait_for matched on its head; with
+ * it, the count of such lines a search scanned, matched or not, so they are said to be searched, not
+ * matched (the house's read of the 33 commits, #22, comment 6307350650, item 4). Search, wait_for and
+ * the watch and service notices said it three ways (a reviewer's read of the fixes for #22).
  */
 export function headOnlyText(n?: number): string {
   if (n === undefined) return 'the line is longer than the match window: matched on its head only';
-  return `${n} line${n === 1 ? '' : 's'} longer than the match window, matched on ${n === 1 ? 'its' : 'their'} head only`;
+  return `${n} line${n === 1 ? '' : 's'} longer than the match window, searched on ${n === 1 ? 'its' : 'their'} head only`;
 }
 
 /** The fallback: refuse back-references and the classic exponential shapes. */

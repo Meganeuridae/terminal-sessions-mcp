@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readJournal, searchJournal, type ReadResult } from '../src/api/reader.js';
+import { readJournal, searchJournal, type ReadOptions, type ReadResult, type ReadSource } from '../src/api/reader.js';
 import { Journal } from '../src/core/journal.js';
 import { lineBytes, MemoryStore } from '../src/core/stores.js';
 import { project } from '../src/core/transcript.js';
@@ -845,9 +845,11 @@ test('the 38 commits 1: a line the byte cap cut is said to be cut, and the reads
 });
 
 test('the 38 commits 2: following the earlier-page hint pages back through one event of 500 lines, new lines every time', async () => {
+  // Lines of two-, three- and four-byte characters, so an offset counted in UTF-16 units instead of
+  // UTF-8 bytes lands elsewhere (the house's read of the 33 commits, #22, comment 6307350650, item 9).
   const src = source();
   startRun(src.journal, 'r1');
-  const body = numbered(500, '\n');
+  const body = Array.from({ length: 500 }, (_, i) => `L${String(i + 1).padStart(6, '0')} Ł€😀 ünïcödé\n`).join('');
   const seq = out(src.journal, body, 'stdout', 'r1');
   endRun(src.journal, 'r1');
   const want = body.replace(/\n$/, '').split('\n');
@@ -863,6 +865,8 @@ test('the 38 commits 2: following the earlier-page hint pages back through one e
       assert.deepEqual(r.text!.split('\n'), want.slice(450 - 50 * i, 500 - 50 * i), `page ${i} back, ${JSON.stringify(o)}`);
       assert.equal(r.nextCursor, seq - 1, 'reading on continues inside the event');
       assert.ok(r.nextOffset! > 0);
+      const on = await readJournal(src, { ...o, since: r.nextCursor, offset: r.nextOffset! }, { resultBytes: 16384 });
+      assert.equal(on.text!.split('\n')[0], want[500 - 50 * i], `reading on starts with the line after page ${i} back`);
       pages.unshift(r.text!);
     }
     assert.equal(r.lines!.before, undefined, 'the first line of the event begins the range: nothing before it');
@@ -921,7 +925,8 @@ test('untilOffset goes with a text tail and until, and is refused anywhere else'
   const src = source();
   out(src.journal, 'one\r\ntwo\r\n');
   for (const o of [{ untilOffset: 3 }, { untilOffset: 3, until: 1 }, { untilOffset: 3, tail: 2 }, { untilOffset: 3, tail: 2, until: 1, as: 'events' as const }]) {
-    await assert.rejects(readJournal(src, o, { resultBytes: 16384 }), /untilOffset goes with a text tail and until/, JSON.stringify(o));
+    // It names the two numbers to pass, not lines.before itself, which read takes no argument for (the house's read of the 33 commits, #22, comment 6307350650, item 3).
+    await assert.rejects(readJournal(src, o, { resultBytes: 16384 }), /untilOffset goes with a text tail and until: pass a tail result’s lines\.before\.until and lines\.before\.untilOffset as until and untilOffset, beside tail$/, JSON.stringify(o));
   }
   const r = await readJournal(src, { tail: 2, until: 1, untilOffset: 5 }, { resultBytes: 16384 });
   assert.equal(r.text, 'one');
@@ -955,4 +960,140 @@ test('a first line begun before the tail’s window is marked so, and its head-f
   const c = await readJournal(inside, { tail: 1, maxBytes: 1024 }, { resultBytes: 16384 });
   assert.equal(c.lines!.cutHead, true);
   assert.equal(c.lines!.begunBefore, undefined, 'the line begins inside what was read');
+});
+
+// ───────────── the house's read of the 33 commits (#22, comment 6307350650) ─────────────
+
+/**
+ * Follow a tail's `lines.before` until it is absent, as an agent pages back: every page, each read with the
+ * same tail. Each page of what came before must end before the range it was read from, or following it
+ * comes back to a page already read.
+ */
+async function pagesBack(src: ReadSource, o: ReadOptions, maxSteps = 1000): Promise<ReadResult[]> {
+  const pages: ReadResult[] = [];
+  let range: { until: number; untilOffset?: number } | undefined;
+  for (let step = 0; step < maxSteps; step++) {
+    const r = await readJournal(src, { ...o, ...(range ?? {}) }, { resultBytes: 16384 });
+    pages.push(r);
+    const b = r.lines?.before;
+    if (!b) return pages;
+    const end = range ?? { until: src.journal.lastSeq };
+    const earlier = b.until < end.until || (b.until === end.until && (b.untilOffset ?? Infinity) < (end.untilOffset ?? Infinity));
+    assert.ok(earlier, `the page before ends before ${JSON.stringify(end)}: ${JSON.stringify(b)}, after ${JSON.stringify(pages.map((p) => p.text))}`);
+    range = b;
+  }
+  assert.fail(`following lines.before ends: ${JSON.stringify(pages.slice(-4).map((p) => p.text))}`);
+}
+
+test('the 33 commits 1: two sources that each end in an unfinished line page back through every line, and no page comes back', async () => {
+  // The house's three layouts, with the pty's lines ended by bare LFs as they wrote them and by CRLF as a
+  // tty writes them: following lines.before from tail 1 or 2 went back and forth between the two unfinished
+  // lines, and tail 3 skipped lines (an unfinished line is shown after a line another source wrote later;
+  // a bare LF leaves a blank line where the source changes).
+  for (const eol of ['\n', '\r\n']) {
+    const layouts: Record<string, { build: (j: Journal) => void; lines: string[] }> = {
+      'the pty first': {
+        build: (j) => {
+          out(j, `p1${eol}p2${eol}PTY-UNFIN`);
+          out(j, 'r1 line\nRUN-UNFIN', 'stdout', 'r1');
+        },
+        lines: ['p1', 'p2', 'r1 line', 'PTY-UNFIN', 'RUN-UNFIN'],
+      },
+      'the Run first': {
+        build: (j) => {
+          out(j, 'r1 line\nRUN-UNFIN', 'stdout', 'r1');
+          out(j, `p1${eol}p2${eol}PTY-UNFIN`);
+        },
+        lines: ['r1 line', 'RUN-UNFIN', 'p1', 'p2', 'PTY-UNFIN'],
+      },
+      interleaved: {
+        build: (j) => {
+          out(j, 'PTY-A-head');
+          out(j, 'r1 line\nRUN-UNFIN', 'stdout', 'r1');
+          out(j, `-PTY-A-tail${eol}p1${eol}PTY-UNFIN`);
+        },
+        lines: ['PTY-A-head-PTY-A-tail', 'r1 line', 'p1', 'PTY-UNFIN', 'RUN-UNFIN'],
+      },
+    };
+    for (const [name, { build, lines }] of Object.entries(layouts)) {
+      for (const tail of [1, 2, 3, 4]) {
+        const src = source();
+        startRun(src.journal, 'r1');
+        build(src.journal);
+        const pages = await pagesBack(src, { tail });
+        const text = pages.map((p) => p.text).join('\n');
+        for (const l of lines) assert.ok(text.includes(l), `${name}, eol ${JSON.stringify(eol)}, tail ${tail}: ${l} in ${JSON.stringify(pages.map((p) => p.text))}`);
+      }
+    }
+  }
+  // The text reaches back to the line written last: tail 1 of the pty's unfinished line and the Run's later line.
+  const src = source();
+  startRun(src.journal, 'r1');
+  out(src.journal, 'p1\r\np2\r\nPTY-UNFIN');
+  out(src.journal, 'r1 line\n', 'stdout', 'r1');
+  const r = await readJournal(src, { tail: 1 }, { resultBytes: 16384 });
+  assert.equal(r.text, 'r1 line\n[terminal]\nPTY-UNFIN');
+  assert.deepEqual(r.lines, { requested: 1, returned: 3, before: { until: 3, untilOffset: 8 } });
+  const before = await readJournal(src, { tail: 2, ...r.lines!.before! }, { resultBytes: 16384 });
+  assert.equal(before.text, 'p1\np2');
+});
+
+test('the 33 commits 1 (property): the pty and two Runs in random events, with unfinished lines, holes, colours and titles: paging back by lines.before reaches every line', async () => {
+  let seed = 0x6307;
+  const rnd = () => {
+    seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+    return seed / 2 ** 32;
+  };
+  for (let round = 0; round < 60; round++) {
+    const src = source();
+    const j = src.journal;
+    startRun(j, 'r1');
+    startRun(j, 'r2');
+    const tokens: string[] = [];
+    const events = 2 + Math.floor(rnd() * 12);
+    for (let e = 0; e < events; e++) {
+      const x = rnd();
+      if (x < 0.08) {
+        j.append({ type: 'gap', from: j.lastSeq + 1, to: j.lastSeq + 1, reason: 'torn-write' });
+        continue;
+      }
+      const runId = x < 0.5 ? undefined : x < 0.75 ? 'r1' : 'r2';
+      const ends = Math.floor(rnd() * 4);
+      let data = '';
+      for (let l = 0; l <= ends; l++) {
+        if (l < ends || rnd() < 0.6) {
+          const t = `<t${tokens.length}>`;
+          tokens.push(t);
+          data += rnd() < 0.2 ? `\x1b[1m${t}\x1b[0m` : t;
+        }
+        if (l === ends) break;
+        // A title whose payload holds a line end, which ends no line.
+        if (rnd() < 0.15) data += '\x1b]0;a\r\nb\x07';
+        data += runId === undefined && rnd() < 0.3 ? '\n' : runId === undefined ? '\r\n' : '\n';
+      }
+      if (data) out(j, data, runId === undefined ? 'pty' : 'stdout', runId);
+    }
+    for (const tail of [1, 2, 3, 5]) {
+      const pages = await pagesBack(src, { tail });
+      const text = pages.map((p) => p.text).join('\n');
+      for (const t of tokens) assert.ok(text.includes(t), `round ${round}, tail ${tail}: ${t} in ${JSON.stringify(pages.map((p) => p.text))}`);
+    }
+  }
+});
+
+test('the 33 commits 2: a LF inside an OSC ends no line: a cut line’s head is read from its head, and the page before ends before it', async () => {
+  // The house's case: the OSC's payload holds a CRLF, so the line's head hint pointed inside the OSC, and the
+  // head-first read began `leBBBB…`: the payload shown, the line's head missing. In one event and split across two.
+  const line = `AAA\x1b]0;tit\r\nle\x07${'B'.repeat(20_000)}\r\n`;
+  for (const parts of [[`line1\r\n${line}`], [`line1\r\nAAA\x1b]0;tit\r\n`, `le\x07${'B'.repeat(20_000)}\r\n`]]) {
+    const src = source();
+    for (const p of parts) out(src.journal, p);
+    const r = await readJournal(src, { tail: 1, maxBytes: 16384 }, { resultBytes: 16384 });
+    assert.equal(r.lines!.cutHead, true, JSON.stringify(r.lines));
+    assert.deepEqual(r.lines!.before, { until: 1, untilOffset: 7 }, `right after line1: ${parts.length} events`);
+    const h = await readJournal(src, { ...r.lines!.head! }, { resultBytes: 16384 });
+    assert.ok(h.text!.startsWith('AAABBB'), `from its head, no payload: ${JSON.stringify(h.text!.slice(0, 20))}`);
+    const b = await readJournal(src, { tail: 1, ...r.lines!.before! }, { resultBytes: 16384 });
+    assert.equal(b.text, 'line1');
+  }
 });
