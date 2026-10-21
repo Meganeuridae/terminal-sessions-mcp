@@ -54,6 +54,9 @@ export interface FakeShellOptions {
 }
 
 export const OSC = (s: string) => `\x1b]${s}\x07`;
+/** The terminal's mode under a line editor at its prompt (bash's readline, zsh's zle, fish), and under a program or a `read` waiting for a line. */
+export const EDITOR_MODE = { canonical: false, echo: false };
+export const COOKED_MODE = { canonical: true, echo: true };
 export const tick = (ms = 5) => new Promise<void>((r) => setTimeout(r, ms));
 export const ofType = <T extends JournalEvent['type']>(evs: JournalEvent[], t: T) => evs.filter((e): e is Extract<JournalEvent, { type: T }> => e.type === t);
 /** The error code `fn` throws with, or 'no error'. */
@@ -126,6 +129,10 @@ export class FakeShell {
   }
 
   private prompt(): void {
+    // At its prompt the line editor holds the terminal (a shell without marks here stands for dash, which
+    // has none), and nothing else reads it: what the cancel's checks read before typing its empty line.
+    this.pty.mode = this.marks === 'none' ? COOKED_MODE : EDITOR_MODE;
+    this.pty.reader = false;
     if (this.marks === 'rich') this.pty.emit(this.mark(`633;P;Cwd=${encodeVscodeValue(this.cwd)}`) + this.mark('133;A') + '$ ' + this.mark('133;B'));
     else this.pty.emit('$ ');
   }
@@ -296,6 +303,8 @@ export class FakeShell {
     }
     if (startMark) this.pty.emit(startMark);
     this.executed.push(line);
+    // The editor gave the terminal back to cooked mode for the command, until the next prompt.
+    this.pty.mode = COOKED_MODE;
     const h = this.handlers.find((x) => (typeof x.match === 'string' ? x.match === line : x.match.test(line)));
     const result: FakeCommandResult = h ? h.handler(line, this) : line.trim() === '' ? { exit: 0 } : { output: `fake: ${line.split(' ')[0]}: command not found\r\n`, exit: 127 };
     if (result.noPreexec) {
@@ -324,6 +333,7 @@ export class FakeShell {
     this.running = { finish };
     if (result.hang) {
       this.pty.foregroundPgid = this.jobPgid;
+      this.pty.reader = true; // the job, in the foreground, can read the terminal
       this.hung = finish;
       if (result.output) this.pty.emit(result.output);
       return;

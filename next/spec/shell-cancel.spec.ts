@@ -94,7 +94,7 @@ for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
       assert.ok(a.admitted);
       const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 200 });
       assert.deepEqual([c.state, c.escalation], ['cancelled', undefined], JSON.stringify(c));
-      assert.deepEqual(x.session.shellAvailable(), { ok: false, reason: 'prompt-pending' }, 'nothing says the shell acted on the ^C');
+      assert.deepEqual(x.session.shellAvailable(), { ok: false, reason: 'cancel-unanswered' }, 'nothing says the shell acted on the ^C');
       const b = x.session.admit({ target: 'shell', line: 'echo second-$((40+2))', principal: AGENT, queue: true });
       assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
       process.kill(pid, 'SIGCONT');
@@ -118,7 +118,9 @@ test('/bin/bash: a cancel whose two ^C a DEBUG trap of the user’s ignores, bef
   // is a subshell that ignores ^C, for daemon lines only (the house's second way to reach item 1). The
   // trap leaves a file when it is entered, and the cancel waits for it: sent before the shell read the
   // line, the ^C would discard it unread and pass on the ordinary path. The trap's 3 s outlast the
-  // cancel's three 200 ms waits, so its two ^C draw no mark.
+  // cancel's three 200 ms waits, so its two ^C draw no mark. The trap's job holds the terminal, so no
+  // empty line is typed into it (the house's review of the 40 commits through f3750e4, #22 comment
+  // 6310921374, question 1): the prompt that ends the late line is the shell's answer.
   const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': `trap 'case $BASH_COMMAND in *tsm-cmd*) : > "$HOME/in-trap"; ( trap "" INT; sleep 3 ) ;; esac' DEBUG\n` } });
   const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
   try {
@@ -128,7 +130,8 @@ test('/bin/bash: a cancel whose two ^C a DEBUG trap of the user’s ignores, bef
     await until(() => fs.existsSync(path.join(x.home, 'in-trap')), 5000, 'the shell to enter the trap');
     const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 200 });
     assert.deepEqual([c.state, c.escalation], ['cancelled', undefined], JSON.stringify(c));
-    assert.deepEqual(c.steps, ['^C', '^C', 'the line was discarded before it started', 'an empty line, whose prompt says the shell is back'], 'the two ^C drew no mark');
+    assert.deepEqual(c.steps.slice(0, 3), ['^C', '^C', 'the line was discarded before it started'], 'the two ^C drew no mark');
+    assert.match(c.steps[3] ?? '', /^no empty line typed, since /, JSON.stringify(c));
     const b = x.session.admit({ target: 'shell', line: 'echo second-$((40+2))', principal: AGENT, queue: true });
     assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
     const r = await x.session.awaitRun(b.run.runId, 10_000);
@@ -166,6 +169,79 @@ test('/bin/bash: a stopped shell whose empty line a third ^C flushed is back onc
     } catch {
       // gone
     }
+    await x.close();
+  }
+});
+
+test('/bin/zsh: a stopped shell whose empty line a third ^C flushed waits as cancel-unanswered, and the Enter its advice asks for brings it back', { skip: !hasShell('/bin/zsh') }, async () => {
+  // zsh 5.9 prints its prompt for a ^C that flushed its input only once the next byte arrives, so no
+  // prompt comes by itself: the shell stays busy, saying what to do, until a person's key draws one.
+  const x = await realSession('/bin/zsh', { login: false });
+  const pid = x.session.info().pid;
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'the shell is ready');
+    process.kill(pid, 'SIGSTOP');
+    const a = x.session.admit({ target: 'shell', line: 'echo first-ran', principal: AGENT });
+    assert.ok(a.admitted);
+    const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 200 });
+    assert.deepEqual([c.state, c.steps.at(-1)], ['cancelled', 'an empty line, whose prompt says the shell is back'], JSON.stringify(c));
+    x.session.input('\x03', { principal: AGENT });
+    const b = x.session.admit({ target: 'shell', line: 'echo second-$((40+2))', principal: AGENT, queue: true });
+    assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+    process.kill(pid, 'SIGCONT');
+    assert.deepEqual(x.session.shellAvailable(), { ok: false, reason: 'cancel-unanswered' });
+    x.session.input('\n', { principal: AGENT });
+    const r = await x.session.awaitRun(b.run.runId, 8000);
+    assert.deepEqual([r.state, r.exit, r.reason], ['exited', 0, undefined], JSON.stringify(r));
+    assert.equal((await x.session.runTranscript(r.runId)).text, 'second-42');
+  } finally {
+    try {
+      process.kill(pid, 'SIGCONT');
+    } catch {
+      // gone
+    }
+    await x.close();
+  }
+});
+
+test('/bin/bash: a DEBUG trap of the user’s that ignores ^C and reads the terminal gets no empty line; the shell waits as cancel-unanswered until a person answers the trap', { skip: !hasShell('/bin/bash') }, async () => {
+  // For the first daemon line only, the trap ignores ^C and reads a line with the shell's own read, in
+  // canonical mode. Typed into it, the empty line was the trap's, and the shell then sat at its prompt
+  // busy for good.
+  const trap = `__k1_trap() {
+  case $BASH_COMMAND in
+    ". '"*/tsm-cmd-*) ;;
+    *) return 0 ;;
+  esac
+  [ -e "$HOME/in-trap" ] && return 0
+  : > "$HOME/in-trap"
+  trap '' INT
+  IFS= read -r __k1
+  printf 'trap-read:[%s]\\n' "$__k1"
+  trap - INT
+}
+trap __k1_trap DEBUG
+`;
+  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': trap } });
+  const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'the shell is ready');
+    const a = x.session.admit({ target: 'shell', line: 'echo first-$((6*7))', principal: AGENT });
+    assert.ok(a.admitted);
+    await until(() => fs.existsSync(path.join(x.home, 'in-trap')), 5000, 'the shell to enter the trap');
+    const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 200 });
+    assert.deepEqual([c.state, c.escalation], ['cancelled', undefined], JSON.stringify(c));
+    assert.match(c.steps.at(-1) ?? '', /^no empty line typed, since its terminal is in canonical mode/, JSON.stringify(c));
+    assert.deepEqual(x.session.shellAvailable(), { ok: false, reason: 'cancel-unanswered' });
+    const b = x.session.admit({ target: 'shell', line: 'echo second-$((40+2))', principal: AGENT, queue: true });
+    assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+    x.session.input('yes\n', { principal: AGENT });
+    const r = await x.session.awaitRun(b.run.runId, 8000);
+    assert.deepEqual([r.state, r.exit, r.reason], ['exited', 0, undefined], JSON.stringify(r));
+    assert.equal((await x.session.runTranscript(r.runId)).text, 'second-42');
+    assert.match(output(), /trap-read:\[yes\]/, 'the trap read the person’s answer, not a daemon line');
+    assert.doesNotMatch(output(), /first-42/, 'the cancelled line’s command never ran');
+  } finally {
     await x.close();
   }
 });

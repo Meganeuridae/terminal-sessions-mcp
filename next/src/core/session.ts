@@ -120,7 +120,7 @@ export interface SeatOptions {
   asOwner?: boolean;
 }
 
-export type BusyReason = 'running' | 'prompt-pending' | 'human-editing' | 'human-submitted' | 'starting' | 'shell-unavailable' | 'exited' | 'declared-shell-ended';
+export type BusyReason = 'running' | 'prompt-pending' | 'cancel-unanswered' | 'human-editing' | 'human-submitted' | 'starting' | 'shell-unavailable' | 'exited' | 'declared-shell-ended';
 export type AdmitResult = { admitted: true; run: RunInfo } | { admitted: false; busy: RunInfo | null; reason: BusyReason };
 
 export interface CancelResult {
@@ -214,6 +214,12 @@ const MAX_ORPHAN_LINES = 32;
  * file (probeLine), and a Run written behind it waits for it.
  */
 const PROMPT_PROBE_GRACE_MS = 300;
+/**
+ * How often, and how far apart, the terminal's mode is read before a cancel types its empty line: one
+ * read just after the ^C varied in the same case, raw once and canonical once (question 1).
+ */
+const EDITOR_SETTLE_READS = 4;
+const EDITOR_SETTLE_STEP_MS = 50;
 /** What a note says when the reinit gate after `exec bash` gives up: the recovery that loads the integration with the session's key. */
 const REINIT_RECOVERY = 'Shell commands are unavailable until it loads: once the shell shows its own prompt, send ` . "$TSM_BASH_RC" reinit typed` with input to load it, or open a new session';
 const publicRun = (r: RunRecord): RunInfo => {
@@ -550,12 +556,13 @@ export class Session {
   /** Daemon lines whose Run ended before its C: a later C with that line is their late execution. */
   private readonly orphanLines = new Map<string, RunRecord>();
   /**
-   * The empty line a cancel typed to learn when the shell is back (askForPrompt): its file, and whether its
-   * pre-execution mark came (the mark's line holds the file's quoted path). The shell is busy until the
-   * prompt after the mark; a prompt not followed by the mark within PROMPT_PROBE_GRACE_MS
-   * (promptProbeTimer) frees it too, the line lost.
+   * After a cancel whose two ^C drew no mark (askForPrompt): the empty line it typed to learn when the
+   * shell is back — its file, or none when nothing was typed — whether that line's pre-execution mark
+   * came (the mark's line holds the file's quoted path), and whether a prompt came since. The shell is
+   * busy until the prompt after the mark, or with nothing typed until its next prompt; a prompt that is
+   * not followed by the mark within PROMPT_PROBE_GRACE_MS (promptProbeTimer) frees it too, the line lost.
    */
-  private promptProbe: { path: string; started: boolean } | undefined;
+  private promptProbe: { path: string | undefined; started: boolean; prompted: boolean } | undefined;
   private promptProbeTimer: NodeJS.Timeout | undefined;
   /**
    * The last empty line's quoted file and its place in the write order: its start after the session gave
@@ -1117,15 +1124,19 @@ export class Session {
       this.discardPending(pending, pending.cancelRequested ? { state: 'cancelled', reason: 'cancelled-before-start' } : { state: 'lost', reason: 'no-pre-execution-mark' });
     }
     if (this.currentShellRun && isTerminal(this.currentShellRun.state)) this.currentShellRun = undefined;
-    // The empty line a cancel typed (askForPrompt): the prompt after its pre-execution mark says the
-    // shell is back. A prompt before that mark (the ^C's own, or one that ends a line read before the ^C)
-    // is followed at once by the line, which the editor reads as soon as the prompt is drawn; without the
-    // mark within the grace the line was lost, and the shell is back at this prompt (onPromptProbeLost).
-    // Counting prompts kept the shell busy for good when no other came (the house's review of the 40
-    // commits through f3750e4, #22 comment 6310921374, question 1).
+    // After a cancel whose ^C drew no mark (askForPrompt): with nothing typed, this prompt is the shell's
+    // answer; with the empty line typed, the prompt after its pre-execution mark is. A prompt before that
+    // mark (the ^C's own, or one that ends a line read before the ^C) is followed at once by the line, which
+    // the editor reads as soon as the prompt is drawn; without the mark within the grace the line was lost,
+    // and the shell is back at this prompt (onPromptProbeLost). Counting prompts kept the shell busy for good
+    // when no other came (the house's review of the 40 commits through f3750e4, #22 comment 6310921374,
+    // question 1).
     const probe = this.promptProbe;
-    if (probe?.started) this.dropPromptProbe();
-    else if (probe) this.armPromptProbeGrace();
+    if (probe && (probe.started || probe.path === undefined)) this.dropPromptProbe();
+    else if (probe) {
+      probe.prompted = true;
+      this.armPromptProbeGrace();
+    }
     if (this.shellState !== 'exited') this.shellState = this.currentShellRun || this.pendingShellRun || this.promptProbe ? 'busy' : 'idle';
     if (!this.ready && !this.readyTimer) {
       // The prompt is being printed; a shell is only truly at its line editor once it
@@ -1663,8 +1674,9 @@ export class Session {
     if (this.shellState === 'unavailable') return { ok: false, reason: 'shell-unavailable' };
     if (this.shellState === 'starting') return { ok: false, reason: 'starting' };
     if (this.pendingShellRun || (this.currentShellRun && !isTerminal(this.currentShellRun.state))) return { ok: false, reason: 'running' };
-    // The last Run ended but the prompt that confirms the shell is back has not arrived.
-    if (this.shellState === 'busy') return { ok: false, reason: 'prompt-pending' };
+    // The last Run ended but the prompt that confirms the shell is back has not arrived — after a cancel
+    // whose ^C drew no mark, none at all yet, which may never come by itself (askForPrompt).
+    if (this.shellState === 'busy') return { ok: false, reason: this.promptProbe && !this.promptProbe.started && !this.promptProbe.prompted ? 'cancel-unanswered' : 'prompt-pending' };
     // The prompt is here, and keys typed during the last Run may be in its editor (see onPromptStart): until
     // the prompt's end mark and the grace after it, nothing says whether the editor shows them.
     if (this.typeaheadWatch !== undefined) return { ok: false, reason: 'prompt-pending' };
@@ -1797,14 +1809,15 @@ export class Session {
 
   /**
    * Admit, waiting out the window between a Run's end mark and the next prompt
-   * (`prompt-pending`) or the shell's startup, up to `settleMs`. A Run that is
-   * actually running still answers `busy` at once.
+   * (`prompt-pending`, or `cancel-unanswered` after a cancel's ^C drew no mark) or the
+   * shell's startup, up to `settleMs`. A Run that is actually running still answers
+   * `busy` at once.
    */
   async admitWhenAvailable(opts: AdmitOptions, settleMs = 1500): Promise<AdmitResult> {
     const deadline = clocks.monotonic() + settleMs;
     for (;;) {
       const a = this.admit(opts);
-      if (a.admitted || (a.reason !== 'prompt-pending' && a.reason !== 'starting')) return a;
+      if (a.admitted || (a.reason !== 'prompt-pending' && a.reason !== 'cancel-unanswered' && a.reason !== 'starting')) return a;
       const remaining = deadline - clocks.monotonic();
       if (remaining <= 0) return a;
       await this.waitAvailable(remaining);
@@ -2474,9 +2487,17 @@ export class Session {
       // 6307351617, item 1). It stays busy until the shell shows it is back, which askForPrompt asks.
       this.discardPending(run, { state: 'cancelled', reason: 'cancelled-before-start' });
       steps.push('the line was discarded before it started');
-      const asked = this.askForPrompt();
-      if (asked) steps.push('an empty line, whose prompt says the shell is back');
-      this.note(`${runId}: no mark followed two ^C; the line was discarded before it started, and the shell counts as available again ${asked ? 'once it has run an empty line typed after the ^C' : 'at its next prompt'}`);
+      const asked = await this.askForPrompt();
+      const discarded = `${runId}: no mark followed two ^C; the line was discarded before it started`;
+      if (asked === 'typed') {
+        steps.push('an empty line, whose prompt says the shell is back');
+        this.note(`${discarded}, and the shell counts as available again once it has run an empty line typed after the ^C, or at a prompt that does not read that line`);
+      } else if (asked === 'answered') this.note(`${discarded}; the shell's prompt since says it is back`);
+      else if (asked === 'gone') this.note(discarded);
+      else {
+        steps.push(`no empty line typed, since ${asked.why}: the shell is back at its next prompt`);
+        this.note(`${discarded}. No empty line was typed to learn when the shell is back, since ${asked.why}: it counts as available again at its next prompt. Until then it is busy; if no prompt comes, read the screen to see what holds the terminal, then send it input, or close the session`);
+      }
     }
     this.replacedStep(run, steps);
     if (run.state === 'running') await this.probeMarker(run, grace, steps);
@@ -2516,23 +2537,58 @@ export class Session {
    * at an empty line; and a line read before the ^C ends with a prompt of its own. An Enter drew one
    * prompt or two, by shell and by where the ^C caught it, with nothing to tell them apart, and a Run
    * written between the two was discarded at the second. Until the line's prompt the shell is busy, so
-   * no Run is written behind it. False when the file cannot be written: the next prompt is then taken
-   * as the shell's answer.
+   * no Run is written behind it.
+   *
+   * The line is typed only when the shell's line editor holds the terminal (whyNotEditor): typed into a
+   * program, or into a DEBUG trap of the user's that reads the terminal, the reader took it, and the shell
+   * then sat at its prompt busy for good (the house's review of the 40 commits through f3750e4, #22
+   * comment 6310921374, question 1). Otherwise nothing is typed, as when the file cannot be written, and
+   * the shell's next prompt is its answer. Until a prompt comes the shell is busy as `cancel-unanswered`,
+   * whose advice is to read the screen, send it input, or close the session: no bound frees it without a
+   * prompt, since nothing else says the shell reads its editor again. Answers `typed`; or why nothing
+   * was typed; `answered` when a prompt came while the terminal was read (the shell is back); `gone` when
+   * the shell exited or was replaced, or the session is closing, meanwhile.
    */
-  private askForPrompt(): boolean {
+  private async askForPrompt(): Promise<'typed' | 'answered' | 'gone' | { why: string }> {
+    const waiting = { path: undefined, started: false, prompted: false };
+    this.promptProbe = waiting;
+    const why = await this.whyNotEditor();
+    if (this.shellState === 'exited' || this.shellState === 'unavailable' || this.closing) return 'gone';
+    if (this.promptProbe !== waiting) return 'answered';
+    if (why !== undefined) return { why };
     let file: string;
     try {
       file = this.writeTempFile('', true);
     } catch (e) {
       this.note(`the empty line that asks the shell for its prompt could not be written (${errMessage(e)})`);
-      return false;
+      return { why: 'its file could not be written' };
     }
     const src = sourceLine(file, this.flavor);
     this.extraTempFiles.add(file);
-    this.promptProbe = { path: file, started: false };
+    this.promptProbe = { path: file, started: false, prompted: false };
     this.probeLine = { file: shellQuote(file), order: ++this.writeOrder };
     this.pty.write(`${CLEAR_LINE_KEYS}${src}\n`);
-    return true;
+    return 'typed';
+  }
+
+  /**
+   * Why a line typed now might not be the shell's line editor's to read, or undefined when it is: the
+   * reinit gate's checks (onExecArmed). The mode the editors of bash, zsh and fish set at their prompt
+   * (ICANON and ECHO off) on every one of EDITOR_SETTLE_READS reads over a short settle, since one read
+   * just after the ^C varied (question 1), and then no process other than the shell that can read the
+   * terminal. What the checks cannot answer is a reason too: unknown is not the editor.
+   */
+  private async whyNotEditor(): Promise<string | undefined> {
+    for (let i = 0; i < EDITOR_SETTLE_READS; i++) {
+      if (i > 0) await sleep(EDITOR_SETTLE_STEP_MS);
+      const mode = this.pty.inputMode?.();
+      if (mode === undefined) return 'its terminal mode could not be read';
+      if (mode.canonical) return 'its terminal is in canonical mode, as while a program or a `read` waits for a line';
+      if (mode.echo) return 'its terminal is non-canonical with echo on, as under `read -n`';
+    }
+    const reader = this.pty.otherReader?.();
+    if (reader === undefined) return 'whether a process other than the shell reads its terminal could not be checked';
+    return reader ? 'a process other than the shell holds its terminal for input' : undefined;
   }
 
   /**
@@ -2547,6 +2603,7 @@ export class Session {
     this.promptProbeTimer = undefined;
     if (!probe) return;
     this.promptProbe = undefined;
+    if (probe.path === undefined) return;
     try {
       fs.rmSync(probe.path, { force: true });
       this.extraTempFiles.delete(probe.path);
