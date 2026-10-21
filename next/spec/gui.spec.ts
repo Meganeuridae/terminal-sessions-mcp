@@ -348,11 +348,17 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
     assert.equal(await page.evaluate<string>(`document.getElementById('secret').textContent`), 'Secret: on');
     await page.click('#term');
     await page.keyboard.type('# locked-text');
-    await new Promise((r) => setTimeout(r, 300));
+    // Waits on the journal, not fixed sleeps: a slow delivery failed the sensitive count, and passed the absence checks
+    // on input not yet there (a reviewer's read of the fixes for #22).
+    // Every key of it has reached the shell once the shell's echo of it shows, so each of its input events (typed keys
+    // flush every few ms, so there can be several) is journaled by then, and the next event is the Enter's.
+    await page.waitForFunction(`${rows}.includes('# locked-text')`, { timeout: 8000 });
     await page.click('#secret');
     await page.click('#term');
+    const beforeEnter = inputsOf('secret').length;
     await page.keyboard.press('Enter');
-    await new Promise((r) => setTimeout(r, 300));
+    // The Enter ends the sensitive line, so the session journals it redacted too (secretInput): any new event is it.
+    await until(() => inputsOf('secret').length > beforeEnter, 5000, 'the Enter, journaled');
     const journal = fs.readFileSync(path.join(dataDir, 'sessions', 'secret', 'journal.jsonl'), 'utf8');
     assert.ok(!journal.includes('hunter2'), 'the password is not in the journal (read -s does not echo it)');
     // The shell echoes what is typed at its prompt (G26 makes no promise about output); the input events are redacted.
@@ -360,8 +366,12 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
     assert.ok(inputsOf('secret').filter((e) => e.sensitive).length > secretInputs.length, 'the locked input was sensitive');
     // Plain and secret text never share one input call: a paste, the lock, and another paste in one task (inside the
     // coalescing window) give a plain event with the first and a redacted one for the second.
+    const beforePaste = inputsOf('secret').length;
     await page.evaluate(`${paste('PLAIN-BIT')}; document.getElementById('secret').click(); ${paste('HIDDEN-BIT')}`);
-    await new Promise((r) => setTimeout(r, 300));
+    await until(() => {
+      const pasted = inputsOf('secret').slice(beforePaste);
+      return pasted.some((e) => e.data.includes('PLAIN-BIT')) && pasted.some((e) => e.sensitive);
+    }, 5000, 'both pastes journaled');
     await page.click('#secret');
     const plain = inputsOf('secret').filter((e) => e.data.includes('PLAIN-BIT'));
     assert.equal(plain.length, 1, 'the plain part was sent on its own');
