@@ -1519,3 +1519,60 @@ test('a catch-up that writes a refused gap and then fails again leaves the gap o
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a file fsync the disk refuses keeps the failed mark: the store refuses the clear and says so once, the clear lands once the files sync, the directory is synced after them, and a file retention took is passed over', (t) => {
+  let mono = 0;
+  t.mock.method(clocks, 'monotonic', () => mono);
+  const dir = tmpDir();
+  const realFsync = fsc.fsyncSync;
+  let refuseFiles = false;
+  const order: { dir: boolean; ino: number }[] = [];
+  fsc.fsyncSync = ((fd: number) => {
+    const st = fsc.fstatSync(fd);
+    if (!st.isDirectory() && refuseFiles) throw Object.assign(new Error('EIO: i/o error, fsync'), { code: 'EIO' });
+    order.push({ dir: st.isDirectory(), ino: st.ino });
+    return realFsync(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  const said: string[] = [];
+  try {
+    // A stretch the disk refused and the ring dropped, with enough output after it that the files rotate.
+    const cold = new Flaky(dir, { maxFileBytes: 2000, log: (level, text) => said.push(`${level}: ${text}`) });
+    const j = new Journal({ hot: new MemoryStore(1500), cold, sessionId: 's' });
+    for (let i = 0; i < 10; i++) j.append(out(`ok${i}`));
+    cold.budget = 0;
+    for (let i = 0; i < 40; i++) j.append(out(`a-${i}-${'z'.repeat(40)}`));
+    assert.equal(peekReservation(dir)?.failed, true, 'the mark is failed on disk');
+    // The disk takes events again but refuses every file fsync: the catch-up's clear waits on the sync, and is refused.
+    refuseFiles = true;
+    cold.budget = Number.POSITIVE_INFINITY;
+    j.retryCold();
+    for (let i = 0; i < 40; i++) j.append(out(`b-${i}-${'y'.repeat(40)}`));
+    assert.equal(peekReservation(dir)?.failed, true, 'still failed on disk');
+    const refused = said.filter((l) => l.startsWith('warn: ') && l.includes("the journal's files could not be synced before its failed mark is cleared"));
+    assert.equal(refused.length, 1, said.join(' | '));
+    assert.match(refused[0]!, /EIO/);
+    // A rotated file retention took meanwhile: nothing to sync there, and the clear does not wait on it.
+    const rotated = fs.readdirSync(dir).filter((n) => /^journal\.\d+\.jsonl$/.test(n)).sort();
+    assert.ok(rotated.length >= 2, rotated.join(', '));
+    fs.rmSync(path.join(dir, rotated[0]!));
+    // The files sync again: the next try clears the mark, with the store's directory synced after its files.
+    refuseFiles = false;
+    order.length = 0;
+    mono += 1000;
+    j.append(out('after'));
+    assert.equal(peekReservation(dir)?.failed, undefined, `cleared: ${cold.calls.join(' → ')}`);
+    const journalFiles = new Set(fs.readdirSync(dir).filter((n) => /^journal(\.\d+)?\.jsonl$/.test(n)).map((n) => fs.statSync(path.join(dir, n)).ino));
+    const dirIno = fs.statSync(dir).ino;
+    const lastFile = order.map((s) => !s.dir && journalFiles.has(s.ino)).lastIndexOf(true);
+    const firstOther = order.findIndex((s) => !s.dir && !journalFiles.has(s.ino)); // the metadata's own write
+    assert.ok(lastFile !== -1 && firstOther > lastFile, JSON.stringify(order));
+    assert.ok(order.slice(lastFile + 1, firstOther).some((s) => s.dir && s.ino === dirIno), 'the directory is synced between the files and the metadata write');
+    assert.equal(said.filter((l) => l.includes("the journal's files could not be synced")).length, 1, 'said once');
+    j.close();
+  } finally {
+    fsc.fsyncSync = realFsync;
+    syncBuiltinESMExports();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

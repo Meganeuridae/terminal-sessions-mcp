@@ -49,9 +49,9 @@ export interface JournalStore {
   /**
    * Sync to disk every file holding a seq this store has not synced since it opened: all of them at its first call,
    * since an earlier life on this boot may have left its appends unsynced, and after that the files appended to
-   * since the last call. False when the disk refused. Appends are not synced otherwise: a journal syncs them only
-   * before it clears a failed reservation, whose holes the gaps it and the lives before it appended record
-   * (Journal.writeReservation).
+   * since the last call, then the directory that holds them, so their entries are durable too. False when the disk
+   * refused, which is said once. Appends are not synced otherwise: a journal syncs them only before it clears a
+   * failed reservation, whose holes the gaps it and the lives before it appended record (Journal.writeReservation).
    */
   syncAppends?(): boolean;
   /**
@@ -574,6 +574,8 @@ export class FileStore implements JournalStore {
   /** Said once per store: the epoch's write refused, and a metadata write the file holds whose directory could not be synced. */
   private refusedWarned = false;
   private syncWarned = false;
+  /** Said once per store too: a refused sync of its files before a clear (appendSyncRefused). */
+  private appendSyncWarned = false;
   /**
    * Directories this open created, the store's own and any parent made on the way, outermost first, whose
    * entries are not yet synced into their parents. A metadata write counts as written only once they are:
@@ -623,11 +625,27 @@ export class FileStore implements JournalStore {
           }
         }
       } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return false; // a file retention took holds nothing to sync
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; // a file retention took holds nothing to sync
+        this.appendSyncRefused(e as NodeJS.ErrnoException);
+        return false;
       }
+    }
+    // The files' entries too: a rotation renames the active file, and the next write makes a new one, with no
+    // directory sync, so without this the clear's metadata write could reach the disk before them.
+    const dirError = syncDir(this.active);
+    if (dirError) {
+      this.appendSyncRefused(dirError);
+      return false;
     }
     this.syncedThrough = this.lastSeq() ?? this.syncedThrough;
     return true;
+  }
+
+  /** A refused sync of the files, said once per store: appends are synced nowhere else, so nothing else would say the disk refuses it. */
+  private appendSyncRefused(e: NodeJS.ErrnoException): void {
+    if (this.appendSyncWarned) return;
+    this.appendSyncWarned = true;
+    this.log?.('warn', `the journal's files could not be synced before its failed mark is cleared: ${e.message}; the mark stays, and its clear is tried again, until they are`);
   }
 
   // ───────────── epoch and high water (G10, mcpl-4, jr2-6) ─────────────
