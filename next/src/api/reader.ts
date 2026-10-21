@@ -47,8 +47,9 @@
  *   it spans the same way, and `describeGap` is the one wording of why.
  * - `tail: N` gives the last N lines of the range (the session, a Run with
  *   `runId`, bounded by `since` and `until`, which `untilOffset` can place inside
- *   an event), up to `maxBytes`. N counts lines of output; the header lines
- *   naming sources come extra. `lines` says how many were asked for and
+ *   an event), up to `maxBytes`. N counts lines of output and notes (a hole's,
+ *   a command's `$ <line>`), each a line of the text; the header lines naming
+ *   sources come extra. `lines` says how many were asked for and
  *   returned: fewer returned without `truncated` means the range holds no more;
  *   `truncated` means `maxBytes`, retention, the scan bound or the projection's
  *   input cap cut lines (or a line's head) that were asked for. `lines.before`
@@ -263,7 +264,16 @@ function withGapInfo<R extends { gap?: GapInfo; gaps?: GapInfo[] }>(r: R, gaps: 
 }
 
 /** Header lines for pages that hold more than one source (§6 rule 6). */
-const label = (s: SourceInfo): string => (s.stream === 'pty' ? '[terminal]' : `[run ${s.runId ?? '?'}]`);
+/** The header line naming a source in a page of several (§6 rule 6): no line of output, so `tail` does not count it. */
+export const sourceHeader = (s: SourceInfo): string => (s.stream === 'pty' ? '[terminal]' : `[run ${s.runId ?? '?'}]`);
+const label = sourceHeader;
+
+/**
+ * Whether a line of a page's text is a source's header, for a reader of the text that does not know its
+ * sources (the compat pack's logs): by sourceHeader's shape. A program's line of that shape counts as a
+ * header, which only shows one line more, or makes a page of what came before repeat one.
+ */
+export const isSourceHeader = (line: string): boolean => line === sourceHeader({ stream: 'pty' }) || /^\[run [^\s\]]+\]$/.test(line);
 const sourceKey = (e: Output) => (e.stream === 'pty' ? 'pty' : `p:${e.runId ?? ''}`);
 const chunkOf = (e: Output, data = e.data): ProjectChunk => ({ data, stream: e.stream, ...(e.runId !== undefined ? { runId: e.runId } : {}) });
 
@@ -1052,7 +1062,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // The header lines naming the sources (§6 rule 6) are no line of output: `tail: N` counts output lines, as the
   // projection's maxLines does, and headers come extra (an independent read of the fix for the house's read of
   // the 33 commits, #22, comment 6307350650: "3 of 1 lines", and a tail of 5 across two sources showed 4).
-  const headers = new Set([...sources].map((k) => (k === 'pty' ? '[terminal]' : `[run ${k.slice(2) || '?'}]`)));
+  const headers = new Set([...sources].map((k) => sourceHeader(k === 'pty' ? { stream: 'pty' } : { stream: 'stdout', ...(k.slice(2) ? { runId: k.slice(2) } : {}) })));
   const outputLines = (kept: string[]) => (multi ? kept.filter((l) => !headers.has(l)).length : kept.length);
   let all = await projectTail(n);
   let shown = fit(all, 1);

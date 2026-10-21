@@ -16,7 +16,7 @@ import { countLines, cutTail, utf8Length } from '../core/text.js';
 import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
 import { commitReadDelivery, takeReadCommit, type App, type ReadResult, type SessionSummary } from './app.js';
 import { looksLikeShellOpener } from './hints.js';
-import { clippedText, gapNote, gapsText } from './reader.js';
+import { clippedText, gapNote, gapsText, isSourceHeader } from './reader.js';
 import type { ToolContext, ToolDef, ToolResult } from './tools.js';
 
 const json = (value: unknown): ToolResult => ({
@@ -221,11 +221,27 @@ function keptLines(lines: string[], p: Plumbing): Array<[string, number]> {
 /** Log lines with the plumbing removed (keptLines). */
 const withoutPlumbingLines = (lines: string[], p: Plumbing): string[] => keptLines(lines, p).map(([l]) => l);
 
-/** The last `n` of `lines` without the plumbing, and the index in `lines` of the first one kept. */
-function keepLines(lines: string[], n: number, p: Plumbing): { lines: string[]; first?: number } {
-  const last = keptLines(lines, p).slice(-n);
+/**
+ * The last `n` of `lines` without the plumbing, and the index in `lines` of the first one kept. In a
+ * text tail (`headers`), `n` counts lines of output, as the reader's tail does: the lines naming
+ * sources come extra (isSourceHeader), with the one naming the first line's source. Counted among
+ * them, a tail of 6 across two sources showed 3 lines of output, and the page of what came before,
+ * read for the lines from the first kept on, was asked for the headers too, so it reached back that
+ * many more lines of output and those between were in neither page (an independent read of the fix
+ * for the house's read of the 33 commits, #22, comment 6307350650).
+ */
+function keepLines(lines: string[], n: number, p: Plumbing, headers = false): { lines: string[]; first?: number } {
+  const kept = keptLines(lines, p);
+  const header = (l: string) => headers && isSourceHeader(l);
+  let i = kept.length;
+  for (let count = 0; i > 0 && count < n; ) if (!header(kept[--i]![0])) count++;
+  if (i > 0 && header(kept[i - 1]![0])) i--;
+  const last = kept.slice(i);
   return last.length ? { lines: last.map(([l]) => l), first: last[0]![1] } : { lines: [] };
 }
+
+/** Lines of `lines` from `from` on that a text tail counts: all but the lines naming sources. */
+const outputLinesFrom = (lines: string[], from: number): number => lines.slice(from).filter((l) => !isSourceHeader(l)).length;
 
 /** The most output the compat tail reads back for its lines: the last 1 MiB. */
 const TAIL_BYTES = 1024 * 1024;
@@ -329,8 +345,8 @@ async function textTail(ctx: ToolContext, session: string, n: number, d: Drawn |
   for (let asked = tailAsked(n); ; asked = Math.min(asked * 2, TAIL_MAX)) {
     const r = await readFor(ctx, d, { session, tail: asked, commands: true, maxBytes: TAIL_BYTES });
     const all = r.text ? r.text.split('\n') : [];
-    const kept = keepLines(all, n, plumbingIn(ctx, session, r.seq[0], r.seq[1]));
-    const short = kept.lines.length < n;
+    const kept = keepLines(all, n, plumbingIn(ctx, session, r.seq[0], r.seq[1]), true);
+    const short = kept.lines.filter((l) => !isSourceHeader(l)).length < n;
     const full = (r.lines?.returned ?? 0) >= asked;
     // The reader gave every line asked for and the plumbing took too many of them: ask for more.
     if (short && full && !r.truncated && asked < TAIL_MAX) continue;
@@ -340,7 +356,7 @@ async function textTail(ctx: ToolContext, session: string, n: number, d: Drawn |
     // not at the first line read (the lines between were in neither page; the house's read of the 38
     // commits, #22, comment 6274935728).
     const cut = async (why: string): Promise<TailCut> => {
-      const from = !kept.first ? r : await readFor(ctx, d, { session, tail: all.length - kept.first, until: r.seq[1], commands: true, maxBytes: TAIL_BYTES });
+      const from = !kept.first ? r : await readFor(ctx, d, { session, tail: outputLinesFrom(all, kept.first), until: r.seq[1], commands: true, maxBytes: TAIL_BYTES });
       const c: TailCut = { before: from.lines?.before ?? { until: from.seq[0] - 1 }, cutHead: from.lines?.cutHead === true, why };
       if (from.lines?.head) c.head = from.lines.head;
       if (from.lines?.begunBefore) c.begunBefore = true;

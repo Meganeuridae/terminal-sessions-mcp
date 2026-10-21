@@ -770,3 +770,31 @@ test('a raw tail counts a crash’s hole as up to its range, as a read does', as
   }
   await call('killSession', { session: 'crashhole', graceful: false });
 });
+
+test('tailLogs counts lines of output across two sources, and the page its cut note advises meets its first line', async () => {
+  // An independent read of the fix for the house's read of the 33 commits (#22, comment 6307350650): the tail kept
+  // the last 6 lines of text, headers among them, so 3 lines of output showed; and the page of what came before was
+  // read for 6 lines from the first kept on, headers counted, so it reached back 3 lines of output too many, and
+  // those were in neither page. The pty and a process Run take turns, in lines of 25,000 bytes, so the tail is cut.
+  await call('runCommand', { session: 'twosources', command: 'echo start' });
+  const live = registry.get('twosources');
+  assert.ok(live?.kind === 'live');
+  const j = live.session.journal;
+  j.append({ type: 'run.admit', runId: 'rx1', target: 'process', principal: A.principal, origin: 'self', queued: false });
+  j.append({ type: 'run.start', runId: 'rx1', cwd: '/' });
+  const big = 'y'.repeat(25_000);
+  for (let i = 0; i < 60; i++) j.append(i % 2 ? { type: 'output', data: `run ${i} ${big}\n`, stream: 'stdout', runId: 'rx1' } : { type: 'output', data: `pty ${i} ${big}\r\n`, stream: 'pty' });
+  const header = (l: string) => l === '[terminal]' || l === '[run rx1]';
+  const numberOf = (l: string) => Number(/^(?:pty|run) (\d+) /.exec(l)?.[1]);
+  const tail = lines(await call('tailLogs', { session: 'twosources', lines: 6 }));
+  const note = tail.find((l) => l.startsWith('[earlier output not shown'));
+  assert.ok(note, `the cut is said: ${JSON.stringify(tail.map((l) => l.slice(0, 20)))}`);
+  const shown = tail.filter((l) => l !== note && !header(l));
+  assert.deepEqual(shown.map(numberOf), [54, 55, 56, 57, 58, 59], 'six lines of output, the headers extra');
+  const m = /read (\{"session": "twosources", "tail": 6, "until": \d+(?:, "untilOffset": \d+)?\}) shows what came before/.exec(note!);
+  assert.ok(m, note);
+  const earlier = (await call('read', { ...(JSON.parse(m[1]!) as Obj), maxBytes: 1024 * 1024 })) as unknown as { text: string };
+  const before = earlier.text.split('\n').filter((l) => !header(l));
+  assert.equal(numberOf(before.at(-1)!), 53, `the page before ends with the line just before the first shown: ${JSON.stringify(before.map((l) => l.slice(0, 8)))}`);
+  await call('killSession', { session: 'twosources', graceful: false });
+});

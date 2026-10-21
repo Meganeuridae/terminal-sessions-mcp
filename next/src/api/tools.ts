@@ -306,8 +306,8 @@ const READ_OUTPUT: Schema = {
     lines: {
       type: 'object',
       properties: {
-        requested: { type: 'integer', description: 'Lines of output asked for (tail).' },
-        returned: { type: 'integer', description: 'Lines of output returned, as requested counts them (the [terminal] and [run …] header lines come extra). Fewer than requested without truncated: the range holds no more. More: with several sources, the lines reach back to the line written last.' },
+        requested: { type: 'integer', description: 'Lines asked for (tail): of output, or a hole’s note.' },
+        returned: { type: 'integer', description: 'Lines returned, as requested counts them: of output, or a hole’s note (the [terminal] and [run …] header lines come extra). Fewer than requested without truncated: the range holds no more. More: with several sources, the lines reach back to the line written last.' },
         cutHead: { type: 'boolean' },
         begunBefore: { type: 'boolean', description: 'With cutHead: the first line may have begun before the lines read, in the page before; head then reads it on from where that page ends, not from its head.' },
         before: { type: 'object', description: 'Where what came before ends: pass its until as until, and its untilOffset, when given (the lines begin inside an event), as untilOffset, beside the same tail.', properties: { until: { type: 'integer' }, untilOffset: { type: 'integer' } }, required: ['until'] },
@@ -581,7 +581,7 @@ export const TOOLS: ToolDef[] = [
         offset: { type: 'integer', minimum: 0, description: 'With since: continue inside the event after since (a result’s nextOffset).' },
         until: { type: 'integer', minimum: 0, description: 'Stop at this cursor (inclusive).' },
         untilOffset: { type: 'integer', minimum: 0, description: 'With tail and until: stop inside the event at until, after this many of its bytes (a tail result’s lines.before.untilOffset).' },
-        tail: { type: 'integer', minimum: 1, maximum: 10000, description: 'The last N lines of output.' },
+        tail: { type: 'integer', minimum: 1, maximum: 10000, description: 'The last N lines: of output, or the note a hole leaves; the [terminal] and [run …] lines naming sources come extra.' },
         runId: { type: 'string', description: "One Run's output, paged from its start (combine with since)." },
         as: { type: 'string', enum: ['text', 'events'] },
         maxBytes: { type: 'integer', minimum: 1024, maximum: 1048576, description: 'Page size in bytes (default 16384).' },
