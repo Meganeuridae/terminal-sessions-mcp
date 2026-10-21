@@ -253,3 +253,20 @@ test('a marker Run’s progress digest shows neither the typed line’s echo nor
   await until(() => out.some((s) => s.kind === 'output' && /building/.test(s.body ?? '')), 5000, 'a digest after the start mark');
   assert.equal(out.filter((s) => s.kind === 'output').at(-1)!.body, 'building 1\nbuilding 2\nhalf');
 });
+
+test('an inline Run’s progress digest shows its partial line: its output begins after its start mark, so nothing waits for one', async (t) => {
+  // A reviewer's read of the fixes for #22: the session journals the piece through an inline Run's start mark to the Run
+  // around it, before the Run starts, so the Run's watch waited for a mark that never came and held back its partial line,
+  // a declared shell's `Password: `, for the whole Run.
+  const src = fakeSource();
+  const seg = new Segmenter(src, { runSettleMs: 5, cadenceMs: 40, screenQuietMs: 20 });
+  t.after(() => seg.dispose());
+  const out = collect(seg);
+  const nonce = 'a1b2c3d4';
+  src.runs.set('r1', { runId: 'r1', sessionId: 's1', target: 'shell', origin: 'agent', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'temporal', line: 'ssh host', strategy: 'inline', nonce });
+  src.journal.append({ type: 'run.start', runId: 'r1', cwd: '', strategy: 'inline', nonce });
+  const data = 'connecting\r\nPassword: ';
+  src.journal.append({ type: 'output', data, stream: 'pty', runId: 'r1' });
+  await until(() => out.some((s) => s.kind === 'output' && s.metadata.bytes === data.length), 5000, 'a digest of all the output');
+  assert.equal(out.filter((s) => s.kind === 'output').at(-1)!.body, 'connecting\nPassword:');
+});

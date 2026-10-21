@@ -763,11 +763,14 @@ interface RunWatch {
   /** What the Run's output left unfinished for the line-end rule (lineEnds). */
   scan: LineCarry;
   /**
-   * A marker or inline Run's start mark, until it arrives, and the echo of the line typed to run it:
-   * the digests drop what the cut drops, everything through the start mark's line (the typed line's
-   * echo, a still-starting shell's banner), and meanwhile the echo. They showed the echo and the mark
-   * until later lines pushed them out (the house's review of the 40 commits through f3750e4, PR #22,
-   * comment 6310921374).
+   * A marker Run's start mark, until it arrives, and the echo of the line typed to run it: the digests
+   * drop what the cut drops, everything through the start mark's line (the typed line's echo, a
+   * still-starting shell's banner), and meanwhile the echo. They showed the echo and the mark until
+   * later lines pushed them out (the house's review of the 40 commits through f3750e4, PR #22, comment
+   * 6310921374). An inline Run has none: the session journals the piece through its start mark to the
+   * Run around it before the Run starts, so its output begins after the mark, and a preamble waiting
+   * for a mark that never came held its partial line back for the whole Run (a reviewer's read of the
+   * fixes for #22).
    */
   preamble?: { start: RegExp; echo: RegExp } | undefined;
   /**
@@ -1065,7 +1068,7 @@ export class Segmenter {
     // clamped to zero while the result said minutes (a reviewer's read of the fixes for #22).
     const startMono = clocks.monotonic() - (this.s.runDurationMs(runId) ?? 0);
     const w: RunWatch = { runId, startMono, pipes: run?.target === 'process', bytes: 0, bytesAtLeast: false, bytesAtLastDigest: 0, lines: [], carry: '', scan: lineCarry(), marks: [] };
-    if ((start?.strategy === 'marker' || start?.strategy === 'inline') && start.nonce !== undefined) w.preamble = { start: startMark(start.nonce), echo: runEcho(start.nonce) };
+    if (start?.strategy === 'marker' && start.nonce !== undefined) w.preamble = { start: startMark(start.nonce), echo: runEcho(start.nonce) };
     this.running.set(runId, w);
     w.timer = setInterval(() => this.digest(w), this.o.cadenceMs);
     return w;
@@ -1198,7 +1201,7 @@ export class Segmenter {
     // the watch goes with the Run, and nothing is lost, since the completion renders the Run's text
     // from the journal, not from these lines (the house's read of the 38 commits, #22, comment 6274773484).
     // The line-end rule's own record says so too, whatever a cut left of the sequence in the carry.
-    // Before a marker or inline Run's start mark, a partial line is the typed line's echo or the mark, as likely as not.
+    // Before a marker Run's start mark, a partial line is the typed line's echo or the mark, as likely as not.
     const partial = w.scan.open || w.preamble || unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
     const tail = (partial ? [...w.lines, partial] : w.lines).slice(-DIGEST_LINES).join('\n');
     const seq = this.s.journal.lastSeq;
