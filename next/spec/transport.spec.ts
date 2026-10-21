@@ -1196,6 +1196,19 @@ test('G21: /health reports a session that awaits recovery’s judgement as sessi
     assert.deepEqual([held.retention, held.pendingRetention], [{}, { maxAgeMs: 3_600_000 }]);
     const entry = h.app.sessionList({ principal: 'agent:a@test', connectionId: 'c' }).find((x) => x.id === 'held')!;
     assert.deepEqual([held.retention, held.pendingRetention], [entry.retention, entry.pendingRetention], 'one view in both');
+
+    // The owner opens the name again while it still awaits judgement: /health's entry is now the live
+    // session's, which goes through its own branch, and reports the same (the house's read of the 40 commits
+    // over our fixes, #22: only the history entry above was checked).
+    const owner = { principal: 'agent:a@test', connectionId: 'c' };
+    await h.app.sessionOpen(owner, { id: 'held' });
+    assert.equal(h.registry.get('held')?.kind, 'live', 'the name is live again');
+    assert.equal(h.registry.awaitsJudgement('held'), true, 'and still awaits judgement');
+    const liveBody = JSON.parse((await httpGet(h.port, '/health?token=ta')).body) as { sessions: Array<Record<string, unknown>> };
+    const live = liveBody.sessions.find((x) => x.id === 'held')!;
+    const liveEntry = h.app.sessionList(owner).find((x) => x.id === 'held')!;
+    assert.deepEqual([live.retention, live.pendingRetention], [{}, { maxAgeMs: 3_600_000 }]);
+    assert.deepEqual([live.retention, live.pendingRetention], [liveEntry.retention, liveEntry.pendingRetention], 'one view in both, live');
   } finally {
     await h.close();
     try {
