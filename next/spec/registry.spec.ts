@@ -796,10 +796,20 @@ test('G18/G10: a refused open of a journal recovery did not surface leaves its f
   fs.mkdirSync(linesLost, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(linesLost, 'journal.jsonl'), '', { mode: 0o600 });
   crashed(linesLost, { epoch: 'd'.repeat(16) });
-  for (const [id, sdir] of [['held', withLines], ['lost', linesLost]] as const) {
+  // And one whose rotated files are past the age its record keeps: a store applies the retention it is given
+  // at once, so an open refused for another owner pruned them when it opened the store with the record's.
+  const agedDir = path.join(r.dir, 'sessions', 'aged');
+  const old = Date.now() - 3_600_000;
+  const k = new Journal({ cold: new FileStore(agedDir, { maxFileBytes: 4096, now: () => old }), sessionId: 'aged', now: () => old });
+  for (let i = 0; i < 60; i++) k.append({ type: 'output', data: 'x'.repeat(200), stream: 'pty' });
+  k.close();
+  const rotated = () => fs.readdirSync(agedDir).filter((n) => /^journal\.\d+\.jsonl$/.test(n));
+  assert.ok(rotated().length >= 2, `rotated files: ${JSON.stringify(rotated())}`);
+  const keeps = { maxAgeMs: 60_000 };
+  for (const [id, sdir, retention] of [['held', withLines, undefined], ['lost', linesLost, undefined], ['aged', agedDir, keeps]] as const) {
     const before = files(sdir);
     const record = path.join(sdir, 'session.json');
-    fs.writeFileSync(record, JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    fs.writeFileSync(record, JSON.stringify({ owner: A, visibility: 'private', ...(retention && { retention }) }), { mode: 0o600 });
     await rejectsWith(r.reg.create({ id, owner: B }), 'forbidden');
     assert.deepEqual(files(sdir), before, `${id}: another principal's refused open`);
     fs.writeFileSync(record, '{');
@@ -814,6 +824,10 @@ test('G18/G10: a refused open of a journal recovery did not surface leaves its f
   fs.writeFileSync(path.join(linesLost, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
   const s = await r.reg.create({ id: 'lost', owner: A });
   assert.ok(s.journal.since(0).events.some((e) => e.type === 'gap' && e.from === 1 && e.to === 20_000), 'the owner\'s life records the lost seqs');
+  // And the record's retention applies once the open is allowed: the aged files go then.
+  fs.writeFileSync(path.join(agedDir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', retention: keeps }), { mode: 0o600 });
+  await r.reg.create({ id: 'aged', owner: A });
+  assert.deepEqual(rotated(), [], 'the owner\'s open pruned what its record does not keep');
   await cleanup(r);
 });
 

@@ -798,6 +798,40 @@ test('jr2-4: a group set aside as untied whose last process goes while recovery 
   }
 });
 
+test('jr2-4/G21: recovery judges a Run\'s process group before it applies the record\'s retention — the aged file that names the group is pruned only after (the house\'s read of the 33 commits, PR #22, comment 6307350477; an independent read of the fix)', { timeout: 15_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'ra');
+  const kids = detachedKids();
+  try {
+    // A Run that ended leaving a child in its group, journaled in a file that has since rotated and aged past
+    // the record's second; only later events, in the active file, are young. Opened with the record's
+    // retention, the store pruned that file at once, and recovery never knew the Run's group.
+    const g = kids.spawn('/bin/sh', ['-c', 'sleep 419 & exit 0']);
+    await kids.exited(g);
+    let ts = Date.now();
+    const j = new Journal({ cold: new FileStore(sdir, { maxFileBytes: 4096 }), sessionId: 'ra', now: () => ts });
+    journalProcess(j, 'r1-left', g);
+    j.append({ type: 'run.end', runId: 'r1-left', state: 'exited', exit: 0, durationMs: 5, leftovers: true });
+    for (let i = 0; i < 60; i++) j.append({ type: 'output', data: 'x'.repeat(200), stream: 'pty' });
+    const aged = ts;
+    ts += 2000;
+    j.append({ type: 'output', data: 'young\r\n', stream: 'pty' });
+    j.close();
+    const rotated = () => fs.readdirSync(sdir).filter((n) => /^journal\.\d+\.jsonl$/.test(n));
+    assert.ok(rotated().length >= 2, `rotated files: ${JSON.stringify(rotated())}`);
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', retention: { maxAgeMs: 1000 } }), { mode: 0o600 });
+    await until(() => Date.now() > aged + 1000, 3000, 'the rotated files to age past the record\'s second');
+    const r = rig(dir, { terminateOrphans: true });
+    const h = hist(r.reg.get('ra'));
+    assert.equal(h.run('r1-left').groupJudged, true, 'the Run, and its group, were known to recovery');
+    await until(() => !groupAlive(g), 3000, 'the leftover group to be ended');
+    assert.deepEqual(rotated(), [], 'and the record\'s retention pruned the aged files after');
+    await r.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
 test('G10/G21: a session within its age whose power loss took every line is recovered — the reservation it left is not retention\'s floor, so it is not removed as past its age (the house\'s read of the 33 commits, PR #22, comment 6307350477; an independent read of the fix)', async () => {
   const dir = path.join(tmp, `d${++dirs}`);
   const sdir = path.join(dir, 'sessions', 'pl');

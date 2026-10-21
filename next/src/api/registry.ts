@@ -508,12 +508,16 @@ export class SessionRegistry {
     const dir = path.join(this.root, id);
     if (!fs.statSync(dir).isDirectory()) return undefined;
     const meta = readMeta(dir);
-    // A record that cannot be read names no retention to trust: open with retention off, so a FileStore
-    // does not prune at open what a repair (which the refusal invites) could bring back; the real
-    // retention is applied once a valid record reads (rereadRecord / newLife). The house's read of the
-    // 36 commits, #22 (comment 6269992150): the default pruned before finishRecovery refused the name.
+    // A record that cannot be read names no retention to trust: none is applied, so the store prunes
+    // nothing a repair (which the refusal invites) could bring back; the real retention is applied once a
+    // valid record reads (rereadRecord / newLife). The house's read of the 36 commits, #22 (comment
+    // 6269992150): the default pruned before finishRecovery refused the name.
     const retention = recordRefusal(id, meta) ? {} : this.retentionFor(undefined, meta.retention);
-    const store = new FileStore(dir, this.storeOptions(id, retention));
+    // The store opens with no retention, whatever the record says: a store applies the retention it is
+    // given at once, and pruned at open, the files that name a Run's process group went before recovery
+    // judged it. The record's is applied once recovery is done with the session (finishRecovery). The
+    // house's read of the 33 commits, PR #22, comment 6307350477; an independent read of the fix.
+    const store = new FileStore(dir, this.storeOptions(id, {}));
     const gone = expired(store, retention, Date.now());
     // The last event the dead daemon wrote, read before the journal opens: opening a journal over a torn
     // last line (or a failed high water) appends a gap stamped with this recovery's time, and read after
@@ -608,6 +612,9 @@ export class SessionRegistry {
     }
     // Mark the restart once: a session closed on purpose, or history since an earlier restart, gains nothing.
     if (meta.closedAt === undefined && last?.type !== 'recovered') journal.append({ type: 'recovered', class: 'history-only' });
+    // Its groups judged, the history is kept under its record's retention from here on; one whose groups no
+    // listing judged keeps every file until a recovery does, as expire leaves it (see awaitsJudgement).
+    if (!unjudged) store.setRetention(retention);
     journal.seal();
     // A record that cannot be read, or that is not there, names no owner. The name is nobody's to
     // reopen until the record is repaired or written or the session removed — not the system
@@ -903,12 +910,13 @@ export class SessionRegistry {
     } else {
       recorded = readMeta(dir);
       before = this.retentionFor(undefined, recorded.retention);
-      // A record that names no owner names no retention to trust either: the store opens without one, as
-      // recovery's does, so a refused open prunes nothing a repaired record would keep — the default the
-      // fallback opened with was applied at once, before the refusal (the house's read of the 38 commits,
-      // PR #22, comment 6274857431, item 7). With no history there is nothing to keep, and the default applies.
+      // The store opens with no retention, as recovery's does, and takes the record's only once the open
+      // is allowed: a store applies the retention it is given at once, so a refused open pruned what a
+      // repaired record would keep (the house's read of the 38 commits, PR #22, comment 6274857431, item
+      // 7), and, for a record that reads, the aged files of a journal another owner's open was refused
+      // (the house's read of the 33 commits, PR #22, comment 6307350477; an independent read of the fix).
       const refusal = recordRefusal(id, recorded);
-      store = new FileStore(dir, this.storeOptions(id, refusal ? {} : before));
+      store = new FileStore(dir, this.storeOptions(id, {}));
       // A journal this registry did not surface (recovery could not read it): its owner stands (G18),
       // and a record that cannot be read, or is not there, names none. Whether it holds history is
       // recovery's rule: an event, or a Run still open that only a rotation header names — by events
@@ -918,9 +926,7 @@ export class SessionRegistry {
       // and when it closes (its reservation), and a refused open wrote both into a journal it did not own
       // (an independent read of the fix). The journal then takes the index the scan built.
       const runs = new RunIndex(id).scanStore(store);
-      if (!holdsHistory(store, runs)) {
-        if (refusal) store.setRetention(before);
-      } else {
+      if (holdsHistory(store, runs)) {
         if (refusal) {
           store.close();
           throw refusal;
@@ -930,6 +936,9 @@ export class SessionRegistry {
           throw err('forbidden', `session ${id} belongs to another principal; only its owner may open it again`, { id });
         }
       }
+      // Allowed: until this life has started, the history is kept under its record's retention (with no
+      // history and no record, the daemon's defaults; there is nothing to keep).
+      store.setRetention(before);
       jo.runs = runs;
       jo.cold = store;
       journal = new Journal(jo);
