@@ -964,6 +964,37 @@ function patching<K extends keyof typeof fsc, T>(name: K, replacement: (real: (t
 }
 const temps = (dir: string) => fs.readdirSync(dir).filter((n) => n.startsWith(`${LOCK_FILE}.`) && n.endsWith('.tmp'));
 
+test('a guard entry that cannot be read is kept, and the refusal names the guard and what it holds, with the advice to remove the guard', () => {
+  const dir = dataDir();
+  staleLock(dir);
+  const guard = guardOf(dir);
+  fs.mkdirSync(guard);
+  const entry = path.join(guard, '999999.3333333333333333');
+  fs.writeFileSync(entry, record(999_999, '3333333333333333'));
+  let thrown: unknown;
+  patching(
+    'readFileSync',
+    (real) =>
+      ((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        if (String(p) === entry) throw Object.assign(new Error(`EACCES: permission denied, open '${entry}'`), { code: 'EACCES' });
+        return (real as (...a: unknown[]) => unknown)(p, ...rest);
+      }) as typeof fs.readFileSync,
+    () => {
+      try {
+        acquireDataDirLock(dir);
+      } catch (e) {
+        thrown = e;
+      }
+    },
+  );
+  assert.equal(code(thrown), 'data_dir_locked');
+  const message = (thrown as TermError).message;
+  assert.ok(message.includes(`behind its takeover guard ${guard}, held by pid 999999`), message);
+  assert.ok(message.includes(`remove ${guard} only if no termd is starting`), message);
+  assert.deepEqual(fs.readdirSync(guard), [path.basename(entry)], 'the entry is kept: a dead pid in a file that cannot be read is not judged gone');
+  assert.equal(readLock(dir).pid, 999_999);
+});
+
 test('an owner file the disk refuses fails the start with that error and takes the attempt\'s temp and guard with it', () => {
   const dir = dataDir();
   staleLock(dir);

@@ -426,11 +426,17 @@ function holderLive(h: LockHolder, current: string, file: string, src: ProcessSo
   return commandNamesTermd(h.pid, src) === false ? 'stale' : 'live';
 }
 
-const lockedError = (dataDir: string, file: string, h: LockHolder | undefined, why: string) =>
-  err('data_dir_locked', `data dir ${dataDir} is in use by ${why}; one daemon per data dir (remove ${file} only if no termd is running)`, {
+/**
+ * The refusal. Given the takeover guard (its path and what it holds), the advice is to remove the guard:
+ * without it the next start takes over or creates the lock as usual, where a termd.lock removed instead
+ * leaves the guard to keep out every later takeover, and every start on a filesystem without hard links.
+ */
+const lockedError = (dataDir: string, file: string, h: LockHolder | undefined, why: string, guard?: { path: string; entries: string[] }) =>
+  err('data_dir_locked', `data dir ${dataDir} is in use by ${why}; one daemon per data dir (${guard ? `remove ${guard.path} only if no termd is starting` : `remove ${file} only if no termd is running`})`, {
     dataDir,
     lockFile: file,
     ...(h ? { pid: h.pid, hostname: h.hostname, startedAt: h.startedAt } : {}),
+    ...(guard ? { guard: guard.path, guardEntries: guard.entries } : {}),
   });
 
 /**
@@ -502,6 +508,9 @@ function attemptInFlight(file: string, src: ProcessSource, seen: Map<string, boo
 
 /** An ownerless guard, or a guard entry without a whole record, is judged by its age past this, beside the attempt scan. */
 const GUARD_STALE_MS = 5000;
+
+/** The lock's takeover guard, a directory beside it. */
+const guardPath = (file: string) => `${file}.takeover`;
 
 /** A guard's owner file: `<pid>.<nonce>`, the attempt's own pid and nonce, holding the attempt's record. */
 interface GuardOwner {
@@ -624,7 +633,7 @@ function breakGuard(file: string, guard: string, src: ProcessSource, seen: Map<s
  * at once. A guard a crashed start left goes as soon as a start finds its owner gone.
  */
 function underGuard<T>(file: string, owner: GuardOwner, src: ProcessSource, seen: Map<string, boolean>, fn: () => T): T | undefined {
-  const guard = `${file}.takeover`;
+  const guard = guardPath(file);
   try {
     fs.mkdirSync(guard, { mode: 0o700 });
   } catch (e) {
@@ -808,5 +817,16 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
     rmTemp(tmp);
     sleepSync(10);
   }
-  throw lockedError(dataDir, file, parseHolder(readRaw(file) ?? ''), 'another termd starting at the same time');
+  // The attempts ran out: on a guard they kept (a live owner, an entry they cannot read, one still being
+  // written), on a torn lock still young, or on a lock that kept changing under them. A guard still there
+  // is named, with what it holds, since it can be what kept them out and termd.lock's record says nothing of it.
+  const guard = guardPath(file);
+  let entries: string[] | undefined;
+  try {
+    entries = fs.readdirSync(guard);
+  } catch {
+    // no guard (or none this start can list): the lock's record is all there is to name
+  }
+  const held = entries === undefined ? '' : `, behind its takeover guard ${guard}, ${entries.length ? `held by ${entries.map((n) => (isOwnerName(n) ? `pid ${n.slice(0, n.indexOf('.'))}` : `an entry named ${n}`)).join(', ')}` : 'with no owner in it yet'}`;
+  throw lockedError(dataDir, file, parseHolder(readRaw(file) ?? ''), `another termd starting at the same time${held}`, entries && { path: guard, entries });
 }
