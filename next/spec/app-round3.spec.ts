@@ -476,3 +476,45 @@ test('a key a restart’s journal recovers keeps its age: it expires a window af
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('the 33 commits 7: a recovered key stamped old behind a younger one is dropped when it is looked up past its window, which the sweep stops short of', async (t) => {
+  // The sweep expires from the oldest entry in insertion order and stops at the first inside the window; a key
+  // a restart recovered is stamped with its Run's age, so it can sit, expired, behind a younger key (the house's
+  // read of the 33 commits, #22, comment 6307350650, item 7).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-idem-behind-'));
+  const open = () => {
+    const registry = new SessionRegistry({ dataDir: dir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
+    return { registry, app: new App({ registry, defaultWaitMs: 5000 }) };
+  };
+  let life = open();
+  const call = (key: string) => life.app.run(A, { session: 'behind', command: `echo ${key}`, target: 'process', wait: 5000, idempotencyKey: key });
+  try {
+    await life.app.sessionOpen(A, { id: 'behind' });
+    const aged = await call('aged-key');
+    assert.equal(aged.state, 'exited', JSON.stringify(aged));
+    await life.registry.closeAll();
+    // The daemon comes back 14 minutes later. A new key is made first, then the old key's retry recovers it,
+    // stamped 14 minutes old, after the younger entry.
+    const realNow = Date.now.bind(Date);
+    let wall = 14 * 60_000;
+    t.mock.method(Date, 'now', () => realNow() + wall);
+    life = open();
+    const young = await call('young-key');
+    assert.equal(young.replayed, undefined);
+    const again = await call('aged-key');
+    assert.equal(again.runId, aged.runId, 'recovered: the same Run');
+    assert.equal(again.replayed, true);
+    // Two minutes on, by both clocks: the young key is inside its window, so the sweep stops at it; the old one,
+    // 16 minutes from its admission, is past its own and runs anew.
+    const realMono = clocks.monotonic;
+    t.mock.method(clocks, 'monotonic', () => realMono() + 2 * 60_000);
+    wall = 16 * 60_000;
+    const later = await call('aged-key');
+    assert.notEqual(later.runId, aged.runId, 'the expired key is dropped where it sits');
+    assert.equal(later.replayed, undefined);
+    assert.equal((await call('young-key')).runId, young.runId, 'the younger key still replays');
+  } finally {
+    await life.registry.closeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

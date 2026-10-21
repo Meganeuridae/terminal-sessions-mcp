@@ -313,7 +313,9 @@ test('run, await and start results report the session’s duration, and a queued
     Date.now = realNow;
     clocks.monotonic = realMono;
   });
-  const first = await tool('run', { session: 'dur', command: 'sleep 3', wait: 300 });
+  // The Run outlives the test and is cancelled at its end: a `sleep 3` could end first on a loaded machine, before
+  // the checks of a Run in flight (the house's read of the 33 commits, #22, comment 6307350650, item 10).
+  const first = await tool('run', { session: 'dur', command: 'sleep 300', wait: 300 });
   const runId = first.structured?.runId as string;
   const live = registry.get('dur');
   assert.ok(live?.kind === 'live');
@@ -331,8 +333,9 @@ test('run, await and start results report the session’s duration, and a queued
   assert.equal(waiting.structured?.state, 'queued');
   assert.ok((waiting.structured?.queuedMs as number) >= 2500, `a queued Run's wait: ${waiting.structured?.queuedMs} ms`);
   assert.doesNotMatch(waiting.text, /queued for -/, waiting.text);
+  await tool('cancel', { runId });
   const done = await tool('await', { runId, wait: 10_000 });
-  assert.equal(done.structured?.state, 'exited', JSON.stringify(done.structured));
+  assert.equal(done.structured?.state, 'cancelled', JSON.stringify(done.structured));
   assert.ok((done.structured?.durationMs as number) >= 2500, `the ended Run: ${done.structured?.durationMs} ms`);
   assert.doesNotMatch(done.text, /in -\d/, done.text);
   const replayed = await tool('start', { session: 'dursvc', command: 'echo up; sleep 30', ready: { pattern: 'up' }, wait: 5000, idempotencyKey: 'dur-svc-1' });

@@ -455,6 +455,14 @@ const BUSY_NEXT: Record<string, string> = {
 
 const SCREEN_TEXT_ONLY = 'this release returns the screen as text, not an image: no file was written';
 
+/**
+ * Whether a pattern holds a tab: the character itself, or an escape for it (`\t`, `\x09`, `\u0009`,
+ * `\cI`; patterns compile without the u flag) that no backslash before it escapes in turn.
+ */
+const holdsTab = (pattern: string): boolean => pattern.includes('\t') || /(?:^|[^\\])(?:\\\\)*\\(?:t|x09|u0009|c[iI])/.test(pattern);
+
+const TAB_NOTE = 'the pattern holds a tab, and lines read as the terminal shows them, where a tab is the spaces up to the next tab stop: use \\s+ to match it';
+
 export const COMPAT_TOOLS: ToolDef[] = [
   {
     name: 'launch',
@@ -742,6 +750,10 @@ export const COMPAT_TOOLS: ToolDef[] = [
       if (gaps) notes.push(`output is missing where the search looked: ${gaps}`);
       const clipped = clippedText(r.clippedLines);
       if (clipped) notes.push(clipped);
+      // 1.x matched the raw logged lines, tabs included; lines here read as the terminal shows them, so a
+      // pattern with a tab finds nothing and an empty list read as absence (the house's read of the 33
+      // commits, #22, comment 6307350650, item 6, and its answer to our third question).
+      if (holdsTab(a.pattern as string)) notes.push(TAB_NOTE);
       if (notes.length) out.push({ note: notes.join('; ') });
       return json(out);
     },

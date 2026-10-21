@@ -197,7 +197,13 @@ interface IdemEntry {
   principal: Principal;
   tool: string;
   digest: string;
-  /** When the entry was made, on the monotonic clock: the window is measured there, so a wall-clock step neither expires a young key nor keeps an old one. */
+  /**
+   * When the entry was made, on the monotonic clock: the window is measured there, so a wall-clock step
+   * neither expires a young key nor keeps an old one. The one exception is a key a restart's journal
+   * recovered: no monotonic clock spans a restart, so it is stamped with its Run's age on the wall clock
+   * (see sweep), and a step taken before that stamp moves it (the house's read of the 33 commits, #22,
+   * comment 6307350650, item 5).
+   */
   mono: number;
   value: Promise<unknown>;
 }

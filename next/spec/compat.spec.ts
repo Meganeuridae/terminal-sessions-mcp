@@ -663,3 +663,21 @@ test('runCommand reports the session’s duration, on the monotonic clock: a wal
   assert.ok(end?.type === 'run.end');
   assert.equal(r.duration, end.durationMs, 'the duration the journal holds');
 });
+
+test('the 33 commits 6: a searchLogs pattern holding a tab, as a character or an escape, comes back with a note that a tab reads as spaces, to use \\s+', async () => {
+  // 1.x matched the raw logged lines, so its callers' tab patterns found tabs; here they find nothing, and an
+  // empty list read as absence (the house's read of the 33 commits, #22, comment 6307350650, item 6).
+  await call('runCommand', { session: 'tabs', command: "printf 'key\\tvalue\\n'" });
+  type Hit = { line?: string; note?: string };
+  const search = async (pattern: string) => (await call('searchLogs', { session: 'tabs', pattern })) as unknown as Hit[];
+  const noteOf = (hits: Hit[]) => hits.find((h) => h.note !== undefined)?.note ?? '';
+  for (const pattern of ['key\tvalue', 'key\\tvalue', 'key\\x09value', 'key\\u0009value', 'key\\cIvalue', '[\\t]value', '\\\\\\tvalue']) {
+    const hits = await search(pattern);
+    assert.equal(hits.filter((h) => h.line !== undefined).length, 0, `the tab itself is not in the line: ${JSON.stringify(pattern)}`);
+    assert.match(noteOf(hits), /the pattern holds a tab, and lines read as the terminal shows them, where a tab is the spaces up to the next tab stop: use \\s\+ to match it/, JSON.stringify(pattern));
+  }
+  // An escaped backslash before a t is no tab; neither is \s.
+  for (const pattern of ['key\\\\tvalue', 'key\\s+value']) assert.doesNotMatch(noteOf(await search(pattern)), /holds a tab/, JSON.stringify(pattern));
+  const found = await search('key\\s+value');
+  assert.ok(found.some((h) => h.line !== undefined && /^key +value$/.test(h.line)), JSON.stringify(found));
+});
