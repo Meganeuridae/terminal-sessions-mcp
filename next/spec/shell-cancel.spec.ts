@@ -61,18 +61,20 @@ for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
   test(`${shell}: G29: jobs that ignore ^C and ^\\ get SIGTERM, then SIGKILL, in their own process group — never the shell`, async () => {
     const x = await realSession(shell);
     try {
-      const a = await x.session.admitWhenAvailable({ target: 'shell', line: `/bin/bash -c "trap '' INT QUIT; sleep 30"`, principal: AGENT });
+      // Each waits for its sleep, which starts once the trap is set, not a fixed time (the house's review of
+      // 4f4c067..a8b6f28): a ^C that came first ended the job at once.
+      const a = await x.session.admitWhenAvailable({ target: 'shell', line: `/bin/bash -c "trap '' INT QUIT; sleep 30.${TAG}"`, principal: AGENT });
       assert.ok(a.admitted);
-      await x.session.awaitRun(a.run.runId, 300);
+      await until(() => pgrep(`^sleep 30\\.${TAG}$`).length === 1, 5000, 'the job’s sleep, its trap set');
       const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 300 });
       assert.equal(c.state, 'cancelled', JSON.stringify(c));
       assert.equal(c.steps.length, 3);
       assert.deepEqual(c.steps.slice(0, 2), ['^C', '^\\']);
       assert.match(c.steps[2]!, /^SIGTERM → foreground process group \d+$/);
       assert.equal(x.session.run(a.run.runId).exit, 143);
-      const b = await x.session.admitWhenAvailable({ target: 'shell', line: `/bin/bash -c "trap '' INT QUIT TERM; sleep 30"`, principal: AGENT });
+      const b = await x.session.admitWhenAvailable({ target: 'shell', line: `/bin/bash -c "trap '' INT QUIT TERM; sleep 31.${TAG}"`, principal: AGENT });
       assert.ok(b.admitted);
-      await x.session.awaitRun(b.run.runId, 300);
+      await until(() => pgrep(`^sleep 31\\.${TAG}$`).length === 1, 5000, 'the job’s sleep, its trap set');
       const cb = await x.session.cancel(b.run.runId, AGENT, { graceMs: 300 });
       assert.equal(cb.state, 'cancelled', JSON.stringify(cb));
       assert.match(cb.steps[3] ?? '', /^SIGKILL → foreground process group \d+$/);
@@ -85,6 +87,7 @@ for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
       assert.equal((await x.run('echo alive')).text, 'alive');
     } finally {
       await x.close();
+      reap(`^sleep 3[01]\\.${TAG}$`);
     }
   });
 }
@@ -318,7 +321,7 @@ test('/bin/bash: G29 (tg-12): a process cancel signals the group until it is emp
     // `&` jobs of a non-interactive sh ignore SIGINT: the leader dies, 301.TAG stays.
     const a = x.session.admit({ target: 'process', argv: ['/bin/sh', '-c', `sleep 301.${TAG} & sleep 302.${TAG}; wait`], principal: AGENT });
     assert.ok(a.admitted);
-    await x.session.awaitRun(a.run.runId, 300);
+    await until(() => pgrep(`^sleep 30[12]\\.${TAG}$`).length === 2, 5000, 'both sleeps');
     // (Anchored: `pgrep -f` would also match the `sh -c` command line that contains it.)
     assert.equal(pgrep(`^sleep 301\\.${TAG}$`).length, 1);
     const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 300 });
@@ -348,7 +351,7 @@ test('/bin/bash: G19/G29 (core-11): close waits for a process Run that ignores S
   const x = await realSession('/bin/bash');
   const a = x.session.admit({ target: 'process', argv: ['/bin/sh', '-c', `trap '' INT; exec sleep 97.${TAG}`], principal: AGENT });
   assert.ok(a.admitted);
-  await x.session.awaitRun(a.run.runId, 300);
+  await until(() => pgrep(`^sleep 97\\.${TAG}$`).length === 1, 5000, 'the sleep, its SIGINT ignored');
   const n = x.journal.lastSeq;
   await x.close();
   try {
@@ -431,7 +434,7 @@ for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
     const x = await realSession(shell);
     const a = await x.session.admitWhenAvailable({ target: 'shell', line: `: $(sleep 32.${TAG})`, principal: AGENT });
     assert.ok(a.admitted);
-    await x.session.awaitRun(a.run.runId, 300);
+    await until(() => pgrep(`^sleep 32\\.${TAG}$`).length === 1, 5000, 'the substitution’s sleep');
     const t0 = Date.now();
     await x.session.close();
     assert.ok(Date.now() - t0 < 1500, `close took ${Date.now() - t0} ms`);
@@ -442,8 +445,7 @@ for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
     try {
       const b = await y.session.admitWhenAvailable({ target: 'shell', line: `: $(trap '' HUP; sleep 33.${TAG})`, principal: AGENT });
       assert.ok(b.admitted);
-      await y.session.awaitRun(b.run.runId, 300);
-      assert.equal(pgrep(`^sleep 33\\.${TAG}$`).length, 1);
+      await until(() => pgrep(`^sleep 33\\.${TAG}$`).length === 1, 5000, 'the substitution’s sleep, its SIGHUP ignored');
       await y.session.close({ timeoutMs: 800 });
       assert.deepEqual(pgrep(`^sleep 3[23]\\.${TAG}$`), [], 'nothing the shell forked outlived it');
       assert.equal(y.session.run(b.run.runId).state, 'lost');
