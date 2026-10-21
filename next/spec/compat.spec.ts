@@ -974,3 +974,34 @@ test("tailLogs' description advises a read with its session, which read requires
   const read = toolsFor('compat').find((t) => t.name === 'read')!;
   assert.deepEqual((read.inputSchema as { required?: string[] }).required, ['session']);
 });
+
+test("compat's logs keep a program's line that an unanswered probe was typed onto, and strike an answered probe's line whole, as the cutter does (an independent read of the fixes for the review of the 40 commits, PR #22)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'compat-probe-head-'));
+  const backend = fakeShellBackend((sh) => { sh.on(/^echo /, (line) => ({ output: `${line.slice(5)}\r\n`, exit: 0 })); }, { marks: 'none' });
+  const registry = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true });
+  const app = new App({ registry, defaultWaitMs: 2000 });
+  const C: Caller = { principal: 'agent:a@test', connectionId: 'cp' };
+  const compat = toolsFor('compat');
+  const call = async (name: string, args: Record<string, unknown>) => JSON.parse((await callTool(name, args, { app, caller: C, resultText: 'json' }, compat)).text);
+  try {
+    await call('runCommand', { session: 'pq', command: 'echo hello' });
+    const live = registry.get('pq');
+    if (live?.kind !== 'live') throw new Error('no live session');
+    const j = live.session.journal;
+    // A program asked and ignored ^C; the daemon's probe was typed on its line, and nothing answered.
+    j.append({ type: 'output', data: `Continue? [y/N] ${markerProbe('n0nce')}\r\nnot continuing\r\n`, stream: 'pty' });
+    // The program's text stays as the cutter keeps it, up to the probe's echo and the space before it, after the prompt it was printed on.
+    const kept = (await call('tailLogs', { session: 'pq', lines: 2 })) as string[];
+    assert.deepEqual(kept, ['$ Continue? [y/N] ', 'not continuing']);
+    assert.equal(((await call('searchLogs', { session: 'pq', pattern: 'Continue' })) as unknown[]).length, 1);
+    // A shell answered the next one: its echo's line, the shell's prompt with it, goes whole. (The answer is plumbing
+    // for a Run's own nonce; this one names none of the session's Runs, so it stays.)
+    j.append({ type: 'output', data: `$ ${markerProbe('n1nce')}\r\n<<<PROBE:n1nce:4242>>>\r\n$ `, stream: 'pty' });
+    const tail = (await call('tailLogs', { session: 'pq', lines: 4 })) as string[];
+    assert.ok(!tail.some((l) => l.includes('printf') || l === '$ '), JSON.stringify(tail));
+    assert.ok(tail.includes('not continuing'), JSON.stringify(tail));
+  } finally {
+    await registry.closeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

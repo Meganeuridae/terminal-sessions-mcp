@@ -179,13 +179,17 @@ const START = startMark();
 const PROBE_ECHO = probeEcho();
 
 /**
- * The lines a probe line's echo spans, by index in `lines`: found by the cutter's own matcher
- * (plumbing.ts probeEcho), a redraw's breaks included, a break inside the nonce among them, and
- * struck whole as cutPlumbing strikes them, whatever nonce the typed line carries, as any typed line
- * is the daemon's. A prompt the shell printed on that line goes with it.
+ * The lines a probe line's echo spans, by index in `lines`, each with the length of its head that stays: found by
+ * the cutter's own matcher (plumbing.ts probeEcho), a redraw's breaks included, a break inside the nonce among
+ * them, whatever nonce the typed line carries, as any typed line is the daemon's, and struck as cutPlumbing strikes
+ * them. A probe a shell answered goes with its lines whole, the shell's prompt on its first with it; one nothing
+ * answered goes from its own start (and the space before it), and the head of its first line stays, since a program
+ * read it after whatever it had printed there: struck whole, a program's `Continue? [y/N] ` went with it, which the
+ * cutter keeps (an independent read of the fixes for the review of the 40 commits, PR #22). A head of 0 is the line
+ * struck whole.
  */
-function probeLines(lines: string[]): Set<number> {
-  const struck = new Set<number>();
+function probeLines(lines: string[]): Map<number, number> {
+  const struck = new Map<number, number>();
   const text = lines.join('\n');
   if (!text.includes('<')) return struck;
   const starts: number[] = [];
@@ -204,7 +208,16 @@ function probeLines(lines: string[]): Set<number> {
     }
     return lo;
   };
-  for (const m of text.matchAll(PROBE_ECHO)) for (let i = lineAt(m.index); i <= lineAt(m.index + m[0].length - 1); i++) struck.add(i);
+  const echoes = [...text.matchAll(PROBE_ECHO)];
+  echoes.forEach((m, k) => {
+    const first = lineAt(m.index);
+    // Answered: the probe's answer, with its nonce when the echo shows it whole, before the next echo.
+    const nonce = /PRO(?:""|'')BE:([^:>"\s]+)/.exec(m[0])?.[1];
+    const answered = text.slice(m.index + m[0].length, echoes[k + 1]?.index ?? text.length).includes(`<<<PROBE:${nonce ?? ''}`);
+    const col = m.index - starts[first]!;
+    const head = answered ? 0 : col > 0 && lines[first]![col - 1] === ' ' ? col - 1 : col;
+    for (let i = first; i <= lineAt(m.index + m[0].length - 1); i++) struck.set(i, Math.min(struck.get(i) ?? Number.POSITIVE_INFINITY, i === first ? head : 0));
+  });
   return struck;
 }
 
@@ -221,8 +234,10 @@ function keptLines(lines: string[], p: Plumbing): Array<[string, number]> {
   const kept: Array<[string, number]> = [];
   const probes = probeLines(lines);
   let markEnd = -1;
-  lines.forEach((l, i) => {
-    if (i === markEnd || probes.has(i)) return;
+  lines.forEach((whole, i) => {
+    const head = probes.get(i);
+    if (i === markEnd || head === 0) return;
+    const l = head === undefined ? whole : whole.slice(0, head);
     const k = withoutPlumbing(l, p);
     if (k !== null) kept.push([k, i]);
     else if (lines[i + 1]?.startsWith('$ ')) {
