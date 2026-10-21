@@ -1510,3 +1510,19 @@ test('a head-first page over a string left open across thousands of small events
     assert.equal(r.nextOffset, 15002, JSON.stringify({ next: r.nextCursor, off: r.nextOffset }));
   }
 });
+
+test('an events tail stops walking back once it holds the events it returns (our read of the 40 commits, PR #22)', async () => {
+  // Sized by line ends, a tail of 10 over events with none walked to MAX_SCAN: 40 batches for 10 events.
+  const src = source();
+  for (let i = 0; i < 30_000; i++) out(src.journal, 'x');
+  let calls = 0;
+  const tail = src.journal.tail.bind(src.journal);
+  src.journal.tail = (n: number, to?: number) => {
+    calls++;
+    return tail(n, to);
+  };
+  const r = await readJournal(src, { tail: 10, as: 'events' }, { resultBytes: 16384 });
+  assert.equal(r.events!.length, 10);
+  assert.deepEqual(r.events!.map((e) => e.seq), Array.from({ length: 10 }, (_, i) => 29_991 + i));
+  assert.ok(calls <= 2, `${calls} batches read`);
+});

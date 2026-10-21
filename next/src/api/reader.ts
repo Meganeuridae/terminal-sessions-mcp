@@ -1101,8 +1101,11 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const gaps: GapInfo[] = [];
   // The window has enough once its line ends (lineEnds, the one rule) reach `need`: a LF in a string's payload
   // ends no line, and counting it stopped the walk short, or inside the string, whose payload then showed as
-  // output (the house's read of the 40 commits, #22). Raw LFs, cheap to count, bound it from above.
-  const enough = (evs: JournalEvent[], raw: number, olderBefore: boolean): boolean => raw >= need && windowEnds(src, o, evs, olderBefore) >= need;
+  // output (the house's read of the 40 commits, #22). Raw LFs, cheap to count, bound it from above. An events tail
+  // has enough once it holds the events it can return: sized by line ends, a tail of 10 over events with none
+  // walked to MAX_SCAN (our read of the 40 commits, PR #22).
+  const enough = (evs: JournalEvent[], raw: number, olderBefore: boolean): boolean =>
+    o.as === 'events' ? evs.length >= Math.min(n, 2000) : raw >= need && windowEnds(src, o, evs, olderBefore) >= need;
   if (o.runId !== undefined) {
     let want = Math.min(cap, 64 * 1024);
     let ro: RunOutput;
