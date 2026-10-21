@@ -471,6 +471,9 @@ test('a trace a shell writes past the typed line’s redirect is named by the Ru
   assert.equal(cutPlumbing(`${echo}${mark}--> printf abc\r\nabc> ${fishTrace}${end}`, marker), '--> printf abc\r\nabc', 'fish’s own prefix, which its trace’s doubled backslash shows');
   // fish 3.7 (Ubuntu 24.04's) escapes what fish 4 quotes: the doubled backslash is still there, and `abc` stayed only with fish 4's.
   const fish37 = `printf \\%s:\\%s\\>\\>\\>\\\\n '<<<EXIT:${N}' 0\r\n`;
+  // A program's unterminated line holding a `printf ` of its own before fish's trace: the trace is the line's last one (an
+  // independent read of the fixes for #22: the first took the program's line with the trace).
+  assert.equal(cutPlumbing(`${echo}> source ${file}\r\n${mark}abc printf x> ${fishTrace}${end}`, marker), 'abc printf x', 'a printf of the program’s own');
   assert.equal(cutPlumbing(`${echo}${mark}--> printf abc\r\nabc> ${fish37}${end}`, marker), '--> printf abc\r\nabc', 'fish 3.7’s trace');
   // bash writes `ESC[?2004l` and a CR before tracing: a typed line's trace on a line the cursor went back to the start of has the
   // prefix after the CR, and a last `printf abc` stays (the house's review of f3750e4..4f4c067, PR #22, comment 6315636412).
@@ -660,4 +663,36 @@ test('a page or tail of a declared shell’s Run that begins with a blank line k
   const window = (truncated: boolean) => ({ events: [{ type: 'output', seq: 5, ts: 0, stream: 'pty', data: raw, runId: 'r1' }], from: 5, to: 5, truncated }) as unknown as RunOutput;
   assert.equal((await journalRunText(window(false), { cols: 80, rows: 24 }, run)).text, '\nline');
   assert.equal((await journalRunText(window(true), { cols: 80, rows: 24 }, run)).text, '\n\nline', 'a tail window');
+});
+
+test('the cut decides each probe echo with one pass over the answers: 120,000 echoes each followed by a rejected answer cost what as many echoes with no answer do', () => {
+  // An independent read of the fixes for #22: each echo's decision looked through every answer from the start, 2.3 s by shape
+  // and 3.9 s with a nonce at 100,000 pairs; a Run's text reads up to 4 MiB, about 80,000 such pairs. Timed against the same
+  // echoes followed by a line that is no answer, on the same machine at the same moment, so a loaded machine slows both:
+  // the old pass took 5 to 9 times as long on the answers, this one about the same.
+  const n = 'a1b2c3d4';
+  const echo = sourceLine('/tmp/x/tsm-cmd-3', 'posix', n);
+  const shapes: Array<[string, Parameters<typeof cutPlumbing>[1], string, string]> = [
+    ['by shape', {}, `<<<PRO""BE:zz\r\n`, `<<<PROBE:zz:1:yy>>>\r\n`],
+    ['marker, a stranger’s pid', { strategy: 'marker', nonce: n }, `${markerProbe(n).trim()}\r\n`, `<<<PROBE:${n}:999>>>\r\n`],
+    ['inline, a stranger’s pid', { strategy: 'inline', nonce: n, pid: '42' }, `${inlineProbe(n, false).trim()}\r\n`, `<<<PROBE:${n}:999:x>>>\r\n`],
+  ];
+  const wrap = (body: string) => `${echo}\r\n<<<START:${n}:42>>>\r\n${body}after\r\n<<<EXIT:${n}:0>>>\r\n`;
+  for (const [name, of, probe, answer] of shapes) {
+    const answered = wrap((probe + answer).repeat(120_000));
+    const unanswered = wrap((probe + answer.replace('PROBE', 'PROBX')).repeat(120_000));
+    let ms = Infinity;
+    let base = Infinity;
+    // Measured again, keeping each one's fastest, only when a moment's load made the first pair miss.
+    for (let i = 0; i < 2 && !(ms < 3 * base + 50); i++) {
+      let t = performance.now();
+      const cut = cutPlumbing(answered, of);
+      ms = Math.min(ms, performance.now() - t);
+      assert.equal(cut, 'after\r\n', name);
+      t = performance.now();
+      cutPlumbing(unanswered, of);
+      base = Math.min(base, performance.now() - t);
+    }
+    assert.ok(ms < 3 * base + 50, `${name}: ${Math.round(ms)} ms with the answers, ${Math.round(base)} ms without`);
+  }
 });

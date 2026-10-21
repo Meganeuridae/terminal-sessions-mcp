@@ -565,9 +565,14 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
   // `Continue? [y/N] ` with it (the house's review of f3750e4..4f4c067, PR #22, comment 6315636412).
   const strikeEcho = striker();
   const probes = [...rest.matchAll(probeEcho(of.nonce))].filter((m) => m.index < to);
+  // The echoes and the answers both go forward: one index into the answers, not a search of them all
+  // per echo, which held the event loop for seconds on 100,000 echoes each followed by a rejected
+  // answer (an independent read of the fixes for #22).
+  let a = 0;
   probes.forEach((m, k) => {
     const next = probes[k + 1]?.index ?? Number.POSITIVE_INFINITY;
-    strikeEcho(m.index, m.index + m[0].length - 1, answers.some((a) => a > m.index && a < next));
+    while (a < answers.length && answers[a]! <= m.index) a++;
+    strikeEcho(m.index, m.index + m[0].length - 1, a < answers.length && answers[a]! < next);
   });
   // Each kept piece, whether it ends where a struck line begins, and where in the raw it begins when a
   // string the struck line before it opened runs on into it.
@@ -645,8 +650,12 @@ function firstAtOrAfter(xs: number[], x: number): number {
  */
 function markTraceStart(text: string, to: number, nonce: string, prefix: string | undefined): number {
   const lineStart = text.lastIndexOf('\n', to - 2) + 1;
-  const t = new RegExp(`printf ([^\\n]*)<<<(?:EXIT|PROBE):${literal(nonce)}'?(?: -?\\d+)?\\n$`).exec(text.slice(lineStart, to));
-  if (!t) return to;
-  const head = prefix ?? (t[1]!.includes('\\\\n') ? '> ' : undefined);
-  return head && text.slice(lineStart, lineStart + t.index).endsWith(head) ? lineStart + t.index - head.length : lineStart;
+  const line = text.slice(lineStart, to);
+  const mark = new RegExp(`<<<(?:EXIT|PROBE):${literal(nonce)}'?(?: -?\\d+)?\\n$`).exec(line);
+  // The trace's command is the line's last `printf ` before the mark: a program's unterminated line before the trace may hold
+  // one of its own (`abc printf x`), and taking the first took that line with the trace (an independent read of the fixes for #22).
+  const at = mark ? line.lastIndexOf('printf ', mark.index) : -1;
+  if (at === -1) return to;
+  const head = prefix ?? (line.slice(at, mark!.index).includes('\\\\n') ? '> ' : undefined);
+  return head && line.slice(0, at).endsWith(head) ? lineStart + at - head.length : lineStart;
 }
