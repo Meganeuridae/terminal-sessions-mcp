@@ -812,6 +812,8 @@ interface Unit {
   envFiles?: string[];
   managerEnv?: Record<string, string>;
   managerFails?: boolean;
+  /** systemd only: the unit's UnsetEnvironment=, each a name or one assignment. */
+  unset?: string[];
 }
 
 /** The two supervisors' answers for a loaded unit: a launchd job's `print` and a systemd unit's `show`, with the same command line and environment. */
@@ -829,7 +831,7 @@ function unitStub(u: Unit): Stub {
     `ExecStart={ path=/bin/sh ; argv[]=/bin/sh /pkg/next/config/termd-launch.sh ${args.join(' ')} ; ignore_errors=no }`,
     `Environment=${words(env)}`,
     ...(u.envFiles ?? []).map((f) => `EnvironmentFiles=${f}`),
-    'UnsetEnvironment=',
+    `UnsetEnvironment=${(u.unset ?? []).join(' ')}`,
   ];
   // `systemctl --user show termd …` asks about the unit; `systemctl --user show --property=Environment`, the manager.
   const manager = u.managerFails ? "echo 'Failed to connect to bus: No medium found' >&2; exit 1" : `printf '%s\\n' ${q(`Environment=${words(Object.entries(u.managerEnv ?? {}))}`)}`;
@@ -845,7 +847,10 @@ function unitStub(u: Unit): Stub {
     '\t}',
     '}',
   ];
-  return { launchctl: `printf '%s\\n' ${launchctl.map(q).join(' ')}`, systemctl: `case " $* " in *" termd "*) printf '%s\\n' ${systemctl.map(q).join(' ')} ;; *) ${manager} ;; esac` };
+  // The unit's answer holds only the properties asked for, as systemctl's does, so a property the shim stops
+  // asking for is one it no longer reads (the house's read of the 40 commits over our fixes, #22).
+  const asked = `props=,; for a in "$@"; do case $a in --property=*) props="$props\${a#--property=}," ;; esac; done; for l in ${systemctl.map(q).join(' ')}; do case $props in *",\${l%%=*},"*) printf '%s\\n' "$l" ;; esac; done`;
+  return { launchctl: `printf '%s\\n' ${launchctl.map(q).join(' ')}`, systemctl: `case " $* " in *" termd "*) ${asked} ;; *) ${manager} ;; esac` };
 }
 
 /** The answers that are not a loaded unit: nothing managed; a check that does not answer in time; a check that fails (systemctl without the user manager's bus, launchctl without a GUI domain, as over ssh). */
@@ -1037,6 +1042,10 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     { name: 'environment-file-and-both-flags', when: linux, stub: () => unitStub({ port: 3101, dataDir: path.join(tmp, 'unit-data'), envFiles: ['/etc/termd.env (ignore_errors=no)'] }), expect: 'start', says: /serves port 3101 out of \S+unit-data, not \d+: a termd for \d+ is started here/ },
     // The user manager's environment reaches the unit's termd: read from Environment= alone, its data dir was $HOME/.tsm.
     { name: 'data-dir-in-the-manager-environment', when: linux, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir } }), expect: 'shared', says: /serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
+    // UnsetEnvironment= takes the manager's TSM_DATA_DIR away: the unit's termd uses $HOME/.tsm. The stub answers
+    // only what is asked, so a query or a call without UnsetEnvironment reads the manager's (the house's read of
+    // the 40 commits over our fixes, #22).
+    { name: 'data-dir-unset-from-the-manager-environment', when: linux, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir }, unset: ['TSM_DATA_DIR'] }), expect: 'start', says: /serves port 3101 out of \S+\/\.tsm, not \d+: a termd for \d+ is started here/ },
     { name: 'manager-environment-query-fails', when: linux, stub: () => unitStub({ port: 3101, managerFails: true }), expect: 'unknown', says: /systemctl --user show \(the user manager's environment, which the unit's termd inherits\) failed \(Failed to connect to bus: No medium found\), so the unit's port and data dir are unknown/ },
     { name: 'launchctl-no-arguments-block', when: darwin, stub: () => ({ launchctl: `printf '%s\\n' 'com.animalabs.termd = {' '\tprogram = /usr/local/bin/termd' '\tenvironment = {' '\t\tTSM_PORT => ${port}' '\t}' '}'`, systemctl: 'exit 1' }), expect: 'unknown', says: /launchctl print shows no arguments for the launchd job com\.animalabs\.termd \(a job naming Program alone, whose program's own arguments are not shown\), so its port and data dir are unknown/ },
   ];
