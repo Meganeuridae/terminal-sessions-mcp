@@ -20,6 +20,8 @@ import { stripEscapes } from './text.js';
 import type { RunStrategy } from './types.js';
 
 const NONCE = '[^:>\\s]+';
+/** Text as a regex that matches it alone. */
+const literal = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** The inline start marker; group 1 is the shell's pid. */
 export const startMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<START:${nonce}:(\\d+)>>>`);
@@ -31,7 +33,11 @@ export const exitMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<EXIT:$
  * from before it was printed).
  */
 export const probeMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<PROBE:${nonce}(?::(\\d+)(?::(${NONCE}|))?)?>>>`);
-const MARK_NONCE = new RegExp(`<<<(?:START|EXIT|PROBE):(${NONCE})`);
+/** A piece of a declared shell's body acknowledged (inline strategy); group 1 is the piece's number. */
+export const ackMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<ACK:${nonce}:(\\d+)>>>`);
+/** A line of a declared shell's body that did not arrive whole, so the body was never run (inline strategy). */
+export const goneMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<GONE:${nonce}>>>`);
+const MARK_NONCE = new RegExp(`<<<(?:START|EXIT|PROBE|ACK|GONE):(${NONCE})`);
 /** The nonce a printed mark carries, for a reader that found the mark by its shape and must know whose it is (the compat pack's logs); undefined for text that is no mark. */
 export const nonceOf = (mark: string): string | undefined => MARK_NONCE.exec(mark)?.[1];
 /**
@@ -44,7 +50,7 @@ export const nonceOf = (mark: string): string | undefined => MARK_NONCE.exec(mar
  */
 const redrawn = (s: string): string => {
   if (s === NONCE) return NONCE;
-  const chars = s.split('').map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const chars = s.split('').map(literal);
   return chars.map((c) => `${c}(?:\\s*${c})?`).join('\\s*');
 };
 /** A mark's word as the typed lines spell it, split by two quotes (`EXI""T`), each piece as it may be redrawn. */
@@ -92,6 +98,22 @@ export const probeEcho = (nonce: string = NONCE): RegExp =>
   new RegExp([...PROBE_LINES].map(([head, rests]) => `${redrawn(head)}\\s*${redrawn(nonce)}(?:\\s*(?:${rests.map(redrawn).join('|')}))?`).join('|'), 'g');
 /** A probe answer with its nonce (1), pid (2) and token (3). */
 const probeAnswer = (nonce: string): RegExp => new RegExp(`<<<PROBE:(${nonce})(?::(\\d+)(?::(${NONCE}|))?)?>>>`, 'g');
+
+/**
+ * How each line the inline strategy types for a Run's body begins (session.ts inlineLines): the
+ * first piece setting the body's variable, a later piece appending to it, and the line that runs it
+ * after pieces, in sh's syntax and in fish's. A single line is a first piece that runs it too.
+ */
+const BODY_HEADS = [` __tsm_b='`, ` __tsm_b=\${__tsm_b-}'`, ` if [ "\${__tsm_b+set}" = set ]`, ` set -g __tsm_b '`, ` set -g __tsm_b "$__tsm_b"'`, ` if set -q __tsm_b; and `];
+/**
+ * The echo of a line the inline strategy typed for a declared shell's body, from its head to the end
+ * of the line, for a reader of the session's text as a whole, as the terminal showed it, which no Run
+ * renderer cuts for (the compat pack's logs): the compat pack kept its own copy of the marker
+ * strategy's shapes, and a declared shell's typed body reached its logs (a reviewer's read of the
+ * fixes for #22). The probe lines' echo is probeEcho's; the marks these lines print are startMark,
+ * exitMark, ackMark and goneMark. A spec ties the heads to inlineLines.
+ */
+export const inlineTypedLine = (): RegExp => new RegExp(`(?:${BODY_HEADS.map(literal).join('|')})[^\\n]*`);
 
 /** What a Run's output holds besides the command's own, as its run.start recorded it. */
 export interface PlumbingOf {

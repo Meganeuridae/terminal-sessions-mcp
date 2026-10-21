@@ -459,7 +459,13 @@ function launchAgentOnDisk(): string | undefined {
   return undefined;
 }
 
-/** The LaunchAgent's plist: ProgramArguments' `<string>`s, whole, and EnvironmentVariables' pairs; or why it could not be read. */
+/**
+ * The LaunchAgent's plist: ProgramArguments' `<string>`s, whole, and EnvironmentVariables' pairs; or
+ * why it could not be read. A plist without a ProgramArguments array in XML is not read as no
+ * arguments: a binary plist (as `plutil -convert binary1` writes it) has no text to find them in, and a
+ * job naming `Program` alone runs a program whose own arguments are not here; either was taken for
+ * termd's defaults (a reviewer's read of the fixes for #22).
+ */
 function plistUnit(file: string): UnitText | { error: string } {
   let xml: string;
   try {
@@ -467,8 +473,10 @@ function plistUnit(file: string): UnitText | { error: string } {
   } catch (e) {
     return { error: (e as NodeJS.ErrnoException).code ?? (e as Error).message };
   }
+  if (xml.startsWith('bplist')) return { error: 'a binary plist, which is not read here' };
   const text = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
-  const args = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(xml)?.[1] ?? '';
+  const args = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(xml)?.[1];
+  if (args === undefined) return { error: 'no ProgramArguments array in it' };
   const argv = [...args.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => text(m[1]!));
   const env: Record<string, string> = {};
   const dict = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(xml)?.[1] ?? '';

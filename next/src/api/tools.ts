@@ -825,7 +825,7 @@ export const TOOLS: ToolDef[] = [
     name: 'watch',
     tier: 'watch',
     description:
-      'Set a standing watch on a session that notifies you when it fires: `pattern` (a regex matched per output line — `^`/`$` are line ends, and a ' +
+      'Set a standing watch on a session that notifies you when it fires: `pattern` (a regex matched per output line as the terminal shows it, a tab as the spaces to the next tab stop — `^`/`$` are line ends, and a ' +
       'prompt with no newline counts after 0.5 s of quiet), `silenceMs` (output stopped for ' +
       'that long), or `idle` (the shell became free after running something). Give exactly one. `label` names it in notifications; `once` removes ' +
       'it after the first firing. Notifications need an MCPL connection; on plain MCP a watch only counts its firings (see `watches`) — use ' +
@@ -879,7 +879,8 @@ export const TOOLS: ToolDef[] = [
     tier: 'watch',
     description:
       'Block up to `wait` ms until a session shows `pattern` in its output, goes quiet for `silenceMs`, or becomes `idle`. With `since`, output ' +
-      'already printed after that cursor counts, so a line printed before the call is not missed. Patterns match per output line. Returns ' +
+      'already printed after that cursor counts, so a line printed before the call is not missed. Patterns match per output line, as the terminal shows it: ' +
+      'a tab is the spaces up to the next tab stop, so match it with ` +` or `\\s+`, not `\\t`. Returns ' +
       'matched: false when the wait ends first, and at once with a `reason` when it can no longer be met (the shell exited, the Run ended). ' +
       '`nextCursor` is the position of the match (or the journal’s end when nothing matched): pass it as the next wait’s `since` to go on from there.',
     inputSchema: {
@@ -911,7 +912,8 @@ export const TOOLS: ToolDef[] = [
     description:
       "Search a session's output history with a regex, line by line: each match comes with lines of context and a `cursor`, plus an `offset` when the line " +
       'lies inside a long output event — `read since=<cursor> offset=<offset>` reads on from the matching line (each match’s own `[read …]` hint spells it out). ' +
-      'Patterns run on a linear-time engine: no back-references or lookahead. Without `since`, the recent past is ' +
+      'Patterns run on a linear-time engine: no back-references or lookahead. A line reads as the terminal shows it: a tab is the spaces up to the next ' +
+      'tab stop, so match it with ` +` or `\\s+`, not `\\t`. Without `since`, the recent past is ' +
       'scanned and the result says if older history was left out, as it says what it skipped (gaps, over-long lines). Use `read` to page through output.',
     inputSchema: {
       type: 'object',

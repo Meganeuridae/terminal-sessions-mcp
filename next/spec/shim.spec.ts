@@ -962,6 +962,20 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     fs.chmodSync(path.join(home, 'Library', 'LaunchAgents', 'com.animalabs.termd.plist'), 0o000);
     return home;
   };
+  /**
+   * As plistHome, with a plist launchd reads and the shim does not: binary (`plutil -convert binary1`), or
+   * naming `Program` alone, with no ProgramArguments array. Both were read as termd's defaults (a
+   * reviewer's read of the fixes for #22). Should a termd be started anyway, it exits at once: its log
+   * path in the case's data dir is a directory.
+   */
+  const otherFormPlistHome = (name: string, form: 'binary' | 'program'): string => {
+    const home = plistHome(name, 3101);
+    const file = path.join(home, 'Library', 'LaunchAgents', 'com.animalabs.termd.plist');
+    if (form === 'binary') execFileSync('plutil', ['-convert', 'binary1', file]);
+    else fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/<key>ProgramArguments<\/key>\s*<array>[\s\S]*?<\/array>/, '<key>Program</key><string>/usr/local/bin/termd</string>'));
+    fs.mkdirSync(path.join(tmp, `sup-${name}`, 'termd.log'), { recursive: true });
+    return home;
+  };
   interface Case {
     name: string;
     when: boolean;
@@ -979,6 +993,8 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     { name: 'shared-data-dir-with-spaces-in-environment', when: true, stub: (dataDir) => unitStub({ port: 3101, env: { TSM_DATA_DIR: dataDir } }), dataDir: spaced('env'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup env with spaces, which a termd/ },
     { name: 'launchctl-not-loaded-plist-shared-with-spaces', when: darwin, stub: 'none', home: plistHome('not-loaded-spaces', 3101, spaced('plist')), dataDir: spaced('plist'), expect: 'shared', says: /LaunchAgent com\.animalabs\.termd \(.*\) serves port 3101 out of the data dir \S+\/sup plist with spaces, which a termd/ },
     { name: 'launchctl-not-loaded-plist-unreadable', when: darwin && process.getuid?.() !== 0, stub: 'none', home: unreadablePlistHome('unreadable', port), expect: 'unknown', says: /the LaunchAgent com\.animalabs\.termd is on disk \(\S+\.plist\) but could not be read \(EACCES\), so its port and data dir are unknown/ },
+    { name: 'launchctl-not-loaded-plist-binary', when: darwin, stub: 'none', home: darwin ? otherFormPlistHome('launchctl-not-loaded-plist-binary', 'binary') : '', expect: 'unknown', says: /the LaunchAgent com\.animalabs\.termd is on disk \(\S+\.plist\) but could not be read \(a binary plist, which is not read here\), so its port and data dir are unknown/ },
+    { name: 'launchctl-not-loaded-plist-program-only', when: darwin, stub: 'none', home: darwin ? otherFormPlistHome('launchctl-not-loaded-plist-program-only', 'program') : '', expect: 'unknown', says: /the LaunchAgent com\.animalabs\.termd is on disk \(\S+\.plist\) but could not be read \(no ProgramArguments array in it\), so its port and data dir are unknown/ },
     { name: 'execstart-in-another-shape', when: linux, stub: () => ({ launchctl: 'exit 113', systemctl: "printf '%s\\n' 'LoadState=loaded' 'ActiveState=active' 'UnitFileState=disabled' 'ExecStart=/bin/sh /pkg/next/config/termd-launch.sh --port 3101' 'Environment='" }), expect: 'unknown', says: /ExecStart is not in the shape read here/ },
     { name: 'data-dir-flag-without-a-value', when: true, stub: () => unitStub({ port: 'none', dataDir: '--port 3101' }), expect: 'dangling', says: /names --data-dir without a value, so the data dir its termd uses is unknown: none is started here/ },
     { name: 'systemctl-no-bus', when: linux, stub: 'failed', expect: 'unknown', says: /systemctl --user show termd failed \(Failed to connect to bus: No medium found\), so whether a unit manages termd is unknown; the user manager is reached through XDG_RUNTIME_DIR/ },

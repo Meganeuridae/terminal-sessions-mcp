@@ -16,6 +16,7 @@ import { SessionRegistry } from '../src/api/registry.js';
 import { callTool, toolsFor } from '../src/api/tools.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { clocks } from '../src/core/clock.js';
+import { probeEcho } from '../src/core/plumbing.js';
 import { fakeShellBackend } from './fake-shell.js';
 import { until } from './testhost.js';
 
@@ -414,6 +415,62 @@ test('a reviewer’s read: a first line begun before the tail’s 1 MiB is said 
   const before = (await call('read', { ...(JSON.parse(m![1]!) as Obj), maxBytes: 1024 * 1024 })) as unknown as { text: string };
   assert.ok(before.text.endsWith('zzz') && !before.text.includes('-TAIL'), 'the page before ends with the line’s earlier part');
   await call('killSession', { session: 'begunline', graceful: false });
+});
+
+test('a reviewer’s read: a declared shell’s typed body, its start mark and its pieces’ marks stay out of the logs, and a program’s mark-shaped line stays in', async () => {
+  // compat cut by its own copy of the marker strategy's shapes: a declared sh's typed body and its
+  // `<<<START:…>>>` showed in tailLogs (a reviewer's read of the fixes for #22).
+  const opened = await call('runCommand', { session: 'declog', command: 'sh', timeout: -1 });
+  await until(() => summary('declog')?.runs?.some((x) => x.runId === opened.runId && x.state === 'running') === true, 5000, 'sh in front');
+  await call('session_declare_shell', { session: 'declog', shell: 'sh' });
+  assert.equal((await call('runCommand', { session: 'declog', command: 'echo declared-hello' })).exitCode, 0);
+  // A body longer than one typed line goes in pieces, each acknowledged by a mark.
+  const long = `echo long-${'x'.repeat(1500)}`;
+  assert.equal((await call('runCommand', { session: 'declog', command: long })).exitCode, 0);
+  assert.equal((await call('runCommand', { session: 'declog', command: 'echo "<<<START:abc:12>>> a program line"' })).exitCode, 0);
+  await until(() => summary('declog')?.runs?.every((x) => x.runId === opened.runId || x.state === 'exited') === true, 5000, 'the Runs ended');
+  const live = registry.get('declog');
+  assert.ok(live?.kind === 'live');
+  const nonces = live.session.listRuns().flatMap((r) => (r.nonce === undefined ? [] : [r.nonce]));
+  assert.ok(nonces.length >= 3, JSON.stringify(nonces));
+  for (const raw of [false, true]) {
+    const tail = lines(await call('tailLogs', { session: 'declog', lines: 40, raw }));
+    const said = `raw ${raw}: ${JSON.stringify(tail.map((l) => l.slice(0, 80)))}`;
+    assert.ok(!tail.some((l) => l.includes('__tsm_')), `no typed body: ${said}`);
+    assert.ok(!tail.some((l) => nonces.some((n) => l.includes(n))), `no mark of the Runs': ${said}`);
+    const at = tail.indexOf('$ echo declared-hello');
+    assert.ok(at >= 0 && tail[at + 1] === 'declared-hello', `the command line, then its output: ${said}`);
+    assert.ok(tail.includes(`long-${'x'.repeat(1500)}`), said);
+    assert.ok(tail.includes('<<<START:abc:12>>> a program line'), `a mark-shaped line with no Run's nonce is the program's: ${said}`);
+  }
+  await call('killSession', { session: 'declog', graceful: false });
+});
+
+test('a reviewer’s read: the probe line a cancel types into a declared shell stays out of the logs, cut by the cutter’s own matcher', async () => {
+  // The program ignores ^C, so the session types its end-marker probe (plumbing.ts inlineProbe) before it
+  // escalates; compat struck that line's echo with a copy of the builders, now with probeEcho itself.
+  const opened = await call('runCommand', { session: 'probelog', command: 'bash --norc --noprofile', timeout: -1 });
+  await until(() => summary('probelog')?.runs?.some((x) => x.runId === opened.runId && x.state === 'running') === true, 5000, 'bash in front');
+  await call('session_declare_shell', { session: 'probelog', shell: 'bash' });
+  const stuck = await call('runCommand', { session: 'probelog', command: '(trap "" INT; sleep 5)', timeout: 500 });
+  assert.equal(stuck.state, 'running', JSON.stringify(stuck));
+  const cancelled = await app.cancel(A, { runId: String(stuck.runId) });
+  assert.match(cancelled.steps.join(' '), /end-marker probe/, 'the probe was typed');
+  assert.equal((await call('runCommand', { session: 'probelog', command: 'echo after-the-cancel' })).exitCode, 0);
+  const live = registry.get('probelog');
+  assert.ok(live?.kind === 'live');
+  // The echo can come in pieces across many small output events: looked for in them joined, on one page.
+  const page = await app.read(A, { session: 'probelog', since: 0, as: 'events', limit: 2000, maxBytes: 1024 * 1024, advance: false });
+  assert.equal(page.more, false);
+  const output = page.events!.map((e) => (e.type === 'output' ? e.data : '')).join('');
+  assert.ok(probeEcho().test(output), 'the probe line’s echo is in the journal');
+  for (const raw of [false, true]) {
+    const tail = lines(await call('tailLogs', { session: 'probelog', lines: 40, raw }));
+    const said = `raw ${raw}: ${JSON.stringify(tail)}`;
+    assert.ok(!tail.some((l) => /PRO''BE|<<<PROBE/.test(l)), `no probe line, no probe answer: ${said}`);
+    assert.ok(tail.includes('$ (trap "" INT; sleep 5)') && tail.includes('after-the-cancel'), said);
+  }
+  await call('killSession', { session: 'probelog', graceful: false });
 });
 
 test('the 38 commits: a raw tail that reaches its 1 MiB bound says so, and the page it advises ends right where its lines begin', async () => {

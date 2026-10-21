@@ -95,6 +95,13 @@ tiers take an `idempotencyKey` (a fresh UUID per operation): a retry returns the
 instead of running twice, also across a daemon restart for `run` and `start`. The 1.x
 compatibility tools do not take one (1.x had none) and ignore one passed to them.
 
+The patterns of `search`, `watch`, `wait_for` and a service's readiness and failure probes match
+one output line at a time, as the terminal shows it: escape sequences are gone, and a tab is the
+spaces up to the next tab stop (every eight columns). So `key\tvalue` does not match a line
+printed with a tab; `key\s+value` does. A line longer than the pattern's match window is matched
+on its head only, and the result, or the notice, says so. 1.x's `searchLogs` matched a tab as
+`\t`; the compat tool of that name reads lines as the others do.
+
 A result `lost` means the daemon could not observe the command's end and refuses to
 guess (DESIGN G3); the reason says why. The common self-inflicted one is `shell-exited
 (status N)`: the shell running the command exited under it. That happens when a command
@@ -226,7 +233,9 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   exit within the unit's `TimeoutStopSec` is SIGKILLed alone, and the process Runs it had not yet
   ended keep running until the next start's recovery. That ends the groups it can tie to their
   Runs; a group it cannot tell from a stranger's that reused the id is left running, with a note
-  in the session's history, and with no process listing (no `/proc`, no `ps`) it ends none.
+  in the session's history. With no process listing (no `/proc`, no `ps`) it ends none and says
+  so, in each of those Runs' histories and once in the log; a later recovery that can list
+  processes judges those groups.
 - **Supervision.** `next/config/com.animalabs.termd.plist` (launchd), `next/config/termd.service`
   (systemd). SIGTERM ends sessions cleanly.
 - **History on disk.** Kept whole by default; `--retention-bytes` and `--retention-days` cap it

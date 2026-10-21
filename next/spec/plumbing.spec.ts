@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
-import { cutPlumbing, exitMark, inlineProbe, markerProbe, nonceOf, probeEcho, probeMark, startMark } from '../src/core/plumbing.js';
+import { ackMark, cutPlumbing, exitMark, goneMark, inlineProbe, inlineTypedLine, markerProbe, nonceOf, probeEcho, probeMark, startMark } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { journalRunText } from '../src/core/segmenter.js';
 import type { RunOutput } from '../src/core/runindex.js';
@@ -280,4 +280,26 @@ test('the probe lines the session types are the ones the grammar parses and the 
     // The matcher a reader without the nonce uses (the compat pack's logs) takes the whole line for any Run's.
     assert.equal([...line.matchAll(probeEcho())][0]?.[0], line.slice(line.indexOf('<<<')), `${name}: with no nonce, the line from its mark to its end`);
   }
+});
+
+test('every line the inline strategy types is the typed-line echo whole, and the marks its pieces print are the grammar’s', () => {
+  // The compat pack's logs cut a declared shell's typed lines by this one shape, where its own copy of the
+  // marker strategy's shapes had left them in (a reviewer's read of the fixes for #22): heads that drift
+  // from inlineLines would leave a body in the logs again.
+  const whole = new RegExp(`^(?:${inlineTypedLine().source})$`);
+  for (const fish of [false, true]) {
+    for (const body of ['echo hi', `echo ${'x'.repeat(3000)}`]) {
+      const typed = inlineLines(body, 'n0ff', fish);
+      if (body.length > 1000) assert.ok(typed.length > 2, 'a long body goes in pieces');
+      typed.forEach((line, i) => {
+        assert.match(line, whole, `fish ${fish}, line ${i}: ${line.slice(0, 60)}`);
+        assert.match(`sh-3.2$ ${line}`, inlineTypedLine(), 'after a prompt too');
+        assert.match(printed(line), goneMark('n0ff'), 'every line prints the gone mark when the text so far is not whole');
+        if (i < typed.length - 1) assert.equal(ackMark('n0ff').exec(printed(line))?.[1], String(i + 1), 'a piece prints its acknowledgement');
+      });
+    }
+  }
+  assert.equal(nonceOf('<<<ACK:n0ff:2>>>'), 'n0ff');
+  assert.equal(nonceOf('<<<GONE:n0ff>>>'), 'n0ff');
+  for (const line of ['__tsm_b is a name', 'echo done', ' set -g PATH /bin']) assert.doesNotMatch(line, inlineTypedLine(), line);
 });

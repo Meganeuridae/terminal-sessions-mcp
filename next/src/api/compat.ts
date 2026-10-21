@@ -11,7 +11,7 @@
 import { clocks } from '../core/clock.js';
 import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
-import { exitMark, nonceOf, probeMark } from '../core/plumbing.js';
+import { ackMark, exitMark, goneMark, inlineTypedLine, nonceOf, probeEcho, probeMark, startMark } from '../core/plumbing.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
 import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
 import { commitReadDelivery, takeReadCommit, type App, type ReadResult, type SessionSummary } from './app.js';
@@ -127,11 +127,15 @@ async function runOutput(ctx: ToolContext, session: string, runId: string, raw: 
 /**
  * The daemon's own typed line as the shell echoes it (Session.sourceLine): ` . '<dir>/tsm-cmd-N'`,
  * `command . '…'` with the chained exit echo under the marker strategy, fish's
- * `eval (__tsm_collect '…' $status)`, and the marks the marker and inline strategies print. 1.x
- * kept these out of its logs and logged `$ <command>` in their place (the house's read of 1cabc6a, #22).
+ * `eval (__tsm_collect '…' $status)`; the lines typed for a declared shell's body (plumbing.ts
+ * inlineTypedLine); and the marks both strategies print, from the core's grammar. The probe lines
+ * typed after a ^C are struck by the cutter's own matcher (keptLines). 1.x kept these out of its logs
+ * and logged `$ <command>` in their place (the house's read of 1cabc6a, #22). The inline strategy's
+ * body, its start mark and its pieces' marks reached the logs while this held a copy of the marker
+ * strategy's shapes alone (a reviewer's read of the fixes for #22).
  */
 const TYPED_LINE = /(?:command )?\. '(?:[^'\n]|'\\'')*\/tsm-cmd-\d+'(?:; echo "<<<EXI""T:[0-9a-f]+:\$\?>>>")?|eval \(__tsm_collect '(?:[^'\n]|'\\'')*\/tsm-cmd-\d+' \$status\)/;
-const PLUMBING = new RegExp(`${TYPED_LINE.source}|${exitMark().source}|${probeMark().source}`, 'g');
+const PLUMBING = new RegExp([TYPED_LINE, inlineTypedLine(), startMark(), exitMark(), probeMark(), ackMark(), goneMark()].map((re) => re.source).join('|'), 'g');
 
 /**
  * What tells the daemon's plumbing from a program's in a stretch of the session's text: the nonces
@@ -163,21 +167,64 @@ function withoutPlumbing(line: string, p: Plumbing): string | null {
   return kept.trim().length ? kept.trimEnd() : null;
 }
 
-/** Log lines with the plumbing removed; a line that held nothing else is dropped. */
-const withoutPlumbingLines = (lines: string[], p: Plumbing): string[] =>
-  lines.flatMap((l) => {
+const START = startMark();
+
+/**
+ * The lines a probe line's echo spans, by index in `lines`: found by the cutter's own matcher
+ * (plumbing.ts probeEcho), a redraw's breaks included, and struck whole as cutPlumbing strikes them,
+ * whatever nonce the typed line carries, as any typed line is the daemon's. A prompt the shell
+ * printed on that line goes with it.
+ */
+function probeLines(lines: string[]): Set<number> {
+  const struck = new Set<number>();
+  const text = lines.join('\n');
+  if (!text.includes('<')) return struck;
+  const starts: number[] = [];
+  let at = 0;
+  for (const l of lines) {
+    starts.push(at);
+    at += l.length + 1;
+  }
+  const lineAt = (offset: number): number => {
+    let lo = 0;
+    let hi = starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (starts[mid]! <= offset) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  };
+  for (const m of text.matchAll(probeEcho())) for (let i = lineAt(m.index); i <= lineAt(m.index + m[0].length - 1); i++) struck.add(i);
+  return struck;
+}
+
+/**
+ * Log lines with the plumbing removed, each with its index in `lines`; a line that held nothing else
+ * is dropped, and so is every line a probe's echo spans (probeLines). A start mark cut takes its
+ * line's end with it: the Run starts at the mark (run.start follows it), so the `$ <command>` line
+ * the reader puts there comes before the mark's line ends, and that end showed as an empty line
+ * under the command line.
+ */
+function keptLines(lines: string[], p: Plumbing): Array<[string, number]> {
+  const kept: Array<[string, number]> = [];
+  const probes = probeLines(lines);
+  let markEnd = -1;
+  lines.forEach((l, i) => {
+    if (i === markEnd || probes.has(i)) return;
     const k = withoutPlumbing(l, p);
-    return k === null ? [] : [k];
+    if (k !== null) kept.push([k, i]);
+    else if (START.test(l) && lines[i + 1]?.startsWith('$ ') && /^\s*$/.test(lines[i + 2] ?? '-')) markEnd = i + 2;
   });
+  return kept;
+}
+
+/** Log lines with the plumbing removed (keptLines). */
+const withoutPlumbingLines = (lines: string[], p: Plumbing): string[] => keptLines(lines, p).map(([l]) => l);
 
 /** The last `n` of `lines` without the plumbing, and the index in `lines` of the first one kept. */
 function keepLines(lines: string[], n: number, p: Plumbing): { lines: string[]; first?: number } {
-  const kept: Array<[string, number]> = [];
-  lines.forEach((l, i) => {
-    const k = withoutPlumbing(l, p);
-    if (k !== null) kept.push([k, i]);
-  });
-  const last = kept.slice(-n);
+  const last = keptLines(lines, p).slice(-n);
   return last.length ? { lines: last.map(([l]) => l), first: last[0]![1] } : { lines: [] };
 }
 
@@ -661,7 +708,9 @@ export const COMPAT_TOOLS: ToolDef[] = [
   {
     name: 'searchLogs',
     tier: 'compat',
-    description: 'Search for patterns in session logs (the last 50,000 journal events; a trailing note says when older output or more matches exist).',
+    description:
+      'Search for patterns in session logs (the last 50,000 journal events; a trailing note says when older output or more matches exist). ' +
+      'Lines read as the terminal shows them: a tab is the spaces up to the next tab stop, so a pattern with \\t does not match it; use \\s+.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -684,7 +733,7 @@ export const COMPAT_TOOLS: ToolDef[] = [
       for (const m of r.matches) {
         // A match inside the daemon's own plumbing is not one 1.x would have shown (the house's read of 1cabc6a, #22):
         // the line is kept when what remains of it still matches.
-        const line = withoutPlumbing(m.line, p);
+        const line = keptLines([m.line], p)[0]?.[0] ?? null;
         if (line === null || (line !== m.line && !re.test(line))) continue;
         out.push({ lineNumber: m.lineNumber, line, context: withoutPlumbingLines([...m.before, m.line, ...m.after], p), seq: m.seq });
       }
