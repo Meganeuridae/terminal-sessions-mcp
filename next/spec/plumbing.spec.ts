@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { ackMark, commandFile, cutPlumbing, exitMark, goneMark, inlineProbe, inlineTypedLine, keptRanges, markerProbe, markerStartLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLine, sourceLineEcho, startMark } from '../src/core/plumbing.js';
+import { ackMark, commandFile, cutPlumbing, exitMark, goneMark, inlineProbe, inlineTypedLine, keptRanges, markerCommandText, markerProbe, nonceOf, probeEcho, probeMark, shellQuote, sourceLine, sourceLineEcho, startMark } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { journalRunText } from '../src/core/segmenter.js';
 import { transcript } from '../src/core/transcript.js';
@@ -321,9 +321,14 @@ test('the line that runs a command file, for each flavor, with the marker strate
       assert.match(line, whole, what);
       assert.equal(`bash-3.2$ ${line}`.replace(sourceLineEcho(), '').trimEnd(), 'bash-3.2$', `after a prompt, the whole line: ${what}`);
       if (nonce) {
-        // The marker strategy's Run output begins with the echo: the cutter takes it by the split end mark it carries.
-        assert.match(line, /; echo "<<<EXI""T:n0ff:\$(?:\?|status)>>>"$/, what);
+        // The marker strategy's Run output begins with the echo: the cutter takes it by the split end mark it carries,
+        // printed by printf (in dash, bash and zsh in a group whose trace goes nowhere).
+        assert.match(line, flavor === 'fish' ? /; printf '%s:%s>>>\\n' "<<<EXI""T:n0ff" \$status$/ : /; \{ printf '%s:%s>>>\\n' "<<<EXI""T:n0ff" "\$\?"; \} 2>\/dev\/null$/, what);
         assert.equal(cutPlumbing(`${line}\r\nout\r\n<<<EXIT:n0ff:0>>>\r\n`, { strategy: 'marker', nonce }), 'out\r\n', what);
+        // The line an earlier build typed, which journals keep, is still the echo.
+        const legacy = line.replace(/; .*$/, `; echo "<<<EXI""T:n0ff:${flavor === 'fish' ? '$status' : '$?'}>>>"`);
+        assert.match(legacy, whole, `legacy: ${what}`);
+        assert.equal(cutPlumbing(`${legacy}\r\nout\r\n<<<EXIT:n0ff:0>>>\r\n`, { strategy: 'marker', nonce }), 'out\r\n', `legacy: ${what}`);
       } else {
         // Under `basic` the output's first line is the echo.
         assert.equal(cutPlumbing(`${line}\r\nout\r\n`, { strategy: 'basic' }), 'out\r\n', what);
@@ -342,6 +347,7 @@ test('no pattern the grammar builds backtracks: every typed line, cut anywhere a
   const file = `/tmp/x/${commandFile(3)}`;
   const lines = [
     markerProbe(nonce),
+    markerProbe(nonce, 'fish'),
     inlineProbe(nonce, false),
     inlineProbe(nonce, true),
     ...(['posix', 'zsh', 'fish'] as const).flatMap((f) => [sourceLine(file, f, nonce), sourceLine(file, f)]),
@@ -395,46 +401,99 @@ test('under the marker strategy the start mark the command file prints bounds th
   assert.equal(cutPlumbing(`${typed(N)}<<<START:0badf00d:4242>>>\r\nout\r\n`, marker), '<<<START:0badf00d:4242>>>\r\nout\r\n');
 });
 
-test('under set -x the plumbing’s traces go: the typed line’s, before the start mark, and the end mark’s own, by the prefix the typed line’s trace showed or PS4’s default', () => {
-  // The house's read of the 33 commits (#22, comment 6307351104), item 9: dash traced the chained echo as a whole end mark, so
-  // the result kept `+ command . <file>` at its head and ended in a dangling `+ echo `.
-  const marker = { strategy: 'marker' as const, nonce: N };
-  const mark = `<<<START:${N}:4242>>>\r\n`;
-  const file = '/tmp/tsm-501/abc/tsm-cmd-1';
-  assert.equal(cutPlumbing(`${typed(N)}+ command . ${file}\r\n${mark}+ echo hi\r\nhi\r\n+ echo <<<EXIT:${N}:0>>>\r\n`, marker), '+ echo hi\r\nhi\r\n', 'dash');
-  assert.equal(cutPlumbing(`${typed(N)}+ command . ${file}\r\n+ . ${file}\r\n${mark}++ echo hi\r\nhi\r\n+ echo '<<<EXIT:${N}:0>>>'\r\n`, marker), '++ echo hi\r\nhi\r\n', 'bash, which quotes the word');
-  assert.equal(cutPlumbing(`${typed(N)}[t] command . ${file}\r\n${mark}partial[t] echo <<<EXIT:${N}:0>>>\r\n`, marker), 'partial', 'a PS4 of the user’s own, after output with no newline');
-  assert.equal(cutPlumbing(`${typed(N)}${mark}+ echo on\r\non\r\n+ echo '<<<EXIT:${N}:0>>>'\r\n`, marker), '+ echo on\r\non\r\n', 'the Run that turned tracing on');
-  assert.equal(cutPlumbing(`${typed(N)}${mark}say echo <<<EXIT:${N}:0>>>\r\n`, marker), 'say echo ', 'not tracing: a program’s line ending in `echo ` stays');
+/** Shells to run the marker strategy's lines in, each with its flavor and how it turns tracing on with a PS4 of its own. */
+const FISH = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find((p) => fs.existsSync(p));
+const MARKER_SHELLS = [
+  { shell: '/bin/dash', flavor: 'posix' as const, trace: "PS4='>> '; set -x; ", status: '$?' },
+  { shell: '/bin/bash', flavor: 'posix' as const, trace: "PS4='>> '; set -x; ", status: '$?' },
+  { shell: '/bin/zsh', flavor: 'zsh' as const, trace: "PS4='>> '; set -x; ", status: '$?' },
+  { shell: FISH, flavor: 'fish' as const, trace: 'set fish_trace 1; ', status: '$status' },
+].filter((x): x is typeof x & { shell: string } => x.shell !== undefined && fs.existsSync(x.shell));
+/** A script run by `shell -c`, its stderr (where every shell writes its trace) joined to its output. */
+const runMerged = (shell: string, script: string): string => execFileSync('/bin/sh', ['-c', 'exec "$0" -c "$1" 2>&1', shell, script], { encoding: 'utf8' });
+
+test('the marker strategy’s end mark and probe are printf-built: no `set -x` trace holds a whole mark, dash, bash and zsh trace neither, and the result ends at the real mark whatever PS4 is', () => {
+  // The house's review of the 40 commits through f3750e4 (PR #22, comment 6310921374), question 2 and the cutter's "left for
+  // later": dash traced the chained echo as the end mark itself, so the Run ended at the trace; a body that set PS4, or whose
+  // output had no line end before the trace, kept the trace's head (`>> echo `, `abc+ echo `).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-printf-mark-'));
+  try {
+    assert.ok(MARKER_SHELLS.length >= 3);
+    for (const { shell, flavor, trace } of MARKER_SHELLS) {
+      const what = path.basename(shell);
+      // A command file's own name: the typed line's trace is known by it.
+      fs.mkdirSync(path.join(dir, what));
+      const file = path.join(dir, what, commandFile(1));
+      for (const [head, body, shown] of [
+        [trace, 'echo hi\nprintf abc\n', flavor === 'fish' ? /^--> echo hi\nhi\n--> printf abc\nabc$/ : /^(>+ )echo hi\nhi\n\1printf abc\nabc$/],
+        ['', flavor === 'fish' ? 'set fish_trace 1\necho on\n' : "PS4='[t] '; set -x\necho on\n", flavor === 'fish' ? /^--> echo on\non\n$/ : /^\[+t\] echo on\non\n$/],
+      ] as const) {
+        fs.writeFileSync(file, markerCommandText(body, N, flavor));
+        const out = runMerged(shell, `${head}false; ${sourceLine(file, flavor, N).trimStart()}; ${markerProbe(N, flavor).trimStart()}`);
+        const said = `${what} ${JSON.stringify(head)}: ${JSON.stringify(out)}`;
+        assert.deepEqual([...out.matchAll(new RegExp(exitMark(N).source, 'g'))].map((m) => m[1]), ['0'], `one end mark, the real one: ${said}`);
+        assert.equal([...out.matchAll(new RegExp(probeMark(N).source, 'g'))].length, 1, `one probe answer: ${said}`);
+        if (flavor !== 'fish') assert.doesNotMatch(out, /printf[^\n]*<<<(?:EXIT|PROBE)/, `neither traced: ${said}`);
+        else if (head) assert.match(out, /abc> printf '%s:%s>>>\\\\n' '<<<EXIT:[^']*' 0\n/, `fish traces past the redirect: ${said}`);
+        assert.match(cutPlumbing(out, { strategy: 'marker', nonce: N }), shown, said);
+      }
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test('the marker strategy’s start line prints the Run’s start mark with the shell’s pid, keeps the status the shell had for the body, ends no shell under set -e, and traces nothing in dash and bash', () => {
-  // The house's answer 2 on the 33 commits (#22, comment 6307351985): `$?` after `false` is still 1 in the body.
+test('a trace a shell writes past the typed line’s redirect is named by the Run’s nonce: from the prefix the typed line’s trace showed, or else its whole line; a program’s lines in its shape stay', () => {
+  // fish writes its trace past any redirect, and bash does to a BASH_XTRACEFD; the trace of the printf-built mark holds none.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  const mark = `<<<START:${N}:4242>>>\r\n`;
+  const end = `<<<EXIT:${N}:0>>>\r\n`;
+  const file = '/tmp/tsm-501/abc/tsm-cmd-1';
+  const echo = `${sourceLine(file, 'fish', N)}\r\n`;
+  const fishTrace = `printf '%s:%s>>>\\\\n' '<<<EXIT:${N}' 0\r\n`;
+  assert.equal(cutPlumbing(`${echo}> source ${file}\r\n${mark}--> printf abc\r\nabc> ${fishTrace}${end}`, marker), '--> printf abc\r\nabc', 'the typed line’s trace showed the prefix: output with no line end stays');
+  assert.equal(cutPlumbing(`${echo}${mark}--> echo on\r\non\r\n> ${fishTrace}${end}`, marker), '--> echo on\r\non\r\n', 'the body turned tracing on: the trace’s line');
+  assert.equal(cutPlumbing(`${echo}${mark}--> printf abc\r\nabc> ${fishTrace}${end}`, marker), '--> printf abc\r\nabc', 'fish’s own prefix, which its trace’s doubled backslash shows');
+  assert.equal(cutPlumbing(`${echo}${mark}on\r\n[t] printf %s:%s>>>\\n <<<EXIT:${N} 0\r\n${end}`, marker), 'on\r\n', 'a PS4 of the body’s own, in dash’s shape');
+  const probe = `^C\r\n$ ${markerProbe(N, 'fish').trimStart()}\r\n> printf '%s>>>\\\\n' '<<<PROBE:${N}'\r\n<<<PROBE:${N}>>>\r\n$ `;
+  assert.equal(cutPlumbing(`${echo}${mark}out\r\n${probe}`, marker), 'out\r\n^C\r\n', 'the probe’s trace before its answer');
+  // Not traces: the echo that printed the mark in earlier builds traced as the mark itself, and the guess at that trace's head
+  // cut a program's own line that ended in `echo `; another Run's nonce names nothing.
+  assert.equal(cutPlumbing(`${echo}${mark}+ echo ${end}`, marker), '+ echo ', 'a program’s `+ echo ` before the mark');
+  const other = `printf '%s:%s>>>\\n' '<<<EXIT:0badf00d' 0\r\n`;
+  assert.equal(cutPlumbing(`${echo}${mark}${other}${end}`, marker), other, 'another Run’s nonce');
+});
+
+test('the marker strategy’s start line prints the Run’s start mark with the shell’s pid, keeps the status the shell had for the body, leaves no temporary behind, ends no shell under set -e, and traces nothing after the mark', () => {
+  // The house's answer 2 on the 33 commits (#22, comment 6307351985): `$?` after `false` is still 1 in the body. The house's review
+  // of the 40 commits through f3750e4 (PR #22, comment 6310921374): `__tsm_q` stayed set in the user's shell, and after
+  // `set -e; ! true` a body of only comments ended the shell, the start line's group being the file's last command.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-start-line-'));
   try {
-    const fish = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish', '/usr/bin/fish'].find((p) => fs.existsSync(p));
-    const shells = [
-      { shell: '/bin/dash', flavor: 'posix' as const, dot: 'command .', status: '$?', traces: true },
-      { shell: '/bin/bash', flavor: 'posix' as const, dot: 'command .', status: '$?', traces: true },
-      { shell: '/bin/zsh', flavor: 'zsh' as const, dot: '.', status: '$?', traces: false },
-      { shell: fish, flavor: 'fish' as const, dot: 'source', status: '$status', traces: false },
-    ].filter((x): x is typeof x & { shell: string } => x.shell !== undefined && fs.existsSync(x.shell));
-    assert.ok(shells.length >= 2);
-    for (const { shell, flavor, dot, status, traces } of shells) {
-      const file = path.join(dir, `${path.basename(shell)}-${commandFile(1)}`);
-      fs.writeFileSync(file, `${markerStartLine(N, flavor)}\necho "body sees ${status}"\n`);
-      const run = (head: string) => execFileSync(shell, ['-c', `${head}${dot} ${shellQuote(file)}; echo "<<<EXIT:${N}:${status}>>>"`], { encoding: 'utf8' });
-      const out = run('false; ');
+    assert.ok(MARKER_SHELLS.length >= 3);
+    for (const { shell, flavor, status, trace } of MARKER_SHELLS) {
+      const what = path.basename(shell);
+      const file = path.join(dir, `${what}-${commandFile(1)}`);
+      const dot = sourceLine(file, flavor, N).trimStart().replace(/;.*$/, '');
+      const left = flavor === 'fish' ? 'echo "q=[$__tsm_q]"; functions -q __tsm_start; and echo leaked-function; true' : 'echo "q=[${__tsm_q-}]"';
+      const run = (head: string, body: string) => {
+        fs.writeFileSync(file, markerCommandText(body, N, flavor));
+        return runMerged(shell, `${head}${dot}; echo "<<<EXIT:${N}:${status}>>>"; ${left}`);
+      };
+      const body = `echo "body sees ${status}"\n`;
+      const out = run('false; ', body);
       const m = startMark(N).exec(out);
-      assert.ok(m && /^\d+$/.test(m[1]!), `${shell}: the mark, with a pid: ${out}`);
-      assert.match(out, /body sees 1\n<<<EXIT:[^:]+:0>>>/, `${shell}: the body saw the earlier status`);
-      assert.match(run('true; '), /body sees 0/, shell);
-      if (flavor !== 'fish') assert.match(run('set -e; ! true; '), /body sees 1\n<<<EXIT/, `${shell}: set -e kept the shell`);
-      if (traces) {
-        const traced = execFileSync(shell, ['-c', `exec 2>&1; set -x; false; ${dot} ${shellQuote(file)}`], { encoding: 'utf8' });
-        const after = traced.slice(traced.indexOf('<<<START'));
-        assert.doesNotMatch(after, /__tsm_q|exit|\[/, `${shell}: nothing of the start line is traced after the mark: ${after}`);
+      assert.ok(m && /^\d+$/.test(m[1]!), `${what}: the mark, with a pid: ${out}`);
+      assert.match(out, /body sees 1\n<<<EXIT:[^:]+:0>>>\nq=\[\]\n$/, `${what}: the body saw the earlier status, and nothing is left: ${out}`);
+      assert.match(run('true; ', body), /body sees 0/, what);
+      assert.match(run('false; ', '\n  # only a comment\n\n'), /<<<START:[^\n]*\n<<<EXIT:[^:]+:0>>>\nq=\[\]\n$/, `${what}: a body of comments exits 0`);
+      for (const head of [`${trace}false; `, `${trace}true; `]) {
+        const after = run(head, 'echo traced\n').split('<<<START')[1]!;
+        assert.match(after, /^:[^\n]*\n[^\n]*echo traced\ntraced\n/, `${what} ${head}: nothing of the start line is traced after the mark: ${after}`);
       }
+      if (flavor === 'fish') continue;
+      assert.match(run('set -e; ! true; ', body), /body sees 1\n<<<EXIT/, `${what}: set -e kept the shell`);
+      assert.match(run('set -e; ! true; ', '# a comment\n'), /<<<EXIT:[^:]+:0>>>\nq=\[\]\n$/, `${what}: set -e kept the shell after a body of comments`);
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

@@ -11,7 +11,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { processLaunch, shellLaunch } from '../src/core/launch.js';
-import { markerStartLine } from '../src/core/plumbing.js';
+import { markerProbe, markerStartLine, sourceLine } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { prepareIntegration } from '../src/shell/integration.js';
 import { hasShell } from './fake-shell.js';
@@ -73,12 +73,22 @@ test('the process launcher and the lines typed for a declared shell parse in sh,
   }
 });
 
-test('the first line of a marker Run’s command file parses in sh, dash, bash and zsh, and fish’s in fish', () => {
-  // The start mark the command file prints (the house's answer 2 on the 33 commits, #22, comment 6307351985).
-  for (const shell of ['/bin/sh', '/bin/dash', '/bin/bash', '/bin/zsh'].filter(hasShell)) parses(shell, ['-n', '-c', markerStartLine('abcd1234', shell.endsWith('zsh') ? 'zsh' : 'posix')], 'the start line');
+test('the marker strategy’s lines parse in sh, dash, bash and zsh, and fish’s in fish: the command file’s first line, with and without the status it restores, the typed line and the probe', () => {
+  // The start mark the command file prints (the house's answer 2 on the 33 commits, #22, comment 6307351985), and the end mark
+  // and probe printf-built (the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374).
+  const lines = (flavor: 'posix' | 'zsh' | 'fish') => [
+    ...[true, false].map((restore) => markerStartLine('abcd1234', flavor, restore)),
+    sourceLine('/tmp/x/tsm-cmd-1', flavor, 'abcd1234'),
+    markerProbe('abcd1234', flavor),
+  ];
+  for (const shell of ['/bin/sh', '/bin/dash', '/bin/bash', '/bin/zsh'].filter(hasShell)) {
+    for (const line of lines(shell.endsWith('zsh') ? 'zsh' : 'posix')) parses(shell, ['-n', '-c', line], line);
+  }
   if (FISH) {
-    const file = path.join(tmp, 'start-line.fish');
-    fs.writeFileSync(file, `${markerStartLine('abcd1234', 'fish')}\n`);
-    parses(FISH, ['--no-execute', file], 'fish’s start line');
+    lines('fish').forEach((line, i) => {
+      const file = path.join(tmp, `marker-${i}.fish`);
+      fs.writeFileSync(file, `${line}\n`);
+      parses(FISH, ['--no-execute', file], line);
+    });
   }
 });

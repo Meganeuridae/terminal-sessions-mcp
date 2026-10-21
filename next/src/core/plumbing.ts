@@ -13,14 +13,17 @@
  * variable the Run's own line set — a nested shell, with another pid or the same one in another
  * PID namespace, has no such variable and answers with an empty token (the house's read of
  * 39787b3, #22). The typed lines that print them spell each word split (`EXI""T`, `STAR''T`,
- * `PRO""BE`), so an echo of the typed line never matches a mark. The probe lines are built here
- * (markerProbe, inlineProbe), and the cutter matches their echo from the same text; so is the line
- * that runs a Run's command file (sourceLine), whose echo the compat pack's logs find from it.
+ * `PRO""BE`), so an echo of the typed line never matches a mark, and the marker strategy's are
+ * printf-built, so a `set -x` trace of one never holds a whole mark either. The probe lines are
+ * built here (markerProbe, inlineProbe), and the cutter matches their echo from the same text; so
+ * is the line that runs a Run's command file (sourceLine), whose echo the compat pack's logs find
+ * from it.
  */
 import { isIntroducer, sequenceEnd, stripEscapes } from './text.js';
 import type { RunStrategy } from './types.js';
 
-const NONCE = '[^:>\\s]+';
+/** A nonce as any mark or typed line holds it: up to the field's end, or the quote a typed line closes after it. */
+const NONCE = '[^:>"\\s]+';
 /** Text as a regex that matches it alone. */
 const literal = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -78,15 +81,36 @@ const splitWord = (a: string, b: string): string => `${redrawn(a)}\\s*(?:${redra
  * marker, split.
  */
 const wrapperEcho = (nonce: string): RegExp =>
-  new RegExp(`${redrawn('<<<')}\\s*(?:${splitWord('EXI', 'T')}\\s*:\\s*${redrawn(nonce)}\\s*:(?:\\s*(?:${MARKER_RESTS.map(redrawn).join('|')}))?|${splitWord('STAR', 'T')}\\s*:\\s*${redrawn(nonce)}\\s*:)`, 'g');
+  new RegExp(`${redrawn('<<<')}\\s*(?:${splitWord('EXI', 'T')}\\s*:\\s*${redrawn(nonce)}(?:\\s*(?:${MARKER_RESTS.map(redrawn).join('|')}))?|${splitWord('STAR', 'T')}\\s*:\\s*${redrawn(nonce)}\\s*:)`, 'g');
 
+/** How the session's own shell runs a typed line: POSIX (bash, dash, an unknown sh), zsh, or fish. */
+export type ShellFlavor = 'posix' | 'zsh' | 'fish';
+const FLAVORS = ['posix', 'zsh', 'fish'] as const;
+/**
+ * A command the marker strategy types after the shell's own, in a group whose `set -x` trace dash,
+ * bash and zsh write, on a typed line, to the group's stderr, here nowhere. fish writes its trace past
+ * any redirect: the marks are printf-built so that no trace holds a whole mark, and the cutter names
+ * fish's trace by the Run's nonce (markTraceStart).
+ */
+const untraced = (command: string, flavor: ShellFlavor): string => (flavor === 'fish' ? command : `{ ${command}; } 2>/dev/null`);
+/**
+ * A mark printed by printf with its `>>>` in the format and its word and nonce in an argument, so
+ * that a `set -x` trace of the line (`+ printf %s>>>\n <<<PROBE:nonce`) never holds a whole mark:
+ * dash traced the echo that printed the end mark as the mark itself, the Run ended at the trace, and
+ * the real mark came after the Run's end (the house's review of the 40 commits through f3750e4, PR
+ * #22, comment 6310921374, question 2). The word stays split, so the typed line's echo matches no
+ * mark either. `fields` are printf's words for the fields after the nonce, each a `:%s` in the format.
+ */
+const printedMark = (word: string, nonce: string, fields: string[] = []): string =>
+  `printf '%s${':%s'.repeat(fields.length)}>>>\\n' "<<<${word}:${nonce}"${fields.map((f) => ` ${f}`).join('')}`;
 /**
  * The end-marker probe the marker strategy types after a ^C: a marker of its own, split so echoes
- * never match. It confirms the shell is back, never the command's status; and the command's own
- * end marker, arriving after a cancel that failed, still reads as the end it is (the house's read of
- * a6d0c35, #22).
+ * never match, and printf-built so no trace of it is one (printedMark), its trace kept off the
+ * terminal where the shell allows (untraced). It confirms the shell is back, never the command's
+ * status; and the command's own end marker, arriving after a cancel that failed, still reads as the
+ * end it is (the house's read of a6d0c35, #22).
  */
-export const markerProbe = (nonce: string): string => ` echo "<<<PRO""BE:${nonce}>>>"`;
+export const markerProbe = (nonce: string, flavor: ShellFlavor = 'posix'): string => ` ${untraced(printedMark('PRO""BE', nonce), flavor)}`;
 /**
  * The probe the inline strategy types after a ^C (which may have cut the line before its end
  * marker): a marker of its own, with the Run's nonce, the pid of the shell that runs it, and the
@@ -95,8 +119,6 @@ export const markerProbe = (nonce: string): string => ` echo "<<<PRO""BE:${nonce
  * … sh` is pid 1), the variable does not travel (the house's read of 39787b3, #22).
  */
 export const inlineProbe = (nonce: string, fish: boolean): string => ` printf '<<<PRO''BE:${nonce}:%s:%s>>>\\n' ${fish ? '$fish_pid "$__tsm_r"' : '"$$" "$\{__tsm_r-}"'}`;
-/** How the session's own shell runs a typed line: POSIX (bash, dash, an unknown sh), zsh, or fish. */
-export type ShellFlavor = 'posix' | 'zsh' | 'fish';
 /** Text as one word for a POSIX shell or fish: single-quoted, each quote in it closed, escaped and reopened. */
 export const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 const COMMAND_FILE = 'tsm-cmd-';
@@ -110,16 +132,24 @@ export const commandFile = (n: number): string => `${COMMAND_FILE}${n}`;
  * which runs it at the prompt's own level: jobs get process groups of their own, so cancel and
  * signal reach them and never fish (ss-2), and `set -l` persists as when typed (ss-11) — `source`
  * gave neither; without the integration fish has `source`. With `nonce`, the marker strategy's
- * line: its end mark is chained after it, with the shell's status. There a POSIX shell abandons
- * the rest of the typed line when a dot script has a syntax error or a special builtin fails;
- * `command .` strips that, so the chained mark still reports the status (ss-5). zsh never
- * abandons the line, and its `command` would look for an external `.`.
+ * line: its end mark is chained after it, with the shell's status, printf-built (printedMark) and
+ * untraced where the shell allows. There a POSIX shell abandons the rest of the typed line when a dot
+ * script has a syntax error or a special builtin fails; `command .` strips that, so the chained mark
+ * still reports the status (ss-5). zsh never abandons the line, and its `command` would look for an
+ * external `.`.
  */
 export function sourceLine(file: string, flavor: ShellFlavor, nonce?: string): string {
-  const marker = nonce !== undefined;
-  const run = flavor === 'fish' ? (marker ? ` source ${shellQuote(file)}` : ` eval (__tsm_collect ${shellQuote(file)} $status)`) : ` ${marker && flavor === 'posix' ? 'command .' : '.'} ${shellQuote(file)}`;
-  return marker ? `${run}; echo "<<<EXI""T:${nonce}:${flavor === 'fish' ? '$status' : '$?'}>>>"` : run;
+  if (nonce === undefined) return flavor === 'fish' ? ` eval (__tsm_collect ${shellQuote(file)} $status)` : ` . ${shellQuote(file)}`;
+  return `${markerRun(file, flavor)}; ${untraced(printedMark('EXI""T', nonce, [flavor === 'fish' ? '$status' : '"$?"']), flavor)}`;
 }
+/** How the marker strategy's typed line runs the command file, before its end mark. */
+const markerRun = (file: string, flavor: ShellFlavor): string => (flavor === 'fish' ? ` source ${shellQuote(file)}` : ` ${flavor === 'posix' ? 'command .' : '.'} ${shellQuote(file)}`);
+/**
+ * The marker strategy's typed line as builds before its end mark was printf-built typed it, an echo:
+ * journals keep its echo, which the cutter and the compat pack's logs still find.
+ */
+const legacySourceLine = (file: string, flavor: ShellFlavor, nonce: string): string =>
+  `${markerRun(file, flavor)}; echo "<<<EXI""T:${nonce}:${flavor === 'fish' ? '$status' : '$?'}>>>"`;
 /**
  * The first line of a marker Run's command file: it prints the Run's start mark, so the cutter has
  * a bound that lands after whatever the shell printed before it ran the file (the typed line's echo,
@@ -127,23 +157,49 @@ export function sourceLine(file: string, flavor: ShellFlavor, nonce?: string): s
  * can stand in for: with the echo alone, a history line with the echo off (`fc -l -1`) was taken for
  * it and the output before it went (the house's read of the 33 commits, #22, comment 6307351104, and
  * its answer 2). Printed from the file, the typed line, its echo and its history entry stay as they
- * are. The status the shell had is kept for the body (`$?` after `false` is still 1; a subshell only
- * when it is not 0), restored in an AND-OR list's first place so `set -e` never ends the shell on it,
- * and the group's stderr goes to /dev/null so `set -x` traces none of it in dash and bash (zsh and
- * fish write their traces elsewhere). fish has no `$?` to restore with `exit`: a function returns it.
- * It adds one line, so a message that names a line of the body names the next one.
+ * are. With `restore`, the status the shell had is kept for the body (`$?` after `false` is still 1),
+ * restored in an AND-OR list's first place so `set -e` never ends the shell on it, and the variable
+ * that carried it is gone again, as the integrations' temporaries are (`__tsm_q` stayed set in the
+ * user's shell: the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374):
+ * POSIX expands it into an eval that unsets it before the restore, a subshell only when it is not 0;
+ * zsh keeps it local to a function; fish, whose source gives the file a scope of its own, erases it
+ * from a function that sees the file's (`-S`), and the function erases itself. dash and bash trace
+ * none of the line under `set -x` (the group's stderr is /dev/null); zsh and fish trace a sourced
+ * file's commands whatever their stderr, so each runs the mark from a function with its trace off,
+ * traced only up to the call, before the mark, and zsh's AND-OR list ends in an empty group, which it
+ * does not trace (a block's end, and a `:`, were traced after the mark). It adds one line, so a
+ * message that names a line of the body names the next one.
  */
-export function markerStartLine(nonce: string, flavor: ShellFlavor): string {
-  return flavor === 'fish'
-    ? `begin; set -g __tsm_q $status; printf '<<<STAR''T:%s:%s>>>\\n' ${nonce} $fish_pid; function __tsm_rs; return $argv[1]; end; __tsm_rs $__tsm_q; end 2>/dev/null`
-    : `{ __tsm_q=$?; printf '<<<STAR''T:%s:%s>>>\\n' ${nonce} "$$"; [ "$__tsm_q" = 0 ] || (exit "$__tsm_q") && :; } 2>/dev/null`;
+export function markerStartLine(nonce: string, flavor: ShellFlavor, restore = true): string {
+  const mark = `printf '<<<STAR''T:%s:%s>>>\\n' ${nonce} ${flavor === 'fish' ? '$fish_pid' : '"$$"'}`;
+  if (flavor === 'fish') {
+    const quiet = 'set -l fish_trace; functions -e __tsm_start';
+    return restore
+      ? `set -l __tsm_q $status; function __tsm_start -S; ${quiet}; set -e __tsm_q; ${mark}; return $argv[1]; end; __tsm_start $__tsm_q`
+      : `function __tsm_start; ${quiet}; ${mark}; end; __tsm_start`;
+  }
+  if (flavor === 'zsh') return restore ? `() { local __tsm_q=$?; setopt localoptions noxtrace; ${mark}; return $__tsm_q; } && { }` : `() { setopt localoptions noxtrace; ${mark}; }`;
+  return restore ? `{ __tsm_q=$?; ${mark}; eval "unset __tsm_q; [ $__tsm_q = 0 ] || (exit $__tsm_q)" && :; } 2>/dev/null` : `{ ${mark}; } 2>/dev/null`;
+}
+/**
+ * A marker Run's command file: its start line, then the body. A body of blank lines and comments runs
+ * no command, so the start line would be the file's last, and the status it restores the file's:
+ * after `set -e; ! true` that status is 1, `command .` returns it, and `set -e` ended the shell (the
+ * house's review of the 40 commits through f3750e4, PR #22, comment 6310921374). Nothing reads the
+ * status there, so such a body's start line restores none, and the Run exits 0, as a sourced file
+ * that runs nothing does and as a comment does under the integrations.
+ */
+export function markerCommandText(body: string, nonce: string, flavor: ShellFlavor): string {
+  return `${markerStartLine(nonce, flavor, !/^(?:[ \t]*(?:#[^\n]*)?(?:\n|$))*$/.test(body))}\n${body}`;
 }
 /** Where a builder's line holds the nonce, to split it there: no builder types this character. */
 const AT_NONCE = '\0';
 /** Where a source line holds its command file's path: no builder types it, and quoting leaves it as it is. */
 const AT_FILE = '\u0001';
-/** What the marker strategy's typed line holds after its end mark's nonce and colon, for each flavor (`$?>>>"`, `$status>>>"`). */
-const MARKER_RESTS = [...new Set((['posix', 'zsh', 'fish'] as const).map((f) => sourceLine(AT_FILE, f, AT_NONCE).split(AT_NONCE)[1]!.slice(1)))];
+/** The marker strategy's typed lines for each flavor, as this build types them and as earlier builds did (journals keep their echo). */
+const MARKER_LINES = FLAVORS.flatMap((f) => [sourceLine(AT_FILE, f, AT_NONCE), legacySourceLine(AT_FILE, f, AT_NONCE)]);
+/** What the marker strategy's typed lines hold after their end mark's nonce (`" "$?"; } 2>/dev/null`, an earlier build's `:$?>>>"`). */
+const MARKER_RESTS = [...new Set(MARKER_LINES.map((line) => line.split(AT_NONCE)[1]!))];
 /**
  * Under `set -x`, the trace of the typed line that ran a command file (`+ command . /tmp/x/tsm-cmd-3`,
  * fish's `> source …`); group 1 is the trace's prefix, PS4 as the shell expanded it. The trace does not
@@ -160,8 +216,7 @@ const QUOTED_FILE = `'(?:[^'\\n]|'\\\\'')*/${literal(COMMAND_FILE)}\\d+'`;
  * kept a hand copy of these lines without fish's marker line: a reviewer's read of the fixes for #22).
  */
 export const sourceLineEcho = (): RegExp => {
-  const lines = new Set<string>();
-  for (const flavor of ['posix', 'zsh', 'fish'] as const) for (const nonce of [undefined, AT_NONCE]) lines.add(sourceLine(AT_FILE, flavor, nonce));
+  const lines = new Set<string>([...FLAVORS.map((f) => sourceLine(AT_FILE, f)), ...MARKER_LINES]);
   const pattern = (line: string) => line.split(shellQuote(AT_FILE)).map((part) => part.split(AT_NONCE).map(literal).join(NONCE)).join(QUOTED_FILE);
   return new RegExp([...lines].sort((a, b) => b.length - a.length).map(pattern).join('|'));
 };
@@ -172,7 +227,9 @@ export const sourceLineEcho = (): RegExp => {
  * leave the echo of the line it types in a Run's output (a reviewer's read of the fixes for #22).
  */
 const PROBE_LINES = new Map<string, string[]>();
-for (const line of [markerProbe(AT_NONCE), inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true)]) {
+/** The marker strategy's probe as builds before it was printf-built typed it, which journals keep. */
+const LEGACY_PROBE = ` echo "<<<PRO""BE:${AT_NONCE}>>>"`;
+for (const line of [...FLAVORS.map((f) => markerProbe(AT_NONCE, f)), LEGACY_PROBE, inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true)]) {
   const [before, after] = line.split(AT_NONCE) as [string, string];
   const head = before.slice(before.indexOf('<<<'));
   PROBE_LINES.set(head, [...(PROBE_LINES.get(head) ?? []), after]);
@@ -181,9 +238,9 @@ for (const line of [markerProbe(AT_NONCE), inlineProbe(AT_NONCE, false), inlineP
  * A Run's nonce as the session makes it, eight hex digits (randomBytes(4)), as a redraw may show it:
  * whitespace between any two digits, and a digit written again after a break (a line editor writes the
  * margin character again after a carriage return). Taken only where the rest of the typed line follows
- * (its `:` or `>`), so a line of hex printed after an echo is not taken in with it.
+ * (its `:`, `>` or closing quote), so a line of hex printed after an echo is not taken in with it.
  */
-const BROKEN_NONCE = '[0-9a-f](?:\\s*[0-9a-f]){7,8}(?=\\s*[:>])';
+const BROKEN_NONCE = '[0-9a-f](?:\\s*[0-9a-f]){7,8}(?=\\s*[:>"])';
 /** The probe lines' echo for a nonce pattern: each head, the nonce, then any of the rests that follow it. */
 const probeEchoSource = (nonce: string): string =>
   [...PROBE_LINES].map(([head, rests]) => `${redrawn(head)}\\s*${nonce}(?:\\s*(?:${rests.map(redrawn).join('|')}))?`).join('|');
@@ -252,7 +309,7 @@ export interface PlumbingOf {
  * payload showed (an independent read of that fix).
  */
 function stripAtMarks(raw: string, nonce: string | undefined): { text: string; map: number[]; open: Set<number> } {
-  const words = nonce === undefined ? '' : `|(?:EXI""T|STAR''T|PRO""BE|PRO''BE):${nonce}[:>]`;
+  const words = nonce === undefined ? '' : `|(?:EXI""T|STAR''T|PRO""BE|PRO''BE):${nonce}[:>"]`;
   const marks = new RegExp(`<<<(?:(?:START|EXIT|PROBE):${nonce ?? NONCE}[:>]${words})`, 'g');
   const at = [...raw.matchAll(marks)].map((m) => m.index).filter((i) => i > 0);
   const open = new Set<number>();
@@ -305,17 +362,16 @@ function stripAtMarks(raw: string, nonce: string | undefined): { text: string; m
  * a still-starting shell's second echo then stays, and with the echo off a program's line in the
  * echo's shape is taken for it. Without a recorded nonce, the echo is cut at the output's head, and
  * a start mark only when no echo comes before it. Everything from the end marker on goes, or from the
- * probe answer the session accepted; and under `set -x`, the end mark's own trace, when the typed
- * line's trace before the start mark shows the shell was tracing (the same read). Before that
- * end, every line of each probe's echo and every rejected answer's line is struck on its own, and the
- * output between them stays: a probe the session rejected (answered by a nested shell: its pid is
- * not the one the start marker named, or its token is not the Run's) is not an end (the house's
- * read of 39787b3, #22), and a probe nothing answered, because a program ignoring ^C read it,
- * leaves only its echo behind, with what the program printed after it still output (the house's
- * read of 78c4d6e, #22: the cut moved back to that echo and the output after it was gone).
- * Without a recorded nonce the same shapes are found with any nonce, which can take a program
- * line in a mark's shape for one. The cut is found on the text without escape sequences
- * (stripAtMarks) and made in the raw (keptRanges).
+ * probe answer the session accepted, and before it the trace of the command that printed it, where
+ * the shell wrote one (markTraceStart). Before that end, every line of each probe's echo and every
+ * rejected answer's line is struck on its own, and the output between them stays: a probe the
+ * session rejected (answered by a nested shell: its pid is not the one the start marker named, or
+ * its token is not the Run's) is not an end (the house's read of 39787b3, #22), and a probe nothing
+ * answered, because a program ignoring ^C read it, leaves only its echo behind, with what the
+ * program printed after it still output (the house's read of 78c4d6e, #22: the cut moved back to
+ * that echo and the output after it was gone). Without a recorded nonce the same shapes are found
+ * with any nonce, which can take a program line in a mark's shape for one. The cut is found on the
+ * text without escape sequences (stripAtMarks) and made in the raw (keptRanges).
  */
 export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
   return keptRanges(raw, of)
@@ -342,9 +398,8 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
   const echoes = [...text.matchAll(wrapperEcho(nonce))].map((m) => [m.index, m.index + m[0].length] as const);
   const start = startMark(nonce).exec(text);
   const own = of.nonce !== undefined && (of.strategy === 'marker' || of.strategy === 'inline');
-  // Set when a marker Run's start mark bounds its output: the prefix of the typed line's trace before
-  // the mark, when the shell was tracing (set -x), or null.
-  let trace: string | null | undefined;
+  // The prefix of the typed line's trace before a marker Run's start mark, when the shell was tracing.
+  let trace: string | undefined;
   if (start && (own || echoes.length === 0 || echoes[0]![0] < start.index)) {
     // The Run's output begins after its start marker: what the text holds before it is the shell's,
     // not the Run's (the typed line's echo, a banner or prompt a slow shell printed after the line
@@ -355,7 +410,7 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
     pid = start[1];
     const nl = text.indexOf('\n', start.index + start[0].length);
     from = nl === -1 ? text.length : nl + 1;
-    if (of.strategy === 'marker') trace = RUN_TRACE.exec(text.slice(0, start.index))?.[1] ?? null;
+    if (of.strategy === 'marker') trace = RUN_TRACE.exec(text.slice(0, start.index))?.[1];
   } else {
     // The typed line's echo, and the lines that follow it without a break, which are more of it: the
     // same line echoed again (typed ahead of its prompt), or the pieces of a redraw, which can split
@@ -392,15 +447,6 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
   }
   const rest = text.slice(from);
   let to = exitMark(nonce).exec(rest)?.index ?? rest.length;
-  if (trace !== undefined) {
-    // Tracing, the shell prints the end mark's echo (`+ echo <<<EXIT:…:0>>>`, bash quoting the word)
-    // before the mark itself, and the first mark ends the Run: that trace's head is plumbing too. Its
-    // prefix is the one the typed line's trace showed, or, in the Run that turned tracing on, PS4's
-    // default at a line's start.
-    const before = rest.slice(0, to);
-    const tail = trace !== null ? [`${trace}echo '`, `${trace}echo `].find((t) => before.endsWith(t)) : /(?:^|\n)(\+ echo '?)$/.exec(before)?.[1];
-    if (tail) to -= tail.length;
-  }
   const struck: Array<[number, number]> = [];
   // Strikes the lines from a match's first character to its last. Matches come in order, and one
   // inside the lines struck last is passed over: scanning to its line's ends again for every match
@@ -435,6 +481,7 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
     }
     strikeAnswer(m.index, m.index);
   }
+  if (of.strategy === 'marker' && of.nonce !== undefined) to = markTraceStart(rest, to, of.nonce, trace);
   // Each probe's echo before the end is plumbing on its own, the accepted probe's included, every
   // line of it: a redraw can break the typed line, its nonce included, over two lines, and striking
   // only the line where it began kept the rest (the house's read of the 38 commits, #22, comment
@@ -464,4 +511,25 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
   return kept
     .map(([s, e, atLine]): [number, number] => [from + s === 0 ? 0 : map[from + s - 1]! + 1, atLine && open.has(from + e) ? map[from + e - 1]! + 1 : (map[from + e] ?? raw.length)])
     .filter(([s, e]) => s < e);
+}
+
+/**
+ * Where a marker Run's output `text` ends before its end at `to`, without the trace of the command that
+ * printed the end mark or the probe's answer. dash, bash and zsh trace neither (untraced); a shell
+ * that writes its trace past the group (fish; bash given a BASH_XTRACEFD) prints the command on the
+ * line before the mark: `<PS4>printf '%s:%s>>>\n' '<<<EXIT:<nonce>' 0`. A printf-built mark's trace
+ * never holds the mark, so the Run ended at the real one, and the trace is named by the Run's nonce,
+ * whatever PS4 is (the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374,
+ * question 2): from the prefix the typed line's trace showed (`prefix`), or fish's own when the trace
+ * is fish's (fish has no PS4: a command the prompt runs is traced after `> `, and its trace writes the
+ * format's backslash doubled), when it stands before it, so output with no line end before the trace
+ * stays, or else from its line's start. The echo that printed the end mark in earlier builds traced as
+ * the mark itself, and a guess at that trace's head cut a program's line that ended in `echo `.
+ */
+function markTraceStart(text: string, to: number, nonce: string, prefix: string | undefined): number {
+  const lineStart = text.lastIndexOf('\n', to - 2) + 1;
+  const t = new RegExp(`printf ([^\\n]*)<<<(?:EXIT|PROBE):${literal(nonce)}'?(?: -?\\d+)?\\n$`).exec(text.slice(lineStart, to));
+  if (!t) return to;
+  const head = prefix ?? (t[1]!.includes('>>>\\\\n') ? '> ' : undefined);
+  return head && text.slice(lineStart, lineStart + t.index).endsWith(head) ? lineStart + t.index - head.length : lineStart;
 }

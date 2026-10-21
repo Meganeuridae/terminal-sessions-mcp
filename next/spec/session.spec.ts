@@ -148,8 +148,9 @@ test('G5/§8.1 fallback: without marks the marker strategy still yields an obser
   const a = h.session.admit({ target: 'shell', line: 'printf hi', principal: AGENT });
   assert.ok(a.admitted);
   const written = h.pty.written;
-  // ss-5: `command .`, so a syntax or special-builtin error in the file cannot abandon the marker.
-  assert.match(written, /^ command \. '.*tsm-cmd.*'; echo "<<<EXI""T:[0-9a-f]+:\$\?>>>"\n$/);
+  // ss-5: `command .`, so a syntax or special-builtin error in the file cannot abandon the marker; the end mark printf-built
+  // and its trace sent nowhere (the house's review of the 40 commits through f3750e4, PR #22, comment 6310921374).
+  assert.match(written, /^ command \. '.*tsm-cmd.*'; \{ printf '%s:%s>>>\\n' "<<<EXI""T:[0-9a-f]+" "\$\?"; \} 2>\/dev\/null\n$/);
   const r = await h.session.awaitRun(a.run.runId, 1000);
   assert.equal(r.state, 'exited');
   assert.equal(r.exit, 0);

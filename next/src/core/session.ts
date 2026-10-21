@@ -21,7 +21,7 @@ import { clocks, timerMs } from './clock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
-import { commandFile, cutPlumbing, exitMark, inlineProbe, markerProbe, markerStartLine, probeMark, shellQuote, sourceLine, startMark, type ShellFlavor } from './plumbing.js';
+import { commandFile, cutPlumbing, exitMark, inlineProbe, markerCommandText, markerProbe, probeMark, shellQuote, sourceLine, startMark, type ShellFlavor } from './plumbing.js';
 import { stripEscapes } from './text.js';
 import { project, type ProjectChunk } from './transcript.js';
 import { type AttachmentRole, type ControlPolicy, type Cursors, DEFAULT_GEOMETRY, type EnvBasis, type EventOf, type IntegrationLevel, type JournalEvent, type Principal, type RunInfo, type RunOrigin, type RunState, type RunTarget, type ScreenSnapshot, type Seq, type ShellState, SYSTEM, type Visibility } from './types.js';
@@ -2254,9 +2254,9 @@ export class Session {
     // plumbing by that name, and a short command directory keeps the echo short.
     const name = commandFile(++this.tempCounter);
     let text = body.endsWith('\n') ? body : body + '\n';
-    // The marker strategy's start mark, from the file's first line (plumbing.ts markerStartLine): what
+    // The marker strategy's start mark, from the file's first line (plumbing.ts markerCommandText): what
     // the shell printed before it ran the file is cut up to it, whatever that was.
-    if (markerNonce !== undefined) text = `${markerStartLine(markerNonce, this.flavor)}\n${text}`;
+    if (markerNonce !== undefined) text = markerCommandText(text, markerNonce, this.flavor);
     // The pipeline's statuses (shell tools 3) are gone by the time the integration's end hook
     // runs: after `. file`, bash, zsh and fish report the statuses of `.` itself. So the file
     // captures them as its last line, in the same statement as `$?`, and returns with that status
@@ -2319,7 +2319,9 @@ export class Session {
     const probe = run.probed ? (probeMark(run.markerNonce!).exec(window)?.index ?? -1) : -1;
     if (exit && (probe === -1 || exit.index < probe)) {
       run.markerTail = '';
-      // The marker chained on the command's line: its status, after a cancel that failed too.
+      // The marker chained on the command's line: its status, after a cancel that failed too. It is
+      // printf-built, so no `set -x` trace of the line holds one, and the first is the real one (the
+      // house's review of the 40 commits through f3750e4, PR #22, comment 6310921374).
       this.endRun(run, { state: run.cancelRequested ? 'cancelled' : 'exited', exit: Number(exit[1]) });
       return;
     }
@@ -2698,7 +2700,7 @@ export class Session {
     const fg = this.pty.foreground?.();
     if (!fg || fg.foregroundPgid !== fg.shellPgid) return;
     run.probed = true;
-    this.pty.write(`${markerProbe(run.markerNonce)}\n`);
+    this.pty.write(`${markerProbe(run.markerNonce, this.flavor)}\n`);
     steps.push('end-marker probe');
     await this.awaitRun(run.runId, grace);
   }

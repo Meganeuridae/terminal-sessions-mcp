@@ -211,3 +211,54 @@ for (const shell of SHELLS) {
     }
   });
 }
+
+// The marker strategy's printf-built end mark and probe, and its start line's leftovers (the house's review of the 40 commits
+// through f3750e4, PR #22, comment 6310921374, question 2 and the cutter's "left for later"), in dash, bash as sh, and zsh and
+// fish started without their integration.
+const MARKER = [
+  ...(hasShell('/bin/dash') ? [{ name: 'dash', shell: '/bin/dash', fish: false }] : []),
+  { name: 'bash as sh', shell: bashAsSh, fish: false },
+  ...(hasShell('/bin/zsh') ? [{ name: 'zsh without its integration', shell: '/bin/zsh', fish: false }] : []),
+  ...(FISH ? [{ name: 'fish without its integration', shell: FISH, fish: true }] : []),
+];
+for (const { name, shell, fish } of MARKER) {
+  test(`${name}: under the marker strategy a trace with a PS4 of the body's own ends at the real mark, a cancel's probe leaves no trace, no temporary stays set, and a body of comments after a failed status keeps a set -e shell`, async () => {
+    const x = await realSession(shell, { integration: false });
+    try {
+      assert.equal(x.session.integration, 'none');
+      // The body turns tracing on with its own PS4 and its output has no line end: nothing of the end mark's command stays.
+      const on = await run(x, fish ? 'set fish_trace 1; printf abc' : "PS4='>> '; set -x; printf abc");
+      assert.deepEqual([on.state, on.exit], ['exited', 0]);
+      assert.match(on.text, fish ? /^-*> printf abc\nabc$/ : /^>+ printf abc\nabc$/, JSON.stringify(on.text));
+      const traced = await run(x, 'echo traced');
+      assert.match(traced.text, fish ? /^-*> echo traced\ntraced$/ : /^>+ echo traced\ntraced$/, JSON.stringify(traced.text));
+      // A cancel's probe, typed while tracing: the Run ends at the real answer, and neither the probe nor its trace is output.
+      const a = await x.session.admitWhenAvailable({ target: 'shell', line: 'sleep 5', principal: AGENT }, 3000);
+      assert.ok(a.admitted);
+      const nonce = x.session.listRuns().find((r) => r.runId === a.run.runId)!.nonce!;
+      const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
+      await until(() => output().includes(`<<<START:${nonce}:`), 3000, 'the command file ran');
+      const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 1500 });
+      assert.equal(c.state, 'cancelled', JSON.stringify(c));
+      const cancelled = (await x.session.runTranscript(a.run.runId)).text;
+      assert.doesNotMatch(cancelled, /printf|<<<|PRO/, JSON.stringify(cancelled));
+      const after = await run(x, 'echo after');
+      assert.match(after.text, fish ? /^-*> echo after\nafter$/ : /^>+ echo after\nafter$/, `the probe's answer is no later Run's output: ${JSON.stringify(after.text)}`);
+      await run(x, fish ? 'set -e fish_trace' : 'set +x');
+      // The start line's temporaries are gone, as the integrations' are.
+      const left = await run(x, fish ? 'echo "[$__tsm_q]"; functions -q __tsm_start; and echo leaked; or echo clean' : 'echo "[${__tsm_q-unset}]"');
+      assert.equal(left.text, fish ? '[]\nclean' : '[unset]');
+      if (!fish) {
+        // A failed status at the prompt, then a Run of comments: its start line restores none, so set -e keeps the shell.
+        await run(x, 'set -e');
+        x.session.input('! true\r', { principal: AGENT });
+        const comment = await run(x, '# only a comment');
+        assert.deepEqual([comment.state, comment.exit], ['exited', 0], JSON.stringify(comment));
+        assert.equal((await run(x, 'echo alive')).text, 'alive');
+        await run(x, 'set +e');
+      }
+    } finally {
+      await x.close();
+    }
+  });
+}

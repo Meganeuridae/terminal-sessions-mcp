@@ -289,8 +289,9 @@ export class FakeShell {
         line = `echo "${file}: No such file or directory"; false`;
       }
     } else {
-      // The marker strategy's end-marker probe: a marker of its own (the house's read of a6d0c35, #22).
-      const probe = /^\s*echo "<<<PRO""BE:([0-9a-f]+)>>>"$/.exec(typedLine);
+      // The marker strategy's end-marker probe: a marker of its own (the house's read of a6d0c35, #22),
+      // printf-built (plumbing.ts markerProbe).
+      const probe = /^\s*(?:\{ )?printf '%s>>>\\n' "<<<PRO""BE:([0-9a-f]+)"(?:; \} 2>\/dev\/null)?$/.exec(typedLine);
       if (probe) {
         this.pty.emit(`<<<PROBE:${probe[1]}>>>\r\n`);
         this.prompt();
@@ -320,9 +321,9 @@ export class FakeShell {
       this.hung = undefined;
       this.pty.foregroundPgid = this.pty.pid;
       if (output) this.pty.emit(output);
-      // The marker tail (`; echo "<<<EXI""T:nonce:$?>>>"`) executes after the sourced file,
-      // unless an interrupt aborted the rest of the line (dash).
-      const m = /echo "<<<EXI""T:([0-9a-f]+):\$(?:\?|status)>>>"/.exec(tail);
+      // The marker tail (`; { printf '%s:%s>>>\n' "<<<EXI""T:nonce" "$?"; } 2>/dev/null`) executes
+      // after the sourced file, unless an interrupt aborted the rest of the line (dash).
+      const m = /printf '%s:%s>>>\\n' "<<<EXI""T:([0-9a-f]+)" (?:"\$\?"|\$status)/.exec(tail);
       if (m && !aborted) this.pty.emit(`<<<EXIT:${m[1]}:${exit}>>>\r\n`);
       if (this.marks !== 'none') this.pty.emit(this.mark(`133;D;${exit}`));
       if (withPrompt) {
@@ -504,6 +505,8 @@ export interface RealOptions {
   cols?: number;
   editingStaleMs?: number;
   control?: 'seat' | 'owner-priority' | 'open';
+  /** false: start the shell without its integration, so its Runs take the marker strategy. */
+  integration?: false;
 }
 
 export interface Real {
@@ -560,7 +563,7 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
   if (opts.editingStaleMs !== undefined) so.editingStaleMs = opts.editingStaleMs;
   if (opts.control !== undefined) so.control = opts.control;
   if (opts.commandDir !== undefined) so.commandDir = opts.commandDir;
-  if (integ.kind !== 'none') so.integration = integ;
+  if (integ.kind !== 'none' && opts.integration !== false) so.integration = integ;
   const t0 = Date.now();
   const session = await Session.start(so);
   const startMs = Date.now() - t0;
