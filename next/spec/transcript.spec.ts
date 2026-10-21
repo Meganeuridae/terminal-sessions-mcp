@@ -559,6 +559,25 @@ test('a byte budget whose cut falls inside a header keeps the header whole, and 
   assert.deepEqual([head.text.split('\n'), head.omittedInputBytes], [['[terminal]', 'p1', 'p2'], 'a1\na2\n'.length]);
 });
 
+test('no cut counts a header as input omitted: a head kept to maxLines, and a tail past an unfinished line twice the budget', async () => {
+  // A reviewer's read of the fixes for #22: b0fd9f2 left headers out of what each cut counts as input omitted, but two of its
+  // four places failed no test with the exclusion undone: the head's rest past maxLines, and the emitted lines dropped before a
+  // held line past twice the budget. Headers exist only with a label, so labelled or not, the same input is omitted.
+  const omitted = async (chunks: ProjectChunk[], opts: Parameters<typeof project>[1]) => {
+    const plain = await project(chunks, opts);
+    const labelled = await project(chunks, { ...opts, label: sourceLabel });
+    assert.ok(plain.omittedInputBytes > 0, JSON.stringify(plain));
+    return [labelled.omittedInputBytes, plain.omittedInputBytes];
+  };
+  const lines = (p: string, n: number, end: string) => Array.from({ length: n }, (_, i) => `${p}${i + 1}${end}`).join('');
+  const sources: ProjectChunk[] = [{ data: lines('p', 6, '\r\n'), stream: 'pty' }, { data: lines('a', 6, '\n'), stream: 'stdout', runId: 'r1' }, { data: lines('q', 3, '\r\n'), stream: 'pty' }];
+  const [headL, headP] = await omitted(sources, { cols: 80, rows: 3, maxLines: 2, keep: 'head' });
+  assert.equal(headL, headP, 'the rest past maxLines: no header counted');
+  const long: ProjectChunk[] = [{ data: 'p1\r\n', stream: 'pty' }, { data: 'x'.repeat(300), stream: 'stdout', runId: 'r1' }];
+  const [tailL, tailP] = await omitted(long, { cols: 80, rows: 24, maxLines: 10, maxInputBytes: 100 });
+  assert.equal(tailL, tailP, 'what goes before a held line past twice the budget: no header counted');
+});
+
 test('a held line cut for the byte budget drops what was emitted before it: a title’s payload after a whole line keeps only the tail', async () => {
   // `head\r\n`, then an OSC 52 of 10 KB in a later chunk with no line end, under a 4 KiB budget: `head` survived
   // the payload between it and the end.
