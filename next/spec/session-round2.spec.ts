@@ -348,12 +348,15 @@ test('an editing hold neither ends early on a forward wall-clock step nor stretc
     // A partial line is being edited at the rich idle prompt: the shell is held until it goes stale.
     h.session.input('sle', { principal: AGENT });
     assert.equal(reason(), 'human-editing');
-    // The wall clock jumps forward an hour; the monotonic clock has not moved: the hold stands.
+    // The wall clock jumps forward an hour; the monotonic clock has not moved: the hold stands. One mock,
+    // whose step changes: a second t.mock.method on Date.now wraps the first, and the test's restore then
+    // leaves the first in place, frozen for every later test in this file.
     const wall = Date.now();
-    t.mock.method(Date, 'now', () => wall + 3_600_000);
+    let step = 3_600_000;
+    t.mock.method(Date, 'now', () => wall + step);
     assert.equal(reason(), 'human-editing', 'a forward wall-clock step does not end the hold early');
     // The wall clock jumps back; still held.
-    t.mock.method(Date, 'now', () => wall - 3_600_000);
+    step = -3_600_000;
     assert.equal(reason(), 'human-editing', 'a backward wall-clock step does not change it');
     // Only the monotonic clock passing the stale period ends it.
     mono = 1500;
@@ -734,7 +737,7 @@ test('a prompt that stops carrying its end mark still gives the empty line up, a
   assert.equal(c.steps.at(-1), 'an empty line, whose prompt says the shell is back', JSON.stringify(c));
   const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
   assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
-  const t0 = performance.now(); // not Date.now, which an earlier test in this file leaves mocked
+  const t0 = performance.now();
   h.pty.emit(h.shell.mark('133;A') + '$ '); // no end mark follows
   await until(() => h.session.run(b.run.runId).state === 'starting', 6000, 'the Run’s line written once the wait ends');
   const waited = performance.now() - t0;
