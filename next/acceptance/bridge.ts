@@ -185,8 +185,11 @@ try {
   // reconnect has been shown: a Run that slept 1.5 s raced the reconnect's own waits (3 s, then
   // 5 s), so a correct reconnect slower than that failed the check on a slow runner (the house's
   // read, #22 comment 6269721389). The command stays short: the completion head shows 100 characters.
+  // Its text doesn't hold the word it prints, which the head (and the screen's typed line) repeat with
+  // the command: looked for anywhere, `bridge-output` matched a completion with no output at all (the
+  // house's read of f3750e4..4f4c067 over our fixes, #22).
   const released = path.join(tmp, 'reconnected')
-  const COMMAND = 'until [ -e reconnected ]; do sleep 0.1; done; echo bridge-output'
+  const COMMAND = 'until [ -e reconnected ]; do sleep 0.1; done; echo bridge-out""put'
   let runId = ''
   await check('start work, receive a run id, stop waiting', async () => {
     const r = await call('run', { session: SESSION, command: COMMAND, wait: 100 })
@@ -252,7 +255,8 @@ try {
     // The point where typing could have happened is shown, not slept past: the terminal takes input in
     // order, so a command run after the note reached termd, whose output the screen then shows, comes
     // after anything the publish had typed (the house's read, #22 comment 6274806357).
-    const marker = await call('run', { session: SESSION, command: 'echo after-the-note', wait: 5000 })
+    // Its text doesn't hold the word it prints, so the screen shows the word only once it ran.
+    const marker = await call('run', { session: SESSION, command: 'echo after-the-""note', wait: 5000 })
     if (marker.structured?.state !== 'exited' || marker.structured?.exit !== 0) fail(`the marker command after the note: ${marker.text}`)
     const screen = await call('screen', { session: SESSION })
     // The screen must be the session's: a failed read, with no text to match, is no evidence.

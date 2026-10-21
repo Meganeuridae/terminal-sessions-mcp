@@ -101,6 +101,13 @@ const within = (p, ms, what) =>
     );
   });
 const journal = () => registry.get(SESSION).session.journal.since(0).events;
+/** The Run's completion messages in the scout's context, however each came. */
+const completionMessages = (runId) =>
+  framework.agents
+    .get('scout')
+    .getContextManager()
+    .getAllMessages()
+    .filter((m) => m.metadata?.runId === runId && m.metadata?.tags?.includes('terminal:run-finished'));
 
 try {
   await check('grant and tools', async () => {
@@ -144,9 +151,12 @@ try {
   // The Run ends when this file appears in the session's cwd, and the check creates it once the
   // reconnect has been shown: a Run that slept 2 s raced the reconnect's own waits (3 s, then 5 s),
   // so a correct reconnect slower than that failed the check on a slow runner (the house's read,
-  // #22 comment 6269721389). The command stays short: the completion head shows 100 characters.
+  // #22 comment 6269721389). The command stays short: the completion head shows 100 characters. Its
+  // text doesn't hold the word it prints, which the head repeats with the command: looked for in the
+  // whole completion, `acceptance-output` matched the head of one with no output at all (the house's
+  // read of f3750e4..4f4c067 over our fixes, #22).
   const released = path.join(tmp, 'reconnected');
-  const COMMAND = 'until [ -e reconnected ]; do sleep 0.1; done; echo acceptance-output';
+  const COMMAND = 'until [ -e reconnected ]; do sleep 0.1; done; echo acceptance-out""put';
   let runId;
   await check('start work, receive a run id, stop waiting', async () => {
     const r = await call('run', { session: SESSION, command: COMMAND, wait: 100 });
@@ -188,7 +198,7 @@ try {
     // carry no Run, so a batch naming the channel passed beside a completion pushed. The completion's own
     // message says how it came: one from the channel carries its message id, a push its event id and
     // feature set (the house's read of the 40 commits over our fixes, #22).
-    const mine = framework.agents.get('scout').getContextManager().getAllMessages().filter((m) => m.metadata?.runId === runId && m.metadata?.tags?.includes('terminal:run-finished'));
+    const mine = completionMessages(runId);
     const route = mine.map((m) => JSON.stringify({ channelId: m.metadata.channelId, messageId: m.metadata.messageId, eventId: m.metadata.eventId, featureSet: m.metadata.featureSet })).join('; ') || 'no message for the Run';
     assert.equal(mine.length, 1, `the completion's messages in the agent context: ${route}`);
     assert.ok(mine[0].metadata.channelId === CHANNEL && mine[0].metadata.messageId !== undefined && mine[0].metadata.eventId === undefined, `delivered on the session's channel, not pushed: ${route}`);
@@ -254,6 +264,9 @@ try {
     log(`   the note came by the channel_publish tool call; the plain reply ${fromProse.length ? 'was also routed into the channel by the host (tolerated)' : 'stayed with the host, not routed'}; routing traces: ${routing.join('; ') || 'none'}`);
     log('   inference calls:', membrane.calls.length);
     assert.ok(membrane.calls.length <= 2, `inference calls: ${membrane.calls.length}`);
+    // Counted again with the host idle twice over: counted only as the completion first showed, a second
+    // copy landing later went uncounted (the house's read of f3750e4..4f4c067 over our fixes, #22).
+    assert.equal(completionMessages(runId).length, 1, "the Run's completion messages once the host is idle again");
   });
 
   await observer.close();
