@@ -537,6 +537,18 @@ test('a tail names its first line’s source wherever the cut falls: past the so
   assert.deepEqual(two.text.split('\n'), ['[run r1]', 'a3', '[terminal]', 'p2']);
 });
 
+test('a byte budget whose cut falls inside a header keeps the header whole, and counts none of it as input omitted', async () => {
+  // A reviewer's read of the fixes for #22: the restore put back a header the cut dropped whole, and a cut inside the
+  // header kept its tail as the first line, `]` or `n r1]`.
+  const chunks: ProjectChunk[] = [{ data: 'p1\r\np2\r\n', stream: 'pty' }, { data: 'a1\na2\n', stream: 'stdout', runId: 'r1' }];
+  const input = 'p1\r\np2\r\n'.length + 'a1\na2\n'.length;
+  for (const max of [8, 10, 12, 14]) {
+    const p = await project(chunks, { cols: 80, rows: 24, label: sourceLabel, maxLines: 10, maxInputBytes: max });
+    assert.deepEqual(p.text.split('\n'), ['[run r1]', 'a1', 'a2'], `a budget of ${max}`);
+    assert.equal(p.omittedInputBytes, input - 'a1\na2\n'.length + '[terminal]\n'.length, `a budget of ${max}: the pty's lines and their header`);
+  }
+});
+
 test('a held line cut for the byte budget drops what was emitted before it: a title’s payload after a whole line keeps only the tail', async () => {
   // `head\r\n`, then an OSC 52 of 10 KB in a later chunk with no line end, under a 4 KiB budget: `head` survived
   // the payload between it and the end.

@@ -152,6 +152,8 @@ interface Segment {
   bytes: number;
   /** A header line naming a source (rule 6): no line of output, so `maxLines` does not count it. */
   header?: true;
+  /** A header's whole line, which a cut inside it leaves `data` short of. */
+  whole?: string;
   /** The header that names this segment's source, emitted just before it. */
   named?: Segment;
   /**
@@ -614,7 +616,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       let named: Segment | undefined;
       if (header) {
         const h = `${header}\n`;
-        named = { key: `n:${notes++}`, pipe: true, data: h, bytes: utf8Length(h), header: true };
+        named = { key: `n:${notes++}`, pipe: true, data: h, bytes: utf8Length(h), header: true, whole: h };
         out.push(named);
         outBytes += utf8Length(h);
       }
@@ -861,11 +863,16 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
   // It counts as a header for keepLines too: the tail budget dropped it inside `segments`, before the
   // headers were gathered, so a tail of 2 counted it as a line of output and cut it again (our read of the
   // house's fixes for its review of f3750e4, PR #22).
+  // A cut inside the header itself kept its tail, `n r1]`, as the first line, and it is put back whole too:
+  // what of it the cuts took is no input omitted either (a reviewer's read of the fixes for #22).
   const first = segs[0];
-  if (first?.named) {
-    segs.unshift(first.named);
-    headers.add(first.named.data.slice(0, -1));
-    omitted -= first.named.bytes;
+  const named = first?.named ?? (first?.whole !== undefined && first.data !== first.whole ? first : undefined);
+  if (named?.whole !== undefined) {
+    omitted -= utf8Length(named.whole) - (named === first ? utf8Length(first.data) : 0);
+    named.data = named.whole;
+    named.bytes = utf8Length(named.whole);
+    if (named !== first) segs.unshift(named);
+    headers.add(named.whole.slice(0, -1));
   }
   // A segment that begins inside a CSI is fed that CSI's head first (rule 6), as no input.
   for (const seg of segs) {
