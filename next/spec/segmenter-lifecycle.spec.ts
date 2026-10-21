@@ -675,17 +675,24 @@ test('a digest never shows the payload of a string that ended inside a long carr
   startRun(src, 'copy');
   const seg = new Segmenter(src, { cadenceMs: 40 });
   const out = collect(seg);
-  const body = () => out.filter((s) => s.kind === 'output').at(-1)?.body ?? '';
+  // Each phase reads the digest of everything appended so far, not whichever came last after a sleep, which under load could be
+  // the phase before's, or none (a reviewer's read of the fixes for #22).
+  let bytes = 0;
+  const append = (data: string) => {
+    bytes += data.length;
+    src.journal.append({ type: 'output', data, stream: 'pty', runId: 'copy' });
+  };
+  const body = async () => (await digestOf(out, bytes)).body ?? '';
   try {
-    src.journal.append({ type: 'output', data: 'start\r\ncopying \x1b]52;c;' + 'S'.repeat(9000) + '\x07 still copying', stream: 'pty', runId: 'copy' });
-    await sleep(100);
-    src.journal.append({ type: 'output', data: ' 50%', stream: 'pty', runId: 'copy' });
-    await sleep(100);
-    assert.ok(!body().includes('SSS'), JSON.stringify(body().slice(-80)));
-    src.journal.append({ type: 'output', data: ' done\r\n', stream: 'pty', runId: 'copy' });
-    await sleep(100);
+    append('start\r\ncopying \x1b]52;c;' + 'S'.repeat(9000) + '\x07 still copying');
+    await body();
+    append(' 50%');
+    const mid = await body();
+    assert.ok(!mid.includes('SSS'), JSON.stringify(mid.slice(-80)));
+    assert.match(mid, /still copying 50%$/, 'the phase with ` 50%` is the one read');
+    append(' done\r\n');
     // The line's tail: its first 4,096 units went with the cut, the clipboard among them.
-    assert.deepEqual(body().split('\n'), ['start', ' still copying 50% done']);
+    assert.deepEqual((await body()).split('\n'), ['start', ' still copying 50% done']);
   } finally {
     seg.dispose();
   }
