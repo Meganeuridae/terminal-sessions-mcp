@@ -473,28 +473,52 @@ test('the newest 1,024 ended Runs keep their last output’s stamp, and an older
   }
 });
 
-test('a wait replaying output from `since` starts its lines afresh across a hole: a string or a line open before it takes nothing after it (the house’s review of the 40 commits through f3750e4, #22, comment 6310921374)', async () => {
+// A hole reaches a read in two shapes: seqs with no event (a gap recorded later sits after its hole), and a
+// stretch still lost, read as a gap at its own last seq, which for one seq is the lost event's own (the
+// house's read of the 40 commits over our fixes, #22).
+for (const shape of ['the events missing', 'a gap at each lost seq'] as const) {
+  test(`a wait replaying output from \`since\` starts its lines afresh across a hole: a string or a line open before it takes nothing after it, with ${shape} (the house’s review of the 40 commits through f3750e4, #22, comment 6310921374)`, async () => {
+    const f = bare();
+    const since = f.journal.since.bind(f.journal);
+    try {
+      f.startRun('r');
+      f.out('ready \x1b]0;my title', 'r');
+      const lost = [f.out('the rest of it\x07\n', 'r').seq];
+      f.out('ERROR: boom\n', 'r');
+      f.out('abc', 'r');
+      lost.push(f.out('XYZ', 'r').seq);
+      f.out('def\n', 'r');
+      // What a store failure took: the read returns no events for those seqs, or the journal's gap for each.
+      f.journal.since = (cursor: number, limit?: number) => {
+        const r = since(cursor, limit);
+        const events =
+          shape === 'the events missing'
+            ? r.events.filter((e) => !lost.includes(e.seq))
+            : r.events.map((e): JournalEvent => (lost.includes(e.seq) ? { type: 'gap', from: e.seq, to: e.seq, reason: 'store-failed', seq: e.seq, ts: e.ts } : e));
+        return { ...r, events };
+      };
+      assert.equal((await f.manager.waitFor({ pattern: '^ERROR' }, 300, 0)).matched, true, 'the title open before the hole took the line after it');
+      assert.equal((await f.manager.waitFor({ pattern: 'abcdef' }, 150, 0)).matched, false, 'no line is joined across the hole');
+      assert.equal((await f.manager.waitFor({ pattern: '^def' }, 300, 0)).matched, true);
+      assert.equal((await f.manager.waitFor({ pattern: '^ready $' }, 300, 0)).matched, true, 'the line open before the hole is a line of its own');
+    } finally {
+      f.journal.since = since;
+      f.close();
+    }
+  });
+}
+
+test('a gap recorded after its hole splits no line the replay reads past it (the house’s read of the 40 commits over our fixes, #22)', async () => {
+  // A catch-up records a healed stretch's gap at a new seq, maybe in the middle of a line the shell is
+  // printing; the hole itself showed where it lay. The live feed passes such a gap by, and so does the replay.
   const f = bare();
-  const since = f.journal.since.bind(f.journal);
   try {
     f.startRun('r');
-    f.out('ready \x1b]0;my title', 'r');
-    const lost = [f.out('the rest of it\x07\n', 'r').seq];
-    f.out('ERROR: boom\n', 'r');
     f.out('abc', 'r');
-    lost.push(f.out('XYZ', 'r').seq);
+    f.journal.append({ type: 'gap', from: 1, to: 1, reason: 'store-failed' });
     f.out('def\n', 'r');
-    // What a store failure took: the read returns no events for those seqs.
-    f.journal.since = (cursor: number, limit?: number) => {
-      const r = since(cursor, limit);
-      return { ...r, events: r.events.filter((e) => !lost.includes(e.seq)) };
-    };
-    assert.equal((await f.manager.waitFor({ pattern: '^ERROR' }, 300, 0)).matched, true, 'the title open before the hole took the line after it');
-    assert.equal((await f.manager.waitFor({ pattern: 'abcdef' }, 150, 0)).matched, false, 'no line is joined across the hole');
-    assert.equal((await f.manager.waitFor({ pattern: '^def' }, 300, 0)).matched, true);
-    assert.equal((await f.manager.waitFor({ pattern: '^ready $' }, 300, 0)).matched, true, 'the line open before the hole is a line of its own');
+    assert.equal((await f.manager.waitFor({ pattern: 'abcdef' }, 300, 0)).matched, true);
   } finally {
-    f.journal.since = since;
     f.close();
   }
 });

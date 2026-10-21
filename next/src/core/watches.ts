@@ -571,11 +571,15 @@ export class WatchManager {
           // torn write) the lines start afresh, as search's do (`lineEnds`): a line, or a string, open
           // before the hole took what followed it (the house's review of the 40 commits through f3750e4,
           // #22, comment 6310921374). The live feed below needs none: it saw every event a gap names.
+          // A stretch still lost reads as a gap seated in its own hole, at its last seq, so a stretch of one
+          // seq makes no jump: the gap itself starts the lines afresh. A gap recorded later sits after its
+          // hole, which showed as a jump where it lay, and splits nothing (the house's read of the 40
+          // commits over our fixes, #22).
           const lastBy = new Map<string, JournalEvent>();
           let prev = since;
           for (const page of this.host.journal.pages(since)) {
             for (const ev of page.events) {
-              if (ev.seq > prev + 1) predicate.restartLines();
+              if (ev.seq > prev + 1 || (ev.type === 'gap' && ev.seq <= ev.to)) predicate.restartLines();
               prev = ev.seq;
               if (done) return;
               predicate.feed(ev);
