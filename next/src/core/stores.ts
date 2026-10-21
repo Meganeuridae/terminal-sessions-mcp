@@ -68,16 +68,21 @@ export interface JournalStore {
 export interface HighWater {
   /** Numbering resumes above this, with nothing missing below it: retention dropped the files that held it. */
   floor?: Seq;
-  /** The journal's reservation: no seq above `to` was issued. */
+  /**
+   * The journal's reservation: no seq above `to` was issued, unless a write of a higher one was refused, when
+   * the journal issues on meanwhile (best effort: Journal.keepMark says what that exposes).
+   */
   reservation?: Reservation;
 }
 
 /**
  * A journal keeps its reservation written and synced a block ahead of the seqs it issues, while its
- * appends are not synced, and lowers it to its last seq when it seals. After a power loss the files may
- * have lost their unsynced tail, but not the reservation, so the next journal numbers above every seq
- * issued before it and records the seqs between the files' last and `to` as a `torn-write` gap (the
- * house's read of the 33 commits, PR #22, comment 6307349700, its question of intent).
+ * appends are not synced, and lowers it to its last seq when it seals. A write of it the disk refuses is
+ * tried again at most once a second, and the journal issues on meanwhile, past it if need be (best effort,
+ * Journal.keepMark). After a power loss the files may have lost their unsynced tail, but not the
+ * reservation, so the next journal numbers above every seq issued before it and records the seqs
+ * between the files' last and `to` as a `torn-write` gap (the house's read of the 33 commits, PR #22,
+ * comment 6307349700, its question of intent).
  */
 export interface Reservation {
   to: Seq;
@@ -91,9 +96,11 @@ export interface Reservation {
    */
   failedFrom?: Seq;
   /**
-   * The boot it was written under (Linux's boot id, macOS's boot session). On the same boot an unclean
-   * stop lost nothing the page cache held, so the files hold every seq issued and the reservation is not
-   * honoured; on another boot, or with none known, it is.
+   * The boot it was written under (Linux's boot id, macOS's boot session). On another boot, or with none
+   * known, it is honoured. On the same boot an unclean stop lost nothing the page cache held, so it is
+   * honoured only while the store accounts for less than the seq its block was reserved above: the one
+   * block a start reserves above a hole it opened, before that hole's gap is in the file
+   * (reservationHonoured).
    */
   boot?: string;
 }
