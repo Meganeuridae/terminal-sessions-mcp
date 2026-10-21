@@ -288,25 +288,29 @@ class Predicate {
     });
   }
 
-  /** A hole in the output read: every stream's unterminated line is complete, and each starts afresh. */
+  /**
+   * A hole in the output read: every source's unterminated line is complete, and each starts afresh. A source
+   * is what `sourceKey` keys a matcher by, the PTY or a process Run's two pipes together, so its line may hold
+   * both pipes' output (the house's read of f3750e4..4f4c067 over our fixes, #22).
+   */
   restartLines(): void {
     this.flush();
     for (const s of this.matchers.values()) s.m.dispose();
     this.matchers.clear();
   }
 
-  /** Complete every stream's unterminated line now (its stream ended). */
+  /** Complete every source's unterminated line now (its output ended). */
   flush(): void {
     for (const s of this.matchers.values()) for (const hit of s.m.flush()) this.fire(hitOf(hit, s.seq));
   }
 
-  /** Complete one stream's unterminated line now, if it has one waiting (the stream has been quiet long enough). */
+  /** Complete one source's unterminated line now, if it has one waiting (the source has been quiet long enough). */
   flushStream(key: string): void {
     const s = this.matchers.get(key);
     if (s) for (const hit of s.m.flush()) this.fire(hitOf(hit, s.seq));
   }
 
-  /** These streams are over: complete their last lines and forget their matchers. */
+  /** These sources are over: complete their last lines and forget their matchers. */
   private endStreams(...keys: string[]): void {
     for (const key of keys) {
       const s = this.matchers.get(key);
@@ -645,7 +649,7 @@ export class WatchManager {
             if (h < holes.length) predicate.restartLines();
             if (done) return;
           }
-          // A stream whose replayed last line has no newline and has been quiet for the partial
+          // A source whose replayed last line has no newline and has been quiet for the partial
           // delay already (a prompt sitting there) is matched now, not after the delay restarts.
           for (const [key, ev] of lastBy) {
             if (this.ageOf(ev) >= PARTIAL_QUIET_MS) predicate.flushStream(key);
