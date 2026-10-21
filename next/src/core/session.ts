@@ -1606,7 +1606,7 @@ export class Session {
     });
   }
 
-  private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; leftovers?: boolean; pipeStatus?: number[] }): void {
+  private endRun(run: RunRecord, outcome: { state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; leftovers?: boolean; pipeStatus?: number[]; shellBack?: boolean }): void {
     if (isTerminal(run.state)) return;
     const killedByClose = (outcome.exit !== undefined && CLOSE_STATUSES.has(outcome.exit)) || (outcome.signal !== undefined && CLOSE_SIGNALS.has(outcome.signal));
     if (outcome.state === 'exited' && run.target === 'shell' && this.closeBegun && killedByClose) {
@@ -1682,7 +1682,9 @@ export class Session {
     const wasCurrent = this.currentShellRun === run;
     if (wasCurrent) this.currentShellRun = undefined;
     if (wasCurrent && this.integrationLevel === 'none' && this.shellState !== 'exited' && this.shellState !== 'unavailable') {
-      this.shellState = outcome.state === 'lost' ? 'unavailable' : 'idle';
+      // A lost marker Run leaves the shell's state unknown, unless what ended it shows the shell reads
+      // lines again (shellBack: the end-marker probe's answer, scanMarker).
+      this.shellState = outcome.state === 'lost' && !outcome.shellBack ? 'unavailable' : 'idle';
       queueMicrotask(() => {
         this.drainQueue();
         this.notifyAvailable();
@@ -2373,8 +2375,12 @@ export class Session {
     if (probe !== -1) {
       run.markerTail = '';
       // The probe is a line of its own, typed after a ^C at the prompt: it confirms the shell is
-      // back, and the command's exit was not observed (ss-5; G2, G3).
-      this.endRun(run, { state: run.cancelRequested ? 'cancelled' : 'lost', reason: 'exit-unobserved' });
+      // back, and the command's exit was not observed (ss-5; G2, G3). Answered after a cancel that
+      // returned with the Run still running, the Run is lost, and the shell is back all the same: the
+      // answer is the shell reading lines. Taken as unknown, the shell stayed unavailable, and a Run
+      // queued behind it stayed queued, with nothing on a shell without integration to free it (the
+      // house's review of f3750e4..4f4c067, PR #22 comment 6315636412, question 3, by run on dash).
+      this.endRun(run, { state: run.cancelRequested ? 'cancelled' : 'lost', reason: 'exit-unobserved', shellBack: true });
       return;
     }
     run.markerTail = window.slice(-64);

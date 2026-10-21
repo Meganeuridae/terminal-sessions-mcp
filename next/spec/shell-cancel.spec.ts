@@ -389,10 +389,17 @@ test('/bin/dash: a marker Run cancelled across a stopped shell, whose ^\\ flushe
     const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 300 });
     assert.deepEqual(c.steps.filter((s) => s === 'end-marker probe').length, 2, JSON.stringify(c.steps));
     assert.ok(c.steps.indexOf('^\\') < c.steps.lastIndexOf('end-marker probe'), 'the second probe after the ^\\');
+    // A Run queued behind it runs once the probe's answer shows the shell is back (the house's review of
+    // f3750e4..4f4c067, PR #22 comment 6315636412, question 3): left unavailable, it was still queued 3 s later.
+    const b = x.session.admit({ target: 'shell', line: 'echo second-$((40+2))', principal: AGENT, queue: true });
+    assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
     process.kill(pid, 'SIGCONT');
     const ra = await x.session.awaitRun(a.run.runId, 5000);
     // ss-5: the probe's $? is its own line's; the Run's exit stays unobserved (G2, G3).
     assert.deepEqual([ra.state, ra.reason], ['lost', 'exit-unobserved'], JSON.stringify(ra));
+    const rb = await x.session.awaitRun(b.run.runId, 5000);
+    assert.deepEqual([rb.state, rb.exit], ['exited', 0], JSON.stringify(rb));
+    assert.equal((await x.session.runTranscript(rb.runId)).text, 'second-42');
   } finally {
     try {
       process.kill(pid, 'SIGCONT');

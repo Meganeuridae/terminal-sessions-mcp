@@ -640,6 +640,29 @@ test('the replies to the shell’s terminal queries since its last prompt start 
   await h.session.close();
 });
 
+test('a marker Run whose probe is answered after a cancel that returned with it running is lost, and the shell is back: a Run queued behind it runs', async () => {
+  // The shell stopped through the cancel: its ^C, probes and ^\ wait unread, and the cancel returns with
+  // the Run running. Once the shell runs again it answers a probe; the Run's end was not observed, but the
+  // answer is the shell reading lines. Left unavailable, the shell held the queued Run for good (the house's
+  // review of f3750e4..4f4c067, PR #22 comment 6315636412, question 3, by run on dash).
+  const h = await harness({ marks: 'none' });
+  await until(() => h.session.shellAvailable().ok, 3000, 'the shell is ready');
+  h.shell.stop();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'running', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.deepEqual([c.state, c.escalation], ['running', 'session_close'], JSON.stringify(c));
+  assert.ok(c.steps.includes('end-marker probe'), JSON.stringify(c.steps));
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  h.shell.cont(); // the prompt for the ^C, then the probe's answer
+  const rb = await h.session.awaitRun(b.run.runId, 2000);
+  assert.deepEqual([rb.state, rb.exit], ['exited', 0], JSON.stringify(rb));
+  assert.equal((await h.session.runTranscript(rb.runId)).text, 'hello');
+  assert.deepEqual([h.session.run(a.run.runId).state, h.session.run(a.run.runId).reason], ['lost', 'exit-unobserved']);
+  await h.session.close();
+});
+
 test('a reader holding the terminal gets none of the kept replies: not after the cancel’s ^Cs, nor after a later ^C', async () => {
   // A DEBUG trap's read holds the terminal in cooked mode, so the cancel types no empty line. The replies
   // went into that read all the same: after the cancel's ^Cs, before the checks that gate the empty line,
