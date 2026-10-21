@@ -578,10 +578,13 @@ export class FileStore implements JournalStore {
   /** Said once per store too: a refused sync of its files before a clear (appendSyncRefused). */
   private appendSyncWarned = false;
   /**
-   * Directories this open created, the store's own and any parent made on the way, outermost first, whose
-   * entries are not yet synced into their parents. A metadata write counts as written only once they are:
-   * the file's own sync and its directory's left a new session's directory entry unsynced, so a power
-   * loss soon after could take the session with the reservation it had synced.
+   * Directories whose entries are not yet synced into their parents, outermost first: those this open created,
+   * the store's own and any parent made on the way, or else the store's own, which an earlier open may have made
+   * and died before syncing (nothing on disk says which). A metadata write counts as written only once they are:
+   * the file's own sync and its directory's left a new session's directory entry unsynced, so a power loss soon
+   * after could take the session with the reservation it had synced; and an open that took its directory as old
+   * never synced it (the house's review of 4f4c067..a8b6f28, PR #22). One directory sync a life, at its first
+   * metadata write: a store that writes none (a closed session a restart seals unchanged) syncs nothing.
    */
   private readonly newDirs: string[];
   private readonly log: FileStoreOptions['log'];
@@ -600,7 +603,8 @@ export class FileStore implements JournalStore {
     this.floor = opts.floor;
     this.log = opts.log;
     // The journal holds whatever programs printed: private to the daemon's user (G26).
-    this.newDirs = makeDirs(dir, DIR_MODE);
+    const made = makeDirs(dir, DIR_MODE);
+    this.newDirs = made.length ? made : [path.resolve(dir)];
     try {
       fs.chmodSync(dir, DIR_MODE);
     } catch {

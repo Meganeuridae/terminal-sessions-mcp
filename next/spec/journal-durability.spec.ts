@@ -1125,10 +1125,15 @@ test('a store syncs a directory it created into its parent with its first metada
     failIno = undefined;
     assert.equal(reserve(y, 100), true, 'counted once the sync lands');
     y.close();
-    // A directory that was already there is not synced into its parent again.
+    // A directory that was already there is synced into its parent once, at the life's first metadata write,
+    // since an open that made it may have died before syncing it (the house's review of 4f4c067..a8b6f28,
+    // PR #22), and not at the writes after it.
     synced.length = 0;
     const again = new FileStore(path.join(root, 'sessions', 'x'));
     assert.equal(reserve(again, 200), true);
+    assert.ok(synced.includes(ino(path.join(root, 'sessions'))), 'its entry in sessions/, once');
+    synced.length = 0;
+    assert.equal(reserve(again, 300), true);
     assert.ok(!synced.includes(ino(path.join(root, 'sessions'))), 'only the store\'s own directory, for its file');
     again.close();
   } finally {
@@ -1498,6 +1503,25 @@ test('a stretch gap the disk refused, then the ring dropped, is one hole to gaps
 
 // ───────────── the house's review of 4f4c067..a8b6f28, PR #22 ─────────────
 
+/** Every directory fsynced while `fn` runs, by inode. */
+function dirsSyncedDuring<T>(fn: () => T): { result: T; synced: Set<string> } {
+  const real = fsc.fsyncSync;
+  const synced = new Set<string>();
+  fsc.fsyncSync = ((fd: number) => {
+    const st = fsc.fstatSync(fd);
+    if (st.isDirectory()) synced.add(String(st.ino));
+    return real(fd);
+  }) as typeof fs.fsyncSync;
+  syncBuiltinESMExports();
+  try {
+    return { result: fn(), synced };
+  } finally {
+    fsc.fsyncSync = real;
+    syncBuiltinESMExports();
+  }
+}
+const inode = (p: string) => String(fs.statSync(p).ino);
+
 test('a read that returns none of the events while more remain covers nothing: a limit of 0 reads no holes and throws nothing', () => {
   const j = new Journal({ sessionId: 's' });
   for (let i = 0; i < 5; i++) j.append(out(`e${i}`));
@@ -1527,6 +1551,36 @@ test('a text read prints a hole wider than a batch once: one joined past MAX_LOS
     assert.equal(listed.length, 1, JSON.stringify((r.gaps ?? []).map((g) => [g.from, g.to])));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a store syncs its own directory into its parent at its first metadata write, though an earlier open made the directory and died before syncing it', () => {
+  const root = tmpDir();
+  try {
+    const dir = path.join(root, 'sessions', 's');
+    fs.mkdirSync(dir, { recursive: true }); // what an open that died before its first metadata write leaves
+    const { synced } = dirsSyncedDuring(() => {
+      const j = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+      j.append(out('first')); // its reservation: the store's first metadata write
+      j.close();
+    });
+    assert.ok(synced.has(inode(path.join(root, 'sessions'))), "the store directory's entry in sessions/ was synced");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a start syncs the data dir and sessions/ into their parents, though an earlier start made them and died before syncing them', async () => {
+  const root = tmpDir();
+  try {
+    const dataDir = path.join(root, 'data');
+    fs.mkdirSync(path.join(dataDir, 'sessions'), { recursive: true }); // what a start that died before its syncs leaves
+    const { result: reg, synced } = dirsSyncedDuring(() => new SessionRegistry({ dataDir, backend: new ScriptedBackend(), lock: false }));
+    assert.ok(synced.has(inode(root)), "the data dir's entry in its parent was synced");
+    assert.ok(synced.has(inode(dataDir)), "sessions/' entry in the data dir was synced");
+    await reg.closeAll();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

@@ -452,9 +452,12 @@ export class SessionRegistry {
     // A directory made here is in its parent durably only once that parent is synced: on a first start, a
     // power loss soon after could take sessions/ with every reservation its stores had synced. A store
     // syncs the directories it makes itself (makeDirs); the data dir and sessions/ are made here, before any
-    // store opens.
-    const unsynced = syncMadeDirs(made);
-    if (unsynced) this.opts.log?.('warn', `a directory the daemon made could not be synced into its parent (${made[0]}): ${unsynced.message}; a power loss soon after this start can take the sessions made since`, { dataDir: opts.dataDir });
+    // store opens. Both are synced at every start, not only the one that made them: a start that made them and
+    // died before this left them unsynced, and the next took them as old (the house's review of
+    // 4f4c067..a8b6f28, PR #22). Two directory syncs a start; any parent made on the way first.
+    const dirs = [...new Set([...made, path.resolve(opts.dataDir), path.resolve(this.root)])].sort((a, b) => a.length - b.length);
+    const unsynced = syncMadeDirs(dirs);
+    if (unsynced) this.opts.log?.('warn', `a directory the daemon made could not be synced into its parent (${dirs[0]}): ${unsynced.message}; a power loss soon after this start can take the sessions made since`, { dataDir: opts.dataDir });
     this.recover();
   }
 
