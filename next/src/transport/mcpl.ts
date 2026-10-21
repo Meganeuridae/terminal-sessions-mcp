@@ -1107,6 +1107,12 @@ export class McplLane {
    * read of the 40 commits through f3750e4, #22 comment 6310921374). What is folded is not settled: the
    * summary pins the cursor below its oldest message until the host accepts it (G22), and the log says
    * so. A summary folded before and not in flight is folded into the new one, so a session keeps one.
+   *
+   * A message whose resend still waits for the host's answer is not folded: refused, it is owed alone
+   * again, so it was retried alone, counted by the summary, and counted again by a later fold (an
+   * independent read of the fold, #22: 30 refused completions read as 4 alone and 33 in summaries when
+   * the host answered 700 ms late). The oldest of the rest go, the one just refused among them, so no
+   * more than `retryMax` are retried alone after a fold.
    */
   private foldRetries(t: Target, st: LaneState): void {
     const singles = [...st.retries].filter(([, r]) => r.kind !== 'summary');
@@ -1124,7 +1130,8 @@ export class McplLane {
       if (r?.timer) clearTimeout(r.timer);
       st.retries.delete(id);
     };
-    for (const [id, r] of singles.slice(0, singles.length - keep)) {
+    const idle = singles.filter(([id]) => !st.inflight.has(id));
+    for (const [id, r] of idle.slice(0, singles.length - keep)) {
       drop(id);
       st.owed.delete(r.seq);
       add({ count: 1, from: r.seq, to: r.seq, kinds: { [r.kind]: 1 } });
