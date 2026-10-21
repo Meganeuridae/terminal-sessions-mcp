@@ -108,6 +108,8 @@ const completionMessages = (runId) =>
     .getContextManager()
     .getAllMessages()
     .filter((m) => m.metadata?.runId === runId && m.metadata?.tags?.includes('terminal:run-finished'));
+/** When the Run's completion first showed in the scout's context, to the next 100 ms poll; the recount waits two seconds on from it. */
+let firstCompletionAt;
 
 try {
   await check('grant and tools', async () => {
@@ -190,6 +192,7 @@ try {
   await check('a useful completion notification through the host, and the inference call it woke', async () => {
     const until = now() + 8000;
     while (!context().includes('acceptance-output') && now() < until) await sleep(100);
+    if (completionMessages(runId).length) firstCompletionAt = now();
     const ctx = context();
     assert.ok(ctx.includes(`${SESSION}: \`${COMMAND}\` → exit 0`), `agent context:\n${ctx.slice(-800)}`);
     assert.match(ctx, /acceptance-output/);
@@ -264,9 +267,16 @@ try {
     log(`   the note came by the channel_publish tool call; the plain reply ${fromProse.length ? 'was also routed into the channel by the host (tolerated)' : 'stayed with the host, not routed'}; routing traces: ${routing.join('; ') || 'none'}`);
     log('   inference calls:', membrane.calls.length);
     assert.ok(membrane.calls.length <= 2, `inference calls: ${membrane.calls.length}`);
-    // Counted again with the host idle twice over: counted only as the completion first showed, a second
-    // copy landing later went uncounted (the house's read of f3750e4..4f4c067 over our fixes, #22).
-    assert.equal(completionMessages(runId).length, 1, "the Run's completion messages once the host is idle again");
+    // Counted again two seconds on from the completion's first showing, as the bridge's check counts its
+    // own. Counted only as it first showed, a second copy landing later went uncounted (the house's read of
+    // f3750e4..4f4c067 over our fixes, #22); and the host's idle waits end at once with nothing in flight,
+    // so a copy the lane sent on a timer could land after them (the house's read of a8b6f28..4860d4c, #22).
+    // The two seconds cover a copy sent on a timer within them, as a retry from 500 ms would be; a copy
+    // sent later than that isn't seen here.
+    const sinceFirst = firstCompletionAt === undefined ? undefined : now() - firstCompletionAt;
+    if (firstCompletionAt !== undefined) await sleep(Math.max(0, firstCompletionAt + 2000 - now()));
+    log(`   the recount: ${sinceFirst === undefined ? 'no completion had shown' : `the check reached it ${Math.round(sinceFirst)} ms after the completion first showed${sinceFirst < 2000 ? ', and waited to two seconds' : ''}`}`);
+    assert.equal(completionMessages(runId).length, 1, "the Run's completion messages two seconds after the first showed");
   });
 
   await observer.close();
