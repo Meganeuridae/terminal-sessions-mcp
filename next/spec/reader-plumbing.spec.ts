@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { readJournal, type ReadOptions, type ReadResult, type ReadSource } from '../src/api/reader.js';
 import { markerProbe, sourceLine } from '../src/core/plumbing.js';
 import type { Journal } from '../src/core/journal.js';
-import { out, readAll, source } from './reader-fixture.spec.js';
+import { out, readAll, source, startRun } from './reader-fixture.spec.js';
 
 const AGENT = 'agent:a@test';
 const NONCE = 'ab12cd34';
@@ -131,6 +131,30 @@ test('a cancelled marker Run reads without the probe line its cancel typed or th
   markerRun(src.journal, ['working\r\n', '^C\r\n'], [`$${markerProbe(NONCE)}\r\n<<<PROBE:${NONCE}>>>\r\n$ `]);
   assert.equal((await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 })).text, 'working\n^C');
   assert.equal((await readJournal(src, { runId: 'r1', tail: 5 }, { resultBytes: 16384 })).text, 'working\n^C');
+});
+
+test('a raw read of a marker Run, paged by events, joins to its own output with its escape codes, the plumbing cut even where a page falls between a mark’s halves (an independent read of the fixes for the review of f3750e4, PR #22)', async () => {
+  // The compat pack's raw output ran its own cutter over the whole Run; it reads these pages now.
+  const body = ['\x1b[1mbold\x1b[0m\r\n', 'two\r\n', 'no-newline'];
+  for (const limit of [1, 2, 3, 2000]) {
+    const src = source();
+    markerRun(src.journal, body, [`<<<EX`, `IT:${NONCE}:0>>>\r\n$ `]);
+    let text = '';
+    let since: number | undefined;
+    for (let guard = 0; guard < 100; guard++) {
+      const r = await readJournal(src, { runId: 'r1', as: 'raw', limit, ...(since !== undefined ? { since } : {}) }, { resultBytes: 16384 });
+      text += r.text ?? '';
+      if (!r.more) break;
+      since = r.nextCursor;
+    }
+    assert.equal(text, body.join(''), `pages of ${limit} events`);
+  }
+  // A process Run's raw output is its data as written.
+  const src = source();
+  startRun(src.journal, 'p1');
+  out(src.journal, '\x1b[31mred\x1b[0m\n<<<EXIT:x:0>>>\n', 'stdout', 'p1');
+  assert.equal((await readJournal(src, { runId: 'p1', as: 'raw' }, { resultBytes: 16384 })).text, '\x1b[31mred\x1b[0m\n<<<EXIT:x:0>>>\n');
+  await assert.rejects(readJournal(src, { runId: 'p1', as: 'raw', tail: 2 }, { resultBytes: 16384 }), /raw read pages head first/);
 });
 
 test('a read of the session still shows everything the terminal showed, plumbing included', async () => {

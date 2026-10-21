@@ -7,6 +7,7 @@
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
@@ -47,7 +48,7 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function start(opts: Partial<ServerOptions> & { prepare?: (dataDir: string) => void } = {}): Promise<Harness> {
+async function start(opts: Partial<ServerOptions> & { prepare?: (dataDir: string) => void; registry?: Partial<ConstructorParameters<typeof SessionRegistry>[0]> } = {}): Promise<Harness> {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-transport-'));
   roots.push(dataDir);
   opts.prepare?.(dataDir);
@@ -55,11 +56,11 @@ async function start(opts: Partial<ServerOptions> & { prepare?: (dataDir: string
     sh.on('echo hello', () => ({ output: 'hello\r\n', exit: 0 }));
     sh.on(/^sleep/, () => ({ hang: true }));
   });
-  const registry = new SessionRegistry({ dataDir, backend, defaultShell: '/bin/bash', noUserRc: true });
+  const registry = new SessionRegistry({ dataDir, backend, defaultShell: '/bin/bash', noUserRc: true, ...opts.registry });
   const app = new App({ registry, defaultWaitMs: 2000 });
   const logs: LogRecord[] = [];
   const usage: UsageRecord[] = [];
-  const { prepare: _p, ...rest } = opts;
+  const { prepare: _p, registry: _r, ...rest } = opts;
   const so: ServerOptions = {
     app,
     resolver: new TokenMapResolver({ tokens: TOKENS }),
@@ -1165,6 +1166,43 @@ test('G28 plumbing: ToolResult.onSent runs once after the response is written, a
   } finally {
     def.run = original;
     await h.close();
+  }
+});
+
+test('G21: /health reports a session that awaits recovery’s judgement as session_list does — no retention applied, the record’s pending (an independent read of the fixes for the review of f3750e4, PR #22)', async () => {
+  // /health gave the record's retention while session_list gave `{}` and pendingRetention. A live group of its own,
+  // so recovery has one to judge.
+  const kid = spawn('/bin/sh', ['-c', 'sleep 60'], { detached: true, stdio: 'ignore' });
+  const g = kid.pid!;
+  const h = await start({
+    // No process listing answers, so the Run's group is left unjudged and the name awaits a recovery that can list.
+    registry: { terminateOrphans: true, listProcesses: () => undefined },
+    prepare: (dataDir) => {
+      const dir = path.join(dataDir, 'sessions', 'held');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'session.json'), JSON.stringify({ owner: 'agent:a@test', visibility: 'private', retention: { maxAgeMs: 3_600_000 } }));
+      const ts = Date.now();
+      const lines = [
+        { type: 'run.admit', runId: 'r1', target: 'process', line: 'sleep', principal: 'agent:a@test', origin: 'self', queued: false, seq: 1, ts },
+        { type: 'run.start', runId: 'r1', cwd: '/', envBasis: 'configured', pid: g, pgid: g, seq: 2, ts },
+      ];
+      fs.writeFileSync(path.join(dir, 'journal.jsonl'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+    },
+  });
+  try {
+    assert.equal(h.registry.awaitsJudgement('held'), true, 'the name awaits judgement');
+    const body = JSON.parse((await httpGet(h.port, '/health?token=ta')).body) as { sessions: Array<Record<string, unknown>> };
+    const held = body.sessions.find((x) => x.id === 'held')!;
+    assert.deepEqual([held.retention, held.pendingRetention], [{}, { maxAgeMs: 3_600_000 }]);
+    const entry = h.app.sessionList({ principal: 'agent:a@test', connectionId: 'c' }).find((x) => x.id === 'held')!;
+    assert.deepEqual([held.retention, held.pendingRetention], [entry.retention, entry.pendingRetention], 'one view in both');
+  } finally {
+    await h.close();
+    try {
+      process.kill(-g, 'SIGKILL');
+    } catch {
+      // gone
+    }
   }
 });
 

@@ -618,7 +618,8 @@ export class TermServer {
       if (s.closed) out.closed = true;
       else out.recovered = s.recovered;
       out.oldestSeq = s.journal.oldestSeq ?? null;
-      out.retention = { ...s.retention };
+      // The entry's view of it (App.retentionOf): what the store applies, and the record's while recovery owes a judgement.
+      Object.assign(out, this.opts.app.retentionOf(s));
       return out;
     }
     const i = s.session.info();
@@ -637,7 +638,7 @@ export class TermServer {
       ...i,
       currentRun,
       oldestSeq: s.session.journal.oldestSeq ?? null,
-      retention: { ...s.retention },
+      ...this.opts.app.retentionOf(s),
       journal: s.session.journal.stats(),
       screen: { backlog: s.session.screen.backlog, droppedUnits: s.session.screen.droppedUnits },
     };

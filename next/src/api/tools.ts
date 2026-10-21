@@ -246,7 +246,7 @@ const SERVICE_STATUS = ['starting', 'ready', 'running', 'unhealthy', 'exited', '
 /** A hole a result spans (reader.ts GapInfo): the `gap` event's range and reason. */
 const GAP: Schema = {
   type: 'object',
-  properties: { from: { type: 'integer' }, to: { type: 'integer' }, reason: { type: 'string', enum: ['retention', 'keeper-overflow', 'torn-write', 'store-error', 'store-failed'] }, exact: { type: 'boolean' } },
+  properties: { from: { type: 'integer' }, to: { type: 'integer' }, reason: { type: 'string', enum: ['retention', 'keeper-overflow', 'torn-write', 'store-error', 'store-failed'] }, exact: { type: 'boolean', description: 'true: every seq from `from` to `to` was issued, so the range counts the events lost; absent: the count is a bound (up to that many), since numbering may have skipped seqs never issued' } },
   required: ['from', 'to', 'reason'],
 };
 

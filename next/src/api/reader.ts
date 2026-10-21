@@ -202,7 +202,12 @@ export interface ReadOptions {
   untilOffset?: number;
   tail?: number;
   runId?: string;
-  as?: 'text' | 'events';
+  /**
+   * `raw`: the output an events page holds, its data joined as written, escape codes kept, a shell Run's plumbing
+   * cut as its text is (runKept); holes go in `gap`/`gaps`, not the text. Not a tool's choice: the compat pack's
+   * raw output reads by it.
+   */
+  as?: 'text' | 'events' | 'raw';
   maxBytes?: number;
   limit?: number;
   /** Text tails: head each Run's output with `$ <line>` where it started (its run.start), as 1.x logged commands. */
@@ -416,11 +421,13 @@ export async function readJournal(src: ReadSource, o: ReadOptions, defaults: { r
   // The Run's record: the source's (a live Session's, with its recorded geometry), else the journal's index.
   const run = o.runId !== undefined ? (src.run?.(o.runId) ?? journal.runs.get(o.runId)) : undefined;
   const geometry = { cols: run?.cols ?? src.cols, rows: run?.rows ?? src.rows ?? DEFAULT_GEOMETRY.rows };
-  if (o.untilOffset !== undefined && (o.tail === undefined || o.until === undefined || o.as === 'events')) {
+  if (o.untilOffset !== undefined && (o.tail === undefined || o.until === undefined || o.as === 'events' || o.as === 'raw')) {
     throw err('invalid_argument', 'untilOffset goes with a text tail and until: pass a tail result’s lines.before.until and lines.before.untilOffset as until and untilOffset, beside tail');
   }
+  if (o.as === 'raw' && o.tail !== undefined) throw err('invalid_argument', 'a raw read pages head first: pass since, not tail');
   if (o.tail !== undefined) return res(await tailRead(src, o, maxBytes, geometry, run));
   if (o.as === 'events') return res(eventsPage(src, o, maxBytes));
+  if (o.as === 'raw') return res(rawPage(src, o, maxBytes, run));
   return res(await textPage(src, o, maxBytes, geometry, run));
 }
 
@@ -1011,6 +1018,20 @@ function eventsPage(src: ReadSource, o: ReadOptions, maxBytes: number): Omit<Rea
   const r: Omit<ReadResult, 'session'> = { events: page, seq: [page[0]?.seq ?? start + 1, next], nextCursor: Math.min(next, journal.lastSeq), more, truncated: false };
   const recorded = recordedIn(page);
   return withGapInfo(r, [...(w.gap ? uncovered(journal, w.gap, recorded) : []), ...recorded]);
+}
+
+/**
+ * A raw page: the output of the events page `o` reads, its data joined as written, and for a shell Run's read
+ * the Run's own (runKept), so its raw output and its text agree on what is the Run's. The compat pack's raw
+ * runCommand output ran a second cutter, over the whole Run in memory, beside the one the reader runs (an
+ * independent read of the fixes for the review of f3750e4, PR #22).
+ */
+function rawPage(src: ReadSource, o: ReadOptions, maxBytes: number, run: RunInfo | undefined): Omit<ReadResult, 'session'> {
+  const { events = [], ...page } = eventsPage(src, o, maxBytes);
+  const outs = events.map((e) => (isOutput(e) ? e : undefined));
+  const of = plumbingOf(o, run);
+  const kept = of ? runKept(src, o.runId!, of, outs.map((e) => e && { ev: e, from: 0, data: e.data })) : [];
+  return { ...page, text: outs.map((e, i) => (!e ? '' : (kept[i]?.map(([a, b]) => e.data.slice(a, b)).join('') ?? e.data))).join('') };
 }
 
 // ───────────── tail ─────────────

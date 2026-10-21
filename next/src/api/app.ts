@@ -134,7 +134,7 @@ export interface SessionSummary extends SessionHeader {
 }
 
 /** A shell Run whose output may hold the daemon's plumbing, as App.runPlumbing describes it. */
-export type PlumbedRun = Pick<PlumbingOf, 'strategy' | 'nonce' | 'pid'> & { runId: string; line?: string };
+export type PlumbedRun = Pick<PlumbingOf, 'strategy' | 'nonce'> & { line?: string };
 
 export interface Caller {
   principal: Principal;
@@ -514,7 +514,7 @@ export class App {
       if (i.declared) out.declared = i.declared;
       const oldest = s.session.journal.oldestSeq;
       if (oldest !== undefined) out.oldestSeq = oldest;
-      this.retentionOf(s, out);
+      Object.assign(out, this.retentionOf(s));
       const x = this.extrasBySession.get(s.session);
       if (x) {
         // The list is bounded like `runs`: a life that starts many services does not grow this without
@@ -535,24 +535,22 @@ export class App {
     }
     const out: SessionSummary = { ...this.summaryHeader(s), visibility: s.visibility, lastSeq: s.journal.lastSeq };
     if (s.closed) out.closed = true;
-    this.retentionOf(s, out);
+    Object.assign(out, this.retentionOf(s));
     const oldest = s.journal.oldestSeq;
     if (oldest !== undefined) out.oldestSeq = oldest;
     return out;
   }
 
   /**
-   * The entry's retention as its store applies it, and the record's while it waits for recovery's judgement
-   * (pendingRetention). The entry reported the record's whatever the store applied, so a session kept whole
-   * for that judgement read as held to its cap (our read of the house's 2f7e9e7, PR #22).
+   * A session's retention as its store applies it, and the record's while it waits for recovery's judgement
+   * (pendingRetention): the one view of it for the entry and for /health. The entry reported the record's
+   * whatever the store applied, so a session kept whole for that judgement read as held to its cap (our read
+   * of the house's 2f7e9e7, PR #22), and /health went on doing so beside the entry's view (an independent read
+   * of the fixes for the review of f3750e4, PR #22).
    */
-  private retentionOf(s: AnySession, out: SessionSummary): void {
-    if (!this.registry.awaitsJudgement(sessionId(s))) {
-      out.retention = { ...s.retention };
-      return;
-    }
-    out.retention = {};
-    out.pendingRetention = { ...s.retention };
+  retentionOf(s: AnySession): Pick<SessionSummary, 'retention' | 'pendingRetention'> {
+    if (!this.registry.awaitsJudgement(sessionId(s))) return { retention: { ...s.retention } };
+    return { retention: {}, pendingRetention: { ...s.retention } };
   }
 
   sessionList(caller: Caller): SessionSummary[] {
@@ -1329,9 +1327,7 @@ export class App {
    * the session's text as a whole, which no Run renderer cuts for (the compat pack's logs). A Run's
    * own text is cut by the renderers; a Run journaled before the recording has neither, and its
    * marks are found by shape (the house's read of 78c4d6e, #22). `line` is the Run's line, which a
-   * reader that heads each Run with `$ <line>` needs to know how many lines that heading takes, and
-   * `pid` the shell that answers for an inline Run, for a reader that cuts one Run's raw output itself
-   * (the compat pack's runCommand).
+   * reader that heads each Run with `$ <line>` needs to know how many lines that heading takes.
    */
   runPlumbing(caller: Caller, o: { session: string; from: Seq; to: Seq }): PlumbedRun[] {
     const s = this.find(caller, o.session, 'observe');
@@ -1346,10 +1342,9 @@ export class App {
       // and one that never starts (its line reaching the shell cut) prints a GONE mark and no start (the
       // house's read of the 33 commits, #22, comment 6307351617, item 5).
       if (r.target !== 'shell' || (r.seq.start === undefined && r.nonce === undefined)) continue;
-      const p: PlumbedRun = { runId: r.runId };
+      const p: PlumbedRun = {};
       if (r.strategy !== undefined) p.strategy = r.strategy;
       if (r.nonce !== undefined) p.nonce = r.nonce;
-      if (r.shellPid !== undefined) p.pid = String(r.shellPid);
       if (r.line !== undefined) p.line = r.line;
       out.push(p);
     }

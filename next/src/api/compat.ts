@@ -11,11 +11,11 @@
 import { clocks } from '../core/clock.js';
 import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
-import { ackMark, cutPlumbing, exitMark, goneMark, inlineTypedLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLineEcho, startMark } from '../core/plumbing.js';
+import { ackMark, exitMark, goneMark, inlineTypedLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLineEcho, startMark } from '../core/plumbing.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
 import { keepLines as tailOfLines } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
-import { commitReadDelivery, takeReadCommit, type App, type PlumbedRun, type ReadResult, type SessionSummary } from './app.js';
+import { commitReadDelivery, takeReadCommit, type App, type ReadResult, type SessionSummary } from './app.js';
 import { looksLikeShellOpener } from './hints.js';
 import { clippedText, gapNote, gapsText, isSourceHeader } from './reader.js';
 import type { ToolContext, ToolDef, ToolResult } from './tools.js';
@@ -94,12 +94,9 @@ const omitted = (runId: string, text: string): string => `[… earlier output om
  * A Run's whole output, paged through `read` (text, or raw events), keeping the last
  * COMPAT_OUTPUT_BYTES with a visible marker when more was cut (er-14, atc-11). The bound
  * is counted in bytes, as the reader counts, not in UTF-16 units (the house's read of 1cabc6a, #22).
- * `read`'s text of a shell Run is cut of the daemon's plumbing; its raw output is cut here (rawRunOutput).
+ * Text and raw alike, a shell Run's pages come with the daemon's plumbing cut by the reader.
  */
-async function runOutput(ctx: ToolContext, session: string, run: { runId: string; seq: [Seq, Seq] }, raw: boolean, d: Drawn): Promise<string> {
-  const runId = run.runId;
-  const plumbed = raw ? ctx.app.runPlumbing(ctx.caller, { session, from: run.seq[0], to: run.seq[1] }).find((p) => p.runId === runId) : undefined;
-  if (plumbed && plumbed.strategy !== 'rich') return rawRunOutput(ctx, session, plumbed, d);
+async function runOutput(ctx: ToolContext, session: string, runId: string, raw: boolean, d: Drawn): Promise<string> {
   const parts: string[] = [];
   let bytes = 0;
   let cut = false;
@@ -110,11 +107,11 @@ async function runOutput(ctx: ToolContext, session: string, run: { runId: string
     if (since !== undefined) o.since = since;
     if (offset !== undefined) o.offset = offset;
     if (raw) {
-      o.as = 'events';
+      o.as = 'raw';
       o.limit = 2000;
     }
     const r = await readFor(ctx, d, o);
-    const text = raw ? (r.events ?? []).filter((e) => e.type === 'output').map((e) => (e as { data: string }).data).join('') : (r.text ?? '') + (r.text && !r.splitLine && r.more ? '\n' : '');
+    const text = raw ? (r.text ?? '') : (r.text ?? '') + (r.text && !r.splitLine && r.more ? '\n' : '');
     parts.push(text);
     bytes += utf8Length(text);
     while (bytes > COMPAT_OUTPUT_BYTES && parts.length > 1) {
@@ -129,57 +126,6 @@ async function runOutput(ctx: ToolContext, session: string, run: { runId: string
   return cut ? omitted(runId, out) : out;
 }
 
-/**
- * A shell Run's raw output without the daemon's plumbing. `read`'s text of a Run is cut by the reader (reader.ts
- * runKept); an events read is the journal as it stands, plumbing and all: the typed line's echo and the marks a
- * marker Run (dash) printed, a declared shell's end mark. So the raw output is cut here by the core's one cutter
- * (plumbing.ts cutPlumbing), by the strategy, nonce and shell the Run's run.start recorded, as its own result is cut
- * (our read of the house's fixes for its review of f3750e4, PR #22; older than them). The Run's events are read
- * whole, the newest COMPAT_OUTPUT_BYTES of output kept; what follows a hole is cut as output read from after the
- * Run's start.
- */
-async function rawRunOutput(ctx: ToolContext, session: string, run: PlumbedRun, d: Drawn): Promise<string> {
-  const events: JournalEvent[] = [];
-  let bytes = 0;
-  let cut = false;
-  // A hole retention left at the Run's head, which the reader reports beside the events rather than among them.
-  let headless = false;
-  let since: number | undefined;
-  for (let page = 0; page < 4096; page++) {
-    const o: Parameters<App['read']>[1] = { session, runId: run.runId, as: 'events', limit: 2000, maxBytes: 256 * 1024 };
-    if (since !== undefined) o.since = since;
-    const r = await readFor(ctx, d, o);
-    if (page === 0 && r.gap !== undefined && !(r.events ?? []).some((e) => e.type === 'gap' && e.from === r.gap!.from)) headless = true;
-    for (const e of r.events ?? []) {
-      if (e.type !== 'output' && e.type !== 'gap') continue;
-      events.push(e);
-      if (e.type === 'output') bytes += utf8Length(e.data);
-    }
-    while (bytes > COMPAT_OUTPUT_BYTES && events.length > 1) {
-      const e = events.shift()!;
-      if (e.type === 'output') bytes -= utf8Length(e.data);
-      cut = true;
-    }
-    if (!r.more || r.nextCursor === since) break;
-    since = r.nextCursor;
-  }
-  // The output between holes, each stretch cut on its own: a hole ends what was open before it.
-  const kept: string[] = [];
-  let stretch = '';
-  let atHead = !cut && !headless;
-  const flush = () => {
-    if (stretch) kept.push(cutPlumbing(stretch, { strategy: run.strategy, nonce: run.nonce, pid: run.pid, truncated: !atHead }));
-    stretch = '';
-    atHead = false;
-  };
-  for (const e of events) {
-    if (e.type === 'output') stretch += e.data;
-    else flush();
-  }
-  flush();
-  const out = kept.join('');
-  return cut || utf8Length(out) > COMPAT_OUTPUT_BYTES ? omitted(run.runId, out) : out;
-}
 
 /**
  * The daemon's own typed lines as the shell echoes them: the line that runs a Run's command file
@@ -666,7 +612,7 @@ export const COMPAT_TOOLS: ToolDef[] = [
           : `session ${r.session} is busy${b?.runId ? ` running ${b.runId}` : ''} (${b?.reason ?? 'busy'}); nothing was run: ${BUSY_NEXT[b?.reason ?? ''] ?? 'try again when it is done, or use another session'}`;
         return json({ output: '', exitCode: -1, duration: 0, state: 'busy', busy: r.busy, error });
       }
-      const output = r.runId ? await runOutput(ctx, r.session, { runId: r.runId, seq: r.output.seq }, a.raw === true, d) : r.output.text;
+      const output = r.runId ? await runOutput(ctx, r.session, r.runId, a.raw === true, d) : r.output.text;
       const res: Record<string, unknown> = { output, exitCode: r.state === 'exited' ? (r.exit ?? -1) : -1, duration: r.durationMs ?? 0, runId: r.runId, state: r.state };
       if (r.shell !== undefined) {
         res.shell = r.shell;
