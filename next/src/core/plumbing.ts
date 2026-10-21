@@ -127,9 +127,12 @@ const printedMark = (word: string, nonce: string, fields: string[] = []): string
  * terminal where the shell allows (untraced). It confirms the shell is back, never the command's
  * status; and the command's own end marker, arriving after a cancel that failed, still reads as the
  * end it is (the house's read of a6d0c35, #22). It names the pid of the shell that runs it, as the
- * start mark does, so only the session's shell answers for the Run: a reader the Run started in the
+ * start mark does, so an answer counts only from the session's shell: a reader the Run started in the
  * shell's own process group (job control off) took the probe, answered it, and the shell counted as
- * back while the reader held the terminal (an independent read of the fixes for #22).
+ * back while the reader held the terminal (an independent read of the fixes for #22). The pid is the
+ * shell's `$$`, which a subshell keeps: with job control off, a subshell of the Run that evaluates
+ * what it reads answers as the shell (the house's review of 4f4c067..a8b6f28, by run on dash). The end
+ * mark names no pid: only the line typed for this Run prints it, read before the Run's program began.
  */
 export const markerProbe = (nonce: string, flavor: ShellFlavor = 'posix'): string =>
   ` ${untraced(printedMark('PRO""BE', nonce, [flavor === 'fish' ? '$fish_pid' : '"$$"']), flavor)}`;
