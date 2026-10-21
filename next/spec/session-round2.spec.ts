@@ -360,10 +360,12 @@ test('an editing hold neither ends early on a forward wall-clock step nor stretc
 
 // ───────────── a cancel right after admit, before the line started (CI at cb603a8 on #22) ─────────────
 
-test('a cancel whose ^C flushed the line before the shell read it, at a shell that prints no prompt for a ^C on an empty line, ends the Run cancelled rather than leaving it starting', async () => {
+test('a cancel whose ^C flushed the line before the shell read it, at a shell that prints no prompt for a ^C on an empty line, ends the Run cancelled, and the shell is back once it has run the empty line the cancel typed', async () => {
   // The tty flushes unread input on SIGINT, so the line is gone; fish prints nothing for a ^C at an
   // empty line, so no prompt mark says so. The cancel answered `starting` with escalation
-  // session_close on a loaded macOS runner (CI at cb603a8 on #22).
+  // session_close on a loaded macOS runner (CI at cb603a8 on #22). Nothing says the shell acted on the
+  // ^Cs either, so it is not available until a line typed after them has run (the house's read of the
+  // 33 commits, #22 comment 6307351617, item 1).
   const h = await harness({ quietEmptyInterrupt: true });
   h.shell.pause(); // the shell has not read the line when the ^C arrives
   const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
@@ -371,11 +373,65 @@ test('a cancel whose ^C flushed the line before the shell read it, at a shell th
   const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
   assert.equal(c.state, 'cancelled', JSON.stringify(c));
   assert.equal(c.escalation, undefined);
-  assert.deepEqual(c.steps, ['^C', '^C', 'the line was discarded before it started']);
+  assert.deepEqual(c.steps, ['^C', '^C', 'the line was discarded before it started', 'an empty line, whose prompt says the shell is back']);
   const r = h.session.run(a.run.runId);
   assert.deepEqual([r.state, r.reason], ['cancelled', 'cancelled-before-start']);
   assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /discarded before it started/.test(e.text)), 'the reason is said');
-  assert.ok(h.session.shellAvailable().ok, 'the shell is at the prompt it never left');
+  assert.deepEqual(h.session.shellAvailable(), { ok: false, reason: 'prompt-pending' }, 'no mark says the shell is back yet');
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  h.shell.resume(); // the shell reads the empty line, runs it, and prompts
+  const rb = await h.session.awaitRun(b.run.runId, 2000);
+  assert.deepEqual([rb.state, rb.exit], ['exited', 0], JSON.stringify(rb));
+  assert.equal((await h.session.runTranscript(rb.runId)).text, 'hello');
+  assert.deepEqual(h.session.listRuns().map((x) => x.runId), [a.run.runId, b.run.runId], 'the empty line is no Run');
+  await h.session.close();
+});
+
+test('a cancel whose two ^C reach a shell that acts on them only later (stopped, or not yet scheduled) leaves it busy, and a Run admitted right after it still runs: the prompt for the pending ^C does not free the shell', async () => {
+  // bash and zsh print a prompt for a ^C, but a shell that is stopped or descheduled prints it only
+  // when it runs again. Counted available at the cancel, the next Run was written at once, discarded
+  // at that late prompt, and its line ran after its command file was gone (the house's read of the 33
+  // commits, #22 comment 6307351617, item 1).
+  const h = await harness();
+  h.shell.stop();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.equal(c.state, 'cancelled', JSON.stringify(c));
+  assert.deepEqual(h.session.shellAvailable(), { ok: false, reason: 'prompt-pending' });
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  h.shell.cont(); // the prompt for the ^C, then the empty line runs, then its prompt
+  const rb = await h.session.awaitRun(b.run.runId, 2000);
+  assert.deepEqual([rb.state, rb.exit, rb.reason], ['exited', 0, undefined], JSON.stringify(rb));
+  assert.equal((await h.session.runTranscript(rb.runId)).text, 'hello');
+  assert.ok(!ofType(h.journal.since(0).events, 'note').some((e) => /ran late/.test(e.text)), 'no line ran without its file');
+  await h.session.close();
+});
+
+test('after a cancel whose ^C a line read before it outlived, the prompt that ends that line does not free the shell; the empty line’s prompt does', async () => {
+  // A DEBUG trap of the user's that ignores ^C runs before the line's start mark: two ^C bring no
+  // mark, the line runs late (its file gone), and its prompt comes before the empty line the cancel
+  // typed is read (the house's read of the 33 commits, #22 comment 6307351617, item 1).
+  const h = await harness({ ignoreSignals: true, typeahead: true, setup: (s) => s.on(/^slowtrap/, () => ({ hang: true, noStartMark: true })) });
+  const a = h.session.admit({ target: 'shell', line: 'slowtrap', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.deepEqual([c.state, c.steps.at(-1)], ['cancelled', 'an empty line, whose prompt says the shell is back'], JSON.stringify(c));
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  // The trap returns: the line's start mark, its end, and its prompt.
+  h.pty.emit(h.shell.mark(`633;E;${h.shell.typed[0]!}`) + h.shell.mark('133;C'));
+  assert.equal(h.session.run(b.run.runId).state, 'queued', 'still queued while the late line runs');
+  // Its end and its prompt; the editor then reads the empty line typed after the ^C, which runs and
+  // prompts. Taken as the shell's answer, the late line's prompt sent the Run's line in behind the
+  // empty line, whose prompt then discarded it (no-pre-execution-mark).
+  h.shell.finishHung(1);
+  const rb = await h.session.awaitRun(b.run.runId, 2000);
+  assert.deepEqual([rb.state, rb.exit, rb.reason], ['exited', 0, undefined], JSON.stringify(rb));
+  assert.equal(h.shell.typed.length, 3, 'the late line, the empty line, then the Run’s');
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /ran late/.test(e.text)), 'the late line was the cancelled Run’s');
   await h.session.close();
 });
 

@@ -225,7 +225,6 @@ const handoffOutput = (x: Awaited<ReturnType<typeof realSession>>): string =>
 const handoffNotes = (x: Awaited<ReturnType<typeof realSession>>): string[] =>
   x.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'note' }> => e.type === 'note').map((e) => e.text);
 
-const PY = ['/usr/bin/python3', '/opt/homebrew/bin/python3', '/usr/local/bin/python3'].find(hasShell);
 
 test('/bin/bash: the reinit is never typed into an rc that reads a line before its first prompt', { skip: !hasShell('/bin/bash') }, async () => {
   // The post-exec bash replaces PROMPT_COMMAND (no hello) and reads a line before any prompt. The
@@ -279,15 +278,18 @@ test('/bin/bash: exec into `bash --noediting` gets the honest note, not a false 
   }
 });
 
-test('/bin/bash: the reinit is not typed while a program the rc started is reading (a child), even non-canonical', { skip: !hasShell('/bin/bash') || PY === undefined }, async () => {
+test('/bin/bash: the reinit is not typed while a program the rc started is reading (a child), even non-canonical', { skip: !hasShell('/bin/bash') }, async () => {
   // A raw-mode reader the rc started is a child and leaves the terminal non-canonical; non-canonical
-  // does not prove readline. Without the child check the daemon would type the reinit into that
-  // program (the house's read, #22 comment 6269901528). `read -e`/`read -n` builtins have no child
-  // and stay a stated limit; this is the external-reader case the child check catches. The rc puts
-  // the terminal in non-canonical mode itself before the reader starts, and the cap is generous: on a
-  // slow runner the interpreter's startup outran a 500 ms cap, and the gate, seeing a canonical
-  // terminal to the end, gave the canonical note instead.
-  const reader = `${PY} -c 'import sys,tty; tty.setcbreak(sys.stdin.fileno()); sys.stdout.write("PYREADY\\n"); sys.stdout.flush(); d=sys.stdin.read(1); sys.stdout.write("PYGOT:["+d+"]\\n"); sys.stdout.flush()'`;
+  // does not prove readline. Without the reader check the daemon would type the reinit into that
+  // program (the house's read, #22 comment 6269901528). `read -e` and `read -s -n` are the shell itself
+  // in readline's own mode and stay a stated limit (a plain `read -n` leaves ECHO on, and the gate holds
+  // on that: the `read -n` test below); this is the external-reader case the reader check catches (the
+  // house's read of the 33 commits, #22 comment 6307351617, item 11). The rc puts the terminal in
+  // non-canonical mode itself before the reader starts, and the cap is generous: on a slow runner the
+  // interpreter's startup outran a 500 ms cap, and the gate, seeing a canonical terminal to the end,
+  // gave the canonical note instead. The reader is sh and dd, so the test runs where python3 is missing
+  // (it was skipped there; item 10).
+  const reader = `sh -c 'stty -icanon -echo; echo READER-READY; d=$(dd bs=1 count=1 2>/dev/null); echo "READER-GOT:[$d]"'`;
   const x = await realSession('/bin/bash', {
     login: false,
     rc: { '.bashrc': `PROMPT_COMMAND=:\nif [ -n "\${SECOND-}" ]; then stty -icanon 2>/dev/null; ${reader}; fi\n` },
@@ -298,11 +300,11 @@ test('/bin/bash: the reinit is not typed while a program the rc started is readi
     await until(() => x.session.shellAvailable().ok, 5000, 'first shell ready');
     const handoff = await x.run('export SECOND=1; exec /bin/bash', 20_000);
     assert.deepEqual([handoff.state, handoff.reason], ['lost', 'shell-replaced']);
-    await until(() => /PYREADY/.test(handoffOutput(x)), 8000, 'the child reader started');
+    await until(() => /READER-READY/.test(handoffOutput(x)), 8000, 'the child reader started');
     await until(() => x.session.info().state === 'unavailable', 10_000, 'unavailable');
     const out = handoffOutput(x);
     assert.ok(!out.includes('reinit typed'), 'nothing was typed into the child reader');
-    assert.doesNotMatch(out, /PYGOT:/, 'the child reader received nothing from the daemon');
+    assert.doesNotMatch(out, /READER-GOT:/, 'the child reader received nothing from the daemon');
     assert.ok(handoffNotes(x).some((t) => /a process other than the shell, in the terminal’s foreground process group, holds the terminal for input/.test(t)), `the note says what the check knows: ${JSON.stringify(handoffNotes(x))}`);
   } finally {
     await x.close();
@@ -362,6 +364,41 @@ test('/bin/bash: a `read -n` in the rc never gets the reinit, and the recovery t
     x.session.input('y', { principal: AGENT });
     await until(() => /RC-GOT:\[y\]/.test(handoffOutput(x)), 3000, 'the read took only the key sent');
     await until(() => (handoffOutput(x).split('RC-GOT:[y]')[1] ?? '').trim().length > 0, 3000, 'the prompt after the read');
+    x.session.input(' . "$TSM_BASH_RC" reinit typed\n', { principal: AGENT });
+    await until(() => x.session.shellAvailable().ok, 5000, 'available after the advised recovery');
+    assert.equal(x.session.integration, 'rich');
+    const back = await x.run('echo back', 10_000);
+    assert.deepEqual([back.state, back.exit, back.text.trim()], ['exited', 0, 'back']);
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: a typed reinit that a program reads draws no hello; the give-up keeps the key, and the recovery its note gives then loads the integration', { skip: !hasShell('/bin/bash') }, async () => {
+  // A program that reads the terminal only through descriptor 1 or 2, as `more` behind a pipe does, is
+  // one the reader check cannot see; the shell's own `read -s -n` is another (the stated limit). Here a
+  // `read -s -n 1` loop in the rc stands for both: the gate types the reinit, the loop takes it, and no
+  // hello comes. That give-up went the generic way and retired the mark key, so the recovery line's
+  // marks were refused (the house's read of the 33 commits, #22 comment 6307351617, item 3).
+  const x = await realSession('/bin/bash', {
+    login: false,
+    rc: { '.bashrc': 'PROMPT_COMMAND=:\nif [ -n "${SECOND-}" ]; then while IFS= read -r -s -n 1 __c && [ "$__c" != q ]; do :; done; printf "RC-%s\\n" DONE; fi\n' },
+    startupCapMs: 800,
+    integrationGraceMs: 400,
+  });
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'first shell ready');
+    const handoff = await x.run('export SECOND=1; exec /bin/bash', 20_000);
+    assert.deepEqual([handoff.state, handoff.reason], ['lost', 'shell-replaced']);
+    await until(() => x.session.info().state === 'unavailable', 15_000, 'unavailable');
+    const notes = handoffNotes(x).join(' | ');
+    assert.match(notes, /loading it once more/, 'the gate typed the reinit');
+    assert.match(notes, /within \d+ ms of the daemon typing the line that loads it/, notes);
+    assert.match(notes, /TSM_BASH_RC" reinit typed` with input/, 'the note gives the recovery');
+    assert.doesNotMatch(notes, /reports no marks/, 'not the generic replacement note');
+    x.session.input('q', { principal: AGENT });
+    await until(() => /RC-DONE/.test(handoffOutput(x)), 3000, 'the loop ended');
+    await until(() => (handoffOutput(x).split('RC-DONE')[1] ?? '').trim().length > 0, 3000, 'the prompt after the rc');
     x.session.input(' . "$TSM_BASH_RC" reinit typed\n', { principal: AGENT });
     await until(() => x.session.shellAvailable().ok, 5000, 'available after the advised recovery');
     assert.equal(x.session.integration, 'rich');

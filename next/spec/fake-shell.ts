@@ -73,6 +73,9 @@ export class FakeShell {
   private handlers: Array<{ match: RegExp | string; handler: FakeHandler }> = [];
   private started = false;
   private paused = false;
+  /** Stopped (SIGSTOP): a ^C is not acted on until cont(), as a shell not yet scheduled does not. */
+  private stopped = false;
+  private interruptPending = false;
   private held = '';
   /** Typeahead, in arrival order, read after the running command ends. */
   private queued = '';
@@ -143,6 +146,25 @@ export class FakeShell {
     this.onWrite(d);
   }
 
+  /** SIGSTOP: input waits, and a ^C flushes it but is acted on only at cont() (a shell descheduled under load). */
+  stop(): void {
+    this.paused = true;
+    this.stopped = true;
+  }
+
+  /** SIGCONT: a ^C that came while stopped is acted on first — a new prompt, or nothing (quietEmptyInterrupt) — then the input. */
+  cont(): void {
+    this.stopped = false;
+    if (this.interruptPending) {
+      this.interruptPending = false;
+      if (!this.opts.quietEmptyInterrupt) {
+        this.pty.emit('^C\r\n');
+        this.prompt();
+      }
+    }
+    this.resume();
+  }
+
   private onWrite(data: string): void {
     const chars = Array.from(data);
     for (let i = 0; i < chars.length; i++) {
@@ -168,6 +190,10 @@ export class FakeShell {
           // at an empty line, prints nothing at all (quietEmptyInterrupt), so no prompt mark follows.
           this.held = '';
           this.buf = '';
+          if (this.stopped) {
+            this.interruptPending = true;
+            continue;
+          }
           if (this.opts.quietEmptyInterrupt) continue;
           this.pty.emit('^C\r\n');
           this.prompt();

@@ -163,8 +163,13 @@ export const UNKNOWN_TYPER: Principal = 'human:unknown';
 
 interface RunRecord extends RunInfo {
   waiters: Array<(r: RunInfo) => void>;
-  /** The monotonic clock at admission, for the ages this daemon life measures (see `runAgeMs`); never journaled, so a Run rebuilt from the journal has none. */
-  admittedMono?: number;
+  /**
+   * The monotonic clock at admission, for the ages this daemon life measures (see `runAgeMs`); never
+   * journaled. Every RunRecord is this life's (newRun is the one constructor; another life's Runs are
+   * the journal's RunInfo, never held here), so it always has one (the house's read of the 33 commits,
+   * #22 comment 6307351617, item 6).
+   */
+  admittedMono: number;
   /** The monotonic clock at the Run's start, which its journaled duration is measured from (likewise never journaled). */
   startedMono?: number;
   /** Called on any state change (start or end). */
@@ -200,6 +205,14 @@ interface RunRecord extends RunInfo {
 const TRANSCRIPT_INPUT_CHARS = 4 * 1024 * 1024;
 /** Daemon lines remembered after their Run was declared lost before it started. */
 const MAX_ORPHAN_LINES = 32;
+/**
+ * Prompts a cancel's empty line may wait behind before its start mark (askForPrompt): one for the
+ * pending ^C (bash, zsh), one for a line the shell read before the ^C. Past them the line is taken as
+ * lost and the shell as back.
+ */
+const PROMPT_PROBE_PROMPTS = 2;
+/** What a note says when the reinit gate after `exec bash` gives up: the recovery that loads the integration with the session's key. */
+const REINIT_RECOVERY = 'Shell commands are unavailable until it loads: once the shell shows its own prompt, send ` . "$TSM_BASH_RC" reinit typed` with input to load it, or open a new session';
 const publicRun = (r: RunRecord): RunInfo => {
   const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, startedMono: _sm, ...info } = r;
   return { ...info, seq: { ...info.seq } };
@@ -533,6 +546,15 @@ export class Session {
   private pendingShellRun: RunRecord | undefined;
   /** Daemon lines whose Run ended before its C: a later C with that line is their late execution. */
   private readonly orphanLines = new Map<string, RunRecord>();
+  /**
+   * The empty line a cancel typed to learn when the shell is back (askForPrompt): its file, whether its
+   * start mark came (its line holds the file's quoted path), and the prompts seen before it. The shell is
+   * busy until the prompt after the mark — or after PROMPT_PROBE_PROMPTS prompts without it, when the
+   * line was lost (a later ^C flushed it, a program read it), so that it cannot hold the shell for good.
+   */
+  private promptProbe: { path: string; started: boolean; prompts: number } | undefined;
+  /** The last empty line's quoted file: its start after the session gave up on it is not a person's command. */
+  private probeFile: string | undefined;
   private readonly queue: RunRecord[] = [];
   /**
    * Declared shells (§8.1): the Run in flight in front of each program — keyed by the Run whose
@@ -938,7 +960,9 @@ export class Session {
             // readline's own mode (ICANON and ECHO off) and no process other than the shell can read
             // it (PtyHandle.otherReader). Anything else, or anything the checks cannot answer, waits;
             // at the cap the gate gives up as a replacement and says the last cause it saw. `read -e`
-            // and `read -s -n` are the shell itself in readline's mode: the stated limit.
+            // and `read -s -n` are the shell itself in readline's mode, and a program that reads the
+            // terminal only through descriptor 1 or 2 (`more` behind a pipe) is no reader to the
+            // check: the stated limits, where a typed reinit draws no hello (the branch after this).
             // The mode first, and the reader check only when the mode would let the reinit be typed.
             // stty is the one process a tick starts on Linux, where the reader check reads /proc;
             // elsewhere the check adds a `ps`, and an `lsof` only while a program other than the shell
@@ -971,12 +995,18 @@ export class Session {
                 // marks" and offered only input or a new session, beside a recovery that restores them
                 // (a reviewer's read of the fixes for #22).
                 this.stopExecWatch();
-                return this.onShellReplaced(now, {
-                  keepKey: true,
-                  note: `the new bash did not load the shell integration within ${cap} ms, and the daemon did not type it in: ${why}. Shell commands are unavailable until it loads: once the shell shows its own prompt, send \` . "$TSM_BASH_RC" reinit typed\` with input to load it, or open a new session`,
-                });
+                return this.onShellReplaced(now, { keepKey: true, note: `the new bash did not load the shell integration within ${cap} ms, and the daemon did not type it in: ${why}. ${REINIT_RECOVERY}` });
               }
             }
+          } else if (kind === 'bash') {
+            // The typed reinit drew no hello within the cap: a program read it — one that reads the
+            // terminal only through descriptor 1 or 2, as `more` behind a pipe does, which the reader
+            // check cannot see, or the shell's own `read -e` or `read -s -n` — or the shell is still
+            // busy. The key stays and the note gives the same recovery as the gate's own give-up; the
+            // generic replacement retired the key, so that recovery's marks were refused (the house's
+            // read of the 33 commits, #22 comment 6307351617, item 3).
+            this.stopExecWatch();
+            return this.onShellReplaced(now, { keepKey: true, note: `the new bash did not load the shell integration within ${cap} ms of the daemon typing the line that loads it: a program may have read that line instead. ${REINIT_RECOVERY}` });
           } else {
             this.stopExecWatch();
             return this.onShellReplaced(now);
@@ -1016,6 +1046,7 @@ export class Session {
     }
     this.helloCommand = command;
     this.flavor = flavorOf(command);
+    this.dropPromptProbe();
     const inFlight = [this.pendingShellRun, this.currentShellRun];
     this.pendingShellRun = undefined;
     this.currentShellRun = undefined;
@@ -1076,7 +1107,14 @@ export class Session {
       this.discardPending(pending, pending.cancelRequested ? { state: 'cancelled', reason: 'cancelled-before-start' } : { state: 'lost', reason: 'no-pre-execution-mark' });
     }
     if (this.currentShellRun && isTerminal(this.currentShellRun.state)) this.currentShellRun = undefined;
-    if (this.shellState !== 'exited') this.shellState = this.currentShellRun || this.pendingShellRun ? 'busy' : 'idle';
+    // The empty line a cancel typed (askForPrompt): the prompt after its start mark says the shell is
+    // back; a prompt before it (the ^C's own, or one that ends a line read before it) does not.
+    const probe = this.promptProbe;
+    if (probe && (probe.started || ++probe.prompts > PROMPT_PROBE_PROMPTS)) {
+      if (!probe.started) this.note(`the empty line typed after a cancel's ^C did not run within ${PROMPT_PROBE_PROMPTS} prompts; the shell counts as available again at this one`);
+      this.dropPromptProbe();
+    }
+    if (this.shellState !== 'exited') this.shellState = this.currentShellRun || this.pendingShellRun || this.promptProbe ? 'busy' : 'idle';
     if (!this.ready && !this.readyTimer) {
       // The prompt is being printed; a shell is only truly at its line editor once it
       // is done (the B mark). Do not wait forever for a PS1 that lost our mark.
@@ -1144,6 +1182,13 @@ export class Session {
     this.typeaheadWatch = undefined;
     const line = this.lastCommandLine;
     this.lastCommandLine = undefined;
+    if (line !== undefined && this.probeFile !== undefined && line.includes(this.probeFile)) {
+      // The empty line a cancel typed (askForPrompt): not a Run. The prompt after it frees the shell.
+      this.shellState = 'busy';
+      if (this.promptProbe) this.promptProbe.started = true;
+      this.probeFile = undefined;
+      return;
+    }
     const cur = this.currentShellRun;
     if (cur && cur.state === 'running') {
       // Never replace a running Run (it would be orphaned 'running' forever). A marker
@@ -2373,17 +2418,19 @@ export class Session {
       // SIGINT and the line editor drops a line it had read, so the line is gone either way — but
       // a shell whose ^C at an empty line prints nothing (fish) sends no prompt mark to say so,
       // and the Run was left `starting` for good, the cancel answering as if it had failed (CI at
-      // cb603a8 on #22: a macOS runner under load). It ends cancelled here; the shell is at the
-      // prompt it never left, so it is available again when nothing else is in flight. A late
-      // start of the line, were it ever read, is attributed as an orphan's (discardPending).
-      this.note(`${runId}: no mark followed two ^C; the line was discarded before it started`);
+      // cb603a8 on #22: a macOS runner under load). It ends cancelled here. A late start of the
+      // line, were it ever read, is attributed as an orphan's (discardPending).
+      //
+      // The shell is not available yet: no mark says it acted on the ^Cs. A bash stopped or not yet
+      // scheduled, or still in a DEBUG trap of the user's that ignores ^C, prints its prompt later;
+      // counted available here, the next Run was written at once, discarded at that late prompt, and
+      // its line ran after its command file was gone (the house's read of the 33 commits, #22 comment
+      // 6307351617, item 1). It stays busy until the shell shows it is back, which askForPrompt asks.
       this.discardPending(run, { state: 'cancelled', reason: 'cancelled-before-start' });
       steps.push('the line was discarded before it started');
-      if (!this.currentShellRun && this.sawPromptEnd && this.shellState === 'busy') {
-        this.shellState = 'idle';
-        this.drainQueue();
-        this.notifyAvailable();
-      }
+      const asked = this.askForPrompt();
+      if (asked) steps.push('an empty line, whose prompt says the shell is back');
+      this.note(`${runId}: no mark followed two ^C; the line was discarded before it started, and the shell counts as available again ${asked ? 'once it has run an empty line typed after the ^C' : 'at its next prompt'}`);
     }
     this.replacedStep(run, steps);
     if (run.state === 'running') await this.probeMarker(run, grace, steps);
@@ -2411,6 +2458,44 @@ export class Session {
       return { runId, state: run.state, contract: 'shell', escalation: 'session_close', steps };
     }
     return { runId, state: run.state, contract: 'shell', steps };
+  }
+
+  /**
+   * After a cancel's two ^Cs drew no mark (item 1): type a daemon line with an empty command file, and
+   * count the shell available at the prompt that follows that line's start mark. The shell reads the
+   * line only after what the terminal held before it, and its start mark names the line, so the prompt
+   * after it is the one that says the shell is back. Any earlier prompt is not: bash prints one for the
+   * pending ^C when it is scheduled again; zsh 5.9, when the ^C flushed input it had been woken for,
+   * prints one only once the next byte arrives (here the empty line's first); fish prints none for a ^C
+   * at an empty line; and a line read before the ^C ends with a prompt of its own. An Enter drew one
+   * prompt or two, by shell and by where the ^C caught it, with nothing to tell them apart, and a Run
+   * written between the two was discarded at the second. Until the line's prompt the shell is busy, so
+   * no Run is written behind it. False when the file cannot be written: the next prompt is then taken
+   * as the shell's answer.
+   */
+  private askForPrompt(): boolean {
+    let file: string;
+    try {
+      file = this.writeTempFile('', true);
+    } catch (e) {
+      this.note(`the empty line that asks the shell for its prompt could not be written (${errMessage(e)})`);
+      return false;
+    }
+    const src = sourceLine(file, this.flavor);
+    this.extraTempFiles.add(file);
+    this.promptProbe = { path: file, started: false, prompts: 0 };
+    this.probeFile = shellQuote(file);
+    this.pty.write(`${CLEAR_LINE_KEYS}${src}\n`);
+    return true;
+  }
+
+  /** The empty line's file goes once its start mark came, or once the session gave up on it. */
+  private dropPromptProbe(): void {
+    const probe = this.promptProbe;
+    if (!probe) return;
+    this.promptProbe = undefined;
+    this.extraTempFiles.delete(probe.path);
+    fs.rmSync(probe.path, { force: true });
   }
 
   private requireCancel(run: RunRecord, principal: Principal, asOwner: boolean): void {
@@ -2518,12 +2603,12 @@ export class Session {
   /**
    * How long ago the Run was admitted, on the monotonic clock, for a hold or a window this daemon
    * life measures: against the journaled wall-clock stamp, a step forward ended a young service
-   * Run's hold (a reviewer's read of the fixes for #22 comment 6270045466). Undefined for a Run this life did not admit,
-   * whose only stamp is the wall clock's.
+   * Run's hold (a reviewer's read of the fixes for #22 comment 6270045466). Undefined for a Run this
+   * session does not hold (pruned, or another daemon life's), whose only stamp is the journal's wall clock.
    */
   runAgeMs(runId: string): number | undefined {
     const r = this.runs.get(runId);
-    return r?.admittedMono === undefined ? undefined : clocks.monotonic() - r.admittedMono;
+    return r === undefined ? undefined : clocks.monotonic() - r.admittedMono;
   }
 
   /**
@@ -2544,12 +2629,10 @@ export class Session {
   /**
    * A Run's time since its start, or since its admission while it has not started: an interval, so on
    * the monotonic clock (the house's read of the 38 commits, #22, comment 6274773484: from the wall
-   * clock, a step back journaled a negative duration and the completion read `exit 0 in -3.0s`). A Run
-   * this daemon life did not admit has no monotonic stamp: from its journaled start, never below zero.
+   * clock, a step back journaled a negative duration and the completion read `exit 0 in -3.0s`).
    */
   private elapsedMs(r: RunRecord): number {
-    const mono = r.startedMono ?? r.admittedMono;
-    return Math.max(0, Math.round(mono !== undefined ? clocks.monotonic() - mono : this.now() - (r.startedAt ?? r.admittedAt)));
+    return Math.max(0, Math.round(clocks.monotonic() - (r.startedMono ?? r.admittedMono)));
   }
 
   listRuns(): RunInfo[] {

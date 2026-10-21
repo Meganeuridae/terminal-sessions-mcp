@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AGENT, hasShell, pgrep, realSession, reap } from './fake-shell.js';
+import { AGENT, hasShell, pgrep, realSession, reap, until } from './fake-shell.js';
 
 for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
   test(`${shell}: G29 (core-4, tg-6): cancelling a queued Run leaves the Run ahead running and never runs the line`, async () => {
@@ -76,6 +76,62 @@ for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
     }
   });
 }
+
+// The house's read of the 33 commits (#22 comment 6307351617, item 1), by run with bash 5.2: two ^C that
+// bring no mark made the shell available at once, the next Run was written, discarded at the prompt the
+// shell printed for the ^C when it ran again, and its line ran after its command file was gone. Now the
+// shell is busy until it has run an empty line the cancel typed after the ^C.
+for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
+  test(`${shell}: a cancel whose two ^C reach a stopped shell (standing in for one not yet scheduled) keeps it busy until it is back, and a Run admitted right after the cancel still runs`, async () => {
+    const x = await realSession(shell, { login: false });
+    const pid = x.session.info().pid;
+    try {
+      await until(() => x.session.shellAvailable().ok, 5000, 'the shell is ready');
+      process.kill(pid, 'SIGSTOP');
+      const a = x.session.admit({ target: 'shell', line: 'echo first-ran', principal: AGENT });
+      assert.ok(a.admitted);
+      const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 200 });
+      assert.deepEqual([c.state, c.escalation], ['cancelled', undefined], JSON.stringify(c));
+      assert.deepEqual(x.session.shellAvailable(), { ok: false, reason: 'prompt-pending' }, 'nothing says the shell acted on the ^C');
+      const b = x.session.admit({ target: 'shell', line: 'echo second-$((40+2))', principal: AGENT, queue: true });
+      assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+      process.kill(pid, 'SIGCONT');
+      const r = await x.session.awaitRun(b.run.runId, 8000);
+      assert.deepEqual([r.state, r.exit, r.reason], ['exited', 0, undefined], JSON.stringify(r));
+      assert.equal((await x.session.runTranscript(r.runId)).text, 'second-42');
+      assert.deepEqual([x.session.run(a.run.runId).state, x.session.run(a.run.runId).reason], ['cancelled', 'cancelled-before-start']);
+    } finally {
+      try {
+        process.kill(pid, 'SIGCONT');
+      } catch {
+        // gone
+      }
+      await x.close();
+    }
+  });
+}
+
+test('/bin/bash: a cancel whose two ^C a DEBUG trap of the user’s ignores, before the start mark, keeps the shell busy until it is back, and a Run admitted right after the cancel still runs', { skip: !hasShell('/bin/bash') }, async () => {
+  // The integration's DEBUG hook runs the user's trap before it prints the start mark; here that trap
+  // is a subshell that ignores ^C, for daemon lines only (the house's second way to reach item 1).
+  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': `trap 'case $BASH_COMMAND in *tsm-cmd*) ( trap "" INT; sleep 1 ) ;; esac' DEBUG\n` } });
+  const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
+  try {
+    await until(() => x.session.shellAvailable().ok, 5000, 'the shell is ready');
+    const a = x.session.admit({ target: 'shell', line: 'echo first-$((6*7))', principal: AGENT });
+    assert.ok(a.admitted);
+    const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 200 });
+    assert.deepEqual([c.state, c.escalation], ['cancelled', undefined], JSON.stringify(c));
+    const b = x.session.admit({ target: 'shell', line: 'echo second-$((40+2))', principal: AGENT, queue: true });
+    assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+    const r = await x.session.awaitRun(b.run.runId, 10_000);
+    assert.deepEqual([r.state, r.exit, r.reason], ['exited', 0, undefined], JSON.stringify(r));
+    assert.equal((await x.session.runTranscript(r.runId)).text, 'second-42');
+    assert.doesNotMatch(output(), /first-42/, 'the cancelled line’s command never ran');
+  } finally {
+    await x.close();
+  }
+});
 
 test('/bin/bash: G29 (tg-12): a process cancel signals the group until it is empty, even after the leader exits', async () => {
   const x = await realSession('/bin/bash');
