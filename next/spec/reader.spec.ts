@@ -331,10 +331,19 @@ test('jr2-11: a torn write or store failure inside the range is a gap in the res
   // A Run's pages show the holes inside the Run.
   startRun(src.journal, 'r1');
   out(src.journal, 'run a\n', 'stdout', 'r1');
-  src.journal.append({ type: 'gap', from: 99, to: 99, reason: 'torn-write' });
+  // The hole lies inside the Run's range (a gap for a hole wholly outside it is not the Run's: the
+  // house's read of the 33 commits, #22 comment 6307350477, item 7); here it is the gap event's own seq.
+  const hole = src.journal.lastSeq + 1;
+  src.journal.append({ type: 'gap', from: hole, to: hole, reason: 'torn-write' });
   out(src.journal, 'run b\n', 'stdout', 'r1');
   const run = await readJournal(src, { runId: 'r1' }, { resultBytes: 16384 });
-  assert.equal(run.text, 'run a\n[… 1 journal event missing (seq 99–99: a torn write) …]\nrun b');
+  assert.equal(run.text, `run a\n[… 1 journal event missing (seq ${hole}–${hole}: a torn write) …]\nrun b`);
+  // A gap the Run's events carry for a hole wholly outside the Run is not shown in its text.
+  startRun(src.journal, 'r2');
+  out(src.journal, 'run c\n', 'stdout', 'r2');
+  src.journal.append({ type: 'gap', from: 1, to: 1, reason: 'torn-write' });
+  out(src.journal, 'run d\n', 'stdout', 'r2');
+  assert.equal((await readJournal(src, { runId: 'r2' }, { resultBytes: 16384 })).text, 'run c\nrun d');
 });
 
 test('a hole recorded after a Run ended, for seqs inside it, is a line in the Run\'s text where the hole is (the house\'s read of cc8c909..39787b3)', async () => {

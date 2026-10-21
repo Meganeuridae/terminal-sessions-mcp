@@ -75,10 +75,10 @@ export interface RunOutput {
   /** With `limit`: output events of the range remain after the last one returned. */
   more?: boolean;
   /**
-   * The journal's gap events within the part of the range this result covers (before the first
-   * output dropped by `limit`, after the first one kept by `maxBytes`), when there are any: a
-   * reader shows a Run's holes where they are, however many other events lie between its outputs
-   * (the house's read of 1cabc6a, #22).
+   * The journal's gap events whose holes meet the part of the range this result covers (the seqs
+   * before the first output dropped by `limit`, after the last one dropped by `maxBytes`), when there
+   * are any: a reader shows a Run's holes where they are, however many other events lie between its
+   * outputs (the house's read of 1cabc6a, #22).
    */
   gaps?: GapEvent[];
 }
@@ -110,11 +110,17 @@ export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
   let gaps = o.gaps
     ?.filter((g) => (range.since === undefined || g.to > range.since) && (range.until === undefined || g.from <= range.until))
     .map((g) => (range.until !== undefined && g.seq > range.until ? { ...g, seq: Math.min(g.to, range.until) } : g));
+  // A page keeps a gap when its hole meets the seqs the page covers, and drops it when the hole lies wholly
+  // outside, wherever the gap is seated: a store-error gap is seated under the next seq when the disk takes
+  // writes again, after outputs that follow its hole, so filtered by its seat a `limit` page before the seat
+  // read as complete across its hole, and a `maxBytes` page after the hole reported it (the house's read of
+  // the 33 commits, PR #22, comment 6307350477, item 7).
   let more = false;
   if (range.limit !== undefined && events.length > range.limit) {
-    // The holes kept are those before the first output dropped.
+    // The page covers the seqs before the first output dropped; a kept gap seated past them is seated where
+    // its hole ends within them, so a reader that pages on places it on this page.
     const cutAt = events[Math.max(0, range.limit)]!.seq;
-    gaps = gaps?.filter((g) => g.seq < cutAt);
+    gaps = gaps?.filter((g) => g.from < cutAt).map((g) => (g.seq >= cutAt ? { ...g, seq: Math.min(g.to, cutAt - 1) } : g));
     events = events.slice(0, Math.max(0, range.limit));
     more = true;
   }
@@ -129,8 +135,9 @@ export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
       k--;
     }
     if (k > 0) {
+      // The page covers the seqs after the last output dropped.
       const dropped = events[k - 1]!.seq;
-      gaps = gaps?.filter((g) => g.seq > dropped);
+      gaps = gaps?.filter((g) => g.to > dropped);
       events = events.slice(k);
       truncated = true;
     }
@@ -158,21 +165,15 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
   // on the way go with the result, so a reader can place them.
   let holed = journal.holeWithin(lo, hi);
   const gaps: GapEvent[] = [];
+  const seen = new Set<Seq>();
+  // Only a gap whose hole meets the range goes with it: one seated among the Run's events for a hole
+  // before the Run is not the Run's (comment 6307350477, item 7, as narrowOutput keeps them).
   const seeGap = (e: JournalEvent): void => {
-    if (e.type !== 'gap') return;
+    if (e.type !== 'gap' || e.to < lo || e.from > hi) return;
     gaps.push(e);
-    if (e.to >= lo && e.from <= hi) holed = true;
+    seen.add(e.seq);
+    holed = true;
   };
-  // A gap for seqs of the range recorded past it — the catch-up writes the gap when the disk takes
-  // writes again, which may be long after the Run ended — is not among the range's events: it goes
-  // with the result all the same, seated where its hole ends (within the Run's whole range, so that
-  // `narrowOutput` places it the same for every `range`), and the reader shows the hole where it is
-  // instead of a complete Run (the house's read of cc8c909..39787b3, #22). The seat may be a live
-  // event's seq: `narrowOutput` sorts by seq and keeps both.
-  for (const g of journal.runs.gapsWithin(lo, hi)) {
-    if (g.seq <= hi) continue;
-    gaps.push({ ...g, seq: Math.min(g.to, to) });
-  }
   if (range.maxBytes !== undefined && range.limit === undefined) {
     let bytes = 0;
     walk: for (let cursor = hi; cursor >= lo; ) {
@@ -202,6 +203,18 @@ export function pageOutput(journal: Journal, runId: string, from: Seq, to: Seq, 
       if (!res.more || !last) break;
       cursor = last.seq + 1;
     }
+  }
+  // A gap for seqs of the range recorded past it — the catch-up writes the gap when the disk takes
+  // writes again, which may be long after the Run ended — is not among the range's events: it goes
+  // with the result all the same, seated where its hole ends (within the Run's whole range, so that
+  // `narrowOutput` places it the same for every `range`), and the reader shows the hole where it is
+  // instead of a complete Run (the house's read of cc8c909..39787b3, #22). The seat may be a live
+  // event's seq: `narrowOutput` sorts by seq and keeps both. One seated within the range after where a
+  // `limit` read stopped goes too, as it stands: its hole may lie before the page's end, which keeps it
+  // (comment 6307350477, item 7).
+  for (const g of journal.runs.gapsWithin(lo, hi)) {
+    if (g.seq > hi) gaps.push({ ...g, seq: Math.min(g.to, to) });
+    else if (!seen.has(g.seq)) gaps.push(g);
   }
   const whole: RunOutput = { events, from, to: hi, truncated: journal.gapAt(from, to) || holed };
   if (gaps.length) whole.gaps = gaps.sort((a, b) => a.seq - b.seq);

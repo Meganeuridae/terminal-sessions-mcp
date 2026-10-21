@@ -305,3 +305,56 @@ test('a gap recorded past the window is seated where its hole ends: a maxBytes p
   const past = narrowOutput({ events: [10, 11].map(out), from: 10, to: 30, truncated: true, gaps: [gap(20, 35) as Extract<JournalEvent, { type: 'gap' }>] }, { until: 30 });
   assert.deepEqual(past.gaps?.map((g) => g.seq), [30]);
 });
+
+test('a page keeps a gap when its hole meets the seqs it covers and drops it when the hole lies wholly outside, wherever the gap is seated (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 7)', () => {
+  // A store-error gap is seated under the next seq once the disk takes writes again, after the outputs that
+  // follow its hole: here the hole is 5..8 and the gap sits at 25. Filtered by its seat, a `maxBytes` page of
+  // 20..30 kept it though the hole lies wholly before the page, and a `limit` page ending at 12 dropped it,
+  // reading as complete across the hole.
+  const out = (seq: number): JournalEvent => ({ type: 'output', data: 'xx', stream: 'stdout', runId: 'r', seq, ts: seq }) as JournalEvent;
+  const events = [1, 2, 3, 4, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26, 27, 28, 29, 30].map(out);
+  const gap = { type: 'gap', from: 5, to: 8, reason: 'store-error', seq: 25, ts: 25 } as Extract<JournalEvent, { type: 'gap' }>;
+  const whole = { events, from: 1, to: 30, truncated: true, gaps: [gap] };
+  const tail = narrowOutput(whole, { maxBytes: 20 });
+  assert.deepEqual([tail.events[0]!.seq, tail.gaps], [20, undefined], 'a tail page after the hole reports none');
+  const head = narrowOutput(whole, { limit: 8 });
+  assert.deepEqual(head.events.map((e) => e.seq), [1, 2, 3, 4, 9, 10, 11, 12]);
+  assert.deepEqual(head.gaps?.map((g) => [g.seq, g.from, g.to]), [[8, 5, 8]], 'a head page across the hole reports it, seated where it ends');
+  // The page after it does not report it again.
+  assert.equal(narrowOutput(whole, { since: 12, limit: 8 }).gaps, undefined);
+  // A hole between a page's last output and the first it drops is in what both that page and the next
+  // one cover: a reader that pages on reports it once, on the page whose outputs reach past it.
+  assert.deepEqual(narrowOutput(whole, { limit: 4 }).gaps?.map((g) => [g.seq, g.from, g.to]), [[8, 5, 8]]);
+  assert.deepEqual(narrowOutput(whole, { since: 4, limit: 4 }).gaps?.map((g) => [g.seq, g.from, g.to]), [[8, 5, 8]]);
+  // Through a journal: the gap the catch-up wrote, for a hole among the Run's outputs, reads the same.
+  const j = new Journal({ sessionId: 's' });
+  const runId = 'r1-seat00';
+  j.append({ type: 'run.admit', runId, target: 'process', principal: 'agent:a@test', origin: 'self', queued: false });
+  j.append({ type: 'run.start', runId, cwd: '/' });
+  const o = () => j.append({ type: 'output', data: 'xx', stream: 'stdout', runId }).seq;
+  const before = [o(), o()];
+  const hole = [j.append({ type: 'note', text: 'n', principal: 'agent:a@test' }).seq, j.append({ type: 'note', text: 'n', principal: 'agent:a@test' }).seq];
+  const after = [o(), o(), o(), o()];
+  const seat = j.append({ type: 'gap', from: hole[0]!, to: hole[1]!, reason: 'store-error' }).seq;
+  o();
+  j.append({ type: 'run.end', runId, state: 'exited', exit: 0, durationMs: 1 });
+  const runWhole = j.runs.output(j, runId);
+  assert.deepEqual(runWhole.gaps?.map((g) => g.seq), [seat]);
+  for (const range of [{ limit: 3 }, { maxBytes: 6 }, { maxBytes: 12 }, { since: before[1]!, limit: 2 }] as RunOutputRange[]) {
+    assert.deepEqual(j.runs.output(j, runId, range), narrowOutput(runWhole, range), JSON.stringify(range));
+  }
+  const headPage = j.runs.output(j, runId, { limit: 3 });
+  assert.deepEqual(headPage.events.map((e) => e.seq), [...before, after[0]]);
+  assert.deepEqual(headPage.gaps?.map((g) => [g.seq, g.from, g.to]), [[hole[1], hole[0], hole[1]]], 'a head page across the hole, which a read stopping at the first dropped output never reached');
+  assert.equal(j.runs.output(j, runId, { maxBytes: 6 }).gaps, undefined, 'a tail page after it');
+  // A gap seated among the Run's events for a hole before the Run started is not the Run's.
+  const k = new Journal({ sessionId: 's' });
+  const early = k.append({ type: 'note', text: 'n', principal: 'agent:a@test' }).seq;
+  k.append({ type: 'run.admit', runId, target: 'process', principal: 'agent:a@test', origin: 'self', queued: false });
+  k.append({ type: 'run.start', runId, cwd: '/' });
+  k.append({ type: 'output', data: 'xx', stream: 'stdout', runId });
+  k.append({ type: 'gap', from: early, to: early, reason: 'store-error' });
+  k.append({ type: 'output', data: 'yy', stream: 'stdout', runId });
+  k.append({ type: 'run.end', runId, state: 'exited', exit: 0, durationMs: 1 });
+  assert.deepEqual([k.runs.output(k, runId).gaps, k.runs.output(k, runId).truncated], [undefined, false]);
+});
