@@ -90,6 +90,9 @@ const BUSY_NEXT: Record<string, string> = {
     'await or cancel it, pass queue:true to run after it, or — when the program it started is a shell (ssh, sudo -i, docker exec, a nested shell) — ' +
     'declare that with session_declare_shell and run again: commands then go to that shell. Or use another session',
   'prompt-pending': 'the shell is between commands: retry, or pass queue:true',
+  'cancel-unanswered':
+    "a cancel's ^C drew no mark from the shell, and no prompt has shown it back since: pass queue:true to run once one does; if none comes, " +
+    'read `screen` to see what holds the terminal, then send it input (Enter at a prompt, or the answer a program reading there waits for), or close the session',
   'shell-unavailable':
     "the session's shell was replaced by a program without integration: if that program is a shell, declare it with session_declare_shell (sh, bash, zsh, fish…) and run again; " +
     'input and screen work regardless; or open a new session',

@@ -543,6 +543,9 @@ function shellOpenerInFront(s: SessionSummary | undefined): { runId: string; lin
 /** What to do about a busy session, in this profile's words (the core's BUSY_NEXT says the same with its own tool names). */
 const BUSY_NEXT: Record<string, string> = {
   exited: "the session's shell has exited: runCommand again starts a new one",
+  'cancel-unanswered':
+    "a cancel's ^C drew no mark from the shell, and no prompt has shown it back since: if none comes, takeScreenshot shows what holds the terminal; " +
+    'then sendInput (Enter at a prompt, or the answer a program reading there waits for), or killSession',
   'shell-unavailable':
     "the session's shell was replaced by a program without integration: if that program is a shell, declare it with session_declare_shell and call runCommand again; sendInput and takeScreenshot work regardless, or use another session",
   'declared-shell-ended':
