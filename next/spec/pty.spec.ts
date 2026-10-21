@@ -480,7 +480,10 @@ test('the reader check tells a background job the rc started from a reader, and 
     { name: 'a background job the rc started', rc: `sleep 301 & echo $! >> "$HOME/pids"\nPS1='READY> '\n`, mode: READLINE, reader: false },
     { name: 'read -n in the rc', rc: "printf 'READY> '; read -n 1 __x\n", mode: { canonical: false, echo: true }, reader: false },
     { name: 'a reader on its stdin', rc: `sh -c 'echo $$ >> "$HOME/pids"; stty -icanon -echo; echo READY">"; exec dd bs=1 count=1 2>/dev/null'\n`, mode: READLINE, reader: true },
-    { name: 'a reader of /dev/tty behind a pipe', rc: `echo | sh -c 'echo $$ >> "$HOME/pids"; stty -icanon -echo < /dev/tty; echo READY">"; exec dd if=/dev/tty bs=1 count=1 2>/dev/null'\n`, mode: READLINE, reader: true },
+    // It opens /dev/tty on a descriptor of its own before it says it is ready, so the check never runs in the
+    // moment between the ready line and dd's own open of /dev/tty, when no process holds the terminal: on a
+    // loaded machine the check can land there, and reads no reader.
+    { name: 'a reader of /dev/tty behind a pipe', rc: `echo | sh -c 'echo $$ >> "$HOME/pids"; exec 3</dev/tty; stty -icanon -echo <&3; echo READY">"; exec dd if=/dev/tty bs=1 count=1 2>/dev/null'\n`, mode: READLINE, reader: true },
   ];
   for (const c of cases) assert.equal(await readerAnswer(c.name, c.rc, c.mode), c.reader, c.name);
 });
