@@ -58,18 +58,49 @@ export function cellWidth(ch: string): 0 | 1 | 2 {
  * the output is text (the house's read of 39787b3, #22, found it taken for one). A sequence left
  * unfinished at the end takes the rest of the text with it: its payload is not text (the same
  * read: `ready\x1b]0;title` read `ready]0;title`).
+ *
+ * Where it differs from the emulator's row (the house's read of the 33 commits, #22, comment
+ * 6307351104): tab stops are xterm's defaults, every eight columns, always. A line that sets or
+ * clears a stop (HTS `ESC H`, TBC `ESC [ g`) or moves by stops (CHT `ESC [ n I`, CBT `ESC [ n Z`)
+ * reads as if it had not: `abc ESC H x CR q TAB Z` reads `qbcx    Z` where xterm shows `qbcZ`.
+ * Stops an earlier line set cannot be seen from one line at all. And a combining mark Unicode added
+ * after the emulator's table (U+1AB0, Unicode 7) takes no cell here and one there (see cellWidth).
  */
 export function cleanLine(raw: string): string {
   // A wide character's second cell holds '' (its continuation); a combining mark joins the cell before it.
   const cells: string[] = [];
   let col = 0;
   const moveTo = (c: number) => (col = Math.max(0, Math.min(c, Math.max(cells.length, MAX_LINE))));
-  // Blank one cell; the other half of a wide character goes with it, as the emulator clears both.
-  const blank = (k: number) => {
-    if (k >= cells.length) return;
-    if (cells[k] === '' && k > 0) cells[k - 1] = ' ';
-    else if (cells[k + 1] === '') cells[k + 1] = ' ';
-    cells[k] = ' ';
+  // Erase to the start is applied lazily, so each costs the same however long the row: blanking the
+  // row cell by cell held the event loop for half a second on a 55 kB line of moves and erases, and
+  // for longer on a long row erased again and again (the house's read of the 33 commits, #22, comment
+  // 6307351104). Each cell carries the time it was written; `erased` holds the erases that still
+  // matter, oldest first, each reaching a column short of the one before it (a newer erase reaching
+  // as far hides an older one), so a cell reads blank when an erase reaching it came after its write.
+  const written: number[] = [];
+  const erased: Array<{ to: number; at: number }> = [];
+  let clock = 0;
+  const at = (k: number): string | undefined => {
+    const v = cells[k];
+    if (v === undefined || !erased.length) return v;
+    // The newest erase that reaches k: the last of those (a prefix of `erased`) reaching it.
+    let lo = 0;
+    let hi = erased.length - 1;
+    if (erased[0]!.to < k) return v;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (erased[mid]!.to >= k) lo = mid;
+      else hi = mid - 1;
+    }
+    return erased[lo]!.at > (written[k] ?? 0) ? ' ' : v;
+  };
+  const set = (k: number, v: string) => {
+    cells[k] = v;
+    written[k] = ++clock;
+  };
+  const truncate = (n: number) => {
+    cells.length = Math.min(cells.length, n);
+    written.length = Math.min(written.length, n);
   };
   for (let i = 0; i < raw.length; ) {
     const c = raw.charCodeAt(i);
@@ -82,10 +113,20 @@ export function cleanLine(raw: string): string {
         const arg = Number.isFinite(n) ? n : 0;
         if (m[2] === 'K') {
           if (arg === 0) {
-            if (cells[col] === '' && col > 0) cells[col - 1] = ' ';
-            cells.length = Math.min(cells.length, col);
-          } else if (arg === 1) for (let k = 0; k <= col; k++) blank(k);
-          else if (arg === 2) cells.length = 0;
+            if (at(col) === '' && col > 0) set(col - 1, ' ');
+            truncate(col);
+          } else if (arg === 1) {
+            // The cells up to the cursor, within the row; a wide character the erase ends inside goes whole, as the emulator clears both halves.
+            const to = Math.min(col, cells.length - 1);
+            if (to >= 0) {
+              if (at(to) !== '' && at(to + 1) === '') set(to + 1, ' ');
+              while (erased.length && erased[erased.length - 1]!.to <= to) erased.pop();
+              erased.push({ to, at: ++clock });
+            }
+          } else if (arg === 2) {
+            truncate(0);
+            erased.length = 0;
+          }
         } else if (m[2] === 'D') moveTo(col - Math.max(1, arg));
         else if (m[2] === 'C') moveTo(col + Math.max(1, arg));
         else moveTo(Math.max(1, arg) - 1);
@@ -104,25 +145,33 @@ export function cleanLine(raw: string): string {
         // A combining mark or a joiner composes with the character before the cursor; at column 0
         // there is none, and the emulator gives the mark a cell of its own.
         let k = Math.max(0, col - 1);
-        if (cells[k] === '' && k > 0) k--;
+        if (at(k) === '' && k > 0) k--;
         while (cells.length < k) cells.push(' '); // after a move past the end: the cells it crossed are blanks
-        cells[k] = (cells[k] ?? ' ') + ch;
+        set(k, (at(k) ?? ' ') + ch);
         continue;
       }
       while (cells.length < col) cells.push(' ');
       // Overwriting either half of a wide character blanks the other half.
-      if (cells[col] === '' && col > 0) cells[col - 1] = ' ';
-      if (cells[col + 1] === '') cells[col + 1] = ' ';
-      cells[col++] = ch;
+      if (at(col) === '' && col > 0) set(col - 1, ' ');
+      if (at(col + 1) === '') set(col + 1, ' ');
+      set(col++, ch);
       if (w === 2) {
-        if (cells[col + 1] === '') cells[col + 1] = ' ';
-        cells[col++] = '';
+        if (at(col + 1) === '') set(col + 1, ' ');
+        set(col++, '');
       }
       continue;
     }
     i++;
   }
-  return cells.join('');
+  if (!erased.length) return cells.join('');
+  // The row as it reads: walking right, the newest erase reaching each column moves down the stack.
+  let e = erased.length - 1;
+  let out = '';
+  for (let k = 0; k < cells.length; k++) {
+    while (e >= 0 && erased[e]!.to < k) e--;
+    out += e >= 0 && erased[e]!.at > (written[k] ?? 0) ? ' ' : cells[k]!;
+  }
+  return out;
 }
 
 /** How long a stream must be quiet before its unterminated line (a prompt like `Password:`) is matched. */

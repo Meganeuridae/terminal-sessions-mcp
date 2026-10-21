@@ -330,3 +330,43 @@ test('the line that runs a command file, for each flavor, with the marker strate
   assert.equal(sourceLine(file, 'zsh', 'n0ff').startsWith(' . '), true, 'zsh: `.`');
   for (const line of ['. ./setup.sh', 'source ~/.bashrc', ` . '/tmp/x/other-12'`]) assert.doesNotMatch(line, sourceLineEcho(), line);
 });
+
+test('no pattern the grammar builds backtracks: every typed line, cut anywhere and followed by a long run of spaces or of its next character, reads in time linear in the line', () => {
+  // The house's read of the 33 commits (#22, comment 6307351104): the typed probe line through its `\n'`, then 3,200 spaces and
+  // a character the pattern did not expect, took one probeEcho().exec 9.35 s, on output any program prints.
+  const nonce = 'a1b2c3d4';
+  const file = `/tmp/x/${commandFile(3)}`;
+  const lines = [
+    markerProbe(nonce),
+    inlineProbe(nonce, false),
+    inlineProbe(nonce, true),
+    ...(['posix', 'zsh', 'fish'] as const).flatMap((f) => [sourceLine(file, f, nonce), sourceLine(file, f)]),
+    ...inlineLines('echo hi', nonce, false),
+    ...inlineLines('echo hi', nonce, true),
+  ];
+  const readers: Array<[string, (s: string) => unknown]> = [
+    ['probeEcho()', (s) => [...s.matchAll(probeEcho())]],
+    ['probeEcho(nonce)', (s) => [...s.matchAll(probeEcho(nonce))]],
+    ['sourceLineEcho', (s) => sourceLineEcho().exec(s)],
+    ['inlineTypedLine', (s) => inlineTypedLine().exec(s)],
+    ['the marker cutter', (s) => cutPlumbing(s, { strategy: 'marker', nonce })],
+    ['the inline cutter', (s) => cutPlumbing(s, { strategy: 'inline', nonce })],
+    ['the cutter by shape', (s) => cutPlumbing(s)],
+  ];
+  let worst = { ms: 0, what: '' };
+  for (const line of lines) {
+    for (let i = 1; i < line.length; i++) {
+      for (const fill of [' ', line[i]!]) {
+        const s = `${line.slice(0, i)}${fill.repeat(2000)}\u0001`;
+        for (const [name, read] of readers) {
+          const t = performance.now();
+          read(s);
+          const ms = performance.now() - t;
+          if (ms > worst.ms) worst = { ms, what: `${name} on ${JSON.stringify(line.slice(0, i))} and 2,000 × ${JSON.stringify(fill)}` };
+        }
+      }
+    }
+  }
+  // Seconds each on the old pattern; a millisecond or two now, and the bound leaves room for a loaded machine.
+  assert.ok(worst.ms < 250, `${worst.what}: ${Math.round(worst.ms)} ms`);
+});

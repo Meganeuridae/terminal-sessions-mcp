@@ -16,7 +16,7 @@ import { SessionRegistry } from '../src/api/registry.js';
 import { callTool, toolsFor } from '../src/api/tools.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { clocks } from '../src/core/clock.js';
-import { commandFile, probeEcho, sourceLine } from '../src/core/plumbing.js';
+import { commandFile, inlineProbe, markerProbe, probeEcho, sourceLine } from '../src/core/plumbing.js';
 import { fakeShellBackend } from './fake-shell.js';
 import { until } from './testhost.js';
 
@@ -582,6 +582,29 @@ test('a reviewer’s read: the logs drop the line that runs a command file for e
       assert.ok(!tail.some((l) => l.includes('tsm-cmd-') || l.includes('EXI""T')), `no typed line: ${said}`);
       assert.equal(tail.filter((l) => l === 'prompt$').length, 6, `each prompt stays: ${said}`);
       assert.equal(tail.filter((l) => l.startsWith('ran-')).length, 6, said);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('the 33 commits 4: a probe line whose nonce a redraw broke over two lines leaves neither line in the logs, for a Run’s recorded nonce and for one a mark in the text carries', async () => {
+  // The house's read of the 33 commits (#22, comment 6307351104): with no nonce the probe filter matched `<<<PRO''BE:a1b2` and
+  // stopped at the break, so the next line, `c3d4:%s:%s>>>\n' "$$" "${__tsm_r-}"`, stayed in compat's logs.
+  const h = await markerHarness();
+  try {
+    const { nonce, journal } = await hungMarkerRun(h, 'brokenprobe');
+    const broken = (line: string, n: string) => line.replace(n, () => `${n.slice(0, 4)}\r\n${n.slice(4)}`);
+    journal.append({ type: 'output', data: `^C\r\n$${broken(markerProbe(nonce), nonce)}\r\nkept-1\r\n`, stream: 'pty' });
+    journal.append({ type: 'output', data: `$${broken(inlineProbe(nonce, false), nonce)}\r\nkept-2\r\n`, stream: 'pty' });
+    // A nonce no Run here recorded, which the probe's answer in the text carries.
+    const other = 'feedface';
+    journal.append({ type: 'output', data: `$${broken(inlineProbe(other, true), other)}\r\n<<<PROBE:${other}:77:${other}>>>\r\nkept-3\r\n`, stream: 'pty' });
+    for (const raw of [false, true]) {
+      const tail = lines(await h.call('tailLogs', { session: 'brokenprobe', lines: 40, raw }));
+      const said = `raw ${raw}: ${JSON.stringify(tail)}`;
+      assert.ok(!tail.some((l) => /%s|PRO""BE|PRO''BE|>>>"/.test(l)), `no piece of a probe line: ${said}`);
+      assert.ok(['^C', 'kept-1', 'kept-2', 'kept-3'].every((k) => tail.includes(k)), `the output around them stays: ${said}`);
     }
   } finally {
     await h.close();

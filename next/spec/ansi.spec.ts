@@ -87,6 +87,30 @@ test('cleanLine renders a line as the transcript does: erase in line and in-line
   assert.ok(crawl.endsWith('x'));
 });
 
+test('cleanLine erases to the start at a cost that does not grow with the row: a move past a short row, or a long row erased again and again, never holds the event loop', () => {
+  // The house's read of the 33 commits (#22, comment 6307351104): a 55 kB line of `ESC [ 65536 C` and `ESC [ 1 K` took the
+  // cleaner 395 ms, its erase blanking every column up to a cursor the move had carried to MAX_LINE; bounded at the row's end,
+  // a 32,000-cell row erased 8,000 times still took over a second.
+  const lines: Record<string, string> = {
+    'moves past a short row': '\x1b[65536C\x1b[1K'.repeat(9200),
+    'a long row erased again and again': 'x'.repeat(32_000) + '\x1b[1K'.repeat(8000),
+    'a long row written at its start and erased from its end': 'x'.repeat(32_000) + '\rx\x1b[99999C\x1b[1K'.repeat(4000),
+    'a row of wide characters': '日'.repeat(16_000) + '\rx\x1b[99999C\x1b[1K'.repeat(4000),
+  };
+  for (const [name, line] of Object.entries(lines)) {
+    const t = performance.now();
+    const read = cleanLine(line);
+    new LineSplitter().feed(`${line}\n`);
+    const ms = performance.now() - t;
+    // Over a second each on the old code, alone; a few milliseconds now, and the bound leaves room for a loaded machine.
+    assert.ok(ms < 400, `${name}: ${Math.round(ms)} ms`);
+    assert.equal(read.trim(), '', `${name}: the last erase blanked the row`);
+  }
+  // Erases that reach less far than an earlier one, with writes between them.
+  assert.equal(cleanLine('abcdefgh\x1b[3G\x1b[1K\x1b[6G\x1b[1K\x1b[2GZ\x1b[1G\x1b[1K\x1b[8GQ'), ' Z    gQ');
+  assert.equal(cleanLine('x'.repeat(6) + '\x1b[1K'.repeat(3) + 'y'), '      y');
+});
+
 test('cleanLine lays characters out as the transcript does: a tab to the next tab stop, a wide character over two cells, a combining mark in none', () => {
   // The house's read of the 38 commits (#22, comment 6274773484): `ab\tc\x1b[2Dz` read `abzc` where the row shows `ab     zc`,
   // and `日本\x1b[1Dx` read `日x` against `日 x`.
@@ -111,7 +135,8 @@ test('cleanLine and the transcript agree on a row: tabs, wide and fullwidth char
   // The transcript is the emulator's own rendering (xterm, its built-in Unicode 6 widths); cleanLine is checked against it
   // directly, so the two cannot drift apart (the house's read of the 38 commits, #22, comment 6274773484).
   const rows = ['a\tb', 'ab\tc\x1b[2Dz', 'abcdefgh\tx', '日本\x1b[1Dx', '日本\x1b[3Dx', 'ab日\rxyz', 'a日b\x1b[2D\x1b[K', 'x日\x1b[2D\x1b[1Kz', 'Ａ\x1b[1Dx',
-    '한국\x1b[2Dx', '😀\bx', '😀x\x1b[1Dy', 'Cafe\u0301\x1b[1Dx', '\u0301x', '\u0301\u0301x', '日\u0301x', 'ab\x1b[3C\u0301z', '〮x\x1b[1Dy', 'abc\x1b[5Cz', 'Progress: 100%\r\x1b[KDone'];
+    '한국\x1b[2Dx', '😀\bx', '😀x\x1b[1Dy', 'Cafe\u0301\x1b[1Dx', '\u0301x', '\u0301\u0301x', '日\u0301x', 'ab\x1b[3C\u0301z', '〮x\x1b[1Dy', 'abc\x1b[5Cz', 'Progress: 100%\r\x1b[KDone',
+    'abcdefgh\x1b[3G\x1b[1K\x1b[6G\x1b[1K\x1b[2GZ\x1b[1G\x1b[1K\x1b[8GQ', '日本日\x1b[3D\x1b[1Kx', '日本日\x1b[4D\x1b[1Kx'];
   for (const row of rows) {
     const shown = (await transcript([{ data: `${row}\r\n`, stream: 'pty' }], { cols: 200 })).replace(/\n$/, '');
     assert.equal(cleanLine(row).trimEnd(), shown, JSON.stringify(row));

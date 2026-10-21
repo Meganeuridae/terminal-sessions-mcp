@@ -48,11 +48,26 @@ export const nonceOf = (mark: string): string | undefined => MARK_NONCE.exec(mar
  * inside a nonce: the house's read of 78c4d6e, #22, found such a probe line kept in a cancelled
  * Run's output), so any character may be followed by whitespace and itself again (the carriage
  * return is whitespace to the regex, and gone from stripEscapes's text). The unknown nonce keeps its class.
+ * A run of whitespace in the typed text has one way to match, one `\s+` with no joins around it: as a
+ * space between joins, each able to take any share of a run of spaces, it let a line of spaces after a
+ * probe line's head backtrack polynomially, 9 s on one 3.2 kB line (the house's read of the 33 commits,
+ * #22, comment 6307351104), on output any program prints, which the compat pack's logs read.
  */
 const redrawn = (s: string): string => {
   if (s === NONCE) return NONCE;
-  const chars = s.split('').map(literal);
-  return chars.map((c) => `${c}(?:\\s*${c})?`).join('\\s*');
+  let out = '';
+  let joined = false;
+  for (const ch of s) {
+    if (/\s/.test(ch)) {
+      if (joined || !out) out += '\\s+';
+      joined = false;
+      continue;
+    }
+    const c = literal(ch);
+    out += `${joined ? '\\s*' : ''}${c}(?:\\s*${c})?`;
+    joined = true;
+  }
+  return out;
 };
 /** A mark's word as the typed lines spell it, split by two quotes (`EXI""T`), each piece as it may be redrawn. */
 const splitWord = (a: string, b: string): string => `${redrawn(a)}\\s*(?:${redrawn('""')}|${redrawn("''")})\\s*${redrawn(b)}`;
@@ -135,10 +150,17 @@ for (const line of [markerProbe(AT_NONCE), inlineProbe(AT_NONCE, false), inlineP
  * there; with no nonce, any Run's. The rests that share a head are alternatives after it, so a line
  * that is not the first's still matches whole (one branch per line would stop sh's at the nonce of
  * fish's line). Global: a reader strikes every line each match spans, as cutPlumbing does, and the
- * compat pack's logs use it so they cut the same echo.
+ * compat pack's logs use it so they cut the same echo. Given several nonces (the Runs a reader of
+ * the session's text knows), the echo of any of them, a redraw's break inside the nonce included,
+ * and any other Run's unbroken: with no nonce the match stopped at a break inside the nonce, and the
+ * line after it stayed in compat's logs (the house's read of the 33 commits, #22, comment 6307351104).
  */
-export const probeEcho = (nonce: string = NONCE): RegExp =>
-  new RegExp([...PROBE_LINES].map(([head, rests]) => `${redrawn(head)}\\s*${redrawn(nonce)}(?:\\s*(?:${rests.map(redrawn).join('|')}))?`).join('|'), 'g');
+export const probeEcho = (nonce: string | readonly string[] = NONCE): RegExp => {
+  const nonces = typeof nonce === 'string' ? redrawn(nonce) : `(?:${[...nonce.map(redrawn), NONCE].join('|')})`;
+  return new RegExp([...PROBE_LINES].map(([head, rests]) => `${redrawn(head)}\\s*${nonces}(?:\\s*(?:${rests.map(redrawn).join('|')}))?`).join('|'), 'g');
+};
+/** The nonces of the marks `text` holds, whoever printed them. */
+export const noncesIn = (text: string): Set<string> => new Set([...text.matchAll(new RegExp(MARK_NONCE.source, 'g'))].map((m) => m[1]!));
 /** A probe answer with its nonce (1), pid (2) and token (3). */
 const probeAnswer = (nonce: string): RegExp => new RegExp(`<<<PROBE:(${nonce})(?::(\\d+)(?::(${NONCE}|))?)?>>>`, 'g');
 
