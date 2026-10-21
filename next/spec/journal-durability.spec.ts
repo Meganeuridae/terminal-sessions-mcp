@@ -700,6 +700,27 @@ test('numbering survives a power loss: a crash that takes the file\'s unsynced t
   }
 });
 
+test('a reservation written under a known boot is honoured when the next open cannot read the boot: an unclean stop then reads as a power loss', (t) => {
+  let boot: string | undefined = 'boot-A';
+  t.mock.method(boots, 'current', () => boot);
+  const dir = tmpDir();
+  try {
+    const j = new Journal({ cold: new FileStore(path.join(dir, 'a')) });
+    for (let i = 0; i < 50; i++) j.append(out(`e${i}`));
+    const peek = new FileStore(path.join(dir, 'a'));
+    assert.equal(peek.highWater()?.reservation?.boot, 'boot-A', 'the reservation names its boot');
+    peek.close();
+    // Left as a crash leaves it; the next open cannot read this boot.
+    boot = undefined;
+    const after = new Journal({ cold: new FileStore(path.join(dir, 'a')) });
+    assert.deepEqual(gaps(after.since(0).events), [[51, HIGH_WATER_BLOCK, 'torn-write']], 'honoured: what a power loss may have taken, and the seqs reserved past it');
+    assert.ok(after.append(out('after')).seq > HIGH_WATER_BLOCK, 'numbering resumes above the reservation');
+    after.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a refused reservation write that leaves numbering exposed is said once until a write lands, and the write that lands is said too: a failed mark refused while the store refuses events, or any write once the next seq is past the reservation on disk', (t) => {
   let mono = 0;
   t.mock.method(clocks, 'monotonic', () => mono);
