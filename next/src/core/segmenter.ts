@@ -1133,6 +1133,12 @@ export class Segmenter {
       // house's read of 78c4d6e, #22: a digest began with a lone low surrogate, another with `;5;196m`).
       const cr = buf.lastIndexOf('\r', buf.length - 2);
       buf = buf.slice(safeCut(buf, cr !== -1 && buf.length - cr - 1 <= CARRY_MAX ? cr + 1 : buf.length - CARRY_MAX));
+      // Inside a string the line-end rule holds open, whose introducer lay further back than safeCut looks, the
+      // cut kept only its payload, which then read as the line's text (a clipboard's base64 in the digest: a
+      // reviewer's read of the fixes for #22). The kept carry begins at the string's introducer again.
+      if (w.scan.open && unfinishedSequence(buf, Number.POSITIVE_INFINITY) === buf.length) {
+        buf = w.scan.open.slice(0, w.scan.open.charCodeAt(0) === 0x1b ? 2 : 1) + buf;
+      }
     }
     w.carry = buf;
   }
@@ -1150,7 +1156,8 @@ export class Segmenter {
     // `working ESC [ 3` showed as `working [3` until the next read). A Run's end does not release it:
     // the watch goes with the Run, and nothing is lost, since the completion renders the Run's text
     // from the journal, not from these lines (the house's read of the 38 commits, #22, comment 6274773484).
-    const partial = unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
+    // The line-end rule's own record says so too, whatever a cut left of the sequence in the carry.
+    const partial = w.scan.open || unfinishedSequence(w.carry) < w.carry.length ? '' : cleanLine(w.carry).trimEnd();
     const tail = (partial ? [...w.lines, partial] : w.lines).slice(-DIGEST_LINES).join('\n');
     const seq = this.s.journal.lastSeq;
     const elapsed = Math.max(0, Math.round(clocks.monotonic() - w.startMono));

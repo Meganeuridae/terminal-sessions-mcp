@@ -633,6 +633,31 @@ test('leaving the alternate screen starts a shell Run’s line-end rule afresh: 
   }
 });
 
+test('a digest never shows a string’s payload, though the carry is cut far inside it', async () => {
+  // An OSC 52 over three events: past the second, the carry's cut (4,096 kept, safeCut's look-back the same) left
+  // only the clipboard's base64, with the line-end rule still inside the string, and the digest's last line was 4,096
+  // of it; the line it ended in, once the string closed, read the same way.
+  const src = fakeSource();
+  startRun(src, 'copy');
+  const seg = new Segmenter(src, { cadenceMs: 40 });
+  const out = collect(seg);
+  const body = () => out.filter((s) => s.kind === 'output').at(-1)?.body ?? '';
+  try {
+    src.journal.append({ type: 'output', data: 'start\r\ncopying \x1b]52;c;' + 'S'.repeat(3000), stream: 'pty', runId: 'copy' });
+    src.journal.append({ type: 'output', data: 'E'.repeat(6000), stream: 'pty', runId: 'copy' });
+    await sleep(100);
+    assert.equal(body(), 'start', 'while the string is open');
+    src.journal.append({ type: 'output', data: 'C'.repeat(6000), stream: 'pty', runId: 'copy' });
+    await sleep(100);
+    assert.equal(body(), 'start', 'still open, after another cut');
+    src.journal.append({ type: 'output', data: '\x07done\r\n', stream: 'pty', runId: 'copy' });
+    await sleep(100);
+    assert.deepEqual(body().split('\n'), ['start', 'done'], 'the line it ended in');
+  } finally {
+    seg.dispose();
+  }
+});
+
 test('unread bytes are never short of what arrived after the read, even once marks were thinned', async () => {
   const src = fakeSource();
   startRun(src, 'many');
