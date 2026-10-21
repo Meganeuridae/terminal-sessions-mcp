@@ -1576,3 +1576,21 @@ test('a file fsync the disk refuses keeps the failed mark: the store refuses the
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a lowering write refused as the journal closes is said: the next start may count seqs it never issued among those lost', () => {
+  const dir = tmpDir();
+  try {
+    const said: string[] = [];
+    const cold = new Flaky(dir);
+    const j = new Journal({ cold, sessionId: 's', log: (level, text) => said.push(`${level}: ${text}`) });
+    for (let i = 0; i < 5; i++) j.append(out(`e${i}`));
+    cold.refuseMarks = true;
+    j.close();
+    assert.ok(cold.calls.includes('clear refused'), cold.calls.join(' → '));
+    const lowered = said.filter((l) => l.startsWith('warn: ') && l.includes('could not be lowered to its last seq (5) as it closed'));
+    assert.equal(lowered.length, 1, said.join(' | '));
+    assert.equal(peekReservation(dir)?.to, HIGH_WATER_BLOCK, 'the block ahead stands');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
