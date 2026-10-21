@@ -87,8 +87,12 @@ async function readFor(ctx: ToolContext, d: Drawn | null, o: Parameters<App['rea
   return ctx.app.read(ctx.caller, { ...o, advance: false });
 }
 
-/** The marker a Run's output cut to its last COMPAT_OUTPUT_BYTES begins with: its earlier output is paged by `read` with its runId (served in this profile), not by tailLogs, which reads the session's end. */
-const omitted = (runId: string, text: string): string => `[… earlier output omitted: read {"runId": "${runId}"} pages all of it]\n${cutTail(text, COMPAT_OUTPUT_BYTES).text}`;
+/**
+ * The marker a Run's output cut to its last COMPAT_OUTPUT_BYTES begins with: its earlier output is paged by `read`
+ * with its session and runId (served in this profile), not by tailLogs, which reads the session's end. The read
+ * requires its session: advised without it, the call was refused (our read of the 40 commits, PR #22).
+ */
+const omitted = (session: string, runId: string, text: string): string => `[… earlier output omitted: read ${callArgs({ session, runId })} pages all of it]\n${cutTail(text, COMPAT_OUTPUT_BYTES).text}`;
 
 /**
  * A Run's whole output, paged through `read` (text, or raw events), keeping the last
@@ -123,7 +127,7 @@ async function runOutput(ctx: ToolContext, session: string, runId: string, raw: 
     offset = r.nextOffset;
   }
   const out = parts.join('');
-  return cut ? omitted(runId, out) : out;
+  return cut ? omitted(session, runId, out) : out;
 }
 
 

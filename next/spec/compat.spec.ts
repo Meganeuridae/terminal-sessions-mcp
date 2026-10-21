@@ -192,7 +192,11 @@ test('runCommand output: raw keeps the stream, paged output comes whole, and pas
   const big = await call('runCommand', { session: 'out', command: "head -c 1200000 /dev/zero | tr '\\0' y | fold -w 200; echo; echo END-OF-BIG", timeout: 30_000 });
   assert.equal(big.exitCode, 0, JSON.stringify({ state: big.state, note: big.note }));
   const out = String(big.output);
-  assert.match(out, new RegExp(`^\\[… earlier output omitted: read \\{"runId": "${big.runId}"\\} pages all of it\\]`));
+  // The advised read names the session, which the read tool requires (our read of the 40 commits, PR #22).
+  const advice = new RegExp(`^\\[… earlier output omitted: read (\\{"session": "out", "runId": "${big.runId}"\\}) pages all of it\\]`).exec(out);
+  assert.ok(advice, out.slice(0, 120));
+  const first = (await call('read', JSON.parse(advice![1]!) as Obj)) as unknown as { text?: string };
+  assert.ok(String(first.text).includes('y'.repeat(200)), 'the advised read pages the Run');
   assert.ok(out.endsWith('END-OF-BIG') || out.trimEnd().endsWith('END-OF-BIG'), out.slice(-100));
   assert.ok(Buffer.byteLength(out) <= 1024 * 1024 + 200, `bounded: ${Buffer.byteLength(out)}`);
   // A tail asked in lines gets lines, raw or clean, from the end.
