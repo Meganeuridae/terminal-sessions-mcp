@@ -553,6 +553,57 @@ test('jr2-4: with no process listing after the SIGTERM, recovery sends no SIGKIL
   }
 });
 
+test('jr2-4: a recovery with no process listing ends no group and says so — a note per candidate Run, one warning in the log — and leaves the Runs candidates, so the next recovery that can list processes ends their groups (a reviewer\'s read of the fixes for #22; the house\'s read of the 36 commits, PR #22, comment 6269992150, item 6)', { timeout: 20_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'nq');
+  const kids = detachedKids();
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    // Both groups leaderless (the leader exited, its child lives on), so the next recovery ties them to
+    // their Runs by the wall clock on every host; a live leader under an end recovery wrote is told by
+    // start ticks only, which macOS has none of.
+    const inFlight = kids.spawn('/bin/sh', ['-c', 'sleep 412 & exit 0']);
+    const leftover = kids.spawn('/bin/sh', ['-c', 'sleep 413 & exit 0']);
+    let ts = Date.now();
+    await kids.exited(inFlight);
+    await kids.exited(leftover);
+    assert.ok(groupAlive(inFlight) && groupAlive(leftover), 'the children keep their leaderless groups alive');
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'nq', now: () => ts });
+    journalProcess(j, 'r1-flight', inFlight);
+    journalProcess(j, 'r2-ended', leftover);
+    j.append({ type: 'run.end', runId: 'r2-ended', state: 'exited', exit: 0, durationMs: 5, leftovers: true });
+    // The dead daemon lived on after starting the Runs: its last event, the evidence the next recovery
+    // bounds the groups by, is later than ps's whole-second starts and their slack.
+    ts += 2000;
+    j.append({ type: 'output', data: 'still here\r\n', stream: 'pty', runId: 'r1-flight', attribution: 'temporal' });
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    const warnings: Array<{ text: string; fields: Record<string, unknown> | undefined }> = [];
+    const r = rig(dir, { terminateOrphans: true, listProcesses: () => undefined, log: (level, text, fields) => void (level === 'warn' && warnings.push({ text, fields })) });
+    const h = hist(r.reg.get('nq'));
+    const notes = h.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'note' }> => e.type === 'note').map((e) => e.text);
+    // Returned before any of this, the recovery left nothing in the history or the log.
+    for (const [g, runId] of [[inFlight, 'r1-flight'], [leftover, 'r2-ended']] as const) {
+      assert.ok(notes.includes(`recovery: process group ${g} left running (no process listing answered, so whose group it is cannot be told) · ${runId}`), JSON.stringify(notes));
+    }
+    const said = warnings.filter((w) => w.text.includes('no process listing answered'));
+    assert.equal(said.length, 1, JSON.stringify(warnings));
+    assert.deepEqual([...(said[0]!.fields!['groups'] as number[])].sort(), [inFlight, leftover].sort());
+    assert.deepEqual(said[0]!.fields!['sessions'], ['nq']);
+    assert.deepEqual([h.run('r1-flight').state, h.run('r1-flight').reason], ['lost', 'daemon-restart'], 'not the Run\'s to end: in a note, not its reason');
+    assert.equal(h.run('r1-flight').groupJudged, undefined, 'nothing judged it: still a candidate');
+    assert.equal(h.run('r2-ended').groupJudged, undefined, 'the ended Run too');
+    assert.ok(groupAlive(inFlight) && groupAlive(leftover), 'nothing was signalled');
+    await r.reg.closeAll();
+    // The next recovery can list processes: it judges both groups by the dead daemon's evidence and ends them.
+    const r2 = rig(dir, { terminateOrphans: true });
+    assert.ok(!groupAlive(inFlight) && !groupAlive(leftover), 'the next recovery ended both groups');
+    await r2.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
 test('jr2-4: the dead daemon\'s last evidence passes over what an earlier recovery wrote before it died too — the journal\'s gap at open, and lost ends, whose recorded evidence is taken (the house\'s read of the 38 commits, PR #22, comment 6274857431, item 5)', async () => {
   const T_death = 1_000_000;
   const T_rec1 = T_death + 60_000;

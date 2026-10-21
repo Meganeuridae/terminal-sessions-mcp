@@ -351,8 +351,13 @@ interface Slot {
  */
 type Recovering = Omit<Slot, 'cursors' | 'view'> & { retention: SessionRetention; journal: Journal; last: JournalEvent | undefined; lastAliveTs: number | undefined; gone: boolean };
 
-/** What recovery did with a Run's process group: `text` names it, `left` is true when the group was left running (a reused pgid it could not tie to the Run). */
-type GroupOutcome = { text: string; left: boolean };
+/**
+ * What recovery did with a Run's process group: `text` names it, `left` is true when the group was left
+ * running (a reused pgid it could not tie to the Run, or no process listing to tell by), and `unjudged`
+ * when nothing judged it (no listing): the Run then stays a candidate, so a later recovery that can list
+ * processes judges the group, bounded by the dead daemon's last evidence.
+ */
+type GroupOutcome = { text: string; left: boolean; unjudged?: true };
 
 /** A name whose record cannot be read has no known owner: nobody may reopen it until the record is repaired or the session removed. */
 const UNOWNED: Principal = 'unknown';
@@ -548,7 +553,7 @@ export class SessionRegistry {
         durationMs: Math.max(0, now - (run.startedAt ?? run.admittedAt)),
         recoveredEnd: true,
       };
-      if (outcome) ev.groupJudged = true;
+      if (outcome && !outcome.unjudged) ev.groupJudged = true;
       // The dead daemon's last evidence, kept on the end: a recovery that could not judge the group (no
       // process listing) leaves the Run a candidate, and the next recovery must bound its group by when
       // the daemon died, not by this recovery's time (comment 6269992150, item 2).
@@ -576,7 +581,7 @@ export class SessionRegistry {
       // recorded as its own event, which the run index folds into groupJudged, so a later restart does
       // not judge the group again with another note and warning (a reviewer's read of the fixes for #22
       // comment 6269992150). A Run recovery ended lost just now carries it on its end.
-      if (!lost.has(run.runId)) journal.append({ type: 'run.judged', runId: run.runId });
+      if (!lost.has(run.runId) && !outcome.unjudged) journal.append({ type: 'run.judged', runId: run.runId });
     }
     // Mark the restart once: a session closed on purpose, or history since an earlier restart, gains nothing.
     if (meta.closedAt === undefined && last?.type !== 'recovered') journal.append({ type: 'recovered', class: 'history-only' });
@@ -609,7 +614,7 @@ export class SessionRegistry {
     if (!candidates.length) return out;
     const list = this.opts.listProcesses ?? listProcesses;
     const procs = list();
-    if (!procs) return out; // nothing can tell whose a group is: leave every process alone
+    if (!procs) return this.leaveUnlisted(candidates, out);
     const groups = orphanGroups(candidates, procs, { pid: process.pid, pgid: procs.find((p) => p.pid === process.pid)?.pgid });
     // The candidate groups with a living member that are not the Run's: left running, and recorded as such
     // (comment 6269992150) — from pgids and start times they cannot be told from a stranger's group that
@@ -688,6 +693,25 @@ export class SessionRegistry {
       unchecked: unchecked.size ? [...unchecked.keys()] : undefined,
       sessions: [...new Set([...groups.values()].flat().map((k) => k.slice(0, k.indexOf('\0'))))],
     });
+    return out;
+  }
+
+  /**
+   * No process listing answered: nothing can tell whose a group is, so every process is left alone and
+   * no Run is marked judged. Each candidate whose group still has a process gets a note in its history,
+   * and the log says it once, in the words used for a group left for a reused pgid (comment 6269992150,
+   * item 6): it returned without a word before, so a group the README says recovery "ends none" of left
+   * nothing behind to say so (a reviewer's read of the fixes for #22).
+   */
+  private leaveUnlisted(candidates: OrphanCandidate[], out: Map<string, GroupOutcome>): Map<string, GroupOutcome> {
+    const left = candidates.filter((c) => groupAlive(c.run.pgid!));
+    for (const { key, run } of left) out.set(key, { text: `process group ${run.pgid} left running (no process listing answered, so whose group it is cannot be told)`, left: true, unjudged: true });
+    if (left.length) {
+      this.opts.log?.('warn', 'recovery left process groups it could not tie to a Run (no process listing answered, so it ended none)', {
+        groups: [...new Set(left.map((c) => c.run.pgid))],
+        sessions: [...new Set(left.map((c) => c.key.slice(0, c.key.indexOf('\0'))))],
+      });
+    }
     return out;
   }
 
