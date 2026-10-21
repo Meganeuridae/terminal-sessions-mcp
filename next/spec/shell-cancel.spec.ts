@@ -265,17 +265,9 @@ test('fish: a stopped shell whose empty line a third ^C flushed reads keys again
   // until the session closed (found by run while answering question 1 of #22 comment 6310921374). The
   // first prompt fish draws after the interrupt runs none of its event handlers, so it carries no marks
   // of ours: the advice's input may take two Enters. (fish 3.7 sends no queries; there the spec shows the
-  // recovery alone.)
-  //
-  // The completions dirs are there already, as after any earlier fish start. In a fresh HOME fish starts its
-  // man-page completion generator while it reads its config, in its own process group: fish 3.7 when
-  // `$__fish_user_data_dir/generated_completions` is missing, with the terminal as the generator's input,
-  // which the reader check rightly takes for a reader (CI's Ubuntu runner); fish 4.9 when
-  // `$__fish_cache_dir/generated_completions` is missing, as `sh -c 'c=$(cat) ...'` and a python parsing
-  // every man page, which the reader check then finds in fish's group and inspects with lsof. With only the
-  // first dir the generator ran in every fish 4.9 run of this spec, and the spec failed twice on macOS under
-  // load, its error not kept. With both dirs, fish is alone on its terminal.
-  const x = await realSession(FISH, { login: false, rc: { '.local/share/fish/generated_completions/.keep': '', '.cache/fish/generated_completions/.keep': '' } });
+  // recovery alone.) No man-page generator shares fish's terminal: realSession's HOME has fish's
+  // completions dirs.
+  const x = await realSession(FISH, { login: false });
   const pid = x.session.info().pid;
   const events = () => x.journal.since(0).events;
   const lastOutputTs = () => events().reduce((t, e) => (e.type === 'output' ? Math.max(t, e.ts) : t), 0);

@@ -528,6 +528,12 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
   temps.add(tmp);
   const home = path.join(tmp, 'home');
   fs.mkdirSync(home, { recursive: true });
+  // In a fresh HOME fish starts its man-page completion generator while it reads its config, in its own
+  // process group beside the shell under test: fish 3.7 when `$__fish_user_data_dir/generated_completions`
+  // is missing, with the terminal as the generator's input, and fish 4 when `$__fish_cache_dir/
+  // generated_completions` is. Its python parsing every man page shared every fish spec's terminal and CPU,
+  // and the cancel's reader check took it for a reader. Both dirs are there, as after any earlier fish start.
+  for (const d of ['.local/share/fish/generated_completions', '.cache/fish/generated_completions']) fs.mkdirSync(path.join(home, d), { recursive: true });
   for (const [f, body] of Object.entries(opts.rc ?? {})) {
     fs.mkdirSync(path.dirname(path.join(home, f)), { recursive: true });
     fs.writeFileSync(path.join(home, f), body);
