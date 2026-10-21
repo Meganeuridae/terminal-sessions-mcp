@@ -591,7 +591,15 @@ same Run, with `origin: human`.
 `; echo "<<<EXI""T:<nonce>:$?>>>"` on the same line, resolved by nonce, buffer cut at the
 marker (`$status` under fish). A `^C` that aborts the marker's echo is followed, once the
 shell's own group holds the terminal again, by the marker alone as a probe, so a cancelled
-marker Run still ends. Both strategies produce identical result shapes.
+marker Run still ends. The command file's first line prints `<<<START:<nonce>:<pid>>>>`,
+keeping the shell's status for the body, and the Run's output is cut at that mark, so
+whatever the shell printed before it ran the file (the typed line's echo, a still-starting
+shell's banner and second echo) goes, and a line in the echo's shape after it is the
+program's; a file that never ran prints no mark, and its echo is cut by the echo rule. The
+extra first line means a shell's own error messages name a line of the body one later than
+written. dash and bash trace none of that line under `set -x`; zsh and fish write their
+traces of it to their own stderr, after the mark. Both strategies produce identical result
+shapes.
 
 *Declared shell* (inline strategy). After `ssh host`, `sudo -i`, `docker exec -it … bash`, a
 nested shell, or an `exec` into a shell without our integration, the program in front of the
