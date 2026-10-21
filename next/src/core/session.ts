@@ -521,6 +521,8 @@ export class Session {
   private sawPromptEnd = false;
   /** This shell's prompts carry an end mark (a B was seen): the empty line's grace then runs from it. */
   private promptsCarryEnd = false;
+  /** Writes of a principal's input (input()), so the cancel's empty line can tell that someone typed during its settle. */
+  private inputsSent = 0;
   /** An `exec` in the Run in flight may replace the shell: its command line is watched (ss-4). */
   private execWatch: { run: RunRecord; timer: NodeJS.Timeout } | undefined;
   /** Order of everything typed into the terminal: principals' lines and the daemon's (ss-1). */
@@ -2576,10 +2578,14 @@ export class Session {
   private async askForPrompt(): Promise<'typed' | 'answered' | 'gone' | { why: string }> {
     const waiting = { path: undefined, started: false, prompted: false };
     this.promptProbe = waiting;
+    const sent = this.inputsSent;
     const why = await this.whyNotEditor();
     if (this.shellState === 'exited' || this.shellState === 'unavailable' || this.closing) return 'gone';
     if (this.promptProbe !== waiting) return 'answered';
     if (why !== undefined) return { why };
+    // Input someone sent during the settle is in the editor, or on its way: the empty line's clear keys
+    // would erase it (the house's review of the 40 commits through 4f4c067, by run).
+    if (this.inputsSent !== sent) return { why: 'input was sent to the shell meanwhile, which the empty line would erase' };
     this.resendReplies();
     let file: string;
     try {
@@ -2861,6 +2867,7 @@ export class Session {
     const current = this.currentShellRun ?? this.pendingShellRun;
     if (current) ev.runId = current.runId;
     this.append(ev);
+    this.inputsSent++;
     if (opts.principal !== SYSTEM) {
       this.lastTyper = opts.principal;
       const layer = this.layers.at(-1);

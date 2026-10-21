@@ -746,6 +746,31 @@ test('a prompt that stops carrying its end mark still gives the empty line up, a
   await h.session.close();
 });
 
+test('input sent while the cancel reads the terminal’s mode is not erased: no empty line is typed after it, and the next prompt is the shell’s answer', async () => {
+  // By run with bash 5.2.37 stopped across the cancel: a command sent during the settle was erased by the
+  // empty line's clear keys and never ran (the house's review of the 40 commits through 4f4c067).
+  const h = await harness();
+  h.shell.stop();
+  const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  let sent = false;
+  h.pty.inputMode = () => {
+    if (!sent) {
+      sent = true;
+      h.session.input('echo typed', { principal: AGENT }); // someone types while the mode is read
+    }
+    return EDITOR_MODE;
+  };
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.ok(sent, 'the input went during the settle');
+  assert.match(c.steps.at(-1) ?? '', /^no empty line typed, since input was sent to the shell meanwhile/, JSON.stringify(c));
+  assert.ok(!h.pty.written.slice(h.pty.written.lastIndexOf('echo typed')).includes('tsm-cmd-'), 'no empty line, nor its clear keys, after the input');
+  assert.ok(!h.pty.written.slice(h.pty.written.lastIndexOf('echo typed')).includes(CLEAR_LINE_KEYS), 'nothing erases it');
+  h.shell.cont(); // the prompt for the ^C is the shell's answer
+  await until(() => h.session.shellAvailable().ok, 2000, 'back at that prompt');
+  await h.session.close();
+});
+
 test('a cancel whose empty line cannot be written types none, says so, and takes the shell’s next prompt as its answer', async () => {
   // askForPrompt's fallback when its file cannot be written: no line is typed, and the prompt the stopped
   // shell prints for the ^C when it runs again is the shell's answer.
