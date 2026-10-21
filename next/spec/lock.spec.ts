@@ -25,7 +25,7 @@ import { acquireDataDirLock, bootId, listProcesses, LOCK_FILE, parseProcStat, PR
  * reaches the module's own `import * as fs` bindings, which the test runner's mocks cannot. Every patch
  * is restored in a finally.
  */
-const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync; openSync: typeof fs.openSync; readFileSync: typeof fs.readFileSync; writeFileSync: typeof fs.writeFileSync };
+const fsc = createRequire(import.meta.url)('node:fs') as { fsyncSync: typeof fs.fsyncSync; fstatSync: typeof fs.fstatSync; mkdirSync: typeof fs.mkdirSync; openSync: typeof fs.openSync; readFileSync: typeof fs.readFileSync; writeFileSync: typeof fs.writeFileSync };
 const cpc = createRequire(import.meta.url)('node:child_process') as { execFileSync: (file: string, args?: readonly string[], ...rest: unknown[]) => unknown };
 const eio = () => Object.assign(new Error('EIO: i/o error, fsync'), { code: 'EIO' });
 /** A directory fsync that fails with EIO while `fn` runs (file fsyncs still work). */
@@ -948,4 +948,43 @@ test('a holder stopped for seconds between its rename and leaving the guard keep
     h.proc.kill('SIGKILL');
     x?.proc.kill('SIGKILL');
   }
+});
+
+/** Run `fn` with one builtin replaced as lock.js sees it, restored after. */
+function patching<K extends keyof typeof fsc, T>(name: K, replacement: (real: (typeof fsc)[K]) => (typeof fsc)[K], fn: () => T): T {
+  const real = fsc[name];
+  fsc[name] = replacement(real);
+  syncBuiltinESMExports();
+  try {
+    return fn();
+  } finally {
+    fsc[name] = real;
+    syncBuiltinESMExports();
+  }
+}
+test('a registry syncs each directory it makes into its parent before recovery: the data dir and any parent made on the way, then sessions/; a sync the disk refuses is said once', async () => {
+  const base = dataDir();
+  fs.mkdirSync(base, { recursive: true });
+  const dir = path.join(base, 'a', 'data');
+  const sessions = path.join(dir, 'sessions');
+  const synced: { ino: number; sessions: boolean }[] = [];
+  const reg = patching(
+    'fsyncSync',
+    (real) =>
+      ((fd: number) => {
+        const st = fsc.fstatSync(fd);
+        if (st.isDirectory()) synced.push({ ino: st.ino, sessions: fs.existsSync(sessions) });
+        return real(fd);
+      }) as typeof fs.fsyncSync,
+    () => new SessionRegistry({ dataDir: dir, backend: new ScriptedBackend() }),
+  );
+  const ino = (p: string) => fs.statSync(p).ino;
+  assert.ok(synced.some((s) => s.ino === ino(base)), 'base, which holds the new a/');
+  assert.ok(synced.some((s) => s.ino === ino(path.join(base, 'a'))), 'a/, which holds the new data dir');
+  assert.ok(synced.some((s) => s.ino === ino(dir) && s.sessions), 'the data dir, once it holds sessions/');
+  await reg.closeAll();
+  const warnings: string[] = [];
+  const refused = withDirFsyncEIO(() => new SessionRegistry({ dataDir: path.join(base, 'b'), backend: new ScriptedBackend(), log: (level, text) => void (level === 'warn' && warnings.push(text)) }));
+  assert.equal(warnings.filter((w) => /a directory the daemon made could not be synced into its parent/.test(w)).length, 1, JSON.stringify(warnings));
+  await refused.closeAll();
 });

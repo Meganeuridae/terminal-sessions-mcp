@@ -202,6 +202,33 @@ export function syncDir(file: string): NodeJS.ErrnoException | undefined {
   }
 }
 
+/**
+ * Make `dir`, and any parent it lacks, with `mode`; the directories this made, outermost first. A new
+ * directory's entry in its parent is not durable until that parent is synced (syncMadeDirs): until then a
+ * power loss can take the directory with whatever its files had synced.
+ */
+export function makeDirs(dir: string, mode: number): string[] {
+  const made = fs.mkdirSync(dir, { recursive: true, mode });
+  const dirs: string[] = [];
+  if (made === undefined) return dirs;
+  const top = path.resolve(made);
+  for (let d = path.resolve(dir); ; d = path.dirname(d)) {
+    dirs.unshift(d);
+    if (d === top || path.dirname(d) === d) break;
+  }
+  return dirs;
+}
+
+/** Sync each of `dirs` (makeDirs) into its parent, outermost first, taking each from `dirs` once it is: undefined once all are, else the first error, the rest left for the next try. */
+export function syncMadeDirs(dirs: string[]): NodeJS.ErrnoException | undefined {
+  while (dirs.length > 0) {
+    const error = syncDir(dirs[0]!);
+    if (error) return error;
+    dirs.shift();
+  }
+  return undefined;
+}
+
 /** Error codes that mean the filesystem cannot fsync a directory, as opposed to a real I/O failure (EIO) that must propagate. */
 export function cannotSyncDir(code: string | undefined): boolean {
   return code === 'EINVAL' || code === 'ENOTSUP' || code === 'EOPNOTSUPP' || code === 'EPERM' || code === 'EISDIR';
@@ -536,7 +563,7 @@ export class FileStore implements JournalStore {
    * the file's own sync and its directory's left a new session's directory entry unsynced, so a power
    * loss soon after could take the session with the reservation it had synced.
    */
-  private newDirs: string[] = [];
+  private readonly newDirs: string[];
   private readonly log: FileStoreOptions['log'];
   /** A rotation header the disk refused: written before the new file's first event (the house's read of b047b92, point 4). */
   private headerPending: Buffer | undefined;
@@ -553,14 +580,7 @@ export class FileStore implements JournalStore {
     this.floor = opts.floor;
     this.log = opts.log;
     // The journal holds whatever programs printed: private to the daemon's user (G26).
-    const made = fs.mkdirSync(dir, { recursive: true, mode: DIR_MODE });
-    if (made !== undefined) {
-      const top = path.resolve(made);
-      for (let d = path.resolve(dir); ; d = path.dirname(d)) {
-        this.newDirs.unshift(d);
-        if (d === top || path.dirname(d) === d) break;
-      }
-    }
+    this.newDirs = makeDirs(dir, DIR_MODE);
     try {
       fs.chmodSync(dir, DIR_MODE);
     } catch {
@@ -624,7 +644,7 @@ export class FileStore implements JournalStore {
       return 'failed';
     }
     this.onDisk = meta;
-    const dirError = this.syncNewDirs();
+    const dirError = syncMadeDirs(this.newDirs);
     if (w.synced && dirError === undefined) return 'written';
     if (!this.syncWarned) {
       this.syncWarned = true;
@@ -632,16 +652,6 @@ export class FileStore implements JournalStore {
       this.log?.('warn', `the journal's metadata (${META}) is written but ${why}; a crash may undo the write`);
     }
     return 'unsynced';
-  }
-
-  /** Sync each directory this open created into its parent, outermost first; undefined once all are, else the first error (the rest stay pending for the next metadata write). */
-  private syncNewDirs(): NodeJS.ErrnoException | undefined {
-    while (this.newDirs.length > 0) {
-      const error = syncDir(this.newDirs[0]!);
-      if (error) return error;
-      this.newDirs.shift();
-    }
-    return undefined;
   }
 
   epoch(): string {

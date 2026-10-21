@@ -30,7 +30,7 @@ import { Journal, reservationHonoured, type JournalOptions } from '../core/journ
 import { acquireDataDirLock, groupAlive, listProcesses, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
 import { RunIndex, type RunOutput, type RunOutputRange } from '../core/runindex.js';
 import { Session, trustedDir, type SessionOptions } from '../core/session.js';
-import { FileStore, FreeSpaceFloor, MemoryStore, type DiskFloor, type DurableWrite, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
+import { FileStore, FreeSpaceFloor, makeDirs, MemoryStore, syncMadeDirs, type DiskFloor, type DurableWrite, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
 import { DEFAULT_GEOMETRY, SYSTEM, type ControlPolicy, type Cursors, type JournalEvent, type Principal, type RunInfo, type Seq, type Visibility } from '../core/types.js';
 import { prepareIntegration } from '../shell/integration.js';
 
@@ -432,15 +432,21 @@ export class SessionRegistry {
     // Journals hold whatever programs printed: private to the daemon's user (G26). The
     // sessions root is ours and always 0700; the data dir only when we create it (it
     // may be a directory the user chose, whose mode is theirs).
-    fs.mkdirSync(opts.dataDir, { recursive: true, mode: 0o700 });
+    const made = makeDirs(opts.dataDir, 0o700);
     // Before recovery writes a byte: a second daemon on this data dir stops here (G10, G20).
     this.ensureLock();
-    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    made.push(...makeDirs(this.root, 0o700));
     try {
       fs.chmodSync(this.root, 0o700);
     } catch {
       // not ours to fix
     }
+    // A directory made here is in its parent durably only once that parent is synced: on a first start, a
+    // power loss soon after could take sessions/ with every reservation its stores had synced. A store
+    // syncs the directories it makes itself (makeDirs); the data dir and sessions/ are made here, before any
+    // store opens.
+    const unsynced = syncMadeDirs(made);
+    if (unsynced) this.opts.log?.('warn', `a directory the daemon made could not be synced into its parent (${made[0]}): ${unsynced.message}; a power loss soon after this start can take the sessions made since`, { dataDir: opts.dataDir });
     this.recover();
   }
 
