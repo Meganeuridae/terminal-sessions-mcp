@@ -68,10 +68,11 @@ export interface PtyHandle {
    * (item 1: unknown is not "no reader").
    *
    * The limit: a program that reads the terminal only through descriptor 1 or 2, as util-linux's
-   * `more` behind a pipe does (stdin the pipe, keys read through its output descriptor), looks like
-   * the rc's background job and answers false (the house's read of the 33 commits, #22 comment
-   * 6307351617, item 3). A reinit typed into it draws no hello, and the gate then gives up keeping the
-   * key, with the recovery line in its note.
+   * `more` behind a pipe does (stdin the pipe, keys read through descriptor 2: with 2>/dev/null,
+   * util-linux 2.41.5's `more` still pages but no longer takes a q), looks like the rc's background
+   * job and answers false (the house's read of the 33 commits, #22 comment 6307351617, item 3). A
+   * reinit typed into it draws no hello, and the gate then gives up keeping the key, with the
+   * recovery line in its note.
    */
   otherReader?(): boolean | undefined;
   /**
