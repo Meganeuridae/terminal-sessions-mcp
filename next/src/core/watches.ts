@@ -439,11 +439,8 @@ export class WatchManager {
       if (!run) rec.predicate.armSilence();
       else {
         // Quiet is measured from the Run's last output; a Run that has printed nothing yet arms on its first (m2-12).
-        const { last } = this.lastRunOutput(run.runId);
-        if (last) {
-          const age = this.ageOf(last);
-          rec.predicate.armSilence(spec.silenceMs! - age, clocks.monotonic() - age);
-        }
+        const newest = this.newestRunOutput(run.runId);
+        if (newest.age !== undefined) rec.predicate.armSilence(spec.silenceMs! - newest.age, clocks.monotonic() - newest.age);
       }
     }
     return this.publicInfo(rec);
@@ -494,6 +491,22 @@ export class WatchManager {
     } catch {
       return { none: 'its output could not be read' };
     }
+  }
+
+  /**
+   * How long ago a Run last printed, with that output's seq: from this manager's own stamp of its newest
+   * output when it has one, which retention or a hole cannot take, else from the journal's last retained
+   * output (from before the manager existed, or an ended Run past the newest ENDED_STAMPED). Read from the
+   * journal first, a live Run whose newest output was gone never armed its silence, and an older event was
+   * aged on the wall clock, its stream's stamp being the newer one's (the house's read of f3750e4..4f4c067
+   * over our fixes, #22).
+   */
+  private newestRunOutput(runId: string): { seq?: Seq; age?: number; none?: string } {
+    let stamp: Stamp | undefined;
+    for (const s of Object.values(this.live.get(runId) ?? this.ended.get(runId) ?? {})) if (s && (!stamp || s.seq > stamp.seq)) stamp = s;
+    if (stamp) return { seq: stamp.seq, age: Math.max(0, Math.round(clocks.monotonic() - stamp.at)) };
+    const { last, none } = this.lastRunOutput(runId);
+    return last ? { seq: last.seq, age: this.ageOf(last) } : { none: none ?? 'no output' };
   }
 
   private onHit(w: WatchRecord, hit: Hit): void {
@@ -655,18 +668,19 @@ export class WatchManager {
         const gone = run ? undefined : exited();
         if (gone) return abort(gone);
         const cur = run && (this.host.journal.runs.get(run.runId) ?? run);
-        const { last, none } = run ? this.lastRunOutput(run.runId) : { last: lastOutput(this.host.journal), none: undefined };
+        const sessionLast = run ? undefined : lastOutput(this.host.journal);
+        const newest: { seq?: Seq; age?: number; none?: string } = run ? this.newestRunOutput(run.runId) : sessionLast ? { seq: sessionLast.seq, age: this.ageOf(sessionLast) } : {};
         if (cur && isTerminal(cur.state)) {
           // A Run that printed nothing has no output to age, and says so as a watch on it does: its quiet was
           // taken from the journal's wall-clock end, so a clock step put any figure there (the house's read
           // of the 40 commits, #22). One whose output is gone, or could not be read, says that instead.
-          const quiet = last ? ` no output for ${this.ageOf(last)}ms` : ` ${none ?? 'no output'}`;
+          const quiet = newest.age !== undefined ? ` no output for ${newest.age}ms` : ` ${newest.none ?? 'no output'}`;
           return finish(result({ matched: true, match: `${endText(cur)};${quiet}`, seq: cur.seq.end ?? this.host.journal.lastSeq }));
         }
-        const age = last ? this.ageOf(last) : 0;
-        if (last && age >= spec.silenceMs!) return finish(result({ matched: true, match: `no output for ${age}ms`, seq: last.seq }));
+        const age = newest.age ?? 0;
+        if (newest.seq !== undefined && age >= spec.silenceMs!) return finish(result({ matched: true, match: `no output for ${age}ms`, seq: newest.seq }));
         // A Run that has printed nothing yet starts the clock at its first output (or its end answers).
-        if (last || !run) predicate.armSilence(spec.silenceMs! - age, clocks.monotonic() - age);
+        if (newest.age !== undefined || !run) predicate.armSilence(spec.silenceMs! - age, clocks.monotonic() - age);
       }
       off = this.host.journal.subscribe((ev) => {
         predicate.feed(ev);

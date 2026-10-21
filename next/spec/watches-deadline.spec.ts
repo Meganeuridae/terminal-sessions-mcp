@@ -455,19 +455,45 @@ test('a silence wait answering for an ended Run that printed nothing says "no ou
 
 test('a silence wait answering for an ended Run says "no output" only when its whole output was read: one whose output is gone, or could not be read, says so (the house’s read of the 40 commits over our fixes, #22)', async (t) => {
   // Read as "no output", a Run that printed and whose output retention took was said to have printed nothing.
+  // The Run printed before this manager existed, as after a restart, so it holds no stamp of that output and
+  // only the journal can say (the house's read of f3750e4..4f4c067 over our fixes, #22).
   const f = bare();
   try {
     f.startRun('q');
     f.out('printed\n', 'q');
     f.journal.append({ type: 'run.end', runId: 'q', state: 'exited', exit: 0, durationMs: 1 });
+    const later = new WatchManager(f.host);
+    try {
+      const output = f.journal.runs.output.bind(f.journal.runs);
+      // What the Run's output read gives once retention or a hole took its output: nothing, and cut.
+      t.mock.method(f.journal.runs, 'output', (...a: Parameters<typeof output>) => ({ ...output(...a), events: [], truncated: true }));
+      assert.equal((await later.waitFor({ silenceMs: 200, runId: 'q' }, 5000)).match, 'run q ended (exited 0); no output retained');
+      t.mock.method(f.journal.runs, 'output', () => {
+        throw new Error('the store could not be read');
+      });
+      assert.equal((await later.waitFor({ silenceMs: 200, runId: 'q' }, 5000)).match, 'run q ended (exited 0); its output could not be read');
+    } finally {
+      later.dispose();
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("a Run's silence is measured from this manager's stamp of its newest output, which retention or a hole in the read cannot take (the house's read of f3750e4..4f4c067 over our fixes, #22)", async (t) => {
+  // Taken from the journal's last retained output, a live Run whose newest output was gone never armed its
+  // silence watch, and an ended one's wait said its output was not retained, though the manager saw it.
+  const f = bare();
+  try {
+    f.startRun('r');
+    f.out('working\n', 'r');
     const output = f.journal.runs.output.bind(f.journal.runs);
-    // What the Run's output read gives once retention or a hole took its output: nothing, and cut.
     t.mock.method(f.journal.runs, 'output', (...a: Parameters<typeof output>) => ({ ...output(...a), events: [], truncated: true }));
-    assert.equal((await f.manager.waitFor({ silenceMs: 200, runId: 'q' }, 5000)).match, 'run q ended (exited 0); no output retained');
-    t.mock.method(f.journal.runs, 'output', () => {
-      throw new Error('the store could not be read');
-    });
-    assert.equal((await f.manager.waitFor({ silenceMs: 200, runId: 'q' }, 5000)).match, 'run q ended (exited 0); its output could not be read');
+    const watch = f.manager.add({ silenceMs: 100, runId: 'r' }, A);
+    for (const until = performance.now() + 5000; !f.firings(watch.watchId).length && performance.now() < until; ) await sleep(20);
+    assert.match(String(f.firings(watch.watchId)[0]?.match), /^no output for \d+ms$/, 'the watch armed from the stamp and fired');
+    f.journal.append({ type: 'run.end', runId: 'r', state: 'exited', exit: 0, durationMs: 1 });
+    assert.match(String((await f.manager.waitFor({ silenceMs: 200, runId: 'r' }, 5000)).match), /^run r ended \(exited 0\); no output for \d+ms$/);
   } finally {
     f.close();
   }
