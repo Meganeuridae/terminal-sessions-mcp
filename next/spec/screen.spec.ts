@@ -232,6 +232,31 @@ test('persistentState keeps what the emulator applies of a sequence with C0 cont
     const replayed = await state(persistentState(data));
     assert.deepEqual([replayed.alt, replayed.insert], [whole.alt, whole.insert], `the replay reaches the emulator's state: ${JSON.stringify(data)}`);
   }
+  // A title ended where an ESC begins another sequence is set, as the emulator sets it; CAN, SUB or another C1 control
+  // ends it unset.
+  const title = async (data: string) => {
+    const t = new xterm.Terminal({ cols: 20, rows: 3, allowProposedApi: true, logLevel: 'off' });
+    let s = '';
+    t.onTitleChange((x) => (s = x));
+    await new Promise<void>((r) => t.write(data, r));
+    t.dispose();
+    return s;
+  };
+  for (const [ender, set] of [
+    ['\x1b[0m', true],
+    ['\x1b7', true],
+    ['\x1b]2;b\x07', true],
+    ['\x07', true],
+    ['\x9c', true],
+    ['\x18', false],
+    ['\x1a', false],
+    ['\x9b0m', false],
+    ['\x85', false],
+  ] as const) {
+    const data = `\x1b]2;hello${ender}`;
+    assert.equal(await title(data), set ? (ender.startsWith('\x1b]') ? 'b' : 'hello') : '', `the emulator: ${JSON.stringify(data)}`);
+    assert.equal(await title(persistentState(data)), await title(data), `the replay: ${JSON.stringify(data)}`);
+  }
   // A shift inside a control string's payload is payload, and sets nothing, as the emulator shows: with G1 the DEC
   // graphics set, `lqqk` after SO inside a title, a clipboard, a DCS or an APC is still `lqqk`. Before a string's
   // kind, or inside a CSI, a shift acts.

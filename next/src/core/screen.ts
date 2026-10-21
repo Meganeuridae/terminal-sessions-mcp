@@ -131,10 +131,15 @@ function sequencesOf(data: string): string {
       }
     } else {
       // A title (OSC 0, 1 or 2) is its introducer's ESC form and what follows the byte that names it, its ST as ESC \;
-      // the other strings set nothing kept here, and a shift in their payload is payload.
+      // the other strings set nothing kept here, and a shift in their payload is payload. One ended where an ESC begins
+      // another sequence sets the title too, and is given its ST; CAN, SUB and the other C1 controls leave it unset.
       const kind = c === 0x1b ? kindAt(data, i) : i;
       const body = data.slice(kind + 1, end);
-      if ((c === 0x9d || data[kind] === ']') && /^[012];/.test(body)) out += `\x1b]${body.endsWith('\x9c') ? `${body.slice(0, -1)}\x1b\\` : body}`;
+      if ((c === 0x9d || data[kind] === ']') && /^[012];/.test(body)) {
+        if (body.endsWith('\x07') || body.endsWith('\x1b\\')) out += `\x1b]${body}`;
+        else if (body.endsWith('\x9c')) out += `\x1b]${body.slice(0, -1)}\x1b\\`;
+        else if (data[end] === '\x1b') out += `\x1b]${body}\x1b\\`;
+      }
     }
     i = end;
   }
