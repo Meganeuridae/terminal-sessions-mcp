@@ -119,14 +119,16 @@ test('/bin/bash: a cancel whose two ^C a DEBUG trap of the user’s ignores, bef
   // The integration's DEBUG hook runs the user's trap before it prints the start mark; here that trap
   // is a subshell that ignores ^C, for daemon lines only (the house's second way to reach item 1). The
   // trap leaves a file when it is entered, and the cancel waits for it: sent before the shell read the
-  // line, the ^C would discard it unread and pass on the ordinary path. The trap's 3 s outlast the
-  // cancel's three 200 ms waits, so its two ^C draw no mark. The trap's job holds the terminal, so no
-  // empty line is typed into it (the house's review of the 40 commits through f3750e4, #22 comment
-  // 6310921374, question 1): the prompt that ends the late line is the shell's answer.
-  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': `trap 'case $BASH_COMMAND in *tsm-cmd*) : > "$HOME/in-trap"; ( trap "" INT; sleep 3 ) ;; esac' DEBUG\n` } });
+  // line, the ^C would discard it unread and pass on the ordinary path. The trap holds until the spec
+  // writes a gate after the cancel returned, so its two ^C draw no mark however slow the runner (a fixed
+  // 3 s held it before: the house's review of the 40 commits through 4f4c067). The trap's job holds the
+  // terminal, so no empty line is typed into it (the house's review of the 40 commits through f3750e4,
+  // #22 comment 6310921374, question 1): the prompt that ends the late line is the shell's answer.
+  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': `trap 'case $BASH_COMMAND in *tsm-cmd*) if [ -e "$HOME/arm" ]; then : > "$HOME/in-trap"; ( trap "" INT; while [ ! -e "$HOME/gate" ]; do sleep 0.05; done ); fi ;; esac' DEBUG\n` } });
   const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
   try {
     await until(() => x.session.shellAvailable().ok, 5000, 'the shell is ready');
+    fs.writeFileSync(path.join(x.home, 'arm'), ''); // the trap holds the daemon's lines from here, not the startup's
     const a = x.session.admit({ target: 'shell', line: 'echo first-$((6*7))', principal: AGENT });
     assert.ok(a.admitted);
     await until(() => fs.existsSync(path.join(x.home, 'in-trap')), 5000, 'the shell to enter the trap');
@@ -136,6 +138,7 @@ test('/bin/bash: a cancel whose two ^C a DEBUG trap of the user’s ignores, bef
     assert.match(c.steps[3] ?? '', /^no empty line typed, since /, JSON.stringify(c));
     const b = x.session.admit({ target: 'shell', line: 'echo second-$((40+2))', principal: AGENT, queue: true });
     assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+    fs.writeFileSync(path.join(x.home, 'gate'), '');
     const r = await x.session.awaitRun(b.run.runId, 10_000);
     assert.deepEqual([r.state, r.exit, r.reason], ['exited', 0, undefined], JSON.stringify(r));
     assert.equal((await x.session.runTranscript(r.runId)).text, 'second-42');
