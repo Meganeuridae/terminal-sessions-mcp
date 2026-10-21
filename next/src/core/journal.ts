@@ -205,6 +205,12 @@ export class Journal {
   /** A refused reservation write has been said, and its landing is said once one lands. */
   private markRefusedSaid = false;
   /**
+   * Writes a refused reservation again at `markRetryAt` even if no event arrives meanwhile: an idle journal's
+   * mark stayed as the refusal left it, and a heal's refused clear, still failed on disk, made the next start
+   * record a hole of seqs never issued (the house's review of the 77 commits through 4f4c067, PR #22).
+   */
+  private markTimer: NodeJS.Timeout | undefined;
+  /**
    * Events the ring dropped that the cold store never took, recorded as they are lost (not computed
    * at the catch-up from `persisted` and the ring's oldest seq: an empty ring or a catch-up that
    * failed partway hid them — the house's read of b047b92, points 2 and 3). Written as gaps once the
@@ -508,6 +514,7 @@ export class Journal {
       return;
     }
     this.markRetryAt = clocks.monotonic() + 1000;
+    this.armMarkRetry();
     // Any other refusal exposes nothing yet: the reservation on disk still covers the next seq, and one marked
     // failed is honoured on any boot.
     if (!this.markRefusedSaid && (failed || this.seq + 1 > this.reserved)) {
@@ -517,6 +524,22 @@ export class Journal {
         : `the journal's reservation could not be written, and seq ${this.seq + 1} is past the one on disk${this.reserved ? ` (seqs up to ${this.reserved})` : ''}: until a write lands, a power loss`;
       this.log?.('warn', `${what} can make this journal give numbers its readers have already seen; it is retried at most once a second`);
     }
+  }
+
+  /**
+   * Write the reservation again at the throttle's deadline, whether or not an event comes first (see `markTimer`).
+   * The timer is that deadline, so it passes the throttle: a timer can fire a little before the monotonic clock
+   * reaches it, and keepMark would then have done nothing and armed nothing.
+   */
+  private armMarkRetry(): void {
+    if (this.markTimer) clearTimeout(this.markTimer);
+    this.markTimer = setTimeout(() => {
+      this.markTimer = undefined;
+      if (this.sealed) return;
+      this.markRetryAt = 0;
+      this.keepMark();
+    }, timerMs(this.markRetryAt - clocks.monotonic()));
+    this.markTimer.unref();
   }
 
   /**
@@ -859,6 +882,8 @@ export class Journal {
     if (this.sealed) return;
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
+    if (this.markTimer) clearTimeout(this.markTimer);
+    this.markTimer = undefined;
     if (this.cold && this.coldError !== null) this.catchUp();
     if (this.cold?.setHighWater && !this.exactlyReserved()) {
       // Exact now: a sealed journal issues no more seqs, so the next journal over the store numbers on from

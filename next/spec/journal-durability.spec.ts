@@ -1402,3 +1402,29 @@ test('a heal clears the failed mark only once the gaps it waited for are synced,
   }
 });
 
+test('a heal whose clearing write is refused writes it again a second later while the session is idle, so a crash after that records no hole of seqs never issued', async (t) => {
+  t.mock.method(boots, 'current', () => 'boot-A');
+  const dir = tmpDir();
+  try {
+    const { cold, j } = refusedStretch(dir);
+    cold.budget = Number.POSITIVE_INFINITY;
+    cold.refuseMarks = true;
+    cold.calls.length = 0;
+    j.retryCold();
+    assert.ok(cold.calls.includes('clear refused'), cold.calls.join(' → '));
+    cold.refuseMarks = false;
+    // Idle: no event comes. The retry is due a second after the refusal, and a loaded runner can fire it late, so
+    // the test looks until it lands, for at most five seconds.
+    for (const until = Date.now() + 5000; peekReservation(dir)?.failed === true && Date.now() < until; ) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(peekReservation(dir)?.failed, undefined, `cleared without an event: ${cold.calls.join(' → ')}`);
+    // The daemon dies (no close); the next start, same boot, finds nothing but the stretch's gap.
+    const next = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+    assert.deepEqual(gaps(next.since(0).events), [[11, 38, 'store-error']]);
+    assert.equal(next.lastSeq, j.lastSeq, 'numbering goes on from the last seq issued');
+    next.close();
+    j.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
