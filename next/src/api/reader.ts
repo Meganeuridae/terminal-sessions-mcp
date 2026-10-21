@@ -1438,7 +1438,12 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     r.nextCursor = o.until! - 1;
     r.nextOffset = o.untilOffset!;
   }
-  return withGapInfo(r, gaps);
+  // The holes that meet the seqs it returns, whose lines the text shows: each sits at its own end within the range, so
+  // one meets [first, end] exactly when its line lies past the cut. The window read behind the lines shown is not the
+  // result's: a tail of 3 reported a hole 34 seqs before its first line, and one of 60 every hole of its window, 61
+  // where it showed 8 (an independent read, PR #22; the rule of the house's review of f3750e4..4f4c067,
+  // comment 6315636412, question 5). The events tail's holes are its own events already.
+  return withGapInfo(r, gaps.filter((g) => g.to >= first && g.from <= end));
 }
 
 /** An event a tail's text shows as a note, which ends every sequence left open (a hole; a command, with `commands`). */

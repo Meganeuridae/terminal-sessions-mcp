@@ -1426,6 +1426,42 @@ test('question 5: a page, a tail, an events page and a search that end inside a 
   assert.deepEqual(last.events!.map((e) => e.seq), [], 'the gap event names a hole elsewhere, reported there');
 });
 
+test('a text tail reports the holes that meet the lines it returns, not every hole of the window it read, a session\'s tail and a Run\'s', async () => {
+  // A tail of 3 whose lines all follow a hole reported the hole, 34 seqs before its first line, and a tail of 60 over 61
+  // holes listed all 61 where it showed 8 (an independent read, PR #22).
+  class Refusing extends MemoryStore {
+    broken = false;
+    override append(e: Parameters<MemoryStore['append']>[0]): void {
+      if (this.broken) throw new Error('ENOSPC: no space left on device, write');
+      super.append(e);
+    }
+  }
+  for (const runId of [undefined, 'r1']) {
+    const cold = new Refusing();
+    const j = new Journal({ sessionId: 's', hot: new MemoryStore(700), cold });
+    const src = source({ journal: j });
+    const write = (data: string) => (runId === undefined ? out(j, `${data}\r\n`) : out(j, `${data}\n`, 'stdout', runId));
+    if (runId !== undefined) startRun(j, runId);
+    write('first');
+    cold.broken = true;
+    for (let i = 0; i < 12; i++) write(`lost ${i} ${'z'.repeat(40)}`);
+    cold.broken = false;
+    assert.equal(j.retryCold(), true);
+    for (let i = 0; i < 30; i++) write(`after ${i}`);
+    const at = (o: ReadOptions) => readJournal(src, { ...o, ...(runId !== undefined && { runId }) }, { resultBytes: 65536 });
+    const short = await at({ tail: 3 });
+    assert.equal(short.text, 'after 27\nafter 28\nafter 29', String(runId));
+    assert.equal(short.gap, undefined, `${runId}: no hole meets the lines it returns`);
+    assert.equal(short.gaps, undefined);
+    assert.equal(short.truncated, false);
+    const long = await at({ tail: 40 });
+    const shown = long.text!.split('\n').filter((l) => /journal events? missing/.test(l));
+    assert.equal(shown.length, 1, `${runId}: ${long.text}`);
+    assert.equal(long.gap?.reason, 'store-error', `${runId}: the hole whose line it shows`);
+    assert.equal(long.gaps, undefined);
+  }
+});
+
 test('paging back past a title left open before a hole reaches every line: the title shows nothing, and the row its LF left counts', async () => {
   // `one`, `two` ended by a bare LF, a title the hole leaves open, then the hole: the hole's line starts after a
   // blank row, which the tail had read as `two`, so the page before ended after `one`.
