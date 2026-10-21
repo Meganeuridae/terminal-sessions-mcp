@@ -313,8 +313,8 @@ test('run, await and start results report the session’s duration, and a queued
     Date.now = realNow;
     clocks.monotonic = realMono;
   });
-  // The Run outlives the test and is cancelled at its end: a `sleep 3` could end first on a loaded machine, before
-  // the checks of a Run in flight (the house's read of the 33 commits, #22, comment 6307350650, item 10).
+  // The Run outlives the checks of a Run in flight and is cancelled once they are done: a `sleep 3` could end first
+  // on a loaded machine, before those checks (the house's read of the 33 commits, #22, comment 6307350650, item 10).
   const first = await tool('run', { session: 'dur', command: 'sleep 300', wait: 300 });
   const runId = first.structured?.runId as string;
   const live = registry.get('dur');
