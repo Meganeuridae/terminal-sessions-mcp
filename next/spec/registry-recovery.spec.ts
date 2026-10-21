@@ -10,6 +10,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -1356,3 +1357,30 @@ test('jr2-4: a journal recovery never read, opened for a new life, ends the Runs
     kids.end();
   }
 });
+
+// ───────────── the house's review of 4f4c067..a8b6f28, PR #22 ─────────────
+
+test('a removal the disk refuses leaves the name with a working cursor book: a later markRead is written', async () => {
+  const r = rig();
+  const s = (await r.reg.ensure({ id: 'x', owner: A })).session;
+  await run(s, 'echo one');
+  await r.reg.close('x');
+  // The removal is refused as a disk refuses it, for any user: node:fs as registry.js sees it, patched for the call.
+  const fsc = createRequire(import.meta.url)('node:fs') as { rmSync: typeof fs.rmSync };
+  const realRm = fsc.rmSync;
+  fsc.rmSync = (() => {
+    throw Object.assign(new Error('EACCES: permission denied, rmdir'), { code: 'EACCES' });
+  }) as typeof fs.rmSync;
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(r.reg.remove('x'), /EACCES/);
+  } finally {
+    fsc.rmSync = realRm;
+    syncBuiltinESMExports();
+  }
+  hist(r.reg.get('x')).markRead(A, 9);
+  const file = path.join(r.dir, 'sessions', 'x', 'cursors.json');
+  await until(() => fs.existsSync(file) && JSON.parse(fs.readFileSync(file, 'utf8'))[A]?.read === 9, 2500, 'the cursors to be written');
+  await r.reg.closeAll();
+});
+

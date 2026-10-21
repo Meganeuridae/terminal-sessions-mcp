@@ -1291,8 +1291,12 @@ export class SessionRegistry {
   /** A history entry and its files go. */
   private drop(slot: Slot, view: HistoryEntry): void {
     view.journal.close();
-    slot.cursors.cancel();
     this.removeFiles(slot.id, slot.dir);
+    // Only once its files are gone: cancelled before a removal that then failed, the book stayed cancelled in a
+    // slot that stayed, and every later life of the name wrote no cursors (the house's review of 4f4c067..a8b6f28,
+    // PR #22). Nothing runs between the synchronous removal and this, so a forgotten life's late settlement is
+    // still refused.
+    slot.cursors.cancel();
     this.slots.delete(slot.id);
     this.recordSyncSaid.delete(slot.id);
     this.emit({ type: 'removed', id: slot.id });
