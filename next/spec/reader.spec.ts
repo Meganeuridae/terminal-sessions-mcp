@@ -1574,3 +1574,20 @@ test("a tail's window reads each source's string left open before it as that str
     assert.equal(lines[lines.length - 1], 'p-after');
   }
 });
+
+test('a tail cut by the byte cap across a change of source names the source of the first line it shows (our read of the 40 commits, PR #22)', async () => {
+  // The pty's line written last is held behind a Run's long line, and the tail reaches back to it; the cut drops
+  // the pty's part and begins inside the Run's line, which read under `[terminal]`.
+  for (const maxBytes of [1024, 1800]) {
+    const src = source({ cols: 4000 });
+    out(src.journal, 'p1\r\n' + 'P'.repeat(300));
+    startRun(src.journal, 'r1');
+    out(src.journal, 'r0\r\n' + 'R'.repeat(2000), 'stdout', 'r1');
+    out(src.journal, 'S'.repeat(300));
+    const r = await readJournal(src, { tail: 1, maxBytes }, { resultBytes: 16384 });
+    const lines = r.text!.split('\n');
+    assert.equal(lines[0], '[run r1]', `maxBytes ${maxBytes}: ${JSON.stringify(lines.map((l) => l.slice(0, 12)))}`);
+    assert.ok(lines[1]!.startsWith('R'), JSON.stringify(lines.map((l) => l.slice(0, 12))));
+    assert.ok(Buffer.byteLength(r.text!) <= maxBytes, `${Buffer.byteLength(r.text!)} bytes`);
+  }
+});

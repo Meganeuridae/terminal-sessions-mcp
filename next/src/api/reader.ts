@@ -1287,9 +1287,20 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     // The first line of output kept: past a header just before it, which is then the one that names it.
     const first = multi && lines.length - drop > 1 && headers.has(lines[drop]!) ? drop + 1 : drop;
     const kept = lines.slice(first);
-    const h = multi ? namingHeader(lines, first, headers) : -1;
+    const joined = kept.join('\n');
+    // The header put first names the first line the cut text shows, which the cut decides: named for the first line
+    // kept before it, a cut that dropped lines across a change of source credited the line shown to the source
+    // before it (`[terminal]` over a Run's line: our read of the 40 commits, PR #22). Room is kept for the longest
+    // header that could be needed: the one naming the first line kept, or one among the lines kept.
+    const h0 = multi ? namingHeader(lines, first, headers) : -1;
+    const room = multi ? Math.max(h0 === -1 ? 0 : utf8Length(lines[h0]!) + 1, ...kept.filter((l) => headers.has(l)).map((l) => utf8Length(l) + 1)) : 0;
+    const tail = cutTail(joined, room ? Math.max(1, maxBytes - room) : maxBytes);
+    const dropped = joined.slice(0, joined.length - tail.text.length);
+    // The line of `lines` the cut text begins in; a header it begins with whole names what follows itself.
+    const at = first + countLines(dropped);
+    const atStart = dropped === '' || dropped.endsWith('\n');
+    const h = !multi || (atStart && headers.has(lines[at]!)) ? -1 : namingHeader(lines, at, headers);
     const named = h === -1 ? undefined : lines[h];
-    const tail = cutTail(kept.join('\n'), named === undefined ? maxBytes : Math.max(1, maxBytes - utf8Length(named) - 1));
     const text = named === undefined ? tail.text : `${named}\n${tail.text}`;
     return { kept, drop: outputLines(lines.slice(0, drop)), cutByBytes, tail: { cut: tail.cut, text } };
   };
