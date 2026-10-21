@@ -492,10 +492,11 @@ export class Journal {
    * events, and until the gaps of what it lost are on disk. One comparison an event while nothing is due.
    * A refused write is retried at most once a second; the event is issued meanwhile, so a power loss
    * while the disk refuses can reissue seqs (best effort, as the module says). A refusal that leaves
-   * numbering exposed is said, once until a write lands: a refused failed mark (a daemon crash on this
-   * boot would number from the files' last line, as the module says), or any refused write once the next
-   * seq is past the reservation on disk (a power loss would number from it). Appends may be landing, and
-   * nothing else would say so. The write that lands after it is said too.
+   * numbering or a hole exposed is said, once until a write lands: a refused failed mark while the disk refuses
+   * events (a daemon crash on this boot would number from the files' last line, as the module says) or while
+   * stretches it lost are not yet in the files (a power loss could leave them recorded nowhere), or any refused
+   * write once the next seq is past the reservation on disk (a power loss would number from it). Appends may be
+   * landing, and nothing else would say so. The write that lands after it is said too.
    */
   private keepMark(): void {
     if (!this.cold?.setHighWater) return;
@@ -519,10 +520,14 @@ export class Journal {
     // failed is honoured on any boot.
     if (!this.markRefusedSaid && (failed || this.seq + 1 > this.reserved)) {
       this.markRefusedSaid = true;
-      const what = failed
-        ? `the journal's reservation could not be marked failed while the disk refuses its events: until a write lands, a daemon crash on this boot, or a power loss${this.reserved ? ` for seqs past ${this.reserved}` : ''},`
-        : `the journal's reservation could not be written, and seq ${this.seq + 1} is past the one on disk${this.reserved ? ` (seqs up to ${this.reserved})` : ''}: until a write lands, a power loss`;
-      this.log?.('warn', `${what} can make this journal give numbers its readers have already seen; it is retried at most once a second`);
+      // Failed is holesUnrecorded: the disk refusing events, or what it lost not yet recorded in its files.
+      const twice = 'can make this journal give numbers its readers have already seen';
+      const what = !failed
+        ? `the journal's reservation could not be written, and seq ${this.seq + 1} is past the one on disk${this.reserved ? ` (seqs up to ${this.reserved})` : ''}: until a write lands, a power loss ${twice}`
+        : this.coldError !== null
+          ? `the journal's reservation could not be marked failed while the disk refuses its events: until a write lands, a daemon crash on this boot, or a power loss${this.reserved ? ` for seqs past ${this.reserved}` : ''}, ${twice}`
+          : `the journal's reservation could not be marked failed while stretches it lost are not yet recorded in its files: until a write lands, a power loss can leave them recorded nowhere`;
+      this.log?.('warn', `${what}; it is retried at most once a second`);
     }
   }
 

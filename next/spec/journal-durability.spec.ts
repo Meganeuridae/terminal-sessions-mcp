@@ -1069,6 +1069,31 @@ test('a refused reservation write that leaves numbering exposed is said once unt
   }
 });
 
+test('a failed mark refused while a stretch the life before lost is still to be recorded, with the disk taking events, says that stretch can be recorded nowhere, not that the disk refuses events', () => {
+  // The files hold seqs 1-20; a new life is given a stretch (5-9) the life before it lost, and records it as it
+  // opens. Its failed mark, which should stand until that gap is on disk, is refused.
+  const said: string[] = [];
+  let last = 20;
+  const store: JournalStore = {
+    kind: 'stretch',
+    append(event) {
+      last = event.seq;
+    },
+    read: () => [],
+    oldestSeq: () => 1,
+    lastSeq: () => last,
+    close() {},
+    highWater: () => undefined,
+    setHighWater: () => false,
+  };
+  const j = new Journal({ cold: store, lost: [{ from: 5, to: 9, reason: 'store-error', exact: true }], log: (level, text) => said.push(`${level}: ${text}`) });
+  const refused = said.filter((l) => l.startsWith('warn: ') && l.includes('could not be marked failed'));
+  assert.equal(refused.length, 1, said.join(' | '));
+  assert.match(refused[0]!, /while stretches it lost are not yet recorded in its files: until a write lands, a power loss can leave them recorded nowhere/);
+  assert.ok(!refused[0]!.includes('refuses its events'), 'the disk takes events here');
+  j.close();
+});
+
 test('a store syncs a directory it created into its parent with its first metadata write, and counts a reservation only once that sync lands', (t) => {
   t.mock.method(boots, 'current', () => 'boot-A');
   const root = tmpDir();
