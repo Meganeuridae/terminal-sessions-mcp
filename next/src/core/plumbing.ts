@@ -123,9 +123,13 @@ const printedMark = (word: string, nonce: string, fields: string[] = []): string
  * never match, and printf-built so no trace of it is one (printedMark), its trace kept off the
  * terminal where the shell allows (untraced). It confirms the shell is back, never the command's
  * status; and the command's own end marker, arriving after a cancel that failed, still reads as the
- * end it is (the house's read of a6d0c35, #22).
+ * end it is (the house's read of a6d0c35, #22). It names the pid of the shell that runs it, as the
+ * start mark does, so only the session's shell answers for the Run: a reader the Run started in the
+ * shell's own process group (job control off) took the probe, answered it, and the shell counted as
+ * back while the reader held the terminal (an independent read of the fixes for #22).
  */
-export const markerProbe = (nonce: string, flavor: ShellFlavor = 'posix'): string => ` ${untraced(printedMark('PRO""BE', nonce), flavor)}`;
+export const markerProbe = (nonce: string, flavor: ShellFlavor = 'posix'): string =>
+  ` ${untraced(printedMark('PRO""BE', nonce, [flavor === 'fish' ? '$fish_pid' : '"$$"']), flavor)}`;
 /**
  * The probe the inline strategy types after a ^C (which may have cut the line before its end
  * marker): a marker of its own, with the Run's nonce, the pid of the shell that runs it, and the
@@ -538,14 +542,15 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
   const answers: number[] = [];
   for (const m of rest.matchAll(probeAnswer(nonce))) {
     if (m.index >= to) break;
-    // Accepted as the session accepts it (applyInlineMarker): the marker strategy's answer names
-    // no pid. An inline answer is judged by the pid first: when the start marker (or the live
-    // session) named the declared shell's pid, only that pid answers for the Run, with the Run's
-    // token or none (no token is the declared shell replaced in place by an exec); the Run's token
+    // Accepted as the session accepts it (applyInlineMarker, scanMarker). An answer is judged by the
+    // pid first: when the start marker (or the live session, or the Run's run.start) named the shell's
+    // pid, only that pid answers for the Run, with the Run's token or none (no token is the declared
+    // shell replaced in place by an exec, and the marker strategy's probe prints none); the Run's token
     // on another pid is a nested shell that inherited the variable (`set -a`), a stranger's answer
     // the session rejects, and the cutter accepted, ending the result at it (the house's read of
     // 78c4d6e, #22, comment 6269901528). With no pid known, the token is the one evidence: the
-    // Run's token is accepted, an empty one is not; from before tokens, any pid.
+    // Run's token is accepted, an empty one is not; from before tokens, any pid; and a marker probe's
+    // answer from before it named a pid, which names none, ends the Run as it did.
     const ok = m[2] === undefined || (pid !== undefined ? m[2] === pid && (m[3] === undefined || m[3] === '' || m[3] === m[1]) : m[3] === undefined || m[3] === m[1]);
     answers.push(m.index);
     if (ok) {

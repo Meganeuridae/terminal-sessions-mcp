@@ -308,6 +308,37 @@ for (const [name, shell] of [...(hasShell('/bin/dash') ? [['dash', '/bin/dash']]
     }
   });
 
+  test(`${name}: a probe a reader in the shell's own process group answers is no end: the Run runs on, and ends after the reader, by its end mark or the shell's own answer`, async () => {
+    // An independent read of the fixes for #22: with job control off, a reader the Run started took the cancel's probe and
+    // answered it, and the Run ended there and the shell counted as back while the reader held the terminal.
+    const x = await realSession(shell);
+    try {
+      await run(x, 'set +m');
+      const a = await x.session.admitWhenAvailable({ target: 'shell', line: `sh -c 'trap "" INT QUIT; echo reader-ready; while read l; do eval "$l"; done'`, principal: AGENT }, 3000);
+      assert.ok(a.admitted);
+      const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
+      await until(() => output().includes('reader-ready'), 3000, 'the reader');
+      const c = await x.session.cancel(a.run.runId, AGENT, { graceMs: 800 });
+      assert.ok(output().includes(`<<<PROBE:${x.session.listRuns().find((r) => r.runId === a.run.runId)!.nonce!}:`), 'the reader answered a probe');
+      assert.equal(c.state, 'running', JSON.stringify(c));
+      assert.equal(x.session.shellAvailable().ok, false, 'the shell is not back');
+      // The reader ends; bash runs the rest of the typed line, its end mark, and dash, which the ^C reached, abandoned it: a
+      // second cancel's probe, answered by the shell itself now, ends the Run.
+      x.session.input('exit\r', { principal: AGENT });
+      let r = await x.session.awaitRun(a.run.runId, 1500);
+      if (r.state === 'running') {
+        await until(() => /\$ $/.test(output()), 3000, 'the shell’s prompt');
+        await x.session.cancel(a.run.runId, AGENT, { graceMs: 800 });
+        r = await x.session.awaitRun(a.run.runId, 3000);
+      }
+      assert.ok(r.state === 'exited' || r.state === 'cancelled', JSON.stringify(r));
+      assert.doesNotMatch((await x.session.runTranscript(a.run.runId)).text, /PROBE|PRO""BE/);
+      assert.equal((await run(x, 'echo back')).text, 'back');
+    } finally {
+      await x.close();
+    }
+  });
+
   test(`${name}: with a BASH_XTRACEFD and set -x on before the Run, nothing of the daemon's lines stays in a Run's result, and a last line with no line end stays`, async () => {
     // bash 4.1 and later write the trace to the BASH_XTRACEFD past the start line's and the end mark's redirects; macOS's 3.2
     // writes it to the redirected stderr, and the result is the same.

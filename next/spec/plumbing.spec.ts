@@ -23,7 +23,7 @@ test('the marks the session prints are the marks the grammar parses: start with 
   assert.match(printed(last).replace('%s', '4242'), startMark('n0ff'));
   assert.equal(startMark('n0ff').exec('<<<START:n0ff:4242>>>')![1], '4242');
   assert.equal(exitMark('n0ff').exec('x\n<<<EXIT:n0ff:-1>>>\n')![1], '-1');
-  assert.equal(probeMark('n0ff').exec('<<<PROBE:n0ff>>>')![1], undefined, 'the marker strategy names no pid');
+  assert.equal(probeMark('n0ff').exec('<<<PROBE:n0ff>>>')![1], undefined, 'the marker strategy’s answer from before it named a pid');
   assert.match(printed(inlineProbe('n0ff', false)), /<<<PROBE:n0ff:%s:%s>>>/, 'the typed probe prints the pid and the token');
   assert.match(inlineProbe('n0ff', false), /"\$\$" "\$\{__tsm_r-}"$/, 'posix: the token from the variable, unset-safe');
   assert.match(inlineProbe('n0ff', true), /\$fish_pid "\$__tsm_r"$/);
@@ -273,7 +273,7 @@ test('the probe lines the session types are the ones the grammar parses and the 
     if (shell) {
       const m = probeMark(nonce).exec(execFileSync(shell, ['-c', `${set}${line}`], { encoding: 'utf8' }));
       assert.ok(m, `${name}: what the shell prints is the mark`);
-      if (of.strategy === 'marker') assert.deepEqual([m[1], m[2]], [undefined, undefined], `${name}: no pid, no token`);
+      if (of.strategy === 'marker') assert.ok(/^\d+$/.test(m[1]!) && m[2] === undefined, `${name}: the shell's pid, no token: ${m[0]}`);
       else assert.ok(/^\d+$/.test(m[1]!) && m[2] === nonce, `${name}: the shell's pid and the Run's token: ${m[0]}`);
     }
     const head = of.strategy === 'marker' ? `${typed(nonce)}out\n` : '\r\nout\r\n';
@@ -663,6 +663,21 @@ test('a page or tail of a declared shell’s Run that begins with a blank line k
   const window = (truncated: boolean) => ({ events: [{ type: 'output', seq: 5, ts: 0, stream: 'pty', data: raw, runId: 'r1' }], from: 5, to: 5, truncated }) as unknown as RunOutput;
   assert.equal((await journalRunText(window(false), { cols: 80, rows: 24 }, run)).text, '\nline');
   assert.equal((await journalRunText(window(true), { cols: 80, rows: 24 }, run)).text, '\n\nline', 'a tail window');
+});
+
+test('a marker probe names the shell that answered it: an answer from another pid is struck and is no end, the shell’s own ends the Run, and one from before probes named a pid still does', () => {
+  // An independent read of the fixes for #22: a reader the Run started in the shell's own process group took the probe and
+  // answered it, and the Run ended there while the reader held the terminal.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  const echo = `${sourceLine('/tmp/tsm-501/abc/tsm-cmd-1', 'posix', N)}\r\n<<<START:${N}:4242>>>\r\nout\r\n`;
+  const probe = (pid?: number) => `^C${markerProbe(N)}\r\n<<<PROBE:${N}${pid === undefined ? '' : `:${pid}`}>>>\r\n`;
+  // A probe something answered goes with its line, the ^C before its echo with it.
+  assert.equal(cutPlumbing(`${echo}${probe(5151)}more\r\n${probe(4242)}$ `, marker), 'out\r\nmore\r\n', 'the stranger’s answer struck, the shell’s the end');
+  assert.equal(cutPlumbing(`${echo}${probe(5151)}more\r\n<<<EXIT:${N}:0>>>\r\n`, marker), 'out\r\nmore\r\n', 'a stranger’s answer only: the end mark ends it');
+  assert.equal(cutPlumbing(`${echo}${probe()}more\r\n`, marker), 'out\r\n', 'an answer naming no pid, from before');
+  // History knows the shell's pid from the run.start when the file never ran and no start mark came.
+  const typed = `${sourceLine('/tmp/tsm-501/abc/tsm-cmd-1', 'posix', N)}\r\nread by a program\r\n`;
+  assert.equal(cutPlumbing(`${typed}${probe(5151)}more\r\n${probe(4242)}`, { ...marker, pid: '4242' }), 'read by a program\r\nmore\r\n');
 });
 
 test('the cut decides each probe echo with one pass over the answers: 120,000 echoes each followed by a rejected answer cost what as many echoes with no answer do', () => {

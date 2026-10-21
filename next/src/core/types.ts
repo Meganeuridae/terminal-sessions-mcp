@@ -144,8 +144,9 @@ export interface RunInfo {
   /** The nonce in a `marker` or `inline` Run's marks, from its run.start (a live `inline` Run's from its launch): what its plumbing is cut by. For the readers of history: an events read returns the run.start as journaled, nonce included; the App's rendered results (run, await, a text read) never carry it. */
   nonce?: string;
   /**
-   * An `inline` Run's shell, the one that printed its start marker, from its run.start: only that
-   * shell's probe answer ends the Run, so history judges answers by it as the live transcript does.
+   * An `inline` Run's shell, the one that printed its start marker, or a `marker` Run's, the session's shell
+   * or the one its start mark named, from its run.start: only that shell's probe answer ends the Run, so
+   * history judges answers by it as the live transcript does. The App's rendered results never carry it.
    * The marker's chunk is journaled before the Run starts, outside its output, so history cannot
    * read the pid from the text (the house's read of the 38 commits, #22, comment 6274773484).
    */

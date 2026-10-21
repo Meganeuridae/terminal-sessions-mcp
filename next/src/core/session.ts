@@ -1568,7 +1568,8 @@ export class Session {
       run.strategy ??= 'rich';
       ev.strategy = run.strategy;
       if (run.markerNonce !== undefined) ev.nonce = run.nonce = run.markerNonce;
-      // The pid the inline start marker named, which history has no other way to know (comment 6274773484).
+      // The pid the inline start marker named, which history has no other way to know (comment 6274773484),
+      // or the marker strategy's shell, whose probe answers name it.
       if (run.shellPid !== undefined) ev.shellPid = run.shellPid;
     }
     // Stamped before the append, which dispatches run.start to listeners at once: the segmenter dates the
@@ -2265,6 +2266,8 @@ export class Session {
     if (marker) {
       run.strategy = 'marker';
       run.markerTail = '';
+      // The shell that runs the file: the start mark names it, and only its answer to a probe ends the Run.
+      run.shellPid = this.pty.pid;
       this.shellState = 'busy'; // G5: a marker Run occupies the shell too (core-8)
       this.startRun(run, { cwd: this.cwdPath });
       this.pty.write(`${clear}${src}\n`);
@@ -2363,7 +2366,13 @@ export class Session {
   private scanMarker(run: RunRecord, chunk: string): void {
     const window = (run.markerTail ?? '') + chunk;
     const exit = exitMark(run.markerNonce!).exec(window);
-    const probe = run.probed ? (probeMark(run.markerNonce!).exec(window)?.index ?? -1) : -1;
+    // The start mark names the shell that ran the file; a probe answer from any other pid is a reader
+    // the Run started, in the shell's own process group, that took the probe (an independent read of
+    // the fixes for #22): not the shell back.
+    const started = startMark(run.markerNonce!).exec(window);
+    if (started) run.shellPid = Number(started[1]);
+    const answer = run.probed ? [...window.matchAll(new RegExp(probeMark(run.markerNonce!).source, 'g'))].find((m) => m[1] === String(run.shellPid)) : undefined;
+    const probe = answer?.index ?? -1;
     if (exit && (probe === -1 || exit.index < probe)) {
       run.markerTail = '';
       // The marker chained on the command's line: its status, after a cancel that failed too. It is
