@@ -24,7 +24,8 @@
  *    the state the host believes it is in. The replay follows what the daemon
  *    did with what the host sent — a request counts when its answer says it took,
  *    a notification when it arrives, and a grant the daemon refused by failing
- *    closed is replayed to fail closed again — goes in bounded windows, its
+ *    closed is replayed to fail closed again, among the first 10,000 refusals
+ *    since the last accepted grant — goes in bounded windows, its
  *    answers are swallowed, and a refusal is logged. What expires in the queue
  *    is logged once per pass, by count and method.
  *  - When the URL is a plain ws:// loopback address and nothing listens, it
@@ -74,6 +75,7 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
+import { launchctlUnit, plistUnit, systemctlUnit, unitDataDir, unitPort, type UnitText } from './units.js';
 
 type Id = string | number;
 interface Parsed {
@@ -255,118 +257,6 @@ function ask(cmd: string, args: string[]): Promise<Asked> {
   });
 }
 
-/**
- * What a unit's text says termd is started with: its arguments, one entry per word as termd receives
- * them, and its environment. Each source is read so that a value with spaces stays whole (the house's
- * read of the 38 commits, #22 comment 6274370651): `launchctl print` lists arguments and environment
- * one per line; a plist holds each in a `<string>`; `systemctl show` prints ExecStart's argv unquoted,
- * so an option's value is the words up to the next option, and quotes an Environment assignment that
- * has spaces.
- */
-interface UnitText {
-  argv: string[];
-  env: Record<string, string>;
-}
-
-/** A `launchctl print` answer: the `arguments = { … }` and `environment = { … }` blocks, one entry per line. */
-function launchctlUnit(out: string): UnitText {
-  const block = (name: string): string[] => {
-    const m = new RegExp(`^\\s*${name} = \\{\\n([\\s\\S]*?)^\\s*\\}`, 'm').exec(out);
-    return m ? m[1]!.split('\n').map((l) => l.trim()).filter(Boolean) : [];
-  };
-  const env: Record<string, string> = {};
-  for (const line of block('environment')) {
-    const m = /^(\w+) => (.*)$/.exec(line);
-    if (m) env[m[1]!] = m[2]!;
-  }
-  return { argv: block('arguments'), env };
-}
-
-/**
- * A `systemctl show` answer: `argv[]=` inside ExecStart, unquoted, and Environment's words. Undefined
- * when ExecStart has text in a shape not read here, since its port and data dir are then unknown.
- */
-function systemctlUnit(execStart: string, environment: string): UnitText | undefined {
-  let argv: string[] = [];
-  if (execStart) {
-    const m = /argv\[\]=(.*?)(?: ; |\s*\}\s*$|$)/.exec(execStart);
-    if (!m) return undefined;
-    argv = joinOptionValues(m[1]!.split(' ').filter(Boolean));
-  }
-  const env: Record<string, string> = {};
-  for (const word of quotedWords(environment)) {
-    const eq = word.indexOf('=');
-    if (eq > 0) env[word.slice(0, eq)] = word.slice(eq + 1);
-  }
-  return { argv, env };
-}
-
-/** Words of a list systemd prints, double-quoted where a word has spaces (`\"` and `\\` inside stand for the characters). */
-function quotedWords(text: string): string[] {
-  const words: string[] = [];
-  const re = /"((?:[^"\\]|\\.)*)"|(\S+)/g;
-  for (const m of text.matchAll(re)) words.push(m[1] !== undefined ? m[1].replace(/\\(.)/g, '$1') : m[2]!);
-  return words;
-}
-
-/**
- * Split words of an unquoted command line, re-joined so each option's value is one entry: the words
- * after an option, up to the next one, are its value (the launcher's flags each take one value or
- * none, and nothing positional follows them). Words before the first option are left as they are.
- */
-function joinOptionValues(words: string[]): string[] {
-  const out: string[] = [];
-  let options = false;
-  let inValue = false;
-  for (const w of words) {
-    if (w.startsWith('--')) {
-      options = true;
-      out.push(w);
-      inValue = w.includes('='); // `--flag=value`: more words belong to the value
-    } else if (!options) out.push(w);
-    else if (inValue) out[out.length - 1] += ` ${w}`;
-    else {
-      out.push(w);
-      inValue = true;
-    }
-  }
-  return out;
-}
-
-/** The value a unit gives an option: the entry after `--flag`, or what follows `--flag=`; undefined when the flag is absent, null when it has no value. */
-function unitArg(u: UnitText, flag: string): string | undefined | null {
-  const i = u.argv.findIndex((a) => a === flag || a.startsWith(`${flag}=`));
-  if (i < 0) return undefined;
-  const a = u.argv[i]!;
-  if (a.length > flag.length) return a.slice(flag.length + 1);
-  const next = u.argv[i + 1];
-  return next === undefined || next.startsWith('--') ? null : next;
-}
-
-/**
- * The port a unit gives termd: `--port N` (`--port=N`), else TSM_PORT, else SESSION_SERVER_PORT in its
- * environment — the order termd reads them in, so a unit that sets both is read as termd reads it
- * (the house's read of the shim, #22 comment 6269349177) — else termd's default.
- */
-function unitPort(u: UnitText): string {
-  return unitArg(u, '--port') ?? u.env.TSM_PORT ?? u.env.SESSION_SERVER_PORT ?? '3101';
-}
-
-/**
- * The data dir a unit's termd uses: `--data-dir`, else TSM_DATA_DIR in its environment, else termd's
- * default; undefined when the unit names the flag without a value, since nothing then says which dir
- * it is. The unit runs as this user from $HOME (the launcher starts there), so `~`, `$HOME` and
- * systemd's `%h` are this home, and a relative path is taken from it.
- */
-function unitDataDir(u: UnitText): string | undefined {
-  const arg = unitArg(u, '--data-dir');
-  if (arg === null) return undefined;
-  const named = arg ?? (u.env.TSM_DATA_DIR || undefined); // an empty TSM_DATA_DIR is unset, as for termd
-  const home = os.homedir();
-  if (named === undefined) return path.join(home, '.tsm');
-  return path.resolve(home, named.replace(/^(~|\$\{?HOME\}?|%h)(?=\/|$)/, home));
-}
-
 const managed = (by: string, u: UnitText): Supervisor => ({ kind: 'managed', by, port: unitPort(u), dataDir: unitDataDir(u) });
 
 /** Whether two paths name one directory: by what they resolve to on disk where they exist, else by their spelling. */
@@ -424,7 +314,9 @@ async function checkSupervisor(): Promise<Supervisor> {
       if (!plist) return { kind: 'none' };
       return { kind: 'unknown', why: `launchctl print failed (${r.failed}) and the LaunchAgent ${LAUNCH_AGENT} is on disk (${plist}), so whether it runs termd is unknown` };
     }
-    return managed(`the launchd job ${LAUNCH_AGENT}`, launchctlUnit(r.out));
+    const unit = launchctlUnit(r.out);
+    if (!unit) return { kind: 'unknown', why: `launchctl print shows no arguments for the launchd job ${LAUNCH_AGENT} (a job naming Program alone, whose program's own arguments are not shown), so its port and data dir are unknown` };
+    return managed(`the launchd job ${LAUNCH_AGENT}`, unit);
   }
   if (process.platform === 'linux') {
     const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,ExecStart,Environment']);
@@ -457,31 +349,6 @@ function launchAgentOnDisk(): string | undefined {
     if (fs.existsSync(file)) return file;
   }
   return undefined;
-}
-
-/**
- * The LaunchAgent's plist: ProgramArguments' `<string>`s, whole, and EnvironmentVariables' pairs; or
- * why it could not be read. A plist without a ProgramArguments array in XML is not read as no
- * arguments: a binary plist (as `plutil -convert binary1` writes it) has no text to find them in, and a
- * job naming `Program` alone runs a program whose own arguments are not here; either was taken for
- * termd's defaults (a reviewer's read of the fixes for #22).
- */
-function plistUnit(file: string): UnitText | { error: string } {
-  let xml: string;
-  try {
-    xml = fs.readFileSync(file, 'utf8');
-  } catch (e) {
-    return { error: (e as NodeJS.ErrnoException).code ?? (e as Error).message };
-  }
-  if (xml.startsWith('bplist')) return { error: 'a binary plist, which is not read here' };
-  const text = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
-  const args = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(xml)?.[1];
-  if (args === undefined) return { error: 'no ProgramArguments array in it' };
-  const argv = [...args.matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => text(m[1]!));
-  const env: Record<string, string> = {};
-  const dict = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(xml)?.[1] ?? '';
-  for (const m of dict.matchAll(/<key>([\s\S]*?)<\/key>\s*<string>([\s\S]*?)<\/string>/g)) env[text(m[1]!)] = text(m[2]!);
-  return { argv, env };
 }
 
 const out = (m: unknown) => process.stdout.write(JSON.stringify(m) + '\n');
@@ -542,14 +409,16 @@ const ASKED_MAX = 4096;
  * What to replay on a new connection so it is in the host's state: its `initialize`; the MCPL grant
  * (the last request-form `featureSets/update` the daemon accepted) with every reduction since —
  * notification-form updates only ever add `disabled` feature sets (MCPL §6.7), so all of them since
- * the grant fold into one set, however many there were (the house's read of 4e37a11, #22); every
- * later request-form update the daemon refused after running it, replayed after the grant in the
+ * the grant fold into one set, however many there were (the house's read of 4e37a11, #22); the
+ * later request-form updates the daemon refused after running it, replayed after the grant in the
  * order sent — the daemon fails closed on a malformed one, to an empty grant with no tools, and only
  * its own handling of the same requests puts the new connection where the host was told the old one
- * was (the house's read of the shim, #22 comment 6269349177); all of them, since a later refusal that
- * left the lane as it was must not stand in for one that failed it closed (the house's read of the 38
- * commits, #22 comment 6274370651); a refusal the daemon did not run (`executed: false`) changed
- * nothing and is not kept; and the channels the host has open (reopened without `history`: catch-up
+ * was (the house's read of the shim, #22 comment 6269349177); all of them up to REFUSED_MAX (10,000)
+ * since the last accepted grant, since a later refusal that left the lane as it was must not stand in
+ * for one that failed it closed (the house's read of the 38 commits, #22 comment 6274370651), and one
+ * past the cap is logged and not replayed (the house's read of the 33 commits, #22 comment
+ * 6307350861); a refusal the daemon did not run (`executed: false`) changed nothing and is not kept;
+ * and the channels the host has open (reopened without `history`: catch-up
  * resumes from the principal's `delivered` cursor, G22). A request's effect is recorded when its
  * answer arrives, a notification's when it does (it is never answered, and one that waits out the
  * queue is never forwarded), so what expired is reflected too (the house's read of 4e37a11, #22).
@@ -623,11 +492,12 @@ function answered(p: Pending, m: Parsed): void {
 
 /**
  * The daemon answered a request-form featureSets/update. Accepted, it is the grant, and the refusals
- * before it no longer matter. Refused after running it, it is kept, with every other refusal since the
+ * before it no longer matter. Refused after running it, it is kept, with the other refusals since the
  * grant, to be replayed after it in the order sent: a malformed one failed the lane closed, and the
  * daemon's own handling of them is what fails the new connection closed too — the shim does not read
  * a refusal to tell a fail-closed from one that left the lane as it was, so it keeps them all (the
- * house's read of the shim, #22 comment 6269349177, and of the 38 commits, #22 comment 6274370651).
+ * house's read of the shim, #22 comment 6269349177, and of the 38 commits, #22 comment 6274370651),
+ * up to REFUSED_MAX: one past the cap is logged and not kept.
  * Refused without running (the in-flight bound says `executed: false`), it changed nothing.
  */
 function grantAnswered(p: Pending, m: Parsed): void {

@@ -1007,6 +1007,11 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     { name: 'both-ports-session-server-first', when: true, stub: () => unitStub({ port: 'none', env: { SESSION_SERVER_PORT: '3100', TSM_PORT: String(port) } }), expect: 'managed', says: /'s to start/ },
     { name: 'shared-data-dir-from-environment', when: true, stub: (dataDir) => unitStub({ port: 3101, env: { TSM_DATA_DIR: dataDir } }), expect: 'shared', says: /serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too: none is started here \(one termd per data dir; give this shim another TSM_DATA_DIR, or dial port 3101\)/ },
     { name: 'shared-data-dir-by-default', when: true, stub: () => unitStub({ port: 3101 }), dataDir: 'default', expect: 'shared', says: /serves port 3101 out of the data dir \S+\/\.tsm, which a termd for port \d+ started here would use too/ },
+    // The house's read of the 33 commits (#22 comment 6307350861): a run of spaces in the unit's data dir is
+    // kept, an empty TSM_PORT is unset as termd has it, and a launchd job with no arguments block is unknown.
+    { name: 'shared-data-dir-with-a-run-of-spaces', when: true, stub: (dataDir) => unitStub({ port: 3101, dataDir }), dataDir: path.join(tmp, 'sup run  of   spaces'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup run {2}of {3}spaces, which a termd/ },
+    { name: 'empty-tsm-port-in-environment', when: true, stub: () => unitStub({ port: 'none', env: { TSM_PORT: '', SESSION_SERVER_PORT: String(port) } }), expect: 'managed', says: /is the (launchd job com\.animalabs\.termd|systemd user unit termd)'s to start/ },
+    { name: 'launchctl-no-arguments-block', when: darwin, stub: () => ({ launchctl: `printf '%s\\n' 'com.animalabs.termd = {' '\tprogram = /usr/local/bin/termd' '\tenvironment = {' '\t\tTSM_PORT => ${port}' '\t}' '}'`, systemctl: 'exit 1' }), expect: 'unknown', says: /launchctl print shows no arguments for the launchd job com\.animalabs\.termd \(a job naming Program alone, whose program's own arguments are not shown\), so its port and data dir are unknown/ },
   ];
   const run = async (c: Case): Promise<void> => {
     const home = c.home ?? path.join(tmp, `home-${c.name}`);
