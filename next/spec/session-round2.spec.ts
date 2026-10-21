@@ -953,6 +953,8 @@ test('a Run’s command file whose removal fails when the Run ends is removed at
     await until(() => failed.length === 1, 2000, 'the removal at the Run’s end failed');
     await tick();
     assert.ok(fs.existsSync(failed[0]!), 'the file is still there');
+    // Said when it fails, not only if close fails again (the house's review of a8b6f28..4860d4c).
+    assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => e.text.startsWith(`${failed[0]} could not be removed when its Run ended (EBUSY`) && e.text.endsWith('; close tries again')), 'the failure is said');
   } finally {
     fs.promises.rm = rm;
   }

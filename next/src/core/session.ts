@@ -1665,12 +1665,13 @@ export class Session {
     // missing file and never runs the command unawaited (ss-8). Close waits for the removal,
     // then removes the command directory.
     if (run.tempFile) {
-      // A removal that fails leaves the file to close, which tries again and says so if it fails there too
-      // (cleanupTempFiles): dropped here, it stayed with no word (the house's review of 4f4c067..a8b6f28).
+      // A removal that fails is said and left to close, which tries again and says so if it fails there too
+      // (cleanupTempFiles): dropped here, it stayed with no word (the house's review of 4f4c067..a8b6f28), and
+      // parked without one, a failure that close then cleared was never said (of a8b6f28..4860d4c).
       const file = run.tempFile;
       const removed: Promise<void> = fs.promises
         .rm(file, { force: true })
-        .catch(() => void this.extraTempFiles.add(file))
+        .catch((e) => this.leaveForClose(file, e))
         .finally(() => this.teardowns.delete(removed));
       this.teardowns.add(removed);
       delete run.tempFile;
@@ -2358,6 +2359,12 @@ export class Session {
   private commandDirTrusted(): boolean {
     const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
     return uid !== undefined && trustedDir(path.dirname(this.commandDir), uid) && trustedDir(this.commandDir, uid);
+  }
+
+  /** A command file whose removal failed: said, and left for close to try again (cleanupTempFiles). */
+  private leaveForClose(file: string, e: unknown): void {
+    this.note(`${file} could not be removed when its Run ended (${errMessage(e)}); close tries again`);
+    this.extraTempFiles.add(file);
   }
 
   private cleanupTempFiles(): void {
