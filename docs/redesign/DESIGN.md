@@ -1164,7 +1164,9 @@ addition; nothing about them touches the live PTY.
 - Structured logs (JSON lines) with `session`, `principal`, `runId`; client strings are
   length-limited and JSON-encoded, tokens never appear. `/health` reports per-session
   state, backend, integration, controller, the current Run, journal stats (bytes, retention,
-  a failed store) and the emulator's backlog, plus connections by kind. Graceful drain on
+  a failed store) and the emulator's backlog, plus connections by kind; on a host without bash
+  or a `/dev/fd` of the process's own, `status` is `degraded` and `unsupported` carries the
+  reason sessions and process Runs are refused. Graceful drain on
   shutdown ends in-flight Runs `lost` with reason `daemon-shutdown`, ends every process
   group a process Run started, and hangs up each shell as a closing terminal does: the shell
   and its foreground job end, while a job the shell detached on purpose (`nohup`, `setsid`,

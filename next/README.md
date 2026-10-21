@@ -30,7 +30,9 @@ shell or a process Run would otherwise inherit — the terminal masters of other
 before the child runs; a process Run's command text itself then runs in `/bin/sh`. Without bash
 (Alpine's base: `apk add bash`), termd says so when it starts and refuses to open a session or run a
 process Run with that message, since a shell that could write into another session's terminal is the
-worse failure.
+worse failure. It keeps serving history, the GUI and the lane meanwhile, and `/health` answers
+`"status":"degraded"` with the same message as `unsupported`. The same holds for a `/dev/fd` that does
+not list the process's own descriptors.
 
 Then connect a host (configurations in [`next/config/`](config/)):
 

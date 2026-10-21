@@ -419,9 +419,15 @@ test('bash is a checked requirement for sessions and process Runs: found at /bin
   // masters, so a session is refused, not opened unsafely (the house's read, #22 comment 6269901528).
   const without = new NodePtyBackend({ bash: null });
   const support = without.processSupport();
-  assert.ok(!support.ok && /needs bash/.test(support.reason), JSON.stringify(support));
+  assert.ok(!support.ok && /has no bash/.test(support.reason), JSON.stringify(support));
+  // The reason reads as the operator's step, not the caller's (the house's read of the 38 commits, #22
+  // comment 6274841346, item 7): an agent told "install it" took it as its own.
+  assert.match(support.reason, /only the host’s operator can fix this/);
+  assert.match(support.reason, /report it rather than retrying/);
   assert.throws(() => without.spawnProcess({ argv: ['/bin/true'], cwd: tmp, env: {} }), (e: { code?: string }) => e.code === 'unsupported');
-  await assert.rejects(real('/bin/bash', without), (e: { code?: string; message: string }) => e.code === 'unsupported' && /needs bash/.test(e.message), 'opening a session without bash is refused');
+  // The backend refuses a shell itself, as it refuses a process Run: no /bin/sh start is left (item 8).
+  assert.throws(() => without.spawnShell({ shell: '/bin/sh', args: [], cwd: tmp, env: {}, cols: 80, rows: 24 }), (e: { code?: string; message: string }) => e.code === 'unsupported' && e.message === support.reason);
+  await assert.rejects(real('/bin/bash', without), (e: { code?: string; message: string }) => e.code === 'unsupported' && /has no bash/.test(e.message), 'opening a session without bash is refused');
   // With bash, a session opens and shell Runs work.
   const { session } = await real('/bin/bash');
   try {
@@ -430,6 +436,23 @@ test('bash is a checked requirement for sessions and process Runs: found at /bin
   } finally {
     await session.close();
   }
+});
+
+test('/dev/fd must list the process’s own descriptors: a missing one and a static one are refused, a real one passes, and the check runs once', () => {
+  // A listing that holds 0, 1 and 2 whatever is open passed the old check, and the launcher's loop then
+  // closed nothing above 2 (the house's read of the 38 commits, #22 comment 6274841346, item 6 and the
+  // spec bullet): the check now opens a descriptor and finds it listed as itself.
+  const missing = new NodePtyBackend({ bash: '/bin/bash', fdDir: path.join(tmp, 'no-fd-dir') }).processSupport();
+  assert.ok(!missing.ok && /it has no .*no-fd-dir/.test(missing.reason), JSON.stringify(missing));
+  const fixed = path.join(tmp, 'static-fd');
+  fs.mkdirSync(fixed, { recursive: true });
+  for (let i = 0; i < 256; i++) fs.writeFileSync(path.join(fixed, String(i)), '');
+  const stat = new NodePtyBackend({ bash: '/bin/bash', fdDir: fixed }).processSupport();
+  assert.ok(!stat.ok && /does not list the process’s own descriptors/.test(stat.reason), JSON.stringify(stat));
+  assert.match(stat.reason, /only the host’s operator can fix this/);
+  const ok = new NodePtyBackend({ bash: '/bin/bash' });
+  assert.deepEqual(ok.processSupport(), { ok: true }, 'this host’s /dev/fd is its own');
+  assert.equal(ok.processSupport(), ok.processSupport(), 'checked once: /health and every spawn read the same answer');
 });
 
 test('a later session’s shell holds no earlier session’s terminal master: the launcher closes what the daemon leaks to it', { skip: process.platform !== 'linux' ? 'readlink of /dev/fd entries needs /proc' : false }, async () => {

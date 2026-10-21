@@ -16,6 +16,7 @@ import xterm from '@xterm/headless';
 import { App } from '../src/api/app.js';
 import { TokenMapResolver } from '../src/api/principals.js';
 import { isSessionId, SessionRegistry } from '../src/api/registry.js';
+import { NodePtyBackend } from '../src/backends/node-pty.js';
 import type { ScriptedBackend, ScriptedPty } from '../src/backends/scripted.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { Journal } from '../src/core/journal.js';
@@ -852,6 +853,31 @@ test('sec-10: /health reports per-session state, backend, controller, integratio
     assert.equal(asA.sessions.find((x) => x.id === 'hp')?.controller, 'agent:a@test');
     a.close();
     gui.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('/health on a host that cannot open sessions says so, with the reason session_open refuses with, to every caller', async () => {
+  // termd keeps serving history, the GUI and the lane without bash; /health answered "ok" with nothing
+  // about it, and the startup warning is one line (the house's answers, #22 comment 6275033749).
+  const h = await start();
+  try {
+    const reason = new NodePtyBackend({ bash: null }).processSupport();
+    assert.ok(!reason.ok);
+    Object.assign(h.backend, { processSupport: () => reason });
+    type Health = { status: string; unsupported?: string };
+    for (const q of ['/health', '/health?token=ta']) {
+      const res = await fetch(`http://127.0.0.1:${h.port}${q}`);
+      const body = (await res.json()) as Health;
+      assert.deepEqual([res.status, body.status, body.unsupported], [200, 'degraded', reason.reason], q);
+    }
+    const a = await Client.open(h.port);
+    await a.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    const opened = await a.call('session_open', { session: 'nobash' });
+    assert.equal(opened.isError, true);
+    assert.ok(opened.text.includes(reason.reason), `the refusal carries the same reason: ${opened.text}`);
+    a.close();
   } finally {
     await h.close();
   }

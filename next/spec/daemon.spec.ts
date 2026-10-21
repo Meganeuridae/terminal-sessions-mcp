@@ -7,7 +7,7 @@
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
@@ -29,10 +29,12 @@ interface Daemon {
 }
 
 /** HOME and HISTFILE point into the temp dir: no shell here touches the user's files. */
-function termd(argv: string[], opts: { env?: NodeJS.ProcessEnv; cwd?: string; stderr?: 'pipe' | 'ignore' } = {}): Daemon {
+function termd(argv: string[], opts: { env?: NodeJS.ProcessEnv; cwd?: string; stderr?: 'pipe' | 'ignore'; via?: string[] } = {}): Daemon {
   const home = path.join(tmp, 'home');
   fs.mkdirSync(home, { recursive: true });
-  const child = spawn(process.execPath, [DAEMON, ...argv], {
+  // `via`: a wrapper that execs node in its place (sandbox-exec), so the child's pid is still termd's.
+  const [cmd, ...pre] = [...(opts.via ?? []), process.execPath];
+  const child = spawn(cmd!, [...pre, DAEMON, ...argv], {
     env: { ...process.env, HOME: home, HISTFILE: path.join(home, '.bash_history'), TSM_TOKEN: '', SHELL: '/bin/bash', ...opts.env },
     cwd: opts.cwd ?? tmp,
     stdio: ['ignore', 'ignore', opts.stderr ?? 'pipe'],
@@ -425,6 +427,36 @@ test('--disk-floor-bytes takes a whole number of bytes; 0 turns the floor off (h
   const high = await under('floor-high', String(Number.MAX_SAFE_INTEGER));
   assert.doesNotMatch(high.journal, /"run\.end"/, 'below the floor nothing of the Run reaches the disk');
   assert.match(String(high.coldFailed), /below the floor/, '/health names the cause');
+});
+
+const SANDBOX = '/usr/bin/sandbox-exec';
+const canHideBash = process.platform === 'darwin' && fs.existsSync(SANDBOX) && spawnSync(SANDBOX, ['-p', '(version 1)(allow default)', '/usr/bin/true']).status === 0;
+
+test('termd on a host without bash keeps serving, says so once at startup, and /health carries the reason sessions are refused', { skip: canHideBash ? false : 'hiding /bin/bash from one process needs sandbox-exec (macOS); the server side runs everywhere in transport.spec' }, async () => {
+  // The house's answers (#22 comment 6275033749): serving keeps history, the GUI and the lane; /health
+  // answered "ok" with nothing about the missing bash. /bin/bash is hidden from this termd alone, and
+  // its PATH holds no bash.
+  const empty = path.join(tmp, 'no-bash-path');
+  fs.mkdirSync(empty, { recursive: true });
+  const d = termd(['--port', '0', '--data-dir', path.join(tmp, 'no-bash'), '--no-usage-log'], {
+    env: { PATH: empty },
+    via: [SANDBOX, '-p', '(version 1)(allow default)(deny file-read* (literal "/bin/bash"))'],
+  });
+  try {
+    await until(() => listening(d) !== undefined, 10_000, 'termd to listen without bash');
+    const warned = d.lines.find((l) => l.includes('cannot open sessions or run process Runs'));
+    assert.ok(warned, `the startup warning: ${d.lines.join('\n')}`);
+    const reason = (JSON.parse(warned) as { reason: string }).reason;
+    assert.match(reason, /has no bash/);
+    const res = await fetch(`${urlOf(d).replace(/^ws/, 'http')}/health`);
+    const body = (await res.json()) as { status: string; unsupported?: string };
+    assert.deepEqual([res.status, body.status, body.unsupported], [200, 'degraded', reason]);
+    const opened = (await rpc(urlOf(d), 'tools/call', { name: 'session_open', arguments: { session: 'nobash' } })) as { isError?: boolean; content: Array<{ text: string }> };
+    assert.equal(opened.isError, true);
+    assert.ok(opened.content[0]!.text.includes(reason), `a session open is refused with the same reason: ${opened.content[0]!.text}`);
+  } finally {
+    await stop(d);
+  }
 });
 
 // ───────────── the house's read of 59f660b (#22): logs, flags, startup and shutdown ─────────────

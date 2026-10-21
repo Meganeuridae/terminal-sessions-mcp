@@ -387,6 +387,11 @@ export class SessionRegistry {
   /** Session directories recovery could not read at startup (skipped, left on disk). */
   readonly recoveryErrors: Array<{ id: string; error: string }> = [];
 
+  /** Whether this host can open sessions and run process Runs at all (ExecutionBackend.processSupport), for /health. */
+  processSupport(): { ok: true } | { ok: false; reason: string } {
+    return this.opts.backend.processSupport?.() ?? { ok: true };
+  }
+
   onChange(l: (c: RegistryChange) => void): () => void {
     this.listeners.add(l);
     return () => this.listeners.delete(l);

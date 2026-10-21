@@ -591,6 +591,15 @@ export class TermServer {
       connections: { total: this.conns.size, ...byKind },
       sessionCount: all.length,
     };
+    // A host without bash or a working /dev/fd keeps serving history, the GUI and the lane, but opens
+    // no session and runs no process Run: said here at any time after startup, with the refusal's own
+    // reason, to every caller, since it names no one's sessions (the house's answers, #22 comment
+    // 6275033749: /health answered "ok" with nothing about it, and the startup warning is one line).
+    const support = app.registry.processSupport();
+    if (!support.ok) {
+      body.status = 'degraded';
+      body.unsupported = support.reason;
+    }
     if (viewer !== undefined) {
       const who = viewer;
       body.sessions = all.filter((s) => app.can(who, s, 'observe')).map((s) => this.healthOf(s));

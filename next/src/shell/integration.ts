@@ -29,7 +29,7 @@ export interface IntegrationSetup {
   args: string[];
   /** Environment additions, with no completion credentials. */
   env: Record<string, string>;
-  /** Private launch script, interpreted by /bin/sh before the configured shell. */
+  /** Private launch script, run under `bash -p` (the backend refuses to start a shell without bash) before the configured shell. */
   launcher?: string;
   key?: string;
   /** Remove any files written for this setup. */

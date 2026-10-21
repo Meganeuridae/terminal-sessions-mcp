@@ -271,50 +271,78 @@ export function findBash(PATH: string | undefined = process.env.PATH, standard =
   return undefined;
 }
 
+/** What every refusal for a missing requirement ends with: only the host's operator can act on it (the house's read of the 38 commits, #22 comment 6274841346, item 7). */
+const OPERATOR = 'only the host’s operator can fix this, and termd checks once at startup, so report it rather than retrying';
+
 export class NodePtyBackend implements ExecutionBackend {
   readonly kind = 'node-pty';
   /** The bash process Runs launch through; undefined where this host has none (process Runs are then refused, not lost). */
   private readonly bash: string | undefined;
+  /** Where children list their descriptors (see closeFdsLine); a spec points it at a missing or static directory. */
+  private readonly fdDir: string;
+  private support: { ok: true } | { ok: false; reason: string } | undefined;
 
-  constructor(opts: { bash?: string | null } = {}) {
+  constructor(opts: { bash?: string | null; fdDir?: string } = {}) {
     this.bash = opts.bash === undefined ? findBash() : (opts.bash ?? undefined);
+    this.fdDir = opts.fdDir ?? '/dev/fd';
   }
 
   /**
    * One requirement for both shells and process Runs, checked once (the house's review of #11 and
-   * read of #22 comment 6269901528): without bash, or without /dev/fd to list descriptors by, a
-   * child could not close the terminal masters node-pty leaves open to it, so a shell could write
-   * into another session's terminal and a process Run could not be isolated. Refused here, with the
-   * reason, rather than opened unsafely or ended `lost` one Run at a time.
+   * read of #22 comment 6269901528): without bash, or without a /dev/fd that lists the process's own
+   * descriptors, a child could not close the terminal masters node-pty leaves open to it, so a shell
+   * could write into another session's terminal and a process Run could not be isolated. Refused
+   * here, with the reason, rather than opened unsafely or ended `lost` one Run at a time. The reason
+   * names the host's operator as the one who can act: a caller told to install bash took it as its
+   * own step (the house's read of the 38 commits, #22 comment 6274841346, item 7).
    */
   processSupport(): { ok: true } | { ok: false; reason: string } {
-    if (!this.bash) return { ok: false, reason: 'termd needs bash (/bin/bash, or a bash on the daemon’s PATH) to open a session or run a process Run without leaking other sessions’ terminals into it, and this host has none: install it (Alpine: apk add bash), then restart termd — the check runs once at startup' };
-    // /dev/fd must be a directory listing this process's own descriptors (a loop over an empty one ran `exec *>&-`).
+    return (this.support ??= this.checkSupport());
+  }
+
+  private checkSupport(): { ok: true } | { ok: false; reason: string } {
+    const refuse = (what: string) => ({ ok: false as const, reason: `termd cannot open a session or run a process Run on this host: ${what}; ${OPERATOR}` });
+    if (!this.bash) return refuse('it has no bash (/bin/bash, or a bash on termd’s PATH), which termd needs to close the other sessions’ terminals a child would inherit — the operator installs bash (Alpine: apk add bash) and restarts termd');
+    // The listing must be this process's own: a descriptor opened now is listed, as itself. A listing
+    // that holds 0, 1 and 2 whatever is open passed the old check, and the launcher's loop then closed
+    // nothing above 2 (the house's read of the 38 commits, #22 comment 6274841346, item 6). The
+    // descriptor is the directory itself, so its entry resolves back to the directory only in a real
+    // listing; a static one's entry is some other file.
+    const fix = 'the operator mounts /dev/fd (on Linux, /proc, which /dev/fd points into) and restarts termd';
+    let fd: number;
     try {
-      const names = fs.readdirSync('/dev/fd');
-      if (!['0', '1', '2'].every((n) => names.includes(n))) return { ok: false, reason: 'termd needs /dev/fd to list the process’s descriptors so the ones a child would inherit can be closed before it runs, and this host’s /dev/fd does not' };
+      fd = fs.openSync(this.fdDir, 'r');
     } catch {
-      return { ok: false, reason: 'termd needs /dev/fd to list the descriptors to close before a child runs, and this host has none' };
+      return refuse(`it has no ${this.fdDir}, which termd needs to list the descriptors a child would inherit and close them before it runs — ${fix}`);
+    }
+    try {
+      const entry = path.join(this.fdDir, String(fd));
+      const listed = fs.readdirSync(this.fdDir).includes(String(fd));
+      const opened = fs.fstatSync(fd);
+      const shown = listed ? fs.statSync(entry) : undefined;
+      if (!shown || shown.dev !== opened.dev || shown.ino !== opened.ino) return refuse(`its ${this.fdDir} does not list the process’s own descriptors (one termd opened is not there as itself), so the ones a child would inherit could not be closed before it runs — ${fix}`);
+    } catch {
+      return refuse(`its ${this.fdDir} could not be read to list the descriptors a child would inherit — ${fix}`);
+    } finally {
+      fs.closeSync(fd);
     }
     return { ok: true };
   }
 
   spawnShell(opts: SpawnShellOptions): PtyHandle {
+    // Refused here as spawnProcess refuses, so no shell starts without the loop that closes the
+    // terminal masters of the sessions opened before this one, which node-pty leaves open to every
+    // child (the house's read of d5873f0). The /bin/sh branches this replaces could not run once the
+    // Session refused first (the house's read of the 38 commits, #22 comment 6274841346, item 8).
+    const support = this.processSupport();
+    if (!support.ok) throw err('unsupported', support.reason);
+    const bash = this.bash!;
+    // The launcher runs under bash (`-p`: no BASH_ENV, no imported functions). A shell without
+    // integration has no launcher: the constant text of shellLaunch closes the same descriptors and
+    // raises its oom_score_adj (the house's read of 2c35df8, #22), then execs the shell, which keeps
+    // its pid.
     const launcher = opts.bootstrap?.launcher;
-    // The launcher runs under bash where there is one (`-p`: no BASH_ENV, no imported functions), so
-    // its loop can close the terminal masters of the sessions opened before this one, which node-pty
-    // leaves open to every child (the house's read of d5873f0). Without bash it runs under /bin/sh
-    // and skips the loop. A shell without integration has no launcher: under bash the constant text
-    // of shellLaunch closes the same descriptors and raises its oom_score_adj (the house's read of
-    // 2c35df8, #22), then execs the shell, which keeps its pid; under /bin/sh the same text skips the
-    // loop and still raises the preference.
-    const through: [string, string[]] = launcher
-      ? this.bash
-        ? [this.bash, ['-p', launcher, opts.shell, ...opts.args]]
-        : ['/bin/sh', [launcher, opts.shell, ...opts.args]]
-      : this.bash
-        ? viaBash(this.bash, shellLaunch(opts.oomScoreAdj ?? 0), 'termd-shell', [opts.shell, ...opts.args])
-        : ['/bin/sh', ['-c', shellLaunch(opts.oomScoreAdj ?? 0), 'termd-shell', opts.shell, ...opts.args]];
+    const through: [string, string[]] = launcher ? [bash, ['-p', launcher, opts.shell, ...opts.args]] : viaBash(bash, shellLaunch(opts.oomScoreAdj ?? 0), 'termd-shell', [opts.shell, ...opts.args]);
     const p = pty.spawn(through[0], through[1], {
       name: 'xterm-256color',
       cwd: opts.cwd,
