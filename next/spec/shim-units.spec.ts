@@ -263,12 +263,15 @@ test("a running termd's environment is the one read when Linux shows it: whole, 
     assert.ok(u, 'the ExecStart is read, ${BASE} from the running environment');
     assert.equal(unitDataDir(u), '/srv/at-start', 'what termd was given, not the manager or the unit text now');
     assert.equal(unitPort(u), '3101');
-    if (process.getuid?.() !== 0) assert.deepEqual(procEnviron(1), { error: "it is another user's process", alive: false });
   } finally {
     child.kill();
   }
   await new Promise((r) => child.once('exit', r));
   assert.deepEqual(procEnviron(child.pid!), { error: 'it has gone', alive: false }, 'a process that has gone');
+});
+
+test("another user's process is not read for its environment: pid 1, whose /proc entry is root's", { skip: (process.platform !== 'linux' && 'Linux shows a process environment in /proc') || (process.getuid?.() === 0 && 'as root, pid 1 is this user\'s') }, () => {
+  assert.deepEqual(procEnviron(1), { error: "it is another user's process", alive: false });
 });
 
 test("termd's flags that take no value are the shim's: read from daemon.ts's FLAGS, which a spec must not import (it starts a daemon)", () => {
@@ -300,11 +303,13 @@ test("a running termd is asked for its data dir on the port its title names, and
   // /health as termd answers it, from a stand-in whose answer the test sets; the connection taken for the pid's.
   const proven = { prove: async () => undefined };
   let answer: Record<string, unknown> = {};
+  /** Set, the status and body sent instead of `answer`. */
+  let raw: { status: number; body: string } | undefined;
   const seen: Array<string | undefined> = [];
   const server = http.createServer((req, res) => {
     seen.push(req.headers.authorization);
-    res.writeHead(req.url === '/health' ? 200 : 404, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(answer));
+    res.writeHead(raw?.status ?? (req.url === '/health' ? 200 : 404), { 'content-type': 'application/json' });
+    res.end(raw?.body ?? JSON.stringify(answer));
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const port = (server.address() as { port: number }).port;
@@ -322,6 +327,14 @@ test("a running termd is asked for its data dir on the port its title names, and
     const before = seen.length;
     assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, token: 'shim-token', prove: async () => 'not shown' }), { error: 'not shown' });
     assert.equal(seen.length, before, 'an unproven listener is sent no request, so no credential');
+    // What isn't termd's answer is refused, each for its own reason (the house's read of the 17 commits over our fixes, #22).
+    raw = { status: 503, body: JSON.stringify({ status: 'ok', pid: 4242, dataDir: '/srv/running' }) };
+    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, ...proven }), { error: 'its /health answered 503' });
+    raw = { status: 200, body: '<html>not termd</html>' };
+    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, ...proven }), { error: 'its /health answer is not JSON' });
+    raw = { status: 200, body: '42' };
+    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, ...proven }), { error: 'its /health answer is not an object' });
+    raw = undefined;
   } finally {
     await new Promise((r) => server.close(r));
   }
@@ -343,10 +356,14 @@ test("the ask has one deadline for the whole exchange and reads at most 1 MiB, h
   // A listener that wrote a byte every 200 ms held a 300 ms ask for 10 s: the socket's timeout fired only when it was idle.
   const body = JSON.stringify({ status: 'ok', pid: 4242, dataDir: '/elsewhere' });
   const timers = new Set<NodeJS.Timeout>();
+  /** The requests the trickle listener got, and the body's bytes it wrote. */
+  let asked = 0;
+  let wrote = 0;
   const trickle = http.createServer((req, res) => {
+    asked++;
     res.writeHead(200, { 'content-type': 'application/json' });
     let i = 0;
-    const t = setInterval(() => (i < body.length ? res.write(body[i++]!) : (clearInterval(t), res.end())), 200);
+    const t = setInterval(() => (i < body.length ? (res.write(body[i++]!), wrote++) : (clearInterval(t), res.end())), 200);
     timers.add(t);
     req.on('close', () => clearInterval(t));
   });
@@ -361,12 +378,117 @@ test("the ask has one deadline for the whole exchange and reads at most 1 MiB, h
     assert.deepEqual(await askDataDir(portOf(trickle), 4242, { timeoutMs: 300, prove: async () => undefined }), { error: 'it did not answer /health within 300 ms' });
     const took = performance.now() - t0;
     assert.ok(took < 1500, `the 300 ms ask took ${took.toFixed(0)} ms`);
+    // A trickle it was: the request arrived and a byte went out before the deadline, so a timeout that only an idle
+    // socket fires would have been put off (the house's read of the 17 commits over our fixes, #22).
+    assert.equal(asked, 1, 'the listener got the request');
+    assert.ok(wrote >= 1, `a byte went out before the deadline (${wrote})`);
     assert.deepEqual(await askDataDir(portOf(flood), 4242, { timeoutMs: 5000, prove: async () => undefined }), { error: 'its /health answer is over 1048576 bytes' });
   } finally {
     for (const t of timers) clearInterval(t);
     trickle.closeAllConnections();
     flood.closeAllConnections();
     await Promise.all([trickle, flood].map((s) => new Promise((r) => s.close(r))));
+  }
+});
+
+test("the ask's one deadline covers the proof too: a proof still running at the deadline ends the ask, and no request follows it (the house's read of the 17 commits over our fixes, #22)", async () => {
+  let asked = 0;
+  const server = http.createServer((_req, res) => {
+    asked++;
+    res.end(JSON.stringify({ status: 'ok', pid: 4242, dataDir: '/srv/running' }));
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as { port: number }).port;
+  try {
+    // A proof that shows the socket as the pid's only after a second, three times the ask's deadline.
+    const slow = () => new Promise<undefined>((r) => setTimeout(() => r(undefined), 1000));
+    const t0 = performance.now();
+    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 300, prove: slow }), { error: 'it did not answer /health within 300 ms' });
+    const took = performance.now() - t0;
+    assert.ok(took < 900, `the 300 ms ask took ${took.toFixed(0)} ms`);
+    await new Promise((r) => setTimeout(r, 1000));
+    assert.equal(asked, 0, 'the proof that resolved after the deadline sent nothing');
+  } finally {
+    server.closeAllConnections();
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test("a termd on ::1 alone is asked there once 127.0.0.1 refuses, and an IPv6 listener dialled on 127.0.0.1 is shown as its own through tcp6 (the house's read of the 17 commits over our fixes, #22)", async (t) => {
+  const answer = (dataDir: string) => (_req: http.IncomingMessage, res: http.ServerResponse) => res.end(JSON.stringify({ status: 'ok', pid: process.pid, dataDir }));
+  const v6 = http.createServer(answer('/v6'));
+  const bound = await new Promise<boolean>((resolve) => {
+    v6.once('error', () => resolve(false));
+    v6.listen(0, '::1', () => resolve(true));
+  });
+  if (!bound) return t.skip('no ::1 here');
+  try {
+    const port = (v6.address() as { port: number }).port;
+    assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 3000, prove: async () => undefined }), { dataDir: '/v6' }, 'nothing on 127.0.0.1, so ::1');
+    if (process.platform === 'linux') assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 3000 }), { dataDir: '/v6' }, "and its socket on ::1 is shown as this process's");
+  } finally {
+    v6.closeAllConnections();
+    await new Promise((r) => v6.close(r));
+  }
+  if (process.platform !== 'linux') return;
+  // An IPv4 connection to an IPv6 socket (here one bound to 127.0.0.1's mapped address, so nothing listens beyond
+  // loopback): its server side is in tcp6, as ::ffff:127.0.0.1.
+  const dual = http.createServer(answer('/dual'));
+  const dualBound = await new Promise<boolean>((resolve) => {
+    dual.once('error', () => resolve(false));
+    dual.listen(0, '::ffff:127.0.0.1', () => resolve(true));
+  });
+  if (!dualBound) return t.skip('no IPv6 socket on ::ffff:127.0.0.1 here');
+  try {
+    const port = (dual.address() as { port: number }).port;
+    const socket = await new Promise<net.Socket>((resolve, reject) => {
+      const c = net.connect({ host: '127.0.0.1', port });
+      c.once('connect', () => resolve(c));
+      c.once('error', reject);
+    });
+    try {
+      assert.equal(socket.remoteFamily, 'IPv4');
+      assert.equal(await connectionOf(socket, process.pid), undefined, "the IPv6 listener's side of an IPv4 connection is this process's");
+    } finally {
+      socket.destroy();
+    }
+    assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 3000 }), { dataDir: '/dual' });
+  } finally {
+    dual.closeAllConnections();
+    await new Promise((r) => dual.close(r));
+  }
+});
+
+test("a connection the listener has yet to accept is looked up again until it is, and then shown as the listener's (the house's read of the 17 commits over our fixes, #22)", { skip: process.platform !== 'linux' && 'Linux shows whose a socket is' }, async (t) => {
+  // A listener that accepts only when told to on its stdin: until then the connection's server side shows no inode.
+  const late = spawn('python3', ['-c', "import socket, sys, time\ns = socket.socket()\ns.bind(('127.0.0.1', 0))\ns.listen(4)\nprint(s.getsockname()[1], flush=True)\nsys.stdin.readline()\nc, _ = s.accept()\ntime.sleep(30)"], { stdio: ['pipe', 'pipe', 'ignore'] });
+  late.stdin!.on('error', () => {}); // gone already: the test fails on its own terms
+  try {
+    const port = await new Promise<number | undefined>((resolve) => {
+      late.stdout!.once('data', (b: Buffer) => resolve(Number(b.toString().trim()) || undefined));
+      late.once('error', () => resolve(undefined));
+      late.once('exit', () => resolve(undefined));
+    });
+    if (port === undefined) return t.skip('no python3 to listen without accepting');
+    const socket = await new Promise<net.Socket>((resolve, reject) => {
+      const c = net.connect({ host: '127.0.0.1', port });
+      c.once('connect', () => resolve(c));
+      c.once('error', reject);
+    });
+    try {
+      // Told to accept once the lookup has been waiting 200 ms, well inside its second.
+      const t0 = performance.now();
+      const shown = connectionOf(socket, late.pid!);
+      await new Promise((r) => setTimeout(r, 200));
+      late.stdin!.write('accept\n');
+      assert.equal(await shown, undefined, 'shown once accepted');
+      const took = performance.now() - t0;
+      assert.ok(took >= 150, `looked up again while not yet accepted (${took.toFixed(0)} ms)`);
+    } finally {
+      socket.destroy();
+    }
+  } finally {
+    late.kill();
   }
 });
 
