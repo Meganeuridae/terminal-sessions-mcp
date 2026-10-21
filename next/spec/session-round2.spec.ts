@@ -757,17 +757,18 @@ test('input sent while the cancel reads the terminal’s mode is not erased: no 
   h.pty.inputMode = () => {
     if (!sent) {
       sent = true;
-      h.session.input('echo typed', { principal: AGENT }); // someone types while the mode is read
+      h.session.input('echo hello\r', { principal: AGENT }); // someone types a command while the mode is read
     }
     return EDITOR_MODE;
   };
   const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
   assert.ok(sent, 'the input went during the settle');
   assert.match(c.steps.at(-1) ?? '', /^no empty line typed, since input was sent to the shell meanwhile/, JSON.stringify(c));
-  assert.ok(!h.pty.written.slice(h.pty.written.lastIndexOf('echo typed')).includes('tsm-cmd-'), 'no empty line, nor its clear keys, after the input');
-  assert.ok(!h.pty.written.slice(h.pty.written.lastIndexOf('echo typed')).includes(CLEAR_LINE_KEYS), 'nothing erases it');
-  h.shell.cont(); // the prompt for the ^C is the shell's answer
-  await until(() => h.session.shellAvailable().ok, 2000, 'back at that prompt');
+  assert.ok(!h.pty.written.slice(h.pty.written.lastIndexOf('echo hello')).includes('tsm-cmd-'), 'no empty line, nor its clear keys, after the input');
+  assert.ok(!h.pty.written.slice(h.pty.written.lastIndexOf('echo hello')).includes(CLEAR_LINE_KEYS), 'nothing erases it');
+  h.shell.cont(); // the prompt for the ^C is the shell's answer, and the command typed after it runs
+  await until(() => /echo hello\r\nhello\r\n/.test(ofType(h.journal.since(0).events, 'output').map((e) => e.data).join('')), 2000, 'the typed command ran');
+  await until(() => h.session.shellAvailable().ok, 2000, 'back at the prompt after it');
   await h.session.close();
 });
 
