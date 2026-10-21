@@ -226,10 +226,12 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
 - **Persistence.** Sessions outlive connections; journals (`~/.tsm/sessions/<id>/`) outlive
   the daemon, and after a restart each old session is readable as `history-only` with its
   in-flight Runs reported `lost` (reason `daemon-restart`). A power loss can take the newest
-  output the disk had not yet written (up to about half a minute of it); that reads as a gap
+  output the disk had not yet written: termd does not sync the journal, so how much is set by
+  the operating system's write-back (by Linux's default settings, data is written back once it
+  is about 30 s old; heavy writing, or other settings, can make it later); that reads as a gap
   (reason `torn-write`). Numbering survives it, so no event number is given twice, as long as the
-  disk took termd's small metadata writes; while a disk refuses writes, a power loss can give some
-  numbers twice. Live processes surviving a restart
+  disk took termd's small metadata writes; while a disk refuses writes, a power loss, or a daemon
+  crash, can give some numbers twice. Live processes surviving a restart
   needs the keeper backend (milestone 3): a stopping daemon hangs up each shell as a closing
   terminal does, so its foreground job ends with it, while a job the shell detached on purpose
   (`nohup`, `setsid`, `disown`) lives on; process Runs' groups are ended. The systemd unit sets
