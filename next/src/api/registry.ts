@@ -152,7 +152,7 @@ class CursorBook {
   private readonly map = new Map<Principal, Cursors>();
   private timer: NodeJS.Timeout | undefined;
   private dirty = false;
-  /** A directory that could not be synced has been said once: the file holds the cursors, rewriting changes nothing. */
+  /** This session's cursor directory could not be synced, and the log has said so: once per session for as long as the registry keeps its book (across its lives), since the file holds the cursors and rewriting changes nothing. */
   private syncWarned = false;
 
   constructor(
@@ -218,7 +218,7 @@ class CursorBook {
     try {
       const w = writeDurably(this.file, JSON.stringify(this.snapshot()));
       // Written, but the directory could not be synced (a real fsync error): the file holds the cursors, so
-      // rewriting them changes nothing — said once, not retried forever; cursors are advisory (comment 6274603516).
+      // rewriting them changes nothing — said once per session, not retried forever; cursors are advisory (comment 6274603516).
       if (!w.synced && !this.syncWarned) {
         this.syncWarned = true;
         this.log?.('warn', `cursors are written but their directory could not be synced: ${w.error?.message ?? 'unknown error'}`, { file: this.file });
@@ -398,7 +398,7 @@ export class SessionRegistry {
   private readonly listeners = new Set<(c: RegistryChange) => void>();
   /** The data dir's lock while this registry holds it (jr2-2). */
   private dirLock: DataDirLock | undefined;
-  /** Names whose record was written while its directory could not be synced, said once per name (noteUnsynced). */
+  /** Names whose record was written while its directory could not be synced: said once per name, again only for a name removed and made anew (noteUnsynced). */
   private readonly recordSyncSaid = new Set<string>();
   /** Session directories recovery could not read at startup (skipped, left on disk). */
   readonly recoveryErrors: Array<{ id: string; error: string }> = [];
@@ -450,9 +450,13 @@ export class SessionRegistry {
     // A lock whose holder is gone means the previous daemon did not drain: said in the log, not only by what recovery does next (the house's read of 59f660b, #22).
     const stale = this.dirLock.tookOver;
     if (stale) this.opts.log?.('warn', 'took over the data dir lock of a daemon that is gone (it did not drain)', { pid: stale.pid, startedAt: stale.startedAt !== undefined ? new Date(stale.startedAt).toISOString() : undefined, hostname: stale.hostname });
-    // Said once per take, since the lock itself has no log (a reviewer's read of the fixes for #22 comment 6269992150).
-    if (this.dirLock.noHardLinks) this.opts.log?.('warn', "the data dir's filesystem has no hard links: the lock is created by an exclusive write instead of link(), whose brief empty window the age guard covers", { dataDir: this.opts.dataDir });
-    // A real fsync error on the lock's directory (EIO): the lock is held; one that vanishes after a crash is taken anew (comment 6274603516).
+    // Said once per take of the lock — at the start, and again only when a new life takes it back after closeAll
+    // released it — since the lock itself has no log (a reviewer's read of the fixes for #22 comment 6269992150).
+    // The fallback writes termd.lock under the takeover guard, so no taker judges it while it is written: no
+    // window is left for an age guard to cover (the house's read of the 33 commits, PR #22, comment 6307349700).
+    if (this.dirLock.noHardLinks) this.opts.log?.('warn', "the data dir's filesystem has no hard links: the lock was created by an exclusive write under its takeover guard instead of link()", { dataDir: this.opts.dataDir });
+    // A real fsync error on the lock's directory (EIO): the lock is held; one that vanishes after a crash is taken anew
+    // (comment 6274603516). Said once per take, as above.
     if (this.dirLock.unsynced) this.opts.log?.('warn', 'the data dir lock is taken but its directory could not be synced; a lock that vanishes after a crash is simply taken anew', { dataDir: this.opts.dataDir });
   }
 
@@ -1021,8 +1025,8 @@ export class SessionRegistry {
 
   /**
    * A record that is written but whose directory could not be synced (a real fsync error): the record
-   * stands; said in the log once per name, as the cursors and the lock are, not at every write (comment
-   * 6274603516; a reviewer's read of the fixes for #22).
+   * stands; said in the log once per name, not at every write — as the cursors' is once per session and the
+   * lock's once per take (comment 6274603516; a reviewer's read of the fixes for #22).
    */
   private noteUnsynced(id: string, w: DurableWrite): void {
     if (w.synced || this.recordSyncSaid.has(id)) return;
@@ -1066,7 +1070,8 @@ export class SessionRegistry {
 
   private storeOptions(id: string, retention: Retention): FileStoreOptions {
     const log = this.opts.log;
-    return { ...retention, ...(this.floor && { floor: this.floor }), ...(log && { log: (level: 'warn', text: string) => log(level, text, { session: id }) }) };
+    // 'info' too: what a store has to say once a refused write lands (its epoch written late) is not a warning.
+    return { ...retention, ...(this.floor && { floor: this.floor }), ...(log && { log: (level: 'warn' | 'info', text: string) => log(level, text, { session: id }) }) };
   }
 
   /** Requested over recorded over daemon defaults. A bad request is refused; a bad record falls back. */
