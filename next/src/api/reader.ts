@@ -936,6 +936,10 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   let rangeStart = (o.since ?? 0) + 1;
   /** The holes the window spans: retention's at the range's start when the window reaches it, then the gap events among the window's events. */
   const gaps: GapInfo[] = [];
+  // The window has enough once its line ends (lineEnds, the one rule) reach `need`: a LF in a string's payload
+  // ends no line, and counting it stopped the walk short, or inside the string, whose payload then showed as
+  // output (the house's read of the 40 commits, #22). Raw LFs, cheap to count, bound it from above.
+  const enough = (evs: JournalEvent[], raw: number, olderBefore: boolean): boolean => raw >= need && windowEnds(src, o, evs, olderBefore) >= need;
   if (o.runId !== undefined) {
     let want = Math.min(cap, 64 * 1024);
     let ro: RunOutput;
@@ -943,8 +947,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     for (;;) {
       ro = src.runOutput(o.runId, rangeOf(o.since, o.until, { maxBytes: want }));
       got = clip(ro.events);
-      const lineEnds = got.reduce((a, e) => a + (isOutput(e) ? countLines(e.data) : 0), 0);
-      if (lineEnds >= need || !ro.truncated || want >= cap) break;
+      const raw = got.reduce((a, e) => a + (isOutput(e) ? countLines(e.data) : 0), 0);
+      if (!ro.truncated || want >= cap || enough(got, raw, true)) break;
       want = Math.min(cap, want * 4);
     }
     end = o.until !== undefined ? Math.min(ro.to, o.until) : ro.to;
@@ -958,7 +962,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     // Walk back from the end until the lines, the byte cap, the event bound, `since` or retention stops it.
     end = o.until !== undefined ? Math.min(o.until, journal.lastSeq) : journal.lastSeq;
     let cursor = end;
-    let lineEnds = 0;
+    let raw = 0;
     let bytes = 0;
     let examined = 0;
     const parts: JournalEvent[][] = [];
@@ -981,11 +985,11 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       examined += fetched.length;
       for (const e of batch) {
         if (!isOutput(e)) continue;
-        lineEnds += countLines(e.data);
+        raw += countLines(e.data);
         bytes += e.data.length;
       }
       cursor = fetched[0]!.seq - 1;
-      if (lineEnds >= need || bytes >= cap || examined >= MAX_SCAN) {
+      if (bytes >= cap || examined >= MAX_SCAN || enough([...parts].reverse().flat(), raw, cursor > (o.since ?? 0))) {
         older = cursor > (o.since ?? 0);
         break;
       }
@@ -1020,6 +1024,16 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const notes = new Set<string>();
   /** Per source, what its last event left unfinished for the line-end rule (lineEnds); a note ends it all, as the projection's CAN does. */
   const carries = new Map<string, LineCarry>();
+  // A window that begins inside a control string its source left open reads as the output did: the string goes
+  // on, its payload's LFs end no line, and the projection shows none of it (openBefore). A note ahead of the
+  // window's first output ends the string first.
+  if (older && firstOut && events.find((e) => isOutput(e) || endsSequences(e, o)) === firstOut) {
+    const open = openBefore(src, o, firstOut);
+    if (open) {
+      chunks.push(chunkOf(firstOut, open));
+      carries.set(sourceKey(firstOut), { open });
+    }
+  }
   const note = (e: JournalEvent, text: string) => {
     chunks.push({ note: text });
     // A command's line can hold newlines: each of its lines is a line of the text, none with a head to cut.
@@ -1138,6 +1152,68 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     r.nextOffset = o.untilOffset!;
   }
   return withGapInfo(r, gaps);
+}
+
+/** An event a tail's text shows as a note, which ends every sequence left open (a hole; a command, with `commands`). */
+const endsSequences = (e: JournalEvent, o: ReadOptions): boolean => isGap(e) || (o.commands === true && e.type === 'run.start' && e.line !== undefined);
+
+/**
+ * What `first`'s source left open where `first` begins (LineCarry's `open`: a control sequence's introducer, and
+ * after a string's a last ESC that may begin its terminator), read in up to STATE_LOOKBACK bytes of that source's
+ * output before it, as stateBefore reads lasting state; '' when nothing is. A hole ends any sequence open before it.
+ */
+function openBefore(src: ReadSource, o: ReadOptions, first: Output): string {
+  const key = sourceKey(first);
+  const back: string[] = [];
+  let bytes = 0;
+  if (o.runId !== undefined) {
+    const ro = src.runOutput(o.runId, { until: first.seq - 1, maxBytes: STATE_LOOKBACK });
+    for (let i = ro.events.length - 1; i >= 0; i--) {
+      const e = ro.events[i]!;
+      if (isGap(e)) break;
+      if (isOutput(e) && sourceKey(e) === key) back.push(e.data);
+    }
+  } else {
+    let cursor = first.seq - 1;
+    let examined = 0;
+    walk: while (bytes < STATE_LOOKBACK && cursor > 0 && examined < MAX_SCAN) {
+      const batch = src.journal.tail(512, cursor);
+      if (batch.length === 0) break;
+      examined += batch.length;
+      for (let i = batch.length - 1; i >= 0 && bytes < STATE_LOOKBACK; i--) {
+        const e = batch[i]!;
+        if (isGap(e)) break walk;
+        if (!isOutput(e) || sourceKey(e) !== key) continue;
+        back.push(e.data);
+        bytes += e.data.length;
+      }
+      cursor = batch[0]!.seq - 1;
+    }
+  }
+  const carry = lineCarry();
+  lineEnds(back.reverse().join(''), carry);
+  return carry.open;
+}
+
+/**
+ * The line ends (lineEnds) a tail's window holds, each source read with its own carry and a hole ending them all;
+ * when older output precedes the window, its first source starts with what that output left open (openBefore).
+ */
+function windowEnds(src: ReadSource, o: ReadOptions, evs: JournalEvent[], olderBefore: boolean): number {
+  const carries = new Map<string, LineCarry>();
+  const first = evs.find((e) => isOutput(e) || endsSequences(e, o));
+  if (olderBefore && first && isOutput(first)) carries.set(sourceKey(first), { open: openBefore(src, o, first) });
+  let count = 0;
+  for (const e of evs) {
+    if (endsSequences(e, o)) carries.clear();
+    else if (isOutput(e)) {
+      const key = sourceKey(e);
+      let carry = carries.get(key);
+      if (!carry) carries.set(key, (carry = lineCarry()));
+      count += lineEnds(e.data, carry).length;
+    }
+  }
+  return count;
 }
 
 /** UTF-8 bytes from the end of the output back to where its last `n` lines begin (by line ends, lineEnds); all of it when it holds no more lines. */

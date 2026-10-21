@@ -1224,3 +1224,33 @@ test('a tail that reaches back to the line written last, cut by the byte cap, co
     for (const part of ['P'.repeat(700), 'R'.repeat(700), 'S'.repeat(700)]) assert.ok(seen.includes(part), `maxBytes ${maxBytes}: ${part.slice(0, 4)}… in ${JSON.stringify([earlier.text, r.text, on.text].map((t) => t?.length))}`);
   }
 });
+
+test('a tail counts the line ends a string payload holds as none: its window goes back far enough, and a window that begins inside the string shows none of it', async () => {
+  // The walk counted raw LFs: past an OSC whose payload holds 800, a tail of 600 came back with 511 lines, cut, and
+  // a Run's tail whose window began inside a long OSC 52 showed its base64 as lines of output.
+  const s = source();
+  for (let i = 0; i < 1000; i++) out(s.journal, `line ${i}\r\n`);
+  out(s.journal, '\x1b]52;c;' + 'QUFB\n'.repeat(800) + '\x07');
+  out(s.journal, 'last\r\n');
+  const t = await readJournal(s, { tail: 600 }, { resultBytes: 1 << 20 });
+  const shown = t.text!.split('\n');
+  assert.equal(shown.length, 600, JSON.stringify({ first: shown[0], lines: t.lines }));
+  assert.equal(shown[0], 'line 401');
+  assert.ok(!t.truncated && !t.lines!.cutHead, JSON.stringify(t.lines));
+  // A Run's OSC 52 of 2,000 and of 4,000 lines of base64: the second is longer than the window's cap, so the window
+  // begins inside it, and what the output before it left open is read from there.
+  for (const payload of [2000, 4000]) {
+    const src = source();
+    startRun(src.journal, 'r1');
+    out(src.journal, 'before\r\n\x1b]52;c;', 'stdout', 'r1');
+    for (let i = 0; i < payload; i++) out(src.journal, `${'QUFB'.repeat(19)}\n`, 'stdout', 'r1');
+    out(src.journal, '\x07done\r\n', 'stdout', 'r1');
+    endRun(src.journal, 'r1');
+    for (const tail of [1, 3]) {
+      const r = await readJournal(src, { runId: 'r1', tail }, { resultBytes: 1 << 20 });
+      const lines = r.text!.split('\n');
+      assert.ok(!lines.some((l) => l.includes('QUFB')), `payload ${payload}, tail ${tail}: ${JSON.stringify(lines.map((l) => l.slice(0, 12)))}`);
+      assert.equal(lines[lines.length - 1], 'done');
+    }
+  }
+});
