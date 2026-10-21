@@ -17,6 +17,7 @@ const A = 'agent:a@test';
 function bare(journal = new Journal()) {
   const waiters: Array<() => void> = [];
   const host: WatchHost & { available: boolean; notify: () => void } = {
+    id: 's',
     journal,
     integration: 'rich',
     available: false,
@@ -151,7 +152,7 @@ test('output from before the manager existed takes a wall-clock age clamped at z
     journal.append({ type: 'output', data: 'old\n', stream: 'pty', runId: 'r' });
     const wall = Date.now();
     t.mock.method(Date, 'now', () => wall - 60_000);
-    const host: WatchHost = { journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
+    const host: WatchHost = { id: 's', journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
     const manager = new WatchManager(host);
     const t0 = performance.now();
     const w = await manager.waitFor({ silenceMs: 200, runId: 'r' }, 3000);
@@ -379,7 +380,7 @@ test('silence rechecks its deadline when the timer wakes before the quiet durati
   t.mock.method(clocks, 'monotonic', () => vnow);
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const journal = new Journal();
-  const host: WatchHost = { journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
+  const host: WatchHost = { id: 's', journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
   const manager = new WatchManager(host);
   const firingsOf = (id: string) => journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'watch.fired' }> => e.type === 'watch.fired' && e.watchId === id);
   try {

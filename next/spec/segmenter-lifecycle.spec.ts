@@ -471,7 +471,7 @@ test('a long output cut to its tail keeps a torn line that is most of the budget
   endRun(src, 'cut');
   await sleep(60);
   assert.equal(out.length, 1);
-  assert.match(out[0]!.body ?? '', /^\[… earlier output omitted · read runId=cut for all of it\]\ntail only$/);
+  assert.match(out[0]!.body ?? '', /^\[… earlier output omitted · read session=s1 runId=cut for all of it\]\ntail only$/);
   assert.equal(out[0]!.metadata.truncated, true);
   // One 10 KB line ending in a newline: its tail is shown under the omission line, not nothing.
   src.runTranscript = async () => ({ text: oneLine, truncated: false, seq: [1, 2], nextCursor: 2 });
@@ -564,7 +564,7 @@ test('a failed transcript read, an end without a status and leftovers are each s
   endRun(src, 'bad');
   await sleep(60);
   assert.equal(out.length, 1);
-  assert.match(out[0]!.body ?? '', /could not be read: store unavailable/);
+  assert.match(out[0]!.body ?? '', /could not be read: store unavailable · read session=s1 runId=bad to try again\]$/, 'the read it advises names the session, which read requires');
   assert.match(out[0]!.head, new RegExp(`read since=${run.seq.start! - 1}$`), 'the read cursor starts at the Run, not past its output');
   assert.equal(out[0]!.metadata.outputError, 'store unavailable');
   src.runTranscript = async (runId) => ({ text: `output of ${runId}`, truncated: false, seq: [1, 2], nextCursor: 2 });

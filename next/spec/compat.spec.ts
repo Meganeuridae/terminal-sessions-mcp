@@ -967,3 +967,10 @@ test('tailLogs over a line written last that another source holds back: the line
     await h.close();
   }
 });
+
+test("tailLogs' description advises a read with its session, which read requires (an independent read of the fixes for the review of the 40 commits, PR #22)", () => {
+  const tail = toolsFor('compat').find((t) => t.name === 'tailLogs')!;
+  assert.match(tail.description, /read \{"session": …, "runId": …\}/);
+  const read = toolsFor('compat').find((t) => t.name === 'read')!;
+  assert.deepEqual((read.inputSchema as { required?: string[] }).required, ['session']);
+});

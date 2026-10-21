@@ -662,7 +662,7 @@ export const COMPAT_TOOLS: ToolDef[] = [
   {
     name: 'tailLogs',
     tier: 'compat',
-    description: 'Get recent logs from a session: its last lines, with `$ <command>` where each command was issued. Earlier output of one command: read {"runId": …}.',
+    description: 'Get recent logs from a session: its last lines, with `$ <command>` where each command was issued. Earlier output of one command: read {"session": …, "runId": …}.',
     inputSchema: {
       type: 'object',
       properties: { session: { type: 'string' }, lines: { type: 'number', description: 'How many lines (default 50, at most 10000)' }, raw },

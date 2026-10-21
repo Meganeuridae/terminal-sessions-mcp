@@ -1046,7 +1046,9 @@ export class App {
       truncated = t.truncated;
     }
     const cut = cutTail(text, this.resultBytes);
-    if (cut.cut) text = `[… earlier output omitted · read runId=${run.runId} pages through all of it]\n${cut.text}`;
+    // The read it advises names the session, which read requires: advised without it, the call was refused (an
+    // independent read of the fixes for the review of the 40 commits, PR #22).
+    if (cut.cut) text = `[… earlier output omitted · read session=${s.kind === 'live' ? s.session.id : s.id} runId=${run.runId} pages through all of it]\n${cut.text}`;
     return { text, truncated: truncated || cut.cut, seq: [from, to], nextCursor: to };
   }
 

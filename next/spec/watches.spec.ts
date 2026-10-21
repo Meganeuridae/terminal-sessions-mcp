@@ -157,7 +157,7 @@ test('m2-11 (/bin/sh, no integration): a process Run ending while a shell Run ru
 
 test('m2-20: a coalesced firing carries the latest match, and "+N more" counts only the hits it does not show', async () => {
   const journal = new Journal();
-  const host: WatchHost = { journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
+  const host: WatchHost = { id: 's', journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
   const wm = new WatchManager(host);
   const w = wm.add({ pattern: 'ERR\\d+' }, A);
   const out = (data: string) => journal.append({ type: 'output', data, stream: 'pty' });
@@ -190,7 +190,7 @@ test('a pattern watch reads a LF or CR inside a window title as no line end, as 
   // line reader split at the title's LF, so `AAA` and `leBBB` were lines and `A+B+` never matched what the
   // transcript and search read as `AAABBB`.
   const journal = new Journal();
-  const host: WatchHost = { journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
+  const host: WatchHost = { id: 's', journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
   const wm = new WatchManager(host);
   try {
     const w = wm.add({ pattern: '^A+B+$' }, A);
@@ -203,4 +203,14 @@ test('a pattern watch reads a LF or CR inside a window title as no line end, as 
   } finally {
     wm.dispose();
   }
+});
+
+test("a watch on an ended Run is refused with a read that names the session, which read requires (an independent read of the fixes for the review of the 40 commits, PR #22)", () => {
+  const journal = new Journal();
+  journal.append({ type: 'run.admit', runId: 'r1', target: 'process', principal: A, origin: 'self', queued: false });
+  journal.append({ type: 'run.start', runId: 'r1', cwd: '/' });
+  journal.append({ type: 'run.end', runId: 'r1', state: 'exited', exit: 0, durationMs: 1 });
+  const host: WatchHost = { id: 'ended', journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
+  const wm = new WatchManager(host);
+  assert.throws(() => wm.add({ pattern: 'x', runId: 'r1' }, A), (e: unknown) => e instanceof TermError && e.message.endsWith('read its output with read {"session": "ended", "runId": "r1"}'));
 });

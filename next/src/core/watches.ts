@@ -89,6 +89,8 @@ export interface WaitResult {
 }
 
 export interface WatchHost {
+  /** The session's name, which a read this manager advises names. */
+  readonly id: string;
   readonly journal: Journal;
   readonly integration: IntegrationLevel;
   waitAvailable(ms: number): Promise<boolean>;
@@ -432,7 +434,7 @@ export class WatchManager {
   add(spec: WatchSpec, owner: Principal, keep?: { watchId: string; createdAt: number }): WatchInfo {
     const kind = kindOf(spec);
     const run = spec.runId !== undefined && kind !== 'idle' ? this.requireRun(spec.runId) : undefined;
-    if (run && isTerminal(run.state)) throw err('invalid_argument', `${endText(run)}: a watch on it would never fire; read its output with read {runId}`, { runId: run.runId });
+    if (run && isTerminal(run.state)) throw err('invalid_argument', `${endText(run)}: a watch on it would never fire; read its output with read {"session": ${JSON.stringify(this.host.id)}, "runId": ${JSON.stringify(run.runId)}}`, { runId: run.runId });
     if (keep) this.counter = Math.max(this.counter, Number(/^w(\d+)-/.exec(keep.watchId)?.[1] ?? 0));
     const watchId = keep?.watchId ?? `w${++this.counter}-${randomBytes(2).toString('hex')}`;
     const label = spec.label ?? (kind === 'pattern' ? spec.pattern! : kind === 'silence' ? `silence ${spec.silenceMs}ms` : 'idle');

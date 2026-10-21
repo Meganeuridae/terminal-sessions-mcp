@@ -357,8 +357,10 @@ class Render {
     const cut = Buffer.byteLength(body) > RUN_BODY_BYTES;
     if (cut) body = tailBytes(body, RUN_BODY_BYTES);
     // The transcript may already be the newest part of a longer output: the omission is said either way.
-    if (cut || t.truncated) body = `[… earlier output omitted · read runId=${ev.runId} for all of it]\n${body}`;
-    if (unreadable !== undefined) body = `[the Run's output could not be read: ${oneLine(unreadable, 160)} · read runId=${ev.runId} to try again]`;
+    // The read each note advises names the session, which read requires (an independent read of the fixes for the
+    // review of the 40 commits, PR #22).
+    if (cut || t.truncated) body = `[… earlier output omitted · read session=${this.src.id} runId=${ev.runId} for all of it]\n${body}`;
+    if (unreadable !== undefined) body = `[the Run's output could not be read: ${oneLine(unreadable, 160)} · read session=${this.src.id} runId=${ev.runId} to try again]`;
     const status =
       ev.state === 'exited'
         ? ev.signal

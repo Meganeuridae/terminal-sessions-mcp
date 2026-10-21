@@ -172,7 +172,7 @@ test('a Run result cut to the result size carries the omission line, is truncate
   const r = await app.run(A, { session: 'omit', command: 'seq 1 5000', wait: 20_000 });
   assert.equal(r.state, 'exited');
   assert.equal(r.output.truncated, true);
-  assert.match(r.output.text, new RegExp(`^\\[… earlier output omitted · read runId=${r.runId} pages through all of it\\]\\n`));
+  assert.match(r.output.text, new RegExp(`^\\[… earlier output omitted · read session=omit runId=${r.runId} pages through all of it\\]\\n`));
   assert.ok(Buffer.byteLength(r.output.text) <= 16 * 1024 + 200, `${Buffer.byteLength(r.output.text)} bytes`);
   assert.match(r.output.text, /\n5000\s*$/);
   const s = registry.get('omit');
