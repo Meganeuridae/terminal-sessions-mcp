@@ -2649,6 +2649,12 @@ export class Session {
    * (ICANON and ECHO off) on every one of EDITOR_SETTLE_READS reads over a short settle, since one read
    * just after the ^C varied (question 1), and then no process other than the shell that can read the
    * terminal. What the checks cannot answer is a reason too: unknown is not the editor.
+   *
+   * The limit: a readline-mode `read -e` in the shell itself, as a DEBUG trap of the user's may run, sets
+   * the editor's mode and is the shell, so it passes both checks, and no reading the daemon has tells it
+   * from the prompt's editor. The trap's `read` then takes the empty line as its answer; the shell comes
+   * back to its prompt without the line's mark, and the grace there takes the line as lost (the house's
+   * review of f3750e4..4f4c067, PR #22 comment 6315636412, question 2, by run with bash 5.2.37).
    */
   private async whyNotEditor(): Promise<string | undefined> {
     for (let i = 0; i < EDITOR_SETTLE_READS; i++) {

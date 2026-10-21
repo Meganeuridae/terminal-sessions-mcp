@@ -663,6 +663,30 @@ test('a marker Run whose probe is answered after a cancel that returned with it 
   await h.session.close();
 });
 
+test('the gate’s limit: a read -e in the shell itself passes it and takes the empty line, and the grace at the shell’s next prompt frees it', async () => {
+  // Nothing the daemon reads tells a readline-mode read in the shell, as a DEBUG trap of the user's may run,
+  // from the prompt's editor: the same mode, and no process but the shell (the house's review of
+  // f3750e4..4f4c067, PR #22 comment 6315636412, question 2, by run with bash 5.2.37). Named as the limit;
+  // this pins the recovery the house saw.
+  const h = await harness({ ignoreSignals: true, setup: (s) => s.on(/^trapread/, () => ({ hang: true, noStartMark: true })) });
+  const a = h.session.admit({ target: 'shell', line: 'trapread', principal: AGENT });
+  assert.ok(a.admitted && a.run.state === 'starting', JSON.stringify(a));
+  h.pty.mode = EDITOR_MODE; // read -e: the editor's mode
+  h.pty.reader = false; // the shell itself
+  const c = await h.session.cancel(a.run.runId, AGENT, { graceMs: 30 });
+  assert.equal(c.steps.at(-1), 'an empty line, whose prompt says the shell is back', JSON.stringify(c));
+  const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+  assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+  // The trap's read took the empty line (the running fake swallows what is typed); it returns, the late line
+  // runs, and the shell prompts without the empty line's mark.
+  h.pty.emit(h.shell.mark(`633;E;${h.shell.typed[0]!}`) + h.shell.mark('133;C'));
+  h.shell.finishHung(1);
+  const rb = await h.session.awaitRun(b.run.runId, 3000);
+  assert.deepEqual([rb.state, rb.exit], ['exited', 0], JSON.stringify(rb));
+  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /it was lost/.test(e.text)), 'the grace took the line as lost');
+  await h.session.close();
+});
+
 test('a reader holding the terminal gets none of the kept replies: not after the cancel’s ^Cs, nor after a later ^C', async () => {
   // A DEBUG trap's read holds the terminal in cooked mode, so the cancel types no empty line. The replies
   // went into that read all the same: after the cancel's ^Cs, before the checks that gate the empty line,

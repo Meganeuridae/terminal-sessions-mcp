@@ -692,6 +692,19 @@ shell to cancel a job in it; that decision is the caller's. `signal` follows the
 the foreground job's group, and signalling the shell itself is refused (that is
 `session_close`).
 
+When two `^C` bring no mark at all, the line never started: the Run ends `cancelled`
+(`cancelled-before-start`), and the shell is busy until it shows it is back. The daemon types
+an empty line and counts the shell back at the prompt after that line's pre-execution mark, or
+at a prompt the line does not follow within 300 ms of its end (the line was lost). It types the
+line only when the terminal's mode is a line editor's (ICANON and ECHO off, on four reads 50 ms
+apart) and no process other than the shell can read the terminal; otherwise it types nothing,
+the shell's next prompt is the answer, and until then the shell is busy as `cancel-unanswered`,
+with no bound. The gate's limit is a readline-mode `read -e` in the shell itself, as a DEBUG trap
+of the user's may run: it sets the editor's mode and is the shell, so it passes, takes the empty
+line as its answer, and the session recovers through the grace at the shell's next prompt. Under
+the marker strategy the end-marker probe's answer shows the shell reads lines again: the Run ends
+`lost` (`exit-unobserved`) unless a cancel in progress ended it, and the shell is available.
+
 ---
 
 ## 9. Attachments and control

@@ -82,7 +82,8 @@ export interface PtyHandle {
    * both off; `read -n` turns ICANON off and leaves ECHO on; `read -p` and a `bash --noediting` prompt
    * leave both on and cannot be told apart; `read -e`, `read -s -n` and a raw-mode program turn both
    * off, like readline. Undefined when it cannot be read (no pts name, or `stty` failed). The gate
-   * after `exec bash` types a reinit only with both off and no other reader.
+   * after `exec bash` types a reinit only with both off and no other reader, as a cancel types its empty
+   * line: a `read -e` in the shell itself passes both, and is the gates' limit (Session's whyNotEditor).
    */
   inputMode?(): { canonical: boolean; echo: boolean } | undefined;
   /** Stop reading the PTY (the writer blocks once the kernel buffer fills) — flow control for the daemon's own emulator (§6). */
