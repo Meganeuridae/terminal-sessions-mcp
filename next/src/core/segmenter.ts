@@ -24,7 +24,7 @@ import type { Journal } from './journal.js';
 import type { RunOutput } from './runindex.js';
 import { cutPlumbing } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
-import { safeCut, tailStart, unfinishedSequence } from './text.js';
+import { lineCarry, lineEnds, safeCut, tailStart, unfinishedSequence, type LineCarry } from './text.js';
 import { headOnlyText } from './regex.js';
 import { minusRanges } from './ranges.js';
 import { project } from './transcript.js';
@@ -756,8 +756,10 @@ interface RunWatch {
   askedAtSeq?: Seq;
   /** The last complete output lines, cleaned (er-3: a digest never reads the journal). */
   lines: string[];
-  /** Raw text after the last newline, capped. */
+  /** Raw text after the last line end, capped. */
   carry: string;
+  /** What the Run's output left unfinished for the line-end rule (lineEnds). */
+  scan: LineCarry;
   /**
    * (seq, bytes through it) checkpoints, for "new since your last read" without reading the
    * journal. Bytes *through* an event, and the newest mark always kept: with "bytes before" and
@@ -1051,7 +1053,7 @@ export class Segmenter {
     // segmenter began was dated from the wall-clock age of its journaled start, which a step back before then
     // clamped to zero while the result said minutes (a reviewer's read of the fixes for #22).
     const startMono = clocks.monotonic() - (this.s.runDurationMs(runId) ?? 0);
-    const w: RunWatch = { runId, startMono, pipes: run?.target === 'process', bytes: 0, bytesAtLeast: false, bytesAtLastDigest: 0, lines: [], carry: '', marks: [] };
+    const w: RunWatch = { runId, startMono, pipes: run?.target === 'process', bytes: 0, bytesAtLeast: false, bytesAtLastDigest: 0, lines: [], carry: '', scan: lineCarry(), marks: [] };
     this.running.set(runId, w);
     w.timer = setInterval(() => this.digest(w), this.o.cadenceMs);
     return w;
@@ -1110,19 +1112,17 @@ export class Segmenter {
    */
   private feedLines(w: RunWatch, data: string, _stream: OutputStream): void {
     let buf = w.carry + data;
-    const nl = buf.lastIndexOf('\n');
+    // Lines end by the one rule (lineEnds): a LF inside a window title ends none (an independent read of
+    // the fix for the house's read of the 33 commits, #22, comment 6307350650).
+    const ends = lineEnds(data, w.scan).map((e) => e + w.carry.length);
+    const nl = ends.length ? ends[ends.length - 1]! : -1;
     if (nl !== -1) {
       const fresh: string[] = [];
-      let end = nl;
-      // Only the newest lines can survive, so read back from the end until there are enough. A
-      // newline at index 0 ends an empty first line, and a search before index 0 must find nothing:
-      // `lastIndexOf('\n', -1)` would search from 0 (the house's read of 3eade8a, #22).
-      while (end >= 0 && fresh.length < DIGEST_LINES) {
-        const start = end > 0 ? buf.lastIndexOf('\n', end - 1) : -1;
-        const line = cleanLine(buf.slice(start + 1, end)).trimEnd();
+      // Only the newest lines can survive, so read back from the end until there are enough.
+      for (let k = ends.length - 1; k >= 0 && fresh.length < DIGEST_LINES; k--) {
+        const start = k > 0 ? ends[k - 1]! : -1;
+        const line = cleanLine(buf.slice(start + 1, ends[k])).trimEnd();
         if (line) fresh.push(line);
-        if (start < 0) break;
-        end = start;
       }
       this.pushLines(w, fresh.reverse());
       buf = buf.slice(nl + 1);

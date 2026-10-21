@@ -176,3 +176,11 @@ test('the 33 commits 8: the read tool hands the request’s range to the status 
   assert.equal(page.text, 'xyz\n[read s run r1-ab seq 7–9 · next: since=9 · more: read since=9 until=40 runId=r1-ab]');
   assert.deepEqual(asked.map((o) => [o.since, o.until, o.tail, o.runId]), [[3, undefined, 2, 'r1-ab'], [3, 40, undefined, 'r1-ab']]);
 });
+
+test('read’s status says when a tail reached back past the lines asked for, to the line written last', () => {
+  // An independent read of the fix for the house's read of the 33 commits (#22, comment 6307350650): "3 of 1 lines" said nothing of why.
+  const base: ReadResult = { session: 's', seq: [3, 4], nextCursor: 4, more: false, truncated: false, text: '[run r1]\nr1 line\n[terminal]\nPTY-UNFIN' };
+  const r = renderRead({ ...base, lines: { requested: 1, returned: 2, before: { until: 3, untilOffset: 8 } } }, 'transcript');
+  assert.match(r.text, / · 2 of 1 lines, back to the line written last · earlier: read tail=1 until=3 untilOffset=8 · next: since=4\]$/);
+  assert.doesNotMatch(renderRead({ ...base, lines: { requested: 2, returned: 2 } }, 'transcript').text, /back to/);
+});

@@ -7,7 +7,7 @@
  */
 import { err } from './errors.js';
 import { compileUserRegex, execBounded } from './regex.js';
-import { safeCut, sequenceEnd } from './text.js';
+import { lineCarry, lineEnds, safeCut, sequenceEnd, type LineCarry } from './text.js';
 
 /**
  * The longest line a StreamMatcher holds: a longer one is matched on its first MAX_LINE, the hit says
@@ -244,6 +244,8 @@ export class LineSplitter {
   private cut = false;
   /** The last chunk ended in CR: an LF opening the next one belongs to it. */
   private pendingCr = false;
+  /** What the stream left unfinished for the line-end rule (lineEnds). */
+  private readonly scan: LineCarry = lineCarry();
   /** The unterminated line was consumed as a prompt. */
   private spent = false;
   private timer: NodeJS.Timeout | undefined;
@@ -261,8 +263,20 @@ export class LineSplitter {
     if (!chunk) return out;
     let text = chunk;
     if (this.pendingCr && text.startsWith('\n')) text = text.slice(1);
-    this.pendingCr = text.endsWith('\r');
-    const parts = text.split(/\r\n|\r|\n/);
+    // Lines and frames end by the one rule (lineEnds, with CRs): a LF or CR inside a window title ends
+    // neither (an independent read of the fix for the house's read of the 33 commits, #22, comment 6307350650).
+    const breaks = lineEnds(text, this.scan, Number.POSITIVE_INFINITY, true);
+    this.pendingCr = text.endsWith('\r') && breaks[breaks.length - 1] === text.length - 1;
+    const parts: string[] = [];
+    let from = 0;
+    for (let k = 0; k < breaks.length; k++) {
+      const b = breaks[k]!;
+      parts.push(text.slice(from, b));
+      // A CRLF is one break.
+      if (text[b] === '\r' && text[b + 1] === '\n' && breaks[k + 1] === b + 1) k++;
+      from = breaks[k]! + 1;
+    }
+    parts.push(text.slice(from));
     const last = parts.pop()!;
     for (const part of parts) {
       this.add(part);

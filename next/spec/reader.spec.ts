@@ -1032,8 +1032,9 @@ test('the 33 commits 1: two sources that each end in an unfinished line page bac
   out(src.journal, 'p1\r\np2\r\nPTY-UNFIN');
   out(src.journal, 'r1 line\n', 'stdout', 'r1');
   const r = await readJournal(src, { tail: 1 }, { resultBytes: 16384 });
-  assert.equal(r.text, 'r1 line\n[terminal]\nPTY-UNFIN');
-  assert.deepEqual(r.lines, { requested: 1, returned: 3, before: { until: 3, untilOffset: 8 } });
+  // Two lines of output, each under the header naming its source: the headers come extra.
+  assert.equal(r.text, '[run r1]\nr1 line\n[terminal]\nPTY-UNFIN');
+  assert.deepEqual(r.lines, { requested: 1, returned: 2, before: { until: 3, untilOffset: 8 } });
   const before = await readJournal(src, { tail: 2, ...r.lines!.before! }, { resultBytes: 16384 });
   assert.equal(before.text, 'p1\np2');
 });
@@ -1095,5 +1096,73 @@ test('the 33 commits 2: a LF inside an OSC ends no line: a cut line’s head is 
     assert.ok(h.text!.startsWith('AAABBB'), `from its head, no payload: ${JSON.stringify(h.text!.slice(0, 20))}`);
     const b = await readJournal(src, { tail: 1, ...r.lines!.before! }, { resultBytes: 16384 });
     assert.equal(b.text, 'line1');
+  }
+});
+
+// ───────────── an independent read of the fix for the house's read of the 33 commits (#22, comment 6307350650) ─────────────
+
+test('one line-end rule: head-first pages and search read a LF inside a window title as no line end, as the tail does', async () => {
+  // Only the tail kept the rule: on `AAA…ESC]0;tit\r\nle BEL BBB…` a page of 1,024 bytes ended at the title's
+  // LF, and the next began `leBBB…`, the title's rest shown; search found `leBBB` and not the line the tail showed.
+  const line = `${'A'.repeat(600)}\x1b]0;tit\r\nle\x07${'B'.repeat(2000)}`;
+  const src = source();
+  out(src.journal, `${line}\r\nend\r\n`);
+  const { text, pages } = await readAll(src, { since: 0, maxBytes: 1024 });
+  assert.equal(text, `${'A'.repeat(600)}${'B'.repeat(2000)}\nend`, 'the pages joined are the line as the terminal shows it');
+  assert.ok(pages.every((p) => !p.text!.startsWith('le')), JSON.stringify(pages.map((p) => p.text!.slice(0, 12))));
+  assert.equal((await searchJournal(src, { pattern: 'AAABBB', since: 0 })).matches.length, 1, 'search finds the line the tail shows');
+  assert.equal((await searchJournal(src, { pattern: '^leB', since: 0 })).matches.length, 0, 'and no line of the title’s rest');
+  // The title split across two events reads the same.
+  const split = source();
+  out(split.journal, `${'A'.repeat(600)}\x1b]0;tit\r\n`);
+  out(split.journal, `le\x07${'B'.repeat(2000)}\r\nend\r\n`);
+  assert.equal((await readAll(split, { since: 0, maxBytes: 1024 })).text, `${'A'.repeat(600)}${'B'.repeat(2000)}\nend`);
+  assert.equal((await searchJournal(split, { pattern: 'AAABBB', since: 0 })).matches.length, 1);
+});
+
+test('tail: N counts lines of output, and the headers naming sources come extra', async () => {
+  // A tail of 5 across two sources showed 4 lines of output and a header, and said "5 of 5".
+  const src = source();
+  startRun(src.journal, 'r1');
+  for (let i = 1; i <= 4; i++) {
+    out(src.journal, `p${i}\r\n`);
+    out(src.journal, `r${i}\n`, 'stdout', 'r1');
+  }
+  const r = await readJournal(src, { tail: 5 }, { resultBytes: 16384 });
+  assert.equal(r.text, '[run r1]\nr2\n[terminal]\np3\n[run r1]\nr3\n[terminal]\np4\n[run r1]\nr4');
+  assert.equal(r.lines!.requested, 5);
+  assert.equal(r.lines!.returned, 5);
+  // The page before ends where the first line shown begins.
+  const b = await readJournal(src, { tail: 3, ...r.lines!.before! }, { resultBytes: 16384 });
+  assert.equal(b.text, '[terminal]\np1\n[run r1]\nr1\n[terminal]\np2');
+});
+
+test('a crash’s hole is counted as up to its range: most of it may be seqs never issued', async () => {
+  // The journal records the range a crash skipped above the last synced reservation, up to 10,000 seqs, so
+  // "9997 journal events missing" overstated what was lost.
+  const src = source();
+  out(src.journal, 'before\r\n');
+  src.journal.append({ type: 'gap', from: 2, to: 9998, reason: 'torn-write' });
+  out(src.journal, 'after\r\n');
+  const r = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
+  assert.equal(r.text, 'before\n[… up to 9997 journal events missing (seq 2–9998: a crash cut the journal short) …]\nafter');
+  // Every other reason counts what is gone, and one seq is one event.
+  const other = source();
+  other.journal.append({ type: 'gap', from: 1, to: 3, reason: 'store-error' });
+  other.journal.append({ type: 'gap', from: 5, to: 5, reason: 'torn-write' });
+  assert.equal((await readJournal(other, { since: 0 }, { resultBytes: 16384 })).text, '[… 3 journal events missing (seq 1–3: the journal store failed) …]\n[… 1 journal event missing (seq 5–5: a crash cut the journal short) …]');
+});
+
+test('paging back past a title left open before a hole reaches every line: the title shows nothing, and the row its LF left counts', async () => {
+  // `one`, `two` ended by a bare LF, a title the hole leaves open, then the hole: the hole's line starts after a
+  // blank row, which the tail had read as `two`, so the page before ended after `one`.
+  for (const tail of [1, 2, 3]) {
+    const src = source();
+    out(src.journal, 'one\r\ntwo\n\x1b]0;q\r\n');
+    src.journal.append({ type: 'gap', from: 2, to: 2, reason: 'torn-write' });
+    src.journal.append({ type: 'gap', from: 3, to: 3, reason: 'torn-write' });
+    const pages = await pagesBack(src, { tail });
+    const text = pages.map((p) => p.text).join('\n');
+    for (const l of ['one', 'two']) assert.ok(text.includes(l), `tail ${tail}: ${l} in ${JSON.stringify(pages.map((p) => p.text))}`);
   }
 });

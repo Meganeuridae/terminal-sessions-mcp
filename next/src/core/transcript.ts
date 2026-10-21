@@ -46,7 +46,8 @@
  *    and escapes in pipe output still resolve. A source is the pty, or one
  *    process Run's pipes (`runId`; stdout and stderr together). Sources are
  *    interleaved by whole lines: each source's unfinished line is held until
- *    that source ends it with a LF, so lines of different sources never mix
+ *    that source ends it (a LF outside a control string, `lineEnds` in
+ *    text.ts: the one line-end rule), so lines of different sources never mix
  *    (two concurrent Runs, or a Run and the shell); the held ends of lines
  *    follow at the end of the range (or before a note), in the order they
  *    began. When the source changes, the next source starts on a fresh line,
@@ -56,9 +57,10 @@
  *    the head or tail (`keep`, default `tail`) is kept, cut on a line boundary
  *    when one lies in the half of the budget nearest the cut and never inside a
  *    character, and `omittedInputBytes` says how much was not projected.
- *    `maxLines` (default 50 000) caps the logical lines returned, keeping the
- *    head or tail. When keeping the tail, input older than the last
- *    `maxLines + 2·rows` newlines is not projected (it cannot contribute to the
+ *    `maxLines` (default 50 000) caps the logical lines of output returned,
+ *    keeping the head or tail; the header lines naming sources (rule 6) come
+ *    extra. When keeping the tail, input older than the last
+ *    `maxLines + 2·rows` line ends is not projected (it cannot contribute to the
  *    last `maxLines` lines of line-oriented output) and counts as omitted; a
  *    full-screen program's time on the alternate screen counts as `rows + 1`
  *    lines there, however many newlines it wrote, since only its final frame
@@ -84,7 +86,7 @@ import xterm from '@xterm/headless';
 import type { IBuffer, Terminal as TerminalType } from '@xterm/headless';
 import { persistentState } from './screen.js';
 import { DEFAULT_GEOMETRY } from './types.js';
-import { headIndex, sequenceEnd, tailStart, unfinishedSequence, utf8Length } from './text.js';
+import { headIndex, lineCarry, lineEnds, sequenceEnd, tailStart, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
 
 const { Terminal } = xterm;
 
@@ -133,12 +135,28 @@ const MAX_BATCH = 512 * 1024;
 const DEFAULT_MAX_LINES = 50_000;
 
 interface Segment {
-  /** `pty`, `p:<runId>` for a process Run's pipes, or `n:<i>` for a note. */
+  /** `pty`, `p:<runId>` for a process Run's pipes, or `n:<i>` for a note or a header. */
   key: string;
   pipe: boolean;
   data: string;
   /** UTF-8 bytes of `data`. */
   bytes: number;
+  /** A header line naming a source (rule 6): no line of output, so `maxLines` does not count it. */
+  header?: true;
+}
+
+/**
+ * Where the interleave (rule 6) cuts a source's data: its lines go out through `through`, the index
+ * after its last line end (0 when it ends none), and the rest is held until the source ends the line.
+ * `ends` are its line ends by the one rule (`lineEnds`, with the source's `carry`), so a LF inside a
+ * window title splits nothing: an event cut there let a header land inside the title, and the title's
+ * rest showed as text (an independent read of the fix for the house's read of the 33 commits, #22,
+ * comment 6307350650). One answer for the projection and for where a tail's lines begin (the reader's
+ * Display).
+ */
+export function interleaveCut(data: string, carry: LineCarry): { ends: number[]; through: number } {
+  const ends = lineEnds(data, carry);
+  return { ends, through: ends.length ? ends[ends.length - 1]! + 1 : 0 };
 }
 
 /** The byte budget applied while the chunks are gathered (rule 7, Cost): what it dropped, and the lasting state of a dropped head. */
@@ -425,8 +443,8 @@ const pipeToTty = (s: string): string => s.replace(/\n/g, '\r\n');
 
 /**
  * Merge chunks into runs of one source, interleaved by whole lines (rule 6):
- * each source's data is emitted up to its last LF, and the rest is held until
- * that source ends the line. Held ends are emitted, in the order they began,
+ * each source's data is emitted through its last line end (interleaveCut), and
+ * the rest is held until that source ends the line. Held ends are emitted, in the order they began,
  * before a note and at the end. A header segment precedes each change of source
  * when `label` gives one.
  *
@@ -448,6 +466,8 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
   const out: Segment[] = [];
   let outBytes = 0;
   const held = new Map<string, { info: SourceInfo; pipe: boolean; data: string; bytes: number; full: boolean }>();
+  /** Per source, what its data left unfinished for the line-end rule; a note ends it all, as its CAN does. */
+  const carries = new Map<string, LineCarry>();
   let notes = 0;
   const drop = (data: string, bytes: number) => {
     budget!.omitted += bytes;
@@ -494,7 +514,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       const header = info && label?.(info);
       if (header) {
         const h = `${header}\n`;
-        out.push({ key: `n:${notes++}`, pipe: true, data: h, bytes: utf8Length(h) });
+        out.push({ key: `n:${notes++}`, pipe: true, data: h, bytes: utf8Length(h), header: true });
         outBytes += utf8Length(h);
       }
       out.push({ key, pipe, data, bytes });
@@ -526,6 +546,7 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
   for (const ch of chunks) {
     if (typeof ch !== 'string' && 'note' in ch) {
       flush();
+      carries.clear();
       const n = `${ch.note}\n`;
       emit(`n:${notes++}`, true, undefined, n);
       continue;
@@ -534,6 +555,10 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     if (!c.data) continue;
     const pipe = c.stream === 'stdout' || c.stream === 'stderr';
     const key = pipe ? `p:${c.runId ?? ''}` : 'pty';
+    // Line ends are read over the whole chunk, as the stream wrote it, before a tail cut's leftover is skipped.
+    let carry = carries.get(key);
+    if (!carry) carries.set(key, (carry = lineCarry()));
+    const { through } = interleaveCut(c.data, carry);
     const data = skipOpen(key, c.data);
     if (!data) continue;
     let h = held.get(key);
@@ -544,8 +569,9 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       h = { info, pipe, data: '', bytes: 0, full: false };
       held.set(key, h);
     }
-    // Only the new data is searched for a LF, so a long unfinished line costs its length once.
-    const nl = data.lastIndexOf('\n');
+    // Only the new data is read for a line end, so a long unfinished line costs its length once.
+    const skipped = c.data.length - data.length;
+    const nl = through - 1 >= skipped ? through - 1 - skipped : -1;
     if (nl === -1) {
       if (h.full) {
         drop(data, utf8Length(data));
@@ -557,7 +583,14 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
         // An unfinished line past twice the budget: only a budget's worth of it can survive. Kept
         // head: that worth is its start, and the rest of the line (`full`) is dropped as it comes.
         const cut = budget.keep === 'tail' ? tailStart(h.data, budget.max) : headIndex(h.data, budget.max);
-        if (budget.keep === 'tail') leaveOpen(key, h.data, cut);
+        if (budget.keep === 'tail') {
+          leaveOpen(key, h.data, cut);
+          // More than the budget goes from this line, which follows every segment emitted so far: none of
+          // them can survive the cut. Kept, `head` before a title's payload held whole survived the
+          // payload's 20 KB (a title's LFs end no line now, so the payload is a held line's).
+          for (const s of out.splice(0)) drop(s.data, s.bytes);
+          outBytes = 0;
+        }
         const gone = budget.keep === 'tail' ? h.data.slice(0, cut) : h.data.slice(cut);
         h.data = budget.keep === 'tail' ? h.data.slice(cut) : h.data.slice(0, cut);
         h.bytes = utf8Length(h.data);
@@ -609,7 +642,8 @@ function cutInput(segs: Segment[], max: number, keep: 'head' | 'tail', dropped: 
     while (k < segs.length && acc + sizes[k]! <= max) acc += sizes[k++]!;
     const seg = segs[k]!;
     let end = headIndex(seg.data, max - acc);
-    const nl = end > 0 ? seg.data.lastIndexOf('\n', end - 1) : -1;
+    const ends = lineEnds(seg.data.slice(0, end));
+    const nl = ends.length ? ends[ends.length - 1]! : -1;
     if (nl !== -1 && utf8Length(seg.data.slice(nl + 1, end)) <= max / 2) end = nl + 1;
     seg.data = seg.data.slice(0, end);
     seg.bytes = utf8Length(seg.data);
@@ -634,8 +668,8 @@ function altSwitchBefore(d: string, i: number): { at: number; enter: boolean } |
 }
 
 /**
- * Keep only input after the newline that precedes the last `n` newlines (rule 7,
- * tail). Newlines inside a full-screen program's time on the alternate screen
+ * Keep only input after the line end that precedes the last `n` line ends (rule 7,
+ * tail; line ends by `lineEnds`, headers not counted). Newlines inside a full-screen program's time on the alternate screen
  * are not counted: the program's frames project as one final frame of at most
  * `rows` lines (plus the line it interrupted), whatever they contained, so that
  * time counts as `rows + 1`, and the cut never lands inside it (the house's read
@@ -662,11 +696,16 @@ function cutToLastNewlines(segs: Segment[], n: number, rows: number, dropped: st
   let seen = 0;
   for (let k = segs.length - 1; k >= 0; k--) {
     const seg = segs[k]!;
+    // A header is no line of output: `maxLines` does not count it.
+    if (seg.header) continue;
     const d = seg.data;
+    const ends = lineEnds(d);
+    let e = ends.length - 1;
     let i = d.length;
     let sw = k in lastSwitch ? lastSwitch[k] : seg.pipe ? undefined : altSwitchBefore(d, i);
     while (i > 0) {
-      const nl = d.lastIndexOf('\n', i - 1);
+      while (e >= 0 && ends[e]! >= i) e--;
+      const nl = e >= 0 ? ends[e]! : -1;
       if (sw && sw.at > nl) {
         if (!sw.enter) inAlt = true;
         else if (inAlt) {
@@ -697,6 +736,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
   const keep = opts.keep ?? 'tail';
   const budget: Budget | undefined = opts.maxInputBytes !== undefined ? { max: Math.max(0, opts.maxInputBytes), keep, omitted: 0, state: '' } : undefined;
   const segs = segments(chunks, opts.label, budget);
+  const headers = new Set(segs.flatMap((s) => (s.header ? [s.data.slice(0, -1)] : [])));
   let omitted = budget?.omitted ?? 0;
   const dropped: string[] = budget?.state ? [budget.state] : [];
   if (budget) omitted += cutInput(segs, budget.max, keep, dropped);
@@ -708,11 +748,13 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
   const pr = new Projector(cols, rows, keep, maxLines);
   try {
     let slice = performance.now();
+    let headersFed = 0;
     outer: for (let s = 0; s < segs.length; s++) {
       const seg = segs[s]!;
+      if (seg.header) headersFed++;
       let pos = 0;
       while (pos < seg.data.length) {
-        if (keep === 'head' && pr.out.lines.length > maxLines) {
+        if (keep === 'head' && pr.out.lines.length > maxLines + headersFed) {
           // The first maxLines lines are complete: the rest is not projected (rule 7).
           omitted += utf8Length(seg.data.slice(pos)) + segs.slice(s + 1).reduce((a, x) => a + utf8Length(x.data), 0);
           break outer;
@@ -742,14 +784,36 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
     }
     let lines = pr.finish(opts.open === true);
     let truncated = omitted > 0 || pr.lost || pr.out.dropped;
-    if (lines.length > maxLines) {
-      lines = keep === 'tail' ? lines.slice(-maxLines) : lines.slice(0, maxLines);
+    const kept = keepLines(lines, maxLines, keep, headers);
+    if (kept) {
+      lines = kept;
       truncated = true;
     }
     return { text: lines.join('\n'), truncated, omittedInputBytes: omitted };
   } finally {
     pr.dispose();
   }
+}
+
+/**
+ * The last (or first) `max` lines of output, with the header lines among them and the one naming the
+ * first line's source; undefined when all of them fit. A header names a source and is no line of
+ * output (rule 6), so `maxLines` counts output lines, and a tail of 5 across two sources showed 4 of
+ * them (an independent read of the fix for the house's read of the 33 commits, #22, comment
+ * 6307350650). Headers are known by their text.
+ */
+function keepLines(lines: string[], max: number, keep: 'head' | 'tail', headers: ReadonlySet<string>): string[] | undefined {
+  if (lines.length <= max) return undefined;
+  let count = 0;
+  if (keep === 'tail') {
+    let i = lines.length;
+    while (i > 0 && count < max) if (!headers.has(lines[--i]!)) count++;
+    if (i > 0 && headers.has(lines[i - 1]!)) i--;
+    return i > 0 ? lines.slice(i) : undefined;
+  }
+  let i = 0;
+  while (i < lines.length && count < max) if (!headers.has(lines[i++]!)) count++;
+  return i < lines.length ? lines.slice(0, i) : undefined;
 }
 
 /** The projection's text alone (the tail survives `maxLines`); see `project`. */

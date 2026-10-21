@@ -47,7 +47,8 @@
  *   it spans the same way, and `describeGap` is the one wording of why.
  * - `tail: N` gives the last N lines of the range (the session, a Run with
  *   `runId`, bounded by `since` and `until`, which `untilOffset` can place inside
- *   an event), up to `maxBytes`. `lines` says how many were asked for and
+ *   an event), up to `maxBytes`. N counts lines of output; the header lines
+ *   naming sources come extra. `lines` says how many were asked for and
  *   returned: fewer returned without `truncated` means the range holds no more;
  *   `truncated` means `maxBytes`, retention, the scan bound or the projection's
  *   input cap cut lines (or a line's head) that were asked for. `lines.before`
@@ -70,8 +71,8 @@ import { LineScanner, type Resume, type SearchMatch } from '../core/search.js';
 import { persistentState } from '../core/screen.js';
 import { minusRanges } from '../core/ranges.js';
 import { lineBytes } from '../core/stores.js';
-import { countLines, cutTail, headIndex, indexAtByte, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length } from '../core/text.js';
-import { project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
+import { countLines, cutTail, headIndex, indexAtByte, lineCarry, lineEnds, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length, type LineCarry } from '../core/text.js';
+import { interleaveCut, project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
 
 /** A hole in the journal (G11, G19), as a result reports it: the `gap` event's range and reason. */
@@ -135,8 +136,9 @@ export interface ReadResult {
   splitLine?: boolean;
   oldestSeq?: Seq;
   /**
-   * Tail reads: lines asked for and returned. Fewer returned without `truncated`: the range holds no
-   * more; more: lines of other sources reach back to the line written last (see the module comment).
+   * Tail reads: lines of output asked for and returned (the header lines naming sources come extra).
+   * Fewer returned without `truncated`: the range holds no more; more: lines of other sources reach
+   * back to the line written last (see the module comment).
    * `before`: where a tail of what came before ends — pass its `until`, and its `untilOffset` when
    * present (the lines shown begin inside an event), as `until` and `untilOffset` beside the same
    * `tail`, so the two pages meet with nothing in neither and following it again pages further back;
@@ -236,10 +238,17 @@ const OPEN_SEQUENCE_BYTES = 1024 * 1024;
 /** Projections tried for one page before its text is accepted over budget. */
 const FIT_ATTEMPTS = 6;
 
-/** The line a hole leaves in text (G11); the compat pack's raw tail marks its holes with it too. */
+/**
+ * The line a hole leaves in text (G11); the compat pack's raw tail marks its holes with it too. A crash's
+ * hole is counted as "up to": numbering resumes above the reservation the journal had synced, so most of
+ * its range may be seqs never issued, up to 10,000 of them, and "9997 journal events missing" overstated
+ * what was lost (an independent read of the fix for the house's read of the 33 commits, #22, comment
+ * 6307350650).
+ */
 export function gapNote(g: GapInfo): string {
   const n = g.to - g.from + 1;
-  return `[… ${n} journal event${n === 1 ? '' : 's'} missing (seq ${g.from}–${g.to}: ${describeGap(g.reason)}) …]`;
+  const count = g.reason === 'torn-write' && n > 1 ? `up to ${n} journal events` : `${n} journal event${n === 1 ? '' : 's'}`;
+  return `[… ${count} missing (seq ${g.from}–${g.to}: ${describeGap(g.reason)}) …]`;
 }
 
 const gapOf = (g: Gap): GapInfo => ({ from: g.from, to: g.to, reason: g.reason });
@@ -257,7 +266,8 @@ const sourceKey = (e: Output) => (e.stream === 'pty' ? 'pty' : `p:${e.runId ?? '
 const chunkOf = (e: Output, data = e.data): ProjectChunk => ({ data, stream: e.stream, ...(e.runId !== undefined ? { runId: e.runId } : {}) });
 
 /** A piece of a page: an output event (or its part from `start` bytes on), or a hole. */
-type OutPiece = { kind: 'out'; ev: Output; data: string; start: number; bytes: number };
+/** `ends`: the line ends in `data` (lineEnds), read from the page's start, which lies outside every control sequence. */
+type OutPiece = { kind: 'out'; ev: Output; data: string; start: number; bytes: number; ends: number[] };
 type Piece = OutPiece | { kind: 'gap'; seq: Seq; gap: GapInfo; atStart?: true };
 
 /** The range a read or search walks: events after a cursor, in batches, up to an end. */
@@ -400,6 +410,8 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // ESC) or a hole makes the check run again (the house's read of 1cabc6a, #22).
   let openString: number | undefined; // pieces checked so far, while a control string is open
   const closer = /[\x07\x1b\x9c]/;
+  /** Per source, what its pieces left unfinished for the line-end rule (lineEnds). */
+  const carries = new Map<string, LineCarry>();
   const full = () => {
     if (bytes <= maxBytes) return false;
     if (bytes > maxBytes + OPEN_SEQUENCE_BYTES) return true;
@@ -427,13 +439,17 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       lastExamined = e.seq;
       if (isGap(e)) {
         pieces.push({ kind: 'gap', seq: e.seq, gap: gapOf(e) });
+        carries.clear(); // a hole ends every sequence
       } else if (isOutput(e)) {
         // The event after `since` is read from `offset` on.
         const from = o.since !== undefined && e.seq === o.since + 1 ? indexAtByte(e.data, o.offset ?? 0) : 0;
         const data = e.data.slice(from);
         if (!data) continue;
         const b = utf8Length(data);
-        pieces.push({ kind: 'out', ev: e, data, start: utf8Length(e.data.slice(0, from)), bytes: b });
+        const key = sourceKey(e);
+        let carry = carries.get(key);
+        if (!carry) carries.set(key, (carry = lineCarry()));
+        pieces.push({ kind: 'out', ev: e, data, start: utf8Length(e.data.slice(0, from)), bytes: b, ends: lineEnds(data, carry) });
         bytes += b;
       }
     }
@@ -663,15 +679,17 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
   if (k < pieces.length) {
     const crossing = out(k)!;
     const room = headIndex(crossing.data, budget - used);
-    // The last line end within the budget: after a whole event, or inside one.
+    // The last line end within the budget: after a whole event, or inside one. Line ends are the one
+    // rule's (lineEnds): a page cut at a LF inside a window title began the next page with the title's
+    // rest as text (an independent read of the fix for the house's read of the 33 commits, #22, comment
+    // 6307350650).
     let boundary = k - 1;
-    while (boundary >= 0 && !out(boundary)?.data.endsWith('\n')) boundary--;
+    while (boundary >= 0 && !endsWithLine(out(boundary))) boundary--;
     let inside: Pos | undefined;
-    const nl = room > 0 ? crossing.data.lastIndexOf('\n', room - 1) : -1;
+    const nl = lastEndBefore(crossing.ends, room);
     if (nl !== -1) inside = { j: k, at: nl + 1 };
     for (let i = k - 1; i > boundary && !inside; i--) {
-      const d = out(i)?.data;
-      const n2 = d === undefined ? -1 : d.lastIndexOf('\n');
+      const n2 = lastEndBefore(out(i)?.ends ?? [], Number.POSITIVE_INFINITY);
       if (n2 !== -1) inside = { j: i, at: n2 + 1 };
     }
     const bytesAt = (p: Pos) => before[p.j]! + utf8Length(out(p.j)!.data.slice(0, p.at));
@@ -702,7 +720,7 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
         cut = undefined;
       } else {
         const after = headIndex(fwd.text.slice(e), budget);
-        const n3 = fwd.text.lastIndexOf('\n', e + after - 1);
+        const n3 = lastEndBefore(lineEnds(fwd.text.slice(0, e + after)), e + after);
         const at = n3 >= e ? n3 + 1 : Math.max(e + 1, e + safeCut(fwd.text.slice(e), after));
         cut = throughLineEnd(pieces, fwd.locate(Math.min(at, fwd.text.length)));
       }
@@ -725,14 +743,14 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
   if (cut) {
     const pc = out(cut.j)!;
     const data = pc.data.slice(0, cut.at);
-    partial = { ...pc, data, bytes: utf8Length(data) };
+    partial = { ...pc, data, bytes: utf8Length(data), ends: pc.ends.filter((e) => e < cut!.at) };
     end = cut.j;
   }
   const taken = pieces.slice(0, end);
   if (partial) taken.push(partial);
   const chunks: ProjectChunk[] = [];
-  /** Per source: its data from the last piece that holds a LF on. */
-  const lastBySource = new Map<string, string>();
+  /** Per source: whether a line ended in what it took, and its data after its last line end. */
+  const lastBySource = new Map<string, { ended: boolean; tail: string }>();
   const sources = new Set<string>();
   const c: Chosen = { chunks, labelled: false, inputBytes: 0, taken: end, gaps: [], midLine: false, held };
   const recorded = taken.flatMap((pc) => (pc.kind === 'gap' && !pc.atStart ? [pc.gap] : []));
@@ -750,13 +768,14 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
     const key = sourceKey(pc.ev);
     sources.add(key);
     const prior = lastBySource.get(key);
-    lastBySource.set(key, prior === undefined || pc.data.includes('\n') ? pc.data : prior + pc.data);
+    const lastEnd = pc.ends[pc.ends.length - 1];
+    lastBySource.set(key, lastEnd !== undefined ? { ended: true, tail: pc.data.slice(lastEnd + 1) } : { ended: prior?.ended ?? false, tail: (prior?.tail ?? '') + pc.data });
     c.firstSeq ??= pc.ev.seq;
     c.lastSeq = pc.ev.seq;
     c.inputBytes += pc.bytes;
   }
   c.labelled = sources.size > 1;
-  c.midLine = [...lastBySource.values()].some((d) => !endsLine(d));
+  c.midLine = [...lastBySource.values()].some((d) => !d.ended || !onlyControls(d.tail));
   // The page ends inside an event: in the part it took, or where the first piece began (a page that took
   // nothing of the event it was continuing keeps the offset it was given).
   const rest = partial ?? (pieces[end]?.kind === 'out' && (pieces[end] as OutPiece).start > 0 ? { ...(pieces[end] as OutPiece), bytes: 0 } : undefined);
@@ -767,10 +786,18 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
   return c;
 }
 
-/** `d` has ended its last line: after its last LF come only carriage returns and control sequences. */
-function endsLine(d: string): boolean {
-  let i = d.lastIndexOf('\n') + 1;
-  if (i === 0) return false;
+/** The last line end in `ends` before index `before`; -1 when none. */
+function lastEndBefore(ends: readonly number[], before: number): number {
+  for (let k = ends.length - 1; k >= 0; k--) if (ends[k]! < before) return ends[k]!;
+  return -1;
+}
+
+/** The piece ends with a line end. */
+const endsWithLine = (pc: OutPiece | undefined): boolean => pc !== undefined && pc.ends[pc.ends.length - 1] === pc.data.length - 1;
+
+/** `d`, what follows a line's end, holds only carriage returns and control sequences: the line has ended. */
+function onlyControls(d: string): boolean {
+  let i = 0;
   while (i < d.length) {
     const c = d.charCodeAt(i);
     const e = c === 0x0d ? i + 1 : c === 0x1b || c === 0x9b ? sequenceEnd(d, i) : undefined;
@@ -980,8 +1007,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     if (state) chunks.push(chunkOf(firstOut, state));
   }
   const notes = new Set<string>();
-  /** Per source, a control string its last event left open (lineEndsOf); a note ends them all, as the projection's CAN does. */
-  const carries = new Map<string, { open: string }>();
+  /** Per source, what its last event left unfinished for the line-end rule (lineEnds); a note ends it all, as the projection's CAN does. */
+  const carries = new Map<string, LineCarry>();
   const note = (e: JournalEvent, text: string) => {
     chunks.push({ note: text });
     notes.add(text);
@@ -997,8 +1024,8 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       sources.add(key);
       chunks.push(chunkOf(e));
       let carry = carries.get(key);
-      if (!carry) carries.set(key, (carry = { open: '' }));
-      const item: TextItem = { ev: e, key, data: e.data, ends: lineEndsOf(e.data, carry) };
+      if (!carry) carries.set(key, (carry = lineCarry()));
+      const item: TextItem = { ev: e, key, data: e.data, ...interleaveCut(e.data, carry) };
       if (clipped && e.seq === o.until) item.clipped = true;
       items.push(item);
     } else if (o.commands && e.type === 'run.start' && e.line !== undefined) {
@@ -1021,6 +1048,11 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     const kept = lines.slice(drop);
     return { kept, drop, cutByBytes, tail: cutTail(kept.join('\n'), maxBytes) };
   };
+  // The header lines naming the sources (§6 rule 6) are no line of output: `tail: N` counts output lines, as the
+  // projection's maxLines does, and headers come extra (an independent read of the fix for the house's read of
+  // the 33 commits, #22, comment 6307350650: "3 of 1 lines", and a tail of 5 across two sources showed 4).
+  const headers = new Set([...sources].map((k) => (k === 'pty' ? '[terminal]' : `[run ${k.slice(2) || '?'}]`)));
+  const outputLines = (kept: string[]) => (multi ? kept.filter((l) => !headers.has(l)).length : kept.length);
   let all = await projectTail(n);
   let shown = fit(all, 1);
   // Fewer lines than asked is truncation only when older output was cut (by the walk's bounds, or
@@ -1034,9 +1066,6 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   let before: Position | undefined;
   let cut: Cut | undefined;
   if (shown.kept.length > 0 && items.length > 0) {
-    // The header lines naming the sources (§6 rule 6) are no line of output.
-    const headers = new Set([...sources].map((k) => (k === 'pty' ? '[terminal]' : `[run ${k.slice(2) || '?'}]`)));
-    const outputLines = (kept: string[]) => (multi ? kept.filter((l) => !headers.has(l)).length : kept.length);
     const display = new Display(items, multi);
     cut = display.cutBefore(display.shownFrom(outputLines(shown.kept)));
     if (cut && cmpCut(cut, display.end) >= 0) {
@@ -1047,7 +1076,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       // read of the 33 commits, #22, comment 6307350650, item 1). The text then reaches back to the line
       // written last, more lines than asked for; the byte cap drops none of them whole, and a cut at their head is read on by `head`.
       const z = display.lastWritten();
-      if (z.lines > all.length) all = await projectTail(Math.max(n, z.lines));
+      if (z.shown > n) all = await projectTail(z.shown);
       shown = fit(all, z.lines);
       cut = display.cutBefore(z.at);
     }
@@ -1060,8 +1089,9 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   }
   const { kept, drop, cutByBytes, tail } = shown;
   const text = tail.text;
-  const truncated = cutByBytes || (kept.length < n && older) || headCut;
-  const counts: NonNullable<ReadResult['lines']> = { requested: n, returned: kept.length };
+  const returned = outputLines(kept);
+  const truncated = cutByBytes || (returned < n && older) || headCut;
+  const counts: NonNullable<ReadResult['lines']> = { requested: n, returned };
   if (before) counts.before = before;
   // The first line returned is cut when the byte cap cut it, or when its head lies past what was
   // projected (and no line was dropped ahead of it, and it is no note): a line dropped for bytes alone
@@ -1084,7 +1114,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   return withGapInfo(r, gaps);
 }
 
-/** UTF-8 bytes from the end of the output back to where its last `n` lines begin (by line ends, lineEndsOf); all of it when it holds no more lines. */
+/** UTF-8 bytes from the end of the output back to where its last `n` lines begin (by line ends, lineEnds); all of it when it holds no more lines. */
 function lastLinesBytes(items: TextItem[], n: number): number {
   const outs = items.filter((it) => it.data !== undefined);
   let bytes = 0;
@@ -1101,59 +1131,17 @@ function lastLinesBytes(items: TextItem[], n: number): number {
 }
 
 /**
- * A piece of a tail's text in journal order: an output event's data (`key` its source; `ends` the LFs
- * in it that end lines), or a note (a hole, a command). `clipped`: the data is the event's head only,
- * the range ending inside it (`untilOffset`).
+ * A piece of a tail's text in journal order: an output event's data (`key` its source; `ends` its line
+ * ends, and `through` where the projection's interleave cuts it: interleaveCut), or a note (a hole, a
+ * command). `clipped`: the data is the event's head only, the range ending inside it (`untilOffset`).
  */
 interface TextItem {
   ev: JournalEvent;
   key?: string;
   data?: string;
   ends?: number[];
+  through?: number;
   clipped?: true;
-}
-
-/** The introducers of the control strings (OSC, DCS, SOS, PM, APC), after ESC. */
-const STRING_START = /[\]PX^_]/;
-
-/**
- * The indices of `data`'s LFs that end lines: every LF outside a control string. A string's payload is
- * not executed, so a LF in an OSC's title ends no line; counted as one, it put a cut line's head hint
- * inside the OSC, and the head-first read began with its payload (the house's read of the 33 commits,
- * #22, comment 6307350650, item 2). Strings end as `sequenceEnd` reads them. `carry` holds what the
- * source's last event left unfinished (a string's introducer, and an ESC that may begin its
- * terminator; or a lone ESC), so a string open across events is read whole; it is updated.
- */
-function lineEndsOf(data: string, carry: { open: string }): number[] {
-  const t = carry.open + data;
-  const skip = carry.open.length;
-  carry.open = '';
-  const ends: number[] = [];
-  let i = 0;
-  let esc = t.indexOf('\x1b');
-  for (;;) {
-    const nl = t.indexOf('\n', i);
-    if (esc !== -1 && (nl === -1 || esc < nl)) {
-      if (esc + 1 === t.length) {
-        carry.open = '\x1b';
-        break;
-      }
-      if (STRING_START.test(t[esc + 1]!)) {
-        const e = sequenceEnd(t, esc);
-        if (e === undefined) {
-          carry.open = t.slice(esc, esc + 2) + (t.length > esc + 2 && t.endsWith('\x1b') ? '\x1b' : '');
-          break;
-        }
-        i = e;
-      } else i = esc + 1;
-      esc = t.indexOf('\x1b', i);
-      continue;
-    }
-    if (nl === -1) break;
-    ends.push(nl - skip);
-    i = nl + 1;
-  }
-  return ends;
 }
 
 /** A point in a tail's items: after item `i`'s first `c` characters of data (a note's `c` is 1: the note itself). */
@@ -1211,11 +1199,12 @@ const lastCut = (u: Unit): Cut | undefined => unitCut(u, u.lines);
 
 /**
  * The display a tail's text is cut from, to find where the lines shown begin (`before`). It follows the
- * projection (§6 rule 6): an event's lines go out at its last LF, with what its source held before them;
+ * projection (§6 rule 6): an event's lines go out where the projection cuts it (interleaveCut, the one
+ * answer for both), with what its source held before them;
  * an unfinished line is held until its source ends it, and the held ones follow, in the order they began,
  * before a note and at the end; each change of source is headed when the page holds several, and starts on
  * a fresh line, where a LF that left the cursor short of column 0 leaves a blank line (a pty without its
- * CRs). A line ends at a LF outside a control string (lineEndsOf); a note is a line of its own.
+ * CRs). A line ends at a LF outside a control string (lineEnds); a note is a line of its own.
  *
  * The lines shown are the text's last ones, and a page of what came before ends after the last byte of
  * every line the text leaves out, so each of those is whole in it (cutBefore); a shown line begun before
@@ -1238,24 +1227,22 @@ class Display {
     let lineEnded = false;
     let col0 = true;
     let lf: Cut | undefined;
-    /** The last segment ended inside a control string, short of a line end (a row its source may go on with). */
-    let openRow: Cut | undefined;
     const segment = (key: string, source: boolean) => {
-      const row = openRow;
-      openRow = undefined;
       if (key === last) return;
-      // A row left open is a line once another segment starts on a fresh line after it (a doubt: counted).
-      if (row) units.push({ lines: 1, shown: 1, at: row });
-      else if (last !== undefined && lineEnded && !col0) units.push({ lines: 1, shown: 1, at: lf! });
+      if (last !== undefined && lineEnded && !col0) units.push({ lines: 1, shown: 1, at: lf! });
       if (multi && source) units.push({ lines: 1, shown: 0 });
       last = key;
     };
     const flush = (blankCounts: boolean) => {
       for (const [key, h] of held) {
         segment(key, true);
-        units.push({ lines: 1, shown: shows(h.data, blankCounts, multi) ? 1 : 0, at: h.at });
-        lineEnded = false;
-        col0 = h.data.endsWith('\r');
+        const visible = shows(h.data, blankCounts, multi);
+        units.push({ lines: 1, shown: visible ? 1 : 0, at: h.at });
+        // A fragment that shows nothing (a title left open) leaves the cursor where the line before it ended.
+        if (visible) {
+          lineEnded = false;
+          col0 = h.data.endsWith('\r');
+        }
       }
       held.clear();
     };
@@ -1270,7 +1257,7 @@ class Display {
       }
       const key = it.key!;
       const h = held.get(key);
-      const nl = it.data.lastIndexOf('\n');
+      const nl = it.through! - 1;
       if (nl === -1) {
         if (h) {
           h.data += it.data;
@@ -1281,22 +1268,15 @@ class Display {
       const start = last === key ? col0 : true;
       segment(key, true);
       const ends = it.ends!;
-      if (ends.length) units.push({ lines: ends.length, shown: ends.length, item: it, i });
-      lineEnded = ends[ends.length - 1] === nl;
-      if (lineEnded) {
-        lf = { i, c: nl + 1 };
-        // A pipe's LF is a CRLF (rule 6).
-        col0 = key !== 'pty' || col0After(it.data, nl, h?.data, start);
-      } else {
-        // The event's last LF lies in a control string: what went out up to it is a row its line has not
-        // ended, which its source goes on with, or another segment starts after on a fresh line.
-        openRow = { i, c: nl + 1 };
-      }
+      units.push({ lines: ends.length, shown: ends.length, item: it, i });
+      lineEnded = true;
+      lf = { i, c: nl + 1 };
+      // A pipe's LF is a CRLF (rule 6).
+      col0 = key !== 'pty' || col0After(it.data, nl, h?.data, start);
       held.delete(key);
       if (nl + 1 < it.data.length) held.set(key, { data: it.data.slice(nl + 1), at: { i, c: it.data.length } });
     });
     flush(false);
-    if (openRow) units.push({ lines: 1, shown: 1, at: openRow });
     for (const u of units) this.prefix.push(maxCut(this.prefix[this.prefix.length - 1], lastCut(u)));
     const lastItem = items[items.length - 1]!;
     this.end = { i: items.length - 1, c: lastItem.data?.length ?? 1 };
@@ -1319,8 +1299,8 @@ class Display {
     return maxCut(this.prefix[at.u], at.keep > 0 ? unitCut(this.units[at.u]!, at.keep) : undefined);
   }
 
-  /** Where the line written last begins in the display, and the text's lines from there to the end. */
-  lastWritten(): { at: { u: number; keep: number }; lines: number } {
+  /** Where the line written last begins in the display, and the text's lines from there to the end: all of them (`lines`), and those of output (`shown`). */
+  lastWritten(): { at: { u: number; keep: number }; lines: number; shown: number } {
     let u = this.units.findIndex((x) => {
       const c = lastCut(x);
       return c !== undefined && cmpCut(c, this.end) === 0;
@@ -1328,8 +1308,12 @@ class Display {
     if (u === -1) u = this.units.length - 1;
     const keep = this.units[u]!.lines - 1;
     let lines = 1;
-    for (let v = u + 1; v < this.units.length; v++) lines += this.units[v]!.lines;
-    return { at: { u, keep }, lines };
+    let shown = 1;
+    for (let v = u + 1; v < this.units.length; v++) {
+      lines += this.units[v]!.lines;
+      shown += this.units[v]!.shown;
+    }
+    return { at: { u, keep }, lines, shown };
   }
 }
 

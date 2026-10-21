@@ -754,3 +754,19 @@ test('6307351617 5: a declared Run typed but not started carries its nonce, so i
   }
   await call('killSession', { session: 'unstarted', graceful: false });
 });
+
+test('a raw tail counts a crash’s hole as up to its range, as a read does', async () => {
+  // An independent read of the fix for the house's read of the 33 commits (#22, comment 6307350650): the range a
+  // crash skipped above the last synced reservation may be mostly seqs never issued.
+  await call('runCommand', { session: 'crashhole', command: 'echo before-crash' });
+  const live = registry.get('crashhole');
+  assert.ok(live?.kind === 'live');
+  const j = live.session.journal;
+  j.append({ type: 'gap', from: j.lastSeq + 1, to: j.lastSeq + 40, reason: 'torn-write' });
+  j.append({ type: 'output', data: 'after-crash\r\n', stream: 'pty' });
+  for (const raw of [true, false]) {
+    const tail = lines(await call('tailLogs', { session: 'crashhole', lines: 50, raw }));
+    assert.ok(tail.some((l) => /^\[… up to 40 journal events missing \(seq \d+–\d+: a crash cut the journal short\) …\]$/.test(l)), `raw ${raw}: ${JSON.stringify(tail)}`);
+  }
+  await call('killSession', { session: 'crashhole', graceful: false });
+});

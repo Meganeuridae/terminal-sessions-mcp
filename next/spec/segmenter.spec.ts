@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { Journal } from '../src/core/journal.js';
 import { liveSource, renderPicked, scanLifecycle, Segmenter, type Segment, type SegmentSource } from '../src/core/segmenter.js';
 import type { RunInfo, ScreenSnapshot } from '../src/core/types.js';
-import { sleep } from './testhost.js';
+import { sleep, until } from './testhost.js';
 
 function fakeSource(): SegmentSource & { runs: Map<string, RunInfo>; screen: ScreenSnapshot } {
   const journal = new Journal();
@@ -214,4 +214,20 @@ test('G23: no segment claims chat:addressed — a Run’s end, a service, a watc
     for (const t of s.tags) assert.ok(t.startsWith('terminal:') || /^chat:from-(human|agent|self)$/.test(t), `${s.kind}: ${t} is neither a terminal:* tag nor a sender facet`);
   }
   seg.dispose();
+});
+
+test('a Run’s progress digest reads a LF inside a window title as no line end, as the transcript does', async (t) => {
+  // An independent read of the fix for the house's read of the 33 commits (#22, comment 6307350650): the digest's
+  // lines split at the title's LF, and showed `leBBB` for the line the transcript reads `AAABBB`.
+  const src = fakeSource();
+  const seg = new Segmenter(src, { runSettleMs: 5, cadenceMs: 40, screenQuietMs: 20 });
+  t.after(() => seg.dispose());
+  const out = collect(seg);
+  src.runs.set('r1', { runId: 'r1', sessionId: 's1', target: 'process', origin: 'self', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'exact', line: 'build' });
+  src.journal.append({ type: 'run.start', runId: 'r1', cwd: '/w' });
+  src.journal.append({ type: 'output', data: 'AAA\x1b]0;tit\n', stream: 'stdout', runId: 'r1' });
+  src.journal.append({ type: 'output', data: 'le\x07BBB\nnext\n', stream: 'stdout', runId: 'r1' });
+  await until(() => out.some((s) => s.kind === 'output' && s.body), 5000, 'a digest with lines');
+  const digest = out.find((s) => s.kind === 'output' && s.body);
+  assert.equal(digest?.body, 'AAABBB\nnext', JSON.stringify(out.map((s) => [s.kind, s.body])));
 });

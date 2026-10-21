@@ -10,9 +10,11 @@
  *
  * 1. Streams. The pty is one stream, and each process Run's stdout and stderr
  *    are one stream each; their lines never mix.
- * 2. Lines. A stream's raw bytes are joined across events and cut at LF, so a
- *    line is the same whatever the chunking: a CRLF, an escape sequence or a
- *    long line split across events reads as if it came in one piece.
+ * 2. Lines. A stream's raw bytes are joined across events and cut at each LF
+ *    outside a control string (`lineEnds`, the one line-end rule: a LF inside a
+ *    window title ends no line), so a line is the same whatever the chunking: a
+ *    CRLF, an escape sequence or a long line split across events reads as if it
+ *    came in one piece.
  * 3. Cleaning. The line is read as the transcript displays it (`cleanLine`):
  *    control sequences are removed, and a carriage return, a backspace, erase in
  *    line and in-line cursor moves apply as overwrites, so `ABCDE\rXY` reads
@@ -48,7 +50,7 @@
  */
 import { cleanLine } from './ansi.js';
 import { testBounded } from './regex.js';
-import { indexAtByte, unfinishedSequence, utf8Length } from './text.js';
+import { indexAtByte, lineCarry, lineEnds, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
 import type { JournalEvent, Seq } from './types.js';
 
 export interface SearchMatch {
@@ -114,6 +116,8 @@ export class LineScanner {
   private readonly recent: Array<{ text: string; cut: boolean }> = [];
   private readonly waiting: SearchMatch[] = [];
   private readonly carries = new Map<string, Carry>();
+  /** Per stream, what its data left unfinished for the line-end rule (lineEnds); a hole ends it all. */
+  private readonly scans = new Map<string, LineCarry>();
   /** Where the scan began: the point before the first event fed, as a continuation names it (rule 6). */
   private start: Resume | undefined;
 
@@ -145,6 +149,7 @@ export class LineScanner {
     this.start ??= { cursor: ev.seq - 1, offset };
     if (ev.type === 'gap') {
       this.flush(ev.seq);
+      this.scans.clear();
       return;
     }
     if (ev.type !== 'output') return;
@@ -203,13 +208,20 @@ export class LineScanner {
     let pos = 0;
     let bytes = base;
     let carry = this.carries.get(key);
+    let scan = this.scans.get(key);
+    if (!scan) this.scans.set(key, (scan = lineCarry()));
+    // A LF inside a window title ends no line: search found the title's rest as a line of its own, and not
+    // the line the tail showed (an independent read of the fix for the house's read of the 33 commits, #22,
+    // comment 6307350650).
+    const ends = lineEnds(data, scan);
+    let e = 0;
     while (pos <= data.length && !this.full) {
       if (!carry) {
         if (pos === data.length) break;
         carry = { raw: '', cut: false, start: { cursor: seq - 1, offset: bytes }, linesAt: this.lines };
         this.carries.set(key, carry);
       }
-      const nl = data.indexOf('\n', pos);
+      const nl = e < ends.length ? ends[e++]! : -1;
       const piece = data.slice(pos, nl === -1 ? undefined : nl);
       if (!carry.cut) {
         const room = MAX_LINE_RAW - carry.raw.length;

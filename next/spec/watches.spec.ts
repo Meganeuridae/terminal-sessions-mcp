@@ -184,3 +184,23 @@ test('a `once` watch is removed after its first firing', async () => {
   await sleep(300);
   assert.equal(fired(s, w.watchId).length, 1, 'it does not fire again');
 });
+
+test('a pattern watch reads a LF or CR inside a window title as no line end, as search does', async () => {
+  // An independent read of the fix for the house's read of the 33 commits (#22, comment 6307350650): the watch's
+  // line reader split at the title's LF, so `AAA` and `leBBB` were lines and `A+B+` never matched what the
+  // transcript and search read as `AAABBB`.
+  const journal = new Journal();
+  const host: WatchHost = { journal, integration: 'rich', waitAvailable: async () => false, shellAvailable: () => ({ ok: false }) };
+  const wm = new WatchManager(host);
+  try {
+    const w = wm.add({ pattern: '^A+B+$' }, A);
+    const firings = () => journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'watch.fired' }> => e.type === 'watch.fired' && e.watchId === w.watchId);
+    journal.append({ type: 'output', data: 'AAA\x1b]0;tit\r\nle\x07BBB\r\n', stream: 'pty' });
+    journal.append({ type: 'output', data: 'AAAA\x1b]0;a\rb', stream: 'pty' });
+    journal.append({ type: 'output', data: '\x07BBBB\r\n', stream: 'pty' });
+    await until(() => firings().length === 2, 2500, 'both lines matched');
+    assert.deepEqual(firings().map((f) => f.match), ['AAABBB', 'AAAABBBB']);
+  } finally {
+    wm.dispose();
+  }
+});

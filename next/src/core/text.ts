@@ -89,13 +89,10 @@ export function cutTail(text: string, maxBytes: number): { text: string; cut: bo
 export function tailStart(text: string, maxBytes: number): number {
   if (utf8Length(text) <= maxBytes) return 0;
   const start = pastSequence(text, tailIndex(text, Math.max(0, maxBytes)));
-  // The line boundary preferred is a real one: a newline inside a control string begins no line.
-  let nl = text.indexOf('\n', start);
-  while (nl !== -1 && nl + 1 < text.length) {
-    const inside = enclosingSequence(text, nl + 1, Number.POSITIVE_INFINITY);
-    if (!inside) break;
-    nl = text.indexOf('\n', inside.end ?? text.length);
-  }
+  // The line boundary preferred is a real one (lineEnds): a newline inside a control string begins no
+  // line. `start` lies outside every sequence, and a boundary farther than half the budget is no use.
+  const e = lineEnds(text.slice(start, start + Math.floor(maxBytes / 2)), lineCarry(), 1)[0];
+  const nl = e === undefined ? -1 : start + e;
   return nl !== -1 && nl + 1 < text.length && utf8Length(text.slice(start, nl + 1)) <= maxBytes / 2 ? nl + 1 : start;
 }
 
@@ -111,6 +108,72 @@ function pastSequence(text: string, index: number): number {
   if (i > 0 && i < text.length && isLow(text.charCodeAt(i)) && isHigh(text.charCodeAt(i - 1))) i++;
   if (i > 0 && i < text.length && text[i - 1] === '\r' && text[i] === '\n') i++;
   return i;
+}
+
+/**
+ * What a stream's data left unfinished for `lineEnds`: the introducer of a control string still open,
+ * and an ESC that may begin its terminator; or a lone ESC that may begin one.
+ */
+export interface LineCarry {
+  open: string;
+}
+
+export const lineCarry = (): LineCarry => ({ open: '' });
+
+/** The introducers of the control strings (OSC, DCS, SOS, PM, APC), after ESC. */
+const STRING_START = /[\]PX^_]/;
+
+/**
+ * The indices of `data`'s LFs that end lines (with `cr`, its CRs too), at most `max` of them: every
+ * one outside a control string (OSC, DCS, SOS, PM, APC), whose payload the terminal does not execute,
+ * so a LF in a window title ends no line. Strings end as `sequenceEnd` reads them. `carry` is what the
+ * stream's data before this left unfinished, and is updated, so a string open across events is read
+ * whole; a new stream, or one after a hole, starts with a fresh carry. The one rule for every reader of
+ * lines: the reader's pages and tails, search, the projection's interleave and its cuts, `tailStart`,
+ * the segmenter's lines and the watches' (the house's read of the 33 commits, #22, comment
+ * 6307350650, item 2, and an independent read of the fix: only the tail kept it, and a page, a search
+ * and the projection split a title in two).
+ */
+export function lineEnds(data: string, carry: LineCarry = lineCarry(), max = Number.POSITIVE_INFINITY, cr = false): number[] {
+  const t = carry.open + data;
+  const skip = carry.open.length;
+  carry.open = '';
+  const ends: number[] = [];
+  // The next ESC, LF and CR at or after `i`, each searched for again only once `i` passes it: a redraw
+  // flood of sequences with few line ends would otherwise search to the far line end once per sequence.
+  let i = 0;
+  let esc = t.indexOf('\x1b');
+  let lf = t.indexOf('\n');
+  let ret = cr ? t.indexOf('\r') : -1;
+  const advance = () => {
+    if (lf !== -1 && lf < i) lf = t.indexOf('\n', i);
+    if (ret !== -1 && ret < i) ret = t.indexOf('\r', i);
+  };
+  while (ends.length < max) {
+    const nl = lf === -1 ? ret : ret === -1 ? lf : Math.min(lf, ret);
+    if (esc !== -1 && (nl === -1 || esc < nl)) {
+      if (esc + 1 === t.length) {
+        carry.open = '\x1b';
+        break;
+      }
+      if (STRING_START.test(t[esc + 1]!)) {
+        const e = sequenceEnd(t, esc);
+        if (e === undefined) {
+          carry.open = t.slice(esc, esc + 2) + (t.length > esc + 2 && t.endsWith('\x1b') ? '\x1b' : '');
+          break;
+        }
+        i = e;
+      } else i = esc + 1;
+      esc = t.indexOf('\x1b', i);
+      advance();
+      continue;
+    }
+    if (nl === -1) break;
+    ends.push(nl - skip);
+    i = nl + 1;
+    advance();
+  }
+  return ends;
 }
 
 /** How many newlines `s` holds. */

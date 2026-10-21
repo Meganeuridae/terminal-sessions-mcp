@@ -498,3 +498,29 @@ test('transcript() is project().text with the old defaults', async () => {
   assert.equal(await transcript([{ data: 'a\nb\n', stream: 'stdout' }]), 'a\nb');
   assert.equal(await transcript([numbered(10)], { maxLines: 3 }), 'L7\nL8\nL9');
 });
+
+// ───────────── an independent read of the fix for the house's read of the 33 commits (#22, comment 6307350650) ─────────────
+
+const sourceLabel = (s: { stream: string; runId?: string }) => (s.stream === 'pty' ? '[terminal]' : `[run ${s.runId}]`);
+
+test('the interleave cuts a source only at a line end: a LF inside a window title, with another source after it, splits nothing', async () => {
+  // The pty's event was emitted through its last LF, inside the title; the Run's header then went out inside
+  // the title, which a CAN ended, and the title's rest (`y`) showed as text, its line split in two.
+  const p = await project([{ data: 'a\r\nT\x1b]0;x\r\n', stream: 'pty' }, { data: 'run line\n', stream: 'stdout', runId: 'r1' }, { data: 'y\x07rest\r\n', stream: 'pty' }], { cols: 80, rows: 24, label: sourceLabel });
+  assert.equal(p.text, '[terminal]\na\n[run r1]\nrun line\n[terminal]\nTrest');
+});
+
+test('maxLines counts lines of output: the headers naming sources come extra, with the one naming the first line’s source', async () => {
+  const chunks: ProjectChunk[] = [{ data: 'p1\r\np2\r\n', stream: 'pty' }, { data: 'r1\nr2\n', stream: 'stdout', runId: 'r1' }, { data: 'p3\r\n', stream: 'pty' }];
+  assert.equal((await project(chunks, { cols: 80, rows: 24, label: sourceLabel, maxLines: 3 })).text, '[run r1]\nr1\nr2\n[terminal]\np3');
+  assert.equal((await project(chunks, { cols: 80, rows: 24, label: sourceLabel, maxLines: 3, keep: 'head' })).text, '[terminal]\np1\np2\n[run r1]\nr1');
+});
+
+test('a held line cut for the byte budget drops what was emitted before it: a title’s payload after a whole line keeps only the tail', async () => {
+  // `head\r\n`, then an OSC 52 of 10 KB in a later chunk with no line end, under a 4 KiB budget: `head` survived
+  // the payload between it and the end.
+  const pay = 'QUJD'.repeat(2600);
+  const read = async (chunks: string[]) => (await project(chunks, { cols: 80, rows: 24, maxInputBytes: 4096 })).text;
+  assert.equal(await read(['head\r\n', `\x1b]52;c;${pay}`, 'tail-of-payload\x07 after']), ' after');
+  assert.equal(await read([`head\r\n\x1b]52;c;${pay}tail-of-payload\x07 after`]), ' after', 'as in one chunk');
+});
