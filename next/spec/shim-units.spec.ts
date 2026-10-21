@@ -9,6 +9,8 @@ import assert from 'node:assert/strict';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import fsModule from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { spawn } from 'node:child_process';
 import * as http from 'node:http';
 import * as net from 'node:net';
@@ -492,7 +494,40 @@ test("a connection the listener has yet to accept is looked up again until it is
   }
 });
 
-test("an answer counts only from the termd's own socket: a listener of another process that echoes its pid is not asked, and is sent no credential (a reviewer's read of the fixes for #22)", async (t) => {
+/** How long an impostor helper (a node process) may take to start listening on a loaded host before its test fails. */
+const IMPOSTOR_START_MS = 20_000;
+
+test("a connection whose other end /proc lists twice is refused: which of the two answered cannot be told (the house's read of the 17 commits over our fixes, #22)", { skip: process.platform !== 'linux' && 'Linux shows whose a socket is' }, async (t) => {
+  // This process's own listener, and a /proc/net/tcp read through node's fs that lists its side of the connection twice.
+  const server = net.createServer(() => {});
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as { port: number }).port;
+  const socket = await new Promise<net.Socket>((resolve, reject) => {
+    const c = net.connect({ host: '127.0.0.1', port });
+    c.once('connect', () => resolve(c));
+    c.once('error', reject);
+  });
+  try {
+    assert.equal(await connectionOf(socket, process.pid), undefined, 'listed once, it is shown as this process\'s');
+    const server_ = procAddress('127.0.0.1', port, false)!;
+    const read = fsModule.readFileSync;
+    t.mock.method(fsModule, 'readFileSync', ((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      const text = (read as (f: fs.PathOrFileDescriptor, o?: unknown) => string | Buffer)(file, options);
+      if (file !== '/proc/net/tcp' || typeof text !== 'string') return text;
+      const twice = text.split('\n').flatMap((line) => (line.trim().split(/\s+/)[1] === server_ ? [line, line] : [line]));
+      return twice.join('\n');
+    }) as typeof fs.readFileSync);
+    syncBuiltinESMExports();
+    assert.equal(await connectionOf(socket, process.pid), `more than one socket is the other end of this connection on port ${port}`);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    socket.destroy();
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test("an answer counts only from the termd's own socket: a listener of another process that echoes its pid is not asked, and is sent no credential (a reviewer's read of the fixes for #22)", async () => {
   if (process.platform !== 'linux') {
     // Whose a socket is cannot be shown here, so no answer is taken.
     const socket = new (await import('node:net')).Socket();
@@ -504,10 +539,12 @@ test("an answer counts only from the termd's own socket: a listener of another p
   let out = '';
   impostor.stdout!.on('data', (b: Buffer) => (out += b.toString()));
   try {
-    const deadline = Date.now() + 5000;
-    while (!/port \d+/.test(out) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    // Its start is awaited by its own line or its exit, and one that doesn't start fails the test: a skip let a slow
+    // host drop the assertions below (the house's read of the 17 commits over our fixes, #22).
+    const deadline = performance.now() + IMPOSTOR_START_MS;
+    while (!/port \d+/.test(out) && impostor.exitCode === null && performance.now() < deadline) await new Promise((r) => setTimeout(r, 20));
     const port = Number(/port (\d+)/.exec(out)?.[1]);
-    if (!port) return t.skip('the impostor did not start');
+    assert.ok(port, `the impostor started (exit ${impostor.exitCode}, said ${JSON.stringify(out)})`);
     assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 3000, token: 'shim-token' }), { error: `the socket that answered on port ${port} is not its` });
     assert.doesNotMatch(out, /asked/, 'no request reached it, so no credential');
     // The same ask of a listener this process owns is answered.
@@ -546,9 +583,9 @@ test("the other end of a connection is found by both its addresses whole, so a c
   impostor.stdout!.on('data', (b: Buffer) => (out += b.toString()));
   const sockets: net.Socket[] = [];
   try {
-    const deadline = Date.now() + 5000;
-    while (!out.includes('listening') && impostor.exitCode === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
-    if (!out.includes('listening')) return t.skip('the impostor did not start');
+    const deadline = performance.now() + IMPOSTOR_START_MS;
+    while (!out.includes('listening') && impostor.exitCode === null && performance.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(out.includes('listening'), `the impostor started (exit ${impostor.exitCode}, said ${JSON.stringify(out)})`);
     const connect = (o: net.NetConnectOpts) =>
       new Promise<net.Socket>((resolve, reject) => {
         const c = net.connect(o);
