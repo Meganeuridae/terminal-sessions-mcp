@@ -175,10 +175,19 @@ function runningUnit(text: string[], running: Record<string, string>): UnitText 
 }
 
 /**
+ * termd's flags that take no value (daemon.ts's FLAGS, which a spec holds this to). The word after one is
+ * an argument of its own, not the flag's value.
+ */
+export const TERMD_BOOLEAN_FLAGS: ReadonlySet<string> = new Set(['--help', '--no-usage-log', '--headless']);
+
+/**
  * The first argument past the first option that an expansion may make an option of its own: a flag
  * whose name holds one, or a word that begins with one and is not the first value of the flag before
- * it. Before the first option stand the launcher and its script, and an option there is overridden by
- * a later literal one (termd takes an option's last value) or falls to the environment, unknown already.
+ * it, a flag that takes no value having none: read as `--headless`'s value, a `--headless ${X}` whose X
+ * a file sets to `--data-dir=/x` passed unflagged (the house's review of 4f4c067..a8b6f28, #22 comment
+ * 6323055715). Before the first option stand the launcher and its script, and an option there is
+ * overridden by a later literal one (termd takes an option's last value) or falls to the environment,
+ * unknown already.
  */
 function looseExpansion(argv: readonly string[]): string | undefined {
   let options = false;
@@ -187,7 +196,7 @@ function looseExpansion(argv: readonly string[]): string | undefined {
     if (w.startsWith('--')) {
       options = true;
       if (w.slice(0, (w.indexOf('=') + 1 || w.length + 1) - 1).includes(UNREAD)) return `an option named by a variable (${w.replaceAll(UNREAD, '${…}')})`;
-      firstValue = !w.includes('=');
+      firstValue = !w.includes('=') && !TERMD_BOOLEAN_FLAGS.has(w);
     } else if (options) {
       if (!firstValue && w.startsWith(UNREAD)) return `an argument (${w.replaceAll(UNREAD, '${…}')})`;
       firstValue = false;
@@ -254,18 +263,35 @@ function throughEnv(u: UnitText, o: { program?: 'path' } = {}): UnitText {
 
 /**
  * The environment of a running process of this user's, as Linux shows it in /proc/<pid>/environ: what
- * its program was given when it was started, which is what termd read; or why it cannot be read. Only
- * this user's: whose a process is is said by its /proc entry's owner.
+ * its program was given when it was started, which is what termd read; or why it cannot be read, and
+ * whether the process is then this user's and alive. Whose a process is is its real uid in
+ * /proc/<pid>/status: its /proc entries belong to root while it is not dumpable, though it is still this
+ * user's, and its environment then reads EACCES. Such a termd is alive and unreadable, so what it was
+ * given is unknown: read from the manager's instead, it was taken for what the unit's restart would take
+ * (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715). A process that has gone, a pid
+ * another user's after reuse, a zombie or one showing no environment is the unit's termd no more, or
+ * was started with none, and reads as not alive: the unit's text is what its restart takes.
  */
-export function procEnviron(pid: number): { env: Record<string, string> } | { error: string } {
+export function procEnviron(pid: number): { env: Record<string, string> } | { error: string; alive: boolean } {
+  const fault = (e: unknown) => {
+    const code = (e as NodeJS.ErrnoException).code;
+    // ESRCH: it exited between the open and the read.
+    return code === 'ENOENT' || code === 'ESRCH' ? { error: 'it has gone', alive: false } : { error: code ?? (e as Error).message, alive: true };
+  };
+  let status: string;
   try {
-    if (fs.statSync(`/proc/${pid}`).uid !== process.getuid?.()) return { error: "it is another user's process" };
+    status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+  } catch (e) {
+    return fault(e);
+  }
+  if (Number(/^Uid:\s+(\d+)/m.exec(status)?.[1]) !== process.getuid?.()) return { error: "it is another user's process", alive: false };
+  if (/^State:\s+Z/m.test(status)) return { error: 'it has exited', alive: false };
+  try {
     const text = fs.readFileSync(`/proc/${pid}/environ`, 'utf8');
-    // A process that has exited but not been reaped shows none.
-    if (!text) return { error: 'it shows no environment' };
+    if (!text) return { error: 'it shows no environment', alive: false };
     return { env: parseEnvNul(text) };
   } catch (e) {
-    return { error: (e as NodeJS.ErrnoException).code ?? (e as Error).message };
+    return fault(e);
   }
 }
 

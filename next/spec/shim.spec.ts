@@ -1037,8 +1037,20 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     assert.ok(listening, `the stand-in termd did not start: ${stderr}`);
     return { pid: child.pid!, port: Number(new URL((JSON.parse(listening) as { url: string }).url).port) };
   };
+  /** A process of this user's that is not dumpable, so its environment reads EACCES; undefined without python3. */
+  const undumpable = async (): Promise<number | undefined> => {
+    const child = spawn('python3', ['-c', 'import ctypes,time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); print("ready", flush=True); time.sleep(60)'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    stand.push(child);
+    const ready = await new Promise<boolean>((resolve) => {
+      child.stdout!.once('data', () => resolve(true));
+      child.once('error', () => resolve(false));
+      child.once('exit', () => resolve(false));
+    });
+    return ready ? child.pid : undefined;
+  };
   const toldDir = path.join(tmp, 'sup-data-dir-told-by-the-running-termd');
   const told = linux ? await liveTermd(toldDir) : undefined;
+  const sealed = linux && process.getuid?.() !== 0 ? await undumpable() : undefined;
   const edited = path.join(tmp, 'edited-termd.service');
   fs.writeFileSync(edited, '[Service]\n');
   // Edited after its termd started, and read since by a daemon-reload: newer than any process here.
@@ -1101,6 +1113,8 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // One that cannot be asked leaves the text, and the note says when the text may have changed since it started.
     { name: 'running-unit-needs-a-daemon-reload', when: linux, stub: (dataDir) => unitStub({ port: 3101, needReload: true, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /\(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"; the unit's text may have changed since that termd started: systemd says the unit needs a daemon-reload\) serves port 3101 out of the data dir/ },
     { name: 'running-unit-file-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: edited, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+edited-termd\.service is newer than its start\) serves port 3101 out of the data dir/ },
+    // This user's live termd whose environment reads EACCES: unknown, not the manager's (which here names the shim's own data dir).
+    { name: 'running-termd-alive-and-unreadable', when: sealed !== undefined, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir }, mainPid: sealed! }), expect: 'unknown', says: /the systemd user unit termd's running termd, pid \d+, is this user's, and its environment could not be read \(EACCES\); its running termd could not be asked: .*, so its port and data dir are unknown/ },
     // An env prefix is environment, as env applies it: read as arguments, these units were $HOME/.tsm.
     { name: 'data-dir-in-an-env-prefix', when: true, stub: (dataDir) => unitStub({ port: 3101, prefix: ['/usr/bin/env', `TSM_DATA_DIR=${dataDir}`] }), expect: 'shared', says: /serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
     // Under an EnvironmentFile=, a ${NAME} in another option left --port and --data-dir unknown too.

@@ -359,6 +359,9 @@ async function checkSupervisor(): Promise<Supervisor> {
       notAsked = `; its running termd could not be asked: ${told.error}${unitChanged(pid, prop)}`;
     }
     const proc = pid > 0 ? procEnviron(pid) : undefined;
+    // This user's live termd whose environment cannot be read: what it was given is unknown, and the
+    // manager's is not it (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715).
+    if (proc && 'alive' in proc && proc.alive) return { kind: 'unknown', why: `the systemd user unit termd's running termd, pid ${pid}, is this user's, and its environment could not be read (${proc.error})${notAsked}, so its port and data dir are unknown` };
     let more: Parameters<typeof systemctlUnit>[2];
     let from: string;
     if (proc && 'env' in proc) {

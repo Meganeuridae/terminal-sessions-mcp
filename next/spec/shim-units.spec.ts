@@ -11,8 +11,11 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import * as http from 'node:http';
+import { fileURLToPath } from 'node:url';
 import { askDataDir, titlePort } from '../src/shim/running.js';
-import { launchctlUnit, plistUnit, procEnviron, systemctlUnit, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
+import { launchctlUnit, plistUnit, procEnviron, systemctlUnit, TERMD_BOOLEAN_FLAGS, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
 
 /** ExecStart as systemd 255 prints it: the argv joined by one space each, unquoted; `prefix` goes before the launcher (an `env …`). */
 const execStart = (argv: string[], prefix: string[] = []) => `{ path=${prefix[0] ?? '/bin/sh'} ; argv[]=${[...prefix, '/bin/sh', '/pkg/next/config/termd-launch.sh', ...argv].join(' ')} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }`;
@@ -189,6 +192,14 @@ test("under an EnvironmentFile=, a ${NAME} makes unknown only what it can be: th
   assert.deepEqual(unitPort(opts), loose);
   assert.deepEqual(unitDataDir(opts), loose);
   assert.deepEqual(unitPort(read(['--${OPT}', '4100', '--data-dir', '/srv/unit'])), { unknown: `passes an option named by a variable (--\${…}) from ${which} where termd may read it as an option of its own` });
+  // A flag that takes no value has none: the word after it is an argument of its own, so `--headless ${X}` may hold an
+  // option. Read as --headless's value, it passed unflagged (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715).
+  for (const flag of ['--headless', '--no-usage-log']) {
+    const after = read(['--port', '3101', '--data-dir', '/srv/unit', flag, '${X}']);
+    assert.deepEqual(unitPort(after), loose, flag);
+    assert.deepEqual(unitDataDir(after), loose, flag);
+  }
+  assert.equal(unitPort(read(['--headless', '--port', '3101', '--data-dir', '/srv/unit'])), '3101', 'a flag that takes no value, then a literal option');
   // Before the first option stand the launcher and its script: a literal option after them wins.
   assert.equal(unitPort(read(['${OPTS}', '--port', '3101', '--data-dir', '/srv/unit'])), '3101');
   // A relative data dir is taken from $HOME, which the file may set; an absolute one is not.
@@ -251,12 +262,37 @@ test("a running termd's environment is the one read when Linux shows it: whole, 
     assert.ok(u, 'the ExecStart is read, ${BASE} from the running environment');
     assert.equal(unitDataDir(u), '/srv/at-start', 'what termd was given, not the manager or the unit text now');
     assert.equal(unitPort(u), '3101');
-    if (process.getuid?.() !== 0) assert.deepEqual(procEnviron(1), { error: "it is another user's process" });
+    if (process.getuid?.() !== 0) assert.deepEqual(procEnviron(1), { error: "it is another user's process", alive: false });
   } finally {
     child.kill();
   }
   await new Promise((r) => child.once('exit', r));
-  assert.deepEqual(procEnviron(child.pid!), { error: 'ENOENT' }, 'a process that has gone');
+  assert.deepEqual(procEnviron(child.pid!), { error: 'it has gone', alive: false }, 'a process that has gone');
+});
+
+test("termd's flags that take no value are the shim's: read from daemon.ts's FLAGS, which a spec must not import (it starts a daemon)", () => {
+  const source = fs.readFileSync(path.resolve(here, '../../src/daemon.ts'), 'utf8');
+  const flags = /const FLAGS = \{([\s\S]*?)\n\} as const;/.exec(source)?.[1];
+  assert.ok(flags, "daemon.ts's FLAGS table");
+  const booleans = [...flags.matchAll(/^\s*'?([\w-]+)'?: \{ type: 'boolean'/gm)].map((m) => `--${m[1]}`);
+  assert.deepEqual([...TERMD_BOOLEAN_FLAGS].sort(), booleans.sort());
+});
+
+test("this user's live termd whose environment cannot be read is alive and unreadable, not gone: its real uid, not its /proc entry's owner, says whose it is (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715)", { skip: process.platform !== 'linux' && 'Linux shows a process environment in /proc' }, async (t) => {
+  // A process that is not dumpable has root's /proc entries and an environ only root reads, though it is this user's.
+  const child = spawn('python3', ['-c', 'import ctypes,sys,time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); print("ready", flush=True); time.sleep(30)'], { stdio: ['ignore', 'pipe', 'ignore'] });
+  try {
+    const ready = await new Promise<boolean>((resolve) => {
+      child.stdout!.once('data', () => resolve(true));
+      child.once('error', () => resolve(false));
+      child.once('exit', () => resolve(false));
+    });
+    if (!ready) return t.skip('no python3 to make a process that is not dumpable');
+    if (process.getuid?.() === 0) return t.skip('root reads every environ');
+    assert.deepEqual(procEnviron(child.pid!), { error: 'EACCES', alive: true });
+  } finally {
+    child.kill();
+  }
 });
 
 test("a running termd is asked for its data dir on the port its title names, and only the pid asked about counts as its answer (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715, question 1)", async () => {
