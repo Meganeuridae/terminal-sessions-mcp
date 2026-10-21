@@ -616,6 +616,16 @@ test('an escape before a struck probe echo stays with the output: a colour, a ti
   }
 });
 
+test('a probe an earlier build typed, printf-built and naming no pid, is struck whole from its echo when a program read it, as the current one is', () => {
+  // A reviewer's read of the fixes for #22: the probe the builds through 4f4c067 typed was no line PROBE_LINES knew once the
+  // probe named the shell's pid, so a program's prompt line kept its lead, `Continue? ^C{ printf '%s>>>\n' "`.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  for (const probe of [` { printf '%s>>>\\n' "<<<PRO""BE:${N}"; } 2>/dev/null`, ` printf '%s>>>\\n' "<<<PRO""BE:${N}"`]) {
+    const read = `${typed(N)}<<<START:${N}:4242>>>\r\nContinue? ^C${probe.trimStart()}\r\nno\r\n<<<EXIT:${N}:0>>>\r\n`;
+    assert.equal(cutPlumbing(read, marker), 'Continue? ^C\r\nno\r\n', probe);
+  }
+});
+
 test('with no nonce recorded, a program’s own split mark word inside a title or a DCS splits nothing: the payload stays hidden', async () => {
   // An independent read of the fix: `<<<PRO''BE:` inside a title split it, the line was struck as a probe's echo, and the
   // title's payload showed (`out1\nsecretafter`).

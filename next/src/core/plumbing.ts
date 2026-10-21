@@ -260,7 +260,12 @@ export const sourceLineEcho = (): RegExp => {
 const PROBE_LINES = new Map<string, { leads: string[]; rests: string[] }>();
 /** The marker strategy's probe as builds before it was printf-built typed it, which journals keep. */
 const LEGACY_PROBE = ` echo "<<<PRO""BE:${AT_NONCE}>>>"`;
-for (const line of [...FLAVORS.map((f) => markerProbe(AT_NONCE, f)), LEGACY_PROBE, inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true)]) {
+/**
+ * The marker strategy's probe as builds before it named the shell's pid typed it, printf-built: its lead
+ * stayed on a program's prompt line once the probe named a pid (a reviewer's read of the fixes for #22).
+ */
+const PIDLESS_PROBES = FLAVORS.map((f) => ` ${untraced(printedMark('PRO""BE', AT_NONCE), f)}`);
+for (const line of [...FLAVORS.map((f) => markerProbe(AT_NONCE, f)), ...PIDLESS_PROBES, LEGACY_PROBE, inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true)]) {
   const [before, after] = line.split(AT_NONCE) as [string, string];
   const at = before.indexOf('<<<');
   const lines = PROBE_LINES.get(before.slice(at)) ?? { leads: [], rests: [] };
