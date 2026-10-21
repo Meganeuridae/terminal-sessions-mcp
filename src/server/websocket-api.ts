@@ -203,17 +203,15 @@ export class SessionAPI {
           result = await this.server.startService(params);
           break;
           
-        case 'session.input': {
-          const { clearedHeldLine } = this.server.sendInput(params.sessionId, params.input, params.appendNewline, params.keys);
-          result = { success: true, clearedHeldLine };
+        case 'session.input':
+          this.server.sendInput(params.sessionId, params.input, params.appendNewline, params.keys);
+          result = { success: true };
           break;
-        }
           
-        case 'session.signal': {
-          const { clearedHeldLine } = this.server.sendSignal(params.sessionId, params.signal);
-          result = { success: true, clearedHeldLine };
+        case 'session.signal':
+          this.server.sendSignal(params.sessionId, params.signal);
+          result = { success: true };
           break;
-        }
           
         case 'session.env':
           result = await this.server.getEnvironment(params.sessionId);

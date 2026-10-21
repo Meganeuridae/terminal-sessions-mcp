@@ -48,9 +48,9 @@ export function decodeKey(name: string): string {
 }
 
 /**
- * Build the byte string a sendInput call writes to the PTY. (sendInput adds
- * ^U and Enter after a lone ^C that gives up a body the shell is partway
- * through reading; see CLEAR_HELD_LINE in the session server.)
+ * Build the byte string a sendInput call writes to the PTY. (sendInput
+ * may write nothing for a lone ^C; see withholdsLoneCtrlC in the session
+ * server.)
  *
  * - `input` is passed through verbatim, followed by decoded `keys`.
  * - Enter (\r — what a real Enter key sends; correct for canonical-mode
