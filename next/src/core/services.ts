@@ -464,11 +464,18 @@ export class ServiceMonitor {
     this.timers.add(t);
   }
 
+  /**
+   * Stop every timer, and let the readings go: an ended or disposed monitor keeps only what info() reports, where its
+   * readings' open lines, each up to MAX_LINE of raw text, stayed for the session's life (our review of the 73
+   * commits through 4860d4c, PR #22).
+   */
   private stopTimers(): void {
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
-    this.lines?.splitter.dispose();
-    for (const r of this.pipes.values()) r.splitter.dispose();
+    for (const r of this.readings()) r.splitter.dispose();
+    this.lines = undefined;
+    this.pipes.clear();
+    this.prompted.clear();
   }
 
   private setStatus(status: ServiceStatus, evidence: string, cause?: UnhealthyCause): void {
