@@ -280,6 +280,25 @@ const gapOf = (g: Gap): GapInfo => ({ from: g.from, to: g.to, reason: g.reason, 
  */
 const vouched = (journal: Journal, g: GapInfo): GapInfo => (g.exact === undefined && journal.runs.countsExactly(g.from, g.to) ? { ...g, exact: true } : g);
 
+/**
+ * Add a hole to those a scan reports, as one with a reported hole of its reason that it overlaps. Before the store
+ * heals, a read shows a lost stretch as a gap seated at its last seq, and the catch-up then records it at a new seq,
+ * with the same range or one grown since: a search that yields between its batches met both, and reported one hole
+ * twice (an independent read of the fixes for the review of f3750e4, PR #22, its question 1). Matched by range rather than by marking the read's
+ * gap provisional: the recorded gap carries the stretch's range, reason and count, so any reader can tell the two
+ * apart from other holes, and no event or result gains a mark.
+ */
+function addHole(gaps: GapInfo[], g: GapInfo): void {
+  const same = gaps.find((h) => h.reason === g.reason && h.from <= g.to && g.from <= h.to);
+  if (!same) {
+    gaps.push(g);
+    return;
+  }
+  same.from = Math.min(same.from, g.from);
+  same.to = Math.max(same.to, g.to);
+  if (!g.exact) delete same.exact;
+}
+
 /** Report the holes a result spans: the first as `gap`, all of them as `gaps` when there are several. */
 function withGapInfo<R extends { gap?: GapInfo; gaps?: GapInfo[] }>(r: R, gaps: GapInfo[]): R {
   if (gaps.length) r.gap = gaps[0]!;
@@ -1692,7 +1711,7 @@ export async function searchJournal(src: ReadSource, o: SearchOptions, limits: P
         stoppedBy = 'time';
         break outer;
       }
-      if (isGap(e)) gaps.push(gapOf(e));
+      if (isGap(e)) addHole(gaps, gapOf(e));
       scanner.feed(e, since !== undefined && e.seq === since + 1 ? (o.offset ?? 0) : 0);
       firstSeq ??= e.seq;
       lastSeq = e.seq;

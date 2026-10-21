@@ -1327,6 +1327,46 @@ test('a page read from an offset inside a CSI that a LF ran through applies the 
   assert.equal(page.text, 'B here\nafter');
 });
 
+test('a search that reads across the store healing reports a lost stretch once: the gap a read showed before the heal and the one the catch-up records are one hole', async () => {
+  // Before the heal a read shows the stretch as a gap seated at its last seq; the catch-up records it at a new seq,
+  // and a search that yields between its batches met both (an independent read of the fixes for the review of f3750e4, PR #22, its question 1).
+  class Refusing extends MemoryStore {
+    broken = false;
+    override append(e: Parameters<MemoryStore['append']>[0]): void {
+      if (this.broken) throw new Error('ENOSPC: no space left on device, write');
+      super.append(e);
+    }
+  }
+  /** Heals the disk right after the read its first batch makes, as a heal between a search's batches would. */
+  class HealsAfterFirstRead extends Journal {
+    heal: (() => void) | undefined;
+    override range(from: number, to?: number, limit?: number): ReturnType<Journal['range']> {
+      const r = super.range(from, to, limit);
+      const heal = this.heal;
+      this.heal = undefined;
+      heal?.();
+      return r;
+    }
+  }
+  const cold = new Refusing();
+  const j = new HealsAfterFirstRead({ sessionId: 's', hot: new MemoryStore(400_000), cold });
+  for (let i = 0; i < 3; i++) out(j, `ok ${i}\r\n`);
+  cold.broken = true;
+  for (let i = 0; i < 100; i++) out(j, `big ${i} ${'b'.repeat(5000)}\r\n`);
+  for (let i = 0; i < 2500; i++) out(j, `small ${i}\r\n`);
+  const lost = j.since(0, 4).events[3]!;
+  assert.ok(lost.type === 'gap' && lost.from === 4, JSON.stringify(lost));
+  j.heal = () => {
+    cold.broken = false;
+    assert.equal(j.retryCold(), true);
+  };
+  const r = await searchJournal(source({ journal: j }), { pattern: 'no such line', since: 0 });
+  assert.equal(r.more, false);
+  assert.ok(j.since(lost.seq).events.some((e) => e.type === 'gap' && e.from === 4 && e.seq > lost.seq), 'the catch-up recorded it at a new seq');
+  assert.deepEqual(r.gap, { from: 4, to: lost.to, reason: 'store-error', exact: true });
+  assert.equal(r.gaps, undefined, 'one hole');
+});
+
 test('paging back past a title left open before a hole reaches every line: the title shows nothing, and the row its LF left counts', async () => {
   // `one`, `two` ended by a bare LF, a title the hole leaves open, then the hole: the hole's line starts after a
   // blank row, which the tail had read as `two`, so the page before ended after `one`.
