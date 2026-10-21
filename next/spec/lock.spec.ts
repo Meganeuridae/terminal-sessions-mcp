@@ -446,12 +446,22 @@ test('Linux: a zombie holder is gone — its stat still has the start ticks and 
   // sh starts the holder, then becomes `sleep`, which never waits for it: killed, it stays a zombie.
   const parent = spawn('sh', ['-c', `${JSON.stringify(process.execPath)} ${JSON.stringify(holder)} & exec sleep 20`], { stdio: 'ignore' });
   try {
-    for (let i = 0; i < 200 && !fs.existsSync(path.join(dir, LOCK_FILE)); i++) await new Promise((r) => setTimeout(r, 25));
-    await new Promise((r) => setTimeout(r, 400));
-    const pid = readLock(dir).pid;
-    assert.equal(parseProcStat(fs.readFileSync(`/proc/${pid}/stat`, 'utf8'))?.state, 'Z', 'the holder is a zombie');
+    // Wait for the state asserted, with a deadline: after its link the holder still removes its temp,
+    // registers the take and syncs the directory before its SIGKILL, which a loaded runner can stretch
+    // past any fixed wait (the house's read of the 33 commits, PR #22, comment 6307349700, item 8).
+    let pid: number | undefined;
+    let state: string | undefined;
+    for (const end = Date.now() + 15_000; state !== 'Z' && Date.now() < end; await new Promise((r) => setTimeout(r, 25))) {
+      try {
+        pid = readLock(dir).pid;
+        state = readProcStat(pid)?.state;
+      } catch {
+        // not linked yet
+      }
+    }
+    assert.equal(state, 'Z', 'the holder is a zombie');
     const lock = acquireDataDirLock(dir);
-    assert.equal(lock.tookOver?.pid, pid, 'taken over: a zombie holds nothing');
+    assert.equal(lock.tookOver?.pid, pid!, 'taken over: a zombie holds nothing');
     lock.release();
   } finally {
     parent.kill('SIGKILL');
@@ -615,4 +625,138 @@ test('Linux: the machine\'s own listing is /proc\'s — every row with start tic
   const real = listProcesses()!;
   assert.ok(real.some((r) => r.pid === process.pid), 'the machine\'s listing has this process');
   assert.ok(real.every((r) => r.startTicks !== undefined && r.bootId === bootId() && r.startSlackMs! >= PROC_START_SLACK_MS), 'the machine\'s rows are /proc\'s');
+});
+
+// ───────────── the house's read of the 33 commits (PR #22, comment 6307349700): the guard, and an unreadable holder ─────────────
+
+const locked = (e: unknown) => code(e) === 'data_dir_locked';
+/**
+ * Child source: say `said` on stdout, synchronously (a pipe's console.log is asynchronous on macOS and would
+ * wait out the stall), then block this thread until `go` exists: a stop the test ends. The child keeps the
+ * unpatched writeSync as `realWrite`.
+ */
+const stallUntil = (said: string, go: string) =>
+  `realWrite(1, ${JSON.stringify(said + '\n')}); while (!fsc.existsSync(${JSON.stringify(go)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);`;
+
+test('without hard links, a start stalled between creating termd.lock in place and writing it, and a taker that reads the file empty and old: one holder, however long the stall (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 1)', async () => {
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, LOCK_FILE);
+  const goA = path.join(tmp, `goA-${dirs}`);
+  const goB = path.join(tmp, `goB-${dirs}`);
+  const outcome = /^(won|refused|error)/;
+  // A: no hard links; its write into termd.lock blocks until the test says go.
+  const a = child(`
+    import { createRequire, syncBuiltinESMExports } from 'node:module';
+    const fsc = createRequire(import.meta.url)('node:fs');
+    const realOpen = fsc.openSync, realWrite = fsc.writeSync;
+    const lockFds = new Set();
+    fsc.openSync = (p, ...rest) => { const fd = realOpen(p, ...rest); if (String(p) === ${JSON.stringify(file)}) lockFds.add(fd); return fd; };
+    fsc.writeSync = (fd, ...rest) => { if (lockFds.delete(fd)) { ${stallUntil('stalling', goA)} } return realWrite(fd, ...rest); };
+    syncBuiltinESMExports();
+    const { acquireDataDirLock } = await import(${JSON.stringify(LOCK_JS)});
+    const noLinks = () => { throw Object.assign(new Error('EPERM: operation not permitted, link'), { code: 'EPERM' }); };
+    try { acquireDataDirLock(${JSON.stringify(dir)}, { link: noLinks }); console.log('won'); }
+    catch (e) { console.log(e.code === 'data_dir_locked' ? 'refused' : 'error ' + e.message); }
+    setInterval(() => {}, 1000);
+  `);
+  let b: ReturnType<typeof child> | undefined;
+  try {
+    await a.line(/^stalling$/);
+    // A stall of seconds, without waiting them out: the empty file reads as old to the taker, and so does
+    // any guard beside it.
+    const old = new Date(Date.now() - 10_000);
+    fs.utimesSync(file, old, old);
+    if (fs.existsSync(`${file}.takeover`)) fs.utimesSync(`${file}.takeover`, old, old);
+    // B: hard links work for it; its rename onto termd.lock, if it gets that far, blocks until the test says go.
+    b = child(`
+      import { createRequire, syncBuiltinESMExports } from 'node:module';
+      const fsc = createRequire(import.meta.url)('node:fs');
+      const realRename = fsc.renameSync, realWrite = fsc.writeSync;
+      fsc.renameSync = (from, to) => { if (String(to) === ${JSON.stringify(file)}) { ${stallUntil('renaming', goB)} } return realRename(from, to); };
+      syncBuiltinESMExports();
+      const { acquireDataDirLock } = await import(${JSON.stringify(LOCK_JS)});
+      try { acquireDataDirLock(${JSON.stringify(dir)}); console.log('won'); }
+      catch (e) { console.log(e.code === 'data_dir_locked' ? 'refused' : 'error ' + e.message); }
+      setInterval(() => {}, 1000);
+    `);
+    const first = await b.line(/^(renaming|won|refused|error)/);
+    fs.writeFileSync(goA, ''); // A's write lands, and it reads its record back
+    await a.line(outcome);
+    if (first === 'renaming') fs.writeFileSync(goB, ''); // the taker's delayed rename lands after that read-back
+    await b.line(outcome);
+    const outcomes = [a, b].map((c) => c.lines.find((l) => outcome.test(l)));
+    assert.equal(outcomes.filter((o) => o === 'won').length, 1, `one holder: A ${outcomes[0]}, B ${outcomes[1]}`);
+    assert.ok(!outcomes.some((o) => o?.startsWith('error')), outcomes.join(', '));
+    const winner = outcomes[0] === 'won' ? a : b;
+    assert.equal(readLock(dir).pid, winner.proc.pid, 'termd.lock names the one holder');
+  } finally {
+    a.proc.kill('SIGKILL');
+    b?.proc.kill('SIGKILL');
+  }
+});
+
+test('an old guard is broken only when no other live process has a lock attempt in flight: one whose attempt\'s temp names a live process is kept, one a dead process left goes (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 1)', () => {
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, LOCK_FILE);
+  const guard = `${file}.takeover`;
+  const record = (pid: number, nonce: string) => JSON.stringify({ pid, startedAt: Date.now(), hostname: os.hostname(), nonce }) + '\n';
+  fs.writeFileSync(file, JSON.stringify({ pid: 999_999, startedAt: Date.now() - 60_000, hostname: os.hostname() }) + '\n');
+  fs.mkdirSync(guard);
+  const old = new Date(Date.now() - 10_000);
+  fs.utimesSync(guard, old, old);
+  // A live process (the test runner, our parent) is inside the guard: its attempt's temp names it.
+  const live = path.join(dir, `${LOCK_FILE}.${process.ppid}.abcdef0123456789.tmp`);
+  fs.writeFileSync(live, record(process.ppid, 'abcdef0123456789'));
+  assert.throws(() => acquireDataDirLock(dir), locked, 'refused: the guard\'s holder may still be about to rename');
+  assert.ok(fs.existsSync(guard), 'the guard is kept');
+  assert.equal(readLock(dir).pid, 999_999, 'and the lock is untouched');
+  // Its process is gone, leaving the temp and the guard behind: a lone start breaks the guard and takes the stale lock.
+  fs.rmSync(live);
+  fs.writeFileSync(path.join(dir, `${LOCK_FILE}.999999.0123456789abcdef.tmp`), record(999_999, '0123456789abcdef'));
+  const lock = acquireDataDirLock(dir);
+  try {
+    assert.equal(lock.tookOver?.pid, 999_999);
+    assert.equal(readLock(dir).pid, process.pid);
+  } finally {
+    lock.release();
+  }
+});
+
+test('a live holder whose /proc stat cannot be read is kept: a listing that leaves its pid out says nothing of it while a signal still finds it (the house\'s read of the 33 commits, PR #22, comment 6307349700, item 2)', () => {
+  // The Linux branch is driven through an injected /proc, so this runs on every host; the holder is a real,
+  // live process, which the lock's signal check finds. On Linux an EACCES, EMFILE or LSM denial on its stat
+  // reads the same: what the injected reader returns for it here.
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, LOCK_FILE);
+  const sleeper = spawn('sleep', ['30'], { stdio: 'ignore' });
+  try {
+    const held = sleeper.pid!;
+    const stat = (pid: number, ticks: number) => `${pid} (sleep) S 1 ${pid} ${pid} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 ${ticks} 12345678 500`;
+    const files: Record<string, string> = { '/proc/uptime': '1000.50 2000.00\n', [`/proc/${process.pid}/stat`]: stat(process.pid, 5000), [`/proc/${held}/stat`]: stat(held, 4242), [`/proc/${held}/cmdline`]: 'sleep\u000030' };
+    let readable = true;
+    const linux: ProcessSource = {
+      platform: 'linux',
+      read: (f) => (f === `/proc/${held}/stat` && !readable ? undefined : files[f]),
+      entries: () => [String(process.pid), String(held)],
+      ps: () => undefined,
+      now: () => Date.now(),
+      bootId: () => 'boot-A',
+      self: process.pid,
+    };
+    fs.writeFileSync(file, JSON.stringify({ pid: held, startedAt: Date.now(), hostname: os.hostname(), nonce: 'holder', startTicks: 4242, bootId: 'boot-A' }) + '\n');
+    assert.throws(() => acquireDataDirLock(dir, { processes: linux }), locked, 'its stat reads, its ticks match: live');
+    readable = false;
+    assert.throws(() => acquireDataDirLock(dir, { processes: linux }), locked, 'its stat cannot be read: kept, not taken over');
+    assert.equal(readLock(dir).pid, held);
+    readable = true;
+    files[`/proc/${held}/stat`] = stat(held, 4243);
+    const lock = acquireDataDirLock(dir, { processes: linux });
+    assert.equal(lock.tookOver?.pid, held, 'its stat reads other ticks: a reused pid, taken over');
+    lock.release();
+  } finally {
+    sleeper.kill('SIGKILL');
+  }
 });

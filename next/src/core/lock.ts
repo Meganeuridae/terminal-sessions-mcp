@@ -8,9 +8,13 @@
  * twice (G10, G20). `<dataDir>/termd.lock` is created exclusively and names
  * its holder; a lock whose holder is gone is taken over.
  *
- * A pid alone does not identify a process: pids are reused. A holder counts
- * only when its process started no later than the lock's `startedAt`; a process
- * group recovery finds counts only when its leader started with the Run.
+ * A pid alone does not identify a process: pids are reused. On Linux a lock
+ * that records its holder's boot id and start ticks is judged by those, frame-free;
+ * elsewhere, or for a lock without them, a holder counts only when its process
+ * started no later than the lock's `startedAt`, and a live pid whose command names
+ * termd is never read as stale on that path (the house's read of the 33 commits,
+ * PR #22, comment 6307349700, item 11). A process group recovery finds counts only
+ * when its leader started with the Run.
  */
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -44,9 +48,9 @@ export interface DataDirLock {
   readonly file: string;
   /** Set when the lock was taken from a holder that is gone: what its file said (empty when it was torn). The daemon logs it (the house's read of 59f660b, #22). */
   readonly tookOver?: Partial<LockHolder>;
-  /** Set when the directory's filesystem refused link(): the lock was created by an exclusive write instead (the registry logs it once). */
+  /** Set when the directory's filesystem refused link(): the lock was created by an exclusive write under the guard instead (the registry logs it once per take, that is once per registry; the house's read of the 33 commits, PR #22, comment 6307349700, item 10). */
   readonly noHardLinks?: true;
-  /** Set when the lock is taken but its directory could not be synced (a real fsync error): a lock that vanishes after a crash is simply taken anew; the registry logs it once (comment 6274603516). */
+  /** Set when the lock is taken but its directory could not be synced (a real fsync error): a lock that vanishes after a crash is simply taken anew; the registry logs it once per take (comment 6274603516; item 10 of comment 6307349700). */
   readonly unsynced?: true;
   /** Give the lock up (idempotent). The file is removed only by the handle that took it, while it holds it. */
   release(): void;
@@ -144,11 +148,12 @@ export function readProcStat(pid: number, read: (file: string) => string | undef
  * through the same parser the process listing and the lock use, so every side agrees on the unit.
  * The backend records it on a process Run's run.start when the group leader is known; recovery and
  * the lock compare it. Undefined off Linux, when the pid is gone, or when either part is unreadable.
+ * `src` is the machine's unless a spec drives the Linux branch with its own (see ProcessSource).
  */
-export function procStart(pid: number): { startTicks: number; bootId: string; zombie: boolean } | undefined {
-  if (process.platform !== 'linux') return undefined;
-  const id = bootId();
-  const stat = id === undefined ? undefined : readProcStat(pid);
+export function procStart(pid: number, src: ProcessSource = machine): { startTicks: number; bootId: string; zombie: boolean } | undefined {
+  if (src.platform !== 'linux') return undefined;
+  const id = src.bootId();
+  const stat = id === undefined ? undefined : readProcStat(pid, src.read);
   return id === undefined || stat === undefined ? undefined : { startTicks: stat.startTicks, bootId: id, zombie: stat.state === 'Z' };
 }
 
@@ -283,12 +288,19 @@ export function listProcesses(src: ProcessSource = machine): ProcessRow[] | unde
   return answer(procRows(src)) ?? answer(psRows(src));
 }
 
-/** One process: null when it is gone (or a zombie), undefined when nothing can say. */
-export function processInfo(pid: number): ProcessRow | null | undefined {
-  const rows = listProcesses();
+/**
+ * One process: null when it is gone (or a zombie), undefined when nothing can say. A listing leaves
+ * out a process whose line it could not read (EACCES, EMFILE, an LSM's denial) as well as one that is
+ * gone, so a pid missing from it is gone only when a signal finds no such process either: a live
+ * holder whose stat could not be read was taken over as gone (the house's read of the 33 commits,
+ * PR #22, comment 6307349700, item 2).
+ */
+export function processInfo(pid: number, src: ProcessSource = machine): ProcessRow | null | undefined {
+  const rows = listProcesses(src);
   if (rows === undefined) return undefined;
   const row = rows.find((r) => r.pid === pid);
-  return row && !row.zombie ? row : null;
+  if (row) return row.zombie ? null : row;
+  return exists(pid) ? undefined : null;
 }
 
 /** The groups among `pgids` with a member that is not a zombie (a zombie holds its pid until reaped): one listing for all. */
@@ -305,9 +317,9 @@ export function livingGroups(pgids: number[]): number[] {
  * daemon (macOS, where there are no ticks). Undefined when nothing can say (no /proc, `ps` failed or
  * timed out): an unknown keeps the holder, by holderLive's own rule (comment 6274603516).
  */
-function commandNamesTermd(pid: number): boolean | undefined {
+function commandNamesTermd(pid: number, src: ProcessSource): boolean | undefined {
   try {
-    if (process.platform === 'linux') return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('termd');
+    if (src.platform === 'linux') return src.read(`/proc/${pid}/cmdline`)?.includes('termd');
     return execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).includes('termd');
   } catch {
     return undefined;
@@ -363,7 +375,7 @@ function parseHolder(raw: string): LockHolder | undefined {
  * a running daemon, so a live pid whose command names termd is never read as stale (the house's read of
  * the 36 commits, #22, comment 6269992150).
  */
-function holderLive(h: LockHolder, current: string, file: string): 'live' | 'stale' | 'self' {
+function holderLive(h: LockHolder, current: string, file: string, src: ProcessSource): 'live' | 'stale' | 'self' {
   // "Self" means this process wrote what the file holds now — what `taken` records, nonce and all. Any
   // other lock naming our pid is a predecessor's that this pid was reused from (a device without a
   // real-time clock booting into the same pid, a backward step): we did not write it, and no other
@@ -372,22 +384,22 @@ function holderLive(h: LockHolder, current: string, file: string): 'live' | 'sta
   if (taken.get(file) === current) return 'self';
   if (h.pid === process.pid) return 'stale';
   if (!(h.pid > 0) || !exists(h.pid)) return 'stale';
-  if (h.bootId !== undefined && process.platform === 'linux') {
-    const boot = bootId();
+  if (h.bootId !== undefined && src.platform === 'linux') {
+    const boot = src.bootId();
     if (boot !== undefined && boot !== h.bootId) return 'stale'; // a different boot: the pid is a new process
-    const now = procStart(h.pid);
+    const now = procStart(h.pid, src);
     // kill(pid, 0) succeeds for a zombie and its stat still holds the start ticks: exited and unreaped is gone (comment 6274603516).
     if (now?.zombie) return 'stale';
     if (h.startTicks !== undefined && now !== undefined) return now.startTicks === h.startTicks ? 'live' : 'stale';
   }
-  const info = processInfo(h.pid);
+  const info = processInfo(h.pid, src);
   if (info === null) return 'stale';
   // Unknown start time: assume the holder is who it says (refusing is recoverable; sharing journals is not).
   // A process that started after the lock was written cannot have written it — the pid was reused — unless
   // its command names termd, which a wall-clock step (not a reuse) can make look so: never take that over.
   // A check that cannot answer keeps the holder too, by the same rule (comment 6274603516).
   if (info === undefined || info.startMs <= h.startedAt + 1000) return 'live';
-  return commandNamesTermd(h.pid) === false ? 'stale' : 'live';
+  return commandNamesTermd(h.pid, src) === false ? 'stale' : 'live';
 }
 
 const lockedError = (dataDir: string, file: string, h: LockHolder | undefined, why: string) =>
@@ -397,17 +409,23 @@ const lockedError = (dataDir: string, file: string, h: LockHolder | undefined, w
     ...(h ? { pid: h.pid, hostname: h.hostname, startedAt: h.startedAt } : {}),
   });
 
-/** Write `raw` to `tmp`, fsynced and owner-only, before `tmp` is linked or renamed into place: the lock is never seen empty or torn. */
-function writeSyncedTemp(tmp: string, raw: string): void {
+/**
+ * Write `raw` to `target`, created exclusively, owner-only and fsynced. For an attempt's temp, written
+ * before it is linked or renamed into place, no reader ever sees it empty or torn. The fallback without
+ * hard links calls this on `termd.lock` itself, which a reader can see empty until the write lands: that
+ * fallback writes under the guard, so a taker never compares it then (the house's read of the 33 commits,
+ * PR #22, comment 6307349700, items 1 and 9).
+ */
+function writeSyncedTemp(target: string, raw: string): void {
   const data = Buffer.from(raw);
-  const fd = fs.openSync(tmp, 'wx', 0o600);
+  const fd = fs.openSync(target, 'wx', 0o600);
   try {
     for (let off = 0; off < data.length; ) off += fs.writeSync(fd, data, off);
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
   }
-  fs.chmodSync(tmp, 0o600);
+  fs.chmodSync(target, 0o600);
 }
 
 const rmTemp = (tmp: string) => {
@@ -418,34 +436,84 @@ const rmTemp = (tmp: string) => {
   }
 };
 
+/** An attempt's temp beside the lock: `termd.lock.<pid>.<nonce>.tmp`, holding that attempt's whole record. */
+const isAttemptTemp = (name: string) => name.startsWith(`${LOCK_FILE}.`) && /^\d+\.[0-9a-f]+\.tmp$/.test(name.slice(LOCK_FILE.length + 1));
+
 /**
- * Replace a stale lock, atomically: under a short-lived guard (an exclusive mkdir), confirm the file
- * still holds what was judged stale, then rename `tmp` — already written and synced before the guard
- * was taken — over it, so only the compare and the rename run inside the guard, never a slow write
- * (the house's read of the 36 commits, #22, comment 6269992150). Returns false when the file changed
- * meanwhile (the caller starts over and judges again); `tmp` is then left for the caller to remove.
+ * Whether another live process has a lock attempt in flight here. Every attempt writes and syncs its
+ * temp before it links, creates in place, or takes the guard, and the temp goes only when the attempt is
+ * done: removed, or renamed into place as a taker's last act under the guard. So a process inside the
+ * guard has one until it has nothing left to do there. Verdicts are kept in `seen` for one acquire.
  */
-function takeOver(file: string, staleRaw: string, tmp: string): boolean {
+function attemptInFlight(file: string, src: ProcessSource, seen: Map<string, boolean>): boolean {
+  let names: string[];
+  try {
+    names = fs.readdirSync(path.dirname(file));
+  } catch {
+    return true; // cannot look: assume one, which keeps the guard (refusing is recoverable)
+  }
+  for (const name of names) {
+    if (!isAttemptTemp(name)) continue;
+    const tmp = path.join(path.dirname(file), name);
+    let raw: string | undefined;
+    try {
+      raw = readRaw(tmp);
+    } catch {
+      return true;
+    }
+    const h = raw === undefined ? undefined : parseHolder(raw);
+    if (raw === undefined || !h || h.pid === process.pid) continue; // finished meanwhile, a write cut short, or ours
+    let live = seen.get(raw);
+    if (live === undefined) seen.set(raw, (live = holderLive(h, raw, tmp, src) !== 'stale'));
+    if (live) return true;
+  }
+  return false;
+}
+
+/**
+ * Run `fn` holding the lock's guard (an exclusive mkdir beside it); undefined when another process holds
+ * it. The takers' compare-and-rename and the fallback's create-in-place run under it, so neither ever
+ * meets the other halfway. A guard is broken only when it is old and no live process other than this one
+ * has an attempt in flight: broken on its age alone, a holder stopped inside it lost it while still about
+ * to rename, and two processes held the lock (the house's read of the 33 commits, PR #22, comment
+ * 6307349700, item 1). A guard a crashed process left goes once that process is gone, by the one starter
+ * that finds no other attempt; two starters that each find the other's wait or refuse, which is recoverable.
+ */
+function underGuard<T>(file: string, src: ProcessSource, seen: Map<string, boolean>, fn: () => T): T | undefined {
   const guard = `${file}.takeover`;
   try {
     fs.mkdirSync(guard, { mode: 0o700 });
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-    // Another taker is inside its (microsecond) critical section; one that crashed there left the guard behind.
     try {
-      if (Date.now() - fs.statSync(guard).mtimeMs > 5000) fs.rmSync(guard, { recursive: true, force: true });
+      if (Date.now() - fs.statSync(guard).mtimeMs > 5000 && !attemptInFlight(file, src, seen)) fs.rmSync(guard, { recursive: true, force: true });
     } catch {
       // gone meanwhile
     }
-    return false;
+    return undefined;
   }
   try {
-    if (readRaw(file) !== staleRaw) return false;
-    fs.renameSync(tmp, file);
-    return true; // the caller syncs the directory once the take is registered, so a sync error never orphans a held lock
+    return fn();
   } finally {
     fs.rmSync(guard, { recursive: true, force: true });
   }
+}
+
+/**
+ * Replace a stale lock, atomically: under the guard, confirm the file still holds what was judged stale,
+ * then rename `tmp` — already written and synced before the guard was taken — over it, so only the
+ * compare and the rename run inside the guard, never a slow write (the house's read of the 36 commits,
+ * #22, comment 6269992150). Returns false when the guard is held or the file changed meanwhile (the
+ * caller starts over and judges again); `tmp` is then left for the caller to remove.
+ */
+function takeOver(file: string, staleRaw: string, tmp: string, src: ProcessSource, seen: Map<string, boolean>): boolean {
+  return (
+    underGuard(file, src, seen, () => {
+      if (readRaw(file) !== staleRaw) return false;
+      fs.renameSync(tmp, file);
+      return true; // the caller syncs the directory once the take is registered, so a sync error never orphans a held lock
+    }) ?? false
+  );
 }
 
 /**
@@ -453,20 +521,25 @@ function takeOver(file: string, staleRaw: string, tmp: string): boolean {
  * written and synced to a temp file first, then `link()`ed to `termd.lock` (EEXIST means taken, as `wx`
  * did), so on that path no starter ever reads an empty or half-written lock (comment 6269992150). On a
  * filesystem without hard links the fallback creates `termd.lock` in place with an exclusive write, which
- * a starter can read empty for a moment (the age guard covers it); the take counts only if the file then
- * holds this attempt's own record, so a taker that read it empty and took it over wins alone (comment
- * 6274603516). A lock left by a dead process (or by a pid reused since) is taken over. Within one process
- * the lock is shared: its taker releases it.
+ * a starter can read empty until the write lands: the fallback creates, writes and reads it back under
+ * the guard the takers compare under, so no taker judges it then (the house's read of the 33 commits,
+ * PR #22, comment 6307349700, item 1), and the take counts only if the file then holds this attempt's
+ * own record (comment 6274603516). A lock left by a dead process (or by a pid reused since) is taken
+ * over. Within one process the lock is shared: its taker releases it. `processes`: where the holder's
+ * process facts are read (specs drive the Linux branch through it; the machine's by default).
  */
-export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: string, newPath: string) => void } = {}): DataDirLock {
+export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: string, newPath: string) => void; processes?: ProcessSource } = {}): DataDirLock {
+  const src = opts.processes ?? machine;
+  /** Verdicts on other attempts' temps, for this acquire (see attemptInFlight). */
+  const seen = new Map<string, boolean>();
   const dir = path.resolve(dataDir);
   const file = path.join(dir, LOCK_FILE);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const link = opts.link ?? ((existing: string, newPath: string) => fs.linkSync(existing, newPath));
   // The directory's filesystem has no hard links (exFAT, some SMB and FUSE mounts): link() refuses with
   // one of these, where the exclusive write worked. The lock then falls back to that write of the same
-  // synced content; the age guard still covers the brief window an exclusive write opens, and the
-  // registry says so once (a reviewer's read of the fixes for #22 comment 6269992150).
+  // synced content, under the guard, and the registry says so once per take (a reviewer's read of the
+  // fixes for #22 comment 6269992150).
   const noLinksCode = (code: string | undefined) => code === 'EPERM' || code === 'ENOTSUP' || code === 'EOPNOTSUPP' || code === 'EXDEV';
   let noHardLinks = false;
   const take = (raw: string, tookOver?: Partial<LockHolder>): DataDirLock => {
@@ -483,7 +556,7 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
     };
   };
   // Our own frame-free start (Linux), through the reader recovery and the listing use.
-  const self = procStart(process.pid);
+  const self = procStart(process.pid, src);
   for (let attempt = 0; attempt < 50; attempt++) {
     const me: LockHolder = { pid: process.pid, startedAt: Date.now(), hostname: os.hostname(), nonce: randomBytes(8).toString('hex'), ...(self && { startTicks: self.startTicks, bootId: self.bootId }) };
     const raw = JSON.stringify(me) + '\n';
@@ -494,7 +567,7 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
       rmTemp(tmp);
       throw e;
     }
-    // Registered before the directory sync; a sync error is reported on the handle (the registry logs it once),
+    // Registered before the directory sync; a sync error is reported on the handle (the registry logs it once per take),
     // not thrown: a lock that vanishes after a crash is simply taken anew (comment 6274603516).
     const publish = (tookOver?: Partial<LockHolder>): DataDirLock => {
       const lock = take(raw, tookOver);
@@ -513,17 +586,29 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
         created = true;
       } else if (noLinksCode(code)) {
         noHardLinks = true;
+        let made: boolean | undefined;
         try {
-          writeSyncedTemp(file, raw); // an exclusive ('wx') create of the same content, fsynced
+          // An exclusive ('wx') create of the same content, fsynced, under the guard: a taker compares
+          // only while holding it, so none reads this file empty mid-write and renames over it later.
+          // The read-back still decides: the take is this attempt's only if the file holds its record.
+          made = underGuard(file, src, seen, () => {
+            try {
+              writeSyncedTemp(file, raw);
+            } catch (e2) {
+              if ((e2 as NodeJS.ErrnoException).code !== 'EEXIST') throw e2;
+            }
+            return readRaw(file) === raw;
+          });
         } catch (e2) {
-          if ((e2 as NodeJS.ErrnoException).code !== 'EEXIST') {
-            rmTemp(tmp);
-            throw e2;
-          }
+          rmTemp(tmp);
+          throw e2;
         }
-        // Created in place: a starter may have read it empty during a slow write and taken it over, so the
-        // take is this attempt's only if the file still holds its record (comment 6274603516).
-        created = readRaw(file) === raw;
+        if (made === undefined) {
+          rmTemp(tmp);
+          sleepSync(10);
+          continue; // another start holds the guard: try again
+        }
+        created = made;
       } else if (code !== 'EEXIST') {
         rmTemp(tmp);
         throw e;
@@ -540,8 +625,9 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
     }
     const holder = parseHolder(current);
     if (!holder) {
-      // Empty or torn: a taker that crashed there, or an older build between its create and its write
-      // (link() of a synced temp no longer leaves such a window). Take it over only when it is old.
+      // Empty or torn: a fallback start that crashed between its create and its write, or an older build
+      // there (link() leaves no such window, and the fallback writes under the guard the takeover below
+      // needs). Take it over only when it is old.
       let age = 0;
       try {
         age = Date.now() - fs.statSync(file).mtimeMs;
@@ -555,7 +641,7 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
         continue;
       }
     } else {
-      const state = holderLive(holder, current, file);
+      const state = holderLive(holder, current, file, src);
       if (state === 'self') {
         rmTemp(tmp);
         return { file, release: () => undefined }; // another registry in this process took it; its taker releases it
@@ -565,7 +651,7 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
         throw lockedError(dataDir, file, holder, `termd pid ${holder.pid}${holder.hostname !== os.hostname() ? ` (written on host ${holder.hostname})` : ''}`);
       }
     }
-    if (takeOver(file, current, tmp)) return publish(holder ?? {});
+    if (takeOver(file, current, tmp, src, seen)) return publish(holder ?? {});
     rmTemp(tmp);
     sleepSync(10);
   }
