@@ -275,9 +275,10 @@ export class RunIndex {
         // The leader's frame-free start on Linux, so recovery can judge its group across a clock step.
         if (ev.startTicks !== undefined) r.startTicks = ev.startTicks;
         if (ev.bootId !== undefined) r.bootId = ev.bootId;
-        // How the Run was launched and the nonce in its marks: what history cuts its plumbing by.
+        // How the Run was launched, the nonce in its marks and the shell that answers for it: what history cuts its plumbing by.
         if (ev.strategy !== undefined) r.strategy = ev.strategy;
         if (ev.nonce !== undefined) r.nonce = ev.nonce;
+        if (ev.shellPid !== undefined) r.shellPid = ev.shellPid;
         return;
       }
       case 'run.end': {

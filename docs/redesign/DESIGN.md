@@ -1369,10 +1369,11 @@ type JournalEvent =
   | { seq; ts; type: 'output';      data: string; runId?; stream: 'pty'|'stdout'|'stderr'; attribution?: 'exact'|'temporal' }
   | { seq; ts; type: 'input';       data: string; principal; kind: 'text'|'keys'|'paste'|'protocol-reply'; sensitive?: true; runId? }  // sensitive: data is '[redacted]'
   | { seq; ts; type: 'run.admit';   runId; target: 'shell'|'process'; line?|argv?; principal; origin: 'self'|'human'|'agent'|'system'; queued: boolean; idem?; shell?; within?: string|null }  // idem: key identity (G16); shell/within: a declared shell's Run (§8.1)
-  | { seq; ts; type: 'run.start';   runId; cwd; line?; envBasis?: 'configured'|'snapshot'; cols?; rows?; pid?; pgid?; startTicks?; bootId?; strategy?: 'rich'|'basic'|'marker'|'inline'; nonce? }
+  | { seq; ts; type: 'run.start';   runId; cwd; line?; envBasis?: 'configured'|'snapshot'; cols?; rows?; pid?; pgid?; startTicks?; bootId?; strategy?: 'rich'|'basic'|'marker'|'inline'; nonce?; shellPid? }
                                     // C mark, or spawn. cols/rows: the geometry the transcript is projected at (§6); pid/pgid: a process Run's group, ended by recovery (G19c);
                                     // startTicks/bootId: the leader's /proc start time in clock ticks and the boot id, so recovery judges its group without a clock frame (Linux);
                                     // strategy/nonce: how the Run's boundaries were observed and the nonce in its marks, so history cuts its plumbing as the live transcript did (§8.1)
+                                    // shellPid: the shell an inline Run's start marker named, the one whose probe answer ends the Run, for history to judge answers by (§8.1)
   | { seq; ts; type: 'run.end';     runId; state: 'exited'|'cancelled'|'lost'; exit?; signal?; reason?; durationMs; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true; lastAliveTs? }
                                     // leftovers: a process Run's group had members when its process exited; pipeStatus: a pipeline's statuses, one per command (§8.1);
                                     // recoveredEnd: recovery wrote this end; groupJudged: recovery ended or left its group; lastAliveTs: the dead daemon's last journal time, which bounds the group a later recovery may take for the Run's

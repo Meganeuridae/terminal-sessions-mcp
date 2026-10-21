@@ -346,6 +346,45 @@ test('a cancel answered by a nested shell leaves the Run running; its result, li
   }
 });
 
+test('a nested shell that inherited the Run’s token answers the cancel on its own pid: the Run goes on, and history, cut by the pid run.start recorded, keeps what followed', { skip: !hasShell('/bin/sh') }, async () => {
+  // The house's read of the 38 commits (#22, comment 6274773484): with `set -a` in the declared sh, the nested sh inherits
+  // the token and answers the probe with it; the session rejected the answer by its pid, but history had no pid to judge
+  // by and ended the result at the stranger's answer.
+  const x = await realSession('/bin/bash');
+  try {
+    const enclosing = await open(x.session, 'sh');
+    declare(x.session, 'sh');
+    const exportAll = x.session.admit({ target: 'shell', line: 'set -a', principal: AGENT });
+    assert.ok(exportAll.admitted);
+    assert.equal((await x.session.awaitRun(exportAll.run.runId, 5000)).state, 'exited');
+    const nested = x.session.admit({ target: 'shell', line: 'sh', principal: AGENT });
+    assert.ok(nested.admitted);
+    const runId = nested.run.runId;
+    await until(() => x.session.run(runId).state === 'running', 5000, 'the nested sh to start');
+    const shellPid = x.journal.runs.run(runId).shellPid;
+    assert.ok(shellPid !== undefined && shellPid > 0, 'run.start records the pid the start marker named');
+    await sleep(300); // its prompt
+    const c = await x.session.cancel(runId, AGENT, { graceMs: 400 });
+    assert.equal(c.state, 'running', JSON.stringify(c));
+    const output = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' && e.runId === runId ? [e.data] : [])).join('');
+    const nonce = x.journal.runs.run(runId).nonce!;
+    const stranger = new RegExp(`<<<PROBE:${nonce}:(\\d+):${nonce}>>>`).exec(output());
+    assert.ok(stranger && Number(stranger[1]) !== shellPid, `the nested shell answered with the token on its own pid: ${JSON.stringify(output())}`);
+    x.session.input('echo after-probe-$((7*6))\n', { principal: AGENT });
+    await until(() => output().includes('after-probe-42'), 5000, 'the typed line to run');
+    x.session.input('exit\n', { principal: AGENT });
+    const r = await x.session.awaitRun(runId, 5000);
+    assert.deepEqual([r.state, r.exit], ['exited', 0]);
+    assert.match((await x.session.runTranscript(runId)).text, /after-probe-42/, 'live');
+    const history = await journalRunText(x.journal.runs.output(x.journal, runId), {}, x.journal.runs.run(runId));
+    assert.match(history.text, /after-probe-42/, `history keeps what followed the stranger's answer: ${JSON.stringify(history.text)}`);
+    assert.doesNotMatch(history.text, /PROBE|printf/);
+    assert.equal(x.session.run(enclosing).state, 'running');
+  } finally {
+    await x.close();
+  }
+});
+
 test('a declared shell preserves a half-typed prompt, refusing or queueing until it is cleared', { skip: !hasShell('/bin/bash') }, async () => {
   const x = await realSession('/bin/bash');
   try {

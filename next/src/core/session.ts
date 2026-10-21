@@ -182,8 +182,6 @@ interface RunRecord extends RunInfo {
   markerTail?: string;
   /** Whether the end-marker probe was typed (marker and inline strategies, after an aborting ^C). */
   probed?: boolean;
-  /** Inline strategy: the pid of the shell that printed the start marker — the one whose probe answer counts. */
-  shellPid?: number;
   /** The reason a process Run ends with when the daemon tears it down (close, shell exit). */
   endReason?: string;
   /** Order of the daemon's write of this Run's line among everything typed into the terminal. */
@@ -208,7 +206,7 @@ const MAX_ORPHAN_LINES = 32;
  */
 const probeLine = (nonce: string) => ` echo "<<<PRO""BE:${nonce}>>>"`;
 const publicRun = (r: RunRecord): RunInfo => {
-  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, shellPid: _sh, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, ...info } = r;
+  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, ...info } = r;
   return { ...info, seq: { ...info.seq } };
 };
 
@@ -1451,6 +1449,8 @@ export class Session {
       run.strategy ??= 'rich';
       ev.strategy = run.strategy;
       if (run.markerNonce !== undefined) ev.nonce = run.nonce = run.markerNonce;
+      // The pid the inline start marker named, which history has no other way to know (comment 6274773484).
+      if (run.shellPid !== undefined) ev.shellPid = run.shellPid;
     }
     const started = this.append(ev);
     run.state = 'running';

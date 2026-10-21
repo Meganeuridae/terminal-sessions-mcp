@@ -257,15 +257,15 @@ export interface HistoryRender {
 /**
  * A Run's text from the journal alone (the one renderer of history, for completions and for
  * results): the newest part of its attributed output, a shell Run's plumbing cut as the live
- * transcript cuts it — by the strategy and nonce its run.start recorded, by shape for a Run
- * journaled before those were (the house's read of 39787b3, #22) — projected (§6) at the size the
+ * transcript cuts it — by the strategy, nonce and shell pid its run.start recorded, by shape for a
+ * Run journaled before those were (the house's read of 39787b3, #22) — projected (§6) at the size the
  * Run started at when the journal recorded one, else the caller's.
  */
 export async function journalRunText(o: RunOutput, how: HistoryRender = {}, run?: RunInfo): Promise<RunText> {
   const events = o.events.filter((e): e is Output => e.type === 'output');
   const chunks =
     run?.target === 'shell' && events.every((e) => e.stream === 'pty')
-      ? [{ data: cutPlumbing(events.map((e) => e.data).join(''), { strategy: run.strategy, nonce: run.nonce, truncated: o.truncated }), stream: 'pty' as const }]
+      ? [{ data: cutPlumbing(events.map((e) => e.data).join(''), { strategy: run.strategy, nonce: run.nonce, truncated: o.truncated, pid: run.shellPid !== undefined ? String(run.shellPid) : undefined }), stream: 'pty' as const }]
       : events.map((e) => ({ data: e.data, stream: e.stream }));
   const p = await project(chunks, { cols: run?.cols ?? how.cols ?? DEFAULT_GEOMETRY.cols, rows: run?.rows ?? how.rows ?? DEFAULT_GEOMETRY.rows, maxInputBytes: how.maxInputBytes ?? HISTORY_RUN_INPUT_BYTES, keep: 'tail' });
   return { text: p.text, truncated: o.truncated || p.truncated, seq: [o.from, o.to], nextCursor: o.to };

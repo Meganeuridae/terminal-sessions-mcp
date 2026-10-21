@@ -50,8 +50,15 @@ const redrawn = (s: string): string => {
 const splitWord = (a: string, b: string): string => `${redrawn(a)}\\s*(?:${redrawn('""')}|${redrawn("''")})\\s*${redrawn(b)}`;
 /** The echo of a typed line that runs a Run: the wrapper's end marker or the inline start marker, split. */
 const wrapperEcho = (nonce: string): RegExp => new RegExp(`${redrawn('<<<')}\\s*(?:${splitWord('EXI', 'T')}|${splitWord('STAR', 'T')})\\s*:\\s*${redrawn(nonce)}\\s*:`, 'g');
-/** The echo of a probe line typed after a ^C, split. */
-const probeEcho = (nonce: string): RegExp => new RegExp(`${redrawn('<<<')}\\s*${splitWord('PRO', 'BE')}\\s*:\\s*${redrawn(nonce)}`, 'g');
+/**
+ * The rest of a typed probe line after its nonce, as each strategy types it (session.ts: the
+ * marker strategy's probeLine, inlineProbe for sh and for fish), so a match covers the whole line
+ * however the editor broke it.
+ */
+const PROBE_TAILS = ['>>>"', `:%s:%s>>>\\n' "$$" "$\{__tsm_r-}"`, `:%s:%s>>>\\n' $fish_pid "$__tsm_r"`];
+/** The echo of a probe line typed after a ^C, split, through the end of the typed line when it is there. */
+const probeEcho = (nonce: string): RegExp =>
+  new RegExp(`${redrawn('<<<')}\\s*${splitWord('PRO', 'BE')}\\s*:\\s*${redrawn(nonce)}(?:\\s*(?:${PROBE_TAILS.map(redrawn).join('|')}))?`, 'g');
 /** A probe answer with its nonce (1), pid (2) and token (3). */
 const probeAnswer = (nonce: string): RegExp => new RegExp(`<<<PROBE:(${nonce})(?::(\\d+)(?::(${NONCE}|))?)?>>>`, 'g');
 
@@ -72,15 +79,18 @@ export interface PlumbingOf {
  * for history. Under `rich` nothing is cut: the output runs from the pre-execution mark to the
  * end mark, and the marks are not output. Under `basic` the first line is the echo of the typed
  * line. Under `marker` and `inline` the marks carry the Run's nonce, and the cut is by it: the
- * echo of the typed line at the output's head (the lines echoing it without a break: typed ahead
- * of the prompt it echoes twice, and a redraw shows it in pieces); under `inline` everything
+ * echo of the typed line (the lines echoing it without a break: typed ahead of the prompt it
+ * echoes twice, and a redraw shows it in pieces), under `marker` from its first line wherever it
+ * is, with everything before it, and otherwise at the output's head; under `inline` everything
  * through the start-marker line (the output begins right after `>>>`), whatever a slow shell
  * printed between the echo and the marker included (a login banner, its first prompt showing the
  * line again); and everything from the end marker on, or from the probe answer the session
  * accepted. A later line in the echo's shape is the program's. The marker strategy has no start
  * marker, so a shell that prints its banner and shows the typed line again before it runs it
- * (one still starting when the line was typed) leaves those lines in its first Run. Before that
- * end, every probe's echo line and every rejected answer's line is struck on its own, and the
+ * (one still starting when the line was typed) leaves those lines in its first Run; and with the
+ * terminal's echo off, a program line in the echo's shape with the Run's own nonce (`history 1`)
+ * is taken for the echo, and what preceded it goes with it. Before that
+ * end, every line of each probe's echo and every rejected answer's line is struck on its own, and the
  * output between them stays: a probe the session rejected (answered by a nested shell: its pid is
  * not the one the start marker named, or its token is not the Run's) is not an end (the house's
  * read of 39787b3, #22), and a probe nothing answered, because a program ignoring ^C read it,
@@ -114,13 +124,25 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     const nl = text.indexOf('\n', start.index + start[0].length);
     from = nl === -1 ? text.length : nl + 1;
   } else {
-    // The typed line's echo is the output's first line, and only the lines that follow it without a
-    // break are more of it: the same line echoed again (typed ahead of its prompt), or the pieces of
-    // a redraw, which can split the nonce across lines. A line in the echo's shape after output is
-    // the program's (`history 1` prints the typed line with the Run's own nonce), and a shell still
+    // The typed line's echo, and the lines that follow it without a break, which are more of it: the
+    // same line echoed again (typed ahead of its prompt), or the pieces of a redraw, which can split
+    // the nonce across lines. Under the marker strategy the echo begins at the Run's first wrapper
+    // echo, wherever it is: the program starts only after its line is typed, so what comes before
+    // the echo is the shell's (a banner, an empty line, the head of a typed line wrapped before its
+    // marker), and the cut through it is the start of the Run's output (the house's read of the 38
+    // commits, #22, comment 6274773484: with a line before the echo, the rule that took the echo only
+    // on the output's first line kept the echo in the output). Otherwise the echo is only at the
+    // output's head: under `inline` the output begins after the start marker, past the echo, and
+    // with no nonce recorded an echo-shaped line further on may be another Run's that a program
+    // printed. A truncated read began after the echo. A line in the echo's shape after output is the
+    // program's (`history 1` prints the typed line with the Run's own nonce), and a shell still
     // starting when the line was typed shows it again after its banner, which the marker strategy,
     // with no start marker, cannot tell from the program's: those lines stay in its first Run.
-    if (echoes.length && echoes[0]![0] < (text.indexOf('\n') === -1 ? text.length : text.indexOf('\n'))) {
+    const first = echoes[0];
+    const anywhere = of.strategy === 'marker' && !of.truncated;
+    const headEnd = text.indexOf('\n') === -1 ? text.length : text.indexOf('\n');
+    if (first && (anywhere || first[0] < headEnd)) {
+      from = anywhere ? text.lastIndexOf('\n', first[0] - 1) + 1 : 0;
       for (;;) {
         const nl = text.indexOf('\n', from);
         const lineEnd = nl === -1 ? text.length : nl;
@@ -156,9 +178,11 @@ export function cutPlumbing(raw: string, of: PlumbingOf = {}): string {
     }
     struck.push(lineOf(m.index));
   }
-  // Each probe's echo line before the end is plumbing on its own, the accepted probe's included; a
-  // probe nothing answered leaves only its echo, and what was printed after it stays.
-  for (const m of rest.matchAll(probeEcho(nonce))) if (m.index < to) struck.push(lineOf(m.index));
+  // Each probe's echo before the end is plumbing on its own, the accepted probe's included, every
+  // line of it: a redraw can break the typed line, its nonce included, over two lines, and striking
+  // only the line where it began kept the rest (the house's read of the 38 commits, #22, comment
+  // 6274773484). A probe nothing answered leaves only its echo, and what was printed after it stays.
+  for (const m of rest.matchAll(probeEcho(nonce))) if (m.index < to) struck.push([lineOf(m.index)[0], lineOf(m.index + m[0].length - 1)[1]]);
   const kept: Array<[number, number]> = [];
   let pos = 0;
   for (const [s, e] of struck.sort((a, b) => a[0] - b[0])) {

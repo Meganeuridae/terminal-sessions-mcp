@@ -40,7 +40,7 @@ export type EventInput =
   | { type: 'input'; data: string; principal: Principal; kind: 'text' | 'keys' | 'paste' | 'protocol-reply'; sensitive?: true; runId?: string }
   /** `shell`/`within`: a Run declared for the shell in front of the terminal (§8.1): the kind of shell, and the Run whose program it is (null: what replaced the session's shell). */
   | { type: 'run.admit'; runId: string; target: RunTarget; line?: string; argv?: string[]; principal: Principal; origin: RunOrigin; queued: boolean; idem?: string; shell?: string; within?: string | null }
-  | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number; startTicks?: number; bootId?: string; strategy?: RunStrategy; nonce?: string }
+  | { type: 'run.start'; runId: string; cwd: string; line?: string; envBasis?: EnvBasis; cols?: number; rows?: number; pid?: number; pgid?: number; startTicks?: number; bootId?: string; strategy?: RunStrategy; nonce?: string; shellPid?: number }
   | { type: 'run.end'; runId: string; state: 'exited' | 'cancelled' | 'lost'; exit?: number; signal?: string; reason?: string; durationMs: number; leftovers?: true; pipeStatus?: number[]; recoveredEnd?: true; groupJudged?: true; lastAliveTs?: number }
   /** Recovery judged this Run's process group (ended it or left it) after the Run had already ended: the run index folds it into groupJudged, so no later restart judges it again. */
   | { type: 'run.judged'; runId: string }
@@ -128,6 +128,13 @@ export interface RunInfo {
   strategy?: RunStrategy;
   /** The nonce in a `marker` or `inline` Run's marks, from its run.start: what its plumbing is cut by. For the readers of history: an events read returns the run.start as journaled, nonce included; the App's rendered results (run, await, a text read) never carry it. */
   nonce?: string;
+  /**
+   * An `inline` Run's shell, the one that printed its start marker, from its run.start: only that
+   * shell's probe answer ends the Run, so history judges answers by it as the live transcript does.
+   * The marker's chunk is journaled before the Run starts, outside its output, so history cannot
+   * read the pid from the text (the house's read of the 38 commits, #22, comment 6274773484).
+   */
+  shellPid?: number;
   /** A declared shell Run (§8.1): the caller's name for the shell in front (`bash`, `sh`, `fish`…). */
   shell?: string;
   /** With `shell`: the Run whose program is that shell (`ssh host`, `sudo -i`…), or null for the program that replaced the session's shell. */

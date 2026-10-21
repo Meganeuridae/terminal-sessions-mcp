@@ -3,6 +3,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { cutPlumbing, exitMark, nonceOf, probeMark, startMark } from '../src/core/plumbing.js';
 import { inlineLines, inlineProbe } from '../src/core/session.js';
+import { journalRunText } from '../src/core/segmenter.js';
+import type { RunOutput } from '../src/core/runindex.js';
+import type { RunInfo } from '../src/core/types.js';
 
 /** What the shell prints for a typed line: the split words joined. */
 const printed = (typed: string) => typed.replace(/""|''/g, '');
@@ -182,6 +185,58 @@ test('a wrapper-shaped line in a Run’s output is output: only the echo lines a
   assert.equal(cutPlumbing(`${typed(N)}$ ${typed(N)}out\n<<<EXIT:${N}:0>>>\n`, marker), 'out\n');
   // Nothing but the echo (a Run cut off before any output) is no output.
   assert.equal(cutPlumbing(typed(N).trimEnd(), marker), '');
+});
+
+test('under the marker strategy the echo begins at the Run’s first wrapper echo wherever it is: what comes before it is the shell’s', () => {
+  // The house's read of the 38 commits (#22, comment 6274773484): with a banner line or an empty line before the echo, the
+  // rule that took the echo only on the output's first line kept the echo in the output.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  assert.equal(cutPlumbing(`Last login: today\n${typed(N)}out\n<<<EXIT:${N}:0>>>\n$ `, marker), 'out\n', 'a banner before the echo');
+  assert.equal(cutPlumbing(`\r\n${typed(N)}out\n<<<EXIT:${N}:0>>>\n`, marker), 'out\n', 'an empty line before the echo');
+  assert.equal(cutPlumbing(`$ ${typed(N)}$ ${typed(N)}out\n<<<EXIT:${N}:0>>>\n`, marker), 'out\n', 'a prompt on the echo’s line, the echo shown twice');
+  // A typed line wrapped before its marker: its head is on the line before the first echo, and goes with what precedes it.
+  assert.equal(cutPlumbing(` command . '/var/folders/x/T/tsm-501/abc/tsm-cmd-1'; e\r\ncho "<<<EXI""T:${N}:$?>>>"\r\nout\r\n<<<EXIT:${N}:0>>>\r\n`, marker), 'out\r\n');
+  // Lines after the echo region are the program's, the echo's shape included.
+  assert.equal(cutPlumbing(`banner\n${typed(N)}before-2\n  502 ${typed(N).trim()}\n<<<EXIT:${N}:0>>>\n`, marker), `before-2\n  502 ${typed(N).trim()}\n`);
+  // A shell still starting when the line was typed shows it again after its banner: that second echo is in the echo's shape
+  // after output, which the rule cannot tell from a program's, so it stays (the marker strategy has no start marker to cut to).
+  assert.equal(cutPlumbing(`${typed(N)}Welcome to fish\n$ ${typed(N)}first\n<<<EXIT:${N}:0>>>\n`, marker), `Welcome to fish\n$ ${typed(N)}first\n`);
+  // A read that began after the Run's start holds no echo of its own: an echo-shaped line there is the program's.
+  assert.equal(cutPlumbing(`tail of out\n  502 ${typed(N).trim()}\nmore\n`, { ...marker, truncated: true }), `tail of out\n  502 ${typed(N).trim()}\nmore\n`);
+  // Under inline the output begins after the start marker, past the echo: an echo-shaped line in it is the program's.
+  const inline = { strategy: 'inline' as const, nonce: N };
+  const typedStart = ` printf '<<<STAR''T:${N}:%s>>>\\n' "$$"; eval "$(printf '%b' "$__tsm_b")"; printf '<<<EXI''T:${N}:%s>>>\\n' "$?"`;
+  assert.equal(cutPlumbing(`\r\nbefore-2\r\n${typedStart}\r\n<<<EXIT:${N}:0>>>`, inline), `before-2\r\n${typedStart}\r\n`);
+});
+
+test('a probe’s echo broken over two lines is struck on every line it spans, through the end of the typed line', () => {
+  // The house's read of the 38 commits (#22, comment 6274773484): only the line where the match began was struck, so
+  // `c3d4:%s:%s>>>\n' …` stayed in the output.
+  const nonce = 'a1b2c3d4';
+  const inline = { strategy: 'inline' as const, nonce };
+  const probe = inlineProbe(nonce, false);
+  const brokenInNonce = probe.replace('a1b2', () => 'a1b2\r\n');
+  assert.equal(cutPlumbing(`\r\nout\r\n^C\r\n$${brokenInNonce}\r\n<<<PROBE:${nonce}:1000:${nonce}>>>\r\n$ `, inline), 'out\r\n^C\r\n');
+  // Broken after the nonce, or between the format and its arguments: the rest of the typed line is struck too.
+  const afterNonce = probe.replace(`${nonce}:`, () => `${nonce}\r\n:`);
+  assert.equal(cutPlumbing(`\r\nout\r\n^C\r\n$${afterNonce}\r\n<<<PROBE:${nonce}:1000:${nonce}>>>\r\n$ `, inline), 'out\r\n^C\r\n');
+  const inArgs = probe.replace(`' "$$"`, () => `'\r\n "$$"`);
+  assert.equal(cutPlumbing(`\r\nout\r\n^C\r\n$${inArgs}\r\nmore\r\n<<<EXIT:${nonce}:0>>>`, inline), 'out\r\n^C\r\nmore\r\n', 'an unanswered probe: its echo struck, the output after it kept');
+  const fish = inlineProbe(nonce, true).replace('$fish_pid', () => '\r\n$fish_pid');
+  assert.equal(cutPlumbing(`\r\nout\r\n${fish}\r\nmore\r\n<<<EXIT:${nonce}:0>>>`, inline), 'out\r\nmore\r\n', 'fish’s probe line');
+  const marker = { strategy: 'marker' as const, nonce };
+  assert.equal(cutPlumbing(`${typed(nonce)}out\n echo "<<<PRO""BE:a1b2\r\nc3d4>>>"\nmore\n<<<EXIT:${nonce}:0>>>\n`, marker), 'out\nmore\n', 'the marker strategy’s probe line');
+});
+
+test('history judges a probe answer by the shell pid the Run’s run.start recorded, as the live transcript does', async () => {
+  // The house's read of the 38 commits (#22, comment 6274773484): history passed the cutter no pid (the start marker's chunk
+  // is journaled outside the Run's output), so a nested shell answering with the Run's inherited token ended the result.
+  const echo = ` printf '<<<PRO''BE:${N}:%s:%s>>>\\n' "$$" "$\{__tsm_r-}"`;
+  const data = `\r\n$ ^C\r\n$ ${echo}\r\n<<<PROBE:${N}:2000:${N}>>>\r\n$ echo after\r\nafter\r\n$ exit\r\n<<<EXIT:${N}:0>>>\r\n`;
+  const o = { events: [{ type: 'output', seq: 5, ts: 0, stream: 'pty', data, runId: 'r1' }], from: 5, to: 5, truncated: false } as unknown as RunOutput;
+  const run = { runId: 'r1', target: 'shell', strategy: 'inline', nonce: N } as unknown as RunInfo;
+  assert.match((await journalRunText(o, { cols: 80, rows: 24 }, { ...run, shellPid: 1000 })).text, /after/, 'the recorded pid rejects the stranger');
+  assert.doesNotMatch((await journalRunText(o, { cols: 80, rows: 24 }, run)).text, /after/, 'a Run journaled before the pid was: the token is the one evidence');
 });
 
 test('a reviewer’s read (6270045466): nonceOf names the nonce a printed mark carries, and nothing for text that is no mark', () => {
