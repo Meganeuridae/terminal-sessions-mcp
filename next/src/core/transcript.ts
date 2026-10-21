@@ -933,9 +933,9 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
  * 6307350650). Headers are known by their text. The header naming the first kept line's source is the
  * nearest one before it, wherever it sits: one only just before the cut was kept, and a tail of 3
  * over a Run's `a1` to `a3` then the pty's `p2` began with `a2` and no name (a reviewer's read of the
- * fixes for #22).
+ * fixes for #22). The compat pack's logs take their tail of the reader's text by this rule too.
  */
-function keepLines(lines: string[], max: number, keep: 'head' | 'tail', headers: ReadonlySet<string>): string[] | undefined {
+export function keepLines(lines: string[], max: number, keep: 'head' | 'tail', headers: ReadonlySet<string>): string[] | undefined {
   if (lines.length <= max) return undefined;
   let count = 0;
   if (keep === 'tail') {

@@ -611,6 +611,45 @@ test('a marker Run’s runCommand output is its command’s alone: no typed line
   }
 });
 
+test('a text tail names its first line’s source by the nearest header before it, wherever it sits, as the reader’s tail does (our read of the house’s fixes for its review of f3750e4, PR #22: c050928)', async () => {
+  // compat kept a header only when it sat just before the first line kept: a tail of 2 over a Run's `a1` to `a3`
+  // then the pty's `p2` began with `a3`, unnamed, where read's tail begins with `[run rx]`.
+  const h = await markerHarness();
+  try {
+    await h.call('runCommand', { session: 'hdr', command: 'echo ready' });
+    const live = h.registry.get('hdr');
+    assert.ok(live?.kind === 'live');
+    const j = live.session.journal;
+    j.append({ type: 'run.admit', runId: 'rx', target: 'process', principal: A.principal, origin: 'self', queued: false });
+    j.append({ type: 'run.start', runId: 'rx', cwd: '/' });
+    j.append({ type: 'output', data: 'a1\na2\na3\n', stream: 'stdout', runId: 'rx' });
+    j.append({ type: 'output', data: 'p2\r\n', stream: 'pty' });
+    // The pty's line follows the scripted shell's prompt; what matters is the head.
+    for (const [n, head] of [
+      [2, ['[run rx]', 'a3', '[terminal]']],
+      [3, ['[run rx]', 'a2', 'a3', '[terminal]']],
+    ] as const) {
+      const tail = lines(await h.call('tailLogs', { session: 'hdr', lines: n }));
+      assert.deepEqual(tail.slice(0, head.length), head, `${n}: ${JSON.stringify(tail)}`);
+      assert.match(tail[head.length]!, /p2$/, JSON.stringify(tail));
+      const read = (await h.app.read(A, { session: 'hdr', tail: n, advance: false })).text!.split('\n');
+      assert.deepEqual(read, tail, `read's tail of ${n} is the same lines`);
+    }
+    // A first line shown without its head is marked, not the header naming its source before it: one progress
+    // line longer than the 1 MiB the tail reads, which shows as `done`.
+    let progress = '';
+    for (let i = 0; i < 90_000; i++) progress += `\r${String(i).padStart(12)}`;
+    j.append({ type: 'output', data: `${progress}\rdone        \n`, stream: 'stdout', runId: 'rx' });
+    j.append({ type: 'output', data: 'p3\r\n', stream: 'pty' });
+    const cut = lines(await h.call('tailLogs', { session: 'hdr', lines: 2 }));
+    const said = JSON.stringify(cut.map((l) => l.slice(0, 40)));
+    assert.match(cut[0]!, /^\[earlier output not shown/, said);
+    assert.deepEqual(cut.slice(1, 4), ['[run rx]', '…done', '[terminal]'], said);
+  } finally {
+    await h.close();
+  }
+});
+
 test('a reviewer’s read: the logs drop the line that runs a command file for every shell flavor the session types for, fish’s marker line included', async () => {
   // compat's hand copy of these lines had none for fish's marker strategy; it is now derived from the session's builder.
   const h = await markerHarness();

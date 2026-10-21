@@ -13,7 +13,7 @@ import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
 import { ackMark, cutPlumbing, exitMark, goneMark, inlineTypedLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLineEcho, startMark } from '../core/plumbing.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
-import { project, type ProjectChunk } from '../core/transcript.js';
+import { keepLines as tailOfLines, project, type ProjectChunk } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
 import { commitReadDelivery, takeReadCommit, type App, type PlumbedRun, type ReadResult, type SessionSummary } from './app.js';
 import { looksLikeShellOpener } from './hints.js';
@@ -302,16 +302,21 @@ const withoutPlumbingLines = (lines: string[], p: Plumbing): string[] => keptLin
  * them, a tail of 6 across two sources showed 3 lines of output, and the page of what came before,
  * read for the lines from the first kept on, was asked for the headers too, so it reached back that
  * many more lines of output and those between were in neither page (an independent read of the fix
- * for the house's read of the 33 commits, #22, comment 6307350650).
+ * for the house's read of the 33 commits, #22, comment 6307350650). The lines are taken by the
+ * projection's own rule (transcript.ts keepLines), so the header naming the first line's source is the
+ * nearest one before it, wherever it sits, as the reader's tail has it since c050928: kept only when it
+ * sat just before, a tail of 2 over a Run's `a1` to `a3` then the pty's `p2` began with `a3`, unnamed
+ * (our read of the house's fixes for its review of f3750e4, PR #22). `first` is then the first line
+ * after the header, the lines between them being shown in neither.
  */
 function keepLines(lines: string[], n: number, p: Plumbing, headers = false): { lines: string[]; first?: number } {
   const kept = keptLines(lines, p);
-  const header = (l: string) => headers && isSourceHeader(l);
-  let i = kept.length;
-  for (let count = 0; i > 0 && count < n; ) if (!header(kept[--i]![0])) count++;
-  if (i > 0 && header(kept[i - 1]![0])) i--;
-  const last = kept.slice(i);
-  return last.length ? { lines: last.map(([l]) => l), first: last[0]![1] } : { lines: [] };
+  const texts = kept.map(([l]) => l);
+  const last = tailOfLines(texts, n, 'tail', new Set(headers ? texts.filter(isSourceHeader) : [])) ?? texts;
+  if (!last.length) return { lines: [] };
+  // A header taken from further back is followed by the end of `kept`; one just before the cut is part of it.
+  const from = kept.length - last.length + (last[0] === texts[kept.length - last.length] ? 0 : 1);
+  return { lines: last, first: kept[from]![1] };
 }
 
 /** Lines of `lines` from `from` on that a text tail counts: all but the lines naming sources. */
@@ -492,7 +497,9 @@ const callArgs = (o: Record<string, string | number>): string => `{${Object.entr
 async function tailLogLines(ctx: ToolContext, session: string, n: number, raw: boolean, d: Drawn | null): Promise<string[]> {
   const { lines, cut } = await tailLines(ctx, session, n, raw, d);
   if (cut === undefined) return lines;
-  if (cut.cutHead && lines.length) lines[0] = `…${lines[0]}`;
+  // The mark goes on the first line of output, after the header naming its source when a text tail has one.
+  const at = raw ? 0 : lines.findIndex((l) => !isSourceHeader(l));
+  if (cut.cutHead && at >= 0 && at < lines.length) lines[at] = `…${lines[at]}`;
   // A line begun before what was read goes on from the page before, whose end is that line's earlier part:
   // its head when the line is shorter than that page, else more of its middle.
   const earlier = ', ending with the earlier part of the first line below';
