@@ -275,7 +275,8 @@ export class TermServer {
   private readonly conns = new Set<Conn>();
   private readonly opts: ServerOptions;
   private readonly statics: StaticFiles;
-  private readonly startedAt = Date.now();
+  /** When this endpoint was built, on the monotonic clock: `/health`'s uptime is an elapsed time inside one process, which a wall-clock step must not move or make negative (the house's read of the 33 commits, #22, comment 6307351372). */
+  private readonly startedAt = clocks.monotonic();
   private offRegistry: (() => void) | undefined;
   private allowed: HostPattern[] = [];
   private boundPort = 0;
@@ -587,7 +588,7 @@ export class TermServer {
       status: 'ok',
       version: this.opts.version ?? 'dev',
       pid: process.pid,
-      uptimeMs: Date.now() - this.startedAt,
+      uptimeMs: Math.round(clocks.monotonic() - this.startedAt),
       connections: { total: this.conns.size, ...byKind },
       sessionCount: all.length,
     };
@@ -988,12 +989,13 @@ export class TermServer {
       case 'tools/call': {
         const name = typeof p.name === 'string' ? p.name : '';
         const args = (p.arguments ?? {}) as Record<string, unknown>;
-        const t0 = Date.now();
+        // The call's latency in its usage record, on the monotonic clock as /health's uptime is.
+        const t0 = clocks.monotonic();
         // A tool's advice about notifications holds only when this connection's grant delivers them for the
         // session it names; being an MCPL host is not enough (the house's read of 2f357bd, #22).
         const notifications = conn.lane !== null && conn.lane.carries(typeof args.session === 'string' ? args.session : '');
         const r = await callTool(name, args, { app, caller: conn.caller, resultText: conn.resultText, notifications }, this.availableTools(conn));
-        this.afterToolCall(conn, name, args, r, Date.now() - t0);
+        this.afterToolCall(conn, name, args, r, Math.round(clocks.monotonic() - t0));
         if (r.onSent) onSent(r.onSent);
         return { content: [{ type: 'text', text: r.text }], structuredContent: r.structured, ...(r.isError ? { isError: true } : {}) };
       }

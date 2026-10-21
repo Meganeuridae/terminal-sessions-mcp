@@ -65,9 +65,10 @@ A value takes the type of the tool's parameter (the daemon's schema decides): te
 commas (--keys Enter,C-c) or is JSON; an object is JSON (start --ready '{"pattern":"listening"}');
 --key=value works everywhere. Durations (--wait and any --*-ms flag): 500ms, 20s, 2m, or plain
 milliseconds.
---json prints the result as JSON on stdout, and a daemon's error as {"error": "..."} on stdout with
-exit 1; tsm's own refusals (a usage error, an unknown command, a connection it cannot make) are text
-on stderr with exit 1, --json or not.
+--json prints the result as JSON on stdout, and a daemon's error (a tool's error result, or an error
+the daemon answers a request with) as {"error": "..."} on stdout with exit 1; tsm's own refusals (a
+usage error, an unknown command, a connection it cannot make or loses) are text on stderr with exit 1,
+--json or not.
 Env: TSM_URL (ws://127.0.0.1:3101), TSM_TOKEN.
 Exit code: a run's exit code; 128+N when it died on signal N; ${EXIT_UNFINISHED} while it is still running
 (await it); ${EXIT_BUSY} when the shell is busy (another Run, or a person editing a line at the prompt); 1 on
@@ -219,7 +220,9 @@ function unknownTool(cmd: string, listed: string[]): string {
   const short = SHORT[cmd];
   // tsm asks for the full profile, which lists every tool of its own version: a shorthand whose tool
   // is missing met a daemon of another version (the house's read, #22 comment 6274806357).
-  if (short) return `${short.tool}, the tool behind ${cmd}, is not one the daemon lists: this tsm and that termd are of different versions; update one to match, or call a tool the daemon lists by its name`;
+  // The remedy names the tools to call, since tsm has no other way to show them (the house's read of
+  // the 33 commits, #22, comment 6307351372).
+  if (short) return `${short.tool}, the tool behind ${cmd}, is not one the daemon lists: this tsm and that termd are of different versions; update one to match, or call a tool the daemon lists by its name (tsm <tool> --arg value): ${listed.length ? listed.join(', ') : 'it lists none'}`;
   const near = [...Object.keys(SHORT), ...listed]
     .map((n) => [n, distance(cmd, n)] as const)
     .filter(([, d]) => d <= 2)
@@ -385,6 +388,15 @@ function usageReport(argv: string[]): void {
 
 /** The daemon connection, when one is open: `end` closes it cleanly. */
 let socket: WebSocket | undefined;
+/** `--json` was given: a daemon's error answer then goes to stdout as JSON (see DaemonError). */
+let jsonOut = false;
+
+/**
+ * An error the daemon answered a request with. Under `--json` it is printed as {"error": "..."} on
+ * stdout, as a tool's error result is; the help said so while main's catch put it on stderr as text
+ * (the house's read of the 33 commits, #22, comment 6307351372).
+ */
+class DaemonError extends Error {}
 
 /**
  * Print the result and end. The exit code is set first, and the process ends only once the
@@ -417,6 +429,7 @@ async function main(): Promise<void> {
   // generic hint and a missing value is a connection error (a reviewer's read of a088780
   // and the house's read, #22 comment 6269721389).
   const syntax = parse(argv, undefined, false);
+  jsonOut = syntax.json;
   const url = new URL(setting('TSM_URL') ?? 'ws://127.0.0.1:3101');
   const token = setting('TSM_TOKEN');
   if (token) url.searchParams.set('token', token);
@@ -434,7 +447,7 @@ async function main(): Promise<void> {
     new Promise<unknown>((resolve, reject) => {
       if (lost) return reject(lost);
       const id = nextId++;
-      pending.set(id, { settle: (m) => (m.error ? reject(new Error(m.error.message)) : resolve(m.result)), reject });
+      pending.set(id, { settle: (m) => (m.error ? reject(new DaemonError(m.error.message)) : resolve(m.result)), reject });
       ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
     });
   ws.on('message', (d) => {
@@ -503,4 +516,8 @@ function connectError(url: URL, message: string): string {
   return `cannot reach ${at}: ${message}`;
 }
 
-main().catch((e: unknown) => end(1, e instanceof Error ? e.message : String(e), process.stderr));
+main().catch((e: unknown) => {
+  const text = e instanceof Error ? e.message : String(e);
+  if (e instanceof DaemonError && jsonOut) end(1, JSON.stringify({ error: text }, null, 2));
+  else end(1, text, process.stderr);
+});

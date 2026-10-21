@@ -35,6 +35,9 @@ const { TermServer } = await import(path.join(DIST, 'src/transport/server.js'));
 const { TestHost, sleep } = await import(path.join(DIST, 'spec/testhost.js'));
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 23), ...a);
+// Every wait below whose expiry fails a check runs on the monotonic clock, so a step of the wall clock
+// neither ends one early nor stretches it (the house's read of the 33 commits, #22, comment 6307351372).
+const now = () => performance.now();
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-accept-af-'));
 // A check that hangs (a host that never reconnects, a shell that never ends) ends here with a verdict,
 // not at the CI job's limit half an hour later with no summary (the house's read of 9f168ff, #22).
@@ -120,9 +123,9 @@ try {
   // moment after session_open.
   await check("the scout's host opens the session's channel", async () => {
     let open;
-    for (const until = Date.now() + 3000; ; await sleep(100)) {
+    for (const until = now() + 3000; ; await sleep(100)) {
       open = await framework.executeToolCall({ id: 'open-1', name: 'channel_open', input: { channelId: CHANNEL, serverId: 'terminal' }, callerAgentName: 'scout' });
-      if (!open.isError || Date.now() > until) break;
+      if (!open.isError || now() > until) break;
     }
     assert.ok(!open.isError, `channel_open: ${open.error}`);
   });
@@ -161,8 +164,8 @@ try {
     await conn.reconnectAfterFailure();
     await within(closed, 3000, 'the link closing');
     await within(reconnected, 5000, 'the link coming back');
-    const until = Date.now() + 5000;
-    while (!(conn.isConnected && conn.policyEstablished) && Date.now() < until) await sleep(50);
+    const until = now() + 5000;
+    while (!(conn.isConnected && conn.policyEstablished) && now() < until) await sleep(50);
     assert.ok(conn.isConnected && conn.policyEstablished, 'reconnected with a policy');
     assert.equal(scoutConnections(), before + 1, `termd accepted a new connection from the scout:\n${serverLog.slice(-10).join('\n')}`);
     assert.equal(registry.get(SESSION).session.run(runId).state, 'running', 'the Run was in flight across the drop');
@@ -173,15 +176,15 @@ try {
   fs.writeFileSync(released, '');
 
   await check('a useful completion notification through the host, and the inference call it woke', async () => {
-    const until = Date.now() + 8000;
-    while (!context().includes('acceptance-output') && Date.now() < until) await sleep(100);
+    const until = now() + 8000;
+    while (!context().includes('acceptance-output') && now() < until) await sleep(100);
     const ctx = context();
     assert.ok(ctx.includes(`${SESSION}: \`${COMMAND}\` → exit 0`), `agent context:\n${ctx.slice(-800)}`);
     assert.match(ctx, /acceptance-output/);
     const pushes = traces.filter((t) => t.type === 'mcpl:push_event' || t.type === 'mcpl:channels-incoming');
     assert.ok(pushes.length >= 1, 'delivered through the host lane');
     // The wake itself, seen from the model's side and apart from any note: an inference call carrying the completion.
-    while (!membrane.calls.length && Date.now() < until) await sleep(50);
+    while (!membrane.calls.length && now() < until) await sleep(50);
     assert.ok(membrane.calls.length >= 1, 'an inference call followed the completion');
     assert.ok(JSON.stringify(membrane.calls[0].messages).includes('acceptance-output'), 'the inference call carries the completion');
   });
@@ -205,8 +208,8 @@ try {
     // Waits for the note itself, not a fixed time: a sleep passed while nothing reached termd.
     const scoutNotes = (events) => events.filter((e) => e.type === 'note' && e.principal === 'agent:scout@test');
     const byTool = (notes) => notes.filter((n) => n.text === TOOL_NOTE);
-    const until = Date.now() + 8000;
-    while (!byTool(scoutNotes(journal())).length && !journal().some((e) => e.type === 'input') && Date.now() < until) await sleep(100);
+    const until = now() + 8000;
+    while (!byTool(scoutNotes(journal())).length && !journal().some((e) => e.type === 'input') && now() < until) await sleep(100);
     // The prose path is the rest of the turn after the tool call (the mock's yielding stream plays the
     // prose in the same inference call; a host that infers again after the tool result makes a second)
     // and then the host's routing of the prose, which the turn awaits before the agent is idle. A fixed
@@ -214,15 +217,19 @@ try {
     // 6269721389): the check waits for the host's idle, then for termd's own evidence that the note
     // passed through the scout's lane: a principal's own note is never sent back to it (mcpl-14), so
     // the lane settles it and the scout's delivered cursor moves past the note's seq. The observer's
-    // copy would show nothing of that lane (the house's read, #22 comment 6274806357). A note that
-    // never reached termd leaves the cursor where it was, and the wait ends quietly: the assertion
-    // below, with the host's channel_publish calls and routing in its message, is what says so.
-    await within(framework.runUntilIdle(), 8000, 'the host going idle after the turn');
+    // copy would show nothing of that lane (the house's read, #22 comment 6274806357). The wait ends
+    // when the cursor has passed the note, or at its bound, and the assertions after it say which
+    // case a run that ran out of time is: no note (the count, with the host's channel_publish calls
+    // and routing in its message), or a note the scout's lane had not settled (the cursor). The
+    // count alone passed the second case (the house's read of the 33 commits, #22, comment
+    // 6307351372). The idle waits are generous: each ends as soon as the host is idle, and only a
+    // host that never goes idle meets the bound.
+    await within(framework.runUntilIdle(), 30_000, 'the host going idle after the turn');
     const scoutDelivered = () => registry.get(SESSION).session.cursorsOf('agent:scout@test').delivered;
     const noteSeq = () => byTool(scoutNotes(journal()))[0]?.seq;
-    for (const settle = Date.now() + 3000; (noteSeq() === undefined || scoutDelivered() < noteSeq()) && Date.now() < settle; ) await sleep(50);
+    for (const settle = now() + 10_000; (noteSeq() === undefined || scoutDelivered() < noteSeq()) && now() < settle; ) await sleep(50);
     log(`   the scout's delivered cursor: ${scoutDelivered()}; the note's seq: ${noteSeq() ?? 'no note'}`);
-    await within(framework.runUntilIdle(), 8000, 'the host idle again after the note passed its lane');
+    await within(framework.runUntilIdle(), 30_000, 'the host idle again after the note passed its lane');
     const events = journal();
     assert.ok(!events.some((e) => e.type === 'input'), 'no input events');
     assert.ok(!fs.existsSync(marker), 'neither text executed');
@@ -230,6 +237,8 @@ try {
     const calls = traces.filter((t) => (t.type === 'tool:completed' || t.type === 'tool:failed') && t.tool === 'channel_publish').map((t) => `${t.type}${t.error ? ` (${t.error})` : ''}`);
     const routing = traces.filter((t) => t.type === 'mcpl:speech-routed' || t.type === 'mcpl:speech-route-failed').map((t) => `${t.type}${t.reason ? ` (${t.reason})` : ''}`);
     assert.equal(byTool(notes).length, 1, `notes from the scout's channel_publish call: ${byTool(notes).length}; the host's channel_publish calls: ${calls.join('; ') || 'none'}; its routing: ${routing.join('; ') || 'nothing routed'}`);
+    const settled = scoutDelivered();
+    assert.ok(settled >= byTool(notes)[0].seq, `the scout's lane settled the note: its delivered cursor ${settled}, the note's seq ${byTool(notes)[0].seq}`);
     const fromProse = notes.filter((n) => n.text === PROSE);
     assert.equal(notes.length, 1 + fromProse.length, `unexpected notes from the scout: ${JSON.stringify(notes.map((n) => n.text))}`);
     log(`   the note came by the channel_publish tool call; the plain reply ${fromProse.length ? 'was also routed into the channel by the host (tolerated)' : 'stayed with the host, not routed'}; routing traces: ${routing.join('; ') || 'none'}`);

@@ -42,7 +42,8 @@ OOMPolicy=continue
 # termd itself does not exit within TimeoutStopSec, systemd SIGKILLs termd alone, the sessions'
 # surviving jobs are left as they are, and the process Runs termd had not yet ended keep running
 # until the next start's recovery, which ends the groups it can tie to their Runs, leaves the rest,
-# and ends none when no process listing answers (daemon.ts says so at its last-resort cleanup).
+# and ends none when no process listing answers (daemon.ts says so in its header; the registry's
+# recovery does it).
 KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=20

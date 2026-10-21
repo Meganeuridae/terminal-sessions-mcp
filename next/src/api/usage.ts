@@ -1,6 +1,10 @@
 /**
  * Measure (§16): the daemon sees every call, so it records them — per tool, per
- * host kind, errors — and a report finds confusion signatures: a `read` right
+ * host kind, errors — except the GUI's successful read-only calls (its own
+ * bookkeeping: session_list, screen, read and the like; the endpoint's
+ * READ_ONLY_TOOLS), which the log keeps at debug level only (the house's read of
+ * the 33 commits, #22, comment 6307351372). A report finds confusion
+ * signatures: a `read` right
  * after a `run` whose wait was too short, `input` sent twice within a second,
  * `screen` polled in a loop, `cancel` after a `busy`. The endpoint builds the
  * records (transport/server.ts); termd appends them to `<data-dir>/usage.jsonl`;

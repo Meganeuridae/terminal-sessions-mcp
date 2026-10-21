@@ -722,7 +722,7 @@ async function main(): Promise<void> {
   };
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(sig, () => void shutdown(sig));
   // Last resort on every exit path the process still runs through: no process Run's group survives
-  // it. (A SIGKILL runs nothing; the next start's recovery ends those it can tie to their Runs.)
+  // it. (A SIGKILL runs nothing; what the next start's recovery ends, leaves and why is in the header.)
   process.on('exit', () => groups.signalAll('SIGKILL'));
 
   // Supervisors may stop us as soon as readiness is visible. Install the drain

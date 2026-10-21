@@ -188,7 +188,7 @@ interface Canned {
  * with a canned envelope — the next of a list when a tool is asked more than once, the last
  * one repeating.
  */
-async function cannedDaemon(answers: Record<string, Record<string, unknown> | Array<Record<string, unknown>>>, opts: { without?: string[] } = {}): Promise<Canned> {
+async function cannedDaemon(answers: Record<string, Record<string, unknown> | Array<Record<string, unknown>>>, opts: { without?: string[]; rpcError?: string } = {}): Promise<Canned> {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise<void>((r) => wss.once('listening', () => r()));
   const calls: Canned['calls'] = [];
@@ -205,6 +205,8 @@ async function cannedDaemon(answers: Record<string, Record<string, unknown> | Ar
       if (m.method === 'tools/list') return reply({ tools: tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
       const call = m.params!;
       calls.push({ name: call.name, arguments: call.arguments });
+      // `rpcError`: the call is answered with a JSON-RPC error, a failure outside the tool layer.
+      if (opts.rpcError !== undefined) return ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: opts.rpcError } }));
       const queue = left[call.name] ?? [];
       const structured = queue.length > 1 ? queue.shift()! : (queue[0] ?? {});
       reply({ content: [{ type: 'text', text: '[canned]' }], structuredContent: structured });
@@ -374,9 +376,34 @@ test('a shorthand whose tool the daemon does not list is told the versions diffe
   try {
     const r = await tsm(['env-capture', 's'], { TSM_URL: `ws://127.0.0.1:${d.port}` });
     assert.equal(r.code, 1);
-    assert.match(r.stderr, /^session_env_capture, the tool behind env-capture, is not one the daemon lists: this tsm and that termd are of different versions; update one to match, or call a tool the daemon lists by its name/m);
+    assert.match(r.stderr, /^session_env_capture, the tool behind env-capture, is not one the daemon lists: this tsm and that termd are of different versions; update one to match, or call a tool the daemon lists by its name \(tsm <tool> --arg value\): run, /m);
+    // The remedy names every tool the daemon lists, since tsm has no other way to show them (the house's read of the 33 commits, #22, comment 6307351372).
+    for (const t of TOOLS.filter((x) => x.name !== 'session_env_capture')) assert.ok(r.stderr.includes(t.name), `${t.name} is named: ${r.stderr}`);
+    assert.ok(!/[:,] session_env_capture\b/.test(r.stderr), 'the missing tool is not offered');
     assert.equal(r.stdout, '', 'a refusal of tsm’s own is text on stderr');
     assert.equal(d.calls.length, 0, 'nothing reached the daemon');
+  } finally {
+    await d.close();
+  }
+});
+
+test('a daemon’s JSON-RPC error answer is {"error": ...} on stdout under --json, as the help says, and text on stderr without it', async () => {
+  // request() rejected on the error answer and main's catch printed it on stderr either way (the house's read of
+  // the 33 commits, #22, comment 6307351372).
+  const message = 'internal error: the call failed outside the tool layer';
+  const d = await cannedDaemon({}, { rpcError: message });
+  const env = { TSM_URL: `ws://127.0.0.1:${d.port}` };
+  try {
+    const json = await tsm(['run', 's', '--json', '--', 'echo', 'hi'], env);
+    assert.equal(json.code, 1);
+    assert.deepEqual(JSON.parse(json.stdout), { error: message });
+    assert.equal(json.stderr, '');
+    const text = await tsm(['run', 's', '--', 'echo', 'hi'], env);
+    assert.equal(text.code, 1);
+    assert.equal(text.stdout, '');
+    assert.equal(text.stderr.trim(), message);
+    const help = await tsm(['--help'], env);
+    assert.match(help.stdout.replace(/\s+/g, ' '), /a daemon's error \(a tool's error result, or an error the daemon answers a request with\) as \{"error": "\.\.\."\} on stdout with exit 1/);
   } finally {
     await d.close();
   }

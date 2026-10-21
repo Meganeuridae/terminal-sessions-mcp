@@ -742,16 +742,50 @@ test('terminal/attach: the owner takes the free seat; detach releases it and sto
     await sleep(50);
     assert.equal(eventsOf(c, 'seat1').length, n, 'no events after detach');
 
-    const hist = (await c.request('terminal/attach', { session: 'past' })) as { snapshot: null; transcript: string; lastSeq: number; runs: Array<{ runId: string; state: string; exit: number; line: string }> };
+    const hist = (await c.request('terminal/attach', { session: 'past' })) as { snapshot: null; transcript: string; lastSeq: number; runs: Array<{ runId: string; state: string; exit: number; line: string; durationMs: number }> };
     assert.equal(hist.snapshot, null);
     assert.match(hist.transcript, /built ok/);
     assert.ok(hist.lastSeq >= 4);
-    assert.deepEqual(hist.runs.map((x) => [x.runId, x.state, x.exit, x.line]), [['r1', 'exited', 0, 'make']]);
+    // The journaled duration (5 ms), not the wall clock's end minus start, which the one `ts` makes 0
+    // (the house's read of the 33 commits, #22, comment 6307351372).
+    assert.deepEqual(hist.runs.map((x) => [x.runId, x.state, x.exit, x.line, x.durationMs]), [['r1', 'exited', 0, 'make', 5]]);
     const forbidden = await Client.open(h.port, { token: 'tb' });
     await assert.rejects(forbidden.request('terminal/attach', { session: 'past' }), /forbidden/);
     c.close();
     forbidden.close();
     setup.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('/health’s uptime and a tool call’s latency are elapsed times on the monotonic clock, which a wall-clock step moves in neither direction', async (t) => {
+  // Both read Date.now (the house's read of the 33 commits, #22, comment 6307351372): a step back made
+  // the uptime negative, a step forward added the step, and a step during a call made its latency in the
+  // usage record negative. Neither the server nor the call can have taken an hour.
+  const realNow = Date.now;
+  let wall = (): number => realNow();
+  t.mock.method(Date, 'now', () => wall());
+  const h = await start();
+  try {
+    const c = await Client.open(h.port);
+    await c.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    const uptime = async () => (JSON.parse((await httpGet(h.port, '/health')).body) as { uptimeMs: number }).uptimeMs;
+    wall = () => realNow() - 3_600_000;
+    const afterBack = await uptime();
+    assert.ok(afterBack >= 0, `uptime after a step back: ${afterBack} ms`);
+    wall = () => realNow() + 3_600_000;
+    const afterForward = await uptime();
+    assert.ok(afterForward < 3_600_000, `uptime after a step forward: ${afterForward} ms`);
+    // Each read of the wall clock during the call is a second earlier than the one before.
+    let reads = 0;
+    wall = () => realNow() - 1000 * reads++;
+    await c.call('session_list', {});
+    wall = () => realNow();
+    const rec = h.usage.at(-1)!;
+    assert.equal(rec.tool, 'session_list');
+    assert.ok(rec.ms >= 0, `the call's latency: ${rec.ms} ms`);
+    c.close();
   } finally {
     await h.close();
   }
