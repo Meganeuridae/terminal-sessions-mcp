@@ -9,10 +9,11 @@ import assert from 'node:assert/strict';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
-import { launchctlUnit, plistUnit, systemctlUnit, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
+import { spawn } from 'node:child_process';
+import { launchctlUnit, plistUnit, procEnviron, systemctlUnit, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
 
-/** ExecStart as systemd 255 prints it: the argv joined by one space each, unquoted. */
-const execStart = (argv: string[]) => `{ path=/bin/sh ; argv[]=${['/bin/sh', '/pkg/next/config/termd-launch.sh', ...argv].join(' ')} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }`;
+/** ExecStart as systemd 255 prints it: the argv joined by one space each, unquoted; `prefix` goes before the launcher (an `env …`). */
+const execStart = (argv: string[], prefix: string[] = []) => `{ path=${prefix[0] ?? '/bin/sh'} ; argv[]=${[...prefix, '/bin/sh', '/pkg/next/config/termd-launch.sh', ...argv].join(' ')} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }`;
 
 /** A `launchctl print` answer as macOS prints one: the job's keys one tab in, a block's entries two. */
 const launchctlPrint = (o: { argv?: string[]; env?: Record<string, string> }) =>
@@ -154,11 +155,106 @@ test("a unit naming an EnvironmentFile= has every value termd takes from its env
   const flags = read(['--port', '4100', '--data-dir', '/srv/unit']);
   assert.equal(unitPort(flags), '4100');
   assert.equal(unitDataDir(flags), '/srv/unit');
-  // systemd expands ${NAME} from the environment the files are part of, so an argument naming one is unknown, HOME too.
-  assert.equal(systemctlUnit(execStart(['--data-dir', '${HOME}/d']), '', { files }), undefined);
-  assert.equal(systemctlUnit(execStart(['--data-dir', '${BASE}/d']), 'BASE=/srv', { files }), undefined);
+  // systemd expands ${NAME} from the environment the files are part of, so a value with one is unknown, HOME too.
+  assert.deepEqual(unitDataDir(read(['--data-dir', '${HOME}/d'])), { unknown: `gives the data dir a value ${which} may set` });
+  assert.deepEqual(unitDataDir(read(['--data-dir', '${BASE}/d'], 'BASE=/srv')), { unknown: `gives the data dir a value ${which} may set` });
   // No file named: as before.
   assert.equal(unitPort(systemd([], 'TSM_PORT=4200')), '4200');
+});
+
+test("under an EnvironmentFile=, a ${NAME} makes unknown only what it can be: the value it stands in, or any option where termd may read it as one (the house's review of f3750e4..4f4c067, #22 comment 6315636412)", () => {
+  // One ${NAME} anywhere made the literal --port and --data-dir unknown too.
+  const files = ['/etc/termd.env (ignore_errors=no)'];
+  const which = 'EnvironmentFile=/etc/termd.env';
+  const read = (argv: string[]) => {
+    const u = systemctlUnit(execStart(argv), '', { manager: 'HOME=/home/a', files });
+    assert.ok(u, 'the ExecStart is read');
+    return u;
+  };
+  const both = read(['--log-file', '${LOG}', '--port', '3101', '--data-dir', '/srv/unit']);
+  assert.equal(unitPort(both), '3101', 'a variable in another option leaves --port known');
+  assert.equal(unitDataDir(both), '/srv/unit');
+  const dir = read(['--port', '3101', '--data-dir', '${BASE}/d']);
+  assert.equal(unitPort(dir), '3101');
+  assert.deepEqual(unitDataDir(dir), { unknown: `gives the data dir a value ${which} may set` });
+  assert.deepEqual(unitDataDir(read(['--port', '3101', '--data-dir', '${DIR}'])), { unknown: `gives the data dir a value ${which} may set` });
+  const port = read(['--port', '${P}', '--data-dir', '/srv/unit']);
+  assert.deepEqual(unitPort(port), { unknown: `gives the port a value ${which} may set` });
+  assert.equal(unitDataDir(port), '/srv/unit');
+  // systemd makes ${NAME} exactly one argument, so where termd may read that argument as an option, any option may be in it.
+  const opts = read(['--data-dir', '/srv/unit', '--port', '3101', '${OPTS}']);
+  const loose = { unknown: `passes an argument (\${…}) from ${which} where termd may read it as an option of its own` };
+  assert.deepEqual(unitPort(opts), loose);
+  assert.deepEqual(unitDataDir(opts), loose);
+  assert.deepEqual(unitPort(read(['--${OPT}', '4100', '--data-dir', '/srv/unit'])), { unknown: `passes an option named by a variable (--\${…}) from ${which} where termd may read it as an option of its own` });
+  // Before the first option stand the launcher and its script: a literal option after them wins.
+  assert.equal(unitPort(read(['${OPTS}', '--port', '3101', '--data-dir', '/srv/unit'])), '3101');
+  // A relative data dir is taken from $HOME, which the file may set; an absolute one is not.
+  assert.deepEqual(unitDataDir(read(['--port', '3101', '--data-dir', 'rel/d'])), { unknown: `gives a data dir taken from $HOME, which ${which} may set` });
+});
+
+test("an env prefix in ExecStart or ProgramArguments is read as env applies it: its assignments, -u and -i change the environment, and an option it has that is not read leaves the unit unknown (the house's review of f3750e4..4f4c067, #22 comment 6315636412)", () => {
+  // Read as arguments, `env TSM_PORT=4100 /bin/sh termd-launch.sh` was port 3101.
+  const read = (prefix: string[], argv: string[] = [], environment = '', files?: string[]) => {
+    const u = systemctlUnit(execStart(argv, prefix), environment, { manager: 'HOME=/home/a', ...(files && { files }) });
+    assert.ok(u, 'the ExecStart is read');
+    return u;
+  };
+  assert.equal(unitPort(read(['/usr/bin/env', 'TSM_PORT=4100'])), '4100');
+  assert.equal(unitPort(read(['/usr/bin/env', 'TSM_PORT=4100'], ['--port', '4200'])), '4200', 'an option still wins over the environment');
+  assert.equal(unitPort(read(['/usr/bin/env', '-u', 'TSM_PORT'], [], 'TSM_PORT=4200')), '3101');
+  assert.equal(unitPort(read(['/usr/bin/env', '--unset=TSM_PORT', 'SESSION_SERVER_PORT=4300'], [], 'TSM_PORT=4200')), '4300');
+  assert.equal(unitDataDir(read(['/usr/bin/env', '-i', 'HOME=/home/z'], [], 'TSM_DATA_DIR=/srv/x')), '/home/z/.tsm', '-i starts the environment empty');
+  assert.equal(unitPort(read(['/usr/bin/env', 'A=1', '/usr/bin/env', 'TSM_PORT=4400'])), '4400', 'env run by env applies again');
+  assert.equal(unitPort(read(['/usr/bin/env', '--', 'TSM_PORT=4500'])), '4500');
+  // What env sets, no EnvironmentFile= decides.
+  const filed = read(['/usr/bin/env', 'TSM_DATA_DIR=/srv/env'], ['--port', '3101'], '', ['/etc/termd.env (ignore_errors=no)']);
+  assert.equal(unitDataDir(filed), '/srv/env');
+  assert.equal(unitPort(filed), '3101');
+  // -C changes the directory a relative data dir is taken from, -S splits a string: neither is read.
+  assert.deepEqual(unitPort(read(['/usr/bin/env', '-C', '/srv'])), { unknown: 'runs env with -C, which is not read here' });
+  assert.deepEqual(unitDataDir(read(['/usr/bin/env', '-S', 'TSM_PORT=1 /bin/sh'])), { unknown: 'runs env with -S, which is not read here' });
+  // systemctl prints the argv unquoted: `"TSM_DATA_DIR=/my data"` reads as two words, and the second is not a program's path.
+  assert.deepEqual(unitDataDir(read(['/usr/bin/env', 'TSM_DATA_DIR=/my', 'data'])), { unknown: "runs env with data after its assignments, which systemctl's unquoted text cannot tell from the rest of a value with a space in it" });
+  // launchd's arguments are whole, so a value with a space is one entry, and env may find its program on PATH.
+  const launchd = launchctlUnit(
+    launchctlPrint({ argv: [] }).replace('\t\t/bin/sh\n\t\t/pkg', '\t\t/usr/bin/env\n\t\tTSM_DATA_DIR=/srv/my data\n\t\tsh\n\t\t/pkg'),
+  );
+  assert.ok(launchd);
+  assert.equal(unitDataDir(launchd), '/srv/my data');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-plist-env-'));
+  try {
+    const file = path.join(dir, 'com.animalabs.termd.plist');
+    fs.writeFileSync(file, '<plist><dict><key>ProgramArguments</key><array><string>/usr/bin/env</string><string>TSM_PORT=4600</string><string>/bin/sh</string><string>/pkg/l.sh</string></array></dict></plist>');
+    const u = plistUnit(file);
+    assert.ok(!('error' in u), JSON.stringify(u));
+    assert.equal(unitPort(u), '4600');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a running termd's environment is the one read when Linux shows it: whole, files and the manager's at its start included, and only this user's process (the house's review of f3750e4..4f4c067, #22 comment 6315636412)", { skip: process.platform !== 'linux' && 'Linux shows a process environment in /proc' }, async () => {
+  // The manager's environment as it is now held a variable imported after the unit started, which the running termd never had.
+  const child = spawn('sleep', ['30'], { env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: '/home/run', TSM_DATA_DIR: '/srv/at-start', BASE: '/srv/base' }, stdio: 'ignore' });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', resolve);
+      child.once('error', reject);
+    });
+    const proc = procEnviron(child.pid!);
+    assert.ok('env' in proc, JSON.stringify(proc));
+    assert.equal(proc.env.TSM_DATA_DIR, '/srv/at-start');
+    const u = systemctlUnit(execStart(['--port', '3101', '--log-file', '${BASE}/log']), 'TSM_DATA_DIR=/srv/unit', { manager: 'TSM_DATA_DIR=/srv/imported-since', files: ['/etc/termd.env (ignore_errors=no)'], running: proc.env });
+    assert.ok(u, 'the ExecStart is read, ${BASE} from the running environment');
+    assert.equal(unitDataDir(u), '/srv/at-start', 'what termd was given, not the manager or the unit text now');
+    assert.equal(unitPort(u), '3101');
+    if (process.getuid?.() !== 0) assert.deepEqual(procEnviron(1), { error: "it is another user's process" });
+  } finally {
+    child.kill();
+  }
+  await new Promise((r) => child.once('exit', r));
+  assert.deepEqual(procEnviron(child.pid!), { error: 'ENOENT' }, 'a process that has gone');
 });
 
 test("a unit's environment starts from the user manager's, which Environment= overrides and UnsetEnvironment= takes from (systemd 257, probed with a user unit)", () => {

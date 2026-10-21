@@ -75,7 +75,7 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
-import { launchctlUnit, plistUnit, systemctlUnit, unitDataDir, unitPort, type UnitText, type Unknown } from './units.js';
+import { launchctlUnit, plistUnit, procEnviron, systemctlUnit, unitDataDir, unitPort, type UnitText, type Unknown } from './units.js';
 
 type Id = string | number;
 interface Parsed {
@@ -325,7 +325,7 @@ async function checkSupervisor(): Promise<Supervisor> {
     return managed(`the launchd job ${LAUNCH_AGENT}`, unit);
   }
   if (process.platform === 'linux') {
-    const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,ExecStart,Environment,EnvironmentFiles,UnsetEnvironment']);
+    const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,MainPID,ExecStart,Environment,EnvironmentFiles,UnsetEnvironment']);
     if (r === 'timeout') return { kind: 'unknown', why: `systemctl --user show termd did not answer within ${SUPERVISOR_CHECK_MS} ms` };
     if (r === 'missing') return { kind: 'none' }; // no systemd: nothing of this user's is managed
     // A failure is no answer: under cron or `sudo -u` the user manager runs, with its units, but systemctl
@@ -341,13 +341,27 @@ async function checkSupervisor(): Promise<Supervisor> {
     const running = ['active', 'activating', 'reloading', 'deactivating'].includes(prop('ActiveState'));
     const enabled = /^(enabled|static|linked|indirect|generated|transient|alias)/.test(prop('UnitFileState'));
     if (!running && !enabled) return { kind: 'none' };
-    // The user manager's environment reaches every unit it starts (see systemctlUnit): asked only of a unit that is the manager's to run.
-    const m = await ask('systemctl', ['--user', 'show', '--property=Environment']);
-    if (m === 'timeout' || m === 'missing' || 'failed' in m) return { kind: 'unknown', why: `systemctl --user show (the user manager's environment, which the unit's termd inherits) ${m === 'timeout' ? `did not answer within ${SUPERVISOR_CHECK_MS} ms` : `failed (${m === 'missing' ? 'not found' : m.failed})`}, so the unit's port and data dir are unknown` };
-    const files = [...r.out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim());
-    const unit = systemctlUnit(prop('ExecStart'), prop('Environment'), { manager: /^Environment=(.*)$/m.exec(m.out)?.[1]?.trim() ?? '', files, unset: prop('UnsetEnvironment') });
-    if (!unit) return { kind: 'unknown', why: prop('ExecStart') ? `the systemd user unit termd's ExecStart is not in the shape read here, or names a variable not known here${files.length ? ' or one its EnvironmentFile= may set' : ''} (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown` : "the systemd user unit termd has no ExecStart, so its port and data dir are unknown" };
-    return managed('the systemd user unit termd', unit);
+    // A termd the unit runs has the environment it started with: a variable imported into the manager since
+    // is not its own (the house's review of f3750e4..4f4c067, #22 comment 6315636412). Linux shows it; the
+    // manager's environment, which every unit it starts inherits (see systemctlUnit), is read only where it
+    // cannot be, or no termd of the unit runs, and the note says which was read.
+    const pid = running ? Number(prop('MainPID')) || 0 : 0;
+    const proc = pid > 0 ? procEnviron(pid) : undefined;
+    let more: Parameters<typeof systemctlUnit>[2];
+    let from: string;
+    if (proc && 'env' in proc) {
+      more = { running: proc.env };
+      from = `its environment read from its running termd, pid ${pid}`;
+    } else {
+      const m = await ask('systemctl', ['--user', 'show', '--property=Environment']);
+      if (m === 'timeout' || m === 'missing' || 'failed' in m) return { kind: 'unknown', why: `systemctl --user show (the user manager's environment, which the unit's termd inherits) ${m === 'timeout' ? `did not answer within ${SUPERVISOR_CHECK_MS} ms` : `failed (${m === 'missing' ? 'not found' : m.failed})`}, so the unit's port and data dir are unknown` };
+      const files = [...r.out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim());
+      more = { manager: /^Environment=(.*)$/m.exec(m.out)?.[1]?.trim() ?? '', files, unset: prop('UnsetEnvironment') };
+      from = proc ? `its environment read from the user manager's, as its running termd's, pid ${pid}, could not be: ${proc.error}` : "its environment read from the user manager's, as no termd of it runs";
+    }
+    const unit = systemctlUnit(prop('ExecStart'), prop('Environment'), more);
+    if (!unit) return { kind: 'unknown', why: prop('ExecStart') ? `the systemd user unit termd's ExecStart is not in the shape read here, or names a variable not known here (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown (${from})` : "the systemd user unit termd has no ExecStart, so its port and data dir are unknown" };
+    return managed(`the systemd user unit termd (${from})`, unit);
   }
   return { kind: 'none' };
 }

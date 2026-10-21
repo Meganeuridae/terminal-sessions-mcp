@@ -814,6 +814,10 @@ interface Unit {
   managerFails?: boolean;
   /** systemd only: the unit's UnsetEnvironment=, each a name or one assignment. */
   unset?: string[];
+  /** systemd only: the pid of the unit's running termd (MainPID), when it runs one. */
+  mainPid?: number;
+  /** Arguments before the launcher, as an `env VAR=value` prefix is. */
+  prefix?: string[];
 }
 
 /** The two supervisors' answers for a loaded unit: a launchd job's `print` and a systemd unit's `show`, with the same command line and environment. */
@@ -828,7 +832,8 @@ function unitStub(u: Unit): Stub {
     `ActiveState=${u.active === false ? 'inactive' : 'active'}`,
     `UnitFileState=${u.enabled ? 'enabled' : 'disabled'}`,
     // The argv unquoted.
-    `ExecStart={ path=/bin/sh ; argv[]=/bin/sh /pkg/next/config/termd-launch.sh ${args.join(' ')} ; ignore_errors=no }`,
+    `MainPID=${u.mainPid ?? 0}`,
+    `ExecStart={ path=${u.prefix?.[0] ?? '/bin/sh'} ; argv[]=${[...(u.prefix ?? []), '/bin/sh', '/pkg/next/config/termd-launch.sh', ...args].join(' ')} ; ignore_errors=no }`,
     `Environment=${words(env)}`,
     ...(u.envFiles ?? []).map((f) => `EnvironmentFiles=${f}`),
     `UnsetEnvironment=${(u.unset ?? []).join(' ')}`,
@@ -838,6 +843,7 @@ function unitStub(u: Unit): Stub {
   const launchctl = [
     'com.animalabs.termd = {',
     '\targuments = {',
+    ...(u.prefix ?? []).map((a) => `\t\t${a}`),
     '\t\t/bin/sh',
     '\t\t/pkg/next/config/termd-launch.sh',
     ...args.map((a) => `\t\t${a}`),
@@ -943,7 +949,7 @@ test("tg-19: on loopback with nothing listening the shim starts termd (unless TS
 test("tg-19: a supervisor's termd on the shim's port is left to it, and a check that does not answer starts nothing (the house's read of 4e37a11, #22)", async () => {
   const port = await unusedPort();
   const cases = [
-    ['ours', /is the (launchd job com\.animalabs\.termd|systemd user unit termd)'s to start/],
+    ['ours', /is the (launchd job com\.animalabs\.termd|systemd user unit termd \([^)]*\))'s to start/],
     ['slow', /did not answer within 1500 ms: no termd is started here/],
   ] as const;
   for (const [kind, expected] of cases) {
@@ -1005,6 +1011,13 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     says: RegExp;
   }
   const spaced = (name: string) => path.join(tmp, `sup ${name} with spaces`);
+  /** A process of this user's standing in for the unit's running termd, with the environment given: its pid. */
+  const stand: ChildProcess[] = [];
+  const runningTermd = (env: Record<string, string>): number => {
+    const child = spawn('sleep', ['60'], { env: { PATH: process.env.PATH ?? '/usr/bin:/bin', ...env }, stdio: 'ignore' });
+    stand.push(child);
+    return child.pid!;
+  };
   const cases: Case[] = [
     { name: 'shared-data-dir-with-spaces-in-argv', when: true, stub: (dataDir) => unitStub({ port: 3101, dataDir }), dataDir: spaced('argv'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup argv with spaces, which a termd for port \d+ started here would use too/ },
     { name: 'shared-data-dir-with-spaces-in-environment', when: true, stub: (dataDir) => unitStub({ port: 3101, env: { TSM_DATA_DIR: dataDir } }), dataDir: spaced('env'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup env with spaces, which a termd/ },
@@ -1025,19 +1038,19 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     { name: 'launchctl-no-domain-no-plist', when: darwin, stub: 'failed', expect: 'start', says: /started termd/ },
     { name: 'launchctl-not-loaded-plist', when: darwin, stub: 'none', home: plistHome('not-loaded', port), expect: 'managed', says: /is the LaunchAgent com\.animalabs\.termd \(\S+\.plist; not loaded now, loaded at login\)'s to start/ },
     { name: 'launchctl-not-loaded-plist-other-port', when: darwin, stub: 'none', home: plistHome('not-loaded-other', 3101), expect: 'start', says: /LaunchAgent com\.animalabs\.termd \(.*\) serves port 3101 out of \S+\.tsm, not \d+: a termd for \d+ is started here/ },
-    { name: 'enabled-inactive', when: linux, stub: () => unitStub({ port, active: false, enabled: true }), expect: 'managed', says: /is the systemd user unit termd's to start/ },
-    { name: 'port-in-environment', when: true, stub: () => unitStub({ port: 'none', env: { TSM_PORT: String(port) } }), expect: 'managed', says: /is the (launchd job com\.animalabs\.termd|systemd user unit termd)'s to start/ },
+    { name: 'enabled-inactive', when: linux, stub: () => unitStub({ port, active: false, enabled: true }), expect: 'managed', says: /is the systemd user unit termd \(its environment read from the user manager's, as no termd of it runs\)'s to start/ },
+    { name: 'port-in-environment', when: true, stub: () => unitStub({ port: 'none', env: { TSM_PORT: String(port) } }), expect: 'managed', says: /is the (launchd job com\.animalabs\.termd|systemd user unit termd \([^)]*\))'s to start/ },
     { name: 'both-ports-session-server-first', when: true, stub: () => unitStub({ port: 'none', env: { SESSION_SERVER_PORT: '3100', TSM_PORT: String(port) } }), expect: 'managed', says: /'s to start/ },
     { name: 'shared-data-dir-from-environment', when: true, stub: (dataDir) => unitStub({ port: 3101, env: { TSM_DATA_DIR: dataDir } }), expect: 'shared', says: /serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too: none is started here \(one termd per data dir; give this shim another TSM_DATA_DIR, or dial port 3101\)/ },
     { name: 'shared-data-dir-by-default', when: true, stub: () => unitStub({ port: 3101 }), dataDir: 'default', expect: 'shared', says: /serves port 3101 out of the data dir \S+\/\.tsm, which a termd for port \d+ started here would use too/ },
     // The house's read of the 33 commits (#22 comment 6307350861): a run of spaces in the unit's data dir is
     // kept, an empty TSM_PORT is unset as termd has it, and a launchd job with no arguments block is unknown.
     { name: 'shared-data-dir-with-a-run-of-spaces', when: true, stub: (dataDir) => unitStub({ port: 3101, dataDir }), dataDir: path.join(tmp, 'sup run  of   spaces'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup run {2}of {3}spaces, which a termd/ },
-    { name: 'empty-tsm-port-in-environment', when: true, stub: () => unitStub({ port: 'none', env: { TSM_PORT: '', SESSION_SERVER_PORT: String(port) } }), expect: 'managed', says: /is the (launchd job com\.animalabs\.termd|systemd user unit termd)'s to start/ },
+    { name: 'empty-tsm-port-in-environment', when: true, stub: () => unitStub({ port: 'none', env: { TSM_PORT: '', SESSION_SERVER_PORT: String(port) } }), expect: 'managed', says: /is the (launchd job com\.animalabs\.termd|systemd user unit termd \([^)]*\))'s to start/ },
     // An EnvironmentFile= can set what the shim reads from Environment=: read from that alone, these units
     // were port 3101 and $HOME/.tsm, and a termd was started (the house's read of the 40 commits through
     // f3750e4, #22 comment 6310921374). Options on the command line stay known.
-    { name: 'environment-file-and-no-port-flag', when: linux, stub: () => unitStub({ port: 'none', envFiles: ['/etc/termd.env (ignore_errors=no)'] }), expect: 'unknown', says: /the systemd user unit termd names no --port and reads EnvironmentFile=\/etc\/termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so its port is unknown/ },
+    { name: 'environment-file-and-no-port-flag', when: linux, stub: () => unitStub({ port: 'none', envFiles: ['/etc/termd.env (ignore_errors=no)'] }), expect: 'unknown', says: /the systemd user unit termd \([^)]*\) names no --port and reads EnvironmentFile=\/etc\/termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so its port is unknown/ },
     { name: 'environment-file-and-no-data-dir-flag', when: linux, stub: () => unitStub({ port: 3101, envFiles: [`${tmp}/termd.env (ignore_errors=yes)`] }), expect: 'dangling', says: /serves port 3101, and its unit names no --data-dir and reads EnvironmentFile=\S+\/termd\.env, which may set TSM_DATA_DIR, so the data dir its termd uses is unknown: none is started here/ },
     { name: 'environment-file-and-both-flags', when: linux, stub: () => unitStub({ port: 3101, dataDir: path.join(tmp, 'unit-data'), envFiles: ['/etc/termd.env (ignore_errors=no)'] }), expect: 'start', says: /serves port 3101 out of \S+unit-data, not \d+: a termd for \d+ is started here/ },
     // The user manager's environment reaches the unit's termd: read from Environment= alone, its data dir was $HOME/.tsm.
@@ -1047,6 +1060,15 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // the 40 commits over our fixes, #22).
     { name: 'data-dir-unset-from-the-manager-environment', when: linux, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir }, unset: ['TSM_DATA_DIR'] }), expect: 'start', says: /serves port 3101 out of \S+\/\.tsm, not \d+: a termd for \d+ is started here/ },
     { name: 'manager-environment-query-fails', when: linux, stub: () => unitStub({ port: 3101, managerFails: true }), expect: 'unknown', says: /systemctl --user show \(the user manager's environment, which the unit's termd inherits\) failed \(Failed to connect to bus: No medium found\), so the unit's port and data dir are unknown/ },
+    // The house's review of f3750e4..4f4c067 (#22 comment 6315636412). A running unit's termd has the environment it
+    // started with: read from the manager's as it is now, a data dir imported into it since was taken for termd's.
+    { name: 'data-dir-in-the-running-termd-environment', when: linux, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: path.join(tmp, 'imported-since') }, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /the systemd user unit termd \(its environment read from its running termd, pid \d+\) serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
+    // One the shim may not read (another user's, pid 1) leaves the manager's, and the note says so.
+    { name: 'running-termd-environment-unreadable', when: linux && process.getuid?.() !== 0, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir }, mainPid: 1 }), expect: 'shared', says: /the systemd user unit termd \(its environment read from the user manager's, as its running termd's, pid 1, could not be: it is another user's process\) serves port 3101 out of the data dir/ },
+    // An env prefix is environment, as env applies it: read as arguments, these units were $HOME/.tsm.
+    { name: 'data-dir-in-an-env-prefix', when: true, stub: (dataDir) => unitStub({ port: 3101, prefix: ['/usr/bin/env', `TSM_DATA_DIR=${dataDir}`] }), expect: 'shared', says: /serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
+    // Under an EnvironmentFile=, a ${NAME} in another option left --port and --data-dir unknown too.
+    { name: 'environment-file-and-a-variable-in-another-option', when: linux, stub: () => unitStub({ argv: ['--port', '3101', '--data-dir', path.join(tmp, 'unit-data'), '--log-file', '${LOG}/termd.log'], envFiles: ['/etc/termd.env (ignore_errors=no)'] }), expect: 'start', says: /serves port 3101 out of \S+unit-data, not \d+: a termd for \d+ is started here/ },
     { name: 'launchctl-no-arguments-block', when: darwin, stub: () => ({ launchctl: `printf '%s\\n' 'com.animalabs.termd = {' '\tprogram = /usr/local/bin/termd' '\tenvironment = {' '\t\tTSM_PORT => ${port}' '\t}' '}'`, systemctl: 'exit 1' }), expect: 'unknown', says: /launchctl print shows no arguments for the launchd job com\.animalabs\.termd \(a job naming Program alone, whose program's own arguments are not shown\), so its port and data dir are unknown/ },
   ];
   const run = async (c: Case): Promise<void> => {
@@ -1070,7 +1092,11 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     if (c.expect === 'unknown') assert.match(failed.error?.message ?? '', /no termd is started here while that is unknown \(TSM_NO_SPAWN=1 skips the check/, c.name);
     assert.equal(await s.exited, 1, c.name);
   };
-  await Promise.all(cases.filter((c) => c.when).map(run));
+  try {
+    await Promise.all(cases.filter((c) => c.when).map(run));
+  } finally {
+    for (const child of stand) child.kill();
+  }
 });
 
 test("tg-19: no termd is started for a wss:// address, and a URL without a port means the scheme's port (the house's read of 4e37a11, #22)", async () => {

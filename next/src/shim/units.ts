@@ -10,17 +10,26 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { setting } from '../core/env.js';
+import { parseEnvNul, setting } from '../core/env.js';
 
 export interface UnitText {
   argv: string[];
   env: Record<string, string>;
   /**
    * A source of the environment termd is given that is not read here (systemd's EnvironmentFile=):
-   * a value termd would take from its environment is then unknown, neither `env`'s nor termd's default.
+   * a variable termd would read is then unknown, neither `env`'s nor termd's default, unless an `env`
+   * prefix on the command line sets it (`fixed`). An argument that expands one of its variables holds
+   * UNREAD where the value goes.
    */
   unreadEnv?: string;
+  /** Variables an `env` prefix set or took away, so no file decides them; `all` after `env -i`. */
+  fixed?: Set<string> | 'all';
+  /** Why no option or variable termd reads can be told from the text at all, worded to follow the unit's name. */
+  unclear?: string;
 }
+
+/** Stands in an argument for the value of a variable an unread EnvironmentFile= may set. */
+const UNREAD = '\u0000';
 
 /** Why a value a unit gives termd cannot be told from its text, worded to follow the unit's name. */
 export interface Unknown {
@@ -47,7 +56,7 @@ export function launchctlUnit(out: string): UnitText | undefined {
     const m = /^(\w+) =>(?: (.*))?$/.exec(line);
     if (m) env[m[1]!] = m[2] ?? '';
   }
-  return { argv, env };
+  return throughEnv({ argv, env });
 }
 
 /**
@@ -66,10 +75,18 @@ export function launchctlUnit(out: string): UnitText | undefined {
  * running termd has what they said at its start), through a grammar of quotes, escapes and continued
  * lines, skipping a missing `-` file and taking every file a glob names; read wrong, the port or data
  * dir compared would be another than termd's, and the shim would start a termd where the unit's runs,
- * which the check is there to prevent. So a unit naming one has every value termd takes from its
- * environment unknown (`unreadEnv`), an argument with `${NAME}` included, while an option on its command
- * line stays known, since termd reads that first (the house's read of the 40 commits through f3750e4,
- * #22 comment 6310921374).
+ * which the check is there to prevent. So a unit naming one has every variable termd reads unknown
+ * (`unreadEnv`), unless an `env` prefix sets it, while an option on its command line stays known, since
+ * termd reads that first (the house's read of the 40 commits through f3750e4, #22 comment 6310921374).
+ * A `${NAME}` the file may set is unknown too, but systemd makes it exactly one argument, so only what
+ * it can be is unknown: the value of the option it follows, or, standing where termd could read it as
+ * an option of its own (a word past the first option that is not a flag's first value), any option, the
+ * port and data dir with it. Read as unknown wherever it stood, one `${NAME}` made a literal `--port` and
+ * `--data-dir` unknown too (the house's review of f3750e4..4f4c067, #22 comment 6315636412).
+ *
+ * `more.running` is the environment the unit's running termd has (`procEnviron`): what systemd gave it
+ * when it started, the files and the manager's environment then included, which a variable imported
+ * into the manager since does not change. Given, it is the environment, whole.
  *
  * The argv is what systemd runs, as it runs it (systemd 255, probed with a user unit): `systemctl
  * show` prints a unit file's specifiers (`%h`) already expanded, while `${NAME}` in an argument is
@@ -86,22 +103,25 @@ export function launchctlUnit(out: string): UnitText | undefined {
  * misread leave the shim starting a termd out of the unit's own data dir, termd's lock on the data dir
  * refuses it, and the shim reports what termd said.
  */
-export function systemctlUnit(execStart: string, environment: string, more: { manager?: string; files?: readonly string[]; unset?: string } = {}): UnitText | undefined {
+export function systemctlUnit(execStart: string, environment: string, more: { manager?: string; files?: readonly string[]; unset?: string; running?: Record<string, string> } = {}): UnitText | undefined {
   if (!execStart) return undefined;
   const m = /argv\[\]=(.*?)(?: ; |\s*\}\s*$|$)/.exec(execStart);
   if (!m) return undefined;
-  const env: Record<string, string> = {};
-  for (const word of [...quotedWords(more.manager ?? ''), ...quotedWords(environment)]) {
-    const eq = word.indexOf('=');
-    if (eq > 0) env[word.slice(0, eq)] = word.slice(eq + 1);
-  }
-  for (const word of quotedWords(more.unset ?? '')) {
-    const eq = word.indexOf('=');
-    const name = eq < 0 ? word : word.slice(0, eq);
-    if (eq < 0 || env[name] === word.slice(eq + 1)) delete env[name];
+  let env: Record<string, string> = {};
+  if (more.running) env = { ...more.running };
+  else {
+    for (const word of [...quotedWords(more.manager ?? ''), ...quotedWords(environment)]) {
+      const eq = word.indexOf('=');
+      if (eq > 0) env[word.slice(0, eq)] = word.slice(eq + 1);
+    }
+    for (const word of quotedWords(more.unset ?? '')) {
+      const eq = word.indexOf('=');
+      const name = eq < 0 ? word : word.slice(0, eq);
+      if (eq < 0 || env[name] === word.slice(eq + 1)) delete env[name];
+    }
   }
   // systemctl prints each as `<path> (ignore_errors=yes|no)`, the `-` of an optional one as the flag.
-  const files = (more.files ?? []).map((f) => f.replace(/ \(ignore_errors=\w+\)$/, ''));
+  const files = more.running ? [] : (more.files ?? []).map((f) => f.replace(/ \(ignore_errors=\w+\)$/, ''));
   const unreadEnv = files.length ? `EnvironmentFile=${files.join(', ')}` : undefined;
   const words: string[] = [];
   for (const w of m[1]!.split(' ')) {
@@ -110,16 +130,120 @@ export function systemctlUnit(execStart: string, environment: string, more: { ma
       // A file may set any variable, HOME too. HOME is in the manager's environment; one the unit's takes
       // away (UnsetEnvironment=HOME) systemd expands to nothing, where this shim's own home was put in (the
       // house's read of the 40 commits over our fixes, #22; systemd 255, probed with transient user units).
-      const v = name === undefined || unreadEnv ? undefined : env[name];
+      if (name !== undefined && unreadEnv) return UNREAD;
+      const v = name === undefined ? undefined : env[name];
       if (v === undefined) unknown = true;
       return v ?? all;
     });
     if (unknown) return undefined;
     words.push(x);
   }
-  const u: UnitText = { argv: joinOptionValues(words), env };
-  if (unreadEnv) u.unreadEnv = unreadEnv;
+  // env's own options start with `--` too, so it is read before the words are joined into option values.
+  // systemctl's text is unquoted, so env's program must be a path: a word that is not one may be the rest
+  // of an assignment's value with a space in it.
+  const u = throughEnv({ argv: words, env }, { program: 'path' });
+  if (unreadEnv) {
+    u.unreadEnv = unreadEnv;
+    const loose = looseExpansion(u.argv);
+    if (loose && !u.unclear) u.unclear = `passes ${loose} from ${unreadEnv} where termd may read it as an option of its own`;
+  }
+  u.argv = joinOptionValues(u.argv);
   return u;
+}
+
+/**
+ * The first argument past the first option that an expansion may make an option of its own: a flag
+ * whose name holds one, or a word that begins with one and is not the first value of the flag before
+ * it. Before the first option stand the launcher and its script, and an option there is overridden by
+ * a later literal one (termd takes an option's last value) or falls to the environment, unknown already.
+ */
+function looseExpansion(argv: readonly string[]): string | undefined {
+  let options = false;
+  let firstValue = false;
+  for (const w of argv) {
+    if (w.startsWith('--')) {
+      options = true;
+      if (w.slice(0, (w.indexOf('=') + 1 || w.length + 1) - 1).includes(UNREAD)) return `an option named by a variable (${w.replaceAll(UNREAD, '${…}')})`;
+      firstValue = !w.includes('=');
+    } else if (options) {
+      if (!firstValue && w.startsWith(UNREAD)) return `an argument (${w.replaceAll(UNREAD, '${…}')})`;
+      firstValue = false;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * A command line run through `env`, as env applies it: its assignments and `-u`/`--unset` change the
+ * environment the program after them gets, `-i` (`-`, `--ignore-environment`) starts it empty, `--`
+ * ends its options, and the program's own arguments follow; env run by env applies again. Read as
+ * arguments, `env TSM_PORT=4100 /bin/sh termd-launch.sh` was port 3101 (the house's review of
+ * f3750e4..4f4c067, #22 comment 6315636412). Any other option of env (`-C` changes the directory a
+ * relative data dir is taken from, `-S` splits a string) is not read: then nothing is known
+ * (`unclear`). What env sets or takes away is `fixed`, so no EnvironmentFile= decides it.
+ */
+function throughEnv(u: UnitText, o: { program?: 'path' } = {}): UnitText {
+  let argv = u.argv;
+  const env = { ...u.env };
+  let fixed: Set<string> | 'all' | undefined;
+  const fix = (name: string) => {
+    if (fixed === 'all') return;
+    fixed ??= new Set();
+    fixed.add(name);
+  };
+  const unclear = (why: string): UnitText => ({ ...u, unclear: why });
+  while (argv.length && path.basename(argv[0]!) === 'env') {
+    let i = 1;
+    for (; i < argv.length; i++) {
+      const w = argv[i]!;
+      if (w === '--') {
+        i++;
+        break;
+      }
+      if (w === '-i' || w === '-' || w === '--ignore-environment') {
+        for (const k of Object.keys(env)) delete env[k];
+        fixed = 'all';
+      } else if (w === '-u' || w === '--unset' || w.startsWith('--unset=') || /^-u./.test(w)) {
+        const name = w === '-u' || w === '--unset' ? argv[++i] : w.startsWith('--unset=') ? w.slice('--unset='.length) : w.slice(2);
+        if (!name) return unclear(`runs env with ${w} and no name after it`);
+        delete env[name];
+        fix(name);
+      } else if (w === '-v' || w === '--debug') continue;
+      else if (w.startsWith('-')) return unclear(`runs env with ${w.replaceAll(UNREAD, '${…}')}, which is not read here`);
+      else break;
+    }
+    for (; i < argv.length && argv[i]!.includes('='); i++) {
+      const w = argv[i]!;
+      const eq = w.indexOf('=');
+      if (eq === 0) return unclear(`runs env with ${w}, which it refuses`);
+      env[w.slice(0, eq)] = w.slice(eq + 1);
+      fix(w.slice(0, eq));
+    }
+    const program = argv[i];
+    if (program === undefined) return unclear('runs env with no program after it');
+    if (o.program === 'path' && !program.startsWith('/')) return unclear(`runs env with ${program.replaceAll(UNREAD, '${…}')} after its assignments, which systemctl's unquoted text cannot tell from the rest of a value with a space in it`);
+    argv = argv.slice(i);
+  }
+  const out: UnitText = { ...u, argv, env };
+  if (fixed) out.fixed = fixed;
+  return out;
+}
+
+/**
+ * The environment of a running process of this user's, as Linux shows it in /proc/<pid>/environ: what
+ * its program was given when it was started, which is what termd read; or why it cannot be read. Only
+ * this user's: whose a process is is said by its /proc entry's owner.
+ */
+export function procEnviron(pid: number): { env: Record<string, string> } | { error: string } {
+  try {
+    if (fs.statSync(`/proc/${pid}`).uid !== process.getuid?.()) return { error: "it is another user's process" };
+    const text = fs.readFileSync(`/proc/${pid}/environ`, 'utf8');
+    // A process that has exited but not been reaped shows none.
+    if (!text) return { error: 'it shows no environment' };
+    return { env: parseEnvNul(text) };
+  } catch (e) {
+    return { error: (e as NodeJS.ErrnoException).code ?? (e as Error).message };
+  }
 }
 
 /** Words of a list systemd prints, double-quoted where a word has spaces (`\"` and `\\` inside stand for the characters). */
@@ -185,10 +309,17 @@ export function unitArg(u: UnitText, flag: string): string | undefined | null {
  * value termd refuses, not digits or past 65535, is unknown, as a flag without one is.
  */
 export function unitPort(u: UnitText): string | Unknown {
+  if (u.unclear) return { unknown: u.unclear };
   const arg = unitArg(u, '--port');
   if (arg === null) return { unknown: 'names --port without a value' };
-  if (arg === undefined && u.unreadEnv) return { unknown: `names no --port and reads ${u.unreadEnv}, which may set TSM_PORT or SESSION_SERVER_PORT` };
-  const value = arg ?? setting('TSM_PORT', u.env) ?? setting('SESSION_SERVER_PORT', u.env) ?? '3101';
+  let value = arg;
+  if (value === undefined) {
+    const tsm = fromEnv(u, 'TSM_PORT');
+    const v1x = tsm === undefined ? fromEnv(u, 'SESSION_SERVER_PORT') : undefined;
+    if (tsm === UNREAD || v1x === UNREAD) return { unknown: `names no --port and reads ${u.unreadEnv}, which may set TSM_PORT or SESSION_SERVER_PORT` };
+    value = tsm ?? v1x ?? '3101';
+  }
+  if (value.includes(UNREAD)) return { unknown: `gives the port a value ${u.unreadEnv} may set` };
   const digits = value.trim();
   const n = /^\d+$/.test(digits) ? Number(digits) : NaN;
   return n <= 65535 ? String(n) : { unknown: `gives the port ${JSON.stringify(value)}, which termd refuses` };
@@ -208,13 +339,23 @@ export function unitPort(u: UnitText): string | Unknown {
  * dir (the house's read of the 40 commits over our fixes, #22).
  */
 export function unitDataDir(u: UnitText): string | Unknown {
+  if (u.unclear) return { unknown: u.unclear };
   const arg = unitArg(u, '--data-dir');
   if (arg === null) return { unknown: 'names --data-dir without a value' };
-  if (arg === undefined && u.unreadEnv) return { unknown: `names no --data-dir and reads ${u.unreadEnv}, which may set TSM_DATA_DIR` };
-  const named = arg ?? setting('TSM_DATA_DIR', u.env);
-  const home = setting('HOME', u.env) ?? os.homedir();
-  if (named === undefined) return path.join(home, '.tsm');
-  return path.resolve(home, named);
+  const named = arg ?? fromEnv(u, 'TSM_DATA_DIR');
+  if (arg === undefined && named === UNREAD) return { unknown: `names no --data-dir and reads ${u.unreadEnv}, which may set TSM_DATA_DIR` };
+  if (named?.includes(UNREAD)) return { unknown: `gives the data dir a value ${u.unreadEnv} may set` };
+  if (named !== undefined && path.isAbsolute(named)) return path.resolve(named);
+  // A relative data dir, or the default, is taken from the home the launcher starts in.
+  const home = fromEnv(u, 'HOME');
+  if (home === UNREAD || home?.includes(UNREAD)) return { unknown: `gives a data dir taken from $HOME, which ${u.unreadEnv} may set` };
+  return path.resolve(home ?? os.homedir(), named ?? '.tsm');
+}
+
+/** A variable termd reads, as setting() reads it; UNREAD when an unread EnvironmentFile= may set it and no `env` prefix does. */
+function fromEnv(u: UnitText, name: string): string | undefined {
+  if (u.unreadEnv && u.fixed !== 'all' && !u.fixed?.has(name)) return UNREAD;
+  return setting(name, u.env);
 }
 
 /**
@@ -241,5 +382,5 @@ export function plistUnit(file: string): UnitText | { error: string } {
   // A key holds no markup, and `<string/>` is an empty value: a lazy key ran on over one, and the key
   // after it was lost (the house's read of the 40 commits, #22).
   for (const m of dict.matchAll(/<key>([^<]*)<\/key>\s*(?:<string>([\s\S]*?)<\/string>|<string\s*\/>)/g)) env[text(m[1]!)] = text(m[2] ?? '');
-  return { argv, env };
+  return throughEnv({ argv, env });
 }
