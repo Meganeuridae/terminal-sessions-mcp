@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { until, unusedPort } from './testhost.js';
+import { groupAlive } from '../src/core/lock.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON = path.resolve(here, '../src/daemon.js');
@@ -489,11 +490,30 @@ async function rpc(url: string, method: string, params: unknown, query = ''): Pr
   }
 }
 
-/** Processes whose command line contains `needle`, as `ps` lists them. */
-const alive = (needle: string): string[] =>
-  execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' })
-    .split('\n')
-    .filter((l) => l.includes(needle) && !l.includes('ps -axo'));
+/**
+ * The process group a Run's start recorded in its session's journal, once written: the group recovery is to
+ * end. Checked by signal, not found in a listing of every process: `ps -axo` through execFileSync outgrew its
+ * 1 MiB default buffer on a busy host and threw ENOBUFS, and it matched other runs' processes by command line
+ * (the house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715).
+ */
+function runPgid(dataDir: string, session: string, runId: string): number | undefined {
+  let text: string;
+  try {
+    text = fs.readFileSync(path.join(dataDir, 'sessions', session, 'journal.jsonl'), 'utf8');
+  } catch {
+    return undefined; // not written yet
+  }
+  for (const line of text.split('\n')) {
+    if (!line.includes('"run.start"')) continue;
+    try {
+      const e = JSON.parse(line) as { type?: string; runId?: string; pgid?: number };
+      if (e.type === 'run.start' && e.runId === runId && typeof e.pgid === 'number' && e.pgid > 1) return e.pgid;
+    } catch {
+      // the line is still being written
+    }
+  }
+  return undefined;
+}
 
 const parsed = (d: Daemon) => d.lines.map((l) => JSON.parse(l) as Record<string, unknown> & { msg: string });
 
@@ -537,14 +557,15 @@ test('recovery after a SIGKILL is logged: the lock taken over, the Runs ended, t
   const tag = `4${String(process.pid % 1000).padStart(3, '0')}7`;
   const a = termd(['--port', '0', '--data-dir', dataDir, '--no-usage-log', '--shell', '/bin/bash']);
   let b: Daemon | undefined;
+  let pgid: number | undefined;
   try {
     await until(() => listening(a) !== undefined, 10_000, 'the first termd');
     const r = await call(urlOf(a), 'run', { session: 'k1', target: 'process', command: `sleep ${tag}`, wait: 300 });
     assert.equal(r.state, 'running', JSON.stringify(r));
-    await until(() => alive(`sleep ${tag}`).length > 0, 5000, 'the process Run');
+    await until(() => (pgid = runPgid(dataDir, 'k1', String(r.runId))) !== undefined && groupAlive(pgid), 5000, 'the process Run');
     a.child.kill('SIGKILL');
     await a.exited;
-    assert.ok(alive(`sleep ${tag}`).length > 0, 'a daemon killed outright runs nothing: the process Run outlives it until the next start');
+    assert.ok(groupAlive(pgid!), 'a daemon killed outright runs nothing: the process Run outlives it until the next start');
     b = termd(['--port', '0', '--data-dir', dataDir, '--no-usage-log']);
     await until(() => listening(b!) !== undefined, 15_000, 'the second termd');
     const text = b.lines.join('\n');
@@ -552,19 +573,15 @@ test('recovery after a SIGKILL is logged: the lock taken over, the Runs ended, t
     assert.match(text, /recovery ended Runs a previous daemon left in flight/, text);
     assert.match(text, /recovery ended process groups a previous daemon left running/, text);
     assert.ok(parsed(b).some((m) => m.msg === 'recovery ended Runs a previous daemon left in flight' && m.session === 'k1' && Array.isArray(m.runs) && m.runs.includes(r.runId)), text);
-    assert.deepEqual(alive(`sleep ${tag}`), [], 'recovery ended the group');
+    // Recovery waits for the group's members to go; a leader the dead daemon fathered is reaped by init
+    // after that, and keeps the group's id until it is.
+    await until(() => !groupAlive(pgid!), 3000, 'recovery to have ended the group');
     assert.equal((JSON.parse(listening(b)!) as { recovered?: number }).recovered, 1);
   } finally {
     if (a.child.exitCode === null) a.child.kill('SIGKILL');
     if (b) await stop(b);
-    for (const l of alive(`sleep ${tag}`)) {
-      if (!l.trim().endsWith(`sleep ${tag}`)) continue;
-      try {
-        process.kill(Number(l.trim().split(/\s+/)[0]), 'SIGKILL');
-      } catch {
-        // gone
-      }
-    }
+    // Only ever this Run's own group, by the id its start recorded.
+    if (pgid !== undefined && groupAlive(pgid)) process.kill(-pgid, 'SIGKILL');
   }
 });
 

@@ -36,8 +36,13 @@ function runDaemon(argv: string[], env: NodeJS.ProcessEnv = {}): { child: ChildP
   return { child, lines, exited };
 }
 
+/**
+ * Processes whose command line contains `needle`. A listing of every process outgrew execFileSync's 1 MiB default
+ * buffer on a busy host and threw ENOBUFS (the house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715):
+ * this one has room for any host's.
+ */
 const alive = (needle: string): string[] =>
-  execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' })
+  execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
     .split('\n')
     .filter((l) => l.includes(needle) && !l.includes('ps -axo'));
 
