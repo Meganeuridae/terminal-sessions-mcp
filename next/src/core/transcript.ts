@@ -178,6 +178,20 @@ function cutFront(x: { data: string; head?: string }, at: number): void {
 }
 
 /**
+ * A tail cut of `x`'s data to `max` bytes, made on its head and data together, since data that begins inside a CSI
+ * is read on from that CSI's head (rule 6): where in the data it lands (tailStart: past the CSI when it would land
+ * inside it), and what it drops, with the head, so the lasting state the dropped part set is replayed. Made on the data
+ * alone, a cut inside the CSI's rest kept the head before a later part of it, a different control, and dropped a part
+ * that set nothing: a tail of 6 or 7 bytes of `ESC [ CR LF`, a Run's line, `4hXY CR Z` showed `ZY`, where the
+ * insert mode `ESC [ 4 h` set shows `ZXY` (our review of the 40 commits through 4f4c067, PR #22).
+ */
+function tailCut(x: { data: string; head?: string }, max: number): { at: number; gone: string } {
+  const head = x.head ?? '';
+  const at = Math.max(0, tailStart(head + x.data, max) - head.length);
+  return { at, gone: head + x.data.slice(0, at) };
+}
+
+/**
  * Where the interleave (rule 6) cuts a source's data: its lines go out through `through`, the index
  * after its last line end (0 when it ends none), and the rest is held until the source ends the line.
  * `ends` are its line ends by the one rule (`lineEnds`, with the source's `carry`), so a LF inside a
@@ -627,19 +641,19 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
     while (out.length > 1 && outBytes - out[0]!.bytes >= budget.max) {
       const gone = out.shift()!;
       outBytes -= gone.bytes;
-      drop(gone.data, gone.bytes);
+      drop((gone.head ?? '') + gone.data, gone.bytes);
     }
     // One source's run past twice the budget: only its last budget's worth can survive.
     const end = out[out.length - 1]!;
     if (end.bytes > 2 * budget.max) {
-      const cut = tailStart(end.data, budget.max);
-      leaveOpen(end.key, end.data, cut);
-      const gone = end.data.slice(0, cut);
-      cutFront(end, cut);
+      const { at, gone } = tailCut(end, budget.max);
+      leaveOpen(end.key, (end.head ?? '') + end.data, at + (end.head?.length ?? 0));
+      const goneBytes = utf8Length(end.data.slice(0, at));
+      cutFront(end, at);
       outBytes -= end.bytes;
       end.bytes = utf8Length(end.data);
       outBytes += end.bytes;
-      drop(gone, utf8Length(gone));
+      drop(gone, goneBytes);
     }
   };
   const flush = () => {
@@ -692,21 +706,22 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
       if (budget && h.bytes > 2 * budget.max) {
         // An unfinished line past twice the budget: only a budget's worth of it can survive. Kept
         // head: that worth is its start, and the rest of the line (`full`) is dropped as it comes.
-        const cut = budget.keep === 'tail' ? tailStart(h.data, budget.max) : headIndex(h.data, budget.max);
-        if (budget.keep === 'tail') {
-          leaveOpen(key, h.data, cut);
+        const tail = budget.keep === 'tail' ? tailCut(h, budget.max) : undefined;
+        const cut = tail ? tail.at : headIndex(h.data, budget.max);
+        if (tail) {
+          leaveOpen(key, (h.head ?? '') + h.data, cut + (h.head?.length ?? 0));
           // More than the budget goes from this line, which follows every segment emitted so far: none of
           // them can survive the cut. Kept, `head` before a title's payload held whole survived the
           // payload's 20 KB (a title's LFs end no line now, so the payload is a held line's).
-          for (const s of out.splice(0)) drop(s.data, s.bytes);
+          for (const s of out.splice(0)) drop((s.head ?? '') + s.data, s.bytes);
           outBytes = 0;
         }
-        const gone = budget.keep === 'tail' ? h.data.slice(0, cut) : h.data.slice(cut);
-        if (budget.keep === 'tail') cutFront(h, cut);
+        const gone = tail ? h.data.slice(0, cut) : h.data.slice(cut);
+        if (tail) cutFront(h, cut);
         else h.data = h.data.slice(0, cut);
         h.bytes = utf8Length(h.data);
         h.full = budget.keep === 'head';
-        drop(gone, utf8Length(gone));
+        drop(tail ? tail.gone : gone, utf8Length(gone));
       }
       continue;
     }
@@ -730,8 +745,9 @@ function segments(chunks: Iterable<ProjectChunk>, label: ProjectOptions['label']
 
 /** Drop the segments before `k` and segment `k`'s data before `at`; the dropped data goes to `dropped`. */
 function dropHead(segs: Segment[], k: number, at: number, dropped: string[]): void {
-  for (let i = 0; i < k; i++) dropped.push(segs[i]!.data);
-  dropped.push(segs[k]!.data.slice(0, at));
+  // A segment that begins inside a CSI is dropped with its head, so the lasting state the CSI set is replayed.
+  for (let i = 0; i < k; i++) dropped.push((segs[i]!.head ?? '') + segs[i]!.data);
+  dropped.push((segs[k]!.head ?? '') + segs[k]!.data.slice(0, at));
   cutFront(segs[k]!, at);
   segs[k]!.bytes = utf8Length(segs[k]!.data);
   segs.splice(0, k);
@@ -751,7 +767,7 @@ function cutInput(segs: Segment[], max: number, keep: 'head' | 'tail', dropped: 
     let k = segs.length - 1;
     while (k >= 0 && acc + sizes[k]! <= max) acc += sizes[k--]!;
     // Segment k holds the cut; the budget left for it is max - acc.
-    dropHead(segs, k, tailStart(segs[k]!.data, max - acc), dropped);
+    dropHead(segs, k, tailCut(segs[k]!, max - acc).at, dropped);
   } else {
     let acc = 0;
     let k = 0;

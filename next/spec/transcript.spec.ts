@@ -653,6 +653,22 @@ test('a LF a CSI executes is a line end the interleave may cut at: the source’
   for (let maxLines = 1; maxLines <= 5; maxLines++) assert.ok(!/1m/.test((await project(chunks, { cols: 40, maxLines })).text), `maxLines ${maxLines}`);
 });
 
+test('a tail cut inside the rest of a CSI a LF split keeps what the CSI set (our review of the 40 commits through 4f4c067, PR #22)', async () => {
+  // `ESC [ CR LF`, a Run's line, then `4hXY CR Z`: insert mode is set, so the terminal shows `ZXY`. A tail of 6 or 7
+  // bytes was cut on the second part's data without the CSI's head: what it dropped set nothing, and the kept part began
+  // with the head before a later part of the CSI, so `ZY` showed.
+  const run = (data: string): ProjectChunk => ({ data, stream: 'stdout', runId: 'r1' });
+  const chunks: ProjectChunk[] = ['A\x1b[\r\n', run('r1\n'), '4hXY\rZ\r\n'];
+  for (let max = 6; max <= 14; max++) {
+    const { text } = await project(chunks, { cols: 40, maxInputBytes: max, keep: 'tail' });
+    assert.equal(text.split('\n').at(-1), 'ZXY', `budget ${max}: ${JSON.stringify(text)}`);
+  }
+  // A line past twice the budget is cut as it is read, by the same rule: its last 8 bytes, `....XY CR Z`, in insert mode
+  // show `Z....XY`, where `Z` written over the first dot would show `Z...XY`.
+  const long: ProjectChunk[] = ['A\x1b[\r\n', run('r1\n'), `4h${'.'.repeat(60)}XY\rZ`];
+  assert.equal((await project(long, { cols: 80, maxInputBytes: 8, keep: 'tail' })).text.split('\n').at(-1), 'Z....XY');
+});
+
 test('a hole starts the projection afresh: no line, and no string, open before it takes what follows', async () => {
   // The Run renderers projected a Run's output without its gaps, so a title open before a hole took the lines after it.
   assert.deepEqual((await project(['ready \x1b]0;my title', { hole: true }, 'ERROR: boom\r\n'], { cols: 40 })).text.split('\n'), ['ready', 'ERROR: boom']);
