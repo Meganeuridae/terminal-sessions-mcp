@@ -679,11 +679,21 @@ export class SessionRegistry {
     // tie (a TERM trap's new process, or a stranger's in a reused id), and the last signal they got: left
     // running, not "terminated" (the house's read of the 33 commits, PR #22, comment 6307350477, item 2).
     const untied = new Map<number, NodeJS.Signals>();
+    // A group set aside as untied whose last process has gone since, by the probe or by a listing taken for
+    // the groups still signalled, ended during the wait: not left running (the house's read of the 33
+    // commits, PR #22, comment 6307350477; an independent read of the fix).
+    const settle = (now: ProcessRow[] | undefined): void => {
+      for (const g of [...untied.keys()]) if (!groupAlive(g) || (now !== undefined && !now.some((p) => p.pgid === g && !p.zombie))) untied.delete(g);
+    };
     const stillOurs = (gs: number[], sent: NodeJS.Signals): number[] => {
       // A signal probe first (no listing): a group with no process at all is gone.
       const alive = gs.filter(groupAlive);
-      if (!alive.length) return alive;
+      if (!alive.length) {
+        settle(undefined);
+        return alive;
+      }
       const now = list();
+      settle(now);
       if (!now) {
         for (const g of alive) unchecked.set(g, sent);
         return [];
@@ -1452,7 +1462,11 @@ function holdsHistory(store: FileStore, journal: Journal): boolean {
 function expired(store: FileStore, retention: SessionRetention, now: number): boolean {
   if (retention.maxAgeMs === undefined) return false; // no age limit: history is kept until forgotten
   const newest = store.newestTs();
-  if (newest === undefined) return store.highWater() !== undefined; // every file aged out already
+  // No event left: aged out only when retention dropped the files and left its floor. Any high water read
+  // so before every store kept a reservation, which a power loss that took every line leaves behind too,
+  // so such a session read as past its age (the house's read of the 33 commits, PR #22, comment
+  // 6307350477; an independent read of the fix).
+  if (newest === undefined) return store.highWater()?.floor !== undefined;
   return newest < now - retention.maxAgeMs;
 }
 

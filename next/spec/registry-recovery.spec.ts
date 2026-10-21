@@ -764,6 +764,58 @@ test('jr2-4: a group a working listing shows gone is judged — no note — so a
   }
 });
 
+test('jr2-4: a group set aside as untied whose last process goes while recovery still waits on another group is reported terminated, not left running (the house\'s read of the 33 commits, PR #22, comment 6307350477; an independent read of the fix)', { timeout: 15_000 }, async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'ut');
+  const kids = detachedKids();
+  try {
+    // Two real groups that ignore SIGTERM, so the signal and the probe reach them; the listings are the test's.
+    // The first shows both leaders; the next, a process recovery never saw in the first group (untied) beside
+    // the second's leader, which keeps the wait going; the one after, the untied process gone; then nothing.
+    const g1 = kids.spawn('/bin/sh', ['-c', "trap '' TERM; exec sleep 417"]);
+    const g2 = kids.spawn('/bin/sh', ['-c', "trap '' TERM; exec sleep 418"]);
+    await until(() => groupAlive(g1) && groupAlive(g2));
+    const ts = Date.now();
+    const j = new Journal({ cold: new FileStore(sdir), sessionId: 'ut', now: () => ts });
+    journalProcess(j, 'r1-untied', g1);
+    journalProcess(j, 'r2-waited', g2);
+    j.close();
+    fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private' }), { mode: 0o600 });
+    const leader = (g: number): ProcessRow => ({ pid: g, pgid: g, startMs: ts, zombie: false });
+    const listings: ProcessRow[][] = [[leader(g1), leader(g2)], [{ pid: g1 + 100_000, pgid: g1, startMs: ts + 60_000, zombie: false }, leader(g2)], [leader(g2)]];
+    let calls = 0;
+    const book = logBook();
+    const r = rig(dir, { terminateOrphans: true, listProcesses: () => listings[calls++] ?? [], log: book.log });
+    assert.ok(calls >= 4, `the wait went on past the untied process's exit (${calls} listings)`);
+    const h = hist(r.reg.get('ut'));
+    assert.equal(h.run('r1-untied').reason, `daemon-restart; process group ${g1} terminated`);
+    assert.ok(!notesOf(h).some((t) => t.includes('left running')), JSON.stringify(notesOf(h)));
+    const ended = book.lines.find((l) => l.text === 'recovery ended process groups a previous daemon left running');
+    assert.deepEqual([ended?.fields?.['leftRunning'], [...((ended?.fields?.['groups'] as number[]) ?? [])].sort()], [undefined, [g1, g2].sort()], JSON.stringify(book.lines));
+    await r.reg.closeAll();
+  } finally {
+    kids.end();
+  }
+});
+
+test('G10/G21: a session within its age whose power loss took every line is recovered — the reservation it left is not retention\'s floor, so it is not removed as past its age (the house\'s read of the 33 commits, PR #22, comment 6307350477; an independent read of the fix)', async () => {
+  const dir = path.join(tmp, `d${++dirs}`);
+  const sdir = path.join(dir, 'sessions', 'pl');
+  fs.mkdirSync(sdir, { recursive: true, mode: 0o700 });
+  // A session with an hour's age limit, created seconds before the power loss: its journal had reserved its
+  // seqs (synced, on a boot that is not this one) and its lines, never synced, are gone.
+  fs.writeFileSync(path.join(sdir, 'journal.jsonl'), '', { mode: 0o600 });
+  fs.writeFileSync(path.join(sdir, 'journal.meta.json'), JSON.stringify({ v: 1, epoch: 'c'.repeat(16), reserved: 10_000, boot: 'the-boot-before-the-power-loss' }) + '\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(sdir, 'session.json'), JSON.stringify({ owner: A, visibility: 'private', createdAt: Date.now() - 5000, retention: { maxAgeMs: 3_600_000 } }), { mode: 0o600 });
+  const r = rig(dir);
+  const h = hist(r.reg.get('pl'));
+  assert.ok(fs.existsSync(sdir), 'its files stay');
+  const gaps = h.journal.since(0).events.filter((e): e is Extract<JournalEvent, { type: 'gap' }> => e.type === 'gap');
+  assert.deepEqual(gaps.map((g) => [g.from, g.to]), [[1, 10_000]], 'the lost seqs are a recorded hole');
+  assert.equal(h.owner, A);
+  await r.reg.closeAll();
+});
+
 test('jr2-4: an end a recovery wrote is bounded by the evidence it recorded as the in-flight rule is — a member proven to have started before it, not one that may have started after (the house\'s read of the 33 commits, PR #22, comment 6307350477, item 5)', () => {
   const self = { pid: 500, pgid: 400 };
   const L = 1_000_000; // the dead daemon's last event
