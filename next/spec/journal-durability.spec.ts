@@ -141,6 +141,36 @@ test('jr2-6/G10: a daemon that dies while the disk refuses writes does not have 
   }
 });
 
+test('jr2-6/G10: a journal.meta.json an earlier build wrote is read as it meant: a failed highWater as a refused reservation, whose seqs above the files are a store-failed gap, and a plain highWater as retention\'s floor, with nothing missing (the house\'s read of the 40 commits, PR #22)', () => {
+  const dir = tmpDir();
+  try {
+    const failedDir = path.join(dir, 'failed');
+    const j = new Journal({ cold: new FileStore(failedDir) });
+    for (let i = 0; i < 40; i++) j.append(out(`e${i}`));
+    j.close();
+    const epoch = (JSON.parse(fs.readFileSync(path.join(failedDir, 'journal.meta.json'), 'utf8')) as { epoch: string }).epoch;
+    // The earlier build kept one mark, `highWater`, and flagged it `failed` while the disk refused the seqs above the files.
+    fs.writeFileSync(path.join(failedDir, 'journal.meta.json'), JSON.stringify({ v: 1, epoch, highWater: 60, failed: true }) + '\n');
+    const a = new Journal({ cold: new FileStore(failedDir) });
+    assert.equal(a.epoch, epoch, 'the same journal');
+    assert.deepEqual(gaps(a.since(40).events), [[41, 60, 'store-failed']], 'the refused seqs are a recorded hole');
+    assert.equal(a.append(out('next')).seq, 62, 'numbering resumes above the hole');
+    a.close();
+    // A highWater without `failed` is the floor retention left when it dropped every file: numbering resumes
+    // above it, and no seq is missing.
+    const floorDir = path.join(dir, 'floor');
+    fs.mkdirSync(floorDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(floorDir, 'journal.jsonl'), '');
+    fs.writeFileSync(path.join(floorDir, 'journal.meta.json'), JSON.stringify({ v: 1, epoch: 'e'.repeat(16), highWater: 80 }) + '\n');
+    const b = new Journal({ cold: new FileStore(floorDir) });
+    assert.deepEqual(gaps(b.since(0).events), [], 'nothing is missing');
+    assert.equal(b.append(out('next')).seq, 81);
+    b.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ───────────── jr2-7: age retention reaches the active file and an idle ring ─────────────
 
 test('jr2-7/G21/G26: the active file is rotated once its oldest event is past maxAgeMs, so aged content goes at the next append', () => {
