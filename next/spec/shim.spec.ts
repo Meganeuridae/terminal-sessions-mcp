@@ -803,6 +803,8 @@ interface Stub {
 interface Unit {
   port?: number | 'none';
   dataDir?: string;
+  /** The unit's arguments to termd-launch.sh as given, in place of those `port` and `dataDir` make: one argument each in launchctl's lines, joined by spaces in systemctl's ExecStart. */
+  argv?: string[];
   env?: Record<string, string>;
   active?: boolean;
   enabled?: boolean;
@@ -810,7 +812,7 @@ interface Unit {
 
 /** The two supervisors' answers for a loaded unit: a launchd job's `print` and a systemd unit's `show`, with the same command line and environment. */
 function unitStub(u: Unit): Stub {
-  const args = [...(u.port === 'none' ? [] : ['--port', String(u.port ?? 3101)]), ...(u.dataDir ? ['--data-dir', u.dataDir] : [])];
+  const args = u.argv ?? [...(u.port === 'none' ? [] : ['--port', String(u.port ?? 3101)]), ...(u.dataDir ? ['--data-dir', u.dataDir] : [])];
   const env = Object.entries(u.env ?? {});
   const q = (s: string) => `'${s}'`;
   const systemctl = [
@@ -996,9 +998,11 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     { name: 'launchctl-not-loaded-plist-binary', when: darwin, stub: 'none', home: darwin ? otherFormPlistHome('launchctl-not-loaded-plist-binary', 'binary') : '', expect: 'unknown', says: /the LaunchAgent com\.animalabs\.termd is on disk \(\S+\.plist\) but could not be read \(a binary plist, which is not read here\), so its port and data dir are unknown/ },
     { name: 'launchctl-not-loaded-plist-program-only', when: darwin, stub: 'none', home: darwin ? otherFormPlistHome('launchctl-not-loaded-plist-program-only', 'program') : '', expect: 'unknown', says: /the LaunchAgent com\.animalabs\.termd is on disk \(\S+\.plist\) but could not be read \(no ProgramArguments array in it\), so its port and data dir are unknown/ },
     { name: 'execstart-in-another-shape', when: linux, stub: () => ({ launchctl: 'exit 113', systemctl: "printf '%s\\n' 'LoadState=loaded' 'ActiveState=active' 'UnitFileState=disabled' 'ExecStart=/bin/sh /pkg/next/config/termd-launch.sh --port 3101' 'Environment='" }), expect: 'unknown', says: /ExecStart is not in the shape read here/ },
-    { name: 'data-dir-flag-without-a-value', when: true, stub: () => unitStub({ port: 'none', dataDir: '--port 3101' }), expect: 'dangling', says: /names --data-dir without a value, so the data dir its termd uses is unknown: none is started here/ },
+    { name: 'data-dir-flag-without-a-value', when: true, stub: () => unitStub({ argv: ['--data-dir', '--port', '3101'] }), expect: 'dangling', says: /names --data-dir without a value, so the data dir its termd uses is unknown: none is started here/ },
     // A --port with no value, which termd refuses, was read on as the environment's port or 3101 (the house's read of the 40 commits, #22).
-    { name: 'port-flag-without-a-value', when: true, stub: () => unitStub({ port: 'none', dataDir: '/srv/unit-data --port' }), expect: 'unknown', says: /names --port without a value, so its port is unknown/ },
+    // Its own argument for both supervisors: a data dir of '/srv/unit-data --port' named it only in systemctl's
+    // joined ExecStart, and launchctl's lines read as port 3101, so a real termd started (Imago's macOS runs, #22).
+    { name: 'port-flag-without-a-value', when: true, stub: () => unitStub({ argv: ['--data-dir', '/srv/unit-data', '--port'] }), expect: 'unknown', says: /names --port without a value, so its port is unknown/ },
     // An empty ExecStart was read as termd with no arguments: its defaults (the house's read of the 40 commits, #22).
     { name: 'execstart-empty', when: linux, stub: () => ({ launchctl: 'exit 113', systemctl: "printf '%s\\n' 'LoadState=loaded' 'ActiveState=active' 'UnitFileState=enabled' 'ExecStart=' 'Environment='" }), expect: 'unknown', says: /the systemd user unit termd has no ExecStart, so its port and data dir are unknown/ },
     { name: 'systemctl-no-bus', when: linux, stub: 'failed', expect: 'unknown', says: /systemctl --user show termd failed \(Failed to connect to bus: No medium found\), so whether a unit manages termd is unknown; the user manager is reached through XDG_RUNTIME_DIR/ },
@@ -1021,8 +1025,10 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     const home = c.home ?? path.join(tmp, `home-${c.name}`);
     fs.mkdirSync(home, { recursive: true });
     const dataDir = c.dataDir === 'default' ? path.join(home, '.tsm') : (c.dataDir ?? path.join(tmp, `sup-${c.name}`));
-    // Where a start is expected, termd exits 2 at once (its log path is a directory): the start is what is checked, not a daemon.
-    if (c.expect === 'start') fs.mkdirSync(path.join(dataDir, 'termd.log'), { recursive: true });
+    // termd exits 2 at once here (its log path is a directory): where a start is expected, the start is what is
+    // checked, not a daemon; elsewhere a start the case didn't expect fails it and leaves no termd serving the
+    // port the other cases dial, as one did on macOS (Imago's runs of the house's e880589, #22).
+    fs.mkdirSync(path.join(dataDir, 'termd.log'), { recursive: true });
     const stub = typeof c.stub === 'function' ? c.stub(dataDir) : c.stub;
     const s = shim({ TSM_URL: `ws://127.0.0.1:${port}`, TSM_NO_SPAWN: '', TSM_DATA_DIR: c.dataDir === 'default' ? '' : dataDir, HOME: home, TSM_CONNECT_TIMEOUT_MS: '2000', PATH: supervisorPath(stub, port) });
     s.send(init(1));
