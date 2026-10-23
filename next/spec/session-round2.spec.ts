@@ -25,7 +25,7 @@ import { AGENT, code, COOKED_MODE, EDITOR_MODE, HUMAN, OSC, ofType, scriptedSess
 const TYPEAHEAD_GRACE_MS_IN_SPEC = 150; // mirrors session.ts
 const PROMPT_PROBE_GRACE_MS_IN_SPEC = 300; // mirrors session.ts
 /** node:fs as session.js sees it: a patch here plus syncBuiltinESMExports reaches its `import * as fs` bindings. */
-const fsc = createRequire(import.meta.url)('node:fs') as { rmSync: typeof fs.rmSync; openSync: typeof fs.openSync };
+const fsc = createRequire(import.meta.url)('node:fs') as { rmSync: typeof fs.rmSync; openSync: typeof fs.openSync; truncateSync: typeof fs.truncateSync };
 const fault = (code: string, what: string) => Object.assign(new Error(`${code}: ${what}`), { code });
 const fileOf = (written: string): string => /'([^']*tsm-cmd-\d+)'/.exec(written.slice(written.lastIndexOf('tsm-cmd-') - 200))![1]!;
 
@@ -992,6 +992,53 @@ test('a line discarded before it started whose command file cannot be removed is
   }
   await h.session.close();
   assert.ok(!fs.existsSync(failed[0]!), 'close removed it');
+});
+
+test('a line discarded unread whose command file cannot be removed is emptied, so a late read of it runs nothing; one that cannot be emptied either is said to run', async () => {
+  // ss-8's shape with the removal failing: the file stayed whole, and a late read of the line ran the cancelled command as
+  // a Run nobody awaits, while the note said its command did not run (the house's review of 4860d4c..bc4bc85, PR #22).
+  for (const emptying of ['works', 'fails'] as const) {
+    const h = await harness({ setup: (s) => s.on('echo publish', () => ({ output: 'PUBLISHED\r\n', exit: 0 })) });
+    h.shell.pause();
+    const a = h.session.admit({ target: 'shell', line: 'echo publish', principal: AGENT });
+    assert.ok(a.admitted);
+    const file = fileOf(h.pty.written);
+    const { rmSync, truncateSync } = fsc;
+    fsc.rmSync = ((f: fs.PathLike, opts?: fs.RmOptions) => {
+      if (String(f) === file) throw fault('EACCES', `permission denied, unlink '${file}'`);
+      return rmSync(f, opts);
+    }) as typeof fs.rmSync;
+    fsc.truncateSync = ((f: fs.PathLike, len?: number) => {
+      if (String(f) === file && emptying === 'fails') throw fault('EACCES', `permission denied, open '${file}'`);
+      return truncateSync(f, len);
+    }) as typeof fs.truncateSync;
+    syncBuiltinESMExports();
+    try {
+      // A ^C raced the write: the shell prints a fresh prompt without reading the line…
+      h.pty.emit(h.shell.mark('133;A') + '$ ' + h.shell.mark('133;B'));
+      assert.equal(h.session.run(a.run.runId).state, 'lost');
+    } finally {
+      fsc.rmSync = rmSync;
+      fsc.truncateSync = truncateSync;
+      syncBuiltinESMExports();
+    }
+    // …then reads it anyway.
+    h.shell.resume();
+    await tick();
+    const notes = ofType(h.journal.since(0).events, 'note').map((e) => e.text);
+    const late = notes.find((t) => t.startsWith(`the line written for ${a.run.runId} `)) ?? '';
+    if (emptying === 'works') {
+      assert.ok(!h.shell.executed.includes('echo publish'), `${emptying}: the command never ran: ${JSON.stringify(h.shell.executed)}`);
+      assert.ok(notes.some((t) => t.startsWith(`${file} could not be removed when its Run ended (EACCES`) && t.includes('it was emptied, so a late read of its line runs nothing')), `${emptying}: ${JSON.stringify(notes)}`);
+      assert.match(late, /its command file had been removed or emptied, so its command did not run$/, emptying);
+    } else {
+      assert.ok(h.shell.executed.includes('echo publish'), `${emptying}: neither removed nor emptied, the late read ran it`);
+      assert.ok(notes.some((t) => t.startsWith(`${file} could not be removed (EACCES`) && t.includes('a late read of its line runs its command')), `${emptying}: ${JSON.stringify(notes)}`);
+      assert.match(late, /its command file could not be removed or emptied, so its command ran$/, emptying);
+    }
+    await h.session.close();
+    assert.ok(!fs.existsSync(file), `${emptying}: close removed it`);
+  }
 });
 
 test('a cancel whose empty line cannot be written types none, says so, and takes the shell’s next prompt as its answer', async () => {

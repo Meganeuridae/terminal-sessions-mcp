@@ -623,6 +623,8 @@ export class Session {
   private readonly tempDir: string;
   private commandDir: string;
   private readonly extraTempFiles = new Set<string>();
+  /** Discarded Runs whose command file could be neither removed nor emptied: a late read of the line runs it. */
+  private readonly commandsLeft = new WeakSet<RunRecord>();
   private tempCounter = 0;
   private runCounter = 0;
   private attachCounter = 0;
@@ -1233,19 +1235,21 @@ export class Session {
   /**
    * A pending Run whose line will not start as ours: its command file goes before the outcome is
    * declared, so a late read of the line sources a missing file (a harmless error) and never runs the
-   * command as a Run nobody awaits; its line is remembered so a late C is still attributed to it as
-   * an orphan's. Never invents an exit (G3).
+   * command as a Run nobody awaits; a file that can't be removed is emptied, which a late read sources
+   * as nothing, and one that can't be emptied either is said, since a late read runs it. Its line is
+   * remembered so a late C is still attributed to it as an orphan's. Never invents an exit (G3).
    */
   private discardPending(pending: RunRecord, outcome: { state: 'cancelled' | 'lost'; reason: string }): void {
     if (this.pendingShellRun === pending) this.pendingShellRun = undefined;
     if (pending.tempFile) {
       // Removed at once, so a late read of the line sources a missing file (ss-8). A removal that fails is
       // said and left to close, as endRun's is: dropped here, the file stayed with no word (the house's review
-      // of a8b6f28..4860d4c).
+      // of a8b6f28..4860d4c); left whole, a late read ran the cancelled command as a Run nobody awaits, while
+      // the note said it did not run (of 4860d4c..bc4bc85). So it is emptied first.
       try {
         fs.rmSync(pending.tempFile, { force: true });
       } catch (e) {
-        this.leaveForClose(pending.tempFile, e);
+        if (!this.leaveUnread(pending.tempFile, e)) this.commandsLeft.add(pending);
       }
       delete pending.tempFile;
     }
@@ -1322,10 +1326,12 @@ export class Session {
         : { target: 'shell', principal: typer ?? UNKNOWN_TYPER, origin: typer === undefined || typer.startsWith('human:') ? 'human' : 'agent', queued: false };
       if (orphan) {
         // The line of a Run that ended before the shell read it (ss-8): its command file was
-        // removed first, so what runs is the plumbing line alone (a missing-file error).
+        // removed or emptied first, so what runs is the plumbing line alone (a missing-file error,
+        // or nothing) — unless neither could be done (discardPending), and then the command ran.
         this.orphanLines.delete(trimmed!);
         init.line = line!;
-        this.note(`the line written for ${orphan.runId} (${orphan.state} before the shell read it) ran late; its command file had been removed, so its command did not run`);
+        const late = `the line written for ${orphan.runId} (${orphan.state} before the shell read it) ran late`;
+        this.note(this.commandsLeft.has(orphan) ? `${late}; its command file could not be removed or emptied, so its command ran` : `${late}; its command file had been removed or emptied, so its command did not run`);
       } else if (line !== undefined) {
         // shell-9: a line typed as sensitive input is not promoted into structured metadata.
         init.line = this.sensitiveSinceCommand ? '[redacted]' : line;
@@ -2370,6 +2376,23 @@ export class Session {
   private leaveForClose(file: string, e: unknown): void {
     this.note(`${file} could not be removed when its Run ended (${errMessage(e)}); close tries again`);
     this.extraTempFiles.add(file);
+  }
+
+  /**
+   * The command file of a line the shell never started, whose removal failed: emptied, so a late read of
+   * the line sources nothing, and left for close to try again, as leaveForClose leaves one. False when it
+   * can't be emptied either.
+   */
+  private leaveUnread(file: string, e: unknown): boolean {
+    this.extraTempFiles.add(file);
+    try {
+      fs.truncateSync(file, 0);
+    } catch (t) {
+      this.note(`${file} could not be removed (${errMessage(e)}) or emptied (${errMessage(t)}) when its Run ended: a late read of its line runs its command; close tries again`);
+      return false;
+    }
+    this.note(`${file} could not be removed when its Run ended (${errMessage(e)}); it was emptied, so a late read of its line runs nothing, and close tries again`);
+    return true;
   }
 
   private cleanupTempFiles(): void {
