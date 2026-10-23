@@ -1215,7 +1215,7 @@ test('an owner file the disk refuses fails the start with that error and takes t
   assert.equal(readLock(dir).pid, 999_999);
 });
 
-test('a registry syncs each directory it makes into its parent before recovery: the data dir and any parent made on the way, then sessions/; a sync the disk refuses is said once', async () => {
+test('a registry syncs each directory on the data dir\'s path into its parent before recovery, a/ and the data dir among them, then sessions/; a sync the disk refuses is said once', async () => {
   const base = dataDir();
   fs.mkdirSync(base, { recursive: true });
   const dir = path.join(base, 'a', 'data');
