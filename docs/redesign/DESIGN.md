@@ -530,8 +530,9 @@ substantially more work than a reliable current screen; deferred until a workflo
    source starts on a fresh line, as a hole and a note do, wherever the cursor stands. A
    process Run's two pipes are one source, for search, watches and a service's probes too: a
    hit names the pipe of its line's first character, the first written to it that shows (one a
-   later backspace or cursor move writes over keeps its pipe), and says when the line holds both. A
-   service's probe pattern matches a line as a read shows it, or as its own pipe wrote it.
+   later backspace or cursor move writes over keeps its pipe), and says when both pipes wrote
+   characters to it that showed. A service's probe pattern matches a line as a read shows it, or
+   as its own pipe wrote it.
 7. *Budgets, all visible.* `maxInputBytes` keeps the head or tail (never splitting a
    character, preferring a line boundary) and reports `omittedInputBytes`; `maxLines`
    caps logical lines; any omission sets `truncated`.

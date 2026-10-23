@@ -222,7 +222,10 @@ export interface SplitLine {
    * (stdout's `ab`, then stderr's `BS BS cd`, shows `cd` and names stdout).
    */
   from?: string;
-  /** The line shows characters from chunks of different sources: both of a process Run's pipes. */
+  /**
+   * Chunks of different sources, both of a process Run's pipes, wrote characters to the line that showed when written,
+   * whether or not they still show: as written, like `from` (stdout's `ab`, then stderr's `BS BS cd`, is mixed).
+   */
   mixed?: true;
   /** Where the line began: the `at` `feed` was given with its first chunk, and UTF-8 bytes into that chunk. */
   begun?: Begun;

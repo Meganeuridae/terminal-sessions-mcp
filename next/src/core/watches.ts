@@ -10,8 +10,9 @@
  * The sources are the transcript's (§6 rule 6): the pty, and each process Run's
  * stdout and stderr together, so `abc` on stdout then `def` and a LF on stderr is
  * the line `abcdef`, as the transcript and the digests show it; a hit on a Run's
- * line names the pipe its first character came from (`stream`), and says `mixed`
- * when the line holds output from both (the house's review of f3750e4..4f4c067,
+ * line names the pipe of the first character written to it that shows (`stream`),
+ * and says `mixed` when both pipes wrote characters to it that showed, as written
+ * (the house's review of f3750e4..4f4c067,
  * #22, comment 6315636412, question 4).
  * A line is read as it displays (`cleanLine`: backspaces, erases and in-line
  * cursor moves applied), with one difference from search: a lone carriage return

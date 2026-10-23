@@ -386,10 +386,11 @@ export function stripEscapes(s: string): { text: string; map: number[] } {
  * Whether `part` shows a character, read on from `open`, the sequence left unfinished before it as a LineCarry holds
  * it (a CSI's head, a string's introducer and state): its text without control sequences and controls (stripEscapes),
  * tabs and line ends aside, so a part that finishes a sequence shows only what follows it. A line names the pipe of the
- * first character it shows (§6 rule 6): an escape sequence, a CSI head carried over a LF, or a control alone names none
- * (our review of the 84 commits through a8b6f28, PR #22: a cursor-hide on stdout before `boom` on stderr named stdout,
- * and the line mixed). The caller holds `open`, so a line of many parts that show nothing costs each part its own
- * length: found again by a look back over the line, 65,536 one-byte tabs took 1.1 s (Imago's read of 7af55b8).
+ * first character written to it that shows, as written (§6 rule 6): an escape sequence, a CSI head carried over a LF,
+ * or a control alone names none (our review of the 84 commits through a8b6f28, PR #22: a cursor-hide on stdout before
+ * `boom` on stderr named stdout, and the line mixed). The caller holds `open`, so a line of many parts that show
+ * nothing costs each part its own length: found again by a look back over the line, 65,536 one-byte tabs took 1.1 s
+ * (Imago's read of 7af55b8).
  */
 export function showsCharacter(open: string, part: string): boolean {
   return /[^\t\n]/.test(stripEscapes(open + part).text);

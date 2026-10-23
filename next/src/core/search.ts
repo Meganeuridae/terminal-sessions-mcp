@@ -102,8 +102,9 @@ interface Carry {
   /** The line's raw bytes passed MAX_LINE_RAW: only its head is kept. */
   cut: boolean;
   /**
-   * The stream of the piece holding the first character the line shows (of the event it began in until one shows),
-   * and whether a piece from the other pipe shows a character of the line too, within what the line keeps (rule 1).
+   * The stream of the piece holding the first character written to the line that shows (of the event it began in until
+   * one shows), as written, so a character a later backspace or cursor move writes over keeps its pipe; and whether a
+   * piece from the other pipe wrote a character that showed too, within what the line keeps (rule 1).
    */
   stream: OutputStream;
   mixed: boolean;
