@@ -304,7 +304,11 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
     // The prompt text is built at run time, so the echoed command line never contains it: waiting for it waits for the prompt.
     // Nor does the line hold `pass` while it is typed: the GUI took `…"Pass$P: ` at the cursor for a password prompt and sent
     // the rest of the command as sensitive (a reviewer's read of the fixes for #22).
-    await page.keyboard.type(`A=Pa; P=word; read -s -p "\${A}ss$P: " PW; echo; echo "len=\${#PW}"`);
+    // The prompt is printed over a row that holds other text, which stays to the cursor's right: the GUI reads the prompt left
+    // of the cursor, as the daemon does. Read whole, the row did not read as one. readline's redraw for the seat's resize can
+    // leave the end of the command's echo there, by run on the VPS, and the same wait failed once on Ubuntu CI (a reviewer's
+    // read of the fixes for #22).
+    await page.keyboard.type(`A=Pa; P=word; printf '%s\\r' "stale text after the prompt"; read -s -p "\${A}ss$P: " PW; echo; echo "len=\${#PW}"`);
     await page.keyboard.press('Enter');
     const live = registry.get('secret');
     assert.ok(live && live.kind === 'live');
