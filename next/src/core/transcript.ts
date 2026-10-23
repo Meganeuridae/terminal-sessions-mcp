@@ -380,17 +380,18 @@ class Projector {
   }
 
   /**
-   * Watch every scroll xterm makes of a scroll region (BufferService.scroll: a line end at the region's last row, a
-   * line wrapping there, IND, NEL). On the normal screen a region not starting at row 1 keeps no scrollback, and its
-   * top row goes. When something other than the source that set the margins causes the scroll (a boundary's line end,
-   * a note, a header, another source's output) and that row holds text, the projection lost it (`lost`): the margins
-   * stay as the program set them, since resetting them would change how its later output scrolls (the house's review
-   * of a8b6f28..4860d4c, PR #22, comment 6341260318). A blank row such a scroll takes is owed (`owed`), and the
-   * program's own next scroll that takes a row with text is reported: it took one the terminal still shows (a blank
-   * top row, then `X` and `Y`, lost `r5` silently: an independent read of the fixes for #22). The program's own
-   * scrolls otherwise lose what the terminal loses. After any scroll of such a region its new top row joins no row
-   * above the region, which it was wrapped from only inside it: a note's tail read glued onto the row above (an
-   * independent read of the fixes for #22). xterm internals: skipped, and nothing reported, if they change.
+   * Watch the scrolls xterm makes of a scroll region through BufferService.scroll: a line end at the region's last row,
+   * a line wrapping there, IND, NEL. SU, SD, IL, DL and RI move a region's rows without it, and aren't watched: a row
+   * one of them takes isn't reported, whoever sent it. On the normal screen a region not starting at row 1 keeps no
+   * scrollback, and its top row goes. When something other than the source that set the margins causes the scroll (a
+   * boundary's line end, a note, a header, another source's output) and that row holds text, the projection lost it
+   * (`lost`): the margins stay as the program set them, since resetting them would change how its later output scrolls
+   * (the house's review of a8b6f28..4860d4c, PR #22, comment 6341260318). A blank row such a scroll takes is owed
+   * (`owed`), and the program's own next scroll that takes a row with text is reported: it took one the terminal still
+   * shows (a blank top row, then `X` and `Y`, lost `r5` silently: an independent read of the fixes for #22). The
+   * program's own scrolls otherwise lose what the terminal loses. After any scroll of such a region its new top row
+   * joins no row above the region, which it was wrapped from only inside it: a note's tail read glued onto the row
+   * above (an independent read of the fixes for #22). xterm internals: skipped, and nothing reported, if they change.
    */
   private hookScroll(): void {
     const core = (this.term as unknown as { _core?: Core })._core;
