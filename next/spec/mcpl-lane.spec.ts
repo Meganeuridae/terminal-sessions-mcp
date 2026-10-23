@@ -2356,6 +2356,44 @@ test("a catch-up keeps a summary whose delivery is still in flight, which settle
   }
 });
 
+test("a catch-up's summary leaves out a past-the-cap completion that a message of its own still carries, which stays owed and retried after the summary's acceptance", { timeout: 60_000 }, async () => {
+  // Covered, the summary's acceptance settled the completion's debt and dropped its retry, so a refusal of the message
+  // still carrying it was neither retried nor owed (the house's read of 4860d4c..bc4bc85, #22).
+  const f = await bareLane('c-cap-carried');
+  try {
+    const noPush = FULL_GRANT.filter((c) => c !== 'pushEvents');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: noPush }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'cc' });
+    const s = live(f.registry, 'cc');
+    const st = () => f.inside.states.get('cc')! as unknown as { owed: Set<number>; retries: Map<string, unknown>; summaries: Map<string, { covered: Set<number> }> };
+    const ends: number[] = [];
+    for (let i = 0; i < 25; i++) {
+      const r = await f.app.run(f.caller, { session: 'cc', command: `echo cc-${i}`, target: 'process', wait: 0 });
+      await until(() => s.run(r.runId!).seq.end !== undefined, 5000, `Run ${i} to end`);
+      ends.push(s.run(r.runId!).seq.end!);
+    }
+    // The oldest is past the catch-up's limit of 20, and a message of its own still carries it.
+    const carriedSeq = ends[0]!;
+    assert.ok(st().owed.has(carriedSeq), 'the oldest completion is owed');
+    st().retries.set('cc-carrier', { seq: carriedSeq, kind: 'run', attempt: 0 });
+    f.late.value = true;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => st().summaries.size === 1, 10_000, "the catch-up's summary");
+    const [summary] = [...st().summaries.values()];
+    assert.ok(summary!.covered.has(ends[1]!), 'a past-the-cap completion nothing else carries is covered');
+    assert.ok(!summary!.covered.has(carriedSeq), 'the carried one is not');
+    f.late.value = false;
+    for (const p of f.pending.splice(0)) p.answer();
+    await until(() => st().summaries.size === 0, 10_000, 'the summary settled by its answer');
+    assert.ok(st().owed.has(carriedSeq), 'the carried completion is still owed after the summary is accepted');
+    assert.ok(st().retries.has('cc-carrier'), 'and its own message is still retried');
+    assert.ok(s.cursorsOf(A).delivered < carriedSeq, `the cursor stays below it (delivered ${s.cursorsOf(A).delivered})`);
+    st().retries.delete('cc-carrier');
+  } finally {
+    await f.close();
+  }
+});
+
 test("a catch-up retires a summary parked for an opening channel, so the open sends only what replaced it", { timeout: 60_000 }, async () => {
   // A summary parked while the channel's history was read had no in-flight, sent or retry entry: retired, it
   // still went out when the open finished, beside the summary that replaced it (the house's read of a8b6f28, #22).

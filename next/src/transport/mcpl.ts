@@ -1447,11 +1447,15 @@ export class McplLane {
       // it: the summary naming the range covers it, unless a message of its own still carries it. Left out,
       // completions owed while nothing carried the session, and those a retired summary had covered, pinned the
       // cursor for the life of the connection once their events were gone (the house's read of a8b6f28, #22: by
-      // run). Covered while a message carried it, the summary's acceptance let `delivered` pass a message still
-      // to go out, whose refusal was then settled as accepted (a reviewer's read of the fixes for #22).
+      // run).
       if (scan.lost?.length) {
-        for (const seq of p.st.owed) if (!carried.has(seq) && scan.lost.some((g) => g.from <= seq && seq <= g.to)) p.covered.add(seq);
+        for (const seq of p.st.owed) if (scan.lost.some((g) => g.from <= seq && seq <= g.to)) p.covered.add(seq);
       }
+      // Whatever a message of its own still carries, found past the cap or lost, stays that message's debt: covered,
+      // the summary's acceptance let `delivered` pass a message still to go out and dropped its retry, so its refusal
+      // was neither retried nor owed (a reviewer's read of the fixes for #22; the house's read of 4860d4c..bc4bc85,
+      // #22, for the past-the-cap path).
+      for (const seq of carried) p.covered.delete(seq);
       // What a retired summary covered that this scan neither replays nor covers, found or lost, and no message
       // carries, the scan found owed no more, as a debt owed only while the channel was open is once it has
       // closed: kept, it pinned the cursor for the life of the connection (a reviewer's read of the fixes for #22).
