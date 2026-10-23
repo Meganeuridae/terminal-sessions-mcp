@@ -497,12 +497,33 @@ test('a trace a shell writes past the typed line’s redirect is named by the Ru
   // zsh's trace drops the `exec` precommand: `+zsh:4> /bin/sh -c 'echo $PPID'` (zsh 5.9, where its trace gets past the redirect).
   const zshProbe = `^C\r\n$ ${markerProbe(N, 'zsh').trimStart()}\r\n+zsh:4> /bin/sh -c 'echo $PPID'\r\n+zsh:4> printf '%s:%s>>>\\n' '<<<PROBE:${N}' 4242\r\n<<<PROBE:${N}:4242>>>\r\n$ `;
   assert.equal(cutPlumbing(`${echo}${mark}out\r\n${zshProbe}`, marker), 'out\r\n^C\r\n', 'zsh’s trace of the substitution');
+  // A program's output with no line end before the substitution's trace stays: the cut takes the trace from its prefix, the
+  // probe's own trace's with bash's first character doubled, zsh's as it is; from its line's start only when no prefix stands
+  // there (the house's review of a8b6f28..4860d4c, PR #22, comment 6341260318).
+  const unterminated = (traced: string) => `${echo}${mark}out\r\n^C\r\n$ ${markerProbe(N).trimStart()}\r\n${traced}`;
+  assert.equal(cutPlumbing(unterminated(bashProbe.slice(bashProbe.indexOf('++ ')).replace('++ ', 'abc++ ')), marker), 'out\r\n^C\r\nabc', 'bash’s doubled prefix');
+  assert.equal(cutPlumbing(unterminated(zshProbe.slice(zshProbe.indexOf('+zsh:4> /bin')).replace('+zsh:4> /bin', 'abc+zsh:4> /bin')), marker), 'out\r\n^C\r\nabc', 'zsh’s prefix');
+  const ps4 = `${sourceLine(file, 'posix', N)}\r\n>> command . ${file}\r\n${mark}out\r\n^C\r\n$ ${markerProbe(N).trimStart()}\r\n`;
+  const ps4Probe = `abc+>>> exec /bin/sh -c 'echo $PPID'\r\n>> printf '%s:%s>>>\\n' '<<<PROBE:${N}' 4242\r\n<<<PROBE:${N}:4242>>>\r\n$ `;
+  assert.equal(cutPlumbing(`${ps4}${ps4Probe}`, marker), 'out\r\n^C\r\nabc+', 'a PS4 of the typed line’s trace');
+  assert.equal(cutPlumbing(unterminated(`abc exec /bin/sh -c 'echo $PPID'\r\n+ printf '%s:%s>>>\\n' '<<<PROBE:${N}' 4242\r\n<<<PROBE:${N}:4242>>>\r\n$ `), marker), 'out\r\n^C\r\n', 'no prefix before the trace: its line');
   if (fs.existsSync('/bin/zsh')) {
     // As zsh traces it where it traces the probe at all, in an eval (a reader the Run started, say).
     const traced = runMerged('/bin/zsh', `set -x; eval ${shellQuote(markerProbe(N, 'zsh').trim())}`).replace(/^\+zsh:1> eval .*\n/, '').replace(/\n/g, '\r\n');
     assert.match(traced, /> \/bin\/sh -c 'echo \$PPID'\r\n/, `zsh's own shape: ${JSON.stringify(traced)}`);
     const own = `<<<START:${N}:${probeMark(N).exec(traced)![1]}>>>\r\n`;
     assert.equal(cutPlumbing(`${echo}${own}out\r\n^C\r\n$ ${markerProbe(N, 'zsh').trimStart()}\r\n${traced}$ `, marker), 'out\r\n^C\r\n', `zsh’s own trace: ${JSON.stringify(traced)}`);
+  }
+  // As the shells trace the substitution after a program's `abc` with no line end, under a PS4 of the body's own.
+  for (const [shell, flavor, script] of [
+    ...(fs.existsSync('/bin/zsh') ? [['/bin/zsh', 'zsh', (probe: string) => `PS4='>> '; set -x; eval ${shellQuote(`printf abc; ${probe}`)}`] as const] : []),
+    ...(XTRACEFD ? [['/bin/bash', 'posix', (probe: string) => `exec 3>&2; BASH_XTRACEFD=3; PS4='>> '; printf abc; set -x; ${probe}`] as const] : []),
+  ]) {
+    // zsh's trace of the eval and of `printf abc` stand before it: the lines before `abc` are the body's.
+    const traced = runMerged(shell, script(markerProbe(N, flavor).trim())).replace(/\n/g, '\r\n').replace(/^(?:[^\r\n]*\r\n)*?(?=abc>)/, '');
+    assert.match(traced, /^abc>+ (?:exec )?\/bin\/sh -c 'echo \$PPID'\r\n/, `${shell}: ${JSON.stringify(traced)}`);
+    const own = `<<<START:${N}:${probeMark(N).exec(traced)![1]}>>>\r\n`;
+    assert.equal(cutPlumbing(`${echo}${own}out\r\n^C\r\n$ ${markerProbe(N, flavor).trimStart()}\r\n${traced}$ `, marker), 'out\r\n^C\r\nabc', `${shell}: ${JSON.stringify(traced)}`);
   }
   // Not traces: the echo that printed the mark in earlier builds traced as the mark itself, and the guess at that trace's head
   // cut a program's own line that ended in `echo `; another Run's nonce names nothing.

@@ -690,10 +690,18 @@ function markTraceStart(text: string, to: number, nonce: string, prefix: string 
   if (at === -1) return to;
   const head = prefix ?? (line.slice(at, mark!.index).includes('\\\\n') ? '> ' : undefined);
   const cut = head && line.slice(0, at).endsWith(head) ? lineStart + at - head.length : lineStart;
-  // The probe's pid comes from a command substitution (markerProbe), which bash traces on the line before.
+  // The probe's pid comes from a command substitution (markerProbe), which bash traces on the line before. That trace goes from
+  // its prefix, the probe's own trace's (what its line holds before `printf `), with its first character doubled where bash's
+  // `exec` shows the trace is bash's, a level down, and as it is in zsh's: taking its whole line took a program's output with no
+  // line end before it (the house's review of a8b6f28..4860d4c, PR #22, comment 6341260318). With no prefix there, its line.
   if (cut === lineStart && lineStart > 0 && mark![0].startsWith('<<<PROBE')) {
     const prev = text.lastIndexOf('\n', lineStart - 2) + 1;
-    if (PID_TRACE.test(text.slice(prev, lineStart))) return prev;
+    const sub = PID_TRACE.exec(text.slice(prev, lineStart));
+    if (sub) {
+      const own = line.slice(0, at);
+      const p = sub[0].startsWith('exec ') ? own.slice(0, 1) + own : own;
+      return text.slice(prev, prev + sub.index).endsWith(p) ? prev + sub.index - p.length : prev;
+    }
   }
   return cut;
 }
