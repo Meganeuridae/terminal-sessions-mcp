@@ -75,7 +75,8 @@
  *    lines there, however many newlines it wrote, since only its final frame
  *    projects (rule 5), and the cut never lands inside it. When keeping the
  *    head, projection stops once `maxLines` lines are complete and the rest
- *    counts as omitted. Any omission or dropped line sets `truncated`. Input
+ *    counts as omitted, with what was fed past those lines (`droppedInput`).
+ *    Any omission or dropped line sets `truncated`. Input
  *    omitted from the head still applies the lasting terminal state it set
  *    (modes, the scroll region, character sets: `persistentState` in screen.ts),
  *    so the tail of apt-style output projects as the terminal shows it.
@@ -944,6 +945,8 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
   try {
     let slice = performance.now();
     let headersFed = 0;
+    // Where feeding stopped, when the head's lines were complete before the range's end.
+    let stopped: { s: number; pos: number } | undefined;
     outer: for (let s = 0; s < segs.length; s++) {
       const seg = segs[s]!;
       if (seg.header) headersFed++;
@@ -952,6 +955,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
         if (keep === 'head' && pr.out.lines.length > maxLines + headersFed) {
           // The first maxLines lines are complete: the rest is not projected (rule 7).
           omitted += input(seg, pos) + segs.slice(s + 1).reduce((a, x) => a + input(x), 0);
+          stopped = { s, pos };
           break outer;
         }
         const end = batchEnd(seg.data, pos, pr.budget, cols);
@@ -979,6 +983,14 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
     let truncated = omitted > 0 || pr.lost || pr.out.dropped;
     const kept = keepLines(lines, maxLines, keep, headers);
     if (kept) {
+      // The head's cut of lines dropped what was fed past the last line it kept, in the batch where the limit fell
+      // and, when the range fitted on the screen, in all of it: that input was not projected either. Left out, a
+      // range of a few short lines over `maxLines` reported 0 omitted with `truncated`, which the reader takes for
+      // lost (the house's review of a8b6f28..4860d4c, PR #22, comment 6341260318).
+      if (keep === 'head') {
+        const made = lines.filter((l) => !headers.has(l)).length;
+        omitted += droppedInput(segs, maxLines, stopped, made - kept.filter((l) => !headers.has(l)).length, made);
+      }
       lines = kept;
       truncated = true;
     }
@@ -986,6 +998,36 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
   } finally {
     pr.dispose();
   }
+}
+
+/**
+ * The input bytes of the `dropped` lines of output, of the `made`, that the head's cut of lines took (rule 7, head), from
+ * what was fed (up to where feeding stopped; headers and a segment's CSI head are no input). When the lines made are the
+ * input's lines, one per line end (`lineEnds`) bar an unfinished last, the dropped lines' input is what was fed after the
+ * `n`th line end. Otherwise which line end closed which line can't be told (a cursor moved down, or a screen an erase kept,
+ * made lines with none, as on every page the reader cuts to its `maxLines`; a redraw went back over lines), and the fed
+ * input is shared among the lines it made, the dropped lines' share counting.
+ */
+function droppedInput(segs: readonly Segment[], n: number, stopped: { s: number; pos: number } | undefined, dropped: number, made: number): number {
+  let ends = 0;
+  let after = 0;
+  let fed = 0;
+  const last = stopped?.s ?? segs.length - 1;
+  for (let s = 0; s <= last; s++) {
+    const seg = segs[s]!;
+    if (seg.header) continue;
+    const end = s === stopped?.s ? stopped.pos : seg.data.length;
+    const lead = seg.lead ?? 0;
+    const bytes = utf8Length(seg.data.slice(lead, Math.max(lead, end)));
+    fed += bytes;
+    if (ends >= n) after += bytes;
+    for (const e of lineEnds(seg.data.slice(0, end))) {
+      if (++ends === n) after += utf8Length(seg.data.slice(Math.max(lead, e + 1), Math.max(lead, end)));
+    }
+  }
+  const byLineEnds = ends >= n && Math.abs(made - ends) <= 1;
+  // A dropped line counts a byte at least, so a cut never reads as lost.
+  return Math.max(dropped > 0 ? 1 : 0, byLineEnds ? after : Math.round((fed * dropped) / Math.max(1, made)));
 }
 
 /**

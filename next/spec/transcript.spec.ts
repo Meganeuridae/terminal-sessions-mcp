@@ -820,3 +820,31 @@ test('a boundary on the alternate screen, after the cursor moved up, scrolls the
   assert.deepEqual(p.text.split('\n'), ['f3', 'f4', 'f5', 'X']);
   assert.deepEqual([p.truncated, p.omittedInputBytes], [false, 0]);
 });
+
+test('a head kept to maxLines counts what it dropped as omitted: the lines fed in the batch where the limit falls, the whole rest of a range that fits on the screen, and a share of what made lines with no line end', async () => {
+  // The house's review of a8b6f28..4860d4c (PR #22, comment 6341260318): the head counted only what it never fed, so on 24 rows a
+  // range of five short lines kept to three reported 0 omitted with `truncated`, which the reader takes for lost.
+  const cases: Array<[string, number, string, number]> = [
+    ['a\nb\nc\nd\ne\n', 24, 'a\nb\nc', 4],
+    ['one\r\ntwo\r\nthree\r\nfour\r\n', 24, 'one\ntwo\nthree', 6],
+    ['a\nb\nc\nd\ne\nf\ng\nh\n', 3, 'a\nb\nc', 10],
+  ];
+  for (const [data, rows, text, omitted] of cases) {
+    const p = await project([{ data, stream: data.includes('\r') ? 'pty' : 'stdout' }], { cols: 80, rows, keep: 'head', maxLines: 3 });
+    assert.deepEqual([p.text, p.truncated, p.omittedInputBytes], [text, true, omitted], `${rows} rows: ${JSON.stringify(data)}`);
+  }
+  // Lines a program made with no line end of input share what was fed: the 11 bytes that moved the cursor down made five lines,
+  // and the three dropped count 7; the 22 bytes that drew two screens an erase kept made ten, and the six dropped count 13. With
+  // more lines than line ends before the last kept, the line ends can't say where the kept lines end: 11 bytes, four lines, the
+  // two dropped count 6, where what followed the second line end was nothing.
+  for (const [data, maxLines, text, omitted] of [
+    ['a\x1b[2Bb\x1b[2Bc', 2, 'a\n', 7],
+    ['\x1b[5;1Hx\x1b[2J\x1b[5;1Hy\x1b[2J', 4, '\n\n\n', 13],
+    ['a\x1b[2Bb\r\nc\r\n', 2, 'a\n', 6],
+  ] as const) {
+    const p = await project([{ data, stream: 'pty' }], { cols: 80, rows: 24, keep: 'head', maxLines });
+    assert.deepEqual([p.text, p.truncated, p.omittedInputBytes], [text, true, omitted], JSON.stringify(data));
+  }
+  // Nothing dropped, nothing omitted.
+  assert.deepEqual(await project([{ data: 'a\nb\nc', stream: 'stdout' }], { cols: 80, rows: 24, keep: 'head', maxLines: 3 }), { text: 'a\nb\nc', truncated: false, omittedInputBytes: 0 });
+});

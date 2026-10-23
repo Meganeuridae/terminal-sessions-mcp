@@ -53,6 +53,18 @@ test('er-1: tab-heavy and cursor-addressed output (the projection is larger than
   assert.equal(text.split('\n').length, 3000);
 });
 
+test('er-1: screens an erase kept, more lines than input bytes, page back whole in pages near maxBytes, none truncated', async () => {
+  // A page cut to its maxLines counts the input of the lines it dropped as omitted, and the fit takes what is left: a count of
+  // their text, longer than the input that drew them, took a third of what fits (the house's review of a8b6f28..4860d4c, PR
+  // #22, comment 6341260318, on omittedInputBytes with keep 'head').
+  const src = source();
+  for (let i = 0; i < 200; i++) out(src.journal, `\x1b[24;1Hx${i}\x1b[2J`);
+  const { text, pages } = await readAll(src, { since: 0, maxBytes: 1024 }, (r) => assert.ok(Buffer.byteLength(r.text!) <= 1024, `page of ${Buffer.byteLength(r.text!)} bytes`));
+  assert.deepEqual(text.split('\n').filter((l) => l !== ''), Array.from({ length: 200 }, (_, i) => `x${i}`));
+  assert.deepEqual(pages.filter((r) => r.truncated).length, 0);
+  assert.ok(pages.length <= 8, `${pages.length} pages`);
+});
+
 /** A small seeded PRNG, so a failing case reproduces. */
 function rng(seed: number): () => number {
   return () => {
