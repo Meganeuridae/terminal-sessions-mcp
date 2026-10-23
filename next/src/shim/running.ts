@@ -81,12 +81,19 @@ export async function askDataDir(port: number, pid: number, o: AskOptions): Prom
   return { error: unproven ?? last };
 }
 
-/** /health's answer, or why there is none: nothing listening (`refused`), or a listener not shown to be the termd's (`unproven`). */
+/**
+ * /health's answer, or why there is none: nothing listening (`refused`), or a listener not shown to be the termd's
+ * (`unproven`): its proof failed, or its connection failed before the proof passed, as by a reset, for any reason but
+ * nothing listening. A listener on 127.0.0.1 that reset the connection, as it was made or while it was proved, was read
+ * as termd's own failure, and ::1 was never tried (the house's read of the 14 commits over our fixes, #22).
+ */
 type Answer = { body: Record<string, unknown> } | { error: string; refused?: boolean; unproven?: boolean };
 
 function health(host: string, port: number, pid: number, o: AskOptions, ms: number): Promise<Answer> {
   return new Promise((resolve) => {
     let done = false;
+    // Until the proof passes, a failure that isn't "nothing listens" is the listener's, which nothing showed to be termd's.
+    let proven = false;
     const socket = net.connect({ host, port });
     const finish = (r: Answer): void => {
       if (done) return;
@@ -97,11 +104,15 @@ function health(host: string, port: number, pid: number, o: AskOptions, ms: numb
     };
     // The whole exchange's deadline: it destroys the request however the bytes trickle in.
     const timer = setTimeout(() => finish({ error: `it did not answer /health within ${o.timeoutMs} ms` }), ms);
-    socket.once('error', (e: NodeJS.ErrnoException) => finish({ error: e.code === 'ECONNREFUSED' ? `nothing listens on port ${port}` : e.message, refused: e.code === 'ECONNREFUSED' || e.code === 'EADDRNOTAVAIL' }));
+    socket.once('error', (e: NodeJS.ErrnoException) => {
+      const refused = e.code === 'ECONNREFUSED' || e.code === 'EADDRNOTAVAIL';
+      finish({ error: e.code === 'ECONNREFUSED' ? `nothing listens on port ${port}` : e.message, refused, unproven: !proven && !refused });
+    });
     socket.once('connect', () => {
       void (o.prove ?? connectionOf)(socket, pid).then((why) => {
         if (done) return;
         if (why !== undefined) return finish({ error: why, unproven: true });
+        proven = true;
         const headers: Record<string, string> = { host: `${host.includes(':') ? `[${host}]` : host}:${port}` };
         if (o.token) headers.authorization = `Bearer ${o.token}`;
         // No agent: the request goes on this proven connection and no other.

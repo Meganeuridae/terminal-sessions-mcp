@@ -449,6 +449,32 @@ test("a listener on 127.0.0.1 not shown to be termd's is passed over for ::1 wit
   }
 });
 
+test("a listener on 127.0.0.1 that resets the connection, as it is made or while it is proved, is passed over for ::1 too (the house's read of the 14 commits over our fixes, #22)", async (t) => {
+  // Read as termd's own failure, the reset ended the ask, and the termd on ::1 was never asked.
+  const asked: string[] = [];
+  const v6 = http.createServer((req, res) => {
+    asked.push(req.headers.authorization ?? '-');
+    res.end(JSON.stringify({ status: 'ok', pid: 4242, dataDir: '/v6' }));
+  });
+  const bound = await new Promise<boolean>((resolve) => {
+    v6.once('error', () => resolve(false));
+    v6.listen(0, '::1', () => resolve(true));
+  });
+  if (!bound) return t.skip('no ::1 here');
+  const port = (v6.address() as { port: number }).port;
+  const resets = net.createServer((c) => c.resetAndDestroy());
+  await new Promise<void>((r) => resets.listen(port, '127.0.0.1', r));
+  // The reset comes as the connection is made or while its proof runs, which here takes 2 s; the IPv6 proof passes at once.
+  const prove = (socket: net.Socket) => (socket.remoteFamily === 'IPv4' ? new Promise<undefined>((r) => setTimeout(() => r(undefined), 2000)) : Promise.resolve(undefined));
+  try {
+    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, prove }), { dataDir: '/v6' });
+    assert.deepEqual(asked, ['-'], 'termd on ::1 was asked');
+  } finally {
+    v6.closeAllConnections();
+    await Promise.all([v6, resets].map((s) => new Promise((r) => s.close(() => r(undefined)))));
+  }
+});
+
 test("a termd on ::1 alone is asked there once 127.0.0.1 refuses, and an IPv6 listener dialled on 127.0.0.1 is shown as its own through tcp6 (the house's read of the 17 commits over our fixes, #22)", async (t) => {
   const answer = (dataDir: string) => (_req: http.IncomingMessage, res: http.ServerResponse) => res.end(JSON.stringify({ status: 'ok', pid: process.pid, dataDir }));
   const v6 = http.createServer(answer('/v6'));
