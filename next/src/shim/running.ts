@@ -55,10 +55,14 @@ const ACCEPT_WAIT_MS = 1000;
  * Tried on 127.0.0.1, then ::1, within one deadline for both: the socket's idle timeout alone let a
  * listener that wrote a byte every 200 ms hold a 300 ms ask for ten seconds (a reviewer's read of the
  * fixes for #22). A listener on 127.0.0.1 that is not shown to be the termd's is no answer: ::1 is tried
- * next, where a termd bound there alone listens, and the first such listener's reason is said when no
- * address answers. Stopped there, another process on 127.0.0.1 at termd's port kept the shim from asking
- * the termd on ::1 at all (the house's review of a8b6f28..4860d4c, #22 comment 6341260318, question 5).
- * Nothing is sent to an unproven listener either way.
+ * next, where a termd bound there alone listens, with what is left of the deadline once that listener's
+ * proof gave up. Its reason is said when nothing listens on ::1, when ::1 is not shown to be the termd's
+ * either, or when the deadline runs out before ::1 is tried; a ::1 that fails otherwise, by its own
+ * timeout or answer, gives its own reason (the house's read of the 14 commits over our fixes, #22: said
+ * as "when no address answers", it promised more). Stopped
+ * at that listener, another process on 127.0.0.1 at termd's port kept the shim from asking the termd on
+ * ::1 at all (the house's review of a8b6f28..4860d4c, #22 comment 6341260318, question 5). Nothing is
+ * sent to an unproven listener either way.
  */
 export async function askDataDir(port: number, pid: number, o: AskOptions): Promise<{ dataDir: string } | { error: string }> {
   const end = clocks.monotonic() + o.timeoutMs;
