@@ -54,32 +54,41 @@ const ACCEPT_WAIT_MS = 1000;
  * What the termd on `port` says its data dir is, over /health, from a connection shown to be `pid`'s.
  * Tried on 127.0.0.1, then ::1, within one deadline for both: the socket's idle timeout alone let a
  * listener that wrote a byte every 200 ms hold a 300 ms ask for ten seconds (a reviewer's read of the
- * fixes for #22).
+ * fixes for #22). A listener on 127.0.0.1 that is not shown to be the termd's is no answer: ::1 is tried
+ * next, where a termd bound there alone listens, and the first such listener's reason is said when no
+ * address answers. Stopped there, another process on 127.0.0.1 at termd's port kept the shim from asking
+ * the termd on ::1 at all (the house's review of a8b6f28..4860d4c, #22 comment 6341260318, question 5).
+ * Nothing is sent to an unproven listener either way.
  */
 export async function askDataDir(port: number, pid: number, o: AskOptions): Promise<{ dataDir: string } | { error: string }> {
   const end = clocks.monotonic() + o.timeoutMs;
   let last = 'it did not answer';
+  let unproven: string | undefined;
   for (const host of ['127.0.0.1', '::1']) {
     const left = end - clocks.monotonic();
-    if (left <= 0) return { error: `it did not answer /health within ${o.timeoutMs} ms` };
+    if (left <= 0) return { error: unproven ?? `it did not answer /health within ${o.timeoutMs} ms` };
     const r = await health(host, port, pid, o, left);
     if ('error' in r) {
       last = r.error;
-      if (r.refused) continue;
+      if (r.unproven) unproven ??= r.error;
+      if (r.refused || r.unproven) continue;
       return r;
     }
     if (r.body.pid !== pid) return { error: `port ${port} answers as pid ${String(r.body.pid)}, not as it` };
     if (typeof r.body.dataDir !== 'string') return { error: `its /health names no data dir: ${o.token ? 'the credential' : 'no credential'} was presented, and one older than this shim never names it` };
     return { dataDir: r.body.dataDir };
   }
-  return { error: last };
+  return { error: unproven ?? last };
 }
 
-function health(host: string, port: number, pid: number, o: AskOptions, ms: number): Promise<{ body: Record<string, unknown> } | { error: string; refused?: boolean }> {
+/** /health's answer, or why there is none: nothing listening (`refused`), or a listener not shown to be the termd's (`unproven`). */
+type Answer = { body: Record<string, unknown> } | { error: string; refused?: boolean; unproven?: boolean };
+
+function health(host: string, port: number, pid: number, o: AskOptions, ms: number): Promise<Answer> {
   return new Promise((resolve) => {
     let done = false;
     const socket = net.connect({ host, port });
-    const finish = (r: { body: Record<string, unknown> } | { error: string; refused?: boolean }): void => {
+    const finish = (r: Answer): void => {
       if (done) return;
       done = true;
       clearTimeout(timer);
@@ -92,7 +101,7 @@ function health(host: string, port: number, pid: number, o: AskOptions, ms: numb
     socket.once('connect', () => {
       void (o.prove ?? connectionOf)(socket, pid).then((why) => {
         if (done) return;
-        if (why !== undefined) return finish({ error: why });
+        if (why !== undefined) return finish({ error: why, unproven: true });
         const headers: Record<string, string> = { host: `${host.includes(':') ? `[${host}]` : host}:${port}` };
         if (o.token) headers.authorization = `Bearer ${o.token}`;
         // No agent: the request goes on this proven connection and no other.

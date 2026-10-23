@@ -416,6 +416,39 @@ test("the ask's one deadline covers the proof too: a proof still running at the 
   }
 });
 
+test("a listener on 127.0.0.1 not shown to be termd's is passed over for ::1 within the same deadline, and is sent nothing (the house's review of a8b6f28..4860d4c, #22 comment 6341260318, question 5)", async (t) => {
+  // Stopped at the first address whose listener was not shown to be termd's, the ask never reached a termd on ::1.
+  const asked: string[] = [];
+  const answer = (dataDir: string) => (req: http.IncomingMessage, res: http.ServerResponse) => {
+    asked.push(`${dataDir} ${req.headers.authorization ?? '-'}`);
+    res.end(JSON.stringify({ status: 'ok', pid: 4242, dataDir }));
+  };
+  const v6 = http.createServer(answer('/v6'));
+  const bound = await new Promise<boolean>((resolve) => {
+    v6.once('error', () => resolve(false));
+    v6.listen(0, '::1', () => resolve(true));
+  });
+  if (!bound) return t.skip('no ::1 here');
+  const port = (v6.address() as { port: number }).port;
+  const v4 = http.createServer(answer('/v4'));
+  await new Promise<void>((r) => v4.listen(port, '127.0.0.1', r));
+  // The proof says no for the IPv4 connection and yes for the IPv6 one, as for an impostor on 127.0.0.1 beside termd on ::1.
+  const prove = async (socket: net.Socket) => (socket.remoteFamily === 'IPv4' ? 'the socket that answered is not its' : undefined);
+  try {
+    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 3000, token: 'shim-token', prove }), { dataDir: '/v6' });
+    assert.deepEqual(asked, ['/v6 Bearer shim-token'], 'nothing went to 127.0.0.1, the credential to ::1 alone');
+    // With nothing on ::1, the reason said is the unproven listener's, not that nothing listens.
+    v6.closeAllConnections();
+    await new Promise((r) => v6.close(r));
+    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 3000, token: 'shim-token', prove }), { error: 'the socket that answered is not its' });
+    assert.equal(asked.length, 1);
+  } finally {
+    v6.closeAllConnections();
+    v4.closeAllConnections();
+    await Promise.all([v6, v4].map((s) => new Promise((r) => s.close(() => r(undefined)))));
+  }
+});
+
 test("a termd on ::1 alone is asked there once 127.0.0.1 refuses, and an IPv6 listener dialled on 127.0.0.1 is shown as its own through tcp6 (the house's read of the 17 commits over our fixes, #22)", async (t) => {
   const answer = (dataDir: string) => (_req: http.IncomingMessage, res: http.ServerResponse) => res.end(JSON.stringify({ status: 'ok', pid: process.pid, dataDir }));
   const v6 = http.createServer(answer('/v6'));
@@ -571,7 +604,11 @@ test("the other end of a connection is found by both its addresses whole, so a c
   assert.equal(procAddress('not an address', 1, true), undefined);
   if (process.platform !== 'linux') return;
   // termd on ::1 only (this process), an impostor on 127.0.0.1 at the same port, claiming termd's pid.
-  const termd = http.createServer((_req, res) => res.end(JSON.stringify({ status: 'ok', pid: process.pid, dataDir: '/real' })));
+  const credentials: Array<string | undefined> = [];
+  const termd = http.createServer((req, res) => {
+    credentials.push(req.headers.authorization);
+    res.end(JSON.stringify({ status: 'ok', pid: process.pid, dataDir: '/real' }));
+  });
   const bound = await new Promise<boolean>((resolve) => {
     termd.once('error', () => resolve(false));
     termd.listen(0, '::1', () => resolve(true));
@@ -598,9 +635,12 @@ test("the other end of a connection is found by both its addresses whole, so a c
     const toTermd = await connect({ host: '::1', port, localAddress: '::1', localPort: toImpostor.localPort! });
     assert.equal(await connectionOf(toImpostor, process.pid), `the socket that answered on port ${port} is not its`, 'the impostor stays an impostor');
     assert.equal(await connectionOf(toTermd, process.pid), undefined, "termd's own connection on ::1 is its");
-    // The ask itself goes to the impostor on 127.0.0.1 first: it is sent no request, so no credential.
-    assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 3000, token: 'shim-token' }), { error: `the socket that answered on port ${port} is not its` });
+    // The ask meets the impostor on 127.0.0.1 first: it is sent no request, so no credential, and the ask goes on
+    // to termd on ::1, which tells it. Stopped at the impostor, it read the unit's text instead (the house's review of
+    // a8b6f28..4860d4c, #22 comment 6341260318, question 5).
+    assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 3000, token: 'shim-token' }), { dataDir: '/real' });
     assert.doesNotMatch(out, /asked/);
+    assert.deepEqual(credentials, ['Bearer shim-token'], 'the credential went to termd alone');
   } finally {
     for (const c of sockets) c.destroy();
     impostor.kill();

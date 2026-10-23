@@ -1058,6 +1058,22 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   const lockedDir = path.join(tmp, 'sup-data-dir-told-by-a-running-termd-with-a-token');
   const locked = linux ? await liveTermd(lockedDir, ['--token', 'unit-token']) : undefined;
   const sealed = linux && process.getuid?.() !== 0 ? await undumpable() : undefined;
+  // A termd bound to ::1 alone, and another process on 127.0.0.1 at its port claiming its pid (the house's review of
+  // a8b6f28..4860d4c, #22 comment 6341260318, question 5): undefined without ::1 or the impostor.
+  const v6Dir = path.join(tmp, 'sup-data-dir-told-past-an-impostor-on-127-0-0-1');
+  const v6 = linux ? await liveTermd(v6Dir, ['--host', '::1']).catch(() => undefined) : undefined;
+  let impostorSaid = '';
+  const impostor = v6
+    ? await new Promise<boolean>((resolve) => {
+        const child = spawn(process.execPath, ['-e', `const http = require('node:http'); const s = http.createServer((req, res) => { process.stdout.write('asked ' + (req.headers.authorization || '-') + '\\n'); res.end(JSON.stringify({ status: 'ok', pid: ${v6.pid}, dataDir: '/impostor' })); }); s.listen(${v6.port}, '127.0.0.1', () => process.stdout.write('listening\\n'));`], { stdio: ['ignore', 'pipe', 'ignore'] });
+        stand.push(child);
+        child.stdout!.on('data', (b: Buffer) => {
+          impostorSaid += b.toString();
+          if (impostorSaid.includes('listening')) resolve(true);
+        });
+        child.once('exit', () => resolve(false));
+      })
+    : false;
   const edited = path.join(tmp, 'edited-termd.service');
   fs.writeFileSync(edited, '[Service]\n');
   // Edited after its termd started, and read since by a daemon-reload: newer than any process here.
@@ -1125,6 +1141,9 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // termd says its port and data dir itself; read from the edited text, they were port 3101 and /srv/edited-since.
     { name: 'data-dir-told-by-the-running-termd', when: told !== undefined, stub: () => unitStub({ port: 3101, dataDir: '/srv/edited-since', mainPid: told!.pid }), dataDir: toldDir, expect: 'shared', says: /the systemd user unit termd \(its port and data dir told by its running termd, pid \d+\) serves port \d+ out of the data dir \S+sup-data-dir-told-by-the-running-termd, which a termd for port \d+ started here would use too/ },
     { name: 'data-dir-told-by-a-running-termd-with-a-token', when: locked !== undefined, stub: () => unitStub({ port: 3101, dataDir: '/srv/edited-since', mainPid: locked!.pid }), dataDir: lockedDir, env: { TSM_TOKEN: 'unit-token' }, expect: 'shared', says: /the systemd user unit termd \(its port and data dir told by its running termd, pid \d+\) serves port \d+ out of the data dir \S+sup-data-dir-told-by-a-running-termd-with-a-token, which a termd for port \d+ started here would use too/ },
+    // The house's review of a8b6f28..4860d4c (#22 comment 6341260318), question 5: an impostor on 127.0.0.1 at termd's
+    // port is passed over for termd on ::1, which tells its data dir; stopped at the impostor, the shim read the text.
+    { name: 'data-dir-told-past-an-impostor-on-127-0-0-1', when: impostor, stub: () => unitStub({ port: 3101, dataDir: '/srv/edited-since', mainPid: v6!.pid }), dataDir: v6Dir, expect: 'shared', says: /the systemd user unit termd \(its port and data dir told by its running termd, pid \d+\) serves port \d+ out of the data dir \S+sup-data-dir-told-past-an-impostor-on-127-0-0-1, which a termd for port \d+ started here would use too/ },
     // One that cannot be asked leaves the text, and the note says when the text may have changed since it started.
     { name: 'running-unit-needs-a-daemon-reload', when: linux, stub: (dataDir) => unitStub({ port: 3101, needReload: true, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /\(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"; the unit's text may have changed since that termd started: systemd says the unit needs a daemon-reload\) serves port 3101 out of the data dir/ },
     { name: 'running-unit-file-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: edited, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+edited-termd\.service is newer than its start\) serves port 3101 out of the data dir/ },
@@ -1160,6 +1179,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   };
   try {
     await Promise.all(cases.filter((c) => c.when).map(run));
+    assert.doesNotMatch(impostorSaid, /asked/, 'the impostor on 127.0.0.1 was sent no request, so no credential');
   } finally {
     for (const child of stand) child.kill();
   }
