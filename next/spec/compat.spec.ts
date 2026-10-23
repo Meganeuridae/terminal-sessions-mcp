@@ -8,6 +8,7 @@
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -1025,6 +1026,37 @@ test("searchLogs judges a probe answered as tailLogs does: an answered probe's p
     live.session.journal.append({ type: 'output', data: `\r\nmyhost$ ${markerProbe('n1nce')}\r\n<<<PROBE:n1nce:4242>>>\r\nmyhost$ ok\r\nplain after\r\n`, stream: 'pty' });
     for (const context of [0, 1, 3]) {
       const hits = (await call('searchLogs', { session: 'sq', pattern: 'myhost', context })) as Array<{ line: string; context: string[] }>;
+      assert.deepEqual(hits.map((h) => h.line), ['myhost$ ok'], `context ${context}: ${JSON.stringify(hits)}`);
+      assert.ok(hits[0]!.context.length <= 2 * context + 1, `context ${context}: ${JSON.stringify(hits[0]!.context)}`);
+    }
+  } finally {
+    await registry.closeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("searchLogs judges a probe answered when its own `set -x` trace stands between its echo and its answer, whatever context is asked (the house's review of 4860d4c..bc4bc85, PR #22)", { skip: !fs.existsSync('/bin/bash') }, async () => {
+  // A line of context reached bash's trace of the probe's pid substitution and no further, so the prompt the answered
+  // probe was typed after came back as a hit at context 0 and 1 (by run, bash 5.2.37).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'compat-search-traced-'));
+  const backend = fakeShellBackend((sh) => { sh.on(/^echo /, (line) => ({ output: `${line.slice(5)}\r\n`, exit: 0 })); }, { marks: 'none' });
+  const registry = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true });
+  const app = new App({ registry, defaultWaitMs: 2000 });
+  const C: Caller = { principal: 'agent:a@test', connectionId: 'cs' };
+  const compat = toolsFor('compat');
+  const call = async (name: string, args: Record<string, unknown>) => JSON.parse((await callTool(name, args, { app, caller: C, resultText: 'json' }, compat)).text);
+  try {
+    await call('runCommand', { session: 'st', command: 'echo hello' });
+    const live = registry.get('st');
+    if (live?.kind !== 'live') throw new Error('no live session');
+    // The probe as a declared shell's inline strategy types it, and bash's own trace of it: the substitution, then the printf.
+    const probe = inlineProbe('n1nce', false).trimStart();
+    const traced = execFileSync('/bin/sh', ['-c', 'exec "$0" -c "$1" 2>&1', '/bin/bash', `set -x; ${probe}`], { encoding: 'utf8' }).replace(/\n/g, '\r\n');
+    // Two trace lines before the answer (`++ exec /bin/sh -c 'echo $PPID'`, `+ printf …` in bash 5.2): its answer is the third.
+    assert.ok(/^[^\r\n]+\r\n[^\r\n]+\r\n<<<PROBE:n1nce:\d+:>>>\r\n$/.test(traced), `bash's trace: ${JSON.stringify(traced)}`);
+    live.session.journal.append({ type: 'output', data: `\r\nmyhost$ ${probe}\r\n${traced}myhost$ ok\r\n`, stream: 'pty' });
+    for (const context of [0, 1, 3]) {
+      const hits = (await call('searchLogs', { session: 'st', pattern: 'myhost', context })) as Array<{ line: string; context: string[] }>;
       assert.deepEqual(hits.map((h) => h.line), ['myhost$ ok'], `context ${context}: ${JSON.stringify(hits)}`);
       assert.ok(hits[0]!.context.length <= 2 * context + 1, `context ${context}: ${JSON.stringify(hits[0]!.context)}`);
     }

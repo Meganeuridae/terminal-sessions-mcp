@@ -177,6 +177,12 @@ function withoutPlumbing(line: string, p: Plumbing): string | null {
 const START = startMark();
 /** Any Run's probe line echo, built once (matchAll copies it, so its lastIndex is never shared). */
 const PROBE_ECHO = probeEcho();
+/**
+ * How far below its echo's line a probe's answer can come: on the next line, or under `set -x` after the probe's
+ * own trace, two lines in bash and zsh (the pid's command substitution, then the printf) and one in fish. A
+ * search's lines end only where the output's do, never at the terminal's width.
+ */
+const PROBE_ANSWER_LINES = 3;
 
 /**
  * The lines a probe line's echo spans, by index in `lines`, each with the length of its head that stays: found by
@@ -795,10 +801,11 @@ export const COMPAT_TOOLS: ToolDef[] = [
     async run(ctx, a) {
       const session = a.session as string;
       const context = typeof a.context === 'number' && a.context >= 0 ? Math.floor(a.context) : 3;
-      // 1.x searched case-insensitively, up to 100 matches (atc-9). The scan takes a line of context at least: a probe's
-      // answer comes on the line after its echo, and a hit's line judged alone kept an answered probe's prompt as a hit,
-      // where tailLogs strikes it (an independent read of the fixes for the review of 4f4c067..a8b6f28, PR #22).
-      const r = await ctx.app.search(ctx.caller, { session, pattern: a.pattern as string, flags: 'i', context: Math.max(context, 1), limit: 100 });
+      // 1.x searched case-insensitively, up to 100 matches (atc-9). The scan takes PROBE_ANSWER_LINES of context at
+      // least: a hit's line judged alone kept an answered probe's prompt as a hit, where tailLogs strikes it (an
+      // independent read of the fixes for the review of 4f4c067..a8b6f28, PR #22), and so did a line of context when
+      // the probe's own `set -x` trace stood between its echo and its answer (the house's review of 4860d4c..bc4bc85).
+      const r = await ctx.app.search(ctx.caller, { session, pattern: a.pattern as string, flags: 'i', context: Math.max(context, PROBE_ANSWER_LINES), limit: 100 });
       const re = compileUserRegex(a.pattern as string, 'i');
       const out: Array<Record<string, unknown>> = [];
       // The plumbing of the Runs the scan covered, by their nonces (a program line in a mark's shape is shown).
