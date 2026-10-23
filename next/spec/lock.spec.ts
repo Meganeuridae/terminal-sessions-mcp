@@ -1241,3 +1241,19 @@ test('a registry syncs each directory on the data dir\'s path into its parent be
   assert.equal(warnings.filter((w) => /a directory on the data dir's path could not be synced into its parent/.test(w)).length, 1, JSON.stringify(warnings));
   await refused.closeAll();
 });
+
+test("a registry passes over a parent on the data dir's path it can't open to sync, and says nothing of it: a root-owned /home at 0751 is one (the house's review of 4860d4c..bc4bc85, PR #22)", { skip: process.getuid?.() === 0 ? 'root opens any directory' : false }, async () => {
+  const base = dataDir();
+  const shut = path.join(base, 'shut');
+  fs.mkdirSync(shut, { recursive: true });
+  // Writable and searchable but not readable: termd can make the data dir in it, and its sync of the data dir's entry, which opens it, gets EACCES.
+  fs.chmodSync(shut, 0o333);
+  try {
+    const warnings: string[] = [];
+    const reg = new SessionRegistry({ dataDir: path.join(shut, 'data'), backend: new ScriptedBackend(), log: (level, text) => void (level === 'warn' && warnings.push(text)) });
+    assert.deepEqual(warnings.filter((w) => /could not be synced into its parent/.test(w)), []);
+    await reg.closeAll();
+  } finally {
+    fs.chmodSync(shut, 0o700);
+  }
+});
