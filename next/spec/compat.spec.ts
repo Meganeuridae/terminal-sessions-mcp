@@ -1020,7 +1020,9 @@ test("searchLogs judges a probe answered as tailLogs does: an answered probe's p
     await call('runCommand', { session: 'sq', command: 'echo hello' });
     const live = registry.get('sq');
     if (live?.kind !== 'live') throw new Error('no live session');
-    live.session.journal.append({ type: 'output', data: `\r\nmyhost$ ${markerProbe('n1nce')}\r\n<<<PROBE:n1nce:4242>>>\r\nmyhost$ ok\r\n`, stream: 'pty' });
+    // A plain line after the hit: the context the scan took beyond what was asked is cut back off (the house's review of
+    // 4860d4c..bc4bc85, PR #22: with only plumbing beside the hit, the cut was never needed).
+    live.session.journal.append({ type: 'output', data: `\r\nmyhost$ ${markerProbe('n1nce')}\r\n<<<PROBE:n1nce:4242>>>\r\nmyhost$ ok\r\nplain after\r\n`, stream: 'pty' });
     for (const context of [0, 1, 3]) {
       const hits = (await call('searchLogs', { session: 'sq', pattern: 'myhost', context })) as Array<{ line: string; context: string[] }>;
       assert.deepEqual(hits.map((h) => h.line), ['myhost$ ok'], `context ${context}: ${JSON.stringify(hits)}`);

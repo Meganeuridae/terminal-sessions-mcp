@@ -54,7 +54,9 @@ const orphan = session.admit({ target: 'process', line: 'sleep 30.${TAG}', princ
 for (let i = 0; i < 100 && session.run(orphan.run.runId).state !== 'running'; i++) await new Promise((r) => setTimeout(r, 20));
 // A Run that ends at once, leaving background work that keeps starting processes in its group. The
 // daemon dies more than a second after the Run ended, so the loop's newest child — whose start ps
-// truncates to the second — started after the end by any reading: the case the house ran.
+// truncates to the second — started after the end by any reading: the case the house ran. The loop
+// starts a child every 0.3 s, so 1.5 s after the end its newest started at least 1.2 s after it, in a
+// later second than the end's by ps's whole seconds.
 const loop = session.admit({ target: 'process', line: '(while true; do sleep 0.3; done) & exit 0', principal: P });
 await session.awaitRun(loop.run.runId, 5000);
 await new Promise((r) => setTimeout(r, 1500));
@@ -128,6 +130,11 @@ test('tg-11/G20: after a SIGKILLed daemon, every admitted Run is terminal and ea
     if (loop.pgid !== undefined) {
       assert.deepEqual(livingGroups([loop.pgid]), [], 'the loop and its newest child were terminated at recovery');
       assert.ok(notes.includes(`recovery: process group ${loop.pgid} terminated; it outlived ${ids.loop}, which had ended`), JSON.stringify(notes));
+    } else if (process.platform === 'linux') {
+      // As the orphan's: without its group the loop's check would pass having checked nothing (the house's review of 4860d4c..bc4bc85, PR #22).
+      assert.fail('run.start recorded no pgid on Linux: the loop could not be terminated (process Runs record pgid at run.start)');
+    } else {
+      console.log('# run.start carries no pgid on this platform: the loop check is skipped');
     }
     const textOf = (runId: string) =>
       h
