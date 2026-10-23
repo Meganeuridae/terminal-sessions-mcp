@@ -355,7 +355,7 @@ class Projector {
     p.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => this.onAltEnter(params));
     p.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => this.onAltExit(params));
     p.registerEscHandler({ final: 'c' }, () => this.onReset());
-    p.registerCsiHandler({ final: 'r' }, () => this.onMargins());
+    p.registerCsiHandler({ final: 'r' }, (params) => this.onMargins(params));
     this.hookScroll();
   }
 
@@ -368,9 +368,19 @@ class Projector {
     }
   }
 
-  /** DECSTBM: whose output set the margins. */
-  private onMargins(): boolean {
-    this.owed = 0;
+  /**
+   * DECSTBM: whose output set the margins. Margins it changes owe no row; the margins already in force, set again,
+   * restore none, so what is owed stays. The margins it sets are read as xterm's setScrollRegion reads them: a bottom
+   * left out, 0 or past the last row is the last row, and one not below the top sets nothing, so it leaves the count
+   * and the owner as they were.
+   */
+  private onMargins(params: (number | number[])[]): boolean {
+    const top = num(params[0]) || 1;
+    let bottom = params.length < 2 ? 0 : num(params[1]);
+    if (bottom === 0 || bottom > this.rows) bottom = this.rows;
+    if (bottom <= top) return false;
+    const now = this.margins();
+    if (top - 1 !== now.top || bottom - 1 !== now.bottom) this.owed = 0;
     if (this.source === undefined) this.adopt = true;
     else {
       this.owner = this.source;
@@ -573,6 +583,9 @@ class Projector {
       this.out.close();
       // Drop the kept rows; the cursor's row moves to the top and the erase blanks it.
       this.clearToCursorRow();
+      // The terminal's screen is blank now too: no row is owed, and the program's own next scroll that takes a row
+      // with text takes one the terminal loses as well.
+      this.owed = 0;
     }
     return false;
   }

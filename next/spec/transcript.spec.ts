@@ -210,6 +210,11 @@ test('rule 7: the lasting state of an omitted head still applies: a scroll regio
   const region = await project([`\x1b[2;5r${'h'.repeat(300)}\r\n`, lines], { cols: 80, rows: 10, maxInputBytes: 100 });
   assert.deepEqual(region.text.split('\n'), ['line 0', 'line 5', 'line 6', 'line 7']);
   assert.equal(region.omittedInputBytes, 6 + 300 + 2);
+  // Labelled, the margins go in with the omitted head's state ahead of the first header, from no source, and the source
+  // fed next owns them (Projector.feeding): its own scrolls lose what the terminal loses, and report no row lost (the
+  // house's review of 4860d4c..bc4bc85).
+  const labelled = await project([`\x1b[2;5r${'h'.repeat(300)}\r\n`, lines], { cols: 80, rows: 10, maxInputBytes: 100, label: () => '[terminal]' });
+  assert.deepEqual([labelled.text.split('\n').slice(-3), labelled.lost], [['line 5', 'line 6', 'line 7'], undefined]);
   // G1 = DEC graphics and shift out, set in the omitted head, draw the box characters of the tail.
   const box = await project([`\x1b)0\x0e${'h'.repeat(30)}\r\n`, 'lqqk\r\n'], { cols: 80, rows: 10, maxInputBytes: 10 });
   assert.deepEqual(box.text.split('\n'), ['┌──┐']);
@@ -888,6 +893,46 @@ test('what the program did not write scrolls a region not starting at row 1 at a
   // terminal's are.
   assert.deepEqual(await read([`${region}\r\n`, { hole: true }, 'X\r\nY\r\n']), [['top1', 'top2', 'r6', 'X', 'Y'], false, 0, undefined], 'nothing owed');
   assert.deepEqual(await read([`${region}\r\nX\r\nY\r\n`]), [['top1', 'top2', 'r6', 'X', 'Y'], false, 0, undefined], 'as the terminal alone shows it');
+});
+
+test('a row owed stays owed through the same margins set again, and goes when the margins change or the screen is erased; the alternate screen reports nothing', async () => {
+  // The house's review of 4860d4c..bc4bc85 (PR #22): setting the margins already in force restores no row, and the
+  // program's own next scroll that took one with text went unreported (I15). A full erase leaves the terminal's screen
+  // blank too, and an owed row then reported a loss where nothing went that the terminal keeps (I72). No test held
+  // a change of margins clearing what is owed, or the normal-screen guards (I41, I42).
+  const read = async (chunks: ProjectChunk[]) => {
+    const p = await project(chunks, { cols: 20, rows: 10 });
+    return [p.text.split('\n'), p.truncated, p.omittedInputBytes, p.lost];
+  };
+  const blankTop = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\n\r\nr4\r\nr5\r\nr6';
+  const owed = await read([blankTop, { hole: true }, '\x1b[6;1HX\r\nY\r\n']);
+  assert.deepEqual(owed.slice(1), [true, 0, true], JSON.stringify(owed));
+  assert.deepEqual(await read([blankTop, { hole: true }, '\x1b[3;6r\x1b[6;1HX\r\nY\r\n']), owed, 'the same margins set again');
+  assert.deepEqual(await read([blankTop, { hole: true }, '\x1b[3;7r\x1b[7;1HX\r\nY\r\n']).then((r) => r.slice(1)), [false, 0, undefined], 'margins changed');
+  // Read as xterm reads DECSTBM: a bottom not below the top sets nothing, and a bottom left out, 0 or past the last
+  // row is the last row, so over margins that reach it each of those sets them again.
+  assert.deepEqual(await read([blankTop, { hole: true }, '\x1b[6;3r\x1b[6;1HX\r\nY\r\n']), owed, 'margins xterm ignores');
+  const toLast = '\x1b[3;10r\x1b[1;1Htop1\r\ntop2\r\n\r\nr4\r\nr5\r\nr6\r\nr7\r\nr8\r\nr9\r\nr10';
+  const owedToLast = await read([toLast, { hole: true }, '\x1b[10;1HX\r\nY\r\n']);
+  assert.deepEqual(owedToLast.slice(1), [true, 0, true], JSON.stringify(owedToLast));
+  for (const again of ['\x1b[3r', '\x1b[3;0r', '\x1b[3;99r']) {
+    assert.deepEqual(await read([toLast, { hole: true }, `${again}\x1b[10;1HX\r\nY\r\n`]), owedToLast, JSON.stringify(again));
+  }
+  // After the erase, `a` and `b` scroll out of the region on the terminal as well.
+  const refill = '\x1b[3;1Ha\r\nb\r\nc\r\nd\r\ne\r\n';
+  const alone = await read([`${blankTop}\x1b[2J${refill}`]);
+  assert.deepEqual(alone.slice(1), [false, 0, undefined], JSON.stringify(alone));
+  assert.deepEqual(await read([blankTop, { hole: true }, `\x1b[2J${refill}`]).then((r) => r.slice(1)), [false, 0, undefined], 'ED 2');
+  assert.deepEqual(await read([blankTop, { hole: true }, `\x1b[H\x1b[J${refill}`]).then((r) => r.slice(1)), [false, 0, undefined], 'ED 0 at home');
+  // The alternate screen keeps no frame whole and reports nothing (Projector.freshLine): a region from row 3 there,
+  // the boundary's line end at its last row, and a line end below it on the screen's last row.
+  const altRegion = '\x1b[?1049h\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6';
+  assert.deepEqual(await read([altRegion, { hole: true }, 'X\r\n']).then((r) => r.slice(1)), [false, 0, undefined], 'the region’s last row');
+  assert.deepEqual(await read([`${altRegion}\x1b[10;1Hlast`, { hole: true }, 'X\r\n']).then((r) => r.slice(1)), [false, 0, undefined], 'below the region');
+  // The normal screen's rows stay as they were under the alternate screen, and the scroll hook reads none of them for
+  // the alternate screen's region: `n3` is its third row when the region from row 3 scrolls.
+  const normalUnder = '\x1b[1;1Hn1\r\nn2\r\nn3\r\nn4\r\nn5\r\nn6\x1b[H';
+  assert.deepEqual(await read([`${normalUnder}${altRegion}`, { hole: true }, 'X\r\n']).then((r) => r.slice(1)), [false, 0, undefined], 'text under it on the normal screen');
 });
 
 test('a head kept to maxLines counts what it dropped as omitted: the lines fed in the batch where the limit falls, the whole rest of a range that fits on the screen, and a share of what made lines with no line end', async () => {
