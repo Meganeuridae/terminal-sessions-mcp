@@ -234,8 +234,12 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   is about 30 s old; heavy writing, or other settings, can make it later); that reads as a gap
   (reason `torn-write`). Numbering survives it, so no event number is given twice, as long as the
   disk took termd's small metadata writes; while a disk refuses writes, a power loss, or a daemon
-  crash, can give some numbers twice. Live processes surviving a restart
-  needs the keeper backend (milestone 3): a stopping daemon hangs up each shell as a closing
+  crash, can give some numbers twice. Once a disk has refused to sync the journal, a later sync
+  that succeeds is taken at its word, though since Linux 4.13 a failed write-back is reported to
+  one sync only: a power loss can then take lines written before the refusal with no gap recorded
+  for them, and a restart on the same boot can't tell either. termd accepts that rather than scan
+  for missing lines at every start, and its log warns of it when the sync is refused. Live
+  processes surviving a restart needs the keeper backend (milestone 3): a stopping daemon hangs up each shell as a closing
   terminal does, so its foreground job ends with it, while a job the shell detached on purpose
   (`nohup`, `setsid`, `disown`) lives on; process Runs' groups are ended. The systemd unit sets
   `KillMode=process` so systemd signals termd alone on stop: those detached jobs survive, as they

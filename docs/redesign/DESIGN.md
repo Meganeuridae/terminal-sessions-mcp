@@ -329,7 +329,18 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   last line on disk. A start after a stop while the disk refused records each jump in the files'
   seqs that no gap covers as a hole: counted exactly, since seqs are dense, unless the failed mark
   says a hole above a reservation was among those unrecorded, when each such jump is counted as up
-  to its range. Three products derive from it and each states
+  to its range. A failed mark without `failedBound`, the flag that says so, reads as exact: only
+  builds of 2.0 from before the flag, none of them released, wrote one. A build that doesn't know the flag reads a bound mark as
+  exact too, so after a rollback to one, a gap note can name as missing up to a block of seqs that
+  were never issued. A failed mark is cleared once every file holding a seq not yet synced, and the
+  directory holding them, sync. A sync that succeeds after one the disk refused counts, though
+  since Linux 4.13 a write-back error is reported to one fsync only, and a later one, on the same
+  descriptor or a new one, can return 0 though the earlier writes never reached the disk. Lines
+  written before the refusal can then be lost to a power loss, and the start after it, finding the
+  mark cleared, looks for no jumps and records no gap for them. A restart on the same boot can't
+  tell either, since the page cache still holds the lines. This is accepted rather than paid for
+  with a scan for missing stretches at every start, which large sessions would feel; the store's
+  warning at the refusal says so. Three products derive from it and each states
   what it is. **Raw output** is retained decoded UTF-8 text with provenance, a pure function of a
   range. **Transcript** is a documented line-oriented projection of a range, a pure
   function of that range and the width it is projected at, for reading and search — not a
