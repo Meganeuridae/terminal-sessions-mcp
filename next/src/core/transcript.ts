@@ -1080,6 +1080,8 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
           // The first maxLines lines are complete: the rest is not projected (rule 7).
           omitted += input(seg, pos) + segs.slice(s + 1).reduce((a, x) => a + input(x), 0);
           stopped = { s, pos };
+          // A header the loop counted on reaching it but stopped before feeding wasn't fed (the look-alike count below).
+          if (seg.header && pos === 0) headersFed--;
           break outer;
         }
         const end = batchEnd(seg.data, pos, pr.budget, cols);
@@ -1107,8 +1109,14 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
     let truncated = omitted > 0 || pr.lost || pr.out.dropped;
     const kept = keepLines(lines, maxLines, keep, headers);
     if (kept) {
-      const made = lines.filter((l) => !headers.has(l)).length;
-      const gone = made - kept.filter((l) => !headers.has(l)).length;
+      // Headers are known by their text, so an output line that reads as one (a `[terminal]` that `tsm read`'s own
+      // output printed in a session) counts as a header too, and a cut that dropped it read as dropping headers alone:
+      // nothing truncated, nothing omitted. Where more lines read as headers than header segments were fed, a dropped
+      // one can't be told from such a line, so every dropped line counts (a reviewer's read of the fixes for #22).
+      const outputs = (ls: string[]) => ls.filter((l) => !headers.has(l)).length;
+      const lookalike = lines.length - outputs(lines) > headersFed;
+      const made = lookalike ? lines.length - headersFed : outputs(lines);
+      const gone = lookalike ? lines.length - kept.length : made - outputs(kept);
       // A cut that drops headers alone, naming sources that showed nothing (a Run that printed a title or blanks),
       // drops no line of output: nothing is truncated (an independent read of the fixes for #22).
       if (gone > 0) {

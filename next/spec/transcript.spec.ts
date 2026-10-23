@@ -833,6 +833,15 @@ test('a cut that drops only headers, naming sources that showed nothing, truncat
   }
 });
 
+test('a cut that drops an output line reading as a header reports it: a Run’s line `[terminal]`, as `tsm read` printed in the session would show, is output', async () => {
+  // A reviewer's read of the fixes for #22: headers are known by their text, so with the pty's header in range a Run's output
+  // line `[terminal]` counted as one, and a head kept to maxLines that dropped it reported nothing truncated and nothing omitted.
+  const chunks: ProjectChunk[] = [{ data: 'p1\r\n', stream: 'pty' }, { data: 'l1\n[terminal]\n', stream: 'stdout', runId: 'r1' }];
+  const p = await project(chunks, { cols: 80, rows: 24, label: sourceLabel, keep: 'head', maxLines: 2 });
+  assert.deepEqual([p.text, p.truncated], ['[terminal]\np1\n[run r1]\nl1', true]);
+  assert.ok(p.omittedInputBytes > 0, JSON.stringify(p));
+});
+
 test('what the program did not write scrolls a region not starting at row 1 at a cost the projection reports: a row with text scrolled away, by the boundary’s line end, a note, a header or another source; margins from row 1 lose nothing', async () => {
   // The house's review of a8b6f28..4860d4c (PR #22, comment 6341260318): with margins 3–6 and the cursor moved up, the boundary's
   // line end at the region's last row scrolls the region, whose top row has no scrollback, and nothing reported it. The margins
