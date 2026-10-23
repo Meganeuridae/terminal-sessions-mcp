@@ -30,9 +30,14 @@
  *   already ended when the prompt is offered: stderr's `Password: ` that stdout's LF ended in the read counts once. So
  *   stdout's `ERROR a`, left quiet before its LF, is a prompt begun where the read's `ERROR aERROR b` began, and the
  *   first rule's two lines are one (the house's review of a8b6f28..4860d4c, #22, comment 6341260318, question 6).
- * A prompt that matched is spent: the rest of its line is not matched again, in either reading, and a line the other
- * pipe ends at that line's end is matched on its own (stdout's `ERROR a` matched quiet, then `ERROR b` and a LF on
- * stderr, are two matches).
+ * Two verdicts, two finalities (the house's review of 4860d4c..bc4bc85, #22, comment 6357989601). A fail match is
+ * final for its place: the rest of its line is not matched again, in either reading, so a fail is counted once per
+ * line. A ready match is final for ready alone: the line's later text, and any line paired with it, the other
+ * reading's twin, is still tested for fail, and ready is never journaled again for the line, so stdout's `server
+ * ready`, left quiet, then ` FATAL` on the same line is unhealthy, where a ready that spent the line never saw the
+ * FATAL. The cost is a ready prompt offered again as its line grows, tested for fail only. A line the other pipe ends
+ * at a spent line's end is matched on its own (stdout's `ERROR a` matched quiet, then `ERROR b` and a LF on stderr,
+ * are two matches).
  */
 import { compileLinePattern, LineSplitter, type Begun, type SplitLine } from './ansi.js';
 import { headOnlyText, testBounded } from './regex.js';
@@ -86,10 +91,20 @@ type Condition = 'pattern' | 'tcp' | 'alive';
 /** A place in a Run's output (where a line began or ended: SplitLine.begun, .ended), as a key; the line's text when it has none. */
 const placeOf = (p: Begun | undefined, line: SplitLine): string => (p ? `${p.at}:${p.offset}` : `?${line.text}`);
 
-/** A line the other reading may hold too (ServiceMonitor.prompted, .completed): where it began, whether it matched, and a completed line's text. */
+/**
+ * What a place in a Run's output, where a line began, has been judged so far: a fail is final, nothing begun there is
+ * matched again; a ready leaves what the line holds past the match, and any line paired with it, to be tested for fail
+ * alone (the house's review of 4860d4c..bc4bc85, #22, comment 6357989601).
+ */
+type Verdict = 'fail' | 'ready' | undefined;
+
+/** The stronger of two verdicts on one place: a fail, else a ready, else none. */
+const stronger = (a: Verdict, b: Verdict): Verdict => (a === 'fail' || b === 'fail' ? 'fail' : a ?? b);
+
+/** A line the other reading may hold too (ServiceMonitor.prompted, .completed): where it began, its verdict so far, and a completed line's text. */
 interface Twin {
   at: Begun | undefined;
-  matched: boolean;
+  verdict: Verdict;
   text?: string;
 }
 
@@ -134,14 +149,14 @@ export class ServiceMonitor {
    */
   private readonly pipes = new Map<OutputStream, Reading>();
   /**
-   * The quiet prompts tested, by where each began (placeOf), and whether one matched: a prompt and its twin, the
-   * other reading's line that began at the same place, are one line, matched once. Kept while a reading holds the line
-   * open (pruneTwins).
+   * The quiet prompts tested, by where each began (placeOf), and their verdict so far: a prompt and its twin, the
+   * other reading's line that began at the same place, are one line, a fail matched once on it and a ready leaving
+   * the rest to fail. Kept while a reading holds the line open (pruneTwins).
    */
   private readonly prompted = new Map<string, Twin>();
   /**
-   * The completed lines another reading still holds a line open beside, begun at the same place (placeOf), with whether
-   * one matched and its text: a quiet prompt that reading offers later is their twin, matched once with them (once),
+   * The completed lines another reading still holds a line open beside, begun at the same place (placeOf), with their
+   * verdict so far and their text: a quiet prompt that reading offers later is their twin, judged with them (once),
    * and a line it completes with the same text is the same line (sameCompleted). Kept while a reading holds the line
    * open (pruneTwins), so at most one a reading.
    */
@@ -273,10 +288,10 @@ export class ServiceMonitor {
         // LF and stderr's at its own, where a quiet between them counted it once (the house's review of
         // a8b6f28..4860d4c, #22, comment 6341260318, question 6).
         const fresh = this.completed.size ? texts.filter((line) => !this.sameCompleted(line)) : texts;
-        const matched = fresh.length > 0 && this.onLines(fresh);
+        const verdict = fresh.length > 0 ? this.onLines(fresh) : undefined;
         // A line the other reading holds open from where it began (stderr's `Password: `, the read's ended at stdout's
         // LF) is that reading's prompt's twin, or its completed line's when the text is the same.
-        for (const line of fresh) if (line.begun && this.heldOpen(line.begun)) this.completed.set(placeOf(line.begun, line), { at: line.begun, matched, text: line.text });
+        for (const line of fresh) if (line.begun && this.heldOpen(line.begun)) this.completed.set(placeOf(line.begun, line), { at: line.begun, verdict, text: line.text });
       }
       this.pruneTwins();
     } else if (ev.type === 'run.start' && ev.runId === this.runId) {
@@ -300,34 +315,37 @@ export class ServiceMonitor {
   }
 
   /**
-   * A completed line, as one reading or both wrote it (`texts`, the pipe's first): matched unless it is a quiet prompt
-   * already matched, whose reading spent it while the other's went on to complete it. True when it matched, then or now.
+   * A completed line, as one reading or both wrote it (`texts`, the pipe's first): tested for what its place still
+   * allows. Nothing after a fail there, a quiet prompt's whose reading spent it while the other's went on to complete
+   * it; fail alone after a ready, stdout's `server ready` matched quiet and then ` FATAL` and a LF, or stderr's
+   * `FATAL` and a LF ending the read's line begun at it (the house's review of 4860d4c..bc4bc85, #22, comment
+   * 6357989601). The place's verdict now.
    */
-  private onLines(texts: SplitLine[]): boolean {
-    if (texts.some((line) => this.prompted.get(placeOf(line.begun, line))?.matched)) return true;
-    return this.onLine(...texts);
+  private onLines(texts: SplitLine[]): Verdict {
+    return this.onLine(texts, texts.reduce<Verdict>((v, line) => stronger(v, this.prompted.get(placeOf(line.begun, line))?.verdict), undefined));
   }
 
   /**
    * A quiet prompt `r` offered: tested together with its twin, the other reading's open line that began where it did,
-   * both texts at once (the pipe's first), as a completed pair is, and matched once. Taken alone, the first offer's
-   * verdict stood for its twin's different text: stderr's `Password: ` was never tested when the read's `Passxword: `
-   * had failed. Told apart by the seq each reading was last fed, one prompt counted twice when the other pipe wrote in
-   * between (our review of the 73 commits through 4860d4c, PR #22). A twin the other reading has already ended was
-   * matched as a completed line: when it matched, the prompt is spent with it, and otherwise the prompt's own text is
-   * tried. Paired only with an open twin, stderr's `Password: ` matched again after the read had matched it, ended at
-   * stdout's LF (the house's review of a8b6f28..4860d4c, #22, comment 6341260318, question 6).
+   * both texts at once (the pipe's first), as a completed pair is, for what their place still allows. Taken alone, the
+   * first offer's verdict stood for its twin's different text: stderr's `Password: ` was never tested when the read's
+   * `Passxword: ` had failed. Told apart by the seq each reading was last fed, one prompt counted twice when the other
+   * pipe wrote in between (our review of the 73 commits through 4860d4c, PR #22). A twin the other reading has already
+   * ended was matched as a completed line: a fail there spends the prompt with it, a ready leaves the prompt's text to
+   * be tried for fail (stdout's `READY FA` ended by stderr's LF in the read, then `TAL` on stdout), and otherwise the
+   * prompt's own text is tried. Paired only with an open twin, stderr's `Password: ` matched again after the read had
+   * matched it, ended at stdout's LF (the house's review of a8b6f28..4860d4c, #22, comment 6341260318, question 6).
+   * True spends the line in its splitter: only a fail is final, so a ready prompt is offered again as its line grows
+   * and comes out once more when it completes, each time tested for fail alone (the house's review of
+   * 4860d4c..bc4bc85, #22, comment 6357989601).
    */
   private once(r: Reading, line: SplitLine): boolean {
     const at = placeOf(line.begun, line);
-    if (this.prompted.get(at)?.matched || this.completed.get(at)?.matched) {
-      this.prompted.set(at, { at: line.begun, matched: true });
-      return true;
-    }
-    const twin = this.readings().find((o) => o !== r && line.begun && samePlace(o.splitter.opened(), line.begun))?.splitter.peek();
-    const matched = twin ? (r.pipe !== undefined ? this.onLine(line, twin) : this.onLine(twin, line)) : this.onLine(line);
-    this.prompted.set(at, { at: line.begun, matched });
-    return matched;
+    const sofar = stronger(this.prompted.get(at)?.verdict, this.completed.get(at)?.verdict);
+    const twin = sofar === 'fail' ? undefined : this.readings().find((o) => o !== r && line.begun && samePlace(o.splitter.opened(), line.begun))?.splitter.peek();
+    const verdict = this.onLine(twin ? (r.pipe !== undefined ? [line, twin] : [twin, line]) : [line], sofar);
+    this.prompted.set(at, { at: line.begun, verdict });
+    return verdict === 'fail';
   }
 
   /** A completed line the other reading completed already, begun at the same place with the same text. */
@@ -374,12 +392,15 @@ export class ServiceMonitor {
   /**
    * One line of the Run's output, as a read shows it or as its own pipe wrote it, or as both (`texts`, the pipe's
    * first): two completed lines that one line end completes, or a quiet prompt and the other reading's open line that
-   * began where it did; true when a pattern matched it. A fail match wins over a ready match on the same
-   * line, in either reading; the evidence is the first reading that matched. It names the line, whichever reading it
-   * is: m2-21's says `Server listening on 8080`.
+   * began where it did. Tested for what its place's verdict `sofar` still allows: nothing after a fail; fail alone
+   * after a ready, so a ready read before a fail on another line is no recovery (stdout's `ready` quiet, stderr's
+   * `FATAL` and LF, then stdout's LF ending its `ready` leaves the service unhealthy); else fail, then ready. A fail
+   * match wins over a ready match on the same line, in either reading; the evidence is the first reading that
+   * matched. It names the line, whichever reading it is: m2-21's says `Server listening on 8080`. The place's verdict
+   * now.
    */
-  private onLine(...texts: SplitLine[]): boolean {
-    if (this.disposed || ended(this.statusValue)) return false;
+  private onLine(texts: SplitLine[], sofar: Verdict): Verdict {
+    if (this.disposed || ended(this.statusValue) || sofar === 'fail') return sofar;
     // Matched on the line's head within the pattern's match window, as watches and search are
     // (the house's read of ed4ecac, #22: a long pattern on a 64 KiB line held the thread for seconds),
     // and on the head the splitter kept of a line longer than MAX_LINE; the evidence says when only
@@ -396,14 +417,15 @@ export class ServiceMonitor {
     const fail = first(this.failRe);
     if (fail !== undefined) {
       this.onFail(fail);
-      return true;
+      return 'fail';
     }
+    if (sofar === 'ready') return sofar;
     const ready = first(this.readyRe);
     if (ready !== undefined) {
       this.onReadyLine(ready);
-      return true;
+      return 'ready';
     }
-    return false;
+    return undefined;
   }
 
   private onFail(evidence: string): void {
