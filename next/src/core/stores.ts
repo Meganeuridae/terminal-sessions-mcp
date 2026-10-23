@@ -658,17 +658,18 @@ export class FileStore implements JournalStore {
 
   /**
    * A refused sync of the files, said once per store: appends are synced nowhere else, so nothing else would say the
-   * disk refuses it. It says what a later success can hide too: since Linux 4.13 a write-back error is reported to one
-   * fsync only, and a later one, on the same descriptor or a new one, can return 0 though the earlier writes never
-   * reached the disk. The clear that success allows stands, so the start after a power loss looks for no missing
-   * stretches and records no gap for lines lost from before the refusal, and a restart on the same boot can't tell
-   * either. That is accepted rather than paid for with a scan at every start (the house's review of
+   * disk refuses it. It says what a later success can hide too: since Linux 4.13 a write-back error is reported once to
+   * each open file description, and after that report an fsync on the same description, or on one opened later, can
+   * return 0 though the earlier writes never reached the disk. The clear that success allows stands, so the start
+   * after a power loss looks for no missing stretches: lines from before the refusal lost from the middle of the
+   * files get no gap (those lost from their end fall in the hole the reservation opens, as a bound), and a restart
+   * on the same boot can't tell either. That is accepted rather than paid for with a scan at every start (the house's review of
    * a8b6f28..4860d4c, PR #22, comment 6341260318, question 2).
    */
   private appendSyncRefused(e: NodeJS.ErrnoException): void {
     if (this.appendSyncWarned) return;
     this.appendSyncWarned = true;
-    this.log?.('warn', `the journal's files could not be synced before its failed mark is cleared: ${e.message}; the mark stays, and its clear is tried again, until they are. A sync that succeeds later clears it, but since Linux 4.13 a write-back error is reported to one sync only, so that success can hide lines the disk never took: a power loss could still take what was written before this refusal, and the start after it would record no gap for those lines`);
+    this.log?.('warn', `the journal's files could not be synced before its failed mark is cleared: ${e.message}; the mark stays, and its clear is tried again, until they are. A sync that succeeds later clears it, but since Linux 4.13 a write-back error is reported once to each open file description, so that success can hide lines the disk never took: a power loss could still take what was written before this refusal, and the start after it would record no gap for those lost from the middle of the journal's files`);
   }
 
   // ───────────── epoch and high water (G10, mcpl-4, jr2-6) ─────────────

@@ -1725,9 +1725,10 @@ test('a file fsync the disk refuses keeps the failed mark: the store refuses the
     const refused = said.filter((l) => l.startsWith('warn: ') && l.includes("the journal's files could not be synced before its failed mark is cleared"));
     assert.equal(refused.length, 1, said.join(' | '));
     assert.match(refused[0]!, /EIO/);
-    // A later success is taken at its word, so the warning names what it can hide: Linux reports a write-back error once.
-    assert.match(refused[0]!, /since Linux 4\.13 a write-back error is reported to one sync only/);
-    assert.match(refused[0]!, /a power loss could still take what was written before this refusal, and the start after it would record no gap for those lines/);
+    // A later success is taken at its word, so the warning names what it can hide: Linux reports a write-back error once
+    // to each open file description.
+    assert.match(refused[0]!, /since Linux 4\.13 a write-back error is reported once to each open file description/);
+    assert.match(refused[0]!, /a power loss could still take what was written before this refusal, and the start after it would record no gap for those lost from the middle of the journal's files/);
     // A rotated file retention took meanwhile: nothing to sync there, and the clear does not wait on it.
     const rotated = fs.readdirSync(dir).filter((n) => /^journal\.\d+\.jsonl$/.test(n)).sort();
     assert.ok(rotated.length >= 2, rotated.join(', '));
