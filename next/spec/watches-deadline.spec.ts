@@ -492,6 +492,74 @@ test("a Run's silence is measured from this manager's stamp of its newest output
   }
 });
 
+test('a silence watch or wait on a live Run whose output from before this manager is gone, or cannot be read, measures its quiet from the manager’s start (the house’s review of a8b6f28..4860d4c, #22, comment 6341260318, question 3)', async (t) => {
+  // The Run printed before this manager existed, as before a restart, and has been quiet since. With no stamp and its
+  // read cut, it had no age, so the watch and the wait armed only on its next output, and it was never reported quiet.
+  const f = bare();
+  const mono = clocks.monotonic;
+  let shift = 0;
+  t.mock.method(clocks, 'monotonic', () => mono() + shift);
+  try {
+    f.startRun('q');
+    f.out('printed before a restart\n', 'q');
+    const later = new WatchManager(f.host);
+    try {
+      const output = f.journal.runs.output.bind(f.journal.runs);
+      t.mock.method(f.journal.runs, 'output', (...a: Parameters<typeof output>) => ({ ...output(...a), events: [], truncated: true }));
+      const watch = later.add({ silenceMs: 100, runId: 'q' }, A);
+      for (const until = performance.now() + 5000; !f.firings(watch.watchId).length && performance.now() < until; ) await sleep(20);
+      assert.match(String(f.firings(watch.watchId)[0]?.match), /^no output for \d+ms$/, 'the watch armed from the manager’s start and fired');
+      later.remove(watch.watchId);
+      const waited = await later.waitFor({ silenceMs: 200, runId: 'q' }, 5000);
+      assert.equal(waited.matched, true, JSON.stringify(waited));
+      // Quiet at least as long as the manager has run: a wait past that answers at once, with that figure.
+      shift = 10_000;
+      const long = await later.waitFor({ silenceMs: 5000, runId: 'q' }, 5000);
+      assert.equal(long.matched, true, JSON.stringify(long));
+      assert.ok(long.elapsedMs < 1000 && Number(/(\d+)ms$/.exec(String(long.match))?.[1]) >= 10_000, JSON.stringify(long));
+      t.mock.method(f.journal.runs, 'output', () => {
+        throw new Error('the store could not be read');
+      });
+      const failed = await later.waitFor({ silenceMs: 5000, runId: 'q' }, 5000);
+      assert.equal(failed.matched, true, `a read that fails measures from there too: ${JSON.stringify(failed)}`);
+    } finally {
+      later.dispose();
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test('a Run admitted under this manager, or whose whole range was read, with nothing printed, still arms on its first output (m2-12; the house’s review of a8b6f28..4860d4c, #22, comment 6341260318, question 3)', async (t) => {
+  // This manager stamps every output of a Run admitted after it began, so one with no stamp printed nothing, whatever a
+  // hole took from its range; and one whose whole range was read printed nothing either.
+  const f = bare();
+  const mono = clocks.monotonic;
+  let shift = 0;
+  t.mock.method(clocks, 'monotonic', () => mono() + shift);
+  try {
+    f.startRun('before');
+    const later = new WatchManager(f.host);
+    try {
+      shift = 10_000;
+      const whole = await later.waitFor({ silenceMs: 200, runId: 'before' }, 400);
+      assert.equal(whole.matched, false, `nothing printed and the whole range read: ${JSON.stringify(whole)}`);
+      f.startRun('after');
+      const output = f.journal.runs.output.bind(f.journal.runs);
+      t.mock.method(f.journal.runs, 'output', (...a: Parameters<typeof output>) => ({ ...output(...a), events: [], truncated: true }));
+      const cut = await later.waitFor({ silenceMs: 200, runId: 'after' }, 400);
+      assert.equal(cut.matched, false, `admitted under the manager, nothing printed: ${JSON.stringify(cut)}`);
+      const first = later.waitFor({ silenceMs: 200, runId: 'after' }, 5000);
+      f.out('first\n', 'after');
+      assert.equal((await first).matched, true, 'armed on its first output');
+    } finally {
+      later.dispose();
+    }
+  } finally {
+    f.close();
+  }
+});
+
 test('the newest 1,024 ended Runs keep their last output’s stamp, and an older one’s output is aged on the wall clock (the house’s read of the 40 commits, #22)', async (t) => {
   // The stamps of ended Runs are bounded: each Run's end past the newest 1,024 lets the oldest go.
   const f = bare();

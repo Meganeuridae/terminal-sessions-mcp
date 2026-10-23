@@ -34,6 +34,17 @@
  * stream and an ended Run's last output were aged on the wall clock; and of the 33 commits after
  * 94ac8c0, comment 6307351806: a stamp for every event, the newest 8,192 kept, let a quiet live
  * Run's stamp go once other Runs printed 8,192 events, and cost about 1.6 µs per event).
+ *
+ * A silence watch or wait on a live Run measures from the Run's last output, and one on a Run that
+ * has printed nothing arms on its first (m2-12). A live Run with no stamp, whose output the journal
+ * cannot give either (retention or a hole cut its read, or the read failed), was admitted before this
+ * manager began: anything it printed since would carry a stamp, so it has been quiet at least since
+ * the manager began, and the watch or wait arms from there. It armed only on the Run's next output,
+ * so a Run that printed before a restart and was quiet since was never reported quiet (the house's
+ * review of a8b6f28..4860d4c, #22, comment 6341260318, question 3). The cost, accepted: such a Run
+ * that never printed, when retention or a hole took other events from its range, fires as quiet
+ * since the manager began. A Run admitted under this manager with no stamp printed nothing, and arms
+ * on its first output.
  */
 import { randomBytes } from 'node:crypto';
 import { compileLinePattern, PARTIAL_QUIET_MS, StreamMatcher, type LineMatch } from './ansi.js';
@@ -379,6 +390,11 @@ interface Stamp {
 }
 /** The newest output of each stream of one Run, or of the session outside Runs. */
 type Newest = Partial<Record<OutputStream, Stamp>>;
+/**
+ * One Run's newest output and its age, or what can be said where there is none (WatchManager.newestRunOutput):
+ * `unread` when the journal's read of it was cut or failed, so it may have printed what the read cannot give.
+ */
+type RunNewest = { seq?: Seq; age?: number; none?: string; unread?: true };
 
 /**
  * How many ended Runs keep their last output's stamp, for a silence wait answering for one: the newest
@@ -397,8 +413,11 @@ export class WatchManager {
   private readonly live = new Map<string, Newest>();
   /** The same for the newest ENDED_STAMPED ended Runs, moved here at each Run's end. */
   private readonly ended = new Map<string, Newest>();
+  /** When this manager began, on the monotonic clock, and the journal's last seq then: every output after it is stamped. */
+  private readonly began: { at: number; seq: Seq };
 
   constructor(private readonly host: WatchHost) {
+    this.began = { at: clocks.monotonic(), seq: host.journal.lastSeq };
     this.off = host.journal.subscribe((ev) => {
       if (ev.type === 'watch.fired') return;
       if (ev.type === 'output') this.stamp(ev);
@@ -462,8 +481,8 @@ export class WatchManager {
       if (!run) rec.predicate.armSilence();
       else {
         // Quiet is measured from the Run's last output; a Run that has printed nothing yet arms on its first (m2-12).
-        const newest = this.newestRunOutput(run.runId);
-        if (newest.age !== undefined) rec.predicate.armSilence(spec.silenceMs! - newest.age, clocks.monotonic() - newest.age);
+        const age = this.quietOf(run, this.newestRunOutput(run.runId)).age;
+        if (age !== undefined) rec.predicate.armSilence(spec.silenceMs! - age, clocks.monotonic() - age);
       }
     }
     return this.publicInfo(rec);
@@ -505,14 +524,14 @@ export class WatchManager {
    * read failed when it did. Read as `no output`, a Run whose output had aged out, or could not be read, was
    * said to have printed nothing (the house's read of the 40 commits over our fixes, #22).
    */
-  private lastRunOutput(runId: string): { last?: JournalEvent; none?: string } {
+  private lastRunOutput(runId: string): { last?: JournalEvent; none?: string; unread?: true } {
     try {
       const out = this.host.journal.runs.output(this.host.journal, runId, { maxBytes: 1 });
       const last = out.events.at(-1);
       if (last) return { last };
-      return { none: out.truncated ? 'no output retained' : 'no output' };
+      return out.truncated ? { none: 'no output retained', unread: true } : { none: 'no output' };
     } catch {
-      return { none: 'its output could not be read' };
+      return { none: 'its output could not be read', unread: true };
     }
   }
 
@@ -524,12 +543,22 @@ export class WatchManager {
    * aged on the wall clock, its stream's stamp being the newer one's (the house's read of f3750e4..4f4c067
    * over our fixes, #22).
    */
-  private newestRunOutput(runId: string): { seq?: Seq; age?: number; none?: string } {
+  private newestRunOutput(runId: string): RunNewest {
     let stamp: Stamp | undefined;
     for (const s of Object.values(this.live.get(runId) ?? this.ended.get(runId) ?? {})) if (s && (!stamp || s.seq > stamp.seq)) stamp = s;
     if (stamp) return { seq: stamp.seq, age: Math.max(0, Math.round(clocks.monotonic() - stamp.at)) };
-    const { last, none } = this.lastRunOutput(runId);
-    return last ? { seq: last.seq, age: this.ageOf(last) } : { none: none ?? 'no output' };
+    const read = this.lastRunOutput(runId);
+    return read.last ? { seq: read.last.seq, age: this.ageOf(read.last) } : read;
+  }
+
+  /**
+   * How long a live Run has been quiet, for a silence watch or wait to arm with: its newest output's age; or, with no
+   * stamp and no output the journal can give, admitted before this manager began, the time since the manager began
+   * (see the module comment); or none, when it has printed nothing: it arms on its first output (m2-12).
+   */
+  private quietOf(run: RunInfo, newest: RunNewest): { seq?: Seq; age?: number } {
+    if (newest.age !== undefined || !newest.unread || run.seq.admit > this.began.seq) return newest;
+    return { age: Math.max(0, Math.round(clocks.monotonic() - this.began.at)) };
   }
 
   private onHit(w: WatchRecord, hit: Hit): void {
@@ -696,7 +725,7 @@ export class WatchManager {
         if (gone) return abort(gone);
         const cur = run && (this.host.journal.runs.get(run.runId) ?? run);
         const sessionLast = run ? undefined : lastOutput(this.host.journal);
-        const newest: { seq?: Seq; age?: number; none?: string } = run ? this.newestRunOutput(run.runId) : sessionLast ? { seq: sessionLast.seq, age: this.ageOf(sessionLast) } : {};
+        const newest: RunNewest = run ? this.newestRunOutput(run.runId) : sessionLast ? { seq: sessionLast.seq, age: this.ageOf(sessionLast) } : {};
         if (cur && isTerminal(cur.state)) {
           // A Run that printed nothing has no output to age, and says so as a watch on it does: its quiet was
           // taken from the journal's wall-clock end, so a clock step put any figure there (the house's read
@@ -704,10 +733,12 @@ export class WatchManager {
           const quiet = newest.age !== undefined ? ` no output for ${newest.age}ms` : ` ${newest.none ?? 'no output'}`;
           return finish(result({ matched: true, match: `${endText(cur)};${quiet}`, seq: cur.seq.end ?? this.host.journal.lastSeq }));
         }
-        const age = newest.age ?? 0;
-        if (newest.seq !== undefined && age >= spec.silenceMs!) return finish(result({ matched: true, match: `no output for ${age}ms`, seq: newest.seq }));
+        // The session's quiet is from its last output, or from now; a live Run's is quietOf's.
+        const quiet = run ? this.quietOf(run, newest) : { ...newest, age: newest.age ?? 0 };
+        const age = quiet.age;
+        if (age !== undefined && age >= spec.silenceMs!) return finish(result({ matched: true, match: `no output for ${age}ms`, seq: quiet.seq ?? this.host.journal.lastSeq }));
         // A Run that has printed nothing yet starts the clock at its first output (or its end answers).
-        if (newest.age !== undefined || !run) predicate.armSilence(spec.silenceMs! - age, clocks.monotonic() - age);
+        if (age !== undefined) predicate.armSilence(spec.silenceMs! - age, clocks.monotonic() - age);
       }
       off = this.host.journal.subscribe((ev) => {
         predicate.feed(ev);
