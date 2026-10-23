@@ -153,10 +153,19 @@ const EVALUATING_PID = `"$(exec /bin/sh -c 'echo $PPID')"`;
  * read answered as the declared shell, so the Run ended cancelled and the next Run ran inside the
  * subshell (the house's review of a8b6f28..4860d4c, PR #22, by run with a declared dash). Its child is
  * the declared shell's `/bin/sh`, on that shell's host, which may be a container or another machine:
- * where it has none, the pid prints empty, the answer is no probe mark, and a cancel there cannot end
- * by the probe.
+ * where it has none, the pid prints empty (the error goes to /dev/null), the answer is no probe mark,
+ * and a cancel there cannot end by the probe. bash's restricted mode (rbash, as a jump host may
+ * give) refuses the path and the redirect: it prints its refusal of the redirect and answers with its
+ * own `$$`, so there a subshell answers as the shell, as every one did before the probe named the
+ * evaluating process; with no fallback it printed `exec: restricted` and an empty pid, and its cancel
+ * could not end by the probe (the house's review of 4860d4c..bc4bc85, PR #22, by run in bash 5.2.37).
+ * zsh's restricted mode still does: its refused `exec` ends the substitution before the fallback (by
+ * run in zsh 5.9), as a missing `/bin/sh` does.
  */
-export const inlineProbe = (nonce: string, fish: boolean): string => ` printf '<<<PRO''BE:${nonce}:%s:%s>>>\\n' ${fish ? '$fish_pid "$__tsm_r"' : `${EVALUATING_PID} "$\{__tsm_r-}"`}`;
+export const inlineProbe = (nonce: string, fish: boolean): string => inlineProbeNaming(nonce, fish ? '$fish_pid' : INLINE_PID, fish);
+/** The evaluating process's pid, or where its child cannot start in a restricted shell, the shell's own. */
+const INLINE_PID = `"$(exec /bin/sh -c 'echo $PPID' 2>/dev/null || echo $$)"`;
+const inlineProbeNaming = (nonce: string, pid: string, fish: boolean): string => ` printf '<<<PRO''BE:${nonce}:%s:%s>>>\\n' ${pid} ${fish ? '"$__tsm_r"' : '"${__tsm_r-}"'}`;
 /** Text as one word for a POSIX shell or fish: single-quoted, each quote in it closed, escaped and reopened. */
 export const shellQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 const COMMAND_FILE = 'tsm-cmd-';

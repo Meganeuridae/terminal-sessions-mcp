@@ -317,6 +317,21 @@ test('the cancel probe answers with the token the Run’s line set: a shell that
   }
 });
 
+test('the cancel probe answers in bash’s restricted mode, with the shell’s own pid, where its child cannot start', { skip: !hasShell('/bin/bash') }, () => {
+  // rbash refuses a command name with a slash and an output redirect: the probe printed `exec: restricted` and an empty pid,
+  // so a cancel in a restricted declared shell could not end by the probe (the house's review of 4860d4c..bc4bc85, PR #22).
+  const n = 'abcd1234';
+  let out = '';
+  try {
+    out = execFileSync('/bin/bash', ['-r', '-c', `echo "shell=$$"\n${inlineProbe(n, false).trimStart()}\n`], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+  } catch (e) {
+    out = (e as { stdout?: string }).stdout ?? '';
+  }
+  const m = new RegExp(`^shell=(\\d+)\n<<<PROBE:${n}:(\\d+):>>>\n$`).exec(out);
+  assert.ok(m, JSON.stringify(out));
+  assert.equal(m[2], m[1], 'the restricted shell names itself');
+});
+
 test('a cancel answered by a nested shell leaves the Run running; its result, live and from history, keeps what followed and none of the probes', { skip: !hasShell('/bin/sh') }, async () => {
   const x = await realSession('/bin/bash');
   try {
