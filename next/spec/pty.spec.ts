@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { findBash, groupStillOurs, NodePtyBackend, otherReaderProc, type ProcFs } from '../src/backends/node-pty.js';
+import { findBash, groupStillOurs, NodePtyBackend, otherReaderProc, otherReaderPs, type ProcFs } from '../src/backends/node-pty.js';
 import type { PtyExit } from '../src/backends/types.js';
 import { Journal } from '../src/core/journal.js';
 import { Session } from '../src/core/session.js';
@@ -486,6 +486,45 @@ test('the reader check tells a background job the rc started from a reader, and 
     { name: 'a reader of /dev/tty behind a pipe', rc: `echo | sh -c 'echo $$ >> "$HOME/pids"; exec 3</dev/tty; stty -icanon -echo <&3; echo READY">"; exec dd if=/dev/tty bs=1 count=1 2>/dev/null'\n`, mode: READLINE, reader: true },
   ];
   for (const c of cases) assert.equal(await readerAnswer(c.name, c.rc, c.mode), c.reader, c.name);
+});
+
+const LSOF = (() => {
+  try {
+    return execFileSync('/bin/sh', ['-c', 'command -v lsof'], { encoding: 'utf8' }).trim() !== '';
+  } catch {
+    return false;
+  }
+})();
+
+test('the reader check through ps and lsof finds a reader that holds the terminal only on a descriptor past 255', { skip: !hasShell('/bin/bash') ? 'needs /bin/bash' : !LSOF ? 'needs lsof, which this host lacks' : false }, async () => {
+  // It listed descriptors 0 to 255 alone (`lsof -d 0-255`), where the contract counts any above 2: a reader of the terminal on
+  // descriptor 300, its stdin a pipe, read as no reader, and the reinit gate would have typed into it (the house's review of
+  // 4860d4c..bc4bc85, PR #22, by run with lsof 4.95.0). It runs where lsof is, Linux included, beside the platform's own check.
+  const backend = new NodePtyBackend();
+  const home = fs.mkdtempSync(path.join(tmp, 'reader-300-'));
+  fs.writeFileSync(path.join(home, 'rc'), `echo | /bin/bash -c 'echo $$ >> "$HOME/pids"; exec 300</dev/tty; echo READY">"; read -r -u 300 __x'\n`);
+  const p = backend.spawnShell({ shell: '/bin/bash', args: ['--rcfile', path.join(home, 'rc'), '-i'], cwd: home, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', TERM: 'dumb', HOME: home }, cols: 80, rows: 24 });
+  let out = '';
+  p.onData((d) => (out += d));
+  const exited = new Promise<PtyExit>((r) => p.onExit(r));
+  try {
+    await until(() => out.includes('READY>'), 5000, 'ready');
+    const tty = `/dev/${execFileSync('ps', ['-o', 'tty=', '-p', String(p.pid)], { encoding: 'utf8' }).trim()}`;
+    assert.match(tty, /^\/dev\/\w/, 'the terminal’s name');
+    assert.equal(p.otherReader?.(), true, 'the platform’s own check (the control)');
+    assert.equal(otherReaderPs(p.pid, tty), true, 'through ps and lsof');
+  } finally {
+    p.kill('SIGKILL');
+    await exited;
+    const pids = fs.existsSync(path.join(home, 'pids')) ? fs.readFileSync(path.join(home, 'pids'), 'utf8').split('\n').filter(Boolean) : [];
+    for (const pid of pids) {
+      try {
+        process.kill(Number(pid), 'SIGKILL');
+      } catch {
+        // gone with the terminal
+      }
+    }
+  }
 });
 
 test('a reader whose descriptors its own user cannot read (non-dumpable) makes the real reader check answer unknown, where the same reader dumpable answers true', { skip: process.platform !== 'linux' ? 'needs Linux: prctl(PR_SET_DUMPABLE) and /proc' : !PY3 ? 'needs python3 to call prctl' : !hasShell('/bin/bash') ? 'needs /bin/bash' : false }, async () => {

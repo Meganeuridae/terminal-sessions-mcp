@@ -258,7 +258,8 @@ function holdsForInput(pid: number, tty: string, proc: ProcFs): boolean | undefi
   return false;
 }
 
-function otherReaderPs(pid: number, tty: string): boolean | undefined {
+/** The reader check elsewhere than Linux (see otherReader), through `ps` and `lsof`; exported for its spec. */
+export function otherReaderPs(pid: number, tty: string): boolean | undefined {
   let rows: Array<{ pid: number; pgid: number; tpgid: number }>;
   try {
     rows = execFileSync('ps', ['-t', tty.replace(/^\/dev\//, ''), '-o', 'pid=,pgid=,tpgid='], { encoding: 'utf8', timeout: 2000 })
@@ -277,7 +278,9 @@ function otherReaderPs(pid: number, tty: string): boolean | undefined {
   if (members.length > MAX_INSPECTED) return undefined;
   let out: string;
   try {
-    out = execFileSync('lsof', ['-a', '-p', members.join(','), '-d', '0-255', '-F', 'pfn'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+    // Every descriptor: a reader holds the terminal on any one above 2, and `-d 0-255` passed over one past 255 (the
+    // house's review of 4860d4c..bc4bc85, PR #22, by run with lsof 4.95.0). Those that aren't numbers are skipped below.
+    out = execFileSync('lsof', ['-a', '-p', members.join(','), '-F', 'pfn'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
   } catch (e) {
     // lsof exits 1 when it lists nothing for some pid; what it did list is still on stdout.
     const x = e as NodeJS.ErrnoException & { status?: number | null; stdout?: string };
