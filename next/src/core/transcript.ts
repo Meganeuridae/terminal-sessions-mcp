@@ -1019,16 +1019,19 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
     let truncated = omitted > 0 || pr.lost || pr.out.dropped;
     const kept = keepLines(lines, maxLines, keep, headers);
     if (kept) {
-      // The head's cut of lines dropped what was fed past the last line it kept, in the batch where the limit fell
-      // and, when the range fitted on the screen, in all of it: that input was not projected either. Left out, a
-      // range of a few short lines over `maxLines` reported 0 omitted with `truncated`, which the reader takes for
-      // lost (the house's review of a8b6f28..4860d4c, PR #22, comment 6341260318).
-      if (keep === 'head') {
-        const made = lines.filter((l) => !headers.has(l)).length;
-        omitted += droppedInput(segs, maxLines, stopped, made - kept.filter((l) => !headers.has(l)).length, made);
+      const made = lines.filter((l) => !headers.has(l)).length;
+      const gone = made - kept.filter((l) => !headers.has(l)).length;
+      // A cut that drops headers alone, naming sources that showed nothing (a Run that printed a title or blanks),
+      // drops no line of output: nothing is truncated (an independent read of the fixes for #22).
+      if (gone > 0) {
+        // The head's cut of lines dropped what was fed past the last line it kept, in the batch where the limit fell
+        // and, when the range fitted on the screen, in all of it: that input was not projected either. Left out, a
+        // range of a few short lines over `maxLines` reported 0 omitted with `truncated`, which the reader takes for
+        // lost (the house's review of a8b6f28..4860d4c, PR #22, comment 6341260318).
+        if (keep === 'head') omitted += droppedInput(segs, maxLines, stopped, gone, made);
+        truncated = true;
       }
       lines = kept;
-      truncated = true;
     }
     return { text: lines.join('\n'), truncated, omittedInputBytes: omitted };
   } finally {

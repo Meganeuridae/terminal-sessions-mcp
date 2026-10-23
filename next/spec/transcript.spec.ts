@@ -821,6 +821,18 @@ test('a boundary on the alternate screen, after the cursor moved up, scrolls the
   assert.deepEqual([p.truncated, p.omittedInputBytes], [false, 0]);
 });
 
+test('a cut that drops only headers, naming sources that showed nothing, truncates nothing and omits nothing', async () => {
+  // An independent read of the fixes for #22: a head kept to its maxLines whose only dropped line was the header of a Run that
+  // printed a title alone counted no line of output, so it reported 0 omitted with `truncated`, which the reader takes for
+  // lost; where the line ends matched the lines, it counted the title's bytes as omitted, though they were projected.
+  for (const [data, text] of [['a\r\nb\r\n', '[terminal]\na\nb'], ['a\x1b[1Bb', '[terminal]\na\n b']] as const) {
+    for (const run of ['\x1b]0;title\x07', '   ']) {
+      const p = await project([{ data, stream: 'pty' }, { data: run, stream: 'stdout', runId: 'r1' }], { cols: 80, rows: 24, label: sourceLabel, keep: 'head', maxLines: 2 });
+      assert.deepEqual(p, { text, truncated: false, omittedInputBytes: 0 }, JSON.stringify([data, run]));
+    }
+  }
+});
+
 test('a boundary on the normal screen that scrolls a region not starting at row 1 costs the region a row, and says so; margins from row 1 lose nothing', async () => {
   // The house's review of a8b6f28..4860d4c (PR #22, comment 6341260318): with margins 3–6 and the cursor moved up, the boundary's
   // line end at the region's last row scrolls the region, whose top row has no scrollback, and nothing reported it. The margins
