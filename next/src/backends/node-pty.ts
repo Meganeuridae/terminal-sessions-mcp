@@ -181,11 +181,12 @@ function procStatOf(p: number, proc: ProcFs): ProcStat | 'gone' | undefined {
 
 /**
  * The members of group `pgrp` other than `pid` among its descendants (every process, without children
- * files). Undefined when it cannot be told: past MAX_INSPECTED, or a process whose stat or children
- * cannot be read, which may be a member (another user's `sudo` under hidepid=1, whose directory is
- * listed and whose files are not) — unknown, not absent, as for a member whose descriptors cannot be
- * read (the house's read of the 33 commits, #22 comment 6307351617, item 4). Without children files a
- * hidepid=2 mount lists no other user's process at all: that walk cannot see them.
+ * files). Undefined when it cannot be told: past MAX_INSPECTED descendants (without children files,
+ * past MAX_INSPECTED * 8 processes), or a process whose stat or children cannot be read, which may be a
+ * member (another user's `sudo` under hidepid=1, whose directory is listed and whose files are not) —
+ * unknown, not absent, as for a member whose descriptors cannot be read (the house's read of the 33
+ * commits, #22 comment 6307351617, item 4). Without children files a hidepid=2 mount lists no other
+ * user's process at all: that walk cannot see them.
  */
 function procGroupMembers(pid: number, pgrp: number, proc: ProcFs): number[] | undefined {
   // A process's children; [] when it has exited meanwhile; undefined when they cannot be read.
