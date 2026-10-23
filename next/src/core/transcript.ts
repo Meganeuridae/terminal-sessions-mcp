@@ -78,7 +78,9 @@
  *    lines there, however many newlines it wrote, since only its final frame
  *    projects (rule 5), and the cut never lands inside it. When keeping the
  *    head, projection stops once `maxLines` lines are complete and the rest
- *    counts as omitted, with what was fed past those lines (`droppedInput`).
+ *    counts as omitted, with the input of the lines it dropped (`droppedInput`):
+ *    what was fed past the `maxLines`-th line end when the lines are one per
+ *    line end, and otherwise their share of what was fed, an estimate.
  *    Any omission or dropped line sets `truncated`. Input
  *    omitted from the head still applies the lasting terminal state it set
  *    (modes, the scroll region, character sets: `persistentState` in screen.ts),
@@ -130,7 +132,10 @@ export interface Projection {
   text: string;
   /** True when any input was omitted or any line dropped (G11). */
   truncated: boolean;
-  /** UTF-8 bytes of input not projected. */
+  /**
+   * UTF-8 bytes of input not projected. A head kept to `maxLines` adds the input of the lines it dropped (rule 7,
+   * `droppedInput`): exact when the lines made are one per line end, otherwise their share of what was fed, an estimate.
+   */
   omittedInputBytes: number;
   /**
    * Rows the projection lost after projecting them: scrolled out of its scratch scrollback unread, or taken from a
