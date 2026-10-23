@@ -780,10 +780,12 @@ interface RunWatch {
    * fixes for #22). It holds no partial line back, since a file that never ran, because a program read
    * the line, would have held the program's partial line (a `Password: `) back for the whole Run (the
    * house's review of 4f4c067..a8b6f28, PR #22, comment 6323055715, question 4); but a partial line that
-   * is the echo is left out as a complete one is. bash's readline writes the echo and then its line end,
-   * and the two can reach the daemon in reads of their own (by run in bash 5, 63 of 200 typed lines;
-   * dash's tty echo came whole), so a digest between them showed the daemon's typed line as the Run's
-   * (a reviewer's read of the fixes for #22).
+   * is the echo is left out as a complete one is, once it holds the nonce `runEcho` matches by. bash's
+   * readline writes the echo and then its line end, and the two can reach the daemon in reads of their
+   * own (by run in bash 5, 63 of 200 typed lines; dash's tty echo came whole), so a digest between them
+   * showed the daemon's typed line as the Run's (a reviewer's read of the fixes for #22). A read that
+   * ended inside the echo before its nonce would still show; in 300 typed lines bash's never did (by run,
+   * the first read holding the echo ended past the nonce 31 times; a reviewer's read of the fixes for #22).
    */
   preamble?: { start: RegExp; echo: RegExp } | undefined;
   /**
