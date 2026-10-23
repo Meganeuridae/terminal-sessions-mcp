@@ -12,6 +12,7 @@ import { lineEnds, stripEscapes, unfinishedSequence } from '../src/core/text.js'
 import { journalRunText } from '../src/core/segmenter.js';
 import { scriptedSession } from './fake-shell.js';
 import type { JournalEvent, RunInfo } from '../src/core/types.js';
+import type { RunOutput } from '../src/core/runindex.js';
 import xterm from '@xterm/headless';
 
 const MB = 1024 * 1024;
@@ -933,6 +934,21 @@ test('a row owed stays owed through the same margins set again, and goes when th
   // the alternate screen's region: `n3` is its third row when the region from row 3 scrolls.
   const normalUnder = '\x1b[1;1Hn1\r\nn2\r\nn3\r\nn4\r\nn5\r\nn6\x1b[H';
   assert.deepEqual(await read([`${normalUnder}${altRegion}`, { hole: true }, 'X\r\n']).then((r) => r.slice(1)), [false, 0, undefined], 'text under it on the normal screen');
+});
+
+test('a Run’s text tells rows its projection lost apart from what a cut omitted', async () => {
+  // The house's review of 4860d4c..bc4bc85 (PR #22, I73): a Run's text carried only `truncated`, and its completion
+  // said "earlier output omitted · read … for all of it" for rows a hole's line end scrolled out of a region, which
+  // no read shows (Projection.lost).
+  const region = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6';
+  const output = (data: string, seq: number) => ({ type: 'output' as const, seq, ts: 0, runId: 'r1', stream: 'pty' as const, data });
+  const run = (truncated: boolean): RunOutput => ({ events: [output(region, 1), output('X\r\n', 5)], gaps: [{ from: 1, to: 5 }], from: 1, to: 5, truncated }) as unknown as RunOutput;
+  const lost = await journalRunText(run(false), { cols: 20, rows: 10 });
+  assert.deepEqual([lost.text.split('\n'), lost.truncated, lost.omitted, lost.lost], [['top1', 'top2', 'r5', 'r6', 'X'], true, undefined, true]);
+  const both = await journalRunText(run(true), { cols: 20, rows: 10 });
+  assert.deepEqual([both.truncated, both.omitted, both.lost], [true, true, true], 'a range cut short as well');
+  const budget = await journalRunText(run(false), { cols: 20, rows: 10, maxInputBytes: 10 });
+  assert.deepEqual([budget.truncated, budget.omitted], [true, true], `the projection's own cut: ${JSON.stringify(budget)}`);
 });
 
 test('a head kept to maxLines counts what it dropped as omitted: the lines fed in the batch where the limit falls, the whole rest of a range that fits on the screen, and a share of what made lines with no line end', async () => {

@@ -2934,7 +2934,7 @@ export class Session {
    * Transcript of a Run's output (§6), projected at the width the Run started at (er-4); the daemon's plumbing
    * is cut out. Where the Run's gaps say output was lost, the projection starts afresh (runChunks).
    */
-  async runTranscript(runId: string): Promise<{ text: string; truncated: boolean; seq: [Seq, Seq]; nextCursor: Seq }> {
+  async runTranscript(runId: string): Promise<{ text: string; truncated: boolean; omitted?: true; lost?: true; seq: [Seq, Seq]; nextCursor: Seq }> {
     const run = this.getRun(runId);
     // Results show the tail: only the newest part is read and projected, so a flood renders
     // in bounded time (emu-3, tg-4, er-11), visibly cut.
@@ -2949,7 +2949,9 @@ export class Session {
         : undefined;
     const input = runChunks(events, out.gaps, cut);
     const p = await project(input, { cols: run.cols ?? this.screen.cols, rows: run.rows ?? this.screen.rows, maxInputBytes: TRANSCRIPT_INPUT_CHARS, keep: 'tail' });
-    return { text: p.text, truncated: out.truncated || p.truncated, seq: [out.from, out.to], nextCursor: out.to };
+    // What a cut omitted and the rows the projection lost are told apart, as the Run's completion says them (RunText).
+    const omitted = out.truncated || p.cut === true;
+    return { text: p.text, truncated: out.truncated || p.truncated, ...(omitted ? { omitted } : {}), ...(p.lost ? { lost: p.lost } : {}), seq: [out.from, out.to], nextCursor: out.to };
   }
 
   // ───────────────────────────── terminal capabilities (G8) ─────────────────────────────

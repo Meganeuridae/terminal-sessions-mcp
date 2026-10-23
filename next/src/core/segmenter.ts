@@ -99,7 +99,12 @@ export interface SegmenterOptions {
 
 export interface RunText {
   text: string;
+  /** Some of the output isn't in `text`: a cut omitted it, or rows were lost. */
   truncated: boolean;
+  /** A cut left output out (older output, or input or lines past a limit), which a read of the Run shows. */
+  omitted?: true;
+  /** Rows were lost as the output was rendered (Projection.lost), which no read shows. */
+  lost?: true;
   seq: [Seq, Seq];
   nextCursor: Seq;
 }
@@ -274,7 +279,8 @@ export async function journalRunText(o: RunOutput, how: HistoryRender = {}, run?
       : undefined;
   const chunks = runChunks(events, o.gaps, cut);
   const p = await project(chunks, { cols: run?.cols ?? how.cols ?? DEFAULT_GEOMETRY.cols, rows: run?.rows ?? how.rows ?? DEFAULT_GEOMETRY.rows, maxInputBytes: how.maxInputBytes ?? HISTORY_RUN_INPUT_BYTES, keep: 'tail' });
-  return { text: p.text, truncated: o.truncated || p.truncated, seq: [o.from, o.to], nextCursor: o.to };
+  const omitted = o.truncated || p.cut === true;
+  return { text: p.text, truncated: o.truncated || p.truncated, ...(omitted ? { omitted } : {}), ...(p.lost ? { lost: p.lost } : {}), seq: [o.from, o.to], nextCursor: o.to };
 }
 
 /**
@@ -358,7 +364,9 @@ class Render {
     // These two notes advise a read of the Run's output with the session, which read requires, as well as the Run (an
     // independent read of the fixes for the review of the 40 commits, PR #22). The heads' `read since=…` are deltas
     // inside a head that names its session first, as read's own status line has them.
-    if (cut || t.truncated) body = `[… earlier output omitted · read session=${this.src.id} runId=${ev.runId} for all of it]\n${body}`;
+    if (cut || t.omitted) body = `[… earlier output omitted · read session=${this.src.id} runId=${ev.runId} for all of it]\n${body}`;
+    // Rows the projection lost are in no page or tail either: a read can't give them (Projection.lost).
+    if (t.lost) body = `[… some rows of this output were lost as it was rendered, and no read shows them]\n${body}`;
     if (unreadable !== undefined) body = `[the Run's output could not be read: ${oneLine(unreadable, 160)} · read session=${this.src.id} runId=${ev.runId} to try again]`;
     const status =
       ev.state === 'exited'

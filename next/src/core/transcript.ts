@@ -137,6 +137,8 @@ export interface Projection {
    * `droppedInput`): exact when the lines made are one per line end, otherwise their share of what was fed, an estimate.
    */
   omittedInputBytes: number;
+  /** Input omitted or lines dropped: what a cut left out, which another page or tail shows. `truncated` counts it. */
+  cut?: true;
   /**
    * Rows the projection lost after projecting them: scrolled out of its scratch scrollback unread, or taken from a
    * scroll region by what the program did not write (rule 6, Projector.hookScroll). `truncated` counts them too; unlike
@@ -1125,7 +1127,8 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
       }
     }
     let lines = pr.finish(opts.open === true);
-    let truncated = omitted > 0 || pr.lost || pr.out.dropped;
+    // What a cut left out: input not projected, or lines dropped (Projection.cut).
+    let cut = omitted > 0 || pr.out.dropped;
     const kept = keepLines(lines, maxLines, keep, headers);
     if (kept) {
       // Headers are known by their text, so an output line that reads as one (a `[terminal]` that `tsm read`'s own
@@ -1144,11 +1147,17 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
         // range of a few short lines over `maxLines` reported 0 omitted with `truncated`, which the reader takes for
         // lost (the house's review of a8b6f28..4860d4c, PR #22, comment 6341260318).
         if (keep === 'head') omitted += droppedInput(segs, maxLines, stopped, gone, made);
-        truncated = true;
+        cut = true;
       }
       lines = kept;
     }
-    return { text: lines.join('\n'), truncated, omittedInputBytes: omitted, ...(pr.lost ? { lost: true as const } : {}) };
+    return {
+      text: lines.join('\n'),
+      truncated: cut || pr.lost,
+      omittedInputBytes: omitted,
+      ...(cut ? { cut: true as const } : {}),
+      ...(pr.lost ? { lost: true as const } : {}),
+    };
   } finally {
     pr.dispose();
   }

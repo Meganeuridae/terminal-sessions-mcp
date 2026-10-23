@@ -476,7 +476,7 @@ test('a long output cut to its tail keeps a torn line that is most of the budget
   assert.ok(t3.startsWith('line ') && !t3.includes('…'), 'whole lines when they fill the budget');
   // The Run's message: a transcript the session already cut gets the omission line and says so in its metadata.
   const src = fakeSource();
-  src.runTranscript = async () => ({ text: 'tail only', truncated: true, seq: [1, 2], nextCursor: 2 });
+  src.runTranscript = async () => ({ text: 'tail only', truncated: true, omitted: true, seq: [1, 2], nextCursor: 2 });
   const seg = new Segmenter(src, { runSettleMs: 5 });
   const out = collect(seg);
   startRun(src, 'cut');
@@ -492,6 +492,15 @@ test('a long output cut to its tail keeps a torn line that is most of the budget
   endRun(src, 'json');
   await sleep(60);
   assert.match(out[0]!.body ?? '', /omitted[^\n]*\n…v+"}\n$/);
+  // Rows the projection lost are in no read: the message says so, and no earlier output was omitted (the house's
+  // review of 4860d4c..bc4bc85, PR #22, I73).
+  src.runTranscript = async () => ({ text: 'r5\nr6\nX', truncated: true, lost: true, seq: [1, 2], nextCursor: 2 });
+  out.length = 0;
+  startRun(src, 'lost');
+  endRun(src, 'lost');
+  await sleep(60);
+  assert.match(out[0]!.body ?? '', /^\[… some rows of this output were lost as it was rendered, and no read shows them\]\nr5\nr6\nX$/);
+  assert.equal(out[0]!.metadata.truncated, true);
   seg.dispose();
 });
 
