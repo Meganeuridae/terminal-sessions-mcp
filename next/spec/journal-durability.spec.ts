@@ -1829,7 +1829,27 @@ test('a lowering write refused as the journal closes is said with its mark faile
     j.close();
     assert.ok(cold.calls.at(-1) === 'failed refused', cold.calls.join(' → '));
     const lowered = said.filter((l) => l.startsWith('warn: ') && l.includes('could not be lowered to its last seq (6) as it closed'));
-    assert.equal(lowered.length, 1, said.join(' | '));
+    // The failed mark is on disk from the refused event's append, so the overcount is all there is to say.
+    assert.deepEqual(lowered, ["warn: the journal's reservation could not be lowered to its last seq (6) as it closed: the next start may count seqs above 6 among those lost, though this journal never issued them"], said.join(' | '));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lowering write refused as the journal closes, with its failed mark never on disk, says too that a start on this boot can give numbers twice', () => {
+  const dir = tmpDir();
+  try {
+    const said: string[] = [];
+    const cold = new Flaky(dir);
+    const j = new Journal({ cold, sessionId: 's', log: (level, text) => said.push(`${level}: ${text}`) });
+    for (let i = 0; i < 5; i++) j.append(out(`e${i}`));
+    cold.refuseMarks = true; // from here no mark lands: the failed one the refused event calls for never reaches the disk
+    cold.budget = 0;
+    j.append(out('refused'));
+    j.close();
+    assert.equal(peekReservation(dir)?.failed, undefined, 'no failed mark on disk');
+    const lowered = said.filter((l) => l.startsWith('warn: ') && l.includes('could not be lowered to its last seq (6) as it closed'));
+    assert.deepEqual(lowered, ["warn: the journal's reservation could not be lowered to its last seq (6) as it closed: the next start may count seqs above 6 among those lost, though this journal never issued them; and its failed mark may not be on disk, so a start on this boot can number from the files' last line, giving numbers its readers have already seen"], said.join(' | '));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

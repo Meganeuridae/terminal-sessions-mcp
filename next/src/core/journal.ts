@@ -955,11 +955,16 @@ export class Journal {
       // Exact now: a sealed journal issues no more seqs, so the next journal over the store numbers on from
       // this one's last, and after a power loss records as lost only what the files lost. If the disk
       // refuses this too, the reservation a block ahead stands, which is safe: no seq is given twice. But the
-      // next start then counts seqs this journal never issued among those it may have lost, so that is said,
-      // failed mark or not: one already on disk a block ahead is honoured on any boot.
+      // next start may then count seqs this journal never issued among those it may have lost, so that is said,
+      // failed mark or not: a failed one on disk is honoured on any boot, and an unmarked one on another boot, or
+      // on this one while the files fall short of its block (reservationHonoured). With the mark failed here and
+      // not confirmed on disk, what keepMark says of a refused failed mark holds past the close as well, and
+      // nothing retries the write now, so that is said too. At a close, holes still unrecorded mean the disk
+      // still refuses events: the last catch-up has just run, and a lost stretch leaves `lost` as its gap issues.
       const failed = this.holesUnrecorded();
       if (!this.writeReservation(this.seq, failed)) {
-        this.log?.('warn', `the journal's reservation could not be lowered to its last seq (${this.seq}) as it closed: the next start may count seqs above ${this.seq} among those lost, though this journal never issued them`);
+        const unmarked = failed && !this.reservedFailed ? "; and its failed mark may not be on disk, so a start on this boot can number from the files' last line, giving numbers its readers have already seen" : '';
+        this.log?.('warn', `the journal's reservation could not be lowered to its last seq (${this.seq}) as it closed: the next start may count seqs above ${this.seq} among those lost, though this journal never issued them${unmarked}`);
       }
     }
     this.sealed = true;
