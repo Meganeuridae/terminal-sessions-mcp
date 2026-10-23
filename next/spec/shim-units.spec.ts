@@ -16,7 +16,7 @@ import * as http from 'node:http';
 import * as net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { askDataDir, connectionOf, procAddress, titlePort } from '../src/shim/running.js';
-import { launchctlUnit, plistUnit, procEnviron, systemctlUnit, TERMD_BOOLEAN_FLAGS, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
+import { launchctlUnit, nextStart, plistUnit, procEnviron, systemctlUnit, TERMD_BOOLEAN_FLAGS, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -713,4 +713,43 @@ test("a unit's data dir is resolved from the HOME its environment gives termd, w
   const launchd = launchctlUnit(launchctlPrint({ argv: ['--data-dir', 'rel/d'], env: { HOME: '/srv/l' } }));
   assert.ok(launchd);
   assert.equal(unitDataDir(launchd), '/srv/l/rel/d');
+});
+
+test("a running unit's text that names another port or data dir than its running termd's has changed, though systemd and the files say nothing: its next start is compared too (a reviewer's read of the fixes for #22)", () => {
+  // Read only when a daemon-reload was pending or a file was newer than termd's start, the text was never compared here.
+  const running = { port: '4100', dataDir: '/srv/run' };
+  const read = (argv: string[], manager = 'HOME=/home/a') => {
+    const u = systemctlUnit(execStart(argv), '', { manager });
+    assert.ok(u, 'the ExecStart is read');
+    return u;
+  };
+  // A drop-in that moved termd to port 4100, removed and then reloaded: the text names the unit's own port again,
+  // and no file is newer than termd's start (a file copied with its times kept, or a package's install, reads the same).
+  assert.deepEqual(nextStart(running, read(['--port', '3101', '--data-dir', '/srv/run']), ''), {
+    why: "it names port 3101, which differs from its running termd's port 4100",
+    certain: true,
+    port: '3101',
+    dataDir: '/srv/run',
+  });
+  // A data dir imported into the user manager since termd started (set-environment, import-environment): no file changed.
+  assert.deepEqual(nextStart(running, read(['--port', '4100'], 'HOME=/home/a TSM_DATA_DIR=/srv/imported'), ''), {
+    why: "it names the data dir /srv/imported, which differs from its running termd's /srv/run",
+    certain: true,
+    port: '4100',
+    dataDir: '/srv/imported',
+  });
+  // The text naming what runs says nothing, and neither does one that cannot tell its values or cannot be read.
+  assert.equal(nextStart(running, read(['--port', '4100', '--data-dir', '/srv/run']), ''), undefined);
+  const filed = systemctlUnit(execStart([]), '', { manager: 'HOME=/home/a', files: ['/etc/termd.env (ignore_errors=no)'] });
+  assert.ok(filed);
+  assert.equal(nextStart(running, filed, ''), undefined);
+  assert.equal(nextStart(running, { why: 'systemctl did not answer' }, ''), undefined);
+  // Where systemd or the files say the text may have changed, that reason stands, the text naming what runs or not.
+  assert.deepEqual(nextStart(running, read(['--port', '4100', '--data-dir', '/srv/run']), 'systemd says the unit needs a daemon-reload'), { why: 'systemd says the unit needs a daemon-reload', certain: false, port: '4100', dataDir: '/srv/run' });
+  assert.deepEqual(nextStart(running, { why: 'systemctl did not answer' }, 'systemd says the unit needs a daemon-reload'), {
+    why: 'systemd says the unit needs a daemon-reload',
+    certain: false,
+    port: { unknown: 'could not be read (systemctl did not answer)' },
+    dataDir: { unknown: 'could not be read (systemctl did not answer)' },
+  });
 });

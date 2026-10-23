@@ -77,7 +77,7 @@ import * as readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { askDataDir, titlePort } from './running.js';
-import { launchctlUnit, plistUnit, procEnviron, systemctlUnit, unitDataDir, unitPort, type UnitText, type Unknown } from './units.js';
+import { launchctlUnit, nextStart, plistUnit, procEnviron, sameDir, systemctlUnit, unitDataDir, unitPort, type NextStart, type UnitText, type Unknown } from './units.js';
 
 type Id = string | number;
 interface Parsed {
@@ -240,7 +240,7 @@ function noStartReason(): string | undefined {
  * started: the port and data dir the text now gives, either unknown where the text cannot tell it.
  */
 type Supervisor =
-  | { kind: 'managed'; by: string; port: string; dataDir: string | Unknown; next?: { unit: string; changed: string; port: string | Unknown; dataDir: string | Unknown } }
+  | { kind: 'managed'; by: string; port: string; dataDir: string | Unknown; next?: NextStart & { unit: string } }
   | { kind: 'none' }
   | { kind: 'unknown'; why: string };
 const SUPERVISOR_CHECK_MS = 1500;
@@ -274,18 +274,6 @@ const managed = (by: string, u: UnitText): Supervisor => {
   if (typeof port !== 'string') return { kind: 'unknown', why: `${by} ${port.unknown}, so its port is unknown` };
   return { kind: 'managed', by, port, dataDir: unitDataDir(u) };
 };
-
-/** Whether two paths name one directory: by what they resolve to on disk where they exist, else by their spelling. */
-function sameDir(a: string, b: string): boolean {
-  const real = (p: string) => {
-    try {
-      return fs.realpathSync(p);
-    } catch {
-      return path.resolve(p);
-    }
-  };
-  return real(a) === real(b);
-}
 
 /**
  * The supervisor that manages a termd for this user, if one does, with the port it serves and the
@@ -370,12 +358,11 @@ async function checkSupervisor(): Promise<Supervisor> {
         // and a daemon-reload since this termd started may have moved: a termd started here on that port or
         // data dir collides with that start. Compared with the running termd alone, it was started (the
         // house's review of a8b6f28..4860d4c, #22 comment 6341260318, question 4).
-        const changed = unitChanged(pid, prop);
-        if (!changed) return sup;
+        // The text is read whatever systemd and the files say, since one that differs from what runs has changed
+        // (see nextStart): one more query of the manager, cached with the rest.
         const text = await managerUnit(r, prop);
-        const unread = (why: string): Unknown => ({ unknown: `could not be read (${why})` });
-        const read = 'why' in text ? { port: unread(text.why), dataDir: unread(text.why) } : { port: unitPort(text.unit), dataDir: unitDataDir(text.unit) };
-        return { ...sup, next: { unit: 'the systemd user unit termd', changed, ...read } };
+        const next = nextStart(sup, 'unit' in text ? text.unit : text, unitChanged(pid, prop));
+        return next ? { ...sup, next: { unit: 'the systemd user unit termd', ...next } } : sup;
       }
       const changed = unitChanged(pid, prop);
       notAsked = `; its running termd could not be asked: ${told.error}${changed ? `; the unit's text may have changed since that termd started: ${changed}` : ''}`;
@@ -846,7 +833,7 @@ async function startDaemon(): Promise<void> {
       // checkSupervisor): a collision with it is refused as one with the running termd is, and said as its.
       const next = sup.next;
       if (next) {
-        const text = `${next.unit}'s text, which may have changed since its running termd started (${next.changed}),`;
+        const text = `${next.unit}'s text, which ${next.certain ? 'has' : 'may have'} changed since its running termd started (${next.why}),`;
         if (typeof next.port !== 'string') {
           noteNotStarted(`${text} ${next.port.unknown}, so the port its next start takes is unknown: none is started here, as it may be ${port} (TSM_NO_SPAWN=1 skips the check)`);
           return;

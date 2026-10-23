@@ -433,3 +433,46 @@ export function plistUnit(file: string): UnitText | { error: string } {
   for (const m of dict.matchAll(/<key>([^<]*)<\/key>\s*(?:<string>([\s\S]*?)<\/string>|<string\s*\/>)/g)) env[text(m[1]!)] = text(m[2] ?? '');
   return throughEnv({ argv, env });
 }
+
+/** Whether two paths name one directory: by what they resolve to on disk where they exist, else by their spelling. */
+export function sameDir(a: string, b: string): boolean {
+  const real = (p: string) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  return real(a) === real(b);
+}
+
+/**
+ * What a unit's next start takes beside its running termd, to be compared with a start here as the running
+ * termd's port and data dir are: the port and data dir the unit's text gives now, and why the text is taken
+ * for one that may differ from what the running termd was started with. `changed` is what systemd or the
+ * files say (a daemon-reload pending, a unit file or drop-in newer than the termd's start); without it, a
+ * text that names another port or data dir than the running termd's has changed all the same, and says so
+ * (`certain`). Read only on that evidence, a drop-in removed and then reloaded, or a text changed with no
+ * newer file (a file copied with its times kept, a package's install, a manager environment set or imported
+ * since), left the text unread, and a start here went ahead into the collision the unit's next start would
+ * meet (a reviewer's read of the fixes for #22). Undefined when nothing says the text differs: no evidence,
+ * and the text names what runs, or cannot tell it, or cannot be read.
+ */
+export function nextStart(running: { port: string; dataDir: string }, text: UnitText | { why: string }, changed: string): NextStart | undefined {
+  if ('why' in text) return changed ? { why: changed, certain: false, port: { unknown: `could not be read (${text.why})` }, dataDir: { unknown: `could not be read (${text.why})` } } : undefined;
+  const port = unitPort(text);
+  const dataDir = unitDataDir(text);
+  if (changed) return { why: changed, certain: false, port, dataDir };
+  if (typeof port === 'string' && port !== running.port) return { why: `it names port ${port}, which differs from its running termd's port ${running.port}`, certain: true, port, dataDir };
+  if (typeof dataDir === 'string' && !sameDir(dataDir, running.dataDir)) return { why: `it names the data dir ${dataDir}, which differs from its running termd's ${running.dataDir}`, certain: true, port, dataDir };
+  return undefined;
+}
+
+/** See nextStart: the port and data dir a unit's next start takes, each unknown where the text cannot tell it. */
+export interface NextStart {
+  why: string;
+  /** The text is known to differ from what the running termd was started with, not only said to have possibly changed. */
+  certain: boolean;
+  port: string | Unknown;
+  dataDir: string | Unknown;
+}
