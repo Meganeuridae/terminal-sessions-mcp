@@ -1129,19 +1129,64 @@ test('a guard owner whose pid another process has now is gone by its record, and
   }
 });
 
-test('with no guard standing when the attempts run out, the refusal says what the last one met: a termd.lock with no whole record, still young, is no termd starting', () => {
-  // An empty termd.lock dated ahead, so it stays young through every attempt: as an older build's start between
-  // its create and its write leaves it, or a crash there. No guard is ever made, since the attempts wait it out.
-  const dir = dataDir();
+test('with no guard standing when the attempts run out, the refusal says what the last one met: a termd.lock with no whole record, still young or dated ahead of the clock, is no termd starting, and its advice quotes the lock\'s path', (t) => {
+  // An empty termd.lock, as an older build's start between its create and its write leaves it, or a crash there.
+  // No guard is ever made, since the attempts wait it out. Dated ahead of this host's clock (a clock stepped back
+  // since it was written), it is never old by the wall clock, and the refusal says why it waited.
+  const dir = path.join(dataDir(), "it's my data");
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, LOCK_FILE);
   fs.writeFileSync(file, '');
   const ahead = new Date(Date.now() + 60_000);
   fs.utimesSync(file, ahead, ahead);
+  const quoted = `'${file.replace("it's", "it'\\''s")}'`;
   const e = refusal(dir);
-  assert.ok(e.message.includes(`in use by a ${LOCK_FILE} with no whole record, under 2 s old by its mtime; one daemon per data dir (remove ${file} only if no termd is running)`), e.message);
+  assert.ok(e.message.includes(`in use by a ${LOCK_FILE} with no whole record, its mtime ahead of this host's clock; one daemon per data dir (remove ${quoted} only if no termd is running)`), e.message);
   assert.equal(e.data?.['guard'], undefined, 'no guard in the details');
   assert.equal(fs.readFileSync(file, 'utf8'), '', 'the lock is untouched');
+  // Young by the clock: the clock held half a second past its mtime through every attempt, so load doesn't age it.
+  const now = new Date();
+  fs.utimesSync(file, now, now);
+  const mtime = fs.statSync(file).mtimeMs;
+  t.mock.method(Date, 'now', () => mtime + 500);
+  const young = refusal(dir);
+  assert.ok(young.message.includes(`in use by a ${LOCK_FILE} with no whole record, under 2 s old by its mtime; one daemon per data dir (remove ${quoted} only if no termd is running)`), young.message);
+});
+
+test('the refusal at a guard names an owner entry with no whole record, and one gone between the listing and its read, as such', () => {
+  // An owner's file with nothing in it yet, still young (dated ahead, so load can't age it): kept by the breaker,
+  // and said as having no whole record.
+  const dir = dataDir();
+  staleLock(dir);
+  const guard = guardOf(dir);
+  fs.mkdirSync(guard);
+  const blank = path.join(guard, '999999.6666666666666666');
+  fs.writeFileSync(blank, '');
+  const ahead = new Date(Date.now() + 60_000);
+  fs.utimesSync(blank, ahead, ahead);
+  const empty = refusal(dir);
+  assert.ok(empty.message.includes(`in use by a takeover guard, ${guard}, holding pid 999999 (no whole record);`), empty.message);
+  // An owner whose file is gone when the refusal reads it, though the listing named it.
+  const gone = path.join(guard, '999999.7777777777777777');
+  fs.writeFileSync(gone, '');
+  let thrown: unknown;
+  patching(
+    'readFileSync',
+    (real) =>
+      ((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+        if (String(p) === gone) throw Object.assign(new Error(`ENOENT: no such file or directory, open '${gone}'`), { code: 'ENOENT' });
+        return (real as (...a: unknown[]) => unknown)(p, ...rest);
+      }) as typeof fs.readFileSync,
+    () => {
+      try {
+        acquireDataDirLock(dir);
+      } catch (e) {
+        thrown = e;
+      }
+    },
+  );
+  assert.equal(code(thrown), 'data_dir_locked', String(thrown));
+  assert.ok((thrown as TermError).message.includes('pid 999999 (gone meanwhile)'), (thrown as TermError).message);
 });
 
 test('an owner file the disk refuses fails the start with that error and takes the attempt\'s temp and guard with it', () => {
