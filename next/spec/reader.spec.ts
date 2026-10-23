@@ -289,6 +289,69 @@ test('6357989601: a projection says how its last line stands for the range that 
   assert.equal((await project(['a\r\nb\r\nc'], { ...opts, maxLines: 2 })).lastLine, undefined);
 });
 
+test('6357989601: a page whose last line an erase or a CR ended does not say it goes on, and the pages join as the terminal showed them', async () => {
+  // The house's shape: a cursor move to the last row, then 400 events of `\rx<i>` and an erase of the display. By the
+  // stream the whole range is one line; the erases make a line of each x<i> (transcript rule 4), and on a terminal x352
+  // stays on its row. Cut after `\rx352`, before its erase, a page said its last line went on, and the pages joined read
+  // `x352x353`.
+  const src = source();
+  out(src.journal, '\x1b[24;1H');
+  for (let i = 0; i < 400; i++) out(src.journal, `\rx${i}\x1b[2J`);
+  const { text, pages } = await readAll(src, { since: 0, maxBytes: 1024 });
+  assert.deepEqual(text.split('\n').filter((l) => l !== ''), Array.from({ length: 400 }, (_, i) => `x${i}`));
+  assert.ok(pages.length > 2, `${pages.length} pages`);
+  for (let k = 1; k < pages.length; k++) {
+    const [a, b] = [pages[k - 1]!, pages[k]!];
+    const last = a.text!.split('\n').at(-1)!;
+    const first = b.text!.split('\n')[0]!;
+    assert.equal(a.more, true);
+    // A page cut inside x<i> says its line goes on, and the next page's first line completes it; one cut where an erase
+    // or a CR ended the line does not, and shows that line whole.
+    if (a.splitLine) assert.match(last + first, /^x\d+$/, `page ${k}: ${JSON.stringify([last, first])}`);
+    else assert.ok(/^x\d+$/.test(last) && /^x\d+$/.test(first), `page ${k}: ${JSON.stringify([last, first])}`);
+  }
+  assert.ok(pages.slice(0, -1).some((p) => p.splitLine), 'some page is cut inside a line');
+  assert.ok(pages.slice(0, -1).some((p) => !p.splitLine), 'some page ends where an erase ended its line');
+  assert.equal(pages.at(-1)!.splitLine, undefined, 'live, but the last erase ended the line: nothing goes on with it');
+  assert.ok(!pages.at(-1)!.text!.endsWith('\n'), 'the row the erase left the cursor on is no line');
+});
+
+test('6357989601: a page cut before a CR that text follows does not say its line goes on: the pages show each overwrite as a line of its own', async () => {
+  // Events of eight bytes, `\rL<6 digits>`, each written over the last: the smallest page holds 128 of them exactly, so
+  // the budget's cut falls where the next event's CR begins. Cut before the CR, a page ended with the cursor past its
+  // line's end and said the line went on, and the next page's first overwrite was glued onto it.
+  const src = source();
+  for (let i = 0; i < 300; i++) out(src.journal, `\rL${String(i).padStart(6, '0')}`);
+  const { text, pages } = await readAll(src, { since: 0, maxBytes: 1024 });
+  assert.ok(pages.length >= 3, `${pages.length} pages`);
+  assert.ok(text.split('\n').every((l) => /^L\d{6}$/.test(l)), text);
+  assert.ok(pages.slice(0, -1).every((p) => p.splitLine === undefined && p.nextOffset === 1), 'each page carries the CR that returns the cursor over its line, and says the line does not go on');
+  assert.equal(pages.at(-1)!.splitLine, true, 'the live range’s last overwrite may go on');
+});
+
+test('6357989601: a live page ending with a CR may be continued by the LF of a CRLF, and says so', async () => {
+  const src = source();
+  out(src.journal, 'first\r');
+  const a = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
+  assert.equal(a.text, 'first');
+  assert.equal(a.splitLine, true, 'nothing follows yet: the LF of a CRLF may');
+  out(src.journal, '\nsecond\r\n');
+  const b = await readJournal(src, { since: a.nextCursor }, { resultBytes: 16384 });
+  assert.equal(a.text + (a.splitLine ? '' : '\n') + b.text, 'first\nsecond');
+});
+
+test('6357989601: a page cut inside a line that goes on, through the control sequences at the cut, still says so, and the pages join without a line end', async () => {
+  // Twelve-byte events `AB ESC[1m CD ESC[0m`: the smallest page's budget falls inside the 86th event's first sequence,
+  // the cut moves before it, and the sequence is carried into the page, whose cursor still stands past `B`.
+  const src = source();
+  for (let i = 0; i < 300; i++) out(src.journal, 'AB\x1b[1mCD\x1b[0m');
+  const { text, pages } = await readAll(src, { since: 0, maxBytes: 1024 });
+  assert.equal(text, 'ABCD'.repeat(300));
+  assert.ok(pages.length >= 3, `${pages.length} pages`);
+  assert.ok(pages.every((p) => p.splitLine === true), 'every page is cut inside the line, which goes on; the live range’s last line may too');
+  assert.equal(pages[0]!.nextOffset, 6, 'the first page ends after `AB ESC[1m`: the sequence at its cut went into the page');
+});
+
 // ───────────── er-13 / atc-16 / ux-21: tail ─────────────
 
 test('er-13 / atc-16: tail with runId gives the last lines of that Run', async () => {

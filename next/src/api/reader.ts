@@ -15,8 +15,9 @@
  *   `maxBytes`. When the budget cuts a page it ends at a line end in the second
  *   half of the budget: after a whole event that completes a line (the cursor
  *   stays a seq), else inside an event (`nextOffset`); else, for a line longer
- *   than the rest of the page, at the budget (mid-line: `splitLine`); else at
- *   an earlier line end. A cut is never inside a character, a control sequence
+ *   than the rest of the page, at the budget, mid-line, with the carriage returns
+ *   and control sequences right after the cut carried into the page
+ *   (throughLineEnd); else at an earlier line end. A cut is never inside a character, a control sequence
  *   or a CRLF: a sequence longer than a page is taken whole (a control string
  *   longer than OPEN_SEQUENCE_BYTES past the page is the one exception), and a
  *   live page that ends inside one stops before it. A hole ends any sequence
@@ -35,8 +36,22 @@
  *   cancel's probe lines) is cut by the core's cutter, and the cursors and
  *   `lines.before` are journal positions still (runKept). A read of the
  *   session shows everything, as the terminal did.
- * - `splitLine` is set whenever the page ends mid-line and the line may go on:
- *   more follows, or the range is still open (a running Run, a live session).
+ * - `splitLine` says the next page's first line goes on with this page's last
+ *   one, by the projection's lines, not the stream's line ends: the page's own
+ *   projection ends with the cursor on its last line past its start
+ *   (Projection.lastLine `unfinished`), and output may follow (more remains, or
+ *   the range is still open: a running Run, a live session). It is not set when
+ *   the next page begins a line of its own: what followed the cut, carried into
+ *   the page, ended the line (an erase of the display, a line end a sequence
+ *   executed) or took the cursor back to its start (a CR, which the text after
+ *   it writes over; the pages show that text as a line of its own). By the
+ *   stream, a range of `\rx<i>` and an erase per event is one line, and a page
+ *   cut before an erase said its `x352` went on, so pages joined by `splitLine`
+ *   read `x352x353` (the house's review of 4860d4c..bc4bc85, PR #22, comment
+ *   6357989601). A page that took every event of a live range and ends with a
+ *   CR may be continued by the LF of a CRLF, and says so. The controls are
+ *   carried up to CARRY_CONTROLS past the cut; a longer run is left to the
+ *   next page, and this page answers for what it holds, as if text followed.
  * - `more` is true whenever retained events of the range remain after the page.
  * - The projection (§6) runs at the session's geometry, and a Run's at the
  *   geometry it started with. A page starts in the lasting terminal state the
@@ -146,7 +161,7 @@ export interface ReadResult {
   gaps?: GapInfo[];
   /** True when text was cut to fit, or lost to the scratch emulator (tail reads keep the end). */
   truncated: boolean;
-  /** The page ends mid-line: the next page's first line continues this page's last one. */
+  /** The next page's first line goes on with this page's last one (join them without a line end): the projection's cursor stood on that line past its start when the page ended, and output may follow (the module comment). */
   splitLine?: boolean;
   oldestSeq?: Seq;
   /**
@@ -660,7 +675,11 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     truncated: p.lost || p.omitted > 0,
   };
   if (nextOffset !== undefined) r.nextOffset = nextOffset;
-  if (chosen.midLine && (more || open)) r.splitLine = true;
+  // The next page goes on with this page's last line when the page's own projection ends with the cursor on that line
+  // past its start, and output may follow (the module comment). A line a CR returned the cursor over is written over
+  // by the text that follows, which the pages show as a line of its own; when nothing follows yet, the LF of a CRLF may.
+  const goesOn = p.lastLine === 'unfinished' || (p.lastLine === 'returned' && allTaken);
+  if (goesOn && (more || open)) r.splitLine = true;
   return withGapInfo(r, metHoles(journal, r.seq[0], r.seq[1], chosen.gaps));
 }
 
@@ -788,8 +807,6 @@ interface Chosen {
   /** The page ends inside event `nextSeq`, after `nextOffset` of its bytes. */
   nextSeq?: Seq;
   nextOffset?: number;
-  /** The page ends mid-line (for some source). */
-  midLine: boolean;
   /** The page stops before an unfinished control sequence at the range's end. */
   held: boolean;
 }
@@ -845,27 +862,39 @@ function sourceForward(pieces: Piece[], j: number): { text: string; locate(i: nu
   return joined(segs, { j: last.j, at: last.data.length });
 }
 
+/** How far past a mid-line cut what shows nothing is read on and carried into the page (throughLineEnd), in UTF-16 units; a sequence begun within it is taken whole. */
+const CARRY_CONTROLS = 64 * 1024;
+
 /**
- * A mid-line cut where the rest of the line shows nothing (blanks, carriage
- * returns, control sequences) moves past the line's end: the line stays whole,
- * so its trailing whitespace trims as it would unsplit (§6 rule 3).
+ * Where a mid-line cut ends. What follows the cut and shows nothing (blanks, carriage returns, control sequences) is
+ * read on, up to CARRY_CONTROLS: to the line end when one follows, so the line stays whole and its trailing whitespace
+ * trims as it would unsplit (§6 rule 3); else past the last carriage return or sequence read, so the page's own
+ * projection holds what ended its last line or took the cursor back over it, and says whether the next page goes on
+ * with it (Projection.lastLine). Cut before them, a page ended `x352` with its erase, or its CR, left to the next page,
+ * whose `x353` was then read as going on with it (the house's review of 4860d4c..bc4bc85, PR #22, comment
+ * 6357989601). A run of controls longer than the bound, or a sequence left unfinished, is read as far as it goes, and
+ * the page answers for what it holds. Blanks are not carried on their own: text follows them.
  */
 function throughLineEnd(pieces: Piece[], pos: Pos): Pos {
   if (pieces[pos.j]?.kind !== 'out') return pos;
   const fwd = sourceForward(pieces, pos.j);
   const d = fwd.text;
-  const limit = Math.min(d.length, pos.at + 64 * 1024);
+  const limit = Math.min(d.length, pos.at + CARRY_CONTROLS);
   let i = pos.at;
+  /** Past the last carriage return or control sequence read. */
+  let controls = pos.at;
   while (i < limit) {
     const c = d.charCodeAt(i);
-    if (c === 0x20 || c === 0x09 || c === 0x0d) i++;
+    if (c === 0x20 || c === 0x09) i++;
+    else if (c === 0x0d) controls = ++i;
     else if (isIntroducer(c)) {
       const e = sequenceEnd(d, i);
-      if (e === undefined) return pos;
-      i = e;
+      if (e === undefined) break;
+      controls = i = e;
     } else break;
   }
-  return d[i] === '\n' ? fwd.locate(i + 1) : pos;
+  if (d[i] === '\n') return fwd.locate(i + 1);
+  return controls > pos.at ? fwd.locate(controls) : pos;
 }
 
 /**
@@ -994,30 +1023,22 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
   const taken = pieces.slice(0, end);
   if (partial) taken.push(partial);
   const chunks: ProjectChunk[] = [];
-  /** Per source: whether a line ended in what it took, and its data after its last line end. */
-  const lastBySource = new Map<string, { ended: boolean; tail: string }>();
   const sources = new Set<string>();
-  const c: Chosen = { chunks, labelled: false, inputBytes: 0, taken: end, gaps: [], midLine: false, held };
+  const c: Chosen = { chunks, labelled: false, inputBytes: 0, taken: end, gaps: [], held };
   for (const pc of taken) {
     if (pc.kind === 'gap') {
       chunks.push({ note: gapNote(pc.gap) });
       c.gaps.push(pc.gap);
       if (!pc.atStart) c.lastSeq = pc.seq;
-      lastBySource.clear(); // a hole ends every line
       continue;
     }
     chunks.push(chunkOf(pc.ev, pc.kept ? pc.kept.map(([a, b]) => pc.data.slice(a, b)).join('') : pc.data));
-    const key = sourceKey(pc.ev);
-    sources.add(key);
-    const prior = lastBySource.get(key);
-    const lastEnd = pc.ends[pc.ends.length - 1];
-    lastBySource.set(key, lastEnd !== undefined ? { ended: true, tail: pc.data.slice(lastEnd + 1) } : { ended: prior?.ended ?? false, tail: (prior?.tail ?? '') + pc.data });
+    sources.add(sourceKey(pc.ev));
     c.firstSeq ??= pc.ev.seq;
     c.lastSeq = pc.ev.seq;
     c.inputBytes += pc.bytes;
   }
   c.labelled = sources.size > 1;
-  c.midLine = [...lastBySource.values()].some((d) => !d.ended || !onlyControls(d.tail));
   // The page ends inside an event: in the part it took, or where the first piece began (a page that took
   // nothing of the event it was continuing keeps the offset it was given).
   const rest = partial ?? (pieces[end]?.kind === 'out' && (pieces[end] as OutPiece).start > 0 ? { ...(pieces[end] as OutPiece), bytes: 0 } : undefined);
@@ -1037,18 +1058,6 @@ function lastEndBefore(ends: readonly number[], before: number): number {
 /** The piece ends with a line end. */
 const endsWithLine = (pc: OutPiece | undefined): boolean => pc !== undefined && pc.ends[pc.ends.length - 1] === pc.data.length - 1;
 
-/** `d`, what follows a line's end, holds only carriage returns and control sequences: the line has ended. */
-function onlyControls(d: string): boolean {
-  let i = 0;
-  while (i < d.length) {
-    const c = d.charCodeAt(i);
-    const e = c === 0x0d ? i + 1 : isIntroducer(c) ? sequenceEnd(d, i) : undefined;
-    if (e === undefined) return false;
-    i = e;
-  }
-  return true;
-}
-
 async function projectPage(chosen: Chosen, geometry: { cols: number; rows: number }, maxBytes: number, continued: boolean, state = '', first?: OutPiece) {
   // maxLines never binds before the byte budget does: every line costs at least its LF.
   const opts: Parameters<typeof project>[1] = { cols: geometry.cols, rows: geometry.rows, keep: 'head', maxLines: maxBytes + 2 };
@@ -1060,7 +1069,7 @@ async function projectPage(chosen: Chosen, geometry: { cols: number; rows: numbe
   const p = await project(chunks, opts);
   const textBytes = utf8Length(p.text);
   // `omittedInputBytes` can only come from maxLines here: the text is over budget by then.
-  return { text: p.text, textBytes, over: textBytes > maxBytes, omitted: p.omittedInputBytes, lost: p.lost === true };
+  return { text: p.text, textBytes, over: textBytes > maxBytes, omitted: p.omittedInputBytes, lost: p.lost === true, lastLine: p.lastLine };
 }
 
 /** Output bytes looked back over for the lasting state a page starts in. */
