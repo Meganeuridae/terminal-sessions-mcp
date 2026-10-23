@@ -18,6 +18,19 @@
  * timeout, then a fail line), since what clears the verdict changes with it.
  * Further fail-pattern lines while already unhealthy for that reason update the
  * evidence and a repeat count on the monitor, not the journal (m2-16).
+ *
+ * A pattern matches a line as a read shows it, a process Run's stdout and stderr as one source, or as its own pipe
+ * wrote it (m2-21). A line both readings hold is one line, matched once, by two rules side by side:
+ * - Completed lines pair by the line end that completes both. A LF is one pipe's, so it completes at most one line of
+ *   each reading: stdout's `ERROR a`, then `ERROR b` and a LF on stderr, then stdout's LF, are two lines, the read's
+ *   `ERROR aERROR b` with stderr's `ERROR b`, and stdout's `ERROR a`.
+ * - A quiet prompt pairs with the other reading's line that began where it did, whether that line is still open or
+ *   already ended when the prompt is offered: stderr's `Password: ` that stdout's LF ended in the read counts once. So
+ *   stdout's `ERROR a`, left quiet before its LF, is a prompt begun where the read's `ERROR aERROR b` began, and the
+ *   first rule's two lines are one (the house's review of a8b6f28..4860d4c, #22, comment 6341260318, question 6).
+ * A prompt that matched is spent: the rest of its line is not matched again, in either reading, and a line the other
+ * pipe ends at that line's end is matched on its own (stdout's `ERROR a` matched quiet, then `ERROR b` and a LF on
+ * stderr, are two matches).
  */
 import { compileLinePattern, LineSplitter, type Begun, type SplitLine } from './ansi.js';
 import { headOnlyText, testBounded } from './regex.js';
@@ -71,6 +84,15 @@ type Condition = 'pattern' | 'tcp' | 'alive';
 /** A place in a Run's output (where a line began or ended: SplitLine.begun, .ended), as a key; the line's text when it has none. */
 const placeOf = (p: Begun | undefined, line: SplitLine): string => (p ? `${p.at}:${p.offset}` : `?${line.text}`);
 
+/** A line the other reading may hold too (ServiceMonitor.prompted, .completed): where it began, and whether it matched. */
+interface Twin {
+  at: Begun | undefined;
+  matched: boolean;
+}
+
+/** Two places in a Run's output are one: the same event, and the same bytes into it. */
+const samePlace = (a: Begun | undefined, b: Begun): boolean => a !== undefined && a.at === b.at && a.offset === b.offset;
+
 /** Lines in the order their ends came: by event, then by offset in it; a line with no end after those with one. */
 const endOrder = (a: Begun | undefined, b: Begun | undefined): number => (a && b ? a.at - b.at || a.offset - b.offset : a ? -1 : b ? 1 : 0);
 
@@ -111,9 +133,15 @@ export class ServiceMonitor {
   /**
    * The quiet prompts tested, by where each began (placeOf), and whether one matched: a prompt and its twin, the
    * other reading's line that began at the same place, are one line, matched once. Kept while a reading holds the line
-   * open (prunePrompts).
+   * open (pruneTwins).
    */
-  private readonly prompted = new Map<string, boolean>();
+  private readonly prompted = new Map<string, Twin>();
+  /**
+   * The completed lines another reading still holds a line open beside, begun at the same place (placeOf), and whether
+   * one matched: a quiet prompt that reading offers later is their twin, matched once with them (once). Kept while a
+   * reading holds the line open (pruneTwins), so at most one a reading.
+   */
+  private readonly completed = new Map<string, Twin>();
   /** A fail-pattern line was seen and no ready-pattern line since. */
   private failed = false;
   private started = false;
@@ -235,8 +263,13 @@ export class ServiceMonitor {
       });
       for (const line of twins.values()) lines.push([line]);
       lines.sort((x, y) => endOrder(x[0]!.ended, y[0]!.ended));
-      for (const texts of lines) this.onLines(texts);
-      this.prunePrompts();
+      for (const texts of lines) {
+        const matched = this.onLines(texts);
+        // A line the other reading holds open from where it began (stderr's `Password: `, the read's ended at stdout's
+        // LF) is that reading's prompt's twin.
+        for (const line of texts) if (line.begun && this.heldOpen(line.begun)) this.completed.set(placeOf(line.begun, line), { at: line.begun, matched });
+      }
+      this.pruneTwins();
     } else if (ev.type === 'run.start' && ev.runId === this.runId) {
       this.onStarted();
     } else if (ev.type === 'run.end' && ev.runId === this.runId) {
@@ -259,11 +292,11 @@ export class ServiceMonitor {
 
   /**
    * A completed line, as one reading or both wrote it (`texts`, the pipe's first): matched unless it is a quiet prompt
-   * already matched, whose reading spent it while the other's went on to complete it.
+   * already matched, whose reading spent it while the other's went on to complete it. True when it matched, then or now.
    */
-  private onLines(texts: SplitLine[]): void {
-    if (texts.some((line) => this.prompted.get(placeOf(line.begun, line)))) return;
-    this.onLine(...texts);
+  private onLines(texts: SplitLine[]): boolean {
+    if (texts.some((line) => this.prompted.get(placeOf(line.begun, line))?.matched)) return true;
+    return this.onLine(...texts);
   }
 
   /**
@@ -271,25 +304,34 @@ export class ServiceMonitor {
    * both texts at once (the pipe's first), as a completed pair is, and matched once. Taken alone, the first offer's
    * verdict stood for its twin's different text: stderr's `Password: ` was never tested when the read's `Passxword: `
    * had failed. Told apart by the seq each reading was last fed, one prompt counted twice when the other pipe wrote in
-   * between (our review of the 73 commits through 4860d4c, PR #22).
+   * between (our review of the 73 commits through 4860d4c, PR #22). A twin the other reading has already ended was
+   * matched as a completed line: when it matched, the prompt is spent with it, and otherwise the prompt's own text is
+   * tried. Paired only with an open twin, stderr's `Password: ` matched again after the read had matched it, ended at
+   * stdout's LF (the house's review of a8b6f28..4860d4c, #22, comment 6341260318, question 6).
    */
   private once(r: Reading, line: SplitLine): boolean {
     const at = placeOf(line.begun, line);
-    if (this.prompted.get(at)) return true;
-    const twin = this.readings().find((o) => o !== r && placeOf(o.splitter.peek()?.begun, line) === at)?.splitter.peek();
+    if (this.prompted.get(at)?.matched || this.completed.get(at)?.matched) {
+      this.prompted.set(at, { at: line.begun, matched: true });
+      return true;
+    }
+    const twin = this.readings().find((o) => o !== r && line.begun && samePlace(o.splitter.opened(), line.begun))?.splitter.peek();
     const matched = twin ? (r.pipe !== undefined ? this.onLine(line, twin) : this.onLine(twin, line)) : this.onLine(line);
-    this.prompted.set(at, matched);
+    this.prompted.set(at, { at: line.begun, matched });
     return matched;
   }
 
-  /** A prompt's entry goes once no reading holds its line open. */
-  private prunePrompts(): void {
-    if (this.prompted.size === 0) return;
-    const open = new Set(this.readings().flatMap((o) => {
-      const line = o.splitter.peek();
-      return line?.begun ? [placeOf(line.begun, line)] : [];
-    }));
-    for (const at of this.prompted.keys()) if (!open.has(at)) this.prompted.delete(at);
+  /** Whether a reading holds open a line that began at `p`: read where it began, without building its text. */
+  private heldOpen(p: Begun): boolean {
+    if (this.lines && samePlace(this.lines.splitter.opened(), p)) return true;
+    for (const o of this.pipes.values()) if (samePlace(o.splitter.opened(), p)) return true;
+    return false;
+  }
+
+  /** A prompt's entry, or a completed line's, goes once no reading holds its line open. */
+  private pruneTwins(): void {
+    if (this.prompted.size === 0 && this.completed.size === 0) return;
+    for (const twins of [this.prompted, this.completed]) for (const [key, t] of twins) if (!t.at || !this.heldOpen(t.at)) twins.delete(key);
   }
 
   private readings(): Reading[] {
@@ -476,6 +518,7 @@ export class ServiceMonitor {
     this.lines = undefined;
     this.pipes.clear();
     this.prompted.clear();
+    this.completed.clear();
   }
 
   private setStatus(status: ServiceStatus, evidence: string, cause?: UnhealthyCause): void {

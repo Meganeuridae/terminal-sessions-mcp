@@ -272,6 +272,50 @@ test('a quiet prompt both readings hold is counted once, however the readings we
   n.dispose();
 });
 
+test('a quiet prompt pairs with the other reading\'s line begun where it did, open or already ended; lines both readings complete still pair by the line end (the house\'s review of a8b6f28..4860d4c, PR #22, comment 6341260318, question 6)', async (t) => {
+  /** The monitor's offers of a quiet prompt, from any reading: what a negative check waits for, in place of a sleep. */
+  const offers = (m: ServiceMonitor) => t.mock.method(m as unknown as { once: (...a: unknown[]) => boolean }, 'once');
+  // stderr's `Password: `, then stdout's LF: the read ends the line at stdout's LF and matches it, while stderr's reading
+  // holds it open. Quiet, stderr offered it, the read's line having ended, and it was matched a second time (repeats 1).
+  const f = fake('process');
+  const m = f.monitor({ fail: { pattern: '^Password:' } }, { partialAfterMs: 30 });
+  const offered = offers(m);
+  f.start();
+  f.out('Password: ', 'stderr');
+  f.out('\n', 'stdout');
+  assert.equal(m.status, 'unhealthy', 'the read\'s line, ended by stdout\'s LF');
+  await until(() => offered.mock.callCount() > 0, 2000, 'stderr offered its quiet prompt');
+  assert.equal(offered.mock.calls[0]!.result, true, 'the prompt is its ended twin\'s, which matched');
+  assert.equal(m.info().repeats, undefined, 'one `Password:`, as a read shows it');
+  m.dispose();
+  // The ended twin did not match: the prompt's own text is still tried, as with an open twin. stderr `Pass`, stdout `x`,
+  // stderr `word: `, stdout's LF: the read ended `Passxword: `, and stderr holds `Password: `.
+  const g = fake('process');
+  const n = g.monitor({ fail: { pattern: '^Password: ?$' } }, { partialAfterMs: 30 });
+  g.start();
+  g.out('Pass', 'stderr');
+  g.out('x', 'stdout');
+  g.out('word: ', 'stderr');
+  g.out('\n', 'stdout');
+  await until(() => n.status === 'unhealthy', 2000, 'stderr\'s own prompt');
+  assert.equal(n.info().evidence, 'Password:');
+  n.dispose();
+  // A quiet `ERROR a` on stdout pairs, by where it began, with the read's `ERROR aERROR b` that stderr's LF ended, one
+  // line; ended by stdout's own LF instead, it is a line of its own, the second of two (the test above).
+  const h = fake('process');
+  const o = h.monitor({ fail: { pattern: 'ERROR' } }, { partialAfterMs: 30 });
+  const spent = offers(o);
+  h.start();
+  h.out('ERROR a', 'stdout');
+  h.out('ERROR b\n', 'stderr');
+  assert.equal(o.status, 'unhealthy');
+  await until(() => spent.mock.callCount() > 0, 2000, 'stdout offered its quiet prompt');
+  h.out('\n', 'stdout');
+  assert.equal(o.info().repeats, undefined, 'one line, matched once');
+  assert.equal(o.info().evidence, 'ERROR b', 'as stderr wrote it');
+  o.dispose();
+});
+
 test('a service\'s lines are taken in the order their ends came, the read\'s and a pipe\'s interleaved (our review of the 73 commits through 4860d4c, PR #22)', () => {
   // stdout `FATAL`, stderr `x` and its LF (the read's `FATALx` ends), then stdout's LF, `READY` and LF: stdout's FATAL
   // ends before READY. The read's lines were all taken first, READY before FATAL, and the service ended unhealthy.

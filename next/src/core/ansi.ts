@@ -413,6 +413,11 @@ export class LineSplitter {
     return this.current();
   }
 
+  /** Where the unterminated line began, once any of it has come; read without building its text, as peek does. */
+  opened(): Begun | undefined {
+    return this.begun;
+  }
+
   /** Stop the quiet timer; nothing is offered afterwards. */
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);
