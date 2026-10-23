@@ -294,7 +294,13 @@ const LEGACY_PROBE = ` echo "<<<PRO""BE:${AT_NONCE}>>>"`;
  * and as builds before it named the evaluating process's typed it, naming the shell's `$$`.
  */
 const PIDLESS_PROBES = [...FLAVORS.map((f) => ` ${untraced(printedMark('PRO""BE', AT_NONCE), f)}`), ...(['posix', 'zsh'] as const).map((f) => ` ${untraced(printedMark('PRO""BE', AT_NONCE, ['"$$"']), f)}`)];
-for (const line of [...FLAVORS.map((f) => markerProbe(AT_NONCE, f)), ...PIDLESS_PROBES, LEGACY_PROBE, inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true)]) {
+/**
+ * The inline strategy's POSIX probe as earlier builds typed it, which journals keep: naming the shell's `$$`, then the
+ * evaluating process's with no fallback. An echo of one broken after its nonce kept the rest of its line in the logs (the
+ * house's review of 4860d4c..bc4bc85, PR #22).
+ */
+const EARLIER_INLINE_PROBES = ['"$$"', EVALUATING_PID].map((pid) => inlineProbeNaming(AT_NONCE, pid, false));
+for (const line of [...FLAVORS.map((f) => markerProbe(AT_NONCE, f)), ...PIDLESS_PROBES, LEGACY_PROBE, inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true), ...EARLIER_INLINE_PROBES]) {
   const [before, after] = line.split(AT_NONCE) as [string, string];
   const at = before.indexOf('<<<');
   const lines = PROBE_LINES.get(before.slice(at)) ?? { leads: [], rests: [] };

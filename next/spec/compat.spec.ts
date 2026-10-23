@@ -754,6 +754,29 @@ test('the 33 commits 4: a probe line whose nonce a redraw broke over two lines l
   }
 });
 
+test("an echo of the inline probe as earlier builds typed it, broken after its nonce, leaves no piece of its line in the logs (the house's review of 4860d4c..bc4bc85, PR #22)", async () => {
+  // Journals keep what earlier builds typed: the probe naming the shell's `$$`, then the evaluating process's with no fallback.
+  // Their rests weren't among the probe lines', so an echo broken after its nonce kept `:%s:%s>>>\n' "$$" "${__tsm_r-}"`.
+  const h = await markerHarness();
+  try {
+    const { nonce, journal } = await hungMarkerRun(h, 'earlierprobe');
+    const head = (n: string) => ` printf '<<<PRO''BE:${n}\r\n:%s:%s>>>\\n' `;
+    const pids = ['"$$"', `"$(exec /bin/sh -c 'echo $PPID')"`];
+    pids.forEach((pid, i) => journal.append({ type: 'output', data: `$${head(nonce)}${pid} "\${__tsm_r-}"\r\nkept-${i + 1}\r\n`, stream: 'pty' }));
+    // And for a nonce no Run here recorded, which the probe's answer in the text carries.
+    const other = 'feedface';
+    journal.append({ type: 'output', data: `$${head(other)}"$$" "\${__tsm_r-}"\r\n<<<PROBE:${other}:77:${other}>>>\r\nkept-3\r\n`, stream: 'pty' });
+    for (const raw of [false, true]) {
+      const tail = lines(await h.call('tailLogs', { session: 'earlierprobe', lines: 40, raw }));
+      const said = `raw ${raw}: ${JSON.stringify(tail)}`;
+      assert.ok(!tail.some((l) => /%s|PRO''BE|__tsm_r|PPID/.test(l)), `no piece of a probe line: ${said}`);
+      assert.ok(['kept-1', 'kept-2', 'kept-3'].every((k) => tail.includes(k)), `the output around them stays: ${said}`);
+    }
+  } finally {
+    await h.close();
+  }
+});
+
 test('a reviewer’s read: a tail whose window the daemon’s own lines fill reads further back for the lines asked, and at its cap says the shortfall instead of returning fewer in silence', async () => {
   const h = await markerHarness();
   try {
