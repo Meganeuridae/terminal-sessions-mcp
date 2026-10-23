@@ -308,19 +308,31 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
     await page.keyboard.press('Enter');
     const live = registry.get('secret');
     assert.ok(live && live.kind === 'live');
-    await page.waitForFunction(`${rows}.includes('Password:')`, { timeout: 8000 }).catch(async (e: Error) => {
-      // Twice on macOS CI the prompt never showed, and the log held nothing to tell why (a reviewer's read of the fixes for #22):
-      // the failure says what the screen and the journal held.
+    // A wait below that fails says what the screen and the journal held: twice on macOS CI the prompt never showed, and the
+    // log held nothing to tell why (a reviewer's read of the fixes for #22).
+    const held = async (e: Error): Promise<never> => {
       const shown = await page.evaluate<string>(rows).catch((r: Error) => `(the rows could not be read: ${r.message})`);
+      // Every kind, with its time from the first: a seat change, a resize or a gap between the prompt and the password shows.
       const events = live.session.journal.since(0).events;
-      const last = (type: 'output' | 'input') =>
-        events
-          .filter((ev): ev is Extract<JournalEvent, { type: 'output' | 'input' }> => ev.type === type)
-          .slice(-8)
-          .map((ev) => JSON.stringify(ev.data).slice(0, 240))
-          .join(' ');
-      throw new Error(`${e.message}. The screen's rows: ${JSON.stringify(shown.slice(-800))}. The journal's last output: ${last('output')}. Its last input: ${last('input')}`);
-    });
+      const t0 = events[0]?.ts ?? 0;
+      const last = events
+        .slice(-24)
+        .map((ev) => {
+          const { seq, ts, type, ...rest } = ev;
+          return `${seq} +${ts - t0}ms ${type} ${JSON.stringify(rest).slice(0, 200)}`;
+        })
+        .join(' | ');
+      // Once on Ubuntu CI the password was typed and secret mode never turned on: the page's seat, label, notice, focus and
+      // cursor row say whether the keys were dropped or the cursor's line didn't read as a prompt (a reviewer's read of the
+      // fixes for #22).
+      const bar = await page
+        .evaluate<string>(
+          `JSON.stringify({ conn: document.getElementById('conn-text')?.textContent, seat: document.getElementById('seat')?.textContent, secret: document.getElementById('secret')?.textContent, notice: document.getElementById('notice')?.textContent, focus: document.activeElement?.className, cursorRow: document.querySelector('.xterm-rows .xterm-cursor')?.parentElement?.innerText })`,
+        )
+        .catch((r: Error) => `(the page could not be read: ${r.message})`);
+      throw new Error(`${e.message}. The page: ${bar.slice(0, 800)}. Its last problems: ${JSON.stringify(problems.slice(-4).map((x) => x.slice(0, 200)))}. The screen's rows: ${JSON.stringify(shown.slice(-800))}. The journal's last events: ${last}`);
+    };
+    await page.waitForFunction(`${rows}.includes('Password:')`, { timeout: 8000 }).catch(held);
     assert.deepEqual(inputsOf('secret').filter((ev) => ev.sensitive), [], 'nothing before the prompt was sent as sensitive');
     // On screen is not yet in force: `read -s` prints its prompt and turns echo off after it, with a tcsetattr that waits for
     // the prompt to drain. On Linux that returns at once; on macOS it waits for the daemon to read the prompt (by reading
@@ -337,10 +349,10 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
     });
     await page.keyboard.type('hunter2-s3cret');
     // Secret mode turns on at the first keystroke on a password line (the session also redacts input at a password prompt on its own, m2-2).
-    await page.waitForFunction(`document.getElementById('secret').textContent === 'Secret: auto'`, { timeout: 3000 });
+    await page.waitForFunction(`document.getElementById('secret').textContent === 'Secret: auto'`, { timeout: 3000 }).catch(held);
     await page.keyboard.press('Enter');
-    await page.waitForFunction(`${rows}.includes('len=14')`, { timeout: 8000 });
-    await page.waitForFunction(`document.getElementById('secret').textContent === 'Secret: off'`, { timeout: 3000 }); // auto ends with the line
+    await page.waitForFunction(`${rows}.includes('len=14')`, { timeout: 8000 }).catch(held);
+    await page.waitForFunction(`document.getElementById('secret').textContent === 'Secret: off'`, { timeout: 3000 }).catch(held); // auto ends with the line
     const secretInputs = inputsOf('secret').filter((e) => e.sensitive);
     assert.ok(secretInputs.length > 0, 'the password was sent as sensitive input');
     // The lock: anything typed while it is on is sensitive.
@@ -352,7 +364,7 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
     // on input not yet there (a reviewer's read of the fixes for #22).
     // Every key of it has reached the shell once the shell's echo of it shows, so each of its input events (typed keys
     // flush every few ms, so there can be several) is journaled by then, and the next event is the Enter's.
-    await page.waitForFunction(`${rows}.includes('# locked-text')`, { timeout: 8000 });
+    await page.waitForFunction(`${rows}.includes('# locked-text')`, { timeout: 8000 }).catch(held);
     await page.click('#secret');
     await page.click('#term');
     const beforeEnter = inputsOf('secret').length;
