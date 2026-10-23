@@ -153,13 +153,27 @@ function health(host: string, port: number, pid: number, o: AskOptions, ms: numb
  * second connection from the same port number to a termd on ::1 made an impostor's socket on 127.0.0.1
  * read as termd's, and the shim sent it its credential (a reviewer's run of the fixes for #22, on Ubuntu
  * 24.04). An IPv4 connection's server side is in tcp, or in tcp6 as a ::ffff: address when the listener is
- * an IPv6 socket; more than one line for it is refused. The accepted socket has an inode only once termd
- * accepts it, so the lookup is tried again every 10 ms for at most a second on the monotonic clock: counted
- * as 100 tries, a loaded host's slow reads stretched it past the second (the house's read of the 17 commits
- * over our fixes, #22). Elsewhere whose a socket is cannot be shown, and the answer is not taken.
+ * an IPv6 socket. The accepted socket has an inode only once termd accepts it, so the lookup is tried
+ * again every 10 ms for at most a second on the monotonic clock: counted as 100 tries, a loaded host's slow
+ * reads stretched it past the second (the house's read of the 17 commits over our fixes, #22). Elsewhere
+ * whose a socket is cannot be shown, and the answer is not taken.
+ *
+ * A read of either table is not one snapshot. The kernel hands it out in page-sized pieces and, once a
+ * piece has reached the table's end, counts its way back to its place from the top; sockets added meanwhile
+ * make that count land on rows already given, so the table's last rows come twice, and a row can be left out
+ * as well. Under the suite's loopback churn a third of the reads listed some socket twice (Ubuntu 24.04, a
+ * few thousand connections a second). Rows with one inode are one socket; the refusal, for a connection two
+ * sockets claim, stands only for distinct inodes, and a row left out is met by the next try (two shim tests
+ * hit the refusal in our fork's run of e8b55ad on Ubuntu). Tests read the tables through `o.read`.
  */
-export async function connectionOf(socket: net.Socket, pid: number): Promise<string | undefined> {
+export interface ConnectionOfOptions {
+  /** The text of a /proc/net table (`/proc/net/tcp` or `tcp6`), or a throw where it cannot be read; the file itself by default. */
+  read?: (table: string) => string;
+}
+
+export async function connectionOf(socket: net.Socket, pid: number, o: ConnectionOfOptions = {}): Promise<string | undefined> {
   if (process.platform !== 'linux') return 'this system does not show whose a socket is';
+  const read = o.read ?? ((table: string) => fs.readFileSync(table, 'utf8'));
   const { remoteAddress, remotePort: port, localAddress, localPort } = socket;
   if (remoteAddress === undefined || port === undefined || localAddress === undefined || localPort === undefined) return 'the connection has no addresses';
   const v6 = socket.remoteFamily === 'IPv6';
@@ -172,23 +186,25 @@ export async function connectionOf(socket: net.Socket, pid: number): Promise<str
   if (wanted.some((w) => w.local === undefined || w.remote === undefined)) return `the connection's addresses are not read here (${remoteAddress}, ${localAddress})`;
   const giveUp = clocks.monotonic() + ACCEPT_WAIT_MS;
   while (!socket.destroyed) {
-    const inodes: string[] = [];
+    // The sockets listed as the server side, by inode: a torn read lists one socket in more than one row.
+    const inodes = new Set<string>();
     for (const w of wanted) {
       let text: string;
       try {
-        text = fs.readFileSync(w.table, 'utf8');
+        text = read(w.table);
       } catch {
         continue;
       }
       for (const line of text.split('\n').slice(1)) {
         const f = line.trim().split(/\s+/);
-        // sl local_address rem_address st … uid timeout inode; 01 is ESTABLISHED.
-        if (f[1] === w.local && f[2] === w.remote && f[3] === '01') inodes.push(f[9] ?? '0');
+        // sl local_address rem_address st … uid timeout inode; 01 is ESTABLISHED. A row with inode 0 is the
+        // connection before termd accepted it: it names no socket yet, and the next try reads again.
+        if (f[1] === w.local && f[2] === w.remote && f[3] === '01' && f[9] !== undefined && f[9] !== '0') inodes.add(f[9]);
       }
     }
-    if (inodes.length > 1) return `more than one socket is the other end of this connection on port ${port}`;
-    const inode = inodes[0];
-    if (inode !== undefined && inode !== '0') {
+    if (inodes.size > 1) return `more than one socket is the other end of this connection on port ${port}`;
+    const [inode] = inodes;
+    if (inode !== undefined) {
       let fds: string[];
       try {
         fds = fs.readdirSync(`/proc/${pid}/fd`);

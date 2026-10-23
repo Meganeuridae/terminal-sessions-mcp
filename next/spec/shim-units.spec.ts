@@ -644,8 +644,11 @@ test("a connection the listener has yet to accept is looked up again until it is
 /** How long an impostor helper (a node process) may take to start listening on a loaded host before its test fails. */
 const IMPOSTOR_START_MS = 20_000;
 
-test("a connection whose other end /proc lists twice is refused: which of the two answered cannot be told (the house's read of the 17 commits over our fixes, #22)", { skip: process.platform !== 'linux' && 'Linux shows whose a socket is' }, async (t) => {
-  // This process's own listener, and a /proc/net/tcp read through node's fs that lists its side of the connection twice.
+test("a read of /proc/net/tcp torn by sockets changing under it lists the connection's other end twice, or leaves it out: rows with one inode are one socket, a row left out is looked up again, and only two distinct inodes are refused (our fork's run of e8b55ad on Ubuntu)", { skip: process.platform !== 'linux' && 'Linux shows whose a socket is' }, async () => {
+  // This process's own listener and a connection to it. The tables reach the lookup through its reader, each from a
+  // real read of the file with the connection's row edited: the kernel hands the table out in page-sized pieces and,
+  // once a piece has reached the table's end, counts its way back to its place from the top, so sockets added meanwhile
+  // make the table's last rows come twice (seen on Ubuntu 24.04 under loopback churn: a third of the reads).
   const server = net.createServer(() => {});
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const port = (server.address() as { port: number }).port;
@@ -655,20 +658,30 @@ test("a connection whose other end /proc lists twice is refused: which of the tw
     c.once('error', reject);
   });
   try {
-    assert.equal(await connectionOf(socket, process.pid), undefined, 'listed once, it is shown as this process\'s');
-    const server_ = procAddress('127.0.0.1', port, false)!;
-    const read = fsModule.readFileSync;
-    t.mock.method(fsModule, 'readFileSync', ((file: fs.PathOrFileDescriptor, options?: unknown) => {
-      const text = (read as (f: fs.PathOrFileDescriptor, o?: unknown) => string | Buffer)(file, options);
-      if (file !== '/proc/net/tcp' || typeof text !== 'string') return text;
-      const twice = text.split('\n').flatMap((line) => (line.trim().split(/\s+/)[1] === server_ ? [line, line] : [line]));
-      return twice.join('\n');
-    }) as typeof fs.readFileSync);
-    syncBuiltinESMExports();
-    assert.equal(await connectionOf(socket, process.pid), `more than one socket is the other end of this connection on port ${port}`);
+    assert.equal(await connectionOf(socket, process.pid), undefined, "listed once, it is shown as this process's");
+    const serverSide = procAddress('127.0.0.1', port, false)!;
+    const fields = (line: string) => line.trim().split(/\s+/);
+    const withInode = (line: string, inode: string) => {
+      const f = fields(line);
+      f[9] = inode;
+      return f.join(' ');
+    };
+    const tables = (edit: (line: string) => string[]) => (table: string) => {
+      const text = fs.readFileSync(table, 'utf8');
+      return table === '/proc/net/tcp' ? text.split('\n').flatMap((line) => (fields(line)[1] === serverSide ? edit(line) : [line])).join('\n') : text;
+    };
+    assert.equal(await connectionOf(socket, process.pid, { read: tables((line) => [line, line]) }), undefined, 'listed twice with one inode, it is one socket');
+    // Before termd accepts, the row has no inode; a torn read can give the row before and after the accept.
+    assert.equal(await connectionOf(socket, process.pid, { read: tables((line) => [withInode(line, '0'), line]) }), undefined, 'the row with an inode is the socket');
+    // A row the tear left out is looked up again: the first read of the table lacks it, the next has it.
+    let reads = 0;
+    const leftOutOnce = (table: string) => tables((line) => (table === '/proc/net/tcp' && reads++ === 0 ? [] : [line]))(table);
+    assert.equal(await connectionOf(socket, process.pid, { read: leftOutOnce }), undefined, 'found on a later read');
+    assert.ok(reads >= 2, `the table was read again (${reads} reads)`);
+    // Two rows with distinct inodes cannot be one socket, and which of them answered cannot be told.
+    const another = (line: string) => withInode(line, String(Number(fields(line)[9]) + 1));
+    assert.equal(await connectionOf(socket, process.pid, { read: tables((line) => [line, another(line)]) }), `more than one socket is the other end of this connection on port ${port}`);
   } finally {
-    t.mock.restoreAll();
-    syncBuiltinESMExports();
     socket.destroy();
     await new Promise((r) => server.close(r));
   }
