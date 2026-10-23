@@ -367,8 +367,10 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
     // Waits on the journal, not fixed sleeps: a slow delivery failed the sensitive count, and passed the absence checks
     // on input not yet there (a reviewer's read of the fixes for #22).
     // Every key of it has reached the shell once the shell's echo of it shows, so each of its input events (typed keys
-    // flush every few ms, so there can be several) is journaled by then, and the next event is the Enter's.
-    await page.waitForFunction(`${rows}.includes('# locked-text')`, { timeout: 8000 }).catch(held);
+    // flush every few ms, so there can be several) is journaled by then, and the next event is the Enter's. The echo is
+    // read across rows: where the prompt and the text cross the right margin it wraps, and the rows' text holds a line end
+    // inside it (a reviewer's read of the fixes for #22).
+    await page.waitForFunction(`${rows}.replace(/\\n/g, '').includes('# locked-text')`, { timeout: 8000 }).catch(held);
     await page.click('#secret');
     await page.click('#term');
     const beforeEnter = inputsOf('secret').length;
