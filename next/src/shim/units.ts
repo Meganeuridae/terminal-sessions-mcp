@@ -434,13 +434,20 @@ export function plistUnit(file: string): UnitText | { error: string } {
   return throughEnv({ argv, env });
 }
 
-/** Whether two paths name one directory: by what they resolve to on disk where they exist, else by their spelling. */
+/**
+ * Whether two paths name one directory, by what they resolve to on disk: one not made yet, by where it would be made,
+ * its deepest existing ancestor resolved and the rest appended. By its spelling alone, a data dir a unit's next start
+ * makes under a symlinked parent was another directory than the same one spelled through the link's target (the
+ * house's read of 4860d4c..bc4bc85, #22).
+ */
 export function sameDir(a: string, b: string): boolean {
-  const real = (p: string) => {
+  const real = (p: string): string => {
+    const abs = path.resolve(p);
     try {
-      return fs.realpathSync(p);
+      return fs.realpathSync(abs);
     } catch {
-      return path.resolve(p);
+      const parent = path.dirname(abs);
+      return parent === abs ? abs : path.join(real(parent), path.basename(abs));
     }
   };
   return real(a) === real(b);

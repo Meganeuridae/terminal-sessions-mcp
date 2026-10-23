@@ -16,7 +16,7 @@ import * as http from 'node:http';
 import * as net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { askDataDir, connectionOf, procAddress, titlePort } from '../src/shim/running.js';
-import { launchctlUnit, nextStart, plistUnit, procEnviron, systemctlUnit, TERMD_BOOLEAN_FLAGS, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
+import { launchctlUnit, nextStart, plistUnit, procEnviron, sameDir, systemctlUnit, TERMD_BOOLEAN_FLAGS, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -843,4 +843,18 @@ test("a running unit's text that names another port or data dir than its running
     port: { unknown: 'could not be read (systemctl did not answer)' },
     dataDir: { unknown: 'could not be read (systemctl did not answer)' },
   });
+});
+
+test('sameDir compares a directory not made yet by where it would be made, through a symlinked parent (the house\'s read of 4860d4c..bc4bc85, #22)', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-samedir-'));
+  try {
+    fs.mkdirSync(path.join(tmp, 'real'));
+    fs.symlinkSync(path.join(tmp, 'real'), path.join(tmp, 'link'));
+    assert.ok(sameDir(path.join(tmp, 'link'), path.join(tmp, 'real')), 'existing: one directory');
+    assert.ok(sameDir(path.join(tmp, 'link', 'data', 'x'), path.join(tmp, 'real', 'data', 'x')), 'not made yet, under the link and under its target: one directory');
+    assert.ok(!sameDir(path.join(tmp, 'link', 'data'), path.join(tmp, 'real', 'other')), 'not made yet and named apart: two');
+    assert.ok(sameDir('relative-not-made', path.resolve('relative-not-made')), 'a relative path, by where it resolves');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
