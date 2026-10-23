@@ -1086,21 +1086,27 @@ const HEAD_EVENTS = 512;
  * head: read from its coordinates, `ESC [ 3 LF` then `1mREADY` showed `1mREADY`, and a search from there found no
  * `^READY$` (our review of the 73 commits through 4860d4c, PR #22). It reads the HEAD_EVENTS journal events before
  * `first`, a Run's page or search the Run's own among them, and at most HEAD_LOOKBACK units of the source's output
- * there, the oldest event it keeps cut to fit. A hole ends every sequence, so the look back stops at the newest hole the
- * journal knows among those events that ends before `first`, wherever its gap line was written: a hole recorded after
- * `first` is not read across, and a gap line recorded late for an older hole doesn't end a look back that hole is behind. The look back of a
- * Run's page was its output read back by bytes alone, through every other event of the session to the Run's start, and
- * a session's stopped at the first gap line in its window, wherever its hole lay (the house's review of 4860d4c..bc4bc85,
- * PR #22).
+ * there, the oldest event it keeps cut to fit. A hole ends every sequence where the scan ends it, so the look back
+ * stops at the newest hole the journal knows among those events, at the seat the walk gives its line, wherever that
+ * line was written: a hole recorded after `first` is not read across, a gap line recorded late for an older hole doesn't
+ * end a look back that hole is behind, and a hole joined past MAX_LOST that reaches past `first` ends nothing before its
+ * end. The look back of a Run's page was its output read back by bytes alone, through every other event of the session
+ * to the Run's start, and a session's stopped at the first gap line in its window, wherever its hole lay (the house's
+ * review of 4860d4c..bc4bc85, PR #22).
  */
 function headBefore(src: ReadSource, o: { runId?: string | undefined }, first: Output, start: number): string {
   const key = sourceKey(first);
   const events = first.seq > 1 ? src.journal.tail(HEAD_EVENTS, first.seq - 1) : [];
   const lo = events[0]?.seq ?? first.seq;
-  // A hole ends the sequences before it where its line goes, at its end, as the scan reads it: one that ends before
-  // `first`. A hole joined past MAX_LOST can reach past `first` over events that are there, and the scan ends nothing
-  // inside it until its end.
-  const holeEnd = Math.max(lo - 1, ...src.journal.holesIn(lo, first.seq - 1, events).flatMap((g) => (g.to < first.seq ? [g.to] : [])));
+  // A hole ends the sequences before it where the walk places its line, the seat holesIn gives it: its end, or for a gap
+  // line that claims its own seq or later ones, the line itself. That holds for a hole that ends before `first`, and
+  // for such a line among the events whatever its range. A hole joined past MAX_LOST can reach past `first` over
+  // events that are there, and the walk places its line, and the scan ends sequences, only at its end.
+  const lines = events.filter(isGap);
+  const holeEnd = Math.max(
+    lo - 1,
+    ...src.journal.holesIn(lo, first.seq - 1, events).flatMap((g) => (g.to < first.seq || lines.some((l) => l.from === g.from && l.to === g.to) ? [g.seq] : [])),
+  );
   const parts: string[] = [];
   let units = 0;
   for (let i = events.length - 1; i >= 0 && units < HEAD_LOOKBACK; i--) {

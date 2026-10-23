@@ -203,6 +203,19 @@ test("a line's coordinates read on from its own source's open sequence only, and
   stale.journal.append({ type: 'gap', from: 1, to: 1, reason: 'store-error' });
   out(stale.journal, '\n1mB\n');
   await sameAsScan(stale, '^B$', 'B');
+  // A gap line claiming its own seq and later ones ends the sequence where it was written, as the walk seats it.
+  const forward = source();
+  out(forward.journal, 'x\x1b[3');
+  forward.journal.append({ type: 'gap', from: 2, to: 5, reason: 'store-error' });
+  out(forward.journal, '\n1mB\n');
+  await sameAsScan(forward, '^1mB$', '1mB');
+  // And there, not at the end of what it claims: a sequence opened after it, inside its claim, reads on.
+  const seated = source();
+  out(seated.journal, 'x\x1b[3');
+  seated.journal.append({ type: 'gap', from: 2, to: 3, reason: 'store-error' });
+  out(seated.journal, 'z\x1b[3');
+  out(seated.journal, '\n1mB\n');
+  await sameAsScan(seated, '^B$', 'B');
 });
 
 test('er-6 / ux-20: read since=match.cursor (offset=match.offset) starts at the matching line, even inside a 64 KiB pipe read', async () => {
