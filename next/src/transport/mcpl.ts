@@ -1565,8 +1565,11 @@ export class McplLane {
       ts: Date.now(),
       // Its own id, by its range: a catch-up's summary can end at the same seq as one still in flight that named
       // less, which then took this one's entry and settled what its host never heard of (the house's read of
-      // 4860d4c, #22), and a later fold can end there too and name more. Two of the same range share one: the newer
-      // may cover more of it, but all inside the span the older's message already names (a reviewer's read).
+      // 4860d4c, #22), and a later fold can end there too and name more. Two of the same range share one, and the newer,
+      // never sent, takes the older's entry: beyond the gaps and the omitted span the older's message names, it covers
+      // only debts the older's scan found not owed, of the kind `left` drops as owed no more when a retired summary
+      // held one, so its acceptance settles nothing the host should have heard of (reviewers' reads of 4860d4c and of
+      // 4860d4c..bc4bc85, #22).
       messageId: segmentId(t.id, t.journal, 'summary', to, how.refused ? `refused-${o!.from}` : `${summaryFloor(o, gaps)}`),
       tags: ['terminal:missed'],
       // `as=events`: a plain read projects text, which has no exit statuses or service changes in it (the house's read of 2f357bd, #22).
