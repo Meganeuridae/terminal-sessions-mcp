@@ -525,6 +525,16 @@ test('a trace a shell writes past the typed line’s redirect is named by the Ru
     const own = `<<<START:${N}:${probeMark(N).exec(traced)![1]}>>>\r\n`;
     assert.equal(cutPlumbing(`${echo}${own}out\r\n^C\r\n$ ${markerProbe(N, flavor).trimStart()}\r\n${traced}$ `, marker), 'out\r\n^C\r\nabc', `${shell}: ${JSON.stringify(traced)}`);
   }
+  // bash under a PS4 that is empty and under one holding digits: the cut still takes the trace from its doubled prefix, or
+  // from where it begins with none (the house's review of 4860d4c..bc4bc85, PR #22, by run in bash 5.2.37).
+  if (XTRACEFD) {
+    for (const ps4 of ['', '+${LINENO}: ']) {
+      const traced = runMerged('/bin/bash', `exec 3>&2; BASH_XTRACEFD=3; PS4='${ps4}'; printf abc; set -x; ${markerProbe(N).trim()}`).replace(/\n/g, '\r\n');
+      assert.match(traced, /^abc(?:\+\+\d+: )?exec \/bin\/sh -c 'echo \$PPID'\r\n/, `PS4 '${ps4}': ${JSON.stringify(traced)}`);
+      const own = `<<<START:${N}:${probeMark(N).exec(traced)![1]}>>>\r\n`;
+      assert.equal(cutPlumbing(`${echo}${own}out\r\n^C\r\n$ ${markerProbe(N).trimStart()}\r\n${traced}$ `, marker), 'out\r\n^C\r\nabc', `PS4 '${ps4}': ${JSON.stringify(traced)}`);
+    }
+  }
   // Not traces: the echo that printed the mark in earlier builds traced as the mark itself, and the guess at that trace's head
   // cut a program's own line that ended in `echo `; another Run's nonce names nothing.
   assert.equal(cutPlumbing(`${echo}${mark}+ echo ${end}`, marker), '+ echo ', 'a program’s `+ echo ` before the mark');
