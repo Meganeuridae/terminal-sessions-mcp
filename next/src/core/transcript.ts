@@ -51,9 +51,10 @@
  *    (two concurrent Runs, or a Run and the shell); the held ends of lines
  *    follow at the end of the range (or before a note), in the order they
  *    began. When the source changes, the next source starts on a fresh line,
- *    under a header line when `label` gives one; where scroll margins that
- *    don't start at row 1 make that line end cost a row with text, the
- *    projection is `truncated` (Projector.boundary). A `note` chunk is a line of its
+ *    under a header line when `label` gives one. Where that line end, a note,
+ *    a header or another source's output scrolls a row with text out of a
+ *    scroll region that doesn't start at row 1, the projection is `truncated`
+ *    and `lost` (Projector.hookScroll). A `note` chunk is a line of its
  *    own (a reader's `[… events missing …]` marker), never part of any source;
  *    a `hole` chunk stands where output was lost (`runChunks`), and the
  *    projection starts afresh there as at a note, with no line of its own, so
@@ -131,6 +132,12 @@ export interface Projection {
   truncated: boolean;
   /** UTF-8 bytes of input not projected. */
   omittedInputBytes: number;
+  /**
+   * Rows the projection lost after projecting them: scrolled out of its scratch scrollback unread, or taken from a
+   * scroll region by what the program did not write (rule 6, Projector.hookScroll). `truncated` counts them too; unlike
+   * what a cut omits or drops, no other page or tail shows them.
+   */
+  lost?: true;
 }
 
 export interface TranscriptOptions {
@@ -300,15 +307,32 @@ class Lines {
   }
 }
 
+/** The text of row `y` of `b`'s screen, trailing blanks trimmed. */
+const rowText = (b: IBuffer, y: number): string => b.getLine(b.baseY + y)?.translateToString(true) ?? '';
+
+/** The xterm internals the projector reads and hooks (margins, scrolls, a row's wrap); each use is skipped if they change. */
+interface Core {
+  _bufferService?: { scroll?: (...args: unknown[]) => void };
+  /** The active buffer, and the normal one among both. */
+  buffer?: { ybase?: unknown; scrollTop?: unknown; scrollBottom?: unknown; lines?: { get?(i: number): { isWrapped: boolean } | undefined } };
+  buffers?: { normal?: unknown };
+}
+
 class Projector {
   readonly term: TerminalType;
   readonly out: Lines;
   /**
-   * Rows may have been lost unread: scrolled out of the scratch scrollback (a batch outran its bound), or at a boundary
-   * (`boundary`) whose line end scrolled a region with no scrollback or could not move off a row with text.
+   * Rows may have been lost unread: scrolled out of the scratch scrollback (a batch outran its bound), or taken from a
+   * scroll region by what the program did not write (hookScroll, boundary).
    */
   lost = false;
   private readonly capacity: number;
+  /** The source being fed (a segment's key); undefined while the projection writes its own: a boundary's line end, a note, a header. */
+  private source: string | undefined;
+  /** The source whose output set the scroll margins. */
+  private owner: string | undefined;
+  /** The margins were set ahead of any source (the lasting state of a dropped head, before a header): the next source fed owns them. */
+  private adopt = false;
 
   constructor(readonly cols: number, readonly rows: number, keep: 'head' | 'tail', maxLines: number) {
     this.term = new Terminal({ cols, rows, scrollback: SCRATCH_SCROLLBACK, allowProposedApi: true });
@@ -320,6 +344,54 @@ class Projector {
     p.registerCsiHandler({ prefix: '?', final: 'h' }, (params) => this.onAltEnter(params));
     p.registerCsiHandler({ prefix: '?', final: 'l' }, (params) => this.onAltExit(params));
     p.registerEscHandler({ final: 'c' }, () => this.onReset());
+    p.registerCsiHandler({ final: 'r' }, () => this.onMargins());
+    this.hookScroll();
+  }
+
+  /** What is fed next comes from `source` (a segment's key), or from the projection itself (undefined). */
+  feeding(source: string | undefined): void {
+    this.source = source;
+    if (source !== undefined && this.adopt) {
+      this.owner = source;
+      this.adopt = false;
+    }
+  }
+
+  /** DECSTBM: whose output set the margins. */
+  private onMargins(): boolean {
+    if (this.source === undefined) this.adopt = true;
+    else {
+      this.owner = this.source;
+      this.adopt = false;
+    }
+    return false;
+  }
+
+  /**
+   * Watch every scroll xterm makes of a scroll region (BufferService.scroll: a line end at the region's last row, a
+   * line wrapping there, IND, NEL). On the normal screen a region not starting at row 1 keeps no scrollback, and its
+   * top row goes. When something other than the source that set the margins causes the scroll (a boundary's line end,
+   * a note, a header, another source's output) and that row holds text, the projection lost it (`lost`): the margins
+   * stay as the program set them, since resetting them would change how its later output scrolls (the house's review
+   * of a8b6f28..4860d4c, PR #22, comment 6341260318). The program's own scrolls lose what the terminal loses. After
+   * any scroll of such a region its new top row joins no row above the region, which it was wrapped from only inside
+   * it: a note's tail read glued onto the row above (an independent read of the fixes for #22). xterm internals:
+   * skipped, and nothing reported, if they change.
+   */
+  private hookScroll(): void {
+    const core = (this.term as unknown as { _core?: Core })._core;
+    const service = core?._bufferService;
+    const scroll = service?.scroll;
+    if (!core || !service || typeof scroll !== 'function') return;
+    service.scroll = (...args: unknown[]) => {
+      // Read on every line end that scrolls: a region of the normal screen only, from xterm's buffer directly.
+      const buf = core.buffer;
+      const top = buf !== undefined && buf === core.buffers?.normal && typeof buf.scrollTop === 'number' ? buf.scrollTop : 0;
+      if (top > 0 && (this.adopt || this.source !== this.owner) && rowText(this.term.buffer.normal, top) !== '') this.lost = true;
+      scroll.apply(service, args);
+      const line = top > 0 && typeof buf?.ybase === 'number' ? buf.lines?.get?.(buf.ybase + top) : undefined;
+      if (line) line.isWrapped = false;
+    };
   }
 
   /**
@@ -385,38 +457,29 @@ class Projector {
   private freshLine(): { line: string; row: number } {
     const b = this.term.buffer.active;
     let last = -1;
-    for (let y = b.cursorY; y < this.term.rows; y++) if ((b.getLine(b.baseY + y)?.translateToString(true) ?? '') !== '') last = y;
+    for (let y = b.cursorY; y < this.term.rows; y++) if (rowText(b, y) !== '') last = y;
     if (last === -1) return { line: b.cursorX > 0 ? '\r\n' : '', row: b.cursorY };
     const { bottom } = this.margins();
     return { line: `${last > b.cursorY ? `\x1b[${last - b.cursorY}B` : ''}\r\n`, row: b.cursorY <= bottom ? Math.min(last, bottom) : last };
   }
 
   /**
-   * End a segment before the next one (rule 6): cancel what it left open and take the cursor to a fresh line (freshLine).
-   * On the normal screen, scroll margins that don't start at row 1 can make that line end lose a row. At the region's last
-   * row it scrolls the region, which has no scrollback, so the region keeps one row fewer of what it holds than the
-   * program's output leaves it: its top row goes at once, or, when blank, at the region's next scroll. Below the region,
-   * on the screen's last row, it moves nothing, so the next segment begins on that row's text. The margins stay as the
-   * program set them, since resetting them would change how its later output scrolls; a loss of a row with text is
-   * reported (`lost`), no input omitted (the house's review of a8b6f28..4860d4c, PR #22, comment 6341260318). Margins
-   * from row 1, as apt's progress bar sets them, scroll into the scrollback and lose nothing.
+   * End a segment before the next one (rule 6): cancel what it left open and take the cursor to a fresh line (freshLine),
+   * as the projection's own output: a scroll region its line end scrolls is watched as any other (hookScroll). Margins
+   * from row 1, as apt's progress bar sets them, scroll into the scrollback and lose nothing. Below the region, on the
+   * screen's last row, the line end moves nothing, so the next segment begins on that row's text, which is reported.
    */
   async boundary(): Promise<void> {
     const { line, row } = this.freshLine();
     const b = this.term.buffer.active;
-    if (line !== '' && b.type === 'normal') {
-      const { top, bottom } = this.margins();
-      const text = (y: number) => (b.getLine(b.baseY + y)?.translateToString(true) ?? '') !== '';
-      if (row === bottom && top > 0) {
-        for (let y = top; y <= bottom && !this.lost; y++) this.lost = text(y);
-      } else if (row === this.rows - 1 && row !== bottom) this.lost ||= text(row);
-    }
+    if (line !== '' && b.type === 'normal' && row === this.rows - 1 && row !== this.margins().bottom && rowText(b, row) !== '') this.lost = true;
+    this.feeding(undefined);
     await this.feed(`\x18${line}`);
   }
 
   /** The active buffer's scroll margins, 0-based (xterm internals; the whole screen if they change). */
   private margins(): { top: number; bottom: number } {
-    const buf = (this.term as unknown as { _core?: { buffer?: { scrollTop?: unknown; scrollBottom?: unknown } } })._core?.buffer;
+    const buf = (this.term as unknown as { _core?: Core })._core?.buffer;
     return typeof buf?.scrollTop === 'number' && typeof buf.scrollBottom === 'number' ? { top: buf.scrollTop, bottom: buf.scrollBottom } : { top: 0, bottom: this.rows - 1 };
   }
 
@@ -986,6 +1049,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
     outer: for (let s = 0; s < segs.length; s++) {
       const seg = segs[s]!;
       if (seg.header) headersFed++;
+      pr.feeding(seg.key.startsWith('n:') ? undefined : seg.key);
       let pos = 0;
       while (pos < seg.data.length) {
         if (keep === 'head' && pr.out.lines.length > maxLines + headersFed) {
@@ -1033,7 +1097,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
       }
       lines = kept;
     }
-    return { text: lines.join('\n'), truncated, omittedInputBytes: omitted };
+    return { text: lines.join('\n'), truncated, omittedInputBytes: omitted, ...(pr.lost ? { lost: true as const } : {}) };
   } finally {
     pr.dispose();
   }

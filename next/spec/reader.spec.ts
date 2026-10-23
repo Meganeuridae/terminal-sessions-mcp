@@ -65,6 +65,34 @@ test('er-1: screens an erase kept, more lines than input bytes, page back whole 
   assert.ok(pages.length <= 8, `${pages.length} pages`);
 });
 
+test('a tail says truncated where the projection lost rows, as a page does: a hole’s note or another source’s line scrolled a region not from row 1', async () => {
+  // An independent read of the fixes for #22: the tail kept only the projection's text, so a scroll region's rows a gap note
+  // or a Run's long line took went unreported in a tail, where a page said truncated.
+  for (const mid of [
+    (j: Journal) => j.append({ type: 'gap', from: 1, to: 1, reason: 'store-error', exact: true }),
+    (j: Journal) => {
+      startRun(j, 'r1');
+      j.append({ type: 'output', stream: 'stdout', runId: 'r1', data: `${'L'.repeat(45)}\n` });
+    },
+  ]) {
+    const j = new Journal({ sessionId: 's' });
+    const src = source({ journal: j, cols: 20, rows: 10 });
+    out(j, '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6');
+    mid(j);
+    out(j, 'X\r\n');
+    const tail = await readJournal(src, { tail: 20 }, { resultBytes: 16384 });
+    const page = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
+    assert.deepEqual([tail.truncated, page.truncated], [true, true], JSON.stringify([tail.text, page.text]));
+    assert.equal(tail.text, page.text);
+  }
+  // The program's own scrolls of its region lose what the terminal loses: nothing to say.
+  const j = new Journal({ sessionId: 's' });
+  const src = source({ journal: j, cols: 20, rows: 10 });
+  out(j, '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6\r\nr7\r\n');
+  const tail = await readJournal(src, { tail: 20 }, { resultBytes: 16384 });
+  assert.deepEqual([tail.text, tail.truncated], ['top1\ntop2\nr5\nr6\nr7', false]);
+});
+
 /** A small seeded PRNG, so a failing case reproduces. */
 function rng(seed: number): () => number {
   return () => {

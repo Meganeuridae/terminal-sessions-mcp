@@ -1047,7 +1047,7 @@ async function projectPage(chosen: Chosen, geometry: { cols: number; rows: numbe
   const p = await project(chunks, opts);
   const textBytes = utf8Length(p.text);
   // `omittedInputBytes` can only come from maxLines here: the text is over budget by then.
-  return { text: p.text, textBytes, over: textBytes > maxBytes, omitted: p.omittedInputBytes, lost: p.truncated && p.omittedInputBytes === 0 };
+  return { text: p.text, textBytes, over: textBytes > maxBytes, omitted: p.omittedInputBytes, lost: p.lost === true };
 }
 
 /** Output bytes looked back over for the lasting state a page starts in. */
@@ -1411,10 +1411,13 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     }
   }
   const multi = sources.size > 1;
+  /** The last projection's rows lost after it projected them (Projection.lost): a cut is the tail's own, a loss is not. */
+  let lost = false;
   const projectTail = async (maxLines: number): Promise<string[]> => {
     const opts: Parameters<typeof project>[1] = { cols: geometry.cols, rows: geometry.rows, maxInputBytes: cap, keep: 'tail', maxLines };
     if (multi) opts.label = label;
     const p = await project(chunks, opts);
+    lost = p.lost === true;
     return p.text === '' ? [] : p.text.split('\n');
   };
   // The header lines naming the sources (§6 rule 6) are no line of output: `tail: N` counts output lines, as the
@@ -1511,7 +1514,9 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // A hole's line among those shown stands where lines asked for were lost: the tail is incomplete, as when
   // retention cuts its head. Without it, a tail across a stretch the disk refused said nothing of it (the house's
   // review of the 40 commits through f3750e4, PR #22, comment 6310921374).
-  const truncated = cutByBytes || (returned < n && older) || headCut || (text !== '' && text.split('\n').some((l) => holes.has(l)));
+  // So does a row the projection lost: a scroll region's that a hole's or another source's line took, which a tail kept
+  // only its text of and said nothing of (an independent read of the fixes for #22), as a page says it.
+  const truncated = cutByBytes || (returned < n && older) || headCut || lost || (text !== '' && text.split('\n').some((l) => holes.has(l)));
   const counts: NonNullable<ReadResult['lines']> = { requested: n, returned };
   if (before) counts.before = before;
   // The first line returned is cut when the byte cap cut it, or when its head lies past what was

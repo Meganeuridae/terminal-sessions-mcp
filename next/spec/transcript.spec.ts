@@ -833,26 +833,38 @@ test('a cut that drops only headers, naming sources that showed nothing, truncat
   }
 });
 
-test('a boundary on the normal screen that scrolls a region not starting at row 1 costs the region a row, and says so; margins from row 1 lose nothing', async () => {
+test('what the program did not write scrolls a region not starting at row 1 at a cost the projection reports: a row with text scrolled away, by the boundary’s line end, a note, a header or another source; margins from row 1 lose nothing', async () => {
   // The house's review of a8b6f28..4860d4c (PR #22, comment 6341260318): with margins 3–6 and the cursor moved up, the boundary's
   // line end at the region's last row scrolls the region, whose top row has no scrollback, and nothing reported it. The margins
-  // stay as the program set them, so its later output scrolls as it did; the row is reported (`truncated`, no input omitted).
-  const read = async (data: string) => {
-    const p = await project([data, { hole: true }, 'X\r\n'], { cols: 20, rows: 10 });
-    return [p.text.split('\n'), p.truncated, p.omittedInputBytes];
+  // stay as the program set them, so its later output scrolls as it did; each scroll that something else causes and that takes a
+  // row with text is reported (`truncated` and `lost`, no input omitted). Reported for the boundary's own line end alone, a gap
+  // note or another source's line that scrolled the region again lost rows unreported, and a blank top row was reported though
+  // every line survived (an independent read of the fixes for #22).
+  const read = async (chunks: ProjectChunk[], label?: typeof sourceLabel) => {
+    const p = await project(chunks, { cols: 20, rows: 10, ...(label ? { label } : {}) });
+    return [p.text.split('\n'), p.truncated, p.omittedInputBytes, p.lost];
   };
   const region = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6';
-  assert.deepEqual(await read(`${region}\x1b[2A`), [['top1', 'top2', 'r5', 'r6', 'X'], true, 0], 'the cursor moved up into the region');
-  assert.deepEqual(await read(region), [['top1', 'top2', 'r5', 'r6', 'X'], true, 0], 'the cursor at the region’s last row');
-  // A blank top row goes at once, and the next scroll takes the row below it, which the program's own scroll left in place.
-  assert.deepEqual(await read('\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\n\r\nr4\r\nr5\r\nr6'), [['top1', 'top2', 'r5', 'r6', 'X'], true, 0], 'a blank top row');
-  assert.deepEqual(await read('\x1b[3;6r\x1b[1;1Htop1\r\ntop2\x1b[6;3H'), [['top1', 'top2', '', '', 'X'], false, 0], 'a region with no text: nothing lost');
-  assert.deepEqual(await read('\x1b[1;6r\x1b[1;1Hr1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6\x1b[2A'), [['r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'X'], false, 0], 'margins from row 1: the top row goes to the scrollback');
+  assert.deepEqual(await read([`${region}\x1b[2A`, { hole: true }, 'X\r\n']), [['top1', 'top2', 'r5', 'r6', 'X'], true, 0, true], 'the cursor moved up into the region');
+  assert.deepEqual(await read([region, { hole: true }, 'X\r\n']), [['top1', 'top2', 'r5', 'r6', 'X'], true, 0, true], 'the cursor at the region’s last row');
+  // A blank top row goes, and nothing with it.
+  assert.deepEqual(await read(['\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\n\r\nr4\r\nr5\r\nr6', { hole: true }, 'X']), [['top1', 'top2', 'r4', 'r5', 'r6', 'X'], false, 0, undefined], 'a blank top row');
+  assert.deepEqual(await read(['\x1b[3;6r\x1b[1;1Htop1\r\ntop2\x1b[6;3H', { hole: true }, 'X\r\n']), [['top1', 'top2', '', '', 'X'], false, 0, undefined], 'a region with no text');
+  assert.deepEqual(await read(['\x1b[1;6r\x1b[1;1Hr1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6\x1b[2A', { hole: true }, 'X\r\n']), [['r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'X'], false, 0, undefined], 'margins from row 1: the top row goes to the scrollback');
+  // A note longer than a row, and another source's line, scroll the region past the boundary's line end; a row whose start
+  // scrolled away joins no row above the region (the note's tail read glued onto `top2`).
+  const note = '[… 1 journal events missing (seq 1: the journal store failed) …]';
+  const noted = await read([`${region}\x1b[2A`, { note }, 'X\r\n']);
+  assert.deepEqual(noted.slice(1), [true, 0, true], JSON.stringify(noted));
+  assert.deepEqual((noted[0] as string[]).slice(0, 2), ['top1', 'top2'], JSON.stringify(noted));
+  const pty = (data: string): ProjectChunk => ({ data, stream: 'pty' });
+  const run = await read([pty(region), { data: `${'L'.repeat(45)}\n`, stream: 'stdout', runId: 'r1' }, pty('X\r\n')], sourceLabel);
+  assert.deepEqual(run.slice(1), [true, 0, true], JSON.stringify(run));
+  assert.deepEqual((run[0] as string[]).slice(1, 3), ['top2', 'LLLLL'], JSON.stringify(run));
   // Below the region on the screen's last row a line end moves nothing, and the next segment begins on that row's text.
-  assert.deepEqual(await read(`${region}\x1b[10;1Hlast\x1b[1A`), [['top1', 'top2', 'r3', 'r4', 'r5', 'r6', '', '', '', 'Xast'], true, 0], 'below the region');
-  // With no boundary, as the terminal shows it: nothing to report.
-  const whole = await project([`${region}\x1b[2A`], { cols: 20, rows: 10 });
-  assert.deepEqual([whole.text.split('\n'), whole.truncated], [['top1', 'top2', 'r3', 'r4', 'r5', 'r6'], false]);
+  assert.deepEqual(await read([`${region}\x1b[10;1Hlast\x1b[1A`, { hole: true }, 'X\r\n']), [['top1', 'top2', 'r3', 'r4', 'r5', 'r6', '', '', '', 'Xast'], true, 0, true], 'below the region');
+  // The program's own output scrolls its region as the terminal does: nothing to report.
+  assert.deepEqual(await read([`${region}\r\nr7\r\n`]), [['top1', 'top2', 'r5', 'r6', 'r7'], false, 0, undefined], 'no boundary');
 });
 
 test('a head kept to maxLines counts what it dropped as omitted: the lines fed in the batch where the limit falls, the whole rest of a range that fits on the screen, and a share of what made lines with no line end', async () => {
