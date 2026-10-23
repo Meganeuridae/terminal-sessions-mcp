@@ -974,7 +974,7 @@ test("tg-19: a supervisor's termd on the shim's port is left to it, and a check 
   }
 });
 
-test("tg-19: the supervisor check fails closed and reads a unit as termd does: a query that fails starts nothing (systemctl without its bus; launchctl without a GUI domain while the LaunchAgent is on disk), a LaunchAgent on disk but not loaded is the agent's port and one that cannot be read is unknown, a unit enabled but inactive or one whose port is in its environment is the unit's, TSM_PORT is read before SESSION_SERVER_PORT, a unit for another port out of the same data dir stops the start, and a data dir with spaces is read whole from each supervisor's text (the house's read of the shim, #22 comment 6269349177; of the 38 commits, #22 comment 6274370651)", async () => {
+test("tg-19: the supervisor check fails closed and reads a unit as termd does: a query that fails starts nothing (systemctl without its bus; launchctl without a GUI domain while the LaunchAgent is on disk), a LaunchAgent on disk but not loaded is the agent's port and one that cannot be read is unknown, a unit enabled but inactive or one whose port is in its environment is the unit's, TSM_PORT is read before SESSION_SERVER_PORT, a unit for another port out of the same data dir stops the start, and a data dir with spaces is read whole from each supervisor's text (the house's read of the shim, #22 comment 6269349177; of the 38 commits, #22 comment 6274370651)", async (t) => {
   const port = await unusedPort();
   const darwin = process.platform === 'darwin';
   const linux = process.platform === 'linux';
@@ -1059,9 +1059,19 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   const locked = linux ? await liveTermd(lockedDir, ['--token', 'unit-token']) : undefined;
   const sealed = linux && process.getuid?.() !== 0 ? await undumpable() : undefined;
   // A termd bound to ::1 alone, and another process on 127.0.0.1 at its port claiming its pid (the house's review of
-  // a8b6f28..4860d4c, #22 comment 6341260318, question 5): undefined without ::1 or the impostor.
+  // a8b6f28..4860d4c, #22 comment 6341260318, question 5). Only a host that can't bind ::1 leaves the case out, and says
+  // so: one that can, and whose termd or impostor doesn't start, fails here, where a failed start dropped the case and the
+  // impostor's last assertion passed on nothing (the house's read of the 14 commits over our fixes, #22).
   const v6Dir = path.join(tmp, 'sup-data-dir-told-past-an-impostor-on-127-0-0-1');
-  const v6 = linux ? await liveTermd(v6Dir, ['--host', '::1']).catch(() => undefined) : undefined;
+  const v6Bindable =
+    linux &&
+    (await new Promise<boolean>((resolve) => {
+      const probe = net.createServer();
+      probe.once('error', () => resolve(false));
+      probe.listen(0, '::1', () => probe.close(() => resolve(true)));
+    }));
+  if (linux && !v6Bindable) t.diagnostic('data-dir-told-past-an-impostor-on-127-0-0-1 is left out: this host cannot bind ::1');
+  const v6 = v6Bindable ? await liveTermd(v6Dir, ['--host', '::1']) : undefined;
   let impostorSaid = '';
   const impostor = v6
     ? await new Promise<boolean>((resolve) => {
@@ -1074,6 +1084,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
         child.once('exit', () => resolve(false));
       })
     : false;
+  if (v6) assert.ok(impostor, `the impostor on 127.0.0.1 started (it said ${JSON.stringify(impostorSaid)})`);
   const edited = path.join(tmp, 'edited-termd.service');
   fs.writeFileSync(edited, '[Service]\n');
   // Edited after its termd started, and read since by a daemon-reload: newer than any process here.

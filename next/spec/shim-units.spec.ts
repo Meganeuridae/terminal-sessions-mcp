@@ -393,23 +393,47 @@ test("the ask has one deadline for the whole exchange and reads at most 1 MiB, h
   }
 });
 
+/** `p`, or `otherwise` if it hasn't settled within `ms`, with the timer cleared either way. */
+async function within<T, U>(p: Promise<T>, ms: number, otherwise: U): Promise<T | U> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([p, new Promise<U>((r) => (timer = setTimeout(() => r(otherwise), ms)))]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 test("the ask's one deadline covers the proof too: a proof still running at the deadline ends the ask, and no request follows it (the house's read of the 17 commits over our fixes, #22)", async () => {
   let asked = 0;
   const server = http.createServer((_req, res) => {
     asked++;
     res.end(JSON.stringify({ status: 'ok', pid: 4242, dataDir: '/srv/running' }));
   });
+  // The listener's side of the ask's one connection closing.
+  const closed = new Promise<'closed'>((r) => server.once('connection', (c: net.Socket) => c.once('close', () => r('closed'))));
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const port = (server.address() as { port: number }).port;
   try {
-    // A proof that shows the socket as the pid's only after a second, three times the ask's deadline.
-    const slow = () => new Promise<undefined>((r) => setTimeout(() => r(undefined), 1000));
-    const t0 = performance.now();
-    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 300, prove: slow }), { error: 'it did not answer /health within 300 ms' });
-    const took = performance.now() - t0;
-    assert.ok(took < 900, `the 300 ms ask took ${took.toFixed(0)} ms`);
-    await new Promise((r) => setTimeout(r, 1000));
-    assert.equal(asked, 0, 'the proof that resolved after the deadline sent nothing');
+    // A proof that shows the socket as the pid's only when the test releases it, once the ask has given up: the ask must
+    // end at its deadline while the proof is still running. Judged by a 900 ms wall-clock bound and a fixed sleep, a
+    // loaded host could fail a correct deadline, and a late proof's request could land after the check (the house's read
+    // of the 14 commits over our fixes, #22).
+    const proof: { entered: boolean; release?: () => void } = { entered: false };
+    const slow = () => {
+      proof.entered = true;
+      return new Promise<undefined>((r) => (proof.release = () => r(undefined)));
+    };
+    const ask = askDataDir(port, 4242, { timeoutMs: 300, prove: slow });
+    // Generous: only a deadline that waits for the proof leaves the ask pending this long.
+    assert.deepEqual(await within(ask, 10_000, 'pending'), { error: 'it did not answer /health within 300 ms' }, 'the ask ended while its proof ran');
+    // The ask destroyed its connection at the deadline. Once the listener's side has closed, nothing the proof does after
+    // can reach it, which a count of requests taken a turn after the release could not show: the listener reads a request
+    // only on a later I/O turn (Abigail-2459's read).
+    assert.equal(await within(closed, 10_000, 'open'), 'closed', 'the ask closed its connection at the deadline');
+    assert.ok(proof.entered && proof.release, 'the proof was entered');
+    proof.release();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(asked, 0, 'nothing reached the listener before its connection closed');
   } finally {
     server.closeAllConnections();
     await new Promise((r) => server.close(r));
@@ -442,6 +466,37 @@ test("a listener on 127.0.0.1 not shown to be termd's is passed over for ::1 wit
     await new Promise((r) => v6.close(r));
     assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 3000, token: 'shim-token', prove }), { error: 'the socket that answered is not its' });
     assert.equal(asked.length, 1);
+  } finally {
+    v6.closeAllConnections();
+    v4.closeAllConnections();
+    await Promise.all([v6, v4].map((s) => new Promise((r) => s.close(() => r(undefined)))));
+  }
+});
+
+test("one deadline covers both addresses: what 127.0.0.1's proof took is gone for ::1 (the house's read of the 14 commits over our fixes, #22)", async (t) => {
+  // The fallback tests' proofs answered at once, so a fresh deadline per address passed them too.
+  const asked: string[] = [];
+  const answer = (dataDir: string) => (_req: http.IncomingMessage, res: http.ServerResponse) => {
+    asked.push(dataDir);
+    res.end(JSON.stringify({ status: 'ok', pid: 4242, dataDir }));
+  };
+  const v6 = http.createServer(answer('/v6'));
+  const bound = await new Promise<boolean>((resolve) => {
+    v6.once('error', () => resolve(false));
+    v6.listen(0, '::1', () => resolve(true));
+  });
+  if (!bound) return t.skip('no ::1 here');
+  const port = (v6.address() as { port: number }).port;
+  const v4 = http.createServer(answer('/v4'));
+  await new Promise<void>((r) => v4.listen(port, '127.0.0.1', r));
+  // Each proof takes 250 ms: 127.0.0.1's says no, and ::1's would say yes, but past a 400 ms deadline for both.
+  const prove = (socket: net.Socket) => new Promise<string | undefined>((r) => setTimeout(() => r(socket.remoteFamily === 'IPv4' ? 'the socket that answered is not its' : undefined), 250));
+  try {
+    // The ask fails, with the deadline's reason, or 127.0.0.1's if a stalled loop ran its proof's timer first; what a
+    // deadline per address would change is that ::1 is asked and answers (Abigail-2459's read).
+    const r = await askDataDir(port, 4242, { timeoutMs: 400, prove });
+    assert.ok('error' in r, `the ask failed (it said ${JSON.stringify(r)})`);
+    assert.deepEqual(asked, [], 'no address was asked');
   } finally {
     v6.closeAllConnections();
     v4.closeAllConnections();
@@ -536,16 +591,26 @@ test("a connection the listener has yet to accept is looked up again until it is
       c.once('connect', () => resolve(c));
       c.once('error', reject);
     });
+    // The lookups, as /proc/net/tcp reads through node's fs: the stand-in is told to accept only once one has been made,
+    // so the lookup is seen to run while the connection is unaccepted, with no sleep for a loaded host to stretch past
+    // its second (the house's read of the 14 commits over our fixes, #22).
+    let reads = 0;
+    const read = fsModule.readFileSync;
+    t.mock.method(fsModule, 'readFileSync', ((file: fs.PathOrFileDescriptor, options?: unknown) => {
+      if (file === '/proc/net/tcp') reads++;
+      return (read as (f: fs.PathOrFileDescriptor, o?: unknown) => string | Buffer)(file, options);
+    }) as typeof fs.readFileSync);
+    syncBuiltinESMExports();
     try {
-      // Told to accept once the lookup has been waiting 200 ms, well inside its second.
-      const t0 = performance.now();
       const shown = connectionOf(socket, late.pid!);
-      await new Promise((r) => setTimeout(r, 200));
+      const before = reads;
+      assert.ok(before >= 1, 'looked up while the connection is not yet accepted');
       late.stdin!.write('accept\n');
       assert.equal(await shown, undefined, 'shown once accepted');
-      const took = performance.now() - t0;
-      assert.ok(took >= 150, `looked up again while not yet accepted (${took.toFixed(0)} ms)`);
+      assert.ok(reads > before, `looked up again after the accept (${before} reads before it, ${reads} in all)`);
     } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
       socket.destroy();
     }
   } finally {
