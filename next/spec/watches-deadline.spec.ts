@@ -516,8 +516,11 @@ test('a silence watch or wait on a live Run whose output from before this manage
       shift = 10_000;
       const long = await later.waitFor({ silenceMs: 5000, runId: 'q' }, 5000);
       assert.equal(long.matched, true, JSON.stringify(long));
-      assert.ok(long.elapsedMs < 1000 && Number(/(\d+)ms$/.exec(String(long.match))?.[1]) >= 10_000, JSON.stringify(long));
-      // No output of the Run is known to name: the journal's last event was another source's.
+      assert.ok(Number(/(\d+)ms$/.exec(String(long.match))?.[1]) >= 10_000, JSON.stringify(long));
+      // No output of the Run is known to name: the journal's last event was another source's. This is also what says it
+      // answered at once: a wait that armed the timer instead fires at its next tick, naming the journal's last event.
+      // A wall-clock bound on the wait added nothing to that, and a CPU-starved run could exceed it (the house's read
+      // of 4860d4c..bc4bc85, #22).
       assert.equal(long.seq, undefined, JSON.stringify(long));
       t.mock.method(f.journal.runs, 'output', () => {
         throw new Error('the store could not be read');
