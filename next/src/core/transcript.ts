@@ -333,6 +333,12 @@ class Projector {
   private owner: string | undefined;
   /** The margins were set ahead of any source (the lasting state of a dropped head, before a header): the next source fed owns them. */
   private adopt = false;
+  /**
+   * Rows others added to the region without taking one with text: a blank row their scroll took, or a row a boundary's
+   * line end moved down to. Each leaves the region a row short of what the program's own output leaves the terminal's,
+   * so the program's own later scroll that takes a row with text took one the terminal still shows.
+   */
+  private owed = 0;
 
   constructor(readonly cols: number, readonly rows: number, keep: 'head' | 'tail', maxLines: number) {
     this.term = new Terminal({ cols, rows, scrollback: SCRATCH_SCROLLBACK, allowProposedApi: true });
@@ -359,6 +365,7 @@ class Projector {
 
   /** DECSTBM: whose output set the margins. */
   private onMargins(): boolean {
+    this.owed = 0;
     if (this.source === undefined) this.adopt = true;
     else {
       this.owner = this.source;
@@ -373,10 +380,12 @@ class Projector {
    * top row goes. When something other than the source that set the margins causes the scroll (a boundary's line end,
    * a note, a header, another source's output) and that row holds text, the projection lost it (`lost`): the margins
    * stay as the program set them, since resetting them would change how its later output scrolls (the house's review
-   * of a8b6f28..4860d4c, PR #22, comment 6341260318). The program's own scrolls lose what the terminal loses. After
-   * any scroll of such a region its new top row joins no row above the region, which it was wrapped from only inside
-   * it: a note's tail read glued onto the row above (an independent read of the fixes for #22). xterm internals:
-   * skipped, and nothing reported, if they change.
+   * of a8b6f28..4860d4c, PR #22, comment 6341260318). A blank row such a scroll takes is owed (`owed`), and the
+   * program's own next scroll that takes a row with text is reported: it took one the terminal still shows (a blank
+   * top row, then `X` and `Y`, lost `r5` silently: an independent read of the fixes for #22). The program's own
+   * scrolls otherwise lose what the terminal loses. After any scroll of such a region its new top row joins no row
+   * above the region, which it was wrapped from only inside it: a note's tail read glued onto the row above (an
+   * independent read of the fixes for #22). xterm internals: skipped, and nothing reported, if they change.
    */
   private hookScroll(): void {
     const core = (this.term as unknown as { _core?: Core })._core;
@@ -387,7 +396,17 @@ class Projector {
       // Read on every line end that scrolls: a region of the normal screen only, from xterm's buffer directly.
       const buf = core.buffer;
       const top = buf !== undefined && buf === core.buffers?.normal && typeof buf.scrollTop === 'number' ? buf.scrollTop : 0;
-      if (top > 0 && (this.adopt || this.source !== this.owner) && rowText(this.term.buffer.normal, top) !== '') this.lost = true;
+      const others = this.adopt || this.source !== this.owner;
+      if (top > 0 && (others || this.owed > 0)) {
+        const text = rowText(this.term.buffer.normal, top) !== '';
+        if (others) {
+          if (text) this.lost = true;
+          else this.owed++;
+        } else if (text) {
+          this.lost = true;
+          this.owed--;
+        }
+      }
       scroll.apply(service, args);
       const line = top > 0 && typeof buf?.ybase === 'number' ? buf.lines?.get?.(buf.ybase + top) : undefined;
       if (line) line.isWrapped = false;
@@ -468,11 +487,16 @@ class Projector {
    * as the projection's own output: a scroll region its line end scrolls is watched as any other (hookScroll). Margins
    * from row 1, as apt's progress bar sets them, scroll into the scrollback and lose nothing. Below the region, on the
    * screen's last row, the line end moves nothing, so the next segment begins on that row's text, which is reported.
+   * Inside a region not from row 1, a line end that moves down adds a row the terminal doesn't have, and is owed.
    */
   async boundary(): Promise<void> {
     const { line, row } = this.freshLine();
     const b = this.term.buffer.active;
-    if (line !== '' && b.type === 'normal' && row === this.rows - 1 && row !== this.margins().bottom && rowText(b, row) !== '') this.lost = true;
+    if (line !== '' && b.type === 'normal') {
+      const { top, bottom } = this.margins();
+      if (row === this.rows - 1 && row !== bottom && rowText(b, row) !== '') this.lost = true;
+      else if (top > 0 && row >= top && row < bottom) this.owed++;
+    }
     this.feeding(undefined);
     await this.feed(`\x18${line}`);
   }

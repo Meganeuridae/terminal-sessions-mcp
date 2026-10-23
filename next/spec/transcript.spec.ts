@@ -865,6 +865,20 @@ test('what the program did not write scrolls a region not starting at row 1 at a
   assert.deepEqual(await read([`${region}\x1b[10;1Hlast\x1b[1A`, { hole: true }, 'X\r\n']), [['top1', 'top2', 'r3', 'r4', 'r5', 'r6', '', '', '', 'Xast'], true, 0, true], 'below the region');
   // The program's own output scrolls its region as the terminal does: nothing to report.
   assert.deepEqual(await read([`${region}\r\nr7\r\n`]), [['top1', 'top2', 'r5', 'r6', 'r7'], false, 0, undefined], 'no boundary');
+  // A blank top row the boundary's line end took leaves the region a row short of the terminal's: the program's own next
+  // scroll that takes a row with text took one the terminal still shows (`r5` beside `r6X`), and says so. Unreported, the
+  // region's rows went silently (an independent read of the fixes for #22).
+  const blankTop = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\n\r\nr4\r\nr5\r\nr6';
+  assert.deepEqual(await read([`${blankTop}X\r\nY\r\n`]), [['top1', 'top2', 'r5', 'r6X', 'Y'], false, 0, undefined], 'the terminal alone');
+  assert.deepEqual(await read([blankTop, { hole: true }, 'X\r\nY\r\n']), [['top1', 'top2', 'r6', 'X', 'Y'], true, 0, true], 'a row owed');
+  // So is a row the boundary's line end moved down to inside the region: `r4` went, where the terminal shows `r4X`.
+  const short = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4';
+  assert.deepEqual(await read([`${short}X\r\nY\r\nZ\r\n`]), [['top1', 'top2', 'r4X', 'Y', 'Z'], false, 0, undefined], 'the terminal alone, moved down');
+  assert.deepEqual(await read([short, { hole: true }, 'X\r\nY\r\nZ\r\n']), [['top1', 'top2', 'X', 'Y', 'Z'], true, 0, true], 'a row owed, moved down');
+  // A boundary on an empty row adds no line end and owes nothing: the program's scrolls after it are its own, as the
+  // terminal's are.
+  assert.deepEqual(await read([`${region}\r\n`, { hole: true }, 'X\r\nY\r\n']), [['top1', 'top2', 'r6', 'X', 'Y'], false, 0, undefined], 'nothing owed');
+  assert.deepEqual(await read([`${region}\r\nX\r\nY\r\n`]), [['top1', 'top2', 'r6', 'X', 'Y'], false, 0, undefined], 'as the terminal alone shows it');
 });
 
 test('a head kept to maxLines counts what it dropped as omitted: the lines fed in the batch where the limit falls, the whole rest of a range that fits on the screen, and a share of what made lines with no line end', async () => {
