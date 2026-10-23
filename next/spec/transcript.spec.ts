@@ -821,6 +821,28 @@ test('a boundary on the alternate screen, after the cursor moved up, scrolls the
   assert.deepEqual([p.truncated, p.omittedInputBytes], [false, 0]);
 });
 
+test('a boundary on the normal screen that scrolls a region not starting at row 1 costs the region a row, and says so; margins from row 1 lose nothing', async () => {
+  // The house's review of a8b6f28..4860d4c (PR #22, comment 6341260318): with margins 3–6 and the cursor moved up, the boundary's
+  // line end at the region's last row scrolls the region, whose top row has no scrollback, and nothing reported it. The margins
+  // stay as the program set them, so its later output scrolls as it did; the row is reported (`truncated`, no input omitted).
+  const read = async (data: string) => {
+    const p = await project([data, { hole: true }, 'X\r\n'], { cols: 20, rows: 10 });
+    return [p.text.split('\n'), p.truncated, p.omittedInputBytes];
+  };
+  const region = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6';
+  assert.deepEqual(await read(`${region}\x1b[2A`), [['top1', 'top2', 'r5', 'r6', 'X'], true, 0], 'the cursor moved up into the region');
+  assert.deepEqual(await read(region), [['top1', 'top2', 'r5', 'r6', 'X'], true, 0], 'the cursor at the region’s last row');
+  // A blank top row goes at once, and the next scroll takes the row below it, which the program's own scroll left in place.
+  assert.deepEqual(await read('\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\n\r\nr4\r\nr5\r\nr6'), [['top1', 'top2', 'r5', 'r6', 'X'], true, 0], 'a blank top row');
+  assert.deepEqual(await read('\x1b[3;6r\x1b[1;1Htop1\r\ntop2\x1b[6;3H'), [['top1', 'top2', '', '', 'X'], false, 0], 'a region with no text: nothing lost');
+  assert.deepEqual(await read('\x1b[1;6r\x1b[1;1Hr1\r\nr2\r\nr3\r\nr4\r\nr5\r\nr6\x1b[2A'), [['r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'X'], false, 0], 'margins from row 1: the top row goes to the scrollback');
+  // Below the region on the screen's last row a line end moves nothing, and the next segment begins on that row's text.
+  assert.deepEqual(await read(`${region}\x1b[10;1Hlast\x1b[1A`), [['top1', 'top2', 'r3', 'r4', 'r5', 'r6', '', '', '', 'Xast'], true, 0], 'below the region');
+  // With no boundary, as the terminal shows it: nothing to report.
+  const whole = await project([`${region}\x1b[2A`], { cols: 20, rows: 10 });
+  assert.deepEqual([whole.text.split('\n'), whole.truncated], [['top1', 'top2', 'r3', 'r4', 'r5', 'r6'], false]);
+});
+
 test('a head kept to maxLines counts what it dropped as omitted: the lines fed in the batch where the limit falls, the whole rest of a range that fits on the screen, and a share of what made lines with no line end', async () => {
   // The house's review of a8b6f28..4860d4c (PR #22, comment 6341260318): the head counted only what it never fed, so on 24 rows a
   // range of five short lines kept to three reported 0 omitted with `truncated`, which the reader takes for lost.

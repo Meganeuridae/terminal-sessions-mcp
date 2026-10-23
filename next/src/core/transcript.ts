@@ -51,7 +51,9 @@
  *    (two concurrent Runs, or a Run and the shell); the held ends of lines
  *    follow at the end of the range (or before a note), in the order they
  *    began. When the source changes, the next source starts on a fresh line,
- *    under a header line when `label` gives one. A `note` chunk is a line of its
+ *    under a header line when `label` gives one; where scroll margins that
+ *    don't start at row 1 make that line end cost a row with text, the
+ *    projection is `truncated` (Projector.boundary). A `note` chunk is a line of its
  *    own (a reader's `[… events missing …]` marker), never part of any source;
  *    a `hole` chunk stands where output was lost (`runChunks`), and the
  *    projection starts afresh there as at a note, with no line of its own, so
@@ -301,7 +303,10 @@ class Lines {
 class Projector {
   readonly term: TerminalType;
   readonly out: Lines;
-  /** Rows may have scrolled out of the scratch scrollback unread (a batch outran its bound). */
+  /**
+   * Rows may have been lost unread: scrolled out of the scratch scrollback (a batch outran its bound), or at a boundary
+   * (`boundary`) whose line end scrolled a region with no scrollback or could not move off a row with text.
+   */
   lost = false;
   private readonly capacity: number;
 
@@ -375,13 +380,44 @@ class Projector {
    * scrolls the frame's top row away, where before the next segment wrote over the row below the cursor. Neither
    * keeps the frame whole, neither is reported (the projection isn't `truncated`, and no input is omitted), and
    * only the program's own repaint of the whole frame brings the row back (a reviewer's read of the fixes for #22).
+   * `row` is the row the line end is given on: a cursor down stops at the bottom margin from within the region or above it.
    */
-  get freshLine(): string {
+  private freshLine(): { line: string; row: number } {
     const b = this.term.buffer.active;
     let last = -1;
     for (let y = b.cursorY; y < this.term.rows; y++) if ((b.getLine(b.baseY + y)?.translateToString(true) ?? '') !== '') last = y;
-    if (last === -1) return b.cursorX > 0 ? '\r\n' : '';
-    return `${last > b.cursorY ? `\x1b[${last - b.cursorY}B` : ''}\r\n`;
+    if (last === -1) return { line: b.cursorX > 0 ? '\r\n' : '', row: b.cursorY };
+    const { bottom } = this.margins();
+    return { line: `${last > b.cursorY ? `\x1b[${last - b.cursorY}B` : ''}\r\n`, row: b.cursorY <= bottom ? Math.min(last, bottom) : last };
+  }
+
+  /**
+   * End a segment before the next one (rule 6): cancel what it left open and take the cursor to a fresh line (freshLine).
+   * On the normal screen, scroll margins that don't start at row 1 can make that line end lose a row. At the region's last
+   * row it scrolls the region, which has no scrollback, so the region keeps one row fewer of what it holds than the
+   * program's output leaves it: its top row goes at once, or, when blank, at the region's next scroll. Below the region,
+   * on the screen's last row, it moves nothing, so the next segment begins on that row's text. The margins stay as the
+   * program set them, since resetting them would change how its later output scrolls; a loss of a row with text is
+   * reported (`lost`), no input omitted (the house's review of a8b6f28..4860d4c, PR #22, comment 6341260318). Margins
+   * from row 1, as apt's progress bar sets them, scroll into the scrollback and lose nothing.
+   */
+  async boundary(): Promise<void> {
+    const { line, row } = this.freshLine();
+    const b = this.term.buffer.active;
+    if (line !== '' && b.type === 'normal') {
+      const { top, bottom } = this.margins();
+      const text = (y: number) => (b.getLine(b.baseY + y)?.translateToString(true) ?? '') !== '';
+      if (row === bottom && top > 0) {
+        for (let y = top; y <= bottom && !this.lost; y++) this.lost = text(y);
+      } else if (row === this.rows - 1 && row !== bottom) this.lost ||= text(row);
+    }
+    await this.feed(`\x18${line}`);
+  }
+
+  /** The active buffer's scroll margins, 0-based (xterm internals; the whole screen if they change). */
+  private margins(): { top: number; bottom: number } {
+    const buf = (this.term as unknown as { _core?: { buffer?: { scrollTop?: unknown; scrollBottom?: unknown } } })._core?.buffer;
+    return typeof buf?.scrollTop === 'number' && typeof buf.scrollBottom === 'number' ? { top: buf.scrollTop, bottom: buf.scrollBottom } : { top: 0, bottom: this.rows - 1 };
   }
 
   /** Rows the next batch may add before the scratch scrollback could drop an unread row. */
@@ -975,7 +1011,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
       // house's read of the 33 commits, #22, comment 6307350650: a title held open at the range's end
       // took a Run's held line, unlabelled).
       if (s + 1 < segs.length) {
-        await pr.feed(`\x18${pr.freshLine}`);
+        await pr.boundary();
         await pr.afterBatch();
       }
     }
