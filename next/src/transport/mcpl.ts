@@ -240,6 +240,8 @@ interface LaneState {
   clearTo: Seq;
   /** While catch-up scans from here, `delivered` does not pass it. */
   scanningFrom?: Seq | undefined;
+  /** Set where this connection began carrying the session again (see `regain`); `delivered` does not pass it until a catch-up planned after it has scanned the session. */
+  regainPin?: { at: Seq } | undefined;
 }
 
 /** A session as delivery sees it: the live Session of one life, or history; either keeps the principal's cursors (G22). */
@@ -272,7 +274,7 @@ const noteBudgets = new WeakMap<object, NoteBudget>();
 /**
  * The lanes of one App, by principal. A principal's `delivered` cursor is one across its
  * connections, so no lane moves it past what another lane of the same principal still owes
- * (the house's read of 2f357bd, #22).
+ * while that lane can carry the session (the house's read of 2f357bd, #22; see `floorAcross`).
  */
 const lanesByApp = new WeakMap<App, Map<Principal, Set<McplLane>>>();
 
@@ -391,6 +393,7 @@ export class McplLane {
 
   /** SPEC §5.3/§6.7: the initial policy, as a Request; the response is a degradation receipt. Malformed fails closed (§5.4). */
   updatePolicy(params: FeatureSetsUpdateParams, form: 'request' | 'notification'): Record<string, unknown> {
+    const could = this.mayCarryNow();
     const r = grantFromUpdate(this.grant, params, form);
     this.grant = r.state;
     if (r.malformed) {
@@ -406,6 +409,13 @@ export class McplLane {
     const selected = r.state.enabledFeatureSets;
     const wanted = (n: string) => (selected === null || selected.includes(n) || selected.includes('*')) && !r.state.disabledFeatureSets.includes(n);
     this.enabledFeatureSets = new Set(derived.enabled.filter(wanted));
+    // A session this lane can carry now and could not before is pinned before anything can settle: the flush below,
+    // and what the live path settles before the activation's catch-up (see `regain`).
+    for (const entry of this.app.registry.list()) {
+      if (!this.app.can(this.me, entry, 'observe')) continue;
+      const t = targetOf(entry);
+      if (!could.has(t.id) && this.mayCarry(t)) this.regain(t);
+    }
     if (form === 'request') this.policyReceived = true;
     if (this.grantTimer) clearTimeout(this.grantTimer);
     this.grantTimer = undefined;
@@ -650,7 +660,11 @@ export class McplLane {
     // other way out abandons the opening, or the channel stayed opening for good, with every message
     // for it held and its owed seqs pinning the cursor (a reviewer's read of the fixes for #22 comment 6270045466).
     const closes = this.closes.get(id) ?? 0;
+    const could = this.mayCarry(t);
     const pending = limit > 0 ? this.beginOpening(id, t) : undefined;
+    // An opening owes what the session delivers meanwhile, so the lane regains the session as the opening begins;
+    // an open without a history read, as it opens (see `regain`).
+    if (!could && this.mayCarry(t)) this.regain(t);
     try {
       if (limit > 0) {
         const r = await replayNewest(this.sourceOf(s), before !== undefined ? { limit, before } : { limit });
@@ -684,6 +698,7 @@ export class McplLane {
     this.registered.add(id);
     const wasOpen = this.open.has(id);
     this.open.add(id);
+    if (!could && pending === undefined && this.carries(t.id)) this.regain(t);
     this.finishOpening(id, pending);
     if (!wasOpen) this.carryNow(t);
     return res;
@@ -993,6 +1008,7 @@ export class McplLane {
     for (const summary of st.summaries.values()) if (summary.from < min) min = summary.from;
     let f = min - 1;
     if (st.scanningFrom !== undefined) f = Math.min(f, st.scanningFrom);
+    if (st.regainPin !== undefined) f = Math.min(f, st.regainPin.at);
     return f;
   }
 
@@ -1034,17 +1050,23 @@ export class McplLane {
   }
 
   private advance(t: Target, st: LaneState): void {
-    // A connection that cannot carry this session's lifecycle messages leaves the cursor where it is:
-    // they stay owed for one that can (G22).
+    // A connection that cannot carry this session's lifecycle messages leaves the cursor where it is: they are the
+    // principal's, delivered by a connection that can, or found from `delivered` by a catch-up (G22).
     if (!this.carries(t.id)) return;
     t.markDelivered(this.me, Math.min(st.clearTo, this.floorAcross(t, st)));
   }
 
-  /** The lowest floor among this principal's connections for the session: `delivered` is theirs together (see `lanesByApp`). */
+  /**
+   * The lowest floor among this principal's connections for the session: `delivered` is theirs together (see `lanesByApp`).
+   * A connection that can't carry the session counts for nothing: what it owed before it lost the session is the
+   * principal's, found again from `delivered` when it carries again. Counted, one refused completion of a connection
+   * that then closed its channel held the cursor of every connection that could deliver (Imago's question on #22's
+   * shared cursor, comment 6355747725).
+   */
   private floorAcross(t: Target, st: LaneState): Seq {
     let f = this.floor(st);
     for (const lane of lanesByApp.get(this.app)?.get(this.me) ?? []) {
-      if (lane === this) continue;
+      if (lane === this || !lane.mayCarry(t)) continue;
       const other = lane.states.get(t.id);
       if (other && other.lineage === t.journal.runs) f = Math.min(f, lane.floor(other));
     }
@@ -1054,6 +1076,50 @@ export class McplLane {
   /** Can this connection deliver the session's lifecycle messages: push events, or its channel open? The endpoint asks before a tool promises notifications about the session (the house's read of 2f357bd, #22). */
   carries(sessionId: string): boolean {
     return this.enabled('terminal.live', 'pushEvents') || (this.open.has(channelId(sessionId)) && this.enabled('terminal.channels', 'channels.incoming'));
+  }
+
+  /** Can this connection carry the session now, or once an open of its channel in flight completes? Only such a lane counts in `floorAcross`. */
+  private mayCarry(t: Target): boolean {
+    return this.carries(t.id) || this.opening.get(channelId(t.id))?.lineage === t.journal.runs;
+  }
+
+  /** The sessions this lane may carry now (see `mayCarry`), among those its principal may observe. */
+  private mayCarryNow(): Set<string> {
+    const ids = new Set<string>();
+    for (const entry of this.app.registry.list()) {
+      const t = targetOf(entry);
+      if (this.app.can(this.me, entry, 'observe') && this.mayCarry(t)) ids.add(t.id);
+    }
+    return ids;
+  }
+
+  /**
+   * The lane can carry the session again: a channel opens, or the grant widens. While it could not, it dropped each
+   * debt whose message it met with nothing to carry it on (see `uncarried`): what it still owes is carried by a message
+   * of its own, or is a message still to be built, which settles when it comes, and a summary left standing with no
+   * retry is retired by the catch-up the regain starts. So the session is only pinned at `delivered`, until a catch-up
+   * planned after this scans it: a lane owing nothing has no floor, and its first settle would lift `delivered` past
+   * what no connection delivered, such as a completion the opening parked whose outcome a synchronous call returned
+   * meanwhile, settled as the open finishes, or anything settled before a catch-up already running lets the queued
+   * one start (Abigail-2459's read of our lean on #22's shared cursor).
+   */
+  private regain(t: Target): void {
+    if (!this.current(t)) return;
+    const st = this.stateOf(t);
+    const { delivered } = t.cursorsOf(this.me);
+    st.regainPin = delivered < t.journal.lastSeq ? { at: delivered } : undefined;
+  }
+
+  /**
+   * A message the lane can't carry, its retry's timer having found nothing to carry it on, or `deliver` having found
+   * push off and the channel closed: its debt goes, unless another message of its own still carries the seq, and the
+   * cursor stays where it is. The message is the principal's, found from `delivered` by a catch-up if it is still
+   * owed then. Kept, a debt owed only while the channel was open, which no catch-up finds owed after it closed, held
+   * every connection of the principal below it for good once this lane could carry the session again (Abigail-2459's
+   * read of the regain).
+   */
+  private uncarried(t: Target, st: LaneState, seq: Seq): void {
+    if (!this.carried(t, st).has(seq)) st.owed.delete(seq);
   }
 
 
@@ -1113,7 +1179,11 @@ export class McplLane {
     const retry = r;
     retry.timer = setTimeout(() => {
       retry.timer = undefined;
-      if (!this.disposed && this.carries(t.id)) this.deliver(t, seg, { released: true });
+      if (this.disposed) return;
+      if (this.carries(t.id)) return this.deliver(t, seg, { released: true });
+      // Nothing to carry it on: the retry can't fire again, so it goes, and so does its debt (see `uncarried`).
+      if (st.retries.get(id) === retry) st.retries.delete(id);
+      this.uncarried(t, st, seg.seq);
     }, Math.min(30_000, 500 * 2 ** Math.min(retry.attempt++, 6)));
     retry.timer.unref?.();
   }
@@ -1258,7 +1328,16 @@ export class McplLane {
       return;
     }
     if (!seg.lifecycle || !this.pushedTo(t, seg)) return this.settleSegment(t, seg, 'not-owed');
-    if (!this.enabled('terminal.live', 'pushEvents')) return this.settleSegment(t, seg, 'refused');
+    if (!this.enabled('terminal.live', 'pushEvents')) {
+      // Push off and the channel closed: nothing carries the message (see `uncarried`). Its own retry goes too when it
+      // has already fired, as one whose message the channel's close sent back from the batch has: kept until an answer
+      // that will never come, it counted as carrying the seq and could not fire again (Abigail-2459's read of the
+      // drops). One whose timer is still pending fires, and its debt stays.
+      this.settleSegment(t, seg, 'refused');
+      const own = st.retries.get(id);
+      if (own && !own.timer) st.retries.delete(id);
+      return this.uncarried(t, st, seg.seq);
+    }
     this.push(t, seg);
   }
 
@@ -1395,7 +1474,7 @@ export class McplLane {
    * across sessions; the rest of each session is one summary with the cursor to read it.
    */
   private async catchUpAll(only?: Set<string>): Promise<void> {
-    const plans: Array<{ t: Target; st: LaneState; src: ReplaySource; from: Seq; open: boolean; covered: Set<Seq>; retire: string[]; left?: Set<Seq>; scan?: LifecycleScan }> = [];
+    const plans: Array<{ t: Target; st: LaneState; src: ReplaySource; from: Seq; open: boolean; covered: Set<Seq>; retire: string[]; pin: LaneState['regainPin']; left?: Set<Seq>; scan?: LifecycleScan }> = [];
     // Every floor goes up before any scan yields, so the live path cannot move a cursor past what a scan has yet to find.
     for (const entry of this.app.registry.list()) {
       if (!this.app.can(this.me, entry, 'observe')) continue;
@@ -1407,8 +1486,14 @@ export class McplLane {
       st.scanningFrom = from;
       // The summaries this catch-up may retire are those standing now: one made while it scans may hold what it won't find.
       const retire = [...st.summaries.keys()].filter((id) => !st.inflight.has(id));
-      plans.push({ t, st, src: this.sourceOf(entry), from, open: this.openOrOpening(channelId(t.id)), covered: new Set(), retire });
+      plans.push({ t, st, src: this.sourceOf(entry), from, open: this.openOrOpening(channelId(t.id)), covered: new Set(), retire, pin: st.regainPin });
     }
+    // A regain pin goes with the scan planned under it, as `scanningFrom` does, failed or not. One set while this
+    // catch-up scans is the queued catch-up's to release: this one planned before the session was regained, and its
+    // scan may have read past what the lane then owed nothing for (see `regain`).
+    const unpin = (): void => {
+      for (const p of plans) if (p.pin !== undefined && p.st.regainPin === p.pin) p.st.regainPin = undefined;
+    };
     try {
       for (const p of plans) {
         if (this.disposed) return;
@@ -1422,8 +1507,10 @@ export class McplLane {
       }
     } catch (e) {
       for (const p of plans) p.st.scanningFrom = undefined;
+      unpin();
       throw e;
     }
+    unpin();
     // Only once every scan has returned, while scanningFrom still holds each floor: retired before, a scan that
     // failed left the summaries gone and the floor lowered, and delivered could pass what they stood for (the
     // house's read of a8b6f28, #22).

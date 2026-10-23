@@ -2100,10 +2100,11 @@ test("a catch-up that retires a refused catch-up summary retires the seq it owed
 });
 
 test("a catch-up's summary of a lost range covers the debts in it, so completions retention took before a scan, or after a refused summary covered them, don't pin the cursor", { timeout: 90_000 }, async () => {
-  // Completions owed while nothing carried the session have no retry of their own. Those retention took before
-  // any catch-up lay in the range the scan reported lost, and those a refused summary covered were left there once
-  // a catch-up retired it and retention took them: no summary covered either, and the cursor stayed below them for
-  // the life of the connection (the house's read of a8b6f28, #22: by run).
+  // Debts nothing carries have no retry of their own. Those retention took before any catch-up lay in the range the
+  // scan reported lost, and those a refused summary covered were left there once a catch-up retired it and retention
+  // took them: no summary covered either, and the cursor stayed below them for the life of the connection (the
+  // house's read of a8b6f28, #22: by run). A connection that can't carry the session drops each debt whose message it
+  // meets with nothing to carry it on, so a debt nothing carries is one whose message is still to be built. The first ones are stood in for by hand, after the grant's regain and before its activation's catch-up.
   const f = await bareLane('c-lost-covered');
   try {
     const st = () => f.inside.states.get('rc')!;
@@ -2127,7 +2128,10 @@ test("a catch-up's summary of a lost range covers the debts in it, so completion
     const eventId = (req: { params?: unknown }) => (req.params as { eventId?: string } | undefined)?.eventId ?? '';
     f.refuse.value = true;
     f.refuse.only = (req) => req.method === 'push/event' && /:summary[:~]/.test(eventId(req));
-    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    const later: Array<() => void> = [];
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, { isRequest: true, after: (fn: () => void) => later.push(fn) });
+    for (const seq of owedFirst) st().owed.add(seq);
+    for (const fn of later) fn();
     await until(() => [...st().summaries.values()].some((x) => !x.folded && x.covered.size > 0), 10_000, "the catch-up's summary covering omitted completions");
     const covered = [...[...st().summaries.values()].find((x) => !x.folded && x.covered.size > 0)!.covered];
     const refused = eventId(f.sent.find((m) => m.method === 'push/event' && /:summary[:~]/.test(eventId(m)))!);
@@ -2385,12 +2389,17 @@ test("a catch-up's summary leaves out a past-the-cap completion that a message o
       await until(() => s.run(r.runId!).seq.end !== undefined, 5000, `Run ${i} to end`);
       ends.push(s.run(r.runId!).seq.end!);
     }
-    // The oldest is past the catch-up's limit of 20, and a message of its own still carries it.
+    // Debts nothing carries when the catch-up plans, stood in for by hand after the grant's regain and before its
+    // activation's catch-up (see the lost-range spec above). The oldest is past the catch-up's limit of 20, and a
+    // message of its own still carries it: a retry waiting on its timer.
     const carriedSeq = ends[0]!;
-    assert.ok(st().owed.has(carriedSeq), 'the oldest completion is owed');
-    st().retries.set('cc-carrier', { seq: carriedSeq, kind: 'run', attempt: 0 });
     f.late.value = true;
-    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    const later: Array<() => void> = [];
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, { isRequest: true, after: (fn: () => void) => later.push(fn) });
+    for (const seq of ends) st().owed.add(seq);
+    const waiting = setTimeout(() => undefined, 60_000);
+    st().retries.set('cc-carrier', { seq: carriedSeq, kind: 'run', attempt: 0, timer: waiting });
+    for (const fn of later) fn();
     await until(() => st().summaries.size === 1, 10_000, "the catch-up's summary");
     const [summary] = [...st().summaries.values()];
     assert.ok(summary!.covered.has(ends[1]!), 'a past-the-cap completion nothing else carries is covered');
@@ -2401,6 +2410,7 @@ test("a catch-up's summary leaves out a past-the-cap completion that a message o
     assert.ok(st().owed.has(carriedSeq), 'the carried completion is still owed after the summary is accepted');
     assert.ok(st().retries.has('cc-carrier'), 'and its own message is still retried');
     assert.ok(s.cursorsOf(A).delivered < carriedSeq, `the cursor stays below it (delivered ${s.cursorsOf(A).delivered})`);
+    clearTimeout(waiting);
     st().retries.delete('cc-carrier');
   } finally {
     await f.close();
@@ -2469,9 +2479,14 @@ test("a catch-up's summary of a lost range leaves out a debt a held message stil
     }
     const gone = goneNow();
     assert.ok(gone.length >= 2, `retention took at least two owed completions (${JSON.stringify(gone)}; oldest ${s.journal.oldestSeq}, ${ends.length} Runs)`);
-    st().held.set('rh-held', { since: performance.now(), seq: gone[0]! });
+    // Debts nothing carries when the catch-up plans, stood in for by hand after the grant's regain and before its
+    // activation's catch-up (see the lost-range spec above).
     f.late.value = true;
-    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    const later: Array<() => void> = [];
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, { isRequest: true, after: (fn: () => void) => later.push(fn) });
+    for (const seq of ends) st().owed.add(seq);
+    st().held.set('rh-held', { since: performance.now(), seq: gone[0]! });
+    for (const fn of later) fn();
     await until(() => [...st().summaries.values()].some((x) => !x.folded), 10_000, "the catch-up's summary");
     const covered = [...st().summaries.values()].find((x) => !x.folded)!.covered;
     assert.ok(!covered.has(gone[0]!), `the held completion's debt is not covered (${JSON.stringify([...covered])})`);
@@ -2539,6 +2554,299 @@ test("a forgotten name's late settlement writes nothing into the cursors.json of
     await sleep(1500);
     const now = onDisk();
     assert.ok(now !== undefined && now <= neu.journal.lastSeq, `the file holds the new life's cursors, not the old life's ${old.cursorsOf(A).delivered} (read ${now}, new life at seq ${neu.journal.lastSeq})`);
+  } finally {
+    await f.close();
+  }
+});
+
+// ───────────── a lane owes only what it can carry (the house's lean on Imago's two lane questions, #22) ─────────────
+
+/** Another connection of `f`'s principal on the same App, with a host that accepts, or refuses deliveries while `refuse.value`. */
+async function secondLane(f: Awaited<ReturnType<typeof bareLane>>, connection: string, grant: string[]) {
+  const sent: Msg[] = [];
+  const refuse = { value: false };
+  const refusal = (req: Msg): unknown =>
+    req.method === 'push/event'
+      ? { accepted: false, reason: 'queue_full' }
+      : { results: (req.params as { messages: Array<{ messageId: string }> }).messages.map((x) => ({ messageId: x.messageId, accepted: false, reason: 'queue_full' })) };
+  const out: Outbound = new Outbound((m) => {
+    const req = m as Msg;
+    sent.push(req);
+    if (req.method === undefined || req.id === undefined) return;
+    const result = refuse.value && (req.method === 'push/event' || req.method === 'channels/incoming') ? refusal(req) : TestHost.accept(req);
+    setImmediate(() => out.handleResponse({ jsonrpc: '2.0', id: req.id!, result } as never));
+  });
+  const lane = new McplLane(f.app, { principal: A, connectionId: connection }, out, () => undefined);
+  f.registry.onChange((c) => {
+    if (c.type === 'created') lane.sessionCreated(c.id);
+  });
+  await lane.handle('featureSets/update', { effectiveCapabilities: grant }, f.ctx);
+  return { lane, sent, refuse, inside: lane as unknown as Awaited<ReturnType<typeof bareLane>>['inside'] };
+}
+
+/** The deliveries a lane's host was sent about a Run: push events and channel messages. */
+const sentAbout = (sent: Msg[], runId: string): Msg[] =>
+  sent.filter((m) => {
+    if (m.method === 'push/event') return (m.params as { origin: Record<string, unknown> }).origin.runId === runId;
+    if (m.method === 'channels/incoming') return (m.params as { messages: Array<{ metadata: Record<string, unknown> }> }).messages.some((x) => x.metadata.runId === runId);
+    return false;
+  });
+
+const NO_PUSH = FULL_GRANT.filter((c) => c !== 'pushEvents');
+
+test("a connection that can't carry a session owes it nothing, so another connection of the principal moves the cursor past what it delivers", { timeout: 30_000 }, async () => {
+  // Owed on lineage alone, each completion the second connection could only push into a refusal pinned the first
+  // connection's cursor, and its owed set grew for as long as it lived (Imago's question on #22, comment 6355747725).
+  const f = await bareLane('nc-push');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'nc' });
+    const s = live(f.registry, 'nc');
+    const g = await secondLane(f, 'nc-channels', NO_PUSH);
+    try {
+      for (let i = 0; i < 3; i++) {
+        const r = await f.app.run(f.caller, { session: 'nc', command: `echo nc-${i}`, target: 'process', wait: 0 });
+        await until(() => s.run(r.runId!).seq.end !== undefined && s.cursorsOf(A).delivered >= s.run(r.runId!).seq.end!, 5000, `completion ${i} pushed and the cursor past it`);
+      }
+      assert.equal(g.inside.states.get('nc')?.owed.size ?? 0, 0, 'the connection that cannot carry the session owes it nothing');
+    } finally {
+      g.lane.dispose();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("a completion refused on a channel that then closed doesn't hold the cursor of the connection that delivers it, and what that delivered is paid when the channel reopens", { timeout: 30_000 }, async () => {
+  const f = await bareLane('lc-push');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'lc' });
+    const s = live(f.registry, 'lc');
+    const g = await secondLane(f, 'lc-channels', NO_PUSH);
+    try {
+      await g.lane.openChannel({ channelId: 'terminal:lc' });
+      f.refuse.value = true;
+      g.refuse.value = true;
+      const r = await f.app.run(f.caller, { session: 'lc', command: 'echo lc-refused', target: 'process', wait: 0 });
+      const runId = r.runId!;
+      await until(() => sentAbout(g.sent, runId).length >= 1 && sentAbout(f.sent, runId).length >= 1, 5000, 'the completion sent on both connections and refused');
+      await until(() => [...(g.inside.states.get('lc')?.retries.values() ?? [])].some((x) => x.kind === 'run'), 5000, "the channel's refusal retried");
+      g.lane.closeChannel('terminal:lc');
+      await sleep(800); // the channel's retry fires with nothing to carry it on
+      f.refuse.value = false;
+      const end = s.run(runId).seq.end!;
+      await until(() => s.cursorsOf(A).delivered >= end, 5000, 'pushed again and accepted: the cursor passes it, the closed channel counting for nothing');
+      // Its retry went, with its debt, when its timer found nothing to carry it on: reopened, the channel owes nothing.
+      g.refuse.value = false;
+      await g.lane.openChannel({ channelId: 'terminal:lc' });
+      const next = await f.app.run(f.caller, { session: 'lc', command: 'echo lc-next', target: 'process', wait: 0 });
+      await until(() => s.run(next.runId!).seq.end !== undefined && s.cursorsOf(A).delivered >= s.run(next.runId!).seq.end!, 5000, 'the next completion delivered and the cursor past it');
+      assert.ok(![...g.inside.states.get('lc')!.retries.values()].some((x) => x.kind === 'run'), 'no stranded retry is left');
+    } finally {
+      g.lane.dispose();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("a completion queued on a channel that closed before it went out leaves no debt to hold the cursor, then or when the channel reopens", { timeout: 30_000 }, async () => {
+  const f = await bareLane('lb-push');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'lb' });
+    const s = live(f.registry, 'lb');
+    const g = await secondLane(f, 'lb-channels', NO_PUSH);
+    try {
+      await g.lane.openChannel({ channelId: 'terminal:lb' });
+      await until(() => g.inside.catchingUp === undefined, 4000, "the channel's catch-up to finish");
+      // The channel closes as the completion is queued on it, once the lane, subscribed first, has queued it: the
+      // flush then finds nothing to carry it on, and the debt goes with it, the cursor staying where it is.
+      let closed = false;
+      const off = f.app.segmenter(s).subscribe((x) => {
+        if (x.kind !== 'run' || closed) return;
+        closed = true;
+        g.lane.closeChannel('terminal:lb');
+      });
+      const r = await f.app.run(f.caller, { session: 'lb', command: 'echo lb-closed', target: 'process', wait: 0 });
+      await until(() => closed && g.inside.batch.length === 0, 5000, 'the channel closed and its queued message routed again');
+      off();
+      const end = s.run(r.runId!).seq.end!;
+      const gst = g.inside.states.get('lb')!;
+      assert.ok(!gst.owed.has(end) && !g.inside.carried(s, gst).has(end), 'the closed channel owes it no more, and nothing of its own carries it');
+      await until(() => s.cursorsOf(A).delivered >= end, 5000, 'pushed and accepted: the cursor passes it, the closed channel counting for nothing');
+      await g.lane.openChannel({ channelId: 'terminal:lb' });
+      const next = await f.app.run(f.caller, { session: 'lb', command: 'echo lb-next', target: 'process', wait: 0 });
+      await until(() => s.run(next.runId!).seq.end !== undefined && s.cursorsOf(A).delivered >= s.run(next.runId!).seq.end!, 5000, 'the next completion delivered and the cursor past it');
+    } finally {
+      g.lane.dispose();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("a retry that fired onto a channel closed before its flush leaves neither the debt nor the retry", { timeout: 20_000 }, async () => {
+  // Fired with the lane carrying, a retry keeps its entry, with no timer, until an answer settles it. Sent back from
+  // the batch to the refused settle when the channel closed before the flush, that entry still counted as carrying
+  // the seq, so the debt stayed, and the entry could never fire again (Abigail-2459's read of the drops).
+  const f = await bareLane('rf');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'rf' });
+    const s = live(f.registry, 'rf');
+    await f.lane.openChannel({ channelId: 'terminal:rf' });
+    await until(() => f.inside.catchingUp === undefined, 4000, "the channel's catch-up to finish");
+    const st = () => f.inside.states.get('rf')!;
+    f.refuse.value = true;
+    const r = await f.app.run(f.caller, { session: 'rf', command: 'echo rf', target: 'process', wait: 0 });
+    const runId = r.runId!;
+    await until(() => [...st().retries.values()].some((x) => x.kind === 'run'), 5000, 'the completion refused on the channel and retried');
+    f.refuse.value = false;
+    // When the retry's timer sends the completion onto the channel, the channel closes before the batch flushes.
+    const lane = f.lane as unknown as { deliver: (t: Session, seg: { kind?: string; runId?: string }, o?: { released?: boolean }) => void };
+    const deliver = lane.deliver.bind(f.lane);
+    let closed = false;
+    lane.deliver = (t, seg, o) => {
+      deliver(t, seg, o);
+      if (!closed && seg.kind === 'run' && seg.runId === runId && f.inside.batch.length > 0) {
+        closed = true;
+        f.lane.closeChannel('terminal:rf');
+      }
+    };
+    try {
+      await until(() => closed && f.inside.batch.length === 0, 5000, 'the retry sent onto the channel, the channel closed, and the flush sent it back');
+    } finally {
+      delete (lane as { deliver?: unknown }).deliver;
+    }
+    assert.ok(![...st().retries.values()].some((x) => x.kind === 'run'), 'no retry is left');
+    assert.ok(!st().owed.has(s.run(runId).seq.end!), 'nor its debt');
+  } finally {
+    await f.close();
+  }
+});
+
+test("a debt owed only while a channel was open, which no catch-up finds owed after it closed, goes when the connection carries the session again", { timeout: 30_000 }, async () => {
+  // Another principal's completion is owed only on an open channel. Refused there, its retry's timer then found the
+  // channel closed, and the debt stayed: kept at a grant's regain above `delivered`, it was never owed again by the
+  // catch-up, scanning with the channel closed, and once the lane counted again it held the cursor below it for good
+  // (Abigail-2459's read of the regain).
+  const f = await bareLane('oo-a');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
+    const other = { principal: B, connectionId: 'oo-b' };
+    await f.app.sessionOpen(other, { id: 'oo', visibility: 'shared' });
+    const s = live(f.registry, 'oo');
+    await f.lane.openChannel({ channelId: 'terminal:oo' });
+    await until(() => f.inside.catchingUp === undefined, 4000, "the channel's catch-up to finish");
+    f.refuse.value = true;
+    const r = await f.app.run(other, { session: 'oo', command: 'echo theirs', target: 'process', wait: 0 });
+    await until(() => [...(f.inside.states.get('oo')?.retries.values() ?? [])].some((x) => x.kind === 'run'), 5000, 'their completion refused on the channel and retried');
+    f.lane.closeChannel('terminal:oo');
+    await sleep(800); // the retry fires with nothing to carry it on
+    f.refuse.value = false;
+    const end = s.run(r.runId!).seq.end!;
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => f.inside.catchingUp === undefined && s.cursorsOf(A).delivered >= end, 5000, `the cursor past it once push carries the session (delivered ${s.cursorsOf(A).delivered}, owed ${JSON.stringify([...(f.inside.states.get('oo')?.owed ?? [])])})`);
+    assert.equal(sentAbout(f.sent, r.runId!).filter((m) => m.method === 'push/event').length, 0, 'never pushed: it is not this principal\'s');
+  } finally {
+    await f.close();
+  }
+});
+
+test("a connection that couldn't carry a session regains it as its channel's open begins: a completion the open finishes settled doesn't lift the cursor past one it no longer owed", { timeout: 20_000 }, async () => {
+  // Owing nothing while it could not carry the session, the lane has no floor there: without the pin, the first
+  // settle after the open would lift `delivered` past the earlier completion before any catch-up pinned the session
+  // (Abigail-2459's read of the house's lean on #22's shared cursor).
+  const d = await daemon();
+  try {
+    const a = await d.host('ta', 'rg-a', { grant: NO_PUSH });
+    await a.call('session_open', { session: 'rg' });
+    const page = await a.call('run', { session: 'rg', command: 'echo rg-page' }); // a Run for the page to render
+    const s = live(d.registry, 'rg');
+    // A Run's message has reached the lane, subscribed first, once it reaches this listener: recorded whenever it
+    // comes, since under load it can come before the run call's answer does. Waited on by its end alone, the Run's
+    // message could come a moment later, during the open, and be parked and sent like any other.
+    const built = new Set<unknown>();
+    const off = d.app.segmenter(s).subscribe((x) => {
+      if (x.kind === 'run') built.add(x.runId);
+    });
+    const unowed = await a.call('run', { session: 'rg', command: 'echo rg-unowed', wait: 0 });
+    const unowedId = unowed.structured!.runId as string;
+    await until(() => built.has(unowedId), 10_000, 'the Run to end, and its message to reach the lane, while nothing carries the session');
+    const hold = holdTranscripts(s, page.structured?.runId);
+    const opening = a.request('channels/open', { channelId: 'terminal:rg', history: { limit: 10 } });
+    await hold.reached;
+    // A Run that ends while the open reads is parked for the channel; its outcome then returned to an `await`, the
+    // open's finish settles it at once.
+    const parked = await a.call('run', { session: 'rg', command: 'sleep 0.2; echo rg-parked', wait: 0 });
+    const parkedId = parked.structured!.runId as string;
+    await until(() => s.run(parkedId).seq.end !== undefined, 10_000, 'the parked Run to end');
+    await until(() => built.has(parkedId), 10_000, "the parked Run's message to reach the lane");
+    off();
+    await a.call('await', { runId: parkedId });
+    hold.release();
+    await opening;
+    hold.restore();
+    const got = await a.delivery(aboutRun(unowedId), 4000);
+    assert.equal(got.via, 'incoming', 'the completion it no longer owed is found by the catch-up, on the channel');
+    await a.close();
+  } finally {
+    await d.stop();
+  }
+});
+
+test("a grant that lets a connection carry a session again pins it until the activation's catch-up: what settles before that doesn't lift the cursor past a completion it no longer owed", { timeout: 20_000 }, async () => {
+  const f = await bareLane('rg-grant');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'rw' });
+    const s = live(f.registry, 'rw');
+    const r = await f.app.run(f.caller, { session: 'rw', command: 'echo rw-unowed', target: 'process', wait: 0 });
+    await until(() => s.run(r.runId!).seq.end !== undefined, 5000, 'the Run to end while nothing carries the session');
+    await sleep(100);
+    // The activation runs after the receipt is on the wire, as the endpoint's `after` does; meanwhile the live path settles.
+    const later: Array<() => void> = [];
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, { isRequest: true, after: (fn: () => void) => later.push(fn) });
+    const note = f.app.note(f.caller, { session: 'rw', text: 'a note before the activation' });
+    const st = f.inside.states.get('rw') as unknown as { clearTo: number };
+    await until(() => st.clearTo >= note.seq, 4000, 'the note settled as owed to nobody');
+    for (const fn of later) fn();
+    await until(() => sentAbout(f.sent, r.runId!).length >= 1, 4000, 'the completion pushed by the catch-up');
+  } finally {
+    await f.close();
+  }
+});
+
+test("a regain pin set while a catch-up scans the session is the next catch-up's to release, not that one's", { timeout: 20_000 }, async () => {
+  const f = await bareLane('rg-scan');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'rs' });
+    const s = live(f.registry, 'rs');
+    const r = await f.app.run(f.caller, { session: 'rs', command: 'echo rs', target: 'process', wait: 0 });
+    await until(() => s.run(r.runId!).seq.end !== undefined, 5000, 'the Run to end');
+    const st = () => f.inside.states.get('rs') as unknown as { regainPin?: { at: number } };
+    const hold = holdTranscripts(s, r.runId);
+    let during: { at: number } | undefined;
+    // In the middle of the open's catch-up scan, the channel closes and opens again: regained a second time, on the
+    // next microtask, once the scanning catch-up is recorded as running, so the reopen's catch-up is queued behind it.
+    let running = false;
+    onFirstPage(s, () => {
+      queueMicrotask(() => {
+        running = f.inside.catchingUp !== undefined;
+        f.lane.closeChannel('terminal:rs');
+        void f.lane.openChannel({ channelId: 'terminal:rs' });
+        during = st().regainPin;
+      });
+    });
+    await f.lane.openChannel({ channelId: 'terminal:rs' });
+    await hold.reached; // the first catch-up is past its scan, sending what it found
+    assert.ok(running, 'the reopen came while the first catch-up ran');
+    assert.ok(during !== undefined, 'the reopen pinned the session');
+    assert.equal(st().regainPin, during, "the catch-up that was scanning when it was set leaves it");
+    hold.release();
+    hold.restore();
+    await until(() => st().regainPin === undefined && f.inside.catchingUp === undefined, 5000, 'the queued catch-up releases it');
+    await until(() => sentAbout(f.sent, r.runId!).length >= 1, 4000, 'the completion on the channel');
   } finally {
     await f.close();
   }
