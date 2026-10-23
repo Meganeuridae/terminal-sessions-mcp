@@ -2306,17 +2306,21 @@ test("a summary's acceptance or retirement leaves its own seq owed while another
     const own = `${NODE_NAME}/ro-own-summary`;
     st.summaries.set(own, { from: 1, covered: new Set(), owes: x });
     st.retries.set(own, { seq: x, kind: 'summary', attempt: 0 });
-    (f.inside.opening as unknown as Map<string, unknown>).set('terminal:ro', { lineage: (s.journal as unknown as { runs: unknown }).runs, held: new Map([[own, { t: s, seg: { seq: x } }]]) });
+    (f.inside.opening as unknown as Map<string, unknown>).set('terminal:ro', { lineage: (s.journal as unknown as { runs: unknown }).runs, held: new Map([[own, { t: s, seg: { seq: x, lifecycle: true } }]]) });
     f.inside.retireSummaries(s, st, [own]);
     (f.inside.opening as unknown as Map<string, unknown>).delete('terminal:ro');
     assert.ok(!st.owed.has(x), 'retired with only its own retry and parked copy carrying its seq, the debt goes');
-    // An opening parks a message at the same seq number: counted when it is this lineage's, not when it is another's.
+    // An opening parks a message at the same seq number: counted when it is this lineage's lifecycle message, not when
+    // it is another lineage's, nor when it is ambient, which is neither retried nor owed (the house's lean on #22's lane
+    // questions).
     const openings = f.inside.opening as unknown as Map<string, unknown>;
-    const parked = new Map([['other', { t: s, seg: { seq: x } }]]);
+    const parked = new Map([['other', { t: s, seg: { seq: x, lifecycle: true } }]]);
     openings.set('terminal:ro', { lineage: (s.journal as unknown as { runs: unknown }).runs, held: parked });
     assert.ok(f.inside.carried(s, st).has(x), "this lineage's parked seq is carried");
     openings.set('terminal:ro', { lineage: {}, held: parked });
     assert.ok(!f.inside.carried(s, st).has(x), "another lineage's parked seq is not carried here");
+    openings.set('terminal:ro', { lineage: (s.journal as unknown as { runs: unknown }).runs, held: new Map([['ambient', { t: s, seg: { seq: x, lifecycle: false } }]]) });
+    assert.ok(!f.inside.carried(s, st).has(x), 'a parked ambient message carries no debt');
     openings.delete('terminal:ro');
     // On a lane that carries the session, the summary's acceptance lifts the cursor to just below the seq still
     // carried: what it settled is passed, what still goes out is not (the house's read of 4860d4c..bc4bc85, #22).
@@ -2847,6 +2851,34 @@ test("a regain pin set while a catch-up scans the session is the next catch-up's
     hold.restore();
     await until(() => st().regainPin === undefined && f.inside.catchingUp === undefined, 5000, 'the queued catch-up releases it');
     await until(() => sentAbout(f.sent, r.runId!).length >= 1, 4000, 'the completion on the channel');
+  } finally {
+    await f.close();
+  }
+});
+
+test("an ambient message carries no debt: a summary whose own seq it shares settles that seq when accepted", { timeout: 20_000 }, async () => {
+  // Counted as carrying it, an ambient message refused, which is neither retried nor settled, left the summary's own
+  // seq owed with nothing to carry it (the house's lean on #22's lane questions).
+  const f = await bareLane('amb');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'am' });
+    const s = live(f.registry, 'am');
+    await f.lane.openChannel({ channelId: 'terminal:am' });
+    await until(() => f.inside.catchingUp === undefined && f.inside.batch.length === 0, 4000, 'the open to settle');
+    const x = s.journal.lastSeq;
+    const st = f.inside.states.get('am')!;
+    f.late.value = true;
+    const ambient = `am-ambient-${x}`;
+    f.inside.deliver(s, { kind: 'output', lifecycle: false, seq: x, ts: Date.now(), messageId: ambient, tags: ['terminal:output'], head: '[terminal] am: output', metadata: {}, interested: [] }, { released: true });
+    await until(() => f.pending.length >= 1, 4000, 'the ambient message in flight');
+    assert.ok(st.inflight.has(`${NODE_NAME}/${ambient}`), 'in flight');
+    st.owed.add(x);
+    st.summaries.set(`${NODE_NAME}/am-gap-summary`, { from: 1, covered: new Set(), owes: x });
+    f.inside.settleSegment(s, { kind: 'summary', lifecycle: true, seq: x, messageId: 'am-gap-summary' }, 'accepted');
+    assert.ok(!st.owed.has(x), "the summary's acceptance settles its own seq");
+    f.late.value = false;
+    for (const p of f.pending.splice(0)) p.answer();
   } finally {
     await f.close();
   }

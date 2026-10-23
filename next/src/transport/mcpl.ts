@@ -224,8 +224,11 @@ interface LaneState {
   lineage: object;
   /** Lifecycle seqs still owed (G22). Elapsed time is never an acknowledgement. */
   owed: Set<Seq>;
-  /** Message ids whose delivery awaits the host's answer. A summary and an event can share a seq. */
-  inflight: Map<string, Seq>;
+  /**
+   * Message ids whose delivery awaits the host's answer, each with the seq it carries: a lifecycle message's own,
+   * none for an ambient one, which is neither retried nor owed. A summary and an event can share a seq.
+   */
+  inflight: Map<string, Seq | undefined>;
   /** Failed lifecycle deliveries remain owed, with their original stable message id; past `McplLane.retryMax` the oldest fold into a summary. */
   retries: Map<string, { seq: Seq; kind: SegmentKind; attempt: number; timer?: NodeJS.Timeout | undefined }>;
   /**
@@ -1141,10 +1144,13 @@ export class McplLane {
   private carried(t: Target, st: LaneState): Set<Seq> {
     // Only this lineage's opening: another's, a forgotten name's still reading its history, holds another journal's
     // seqs, which counted here pinned this lineage's debts (the house's read of 4860d4c, #22).
+    // Lifecycle messages only: an ambient one is neither retried nor owed, so refused it left the seq it shared with a
+    // summary owed, carried by nothing (the house's lean on #22's lane questions).
     const o = this.opening.get(channelId(t.id));
-    const opening = o?.lineage === t.journal.runs ? [...o.held.values()].map((h) => h.seg.seq) : [];
+    const opening = o?.lineage === t.journal.runs ? [...o.held.values()].flatMap((h) => (h.seg.lifecycle ? [h.seg.seq] : [])) : [];
     const held = [...st.held.values()].flatMap((h) => (h.seq === undefined ? [] : [h.seq]));
-    return new Set([...st.inflight.values(), ...[...st.retries.values()].map((r) => r.seq), ...opening, ...held]);
+    const inflight = [...st.inflight.values()].flatMap((seq) => (seq === undefined ? [] : [seq]));
+    return new Set([...inflight, ...[...st.retries.values()].map((r) => r.seq), ...opening, ...held]);
   }
 
   private remember(id: string): void {
@@ -1319,7 +1325,7 @@ export class McplLane {
     if (ours && this.open.has(cid) && this.enabled('terminal.channels', 'channels.incoming')) {
       const msg = this.message(t, seg);
       this.remember(msg.messageId);
-      st.inflight.set(id, seg.seq);
+      st.inflight.set(id, seg.lifecycle ? seg.seq : undefined);
       this.batch.push({ t, seg, msg });
       if (!this.batchTimer) {
         this.batchTimer = setTimeout(() => void this.flush(), BATCH_MS);
