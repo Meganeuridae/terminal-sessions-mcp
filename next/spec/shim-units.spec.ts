@@ -504,31 +504,54 @@ test("one deadline covers both addresses: what 127.0.0.1's proof took is gone fo
   }
 });
 
-test("a listener on 127.0.0.1 that resets the connection, as it is made or while it is proved, is passed over for ::1 too (the house's read of the 14 commits over our fixes, #22)", async (t) => {
-  // Read as termd's own failure, the reset ended the ask, and the termd on ::1 was never asked.
-  const asked: string[] = [];
-  const v6 = http.createServer((req, res) => {
-    asked.push(req.headers.authorization ?? '-');
-    res.end(JSON.stringify({ status: 'ok', pid: 4242, dataDir: '/v6' }));
+for (const when of ['as it is made', 'while it is proved'] as const) {
+  test(`a listener on 127.0.0.1 that resets the connection ${when} is passed over for ::1 too (the house's read of the 14 commits over our fixes, #22)`, async (t) => {
+    // Read as termd's own failure, the reset ended the ask, and the termd on ::1 was never asked.
+    const asked: string[] = [];
+    const v6 = http.createServer((req, res) => {
+      asked.push(req.headers.authorization ?? '-');
+      res.end(JSON.stringify({ status: 'ok', pid: 4242, dataDir: '/v6' }));
+    });
+    const bound = await new Promise<boolean>((resolve) => {
+      v6.once('error', () => resolve(false));
+      v6.listen(0, '::1', () => resolve(true));
+    });
+    if (!bound) return t.skip('no ::1 here');
+    const port = (v6.address() as { port: number }).port;
+    // Reset as accepted (on Linux, in the house's runs, the connect itself failed), or held and reset once the proof is
+    // running, so that case is met on every host rather than only as a host's timing falls.
+    const held: net.Socket[] = [];
+    const resets = net.createServer((c) => {
+      held.push(c);
+      c.on('error', () => {});
+      if (when === 'as it is made') c.resetAndDestroy();
+    });
+    const accepted = new Promise<net.Socket>((r) => resets.once('connection', r));
+    await new Promise<void>((r) => resets.listen(port, '127.0.0.1', r));
+    // Only a socket that reads as connected over IPv6 is shown as termd's, at once. Any other waits past the deadline, so
+    // only the reset can end it: a reset socket's other end can read as unknown, and the real proof never shows such a
+    // socket as anyone's (connectionOf). Passed for not reading as IPv4, a socket reset before its family was read was
+    // shown, and the request went into the reset: `write EPIPE`, not unproven (macOS 24, the fork's run 39896549112).
+    const prove = (socket: net.Socket) => {
+      if (socket.remoteFamily === 'IPv6') return Promise.resolve(undefined);
+      if (when === 'while it is proved') void accepted.then((c) => c.resetAndDestroy());
+      return new Promise<string | undefined>((r) => {
+        setTimeout(() => r(undefined), 2000).unref();
+        // A host that reports the reset as a close with no error: the real proof shows no closed connection either. Where
+        // the reset is an error, as on Linux, that comes first and decides (Abigail-2459's read).
+        socket.once('close', () => r('the connection closed while it was proved'));
+      });
+    };
+    try {
+      assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, prove }), { dataDir: '/v6' });
+      assert.deepEqual(asked, ['-'], 'termd on ::1 was asked');
+    } finally {
+      v6.closeAllConnections();
+      for (const c of held) c.destroy();
+      await Promise.all([v6, resets].map((s) => new Promise((r) => s.close(() => r(undefined)))));
+    }
   });
-  const bound = await new Promise<boolean>((resolve) => {
-    v6.once('error', () => resolve(false));
-    v6.listen(0, '::1', () => resolve(true));
-  });
-  if (!bound) return t.skip('no ::1 here');
-  const port = (v6.address() as { port: number }).port;
-  const resets = net.createServer((c) => c.resetAndDestroy());
-  await new Promise<void>((r) => resets.listen(port, '127.0.0.1', r));
-  // The reset comes as the connection is made or while its proof runs, which here takes 2 s; the IPv6 proof passes at once.
-  const prove = (socket: net.Socket) => (socket.remoteFamily === 'IPv4' ? new Promise<undefined>((r) => setTimeout(() => r(undefined), 2000)) : Promise.resolve(undefined));
-  try {
-    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, prove }), { dataDir: '/v6' });
-    assert.deepEqual(asked, ['-'], 'termd on ::1 was asked');
-  } finally {
-    v6.closeAllConnections();
-    await Promise.all([v6, resets].map((s) => new Promise((r) => s.close(() => r(undefined)))));
-  }
-});
+}
 
 test("a termd on ::1 alone is asked there once 127.0.0.1 refuses, and an IPv6 listener dialled on 127.0.0.1 is shown as its own through tcp6 (the house's read of the 17 commits over our fixes, #22)", async (t) => {
   const answer = (dataDir: string) => (_req: http.IncomingMessage, res: http.ServerResponse) => res.end(JSON.stringify({ status: 'ok', pid: process.pid, dataDir }));
