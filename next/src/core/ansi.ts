@@ -416,7 +416,7 @@ export class LineSplitter {
     return this.current();
   }
 
-  /** Where the unterminated line began, once any of it has come; read without building its text, as peek does. */
+  /** Where the unterminated line began, once any of it has come; read without building its text (peek builds it). */
   opened(): Begun | undefined {
     return this.begun;
   }
