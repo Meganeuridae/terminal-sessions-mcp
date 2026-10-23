@@ -575,9 +575,14 @@ export class TermServer {
    * human, so its private-session view can differ. A presented token must be
    * valid (else 401); without one, the daemon's anonymous principal is used when
    * configured (including an unconfigured loopback daemon). A daemon that
-   * requires a credential tells an unauthenticated caller only that it is
-   * alive, with counts — never another agent's private sessions
-   * (tsg-17). History sessions report `closed` or `recovered`, their retention and
+   * requires a credential tells an unauthenticated caller what names no one's
+   * sessions: that it is alive, its version, pid and how long this endpoint has
+   * served (`endpointElapsedMs`), its connection and
+   * session counts, and when it is `degraded` the refusal's own reason — never
+   * another agent's private sessions (tsg-17; the docblock once said "only that
+   * it is alive, with counts", narrower than the code: the house's review of
+   * 4860d4c..bc4bc85, PR #22, comment 6357989601). History sessions report
+   * `closed` or `recovered`, their retention and
    * oldest seq (G20, G21; jr2-14). A caller that has a principal and a loopback peer
    * address is also told the data dir.
    */

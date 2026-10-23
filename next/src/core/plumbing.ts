@@ -694,6 +694,13 @@ function firstAtOrAfter(xs: number[], x: number): number {
  * quote, `\%s:\%s\>\>\>\\n`), when it stands before it, so output with no line end before the trace
  * stays, or else from its line's start. The echo that printed the end mark in earlier builds traced as
  * the mark itself, and a guess at that trace's head cut a program's line that ended in `echo `.
+ *
+ * The limit of the prefix rule: a PS4 that changes with every trace (`+$BASHPID `, `+$EPOCHREALTIME `)
+ * gives the probe's trace no prefix the typed line's showed, so the cut falls back to the line's start
+ * and takes a program's unfinished output before it; a PS4 changed during the Run to one that ends with
+ * the old (`>> ` then `+>> `) leaves a `+` and the pid substitution's trace as noise, with nothing lost.
+ * Cutting at PS4's first character doubled would cover bash alone and only that case, so the rule stays
+ * (the house's review of 4860d4c..bc4bc85, PR #22, comment 6357989601).
  */
 function markTraceStart(text: string, to: number, nonce: string, prefix: string | undefined): number {
   const lineStart = text.lastIndexOf('\n', to - 2) + 1;
