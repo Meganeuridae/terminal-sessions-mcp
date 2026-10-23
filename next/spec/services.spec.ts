@@ -5,7 +5,7 @@
  * ready (m2-1, atc-7), a lost Run is `lost` (m2-6), fail beats health (m2-15),
  * one message per transition (m2-16), per-stream matching (m2-21) beside the one source a read shows.
  */
-import { test, before, after } from 'node:test';
+import { test, before, after, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
@@ -23,6 +23,11 @@ import type { JournalEvent, OutputStream, RunTarget } from '../src/core/types.js
 import { sleep, until } from './testhost.js';
 
 const A = 'agent:a@test';
+
+/** The monitor's offers of a quiet prompt, from any reading: what a negative check waits for, in place of a sleep. */
+function offers(t: TestContext, m: ServiceMonitor) {
+  return t.mock.method(m as unknown as { once: (...a: unknown[]) => boolean }, 'once');
+}
 
 // ───────────── the monitor against a hand-driven journal ─────────────
 
@@ -220,13 +225,14 @@ test('the two readings’ lines that one line end completes are one line: matche
   q.dispose();
 });
 
-test('a quiet prompt is offered by both readings and matched once: as a read shows it, or as its own pipe wrote it', async () => {
+test('a quiet prompt is offered by both readings and matched once: as a read shows it, or as its own pipe wrote it', async (t) => {
   const f = fake('process');
   const m = f.monitor({ fail: { pattern: '^Password:' } }, { partialAfterMs: 30 });
+  const offered = offers(t, m);
   f.start();
   f.out('Password: ', 'stderr');
-  await until(() => m.status === 'unhealthy', 2000, 'the prompt matched once quiet');
-  await sleep(100);
+  await until(() => offered.mock.callCount() >= 2, 2000, 'the read and stderr each offered the prompt');
+  assert.equal(m.status, 'unhealthy');
   assert.equal(m.info().repeats, undefined, 'one prompt, one match');
   m.dispose();
   // A prompt only its pipe holds whole: stdout's `Pass` then stderr's line then `word: ` is `Password: ` to stdout alone.
@@ -239,6 +245,20 @@ test('a quiet prompt is offered by both readings and matched once: as a read sho
   await until(() => n.status === 'unhealthy', 2000, 'the prompt as stdout wrote it');
   assert.equal(n.info().evidence, 'Password:');
   n.dispose();
+  // A quiet `ERROR a` on stdout, offered by both readings before stderr's `ERROR b` line: two lines, each once, as with no
+  // quiet at all (the test of lines begun at different events, above). Quiet only after stderr's line ended the read's,
+  // it is one line (the test of a prompt's ended twin, below).
+  const h = fake('process');
+  const o = h.monitor({ fail: { pattern: 'ERROR' } }, { partialAfterMs: 30 });
+  const both = offers(t, o);
+  h.start();
+  h.out('ERROR a', 'stdout');
+  await until(() => both.mock.callCount() >= 2, 2000, 'the read and stdout each offered `ERROR a`');
+  h.out('ERROR b\n', 'stderr');
+  h.out('\n', 'stdout');
+  assert.equal(o.info().repeats, 1, 'two lines, each once');
+  assert.equal(o.info().evidence, 'ERROR b', 'the second, as stderr wrote it');
+  o.dispose();
 });
 
 test('a quiet prompt is tested with its twin, the other reading\'s line begun where it did (our review of the 73 commits through 4860d4c, PR #22)', async () => {
@@ -258,28 +278,71 @@ test('a quiet prompt is tested with its twin, the other reading\'s line begun wh
   }
 });
 
-test('a quiet prompt both readings hold is counted once, however the readings were last fed (our review of the 73 commits through 4860d4c, PR #22)', async () => {
+test('a quiet prompt and its twin are tested together: a ready match on one text never stands while the other fails (the house\'s review of 4860d4c..bc4bc85, PR #22)', async (t) => {
+  // stderr `Pass`, stdout `x`, stderr `word: `: ready matches the read's `Passxword: `, fail matches stderr's `Password: `.
+  // Tested one reading at a time, the read's offer journaled `ready` before stderr's failed it, and a waitReady woke on it.
+  const f = fake('process');
+  const m = f.monitor({ ready: { pattern: 'xword' }, fail: { pattern: '^Password: ?$' } }, { partialAfterMs: 30 });
+  const offered = offers(t, m);
+  f.start();
+  f.out('Pass', 'stderr');
+  f.out('x', 'stdout');
+  f.out('word: ', 'stderr');
+  await until(() => offered.mock.callCount() >= 3, 2000, 'the read, stderr and stdout each offered its prompt');
+  assert.deepEqual(f.statuses(), ['starting', 'unhealthy'], 'never ready');
+  assert.equal(m.info().evidence, 'Password:', 'as stderr wrote it');
+  m.dispose();
+});
+
+test('a service lets a twin go once no reading holds its line, and an ended service its readings (the house\'s review of 4860d4c..bc4bc85, PR #22)', async (t) => {
+  const f = fake('process');
+  const m = f.monitor({ fail: { pattern: '^Password:' } }, { partialAfterMs: 30 });
+  // Read through private fields on purpose: nothing public shows the memory these hold, and the case fails with
+  // pruneTwins made a no-op or the release in stopTimers removed. A rename here is a rename there, not a reason to drop it.
+  const held = m as unknown as { prompted: Map<string, unknown>; completed: Map<string, unknown>; pipes: Map<string, unknown>; lines: unknown };
+  const offered = offers(t, m);
+  f.start();
+  // A quiet prompt both readings hold: kept while they hold it, gone once its line ends.
+  f.out('Password: ', 'stderr');
+  await until(() => offered.mock.callCount() >= 2, 2000, 'the read and stderr each offered the prompt');
+  assert.equal(held.prompted.size, 1, 'the prompt, while its line is open');
+  f.out('\n', 'stderr');
+  assert.equal(held.prompted.size, 0, 'the prompt, once its line ended');
+  // A line the read completed while stderr holds it open: kept while stderr holds it, gone once stderr ends it.
+  f.out('Pass', 'stderr');
+  f.out('\n', 'stdout');
+  assert.equal(held.completed.size, 1, 'the read\'s line, while stderr holds it open');
+  f.out('\n', 'stderr');
+  assert.equal(held.completed.size, 0, 'the read\'s line, once stderr ended it');
+  // Ended, the service holds no reading.
+  f.end({ state: 'exited', exit: 0 });
+  assert.equal(m.status, 'exited');
+  assert.equal(held.pipes.size, 0, 'no pipe\'s reading');
+  assert.equal(held.lines, undefined, 'no read\'s reading');
+  m.dispose();
+});
+
+test('a quiet prompt both readings hold is counted once, however the readings were last fed (our review of the 73 commits through 4860d4c, PR #22)', async (t) => {
   // stderr's `Password: `, then a stdout SGR while it is quiet: the readings were last fed at different events, and the
   // prompt counted twice.
   const g = fake('process');
   const n = g.monitor({ fail: { pattern: '^Password:' } }, { partialAfterMs: 30 });
+  const offered = offers(t, n);
   g.start();
   g.out('Password: ', 'stderr');
   g.out('\x1b[0m', 'stdout');
-  await until(() => n.status === 'unhealthy', 2000, 'the prompt matched once quiet');
-  await sleep(100);
+  await until(() => offered.mock.callCount() >= 2, 2000, 'the read and stderr each offered the prompt');
+  assert.equal(n.status, 'unhealthy');
   assert.equal(n.info().repeats, undefined, 'one prompt, one match');
   n.dispose();
 });
 
 test('a quiet prompt pairs with the other reading\'s line begun where it did, open or already ended; lines both readings complete still pair by the line end (the house\'s review of a8b6f28..4860d4c, PR #22, comment 6341260318, question 6)', async (t) => {
-  /** The monitor's offers of a quiet prompt, from any reading: what a negative check waits for, in place of a sleep. */
-  const offers = (m: ServiceMonitor) => t.mock.method(m as unknown as { once: (...a: unknown[]) => boolean }, 'once');
   // stderr's `Password: `, then stdout's LF: the read ends the line at stdout's LF and matches it, while stderr's reading
   // holds it open. Quiet, stderr offered it, the read's line having ended, and it was matched a second time (repeats 1).
   const f = fake('process');
   const m = f.monitor({ fail: { pattern: '^Password:' } }, { partialAfterMs: 30 });
-  const offered = offers(m);
+  const offered = offers(t, m);
   f.start();
   f.out('Password: ', 'stderr');
   f.out('\n', 'stdout');
@@ -304,7 +367,7 @@ test('a quiet prompt pairs with the other reading\'s line begun where it did, op
   // line; ended by stdout's own LF instead, it is a line of its own, the second of two (the test above).
   const h = fake('process');
   const o = h.monitor({ fail: { pattern: 'ERROR' } }, { partialAfterMs: 30 });
-  const spent = offers(o);
+  const spent = offers(t, o);
   h.start();
   h.out('ERROR a', 'stdout');
   h.out('ERROR b\n', 'stderr');
