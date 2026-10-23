@@ -233,8 +233,16 @@ function noStartReason(): string | undefined {
   return undefined;
 }
 
-/** A supervised termd: who manages it, the port it serves and the data dir it uses (both from the unit's text; the data dir unknown, with why, where the text does not tell it). */
-type Supervisor = { kind: 'managed'; by: string; port: string; dataDir: string | Unknown } | { kind: 'none' } | { kind: 'unknown'; why: string };
+/**
+ * A supervised termd: who manages it, the port it serves and the data dir it uses (from its running termd
+ * or the unit's text; the data dir unknown, with why, where the text does not tell it). `next` is what the
+ * unit's next start takes when its running termd answered but the text may have changed since that termd
+ * started: the port and data dir the text now gives, either unknown where the text cannot tell it.
+ */
+type Supervisor =
+  | { kind: 'managed'; by: string; port: string; dataDir: string | Unknown; next?: { unit: string; changed: string; port: string | Unknown; dataDir: string | Unknown } }
+  | { kind: 'none' }
+  | { kind: 'unknown'; why: string };
 const SUPERVISOR_CHECK_MS = 1500;
 const SUPERVISOR_CACHE_MS = 30_000;
 let supervisorCache: { at: number; result: Supervisor } | undefined;
@@ -356,44 +364,67 @@ async function checkSupervisor(): Promise<Supervisor> {
       const port = titlePort(pid);
       // The shim's own credential, so a termd that requires one answers too; sent only on a connection shown to be the termd's.
       const told = typeof port === 'number' ? await askDataDir(port, pid, { timeoutMs: SUPERVISOR_CHECK_MS, token: chosen.token }) : port;
-      if ('dataDir' in told) return { kind: 'managed', by: `the systemd user unit termd (its port and data dir told by its running termd, pid ${pid})`, port: String(port), dataDir: told.dataDir };
-      notAsked = `; its running termd could not be asked: ${told.error}${unitChanged(pid, prop)}`;
+      if ('dataDir' in told) {
+        const sup = { kind: 'managed' as const, by: `the systemd user unit termd (its port and data dir told by its running termd, pid ${pid})`, port: String(port), dataDir: told.dataDir };
+        // The unit's next start, on a failure or at the next login, takes what its text gives, which an edit
+        // and a daemon-reload since this termd started may have moved: a termd started here on that port or
+        // data dir collides with that start. Compared with the running termd alone, it was started (the
+        // house's review of a8b6f28..4860d4c, #22 comment 6341260318, question 4).
+        const changed = unitChanged(pid, prop);
+        if (!changed) return sup;
+        const text = await managerUnit(r, prop);
+        const unread = (why: string): Unknown => ({ unknown: `could not be read (${why})` });
+        const read = 'why' in text ? { port: unread(text.why), dataDir: unread(text.why) } : { port: unitPort(text.unit), dataDir: unitDataDir(text.unit) };
+        return { ...sup, next: { unit: 'the systemd user unit termd', changed, ...read } };
+      }
+      const changed = unitChanged(pid, prop);
+      notAsked = `; its running termd could not be asked: ${told.error}${changed ? `; the unit's text may have changed since that termd started: ${changed}` : ''}`;
     }
     const proc = pid > 0 ? procEnviron(pid) : undefined;
     // This user's live termd whose environment cannot be read: what it was given is unknown, and the
     // manager's is not it (the house's review of 4f4c067..a8b6f28, #22 comment 6323055715).
     if (proc && 'alive' in proc && proc.alive) return { kind: 'unknown', why: `the systemd user unit termd's running termd, pid ${pid}, is this user's, and its environment could not be read (${proc.error})${notAsked}, so its port and data dir are unknown` };
-    let more: Parameters<typeof systemctlUnit>[2];
-    let from: string;
     if (proc && 'env' in proc) {
-      more = { running: proc.env };
-      from = `its environment read from its running termd, pid ${pid}${notAsked}`;
-    } else {
-      const m = await ask('systemctl', ['--user', 'show', '--property=Environment']);
-      if (m === 'timeout' || m === 'missing' || 'failed' in m) return { kind: 'unknown', why: `systemctl --user show (the user manager's environment, which the unit's termd inherits) ${m === 'timeout' ? `did not answer within ${SUPERVISOR_CHECK_MS} ms` : `failed (${m === 'missing' ? 'not found' : m.failed})`}, so the unit's port and data dir are unknown` };
-      const files = [...r.out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim());
-      more = { manager: /^Environment=(.*)$/m.exec(m.out)?.[1]?.trim() ?? '', files, unset: prop('UnsetEnvironment') };
-      from = proc ? `its environment read from the user manager's, as its running termd's, pid ${pid}, could not be: ${proc.error}${notAsked}` : "its environment read from the user manager's, as no termd of it runs";
+      const from = `its environment read from its running termd, pid ${pid}${notAsked}`;
+      const unit = systemctlUnit(prop('ExecStart'), prop('Environment'), { running: proc.env });
+      if (!unit) return { kind: 'unknown', why: `${unshaped(prop)} (${from})` };
+      return managed(`the systemd user unit termd (${from})`, unit);
     }
-    const unit = systemctlUnit(prop('ExecStart'), prop('Environment'), more);
-    if (!unit) return { kind: 'unknown', why: prop('ExecStart') ? `the systemd user unit termd's ExecStart is not in the shape read here, or names a variable not known here (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown (${from})` : "the systemd user unit termd has no ExecStart, so its port and data dir are unknown" };
-    return managed(`the systemd user unit termd (${from})`, unit);
+    const text = await managerUnit(r, prop);
+    if ('why' in text) return { kind: 'unknown', why: text.why };
+    const from = proc ? `its environment read from the user manager's, as its running termd's, pid ${pid}, could not be: ${proc.error}${notAsked}` : "its environment read from the user manager's, as no termd of it runs";
+    return managed(`the systemd user unit termd (${from})`, text.unit);
   }
   return { kind: 'none' };
 }
 
+/** Why a systemd unit's ExecStart gives no port or data dir, worded as a whole note. */
+const unshaped = (prop: (k: string) => string): string =>
+  prop('ExecStart') ? `the systemd user unit termd's ExecStart is not in the shape read here, or names a variable not known here (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown` : 'the systemd user unit termd has no ExecStart, so its port and data dir are unknown';
+
 /**
- * Why the unit's text may not be what its running termd was started with, worded to follow a note: systemd
- * says it needs a daemon-reload (an edit not yet read), or its file or a drop-in is newer than the termd's
- * start (an edit read since); empty when neither. A start that cannot be read is said too.
+ * The unit's text read with the user manager's environment, which every unit it starts inherits (see
+ * systemctlUnit), as a start of the unit now would take it; or why it cannot be read.
+ */
+async function managerUnit(r: { out: string }, prop: (k: string) => string): Promise<{ unit: UnitText } | { why: string }> {
+  const m = await ask('systemctl', ['--user', 'show', '--property=Environment']);
+  if (m === 'timeout' || m === 'missing' || 'failed' in m) return { why: `systemctl --user show (the user manager's environment, which the unit's termd inherits) ${m === 'timeout' ? `did not answer within ${SUPERVISOR_CHECK_MS} ms` : `failed (${m === 'missing' ? 'not found' : m.failed})`}, so the unit's port and data dir are unknown` };
+  const files = [...r.out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim());
+  const unit = systemctlUnit(prop('ExecStart'), prop('Environment'), { manager: /^Environment=(.*)$/m.exec(m.out)?.[1]?.trim() ?? '', files, unset: prop('UnsetEnvironment') });
+  return unit ? { unit } : { why: unshaped(prop) };
+}
+
+/**
+ * Why the unit's text may not be what its running termd was started with: systemd says it needs a
+ * daemon-reload (an edit not yet read), or its file or a drop-in is newer than the termd's start (an edit
+ * read since); empty when neither. A start that cannot be read is said too.
  */
 function unitChanged(pid: number, prop: (k: string) => string): string {
-  const said = "; the unit's text may have changed since that termd started";
-  if (prop('NeedDaemonReload') === 'yes') return `${said}: systemd says the unit needs a daemon-reload`;
+  if (prop('NeedDaemonReload') === 'yes') return 'systemd says the unit needs a daemon-reload';
   const files = [prop('FragmentPath'), ...prop('DropInPaths').split(' ')].filter(Boolean);
   if (!files.length) return '';
   const started = processInfo(pid);
-  if (!started) return `${said}: when it started cannot be read`;
+  if (!started) return 'when it started cannot be read';
   for (const file of files) {
     let mtime: number;
     try {
@@ -401,7 +432,7 @@ function unitChanged(pid: number, prop: (k: string) => string): string {
     } catch {
       continue;
     }
-    if (mtime > started.startMs + (started.startSlackMs ?? 1000)) return `${said}: ${file} is newer than its start`;
+    if (mtime > started.startMs + (started.startSlackMs ?? 1000)) return `${file} is newer than its start`;
   }
   return '';
 }
@@ -811,7 +842,29 @@ async function startDaemon(): Promise<void> {
         noteNotStarted(`${sup.by} serves port ${sup.port} out of the data dir ${dataDir}, which a termd for port ${port} started here would use too: none is started here (one termd per data dir; give this shim another TSM_DATA_DIR, or dial port ${sup.port})`);
         return;
       }
-      log(`${sup.by} serves port ${sup.port} out of ${sup.dataDir}, not ${port}: a termd for ${port} is started here with ${dataDir}`);
+      // The unit's next start, where its text may have changed since the running termd started (see
+      // checkSupervisor): a collision with it is refused as one with the running termd is, and said as its.
+      const next = sup.next;
+      if (next) {
+        const text = `${next.unit}'s text, which may have changed since its running termd started (${next.changed}),`;
+        if (typeof next.port !== 'string') {
+          noteNotStarted(`${text} ${next.port.unknown}, so the port its next start takes is unknown: none is started here, as it may be ${port} (TSM_NO_SPAWN=1 skips the check)`);
+          return;
+        }
+        if (next.port === port) {
+          noteNotStarted(`${text} names port ${port} for its next start, which would find a termd started here on it: none is started here (TSM_NO_SPAWN=1 skips the check)`);
+          return;
+        }
+        if (typeof next.dataDir !== 'string') {
+          noteNotStarted(`${text} ${next.dataDir.unknown}, so the data dir its next start uses is unknown: none is started here, as it may be ${dataDir} (TSM_NO_SPAWN=1 skips the check)`);
+          return;
+        }
+        if (sameDir(next.dataDir, dataDir)) {
+          noteNotStarted(`${text} names the data dir ${dataDir} for its next start, which a termd for port ${port} started here would use too: none is started here (one termd per data dir; give this shim another TSM_DATA_DIR)`);
+          return;
+        }
+      }
+      log(`${sup.by} serves port ${sup.port} out of ${sup.dataDir}, not ${port}${next ? `, and its text names port ${String(next.port)} and ${String(next.dataDir)} for its next start` : ''}: a termd for ${port} is started here with ${dataDir}`);
     }
     // While the supervisor was asked, a reconnect may have found a daemon (one started by a hand, a
     // unit, or another shim): then there is nothing to start, and a termd started now would only exit
