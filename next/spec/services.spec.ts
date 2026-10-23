@@ -316,6 +316,43 @@ test('a quiet prompt pairs with the other reading\'s line begun where it did, op
   o.dispose();
 });
 
+test('two completed lines that began at one place with the same text are one line, the other pipe having added nothing to it (the house\'s review of a8b6f28..4860d4c, PR #22, comment 6341260318, question 6)', () => {
+  // stderr's `Password: `, stdout's LF, then stderr's LF with no quiet between: the read's `Password: ` ended at
+  // stdout's LF and stderr's at its own, so the line ends told them apart and the same bytes counted twice, where a
+  // quiet between the two line ends counted them once.
+  const f = fake('process');
+  const m = f.monitor({ fail: { pattern: '^Password:' } });
+  f.start();
+  f.out('Password: ', 'stderr');
+  f.out('\n', 'stdout');
+  f.out('\n', 'stderr');
+  assert.equal(m.status, 'unhealthy');
+  assert.equal(m.info().repeats, undefined, 'one `Password:`, as a read shows it');
+  m.dispose();
+  // What stdout wrote shows nothing: still the same text, one line.
+  const g = fake('process');
+  const n = g.monitor({ fail: { pattern: '^Password:' } });
+  g.start();
+  g.out('Password: ', 'stderr');
+  g.out('\x1b[0m\n', 'stdout');
+  g.out('\n', 'stderr');
+  assert.equal(n.info().repeats, undefined, 'an SGR adds nothing that shows');
+  n.dispose();
+  // A line stdout writes between the two line ends is a line of its own, and the same rule counts it once: the read
+  // ends it at stderr's LF, stdout at its own.
+  const h = fake('process');
+  const o = h.monitor({ fail: { pattern: '^Password:|ERROR' } });
+  h.start();
+  h.out('Password: ', 'stderr');
+  h.out('\n', 'stdout');
+  h.out('ERROR z', 'stdout');
+  h.out('\n', 'stderr');
+  h.out('\n', 'stdout');
+  assert.equal(o.info().repeats, 1, 'two lines, each once');
+  assert.equal(o.info().evidence, 'ERROR z');
+  o.dispose();
+});
+
 test('a service\'s lines are taken in the order their ends came, the read\'s and a pipe\'s interleaved (our review of the 73 commits through 4860d4c, PR #22)', () => {
   // stdout `FATAL`, stderr `x` and its LF (the read's `FATALx` ends), then stdout's LF, `READY` and LF: stdout's FATAL
   // ends before READY. The read's lines were all taken first, READY before FATAL, and the service ended unhealthy.

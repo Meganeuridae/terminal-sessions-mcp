@@ -21,9 +21,11 @@
  *
  * A pattern matches a line as a read shows it, a process Run's stdout and stderr as one source, or as its own pipe
  * wrote it (m2-21). A line both readings hold is one line, matched once, by two rules side by side:
- * - Completed lines pair by the line end that completes both. A LF is one pipe's, so it completes at most one line of
- *   each reading: stdout's `ERROR a`, then `ERROR b` and a LF on stderr, then stdout's LF, are two lines, the read's
- *   `ERROR aERROR b` with stderr's `ERROR b`, and stdout's `ERROR a`.
+ * - Completed lines pair by the line end that completes both, or by beginning at one place with the same text, the
+ *   other pipe having added nothing to the line. A LF is one pipe's, so it completes at most one line of each reading:
+ *   stdout's `ERROR a`, then `ERROR b` and a LF on stderr, then stdout's LF, are two lines, the read's `ERROR aERROR b`
+ *   with stderr's `ERROR b`, and stdout's `ERROR a`, whose text is not the read's line begun there. stderr's
+ *   `Password: `, stdout's LF, then stderr's LF are one line, the read's ended at stdout's LF and stderr's at its own.
  * - A quiet prompt pairs with the other reading's line that began where it did, whether that line is still open or
  *   already ended when the prompt is offered: stderr's `Password: ` that stdout's LF ended in the read counts once. So
  *   stdout's `ERROR a`, left quiet before its LF, is a prompt begun where the read's `ERROR aERROR b` began, and the
@@ -84,10 +86,11 @@ type Condition = 'pattern' | 'tcp' | 'alive';
 /** A place in a Run's output (where a line began or ended: SplitLine.begun, .ended), as a key; the line's text when it has none. */
 const placeOf = (p: Begun | undefined, line: SplitLine): string => (p ? `${p.at}:${p.offset}` : `?${line.text}`);
 
-/** A line the other reading may hold too (ServiceMonitor.prompted, .completed): where it began, and whether it matched. */
+/** A line the other reading may hold too (ServiceMonitor.prompted, .completed): where it began, whether it matched, and a completed line's text. */
 interface Twin {
   at: Begun | undefined;
   matched: boolean;
+  text?: string;
 }
 
 /** Two places in a Run's output are one: the same event, and the same bytes into it. */
@@ -137,9 +140,10 @@ export class ServiceMonitor {
    */
   private readonly prompted = new Map<string, Twin>();
   /**
-   * The completed lines another reading still holds a line open beside, begun at the same place (placeOf), and whether
-   * one matched: a quiet prompt that reading offers later is their twin, matched once with them (once). Kept while a
-   * reading holds the line open (pruneTwins), so at most one a reading.
+   * The completed lines another reading still holds a line open beside, begun at the same place (placeOf), with whether
+   * one matched and its text: a quiet prompt that reading offers later is their twin, matched once with them (once),
+   * and a line it completes with the same text is the same line (sameCompleted). Kept while a reading holds the line
+   * open (pruneTwins), so at most one a reading.
    */
   private readonly completed = new Map<string, Twin>();
   /** A fail-pattern line was seen and no ready-pattern line since. */
@@ -264,10 +268,15 @@ export class ServiceMonitor {
       for (const line of twins.values()) lines.push([line]);
       lines.sort((x, y) => endOrder(x[0]!.ended, y[0]!.ended));
       for (const texts of lines) {
-        const matched = this.onLines(texts);
+        // A line the other reading completed already, begun at its place with the same text, is that line, matched
+        // once: stderr's `Password: `, then stdout's LF and stderr's, counted twice, the read's line ended at stdout's
+        // LF and stderr's at its own, where a quiet between them counted it once (the house's review of
+        // a8b6f28..4860d4c, #22, comment 6341260318, question 6).
+        const fresh = this.completed.size ? texts.filter((line) => !this.sameCompleted(line)) : texts;
+        const matched = fresh.length > 0 && this.onLines(fresh);
         // A line the other reading holds open from where it began (stderr's `Password: `, the read's ended at stdout's
-        // LF) is that reading's prompt's twin.
-        for (const line of texts) if (line.begun && this.heldOpen(line.begun)) this.completed.set(placeOf(line.begun, line), { at: line.begun, matched });
+        // LF) is that reading's prompt's twin, or its completed line's when the text is the same.
+        for (const line of fresh) if (line.begun && this.heldOpen(line.begun)) this.completed.set(placeOf(line.begun, line), { at: line.begun, matched, text: line.text });
       }
       this.pruneTwins();
     } else if (ev.type === 'run.start' && ev.runId === this.runId) {
@@ -319,6 +328,11 @@ export class ServiceMonitor {
     const matched = twin ? (r.pipe !== undefined ? this.onLine(line, twin) : this.onLine(twin, line)) : this.onLine(line);
     this.prompted.set(at, { at: line.begun, matched });
     return matched;
+  }
+
+  /** A completed line the other reading completed already, begun at the same place with the same text. */
+  private sameCompleted(line: SplitLine): boolean {
+    return line.begun !== undefined && this.completed.get(placeOf(line.begun, line))?.text === line.text;
   }
 
   /** Whether a reading holds open a line that began at `p`: read where it began, without building its text. */
