@@ -2314,6 +2314,19 @@ test("a summary's acceptance or retirement leaves its own seq owed while another
     openings.set('terminal:ro', { lineage: {}, held: parked });
     assert.ok(!f.inside.carried(s, st).has(x), "another lineage's parked seq is not carried here");
     openings.delete('terminal:ro');
+    // On a lane that carries the session, the summary's acceptance lifts the cursor to just below the seq still
+    // carried: what it settled is passed, what still goes out is not (the house's read of 4860d4c..bc4bc85, #22).
+    const lane = f.inside as unknown as { carries: (id: string) => boolean };
+    lane.carries = () => true;
+    st.summaries.clear();
+    st.owed.clear();
+    st.owed.add(x);
+    st.retries.set('a-carrier', { seq: x, kind: 'run', attempt: 0 });
+    st.summaries.set(`${NODE_NAME}/ro-carried-summary`, { from: 1, covered: new Set(), owes: x });
+    f.inside.settleSegment(s, { kind: 'summary', lifecycle: true, seq: x, messageId: 'ro-carried-summary' }, 'accepted');
+    assert.equal(s.cursorsOf(A).delivered, x - 1, 'delivered rises to just below the carried seq');
+    st.retries.delete('a-carrier');
+    delete (lane as { carries?: unknown }).carries;
   } finally {
     await f.close();
   }
