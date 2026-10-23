@@ -240,7 +240,7 @@ function noStartReason(): string | undefined {
  * started: the port and data dir the text now gives, either unknown where the text cannot tell it.
  */
 type Supervisor =
-  | { kind: 'managed'; by: string; port: string; dataDir: string | Unknown; next?: NextStart & { unit: string } }
+  | { kind: 'managed'; by: string; port: string; dataDir: string | Unknown; next?: NextStart & { unit: string }; nextUnread?: string }
   | { kind: 'none' }
   | { kind: 'unknown'; why: string };
 const SUPERVISOR_CHECK_MS = 1500;
@@ -348,6 +348,7 @@ async function checkSupervisor(): Promise<Supervisor> {
     // running.ts); only when it cannot be asked is the text read, and the note says whether it may have
     // changed since that termd started.
     let notAsked = '';
+    let changed = '';
     if (pid > 0) {
       const port = titlePort(pid);
       // The shim's own credential, so a termd that requires one answers too; sent only on a connection shown to be the termd's.
@@ -360,11 +361,9 @@ async function checkSupervisor(): Promise<Supervisor> {
         // house's review of a8b6f28..4860d4c, #22 comment 6341260318, question 4).
         // The text is read whatever systemd and the files say, since one that differs from what runs has changed
         // (see nextStart): one more query of the manager, cached with the rest.
-        const text = await managerUnit(r, prop);
-        const next = nextStart(sup, 'unit' in text ? text.unit : text, unitChanged(pid, prop));
-        return next ? { ...sup, next: { unit: 'the systemd user unit termd', ...next } } : sup;
+        return withNext(sup, r, prop, unitChanged(pid, prop, r.out));
       }
-      const changed = unitChanged(pid, prop);
+      changed = unitChanged(pid, prop, r.out);
       notAsked = `; its running termd could not be asked: ${told.error}${changed ? `; the unit's text may have changed since that termd started: ${changed}` : ''}`;
     }
     const proc = pid > 0 ? procEnviron(pid) : undefined;
@@ -375,7 +374,10 @@ async function checkSupervisor(): Promise<Supervisor> {
       const from = `its environment read from its running termd, pid ${pid}${notAsked}`;
       const unit = systemctlUnit(prop('ExecStart'), prop('Environment'), { running: proc.env });
       if (!unit) return { kind: 'unknown', why: `${unshaped(prop)} (${from})` };
-      return managed(`the systemd user unit termd (${from})`, unit);
+      // Its next start takes the manager's environment, not the one this termd started with, and the text as it is
+      // now: compared with this termd's alone, as when it answers (above), a start here could take what that next
+      // start uses (the house's read of 4860d4c..bc4bc85, #22).
+      return withNext(managed(`the systemd user unit termd (${from})`, unit), r, prop, changed);
     }
     const text = await managerUnit(r, prop);
     if ('why' in text) return { kind: 'unknown', why: text.why };
@@ -402,13 +404,42 @@ async function managerUnit(r: { out: string }, prop: (k: string) => string): Pro
 }
 
 /**
- * Why the unit's text may not be what its running termd was started with: systemd says it needs a
- * daemon-reload (an edit not yet read), or its file or a drop-in is newer than the termd's start (an edit
- * read since); empty when neither. A start that cannot be read is said too.
+ * The text the unit's next start takes. While systemd says the unit needs a daemon-reload, systemctl shows the loaded
+ * text, which a restart takes, while the next login's manager loads the file on disk, which is not read here: by run
+ * (systemd 255), a unit edited with no daemon-reload showed its old ExecStart. Read as the next start's, the loaded text
+ * named what the running termd was started with, and a start here went ahead (the house's read of 4860d4c..bc4bc85, #22).
  */
-function unitChanged(pid: number, prop: (k: string) => string): string {
+async function nextText(r: { out: string }, prop: (k: string) => string): Promise<UnitText | { why: string }> {
+  if (prop('NeedDaemonReload') === 'yes') return { why: 'its file on disk awaits a daemon-reload, so systemctl shows the loaded text, which a restart takes, not the file the next login reads; systemctl --user daemon-reload reads it' };
+  const text = await managerUnit(r, prop);
+  return 'unit' in text ? text.unit : text;
+}
+
+/** `sup` with the unit's next start beside it, where its text may differ from what the running termd was started with (see nextStart). */
+async function withNext(sup: Supervisor, r: { out: string }, prop: (k: string) => string, changed: string): Promise<Supervisor> {
+  if (sup.kind !== 'managed' || typeof sup.dataDir !== 'string') return sup;
+  const text = await nextText(r, prop);
+  const next = nextStart({ port: sup.port, dataDir: sup.dataDir }, text, changed);
+  if (next) return { ...sup, next: { unit: 'the systemd user unit termd', ...next } };
+  // Nothing says the text changed, and it could not be read to see: the start's log says the comparison was not made.
+  return 'why' in text ? { ...sup, nextUnread: text.why } : sup;
+}
+
+/** The unit's EnvironmentFiles= paths, one a line as systemctl shows them, without their ` (ignore_errors=…)`. */
+const envFilesOf = (out: string): string[] => [...out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim().replace(/ \(ignore_errors=\w+\)$/, ''));
+
+/**
+ * Why the unit's text may not be what its running termd was started with: systemd says it needs a
+ * daemon-reload (an edit not yet read), or its file, a drop-in or an environment file is newer than the
+ * termd's start (an edit read since, or read at the next start); empty when none. A start that cannot be
+ * read is said too.
+ */
+function unitChanged(pid: number, prop: (k: string) => string, out: string): string {
   if (prop('NeedDaemonReload') === 'yes') return 'systemd says the unit needs a daemon-reload';
-  const files = [prop('FragmentPath'), ...prop('DropInPaths').split(' ')].filter(Boolean);
+  // An EnvironmentFile= is read at each start, with no daemon-reload: by run (systemd 255), one edited in place left
+  // NeedDaemonReload=no and the fragment as it was, and the next start took its new value, while nothing here said
+  // the text had changed (the house's read of 4860d4c..bc4bc85, #22).
+  const files = [prop('FragmentPath'), ...prop('DropInPaths').split(' '), ...envFilesOf(out)].filter(Boolean);
   if (!files.length) return '';
   const started = processInfo(pid);
   if (!started) return 'when it started cannot be read';
@@ -833,7 +864,11 @@ async function startDaemon(): Promise<void> {
       // checkSupervisor): a collision with it is refused as one with the running termd is, and said as its.
       const next = sup.next;
       if (next) {
-        const text = `${next.unit}'s text, which ${next.certain ? 'has' : 'may have'} changed since its running termd started (${next.why}),`;
+        // Certain only of a difference, which the manager's environment can make with no edit to the unit (the house's
+        // read of 4860d4c..bc4bc85, #22): said as one, not as an edit.
+        const text = next.certain
+          ? `${next.unit}'s text, read with the user manager's environment, differs from what its running termd was started with (${next.why}), and`
+          : `${next.unit}'s text, which may have changed since its running termd started (${next.why}),`;
         if (typeof next.port !== 'string') {
           noteNotStarted(`${text} ${next.port.unknown}, so the port its next start takes is unknown: none is started here, as it may be ${port} (TSM_NO_SPAWN=1 skips the check)`);
           return;
@@ -851,7 +886,7 @@ async function startDaemon(): Promise<void> {
           return;
         }
       }
-      log(`${sup.by} serves port ${sup.port} out of ${sup.dataDir}, not ${port}${next ? `, and its text names port ${String(next.port)} and ${String(next.dataDir)} for its next start` : ''}: a termd for ${port} is started here with ${dataDir}`);
+      log(`${sup.by} serves port ${sup.port} out of ${sup.dataDir}, not ${port}${next ? `, and its text names port ${String(next.port)} and ${String(next.dataDir)} for its next start` : sup.nextUnread ? `, and the text its next start takes could not be read to compare (${sup.nextUnread})` : ''}: a termd for ${port} is started here with ${dataDir}`);
     }
     // While the supervisor was asked, a reconnect may have found a daemon (one started by a hand, a
     // unit, or another shim): then there is nothing to start, and a termd started now would only exit
