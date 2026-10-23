@@ -15,8 +15,9 @@
  * hung up (the house's review of #11, issue #18, and the read of d5873f0). The descriptors are
  * listed through /dev/fd (Linux links it to /proc/self/fd); the glob is expanded, and its directory
  * closed, before the loop runs. Only bash can name an arbitrary descriptor in `exec N>&-` (dash
- * reads `exec 12>&-` as a command named 12), so the loop runs only under bash and the same text is
- * a no-op under /bin/sh.
+ * reads `exec 12>&-` as a command named 12), so the loop runs only under bash, a /bin/sh that is bash
+ * included (macOS's: bash sets BASH_VERSION when run as sh), and the same text is a no-op under one
+ * that isn't, such as dash.
  */
 export function closeFdsLine(keep: string): string {
   return `if [ -n "\${BASH_VERSION-}" ] && [ -d /dev/fd ]; then for __tsm_fd in /dev/fd/*; do case "\${__tsm_fd##*/}" in ${keep}) ;; *) eval "exec \${__tsm_fd##*/}>&-" 2>/dev/null || :;; esac; done; unset __tsm_fd; fi`;
