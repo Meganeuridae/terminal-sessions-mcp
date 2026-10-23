@@ -65,6 +65,18 @@ test('er-1: screens an erase kept, more lines than input bytes, page back whole 
   assert.ok(pages.length <= 8, `${pages.length} pages`);
 });
 
+test('er-1: a page whose screens an erase kept make many times its input in lines takes what fits, sized by the input its kept lines took', async () => {
+  // A reviewer's read of the fixes for #22: the fit counts a page's dropped lines as omitted input, but no spec failed with that
+  // count left out of the next attempt's size. Here each event of about 15 bytes keeps a screen of 100 rows, so a page cut to its
+  // maxLines drops most of what it took. Sized by its whole input, each attempt shrank by a tenth, and the fit ran out of
+  // attempts over budget; sized by the input its kept lines took, it fits.
+  const src = source({ rows: 100 });
+  for (let i = 0; i < 200; i++) out(src.journal, `\x1b[100;1Hx${i}\x1b[2J`);
+  const { text, pages } = await readAll(src, { since: 0, maxBytes: 1024 }, (r) => assert.ok(Buffer.byteLength(r.text!) <= 1024, `page of ${Buffer.byteLength(r.text!)} bytes`));
+  assert.deepEqual(text.split('\n').filter((l) => l !== ''), Array.from({ length: 200 }, (_, i) => `x${i}`));
+  assert.deepEqual(pages.filter((r) => r.truncated).length, 0);
+});
+
 test('a tail says truncated where the projection lost rows, as a page does: a hole’s note or another source’s line scrolled a region not from row 1', async () => {
   // An independent read of the fixes for #22: the tail kept only the projection's text, so a scroll region's rows a gap note
   // or a Run's long line took went unreported in a tail, where a page said truncated.
