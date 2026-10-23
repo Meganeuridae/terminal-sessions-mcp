@@ -416,7 +416,7 @@ const WAIT_OUTPUT: Schema = {
     clipped: { type: 'boolean', description: 'The line was longer than the match window and matched on its head only; `line` is that head.' },
     stream: STREAM,
     mixed: MIXED,
-    seq: { type: 'integer', description: 'The event that satisfied the wait: for a pattern, the one that completed the line, or for a line a flush completed (its Run ended, the session exited, a hole, a partial line left quiet) the one its last output came in.' },
+    seq: { type: 'integer', description: 'The event that satisfied the wait: for a pattern, the one that completed the line, or for a line a flush completed (its Run ended, the session exited, a hole, a partial line left quiet) the one its last output came in. For silence, the last output the quiet is measured from when it had lasted long enough already, a Run\'s end when it ended, else the journal\'s last event; absent when there is no output to name: a Run whose earlier output is gone, its quiet counted from when this daemon began watching its session.' },
     cursor: { type: 'integer', description: "A pattern's line: pass as read `since` (with `offset`) to read from its start, as a search match's cursor." },
     offset: { type: 'integer' },
     elapsedMs: { type: 'number' },
@@ -931,7 +931,7 @@ export const TOOLS: ToolDef[] = [
       // A match on a clipped line is said in the text, in the words search's status and the watch notice use (headOnlyText); only `--json` showed `clipped` (the house's read of the 38 commits, #22 comment 6274806357).
       const clipped = r.clipped ? ` · ${headOnlyText()}` : '';
       const from = r.cursor !== undefined ? ` · read since=${r.cursor}${r.offset ? ` offset=${r.offset}` : ''}` : '';
-      const text = r.matched ? `[${r.kind} matched after ${fmt(r.elapsedMs)}${r.line ? `: ${r.line}` : r.match ? `: ${r.match}` : ''}${item(pipeOf(r))} · seq ${r.seq ?? '?'}${from}${clipped}]` : `[no ${r.kind} match${r.reason ? ` · ${r.reason}` : ` within ${fmt(r.elapsedMs)}`} · next=${r.nextCursor}]`;
+      const text = r.matched ? `[${r.kind} matched after ${fmt(r.elapsedMs)}${r.line ? `: ${r.line}` : r.match ? `: ${r.match}` : ''}${item(pipeOf(r))}${r.seq !== undefined ? ` · seq ${r.seq}` : ''}${from}${clipped}]` : `[no ${r.kind} match${r.reason ? ` · ${r.reason}` : ` within ${fmt(r.elapsedMs)}`} · next=${r.nextCursor}]`;
       return render(ctx, text, env(r));
     },
   },

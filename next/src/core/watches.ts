@@ -95,7 +95,10 @@ export interface WaitResult {
   /**
    * Journal position of the event that satisfied the wait: for a pattern, the event that completed the line, or for a
    * line a flush completed (a Run's end, the session's exit, a hole, a partial line left quiet) the event its last
-   * output came in.
+   * output came in. For silence: the last output the quiet is measured from when it had lasted long enough already,
+   * the journal's last event when the quiet ran its length during the wait, and the Run's end for an ended Run. A live
+   * Run's quiet counted from the watch manager's start names no output, and has none: the journal's last event was
+   * another source's.
    */
   seq?: Seq;
   /**
@@ -736,7 +739,7 @@ export class WatchManager {
         // The session's quiet is from its last output, or from now; a live Run's is quietOf's.
         const quiet = run ? this.quietOf(run, newest) : { ...newest, age: newest.age ?? 0 };
         const age = quiet.age;
-        if (age !== undefined && age >= spec.silenceMs!) return finish(result({ matched: true, match: `no output for ${age}ms`, seq: quiet.seq ?? this.host.journal.lastSeq }));
+        if (age !== undefined && age >= spec.silenceMs!) return finish(result({ matched: true, match: `no output for ${age}ms`, ...(quiet.seq !== undefined ? { seq: quiet.seq } : {}) }));
         // A Run that has printed nothing yet starts the clock at its first output (or its end answers).
         if (age !== undefined) predicate.armSilence(spec.silenceMs! - age, clocks.monotonic() - age);
       }
