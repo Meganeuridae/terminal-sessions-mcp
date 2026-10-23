@@ -416,7 +416,7 @@ const WAIT_OUTPUT: Schema = {
     clipped: { type: 'boolean', description: 'The line was longer than the match window and matched on its head only; `line` is that head.' },
     stream: STREAM,
     mixed: MIXED,
-    seq: { type: 'integer', description: 'The event that satisfied the wait: for a pattern, the one that completed the line, or for a line a flush completed (its Run ended, the session exited, a hole, a partial line left quiet) the one its last output came in. For silence, the last output the quiet is measured from when it had lasted long enough already, a Run\'s end when it ended, else the journal\'s last event; absent when there is no output to name: a Run whose earlier output is gone, its quiet counted from when this daemon began watching its session.' },
+    seq: { type: 'integer', description: 'The event that satisfied the wait: for a pattern, the one that completed the line, or for a line a flush completed (its Run ended, the session exited, a hole, a partial line left quiet) the one its last output came in. For silence, the last output the quiet is measured from when it had lasted long enough already, a Run\'s end when it ended, else the journal\'s last event; absent when the quiet had lasted long enough already with no output to name: a Run whose earlier output is gone, its quiet counted from when this daemon began watching its session.' },
     cursor: { type: 'integer', description: "A pattern's line: pass as read `since` (with `offset`) to read from its start, as a search match's cursor." },
     offset: { type: 'integer' },
     elapsedMs: { type: 'number' },

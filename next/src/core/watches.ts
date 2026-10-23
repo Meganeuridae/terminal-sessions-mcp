@@ -41,10 +41,14 @@
  * manager began: anything it printed since would carry a stamp, so it has been quiet at least since
  * the manager began, and the watch or wait arms from there. It armed only on the Run's next output,
  * so a Run that printed before a restart and was quiet since was never reported quiet (the house's
- * review of a8b6f28..4860d4c, #22, comment 6341260318, question 3). The cost, accepted: such a Run
- * that never printed, when retention or a hole took other events from its range, fires as quiet
- * since the manager began. A Run admitted under this manager with no stamp printed nothing, and arms
- * on its first output.
+ * review of a8b6f28..4860d4c, #22, comment 6341260318, question 3). One whose newest retained output
+ * has a hole after it, which may have held later output, is measured from the manager's start too:
+ * aged from that output, its silence fired early (the house's read of 4860d4c..bc4bc85, #22). The
+ * cost, accepted: such a Run that never printed fires as quiet since the manager began when
+ * retention or a hole took other events from its range, or its read failed; and one whose newest
+ * retained output has a hole after it is said to be quiet since the manager began, which may be less
+ * than it has been. A Run admitted under this manager with no stamp printed nothing, and arms on its
+ * first output.
  */
 import { randomBytes } from 'node:crypto';
 import { compileLinePattern, PARTIAL_QUIET_MS, StreamMatcher, type LineMatch } from './ansi.js';
@@ -97,8 +101,9 @@ export interface WaitResult {
    * line a flush completed (a Run's end, the session's exit, a hole, a partial line left quiet) the event its last
    * output came in. For silence: the last output the quiet is measured from when it had lasted long enough already,
    * the journal's last event when the quiet ran its length during the wait, and the Run's end for an ended Run. A live
-   * Run's quiet counted from the watch manager's start names no output, and has none: the journal's last event was
-   * another source's.
+   * Run's quiet counted from the watch manager's start that had lasted long enough already names no output, and has
+   * none: the journal's last event was another source's. One that runs its length during the wait names the journal's
+   * last event, as any silence that ends during a wait does.
    */
   seq?: Seq;
   /**
@@ -395,7 +400,8 @@ interface Stamp {
 type Newest = Partial<Record<OutputStream, Stamp>>;
 /**
  * One Run's newest output and its age, or what can be said where there is none (WatchManager.newestRunOutput):
- * `unread` when the journal's read of it was cut or failed, so it may have printed what the read cannot give.
+ * `unread` when the journal's read of it was cut, by a hole after its newest retained output too, or failed, so it may
+ * have printed what the read cannot give.
  */
 type RunNewest = { seq?: Seq; age?: number; none?: string; unread?: true };
 
@@ -525,13 +531,16 @@ export class WatchManager {
    * A Run's newest output, or, where there is none to age, what can be said of it: `no output` only when the
    * Run's whole range was read, `no output retained` when retention or a hole took part of it, and that the
    * read failed when it did. Read as `no output`, a Run whose output had aged out, or could not be read, was
-   * said to have printed nothing (the house's read of the 40 commits over our fixes, #22).
+   * said to have printed nothing (the house's read of the 40 commits over our fixes, #22). Its newest output comes
+   * marked `unread` when a hole follows it in the Run's range (the house's read of 4860d4c..bc4bc85, #22).
    */
   private lastRunOutput(runId: string): { last?: JournalEvent; none?: string; unread?: true } {
     try {
       const out = this.host.journal.runs.output(this.host.journal, runId, { maxBytes: 1 });
       const last = out.events.at(-1);
-      if (last) return { last };
+      // A hole after the newest retained output may have held later output: the read can't say how long the Run
+      // has been quiet, only that it printed then (the house's read of 4860d4c..bc4bc85, #22).
+      if (last) return out.gaps?.some((g) => g.to > last.seq) ? { last, unread: true } : { last };
       return out.truncated ? { none: 'no output retained', unread: true } : { none: 'no output' };
     } catch {
       return { none: 'its output could not be read', unread: true };
@@ -551,16 +560,17 @@ export class WatchManager {
     for (const s of Object.values(this.live.get(runId) ?? this.ended.get(runId) ?? {})) if (s && (!stamp || s.seq > stamp.seq)) stamp = s;
     if (stamp) return { seq: stamp.seq, age: Math.max(0, Math.round(clocks.monotonic() - stamp.at)) };
     const read = this.lastRunOutput(runId);
-    return read.last ? { seq: read.last.seq, age: this.ageOf(read.last) } : read;
+    return read.last ? { seq: read.last.seq, age: this.ageOf(read.last), ...(read.unread ? { unread: true as const } : {}) } : read;
   }
 
   /**
    * How long a live Run has been quiet, for a silence watch or wait to arm with: its newest output's age; or, with no
-   * stamp and no output the journal can give, admitted before this manager began, the time since the manager began
-   * (see the module comment); or none, when it has printed nothing: it arms on its first output (m2-12).
+   * stamp and no output the journal can give, or a hole after the newest it gives, admitted before this manager began,
+   * the time since the manager began (see the module comment); or none, when it has printed nothing: it arms on its
+   * first output (m2-12).
    */
   private quietOf(run: RunInfo, newest: RunNewest): { seq?: Seq; age?: number } {
-    if (newest.age !== undefined || !newest.unread || run.seq.admit > this.began.seq) return newest;
+    if (!newest.unread || run.seq.admit > this.began.seq) return newest;
     return { age: Math.max(0, Math.round(clocks.monotonic() - this.began.at)) };
   }
 

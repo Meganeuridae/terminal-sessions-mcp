@@ -532,6 +532,37 @@ test('a silence watch or wait on a live Run whose output from before this manage
   }
 });
 
+test("a live Run's silence isn't aged from its newest retained output when a hole follows it, which may have held later output: it is quiet since this manager began (the house's read of 4860d4c..bc4bc85, #22)", async (t) => {
+  // The Run printed before this manager existed. Its newest retained output is a minute old; aged from it, a 30 s
+  // silence answered at once, though the hole after it may have held output from a moment ago.
+  const f = bare();
+  try {
+    f.startRun('h');
+    const early = f.out('early\n', 'h').seq;
+    const later = new WatchManager(f.host);
+    try {
+      let hole = false;
+      const output = f.journal.runs.output.bind(f.journal.runs);
+      t.mock.method(f.journal.runs, 'output', (...a: Parameters<typeof output>) => {
+        const out = output(...a);
+        const events = out.events.map((e) => ({ ...e, ts: e.ts - 60_000 }));
+        if (!hole) return { ...out, events };
+        const lost = early + 1;
+        return { ...out, events, truncated: true, gaps: [{ seq: lost, ts: Date.now(), type: 'gap' as const, from: lost, to: lost, reason: 'torn-write' as const }] };
+      });
+      const whole = await later.waitFor({ silenceMs: 30_000, runId: 'h' }, 300);
+      assert.deepEqual([whole.matched, whole.seq], [true, early], `with nothing lost after it, its newest output is a minute old: ${JSON.stringify(whole)}`);
+      hole = true;
+      const cut = await later.waitFor({ silenceMs: 30_000, runId: 'h' }, 300);
+      assert.equal(cut.matched, false, `with a hole after it, the quiet known is since the manager began: ${JSON.stringify(cut)}`);
+    } finally {
+      later.dispose();
+    }
+  } finally {
+    f.close();
+  }
+});
+
 test('a Run admitted under this manager, or whose whole range was read, with nothing printed, still arms on its first output (m2-12; the house’s review of a8b6f28..4860d4c, #22, comment 6341260318, question 3)', async (t) => {
   // This manager stamps every output of a Run admitted after it began, so one with no stamp printed nothing, whatever a
   // hole took from its range; and one whose whole range was read printed nothing either.
