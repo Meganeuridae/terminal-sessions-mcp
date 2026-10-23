@@ -60,6 +60,17 @@ later release (`next/README.md`, "Upgrading from 1.x").
   xterm from a CDN, and 1.x's `ws` stays within 8.x. New dependencies: `@animalabs/mcpl-core`,
   `@xterm/headless`, `@xterm/addon-serialize`.
 
+## v1.7.3 - 2026-10-22
+
+### Fixed
+
+- **The stdio MCP server answers `initialize` with the protocol revision the
+  client asked for, when it supports that revision.** It answered
+  `2025-06-18` whatever the client asked for, which a client that speaks
+  only an earlier revision can't accept. It now answers `2025-06-18`,
+  `2025-03-26`, `2024-11-05` or `2024-10-07` when the client asks for it,
+  and `2025-06-18` for any other revision or none.
+
 ## v1.7.2 - 2026-10-20
 
 ### Fixed
