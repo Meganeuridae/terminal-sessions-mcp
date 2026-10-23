@@ -10,10 +10,10 @@
 // Keystrokes are sent only over an open connection to an attached session: typed
 // while disconnected or attaching, they are dropped with a notice, never queued to
 // run seconds later against whatever the terminal shows by then (tsg-7). Input can
-// be marked secret (the lock), and is automatically while the cursor line looks
-// like a password prompt: the daemon journals it as a redacted placeholder (G26,
-// tsg-8). The session list is pushed by the daemon on change (terminal/sessions)
-// and refreshed slowly only while the page is visible (tsg-16).
+// be marked secret (the lock), and is automatically while the text left of the
+// cursor looks like a password prompt: the daemon journals it as a redacted
+// placeholder (G26, tsg-8). The session list is pushed by the daemon on change
+// (terminal/sessions) and refreshed slowly only while the page is visible (tsg-16).
 'use strict';
 (() => {
   // The token arrives once in the page URL (`tsm gui` prints it). Keep it for this tab only and take it
@@ -275,10 +275,15 @@
   const SECRET_PROMPT = /(pass(word|phrase|code)?|\bpin\b|passcode|\botp\b|one-time code|verification code|secret|token)[^\n]{0,80}[:?]\s*$/i;
   const secret = { manual: false, auto: false };
 
-  function cursorLine() {
+  /**
+   * The text left of the cursor on its row, as the daemon's m2-2 reads a prompt on the screen (`atSecretPrompt`): what a
+   * row held before the prompt was printed over it can stay to the cursor's right. Read whole, a row left so by readline's
+   * redraw for a resize took `Password: o "len=${#PW}"` for no prompt (a reviewer's read of the fixes for #22).
+   */
+  function textBeforeCursor() {
     if (!term) return '';
     const b = term.buffer.active;
-    return b.getLine(b.baseY + b.cursorY)?.translateToString(true) ?? '';
+    return b.getLine(b.baseY + b.cursorY)?.translateToString(true, 0, b.cursorX) ?? '';
   }
 
   function updateSecret() {
@@ -319,8 +324,8 @@
       );
       return;
     }
-    // G26: a password prompt on the cursor line makes this input secret until the line is entered.
-    if (!secret.manual && !secret.auto && SECRET_PROMPT.test(cursorLine())) {
+    // G26: a password prompt left of the cursor makes this input secret until the line is entered.
+    if (!secret.manual && !secret.auto && SECRET_PROMPT.test(textBeforeCursor())) {
       secret.auto = true;
       updateSecret();
     }
