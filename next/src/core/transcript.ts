@@ -21,7 +21,13 @@
  *    When `open` says a next range continues this one (a page), the blank lines
  *    the range ended with are kept (every line begun up to the cursor's row), and
  *    an unfinished last line keeps its trailing whitespace, so the pages joined
- *    read as the whole range does.
+ *    read as the whole range does. The cursor's row is begun when something was
+ *    written on it; a row it was moved onto without a write (an erase of the
+ *    display left it there, a cursor motion took it there) is no line yet. The
+ *    projection says how its last line stands for the next range (`lastLine`):
+ *    unfinished, with the cursor on it past its start, so what the next range
+ *    writes first goes on with it; or returned over, the cursor at its start,
+ *    so the next range's text writes over it, unless a LF ends it first.
  * 4. Nothing printed is lost to redraws of the whole display. Before an erase of
  *    the whole display (`ED 2`, `ED 0` from the home position, their DECSED
  *    forms, or `RIS`) its content is kept, and the projection continues on the
@@ -145,6 +151,16 @@ export interface Projection {
    * what a cut omits or drops, no other page or tail shows them.
    */
   lost?: true;
+  /**
+   * With `open`, how the last line stands for the range that continues this one (rule 3): `unfinished`, the cursor
+   * on it past its start, so the next range's first output goes on with it; `returned`, the cursor taken back to its
+   * start (a CR), so the next range's first text writes over it, unless it is the LF of a CRLF, which ends it. Absent
+   * when the next range begins a line of its own: the cursor stands on a row nothing was written on (after a line
+   * end, an erase of the display, a cursor motion), or above the last line, or the head's cut of lines dropped the
+   * line it stands on. The reader's `splitLine` is read from it (the house's review of 4860d4c..bc4bc85, PR #22,
+   * comment 6357989601: by the stream's line ends, a page whose last line an erase had ended said it went on).
+   */
+  lastLine?: 'unfinished' | 'returned';
 }
 
 export interface TranscriptOptions {
@@ -333,6 +349,8 @@ class Projector {
    * scroll region by what the program did not write (hookScroll, boundary).
    */
   lost = false;
+  /** How the last line stands for a next range (Projection.lastLine), once `finish` has run with `open`. */
+  lastLine: 'unfinished' | 'returned' | undefined;
   private readonly capacity: number;
   /** The source being fed (a segment's key); undefined while the projection writes its own: a boundary's line end, a note, a header. */
   private source: string | undefined;
@@ -535,20 +553,23 @@ class Projector {
     const n = this.term.buffer.normal;
     const alt = this.term.buffer.active.type === 'alternate';
     let last = lastNonEmpty(n);
-    let unfinished = false;
     if (open && !alt) {
-      // A range that a next range continues keeps what the next one builds on: the blank
-      // lines it ended with (every line it began, up to the cursor's), and an unfinished
-      // last line with its trailing whitespace (rule 3).
+      // A range that a next range continues keeps what the next one builds on: the blank lines it ended with (every
+      // line it began, up to the cursor's), and an unfinished last line with its trailing whitespace (rule 3). The
+      // cursor's row is begun when something was written on it (xterm keeps written blanks as content, so written
+      // indentation is a begun line); a row the cursor was only moved onto is not: after a whole-display erase the
+      // cursor keeps its column on a blank row, and that row counted as a begun, unfinished line, so a page ending
+      // there said its last line went on (the house's review of 4860d4c..bc4bc85, PR #22, comment 6357989601). How
+      // the last line stands for the next range is kept for the caller (`lastLine`).
       const row = n.baseY + n.cursorY;
-      if (n.cursorX > 0) {
-        unfinished = row >= last;
+      if (rowText(n, n.cursorY) !== '') {
+        if (row >= last) this.lastLine = n.cursorX > 0 ? 'unfinished' : 'returned';
         last = Math.max(last, row);
       } else last = Math.max(last, row - 1);
     }
     this.rowsOut(n, 0, last + 1);
     if (alt) this.frameOut(this.term.buffer.alternate);
-    if (!unfinished) this.out.close();
+    if (this.lastLine !== 'unfinished') this.out.close();
     const lines = this.out.lines;
     if (!open) while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
     return lines;
@@ -1149,6 +1170,8 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
         if (keep === 'head') omitted += droppedInput(segs, maxLines, stopped, gone, made);
         cut = true;
       }
+      // The head's cut dropped the lines after the ones kept: the line the cursor stands on is not the last shown.
+      if (keep === 'head') pr.lastLine = undefined;
       lines = kept;
     }
     return {
@@ -1157,6 +1180,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
       omittedInputBytes: omitted,
       ...(cut ? { cut: true as const } : {}),
       ...(pr.lost ? { lost: true as const } : {}),
+      ...(pr.lastLine !== undefined ? { lastLine: pr.lastLine } : {}),
     };
   } finally {
     pr.dispose();

@@ -266,6 +266,29 @@ test('er-12: a live page that ends a line and then only control sequences does n
   assert.equal((await readJournal(src, { since: a.nextCursor }, { resultBytes: 16384 })).text, 'second line');
 });
 
+// ───────────── 6357989601: splitLine follows the projection's lines ─────────────
+
+test('6357989601: a projection says how its last line stands for the range that continues it', async () => {
+  const opts = { cols: 20, rows: 5, keep: 'head' as const, open: true };
+  const at = async (data: string) => (await project([data], opts)).lastLine;
+  assert.equal(await at('abc'), 'unfinished', 'the cursor stands on the line past its start');
+  assert.equal(await at('abc\r\n   '), 'unfinished', 'written indentation begins a line');
+  assert.equal(await at('x'.repeat(20)), 'unfinished', 'a full row: the next character wraps, going on with the line');
+  assert.equal(await at('abc\r'), 'returned', 'a CR took the cursor back over the line');
+  assert.equal(await at('abc\r\n'), undefined, 'the line ended');
+  assert.equal(await at('abc\x1b[2J'), undefined, 'the erase ended the line: the cursor keeps its column on a row holding nothing');
+  assert.equal(await at('abc\x1b[2K'), undefined, 'the line was erased');
+  assert.equal(await at('abc\r\n\x1b[4C'), undefined, 'a cursor motion onto an empty row begins no line');
+  assert.equal(await at('abc\r\ndef\x1b[A'), undefined, 'the cursor stands above the last line');
+  assert.equal((await project(['abc'], { ...opts, open: false })).lastLine, undefined, 'without open, no range continues this one');
+  // A row the cursor only stands on is no line of the text: after the erase the text ends with the line it kept.
+  assert.equal((await project(['abc\x1b[2J'], opts)).text, 'abc');
+  assert.equal((await project(['abc\r\n\r\n\x1b[4C'], opts)).text, 'abc\n', 'the blank line a LF began is kept; the row the cursor was moved onto is not');
+  assert.equal((await project(['abc\r\n   '], opts)).text, 'abc\n   ', 'an unfinished line keeps its trailing whitespace');
+  // The head's cut of lines drops the line the cursor stands on: the last line shown is not it.
+  assert.equal((await project(['a\r\nb\r\nc'], { ...opts, maxLines: 2 })).lastLine, undefined);
+});
+
 // ───────────── er-13 / atc-16 / ux-21: tail ─────────────
 
 test('er-13 / atc-16: tail with runId gives the last lines of that Run', async () => {
