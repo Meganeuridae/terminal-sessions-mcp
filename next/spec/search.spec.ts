@@ -151,6 +151,60 @@ test('a match\'s coordinates read and search on from a CSI the source\'s earlier
   }
 });
 
+test("a line's coordinates read on from its own source's open sequence only, and never across a hole the journal knows, wherever its gap line was written (the house's review of 4860d4c..bc4bc85, PR #22)", async () => {
+  // From a line's coordinates, the head looked back for (headBefore) must be what the scan carried into that line: the
+  // line's own source's open sequence, read across another Run's output for a Run's pages, and none across a hole.
+  const sameAsScan = async (src: ReturnType<typeof source>, pattern: string, want: string, runId?: string) => {
+    const scoped = runId !== undefined ? { runId } : {};
+    const m = (await search(src, { pattern, since: 0, ...scoped })).matches[0];
+    assert.ok(m, `${want}: found`);
+    const at = { since: m.cursor, ...(m.offset ? { offset: m.offset } : {}), ...scoped };
+    assert.equal((await readJournal(src, at, { resultBytes: 4096 })).text!.split('\n')[0], want, `${want}: the read`);
+    assert.deepEqual(lines(await search(src, { pattern, ...at, context: 0 })), [want], `${want}: the search`);
+  };
+  // Another source's open CSI is not this line's head: `1mB` is the terminal's text.
+  const other = source();
+  startRun(other.journal, 'r1');
+  out(other.journal, 'x\x1b[3', 'stdout', 'r1');
+  out(other.journal, '\n1mB\n');
+  await sameAsScan(other, '^1mB$', '1mB');
+  // A Run's own open CSI, with another Run's output between, is: the Run's line reads `B`.
+  const run = source();
+  startRun(run.journal, 'r1');
+  out(run.journal, 'x\x1b[3', 'stdout', 'r1');
+  startRun(run.journal, 'r2');
+  for (let i = 0; i < 3; i++) out(run.journal, `r2 line ${i}\n`, 'stdout', 'r2');
+  out(run.journal, '\n1mB\n', 'stdout', 'r1');
+  await sameAsScan(run, '^B$', 'B', 'r1');
+  // So is a Run's own on the terminal, with other terminal output between that would end the CSI (`z` is a final byte).
+  const pty = source();
+  startRun(pty.journal, 'r1');
+  out(pty.journal, 'x\x1b[3', 'pty', 'r1');
+  out(pty.journal, 'zz\n', 'pty');
+  out(pty.journal, '\n1mB\n', 'pty', 'r1');
+  await sameAsScan(pty, '^B$', 'B', 'r1');
+  // A hole between, its gap line there.
+  const gap = source();
+  out(gap.journal, 'x\x1b[3');
+  gap.journal.append({ type: 'gap', from: 2, to: 2, reason: 'torn-write' });
+  out(gap.journal, '\n1mB\n');
+  await sameAsScan(gap, '^1mB$', '1mB');
+  // A hole between whose gap line was written after the line, as a catch-up writes one.
+  const late = source();
+  out(late.journal, 'x\x1b[3');
+  late.journal.append({ type: 'note', text: 'stands for the lost seq', principal: 'human:test' });
+  out(late.journal, '\n1mB\n');
+  late.journal.append({ type: 'gap', from: 2, to: 2, reason: 'store-error' });
+  await sameAsScan(late, '^1mB$', '1mB');
+  // A gap line written late for an older hole, behind the open CSI, doesn't end the look back: the line reads `B`.
+  const stale = source();
+  out(stale.journal, 'before\n');
+  out(stale.journal, 'x\x1b[3');
+  stale.journal.append({ type: 'gap', from: 1, to: 1, reason: 'store-error' });
+  out(stale.journal, '\n1mB\n');
+  await sameAsScan(stale, '^B$', 'B');
+});
+
 test('er-6 / ux-20: read since=match.cursor (offset=match.offset) starts at the matching line, even inside a 64 KiB pipe read', async () => {
   const src = source();
   startRun(src.journal, 'r1');

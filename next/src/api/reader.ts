@@ -1054,21 +1054,14 @@ async function projectPage(chosen: Chosen, geometry: { cols: number; rows: numbe
 const STATE_LOOKBACK = 1024 * 1024;
 
 /**
- * The lasting terminal state (`persistentState`, screen.ts) set by the view's
- * output before the page: `first`'s bytes before `start`, and up to
- * STATE_LOOKBACK bytes of output before it — the Run's own for a Run's pages.
- * A session's look-back also stops after MAX_SCAN journal events, output or
- * not, so many small events end it before the bytes do (40,000 events of 8 bytes
- * are 320 KB): state set before them is not applied.
- */
-/**
  * How far back headBefore reads a source's earlier output for the start of a sequence open where a page begins, in
- * UTF-16 units and in events: the look back for an unfinished sequence the house's other readers use (4,096), and one
- * batch of events, since it runs for every page and search that starts at since. A CSI or escape sequence whose open
- * head runs further back than that, across events, is missed: a read or search from a line inside it shows the
- * sequence's rest as text, where the matcher, which carries the head whole, read it. Only a malformed sequence is that
- * long. Reading back until a character an open sequence can't hold would be exact, but an open CSI can hold digits
- * and line ends, so that would walk back through the whole of a Run that prints numbers (`seq 1 30000`, 169 KB).
+ * UTF-16 units and in journal events: the look back for an unfinished sequence the house's other readers use (4,096),
+ * among one batch of the journal's events (512), since it runs for every page and search that starts at since. A CSI or
+ * escape sequence whose open head runs further back than that, across events, is missed: a read or search from a line
+ * inside it shows the sequence's rest as text, where the matcher, which carries the head whole, read it. A sequence
+ * that long is rare but can be valid (a CSI's parameters can run to thousands of digits). Reading back until a
+ * character an open sequence can't hold would be exact, but an open CSI can hold digits and line ends, so that would
+ * walk back through the whole of a Run that prints numbers (`seq 1 30000`, 169 KB).
  */
 const HEAD_LOOKBACK = 4096;
 const HEAD_EVENTS = 512;
@@ -1078,31 +1071,45 @@ const HEAD_EVENTS = 512;
  * one begun earlier in `first`, or in the same source's earlier output, read on across its events, as the matcher
  * that gave the coordinates read it. A line begun after a LF a CSI in an earlier event executed begins with that CSI's
  * head: read from its coordinates, `ESC [ 3 LF` then `1mREADY` showed `1mREADY`, and a search from there found no
- * `^READY$` (our review of the 73 commits through 4860d4c, PR #22). A hole ends every sequence, so the look back
- * stops at one; it reads at most HEAD_LOOKBACK of the source's output, among the HEAD_EVENTS events before.
+ * `^READY$` (our review of the 73 commits through 4860d4c, PR #22). It reads the HEAD_EVENTS journal events before
+ * `first`, a Run's page or search the Run's own among them, and at most HEAD_LOOKBACK units of the source's output
+ * there, the oldest event it keeps cut to fit. A hole ends every sequence, so the look back stops at the newest hole the
+ * journal knows among those events, wherever its gap line was written: a hole recorded after `first` is not read
+ * across, and a gap line recorded late for an older hole doesn't end a look back that hole is behind. The look back of a
+ * Run's page was its output read back by bytes alone, through every other event of the session to the Run's start, and
+ * a session's stopped at the first gap line in its window, wherever its hole lay (the house's review of 4860d4c..bc4bc85,
+ * PR #22).
  */
 function headBefore(src: ReadSource, o: { runId?: string | undefined }, first: Output, start: number): string {
   const key = sourceKey(first);
+  const events = first.seq > 1 ? src.journal.tail(HEAD_EVENTS, first.seq - 1) : [];
+  const lo = events[0]?.seq ?? first.seq;
+  const holeEnd = Math.max(lo - 1, ...src.journal.holesIn(lo, first.seq - 1, events).map((g) => g.to));
   const parts: string[] = [];
   let units = 0;
-  const take = (events: readonly JournalEvent[]): void => {
-    for (let i = events.length - 1; i >= 0 && units < HEAD_LOOKBACK; i--) {
-      const e = events[i]!;
-      if (isGap(e)) return;
-      if (!isOutput(e) || sourceKey(e) !== key) continue;
-      parts.push(e.data);
-      units += e.data.length;
-    }
-  };
-  if (o.runId !== undefined) {
-    const back = src.runOutput(o.runId, { until: first.seq - 1, maxBytes: HEAD_LOOKBACK });
-    const holeEnd = Math.max(-1, ...(back.gaps ?? []).map((g) => g.to));
-    take(back.events.filter((e) => e.seq > holeEnd));
-  } else if (first.seq > 1) take(src.journal.tail(HEAD_EVENTS, first.seq - 1));
+  for (let i = events.length - 1; i >= 0 && units < HEAD_LOOKBACK; i--) {
+    const e = events[i]!;
+    if (e.seq <= holeEnd) break;
+    if (!isOutput(e) || sourceKey(e) !== key || (o.runId !== undefined && e.runId !== o.runId)) continue;
+    const data = e.data.length > HEAD_LOOKBACK - units ? e.data.slice(e.data.length - (HEAD_LOOKBACK - units)) : e.data;
+    parts.push(data);
+    units += data.length;
+  }
   const before = parts.reverse().join('');
   return headAt(before + first.data, before.length + start);
 }
 
+/**
+ * The lasting terminal state (`persistentState`, screen.ts) set by the view's
+ * output before the page: `first`'s bytes before `start`, and up to
+ * STATE_LOOKBACK bytes of output before it — the Run's own for a Run's pages.
+ * The look-back also stops after MAX_SCAN journal events, output or not, so many
+ * small events end it before the bytes do (40,000 events of 8 bytes are 320 KB):
+ * state set before them is not applied. A Run's look-back is bounded so too: it
+ * read the Run's output back by bytes alone, through every other event of the
+ * session to the Run's start (found beside headBefore's, the house's review of
+ * 4860d4c..bc4bc85, PR #22).
+ */
 function stateBefore(src: ReadSource, o: ReadOptions, first: Output, start = 0): string {
   const parts: string[] = [];
   let bytes = 0;
@@ -1111,29 +1118,20 @@ function stateBefore(src: ReadSource, o: ReadOptions, first: Output, start = 0):
     parts.push(head);
     bytes += head.length;
   }
-  if (o.runId !== undefined) {
-    if (bytes >= STATE_LOOKBACK) return persistentState(parts[0]!);
-    const ro = src.runOutput(o.runId, { until: first.seq - 1, maxBytes: STATE_LOOKBACK - bytes });
-    for (let i = ro.events.length - 1; i >= 0; i--) {
-      const e = ro.events[i]!;
-      if (isOutput(e)) parts.push(e.data);
+  let cursor = first.seq - 1;
+  let examined = 0;
+  // Bounded in events as well as bytes: a stretch of marks and notes, or of other Runs' output, ends the look-back.
+  while (bytes < STATE_LOOKBACK && cursor > 0 && examined < MAX_SCAN) {
+    const batch = src.journal.tail(512, cursor);
+    if (batch.length === 0) break;
+    examined += batch.length;
+    for (let i = batch.length - 1; i >= 0 && bytes < STATE_LOOKBACK; i--) {
+      const e = batch[i]!;
+      if (!isOutput(e) || (o.runId !== undefined && e.runId !== o.runId)) continue;
+      parts.push(e.data);
+      bytes += e.data.length;
     }
-  } else {
-    let cursor = first.seq - 1;
-    let examined = 0;
-    // Bounded in events as well as bytes: a stretch of marks and notes with no output ends the look-back.
-    while (bytes < STATE_LOOKBACK && cursor > 0 && examined < MAX_SCAN) {
-      const batch = src.journal.tail(512, cursor);
-      if (batch.length === 0) break;
-      examined += batch.length;
-      for (let i = batch.length - 1; i >= 0 && bytes < STATE_LOOKBACK; i--) {
-        const e = batch[i]!;
-        if (!isOutput(e)) continue;
-        parts.push(e.data);
-        bytes += e.data.length;
-      }
-      cursor = batch[0]!.seq - 1;
-    }
+    cursor = batch[0]!.seq - 1;
   }
   // Oldest first, reduced as one text: a sequence split across two events (apt's scroll region) is
   // whole again (the house's read of 1cabc6a, #22); a reset makes what precedes it moot.
