@@ -322,6 +322,19 @@ function withGapInfo<R extends { gap?: GapInfo; gaps?: GapInfo[] }>(r: R, gaps: 
   return r;
 }
 
+/**
+ * The holes a result's range meets, with those it collected (addHole): a page or a search lists every hole that meets
+ * the seqs it covered, as a tail's text does, wherever the walk places the hole's line. A hole wider than a batch has
+ * its line placed in the batch that holds its end, so a page or search that stopped inside it said nothing of it: a
+ * page of seqs 1–50 under a hole joined past MAX_LOST (1–2600) listed no gap and showed no note (the house's review of
+ * 4860d4c..bc4bc85, PR #22).
+ */
+function metHoles(journal: Journal, from: Seq, to: Seq, collected: GapInfo[]): GapInfo[] {
+  const all = [...collected];
+  if (to >= from) for (const g of journal.holesIn(from, to)) addHole(all, gapOf(g));
+  return all;
+}
+
 /** Header lines for pages that hold more than one source (§6 rule 6). */
 /** The header line naming a source in a page of several (§6 rule 6): no line of output, so `tail` does not count it. */
 export const sourceHeader = (s: SourceInfo): string => (s.stream === 'pty' ? '[terminal]' : `[run ${s.runId ?? '?'}]`);
@@ -648,7 +661,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   };
   if (nextOffset !== undefined) r.nextOffset = nextOffset;
   if (chosen.midLine && (more || open)) r.splitLine = true;
-  return withGapInfo(r, chosen.gaps);
+  return withGapInfo(r, metHoles(journal, r.seq[0], r.seq[1], chosen.gaps));
 }
 
 /**
@@ -1165,7 +1178,7 @@ function eventsPage(src: ReadSource, o: ReadOptions, maxBytes: number): Omit<Rea
   const next = more ? page[page.length - 1]!.seq : Math.max(w.end, page[page.length - 1]?.seq ?? start);
   const r: Omit<ReadResult, 'session'> = { events: page, seq: [page[0]?.seq ?? start + 1, next], nextCursor: Math.min(next, journal.lastSeq), more, truncated: false };
   const recorded = recordedIn(page);
-  return withGapInfo(r, [...(w.gap ? uncovered(journal, w.gap, recorded) : []), ...recorded]);
+  return withGapInfo(r, metHoles(journal, r.seq[0], r.seq[1], [...(w.gap ? uncovered(journal, w.gap, recorded) : []), ...recorded]));
 }
 
 /**
@@ -2012,7 +2025,7 @@ export async function searchJournal(src: ReadSource, o: SearchOptions, limits: P
     if (resume.offset > 0) r.nextOffset = resume.offset;
   }
   if (stoppedBy) r.stoppedBy = stoppedBy;
-  withGapInfo(r, [...(w.gap ? uncovered(journal, w.gap, gaps) : []), ...gaps]);
+  withGapInfo(r, metHoles(journal, r.scanned[0], r.scanned[1], [...(w.gap ? uncovered(journal, w.gap, gaps) : []), ...gaps]));
   if (scanner.clippedLines > 0) r.clippedLines = scanner.clippedLines;
   return r;
 }

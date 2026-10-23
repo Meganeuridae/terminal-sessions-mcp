@@ -1889,6 +1889,35 @@ test("a hole wider than a batch breaks the line where it ends: output on either 
   }
 });
 
+test("a page or a search that stops inside a hole wider than a batch lists it, though its line goes where it ends (the house's review of 4860d4c..bc4bc85, PR #22)", async () => {
+  // As above, the two oldest holes, 1 and 2600, are joined past MAX_LOST. A page of the first 50 seqs and a search that
+  // stopped at seq 15 covered seq 1, and said nothing of the hole.
+  const dir = tmpDir();
+  try {
+    const first = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+    for (let i = 0; i < 3200; i++) first.append(out(`e${i}\n`));
+    first.close();
+    const cold = new Flaky(dir);
+    cold.budget = 0;
+    const holes = [1, 2600, ...Array.from({ length: 254 }, (_, k) => 2602 + 2 * k)].map((s) => ({ from: s, to: s, reason: 'store-error' as const, exact: true as const }));
+    const j = new Journal({ hot: new MemoryStore(1), cold, startSeq: first.lastSeq, lost: holes, sessionId: 's' });
+    j.append(out('last\n'));
+    assert.ok(j.gapsWithin(1, j.lastSeq).some((g) => g.from === 1 && g.to === 2600), 'the two oldest holes were joined');
+    const src = { id: 's', journal: j, cols: 80, rows: 24, runOutput: (runId: string, range: Parameters<typeof j.runs.output>[2]) => j.runs.output(j, runId, range), run: (runId: string) => j.runs.get(runId) };
+    const listed = (r: { gap?: { from: number; to: number }; gaps?: { from: number; to: number }[] }) => (r.gaps ?? (r.gap ? [r.gap] : [])).filter((g) => g.from === 1 && g.to === 2600).length;
+    const page = await readJournal(src, { since: 0, maxBytes: 2000 }, { resultBytes: 4 << 20 });
+    assert.ok(page.more && page.seq[1] < 2600, JSON.stringify(page.seq));
+    assert.equal(listed(page), 1, JSON.stringify(page.gaps ?? page.gap));
+    const events = await readJournal(src, { since: 0, as: 'events', limit: 20 }, { resultBytes: 4 << 20 });
+    assert.equal(listed(events), 1, JSON.stringify(events.gaps ?? events.gap));
+    const found = await searchJournal(src, { pattern: '^e1\\d$', since: 0, limit: 3 });
+    assert.ok(found.more && found.scanned[1] < 2600, JSON.stringify(found.scanned));
+    assert.equal(listed(found), 1, JSON.stringify(found.gaps ?? found.gap));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a gap line the journal didn't write, whose range reaches past the batch that holds it, keeps its note (an independent read of the fixes for the review of 4f4c067..a8b6f28, PR #22)", async () => {
   // Effie-2756's case: such a line is seated at its own seq and reported only by the batch that holds it, so waiting for
   // the batch that holds its range's end lost its note when the batch boundary (2048) fell inside the range.
