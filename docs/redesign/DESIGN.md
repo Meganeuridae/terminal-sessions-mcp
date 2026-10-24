@@ -894,7 +894,9 @@ and hosts match them with globs; bare tags name distinct event classes
 A person's typed line (`terminal:human-input`) is held like ordinary output, not a wake: an agent
 sharing a terminal with someone in a long interactive session would otherwise run inference on
 every line. A host that wants to be woken by it can key on `chat:from-human`, which the same
-message carries.
+message carries. Like all ambient output, it reaches a host only on an open channel
+(`terminal.channels`, with `terminal:<session>` open), so only a host that follows the session
+that way is woken by it.
 
 The five service classes are the statuses a Service reports after `starting` (§10.2):
 `ready`, `running`, `unhealthy`, `exited`, `lost`; the shipped bridge configuration wakes on
