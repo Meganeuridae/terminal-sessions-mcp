@@ -1739,8 +1739,8 @@ export class McplLane {
     }
     let head = seg.head;
     if (seg.kind === 'output' && seg.runId !== undefined) {
-      const unread = this.watched.get(t.id)?.segmenter.unreadBytes(seg.runId, t.cursorsOf(this.me).read) ?? 0;
-      if (unread > 0) head += ` · ${fmtBytes(unread)} new since your last read`;
+      const unread = this.watched.get(t.id)?.segmenter.unreadBytes(seg.runId, t.cursorsOf(this.me).read);
+      if (unread && unread.bytes > 0) head += ` · ${unread.atLeast ? 'at least ' : ''}${fmtBytes(unread.bytes)} new since your last read`;
     }
     const metadata: Record<string, unknown> = { node: NODE_NAME, ...seg.metadata, seq: seg.seq, kind: seg.kind };
     if (seg.supersedes) metadata.supersedes = qualify(seg.supersedes);

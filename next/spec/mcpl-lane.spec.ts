@@ -837,6 +837,33 @@ test("MCPL 2: a progress digest's id carries its Run, so two Runs digested at th
   }
 });
 
+test("a digest of a Run already running when the lane began says the output new since a read before its count began is at least what it counted (the house's review of bc4bc85..5d8ce0e, PR #22, I36)", { timeout: 30_000 }, async () => {
+  const d = await daemon();
+  try {
+    // Opened and run over plain MCP, so no lane follows the session and its segmenter begins only when one does: after
+    // more output than its first read of a Run in flight takes (1 MiB), while the Run still runs.
+    const m = await d.host('ta', 'late-m', { mcpl: false });
+    await m.call('session_open', { session: 'late', visibility: 'shared' });
+    const r = await m.call('run', { session: 'late', command: "head -c 1200000 /dev/zero | tr '\\0' a; echo; sleep 10", target: 'process', wait: 20 });
+    const runId = r.structured?.runId;
+    assert.ok(typeof runId === 'string', JSON.stringify(r));
+    const s = live(d.registry, 'late');
+    const printed = () => s.runOutput(runId).events.reduce((n, e) => n + (e.type === 'output' ? Buffer.byteLength(e.data) : 0), 0);
+    await until(() => printed() > 1_200_000, 10_000, 'the output');
+    // Another principal's lane, which has read none of it.
+    const b = await d.host('tb', 'late-b');
+    await b.request('channels/open', { channelId: 'terminal:late' });
+    const digest = await b.delivery((x) => x.tags.includes('terminal:output') && x.metadata.runId === runId, 8000);
+    const head = digest.text.split('\n')[0]!;
+    assert.match(head, /at least [\d.]+ \S+ so far/, head);
+    assert.match(head, / · at least [\d.]+ \S+ new since your last read/, head);
+    await m.close();
+    await b.close();
+  } finally {
+    await d.stop();
+  }
+});
+
 // ───────────── the house's read of 2f357bd (#22) ─────────────
 
 for (const first of ['never carried', 'refused on an open channel'] as const) {

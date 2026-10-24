@@ -295,6 +295,12 @@ test('a marker Run in flight when the segmenter begins: its digest drops the ech
   assert.equal(digest('near')!.body, 'building 1\nhalf');
   assert.equal(digest('far')!.metadata.bytesAtLeast, true, 'the read was cut');
   assert.equal(digest('far')!.body?.split('\n').slice(-2).join('\n'), 'last\nhalf');
+  // The house's review of bc4bc85..5d8ce0e (PR #22), I36: for a read before what the cut read began with, the count of what's new is a lower bound; from
+  // there on, it isn't. A Run the read took whole counts exactly from its start.
+  const far = seg.unreadBytes('far', 0)!;
+  assert.equal(far.atLeast, true, `a read before the count began: ${JSON.stringify(far)}`);
+  assert.equal(seg.unreadBytes('far', src.journal.lastSeq - 1)!.atLeast, false, 'a read inside what was counted');
+  assert.equal(seg.unreadBytes('near', 0)!.atLeast, false);
 });
 
 test('an inline Run’s progress digest shows its partial line: its output begins after its start mark, so nothing waits for one', async (t) => {

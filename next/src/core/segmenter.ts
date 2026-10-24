@@ -784,6 +784,8 @@ interface RunWatch {
   bytes: number;
   /** The count began when the segmenter did, after some output it could only read bounded (a Run already in flight). */
   bytesAtLeast: boolean;
+  /** With `bytesAtLeast`, the first output the count holds: a read before it has more unread than the count. */
+  countedFrom?: Seq;
   bytesAtLastDigest: number;
   lastDigestId?: string;
   timer?: NodeJS.Timeout | undefined;
@@ -978,9 +980,11 @@ export class Segmenter {
   /**
    * Output bytes of a running Run after `read` (for "new since your last read"), or undefined when
    * it is not tracked. Exact while the mark for `read` is kept; when it was dropped, the count runs
-   * from the last kept mark before it, so it is never short.
+   * from the last kept mark before it, so it is never short, except as `atLeast` says: a segmenter
+   * that came in while the Run ran counted only the newest output it could read, and for a read
+   * before the first of that, the output before it is unread too (the house's review of bc4bc85..5d8ce0e, PR #22, I36).
    */
-  unreadBytes(runId: string, read: Seq): number | undefined {
+  unreadBytes(runId: string, read: Seq): { bytes: number; atLeast: boolean } | undefined {
     const w = this.running.get(runId);
     if (!w) return undefined;
     let through = 0;
@@ -988,7 +992,7 @@ export class Segmenter {
       if (seq > read) break;
       through = bytes;
     }
-    return w.bytes - through;
+    return { bytes: w.bytes - through, atLeast: w.bytesAtLeast && (w.countedFrom === undefined || read < w.countedFrom) };
   }
 
   private emit(seg: Segment | undefined): void {
@@ -1143,6 +1147,8 @@ export class Segmenter {
       if (!this.alt || w.pipes) this.feedLines(w, ev.data, ev.stream);
     }
     w.bytesAtLeast = out.truncated;
+    const first = out.events.find((e) => e.type === 'output');
+    if (first) w.countedFrom = first.seq;
     if (out.events.length) w.marks.push([out.events[out.events.length - 1]!.seq, w.bytes]);
     if (!w.pipes) w.silenceTimer = setTimeout(() => this.checkNeedsInput(w), this.o.needsInputMs);
   }

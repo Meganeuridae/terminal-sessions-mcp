@@ -255,9 +255,9 @@ test('er-3/mcpl-11/m2-17: a digest never reads the journal; it shows the last li
   const lines = digest.body!.split('\n');
   assert.equal(lines.length, 8);
   assert.deepEqual(lines.slice(-3), ['log line 19999', 'tick green', 'progress 90%']);
-  assert.equal(seg.unreadBytes('svc', 0), Buffer.byteLength(big) + 'tick \x1b[3'.length + '2mgreen\x1b[0m\r\nprogress 10%\rprogress 90%'.length);
+  assert.equal(seg.unreadBytes('svc', 0)?.bytes, Buffer.byteLength(big) + 'tick \x1b[3'.length + '2mgreen\x1b[0m\r\nprogress 10%\rprogress 90%'.length);
   const second = src.journal.lastSeq;
-  assert.equal(seg.unreadBytes('svc', second), 0);
+  assert.equal(seg.unreadBytes('svc', second)?.bytes, 0);
   seg.dispose();
 });
 
@@ -613,7 +613,7 @@ test('a Run already in flight when the segmenter starts: its bytes so far are co
   src.screen.seq = src.journal.append({ type: 'output', data: 'Name? ', stream: 'pty', runId: 'ask' }).seq;
   const seg = new Segmenter(src, { needsInputMs: 40, cadenceMs: 30 });
   const out = collect(seg);
-  assert.equal(seg.unreadBytes('ask', 0), 6);
+  assert.deepEqual(seg.unreadBytes('ask', 0), { bytes: 6, atLeast: false }, 'its whole output so far was read');
   await sleep(120);
   assert.equal(src.journal.since(0).events.filter((e) => e.type === 'run.waiting').length, 1, 'needs-input armed for a Run already waiting');
   assert.ok(out.some((s) => s.kind === 'needs-input'));
@@ -732,9 +732,9 @@ test('unread bytes are never short of what arrived after the read, even once mar
   const seg = new Segmenter(src, { cadenceMs: 60_000 });
   const first = src.journal.append({ type: 'output', data: 'x', stream: 'pty', runId: 'many' });
   for (let i = 1; i < 1100; i++) src.journal.append({ type: 'output', data: 'x', stream: 'pty', runId: 'many' });
-  assert.equal(seg.unreadBytes('many', first.seq), 1099);
-  assert.equal(seg.unreadBytes('many', src.journal.lastSeq), 0);
-  assert.equal(seg.unreadBytes('many', 0), 1100);
+  assert.equal(seg.unreadBytes('many', first.seq)?.bytes, 1099);
+  assert.equal(seg.unreadBytes('many', src.journal.lastSeq)?.bytes, 0);
+  assert.deepEqual(seg.unreadBytes('many', 0), { bytes: 1100, atLeast: false });
   seg.dispose();
 });
 
