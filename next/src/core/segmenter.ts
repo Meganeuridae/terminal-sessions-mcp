@@ -422,7 +422,7 @@ class Render {
   }
 
   watch(ev: EventOf<'watch.fired'>): Segment {
-    // A process Run's line names its first character's pipe, and `mixed` when it holds both: a watch reads the
+    // A process Run's line names the pipe of its first character that showed, and `mixed` when both wrote to it: a watch reads the
     // two as one source (the house's review of f3750e4..4f4c067, #22, comment 6315636412, question 4).
     const pipe = ev.stream ? ` (${ev.stream}${ev.mixed ? ', mixed' : ''})` : '';
     const what = ev.kind === 'pattern' ? `matched: ${oneLine(ev.line ?? ev.match ?? '', 160)}${pipe}` : ev.kind === 'silence' ? (ev.match ?? 'output went quiet') : 'the shell is available';

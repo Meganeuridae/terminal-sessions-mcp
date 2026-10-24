@@ -96,9 +96,9 @@ export interface WaitResult {
   line?: string;
   /** The line was longer than the pattern's match window and matched on its head only (the house's read of the 36 commits, #22). */
   clipped?: boolean;
-  /** A process Run's line: the pipe its first character came from. */
+  /** A process Run's line: the pipe that wrote its first character that showed. */
   stream?: 'stdout' | 'stderr';
-  /** The line holds output from both of the Run's pipes. */
+  /** Both of the Run's pipes wrote characters to the line that showed when written. */
   mixed?: boolean;
   /**
    * Journal position of the event that satisfied the wait: for a pattern, the event that completed the line, or for a
@@ -188,7 +188,8 @@ const endText = (r: { runId: string; state: string; exit?: number; signal?: stri
  * What a predicate fires with: the match and its line, where in the journal (`seq` the event that completed the line,
  * or for a line a flush completed the event its last output came in; `cursor` and `offset` where it began, as
  * search's match names it), whether the line was matched on its head only (longer than the pattern's match window),
- * and for a process Run's line its first character's pipe and whether it holds both.
+ * and for a process Run's line the pipe that wrote its first character that showed, and whether both pipes wrote
+ * characters to it that showed.
  */
 type Hit = { match?: string; line?: string; seq: Seq; cursor?: Seq; offset?: number; clipped?: boolean; stream?: 'stdout' | 'stderr'; mixed?: boolean };
 

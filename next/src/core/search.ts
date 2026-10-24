@@ -13,9 +13,11 @@
  *    process Run's stdout and stderr together, so `abc` on stdout then `def` and
  *    a LF on stderr is the line `abcdef`, as a read and the digests show it, and
  *    the lines of different sources never mix. A match on a Run's line names the
- *    pipe its first character came from (`stream`), and says `mixed` when the
- *    line holds output from both (the house's review of f3750e4..4f4c067, #22,
- *    comment 6315636412, question 4: they were two sources here and one there).
+ *    pipe that wrote its first character that showed (`stream`), and says `mixed`
+ *    when both pipes wrote characters to it that showed, within the head the line
+ *    keeps (rule 1), as SplitLine's `from` and `mixed` (the house's review of
+ *    f3750e4..4f4c067, #22, comment 6315636412, question 4: they were two sources
+ *    here and one there).
  * 2. Lines. A stream's raw bytes are joined across events and cut at each LF
  *    outside a control string (`lineEnds`, the one line-end rule: a LF inside a
  *    window title ends no line), so a line is the same whatever the chunking: a
@@ -75,9 +77,9 @@ export interface SearchMatch {
   offset?: number;
   /** The line (or a context line) is longer than shown, or than the part matched. */
   clipped?: true;
-  /** A process Run's line: the pipe its first character came from (rule 1). */
+  /** A process Run's line: the pipe that wrote its first character that showed (rule 1). */
   stream?: 'stdout' | 'stderr';
-  /** The line holds output from both of the Run's pipes. */
+  /** Both of the Run's pipes wrote characters to the line that showed when written (rule 1). */
   mixed?: true;
 }
 

@@ -224,7 +224,9 @@ export interface SplitLine {
   from?: string;
   /**
    * Chunks of different sources, both of a process Run's pipes, wrote characters to the line that showed when written,
-   * whether or not they still show: as written, like `from` (stdout's `ab`, then stderr's `BS BS cd`, is mixed).
+   * whether or not they still show: as written, like `from` (stdout's `ab`, then stderr's `BS BS cd`, is mixed). Only
+   * characters within the head the line keeps count (MAX_LINE): once the line is cut, a source that writes past the
+   * cut doesn't make it mixed (the house's review of bc4bc85..5d8ce0e, PR #22, I88).
    */
   mixed?: true;
   /** Where the line began: the `at` `feed` was given with its first chunk, and UTF-8 bytes into that chunk. */
@@ -246,7 +248,7 @@ export interface LineMatch {
   line: string;
   /** Only the line's head was searched: it is longer than the pattern's match window (`$` meant the window's end), or longer than MAX_LINE (the rest was dropped). */
   clipped?: true;
-  /** As SplitLine's: where the line's first character came from, and whether the line holds output from elsewhere too. */
+  /** As SplitLine's: where the first character written to the line that showed came from, and whether other sources wrote characters to it that showed. */
   from?: string;
   mixed?: true;
   /** As SplitLine's: where the line began. */
@@ -311,7 +313,7 @@ export class LineSplitter {
   /**
    * Feed a chunk; returns the lines it completed, in order. `source` says where the chunk came from, for a
    * stream whose writers take turns (a process Run's two pipes, one source as the transcript reads them):
-   * each line says where its first character came from, and whether it holds output from elsewhere too.
+   * each line says where its first character that showed came from, and whether other sources wrote characters to it that showed.
    * `at` names the chunk (a journal seq): each line says where it began, the `at` of its first chunk and
    * the UTF-8 bytes into it, as search's cursor and offset name a line's start.
    */
