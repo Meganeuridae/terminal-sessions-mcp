@@ -488,9 +488,13 @@ export class McplLane {
       .then(() => {
         // Only a scan that covered the sessions awaiting one ends the backoff: reset by any success, a channel opened
         // elsewhere had a store that kept failing scanned again at 500 ms instead of backing off (an independent read
-        // of the lane fixes on PR #22, comment 6376365550).
+        // of the lane fixes on PR #22, comment 6376365550). Its timer ends with it: left standing, the next failure
+        // logged a 500 ms wait and waited on that timer instead, up to 30 s (the house's review of
+        // bc4bc85..5d8ce0e, PR #22).
         const r = this.catchUpRetry;
         if (r && (scope === 'all' || (r.scope !== 'all' && [...r.scope].every((id) => scope.has(id))))) {
+          if (r.timer) clearTimeout(r.timer);
+          r.timer = undefined;
           r.attempt = 0;
           r.scope = new Set();
         }

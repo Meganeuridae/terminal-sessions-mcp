@@ -3161,6 +3161,14 @@ test("a scan that keeps failing backs off: a catch-up of another scope succeedin
     const failing = { value: true };
     failPages(s, failing);
     const failures = () => f.logs.filter((l) => /catch-up failed: EIO/.test(l));
+    // When each failure was logged, so the waits between scans are measured, not only the log's word for them: each gap
+    // is at least the wait the failure before it named (the house's review of bc4bc85..5d8ce0e, PR #22).
+    const failedAt: number[] = [];
+    const log = f.logs.push.bind(f.logs);
+    f.logs.push = (...lines: string[]) => {
+      for (const l of lines) if (/catch-up failed: EIO/.test(l)) failedAt.push(performance.now());
+      return log(...lines);
+    };
     await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
     await until(() => failures().length >= 1, 5000, 'the first scan failing');
     assert.match(failures()[0]!, /in 500 ms/);
@@ -3168,6 +3176,12 @@ test("a scan that keeps failing backs off: a catch-up of another scope succeedin
     await f.inside.startCatchUp(['bo-other']);
     await until(() => failures().length >= 2, 5000, 'the scan run again failing');
     assert.match(failures()[1]!, /in 1000 ms/, "the wait doubled: the other scope's success did not end the backoff");
+    await until(() => failures().length >= 3, 5000, 'the scan run a third time, failing');
+    const gaps = [failedAt[1]! - failedAt[0]!, failedAt[2]! - failedAt[1]!].map(Math.round);
+    // A Node timer can fire a fraction of a millisecond before its delay has passed by this clock (0.8 ms at most, over
+    // 150 timers on Node 24): the bounds leave 10 ms, and a scan run again at once, or after 500 ms where the wait had
+    // doubled, still falls below them.
+    assert.ok(gaps[0]! >= 490 && gaps[1]! >= 990, `the scans waited 500 ms, then 1000 ms: the gaps were ${gaps.join(' and ')} ms`);
     failing.value = false;
     await until(() => s.cursorsOf(A).delivered >= s.run(r.runId!).seq.end!, 15_000, 'the cursor past the completion once a scan of the session succeeds');
     await until(() => f.inside.catchUpRetry?.attempt === 0, 5000, 'the covering scan ends the backoff');
@@ -3256,6 +3270,64 @@ test("a regain on a session delivered to its end retires the summaries standing,
     assert.ok(st.owed.has(alsoCarried), 'a debt another message still carries stays');
     st.inflight.delete(flying);
     st.retries.delete('a-retried-completion');
+  } finally {
+    await f.close();
+  }
+});
+
+/** A session whose Run's completion the host refused, so the cursor stays below it and a catch-up has something to scan. */
+async function refusedCompletion(f: Awaited<ReturnType<typeof bareLane>>, id: string): Promise<Session> {
+  await f.app.sessionOpen(f.caller, { id });
+  const s = live(f.registry, id);
+  f.refuse.value = true;
+  const r = await f.app.run(f.caller, { session: id, command: `echo ${id}`, target: 'process', wait: 0 });
+  await until(() => sentAbout(f.sent, r.runId!).length >= 1 && s.cursorsOf(A).delivered < s.journal.lastSeq, 5000, 'the completion pushed and refused');
+  return s;
+}
+
+test("a scan of one session that keeps failing backs off, and that scan succeeding ends the backoff", { timeout: 30_000 }, async () => {
+  // The other test reaches only the reset for a scan of every session, since its failing scan came from the grant's
+  // activation (the house's review of bc4bc85..5d8ce0e, PR #22).
+  const f = await bareLane('bo-one');
+  try {
+    const s = await refusedCompletion(f, 'bt');
+    const failing = { value: true };
+    failPages(s, failing);
+    const failures = () => f.logs.filter((l) => /catch-up failed: EIO/.test(l));
+    void f.inside.startCatchUp(['bt']);
+    await until(() => failures().length >= 1, 5000, 'the scan of the session failing');
+    const retry = f.inside.catchUpRetry;
+    assert.ok(retry && retry.scope !== 'all' && [...retry.scope].join() === 'bt', 'the backoff waits on a scan of that session alone');
+    assert.equal(retry.attempt, 1);
+    failing.value = false;
+    await until(() => f.inside.catchUpRetry?.attempt === 0, 5000, 'the scan of the session, run again and succeeding, ends the backoff');
+  } finally {
+    await f.close();
+  }
+});
+
+test("a scan that ends the backoff ends its timer too: the next failure is scanned again on its own wait", { timeout: 30_000 }, async () => {
+  // Reset with its timer left standing, the backoff's next failure logged a 500 ms wait and waited on that timer, up to
+  // 30 s (the house's review of bc4bc85..5d8ce0e, PR #22).
+  const f = await bareLane('bo-timer');
+  try {
+    const s = await refusedCompletion(f, 'bm');
+    const failing = { value: true };
+    failPages(s, failing);
+    const failures = () => f.logs.filter((l) => /catch-up failed: EIO/.test(l));
+    // A backoff already at its longest wait.
+    f.inside.catchUpRetry = { attempt: 6, scope: new Set() };
+    void f.inside.startCatchUp(['bm']);
+    await until(() => failures().length >= 1, 5000, 'a scan failing at the longest wait');
+    assert.match(failures()[0]!, /in 30000 ms/);
+    failing.value = false;
+    await f.inside.startCatchUp(['bm']);
+    assert.equal(f.inside.catchUpRetry?.attempt, 0, 'a scan of the session succeeding ends the backoff');
+    failing.value = true;
+    void f.inside.startCatchUp(['bm']);
+    await until(() => failures().length >= 2, 5000, 'the next scan failing');
+    assert.match(failures()[1]!, /in 500 ms/);
+    await until(() => failures().length >= 3, 5000, 'the scan run again on its own 500 ms wait, not on the 30 s timer from before');
   } finally {
     await f.close();
   }
