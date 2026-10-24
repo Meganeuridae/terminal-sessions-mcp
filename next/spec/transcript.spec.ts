@@ -392,14 +392,25 @@ test('api-20: maxInputBytes keeps the tail or head, never splits a character, an
 
 // ───────────── floods (emu-3, tg-4) ─────────────
 
-async function timed<T>(fn: () => Promise<T>): Promise<{ value: T; ms: number; heapRise: number }> {
+/**
+ * Time a projection two ways. `cpu` is the process's CPU time from the call to the promise's settling: what the work
+ * costs, which is what a bound on cost reads, since on a busy machine the wall clock also counts the time the process
+ * waits for a core. Everything the process runs in that span counts, which is `fn` alone here, as this file's tests run
+ * one at a time. `ms` is the wall clock, for a bound on waiting, which CPU time can't see. tg-4's 8 s bound on the
+ * wall clock missed once at a load of 43; run beside 48 busy processes on 12 cores, its projection took up to 29 s of
+ * wall time and about 2 s of CPU (the house's review of bc4bc85..5d8ce0e, PR #22).
+ */
+async function timed<T>(fn: () => Promise<T>): Promise<{ value: T; ms: number; cpu: number; heapRise: number }> {
   const start = process.memoryUsage().heapUsed;
   let peak = start;
   const iv = setInterval(() => (peak = Math.max(peak, process.memoryUsage().heapUsed)), 2);
   const t0 = Date.now();
+  const c0 = process.cpuUsage();
   try {
     const value = await fn();
-    return { value, ms: Date.now() - t0, heapRise: Math.max(peak, process.memoryUsage().heapUsed) - start };
+    const { user, system } = process.cpuUsage(c0);
+    const heapRise = Math.max(peak, process.memoryUsage().heapUsed) - start;
+    return { value, ms: Date.now() - t0, cpu: (user + system) / 1000, heapRise };
   } finally {
     clearInterval(iv);
   }
@@ -415,8 +426,8 @@ test('emu-3 / tg-4: 20 MB in 5000 chunks projects in bounded time; the tail is e
   while (lines.length * 80 < 20 * MB) lines.push(`line ${String(i++).padStart(8, '0')} ${'x'.repeat(66)}`);
   const body = `${lines.join('\r\n')}\r\nEND\r\n`;
   const chunks = [...chunksOf(body, Math.ceil(body.length / 5000))];
-  const { value: r, ms, heapRise } = await timed(() => project(chunks, { cols: 120, rows: 30 }));
-  assert.ok(ms < 5000, `20 MB took ${ms} ms`);
+  const { value: r, cpu, heapRise } = await timed(() => project(chunks, { cols: 120, rows: 30 }));
+  assert.ok(cpu < 5000, `20 MB took ${Math.round(cpu)} ms of CPU`);
   assert.ok(heapRise < 300 * MB, `heap rose ${Math.round(heapRise / MB)} MB`);
   assert.equal(r.truncated, true);
   const out = r.text.split('\n');
@@ -430,8 +441,8 @@ test('tg-4: 20 MB under maxLines keeps every line, in bounded time and memory', 
   // 20 MB in 250 000 lines of 83 bytes (20 000 chunks), projected at a width that holds each line.
   const lines = Array.from({ length: 250_000 }, (_, i) => `row ${String(i).padStart(7, '0')} ${'y'.repeat(70)}`);
   const body = `${lines.join('\r\n')}\r\n`;
-  const { value: r, ms, heapRise } = await timed(() => project(chunksOf(body, 1024), { cols: 120, maxLines: 300_000 }));
-  assert.ok(ms < 8000, `took ${ms} ms`);
+  const { value: r, cpu, heapRise } = await timed(() => project(chunksOf(body, 1024), { cols: 120, maxLines: 300_000 }));
+  assert.ok(cpu < 8000, `took ${Math.round(cpu)} ms of CPU`);
   assert.ok(heapRise < 400 * MB, `heap rose ${Math.round(heapRise / MB)} MB`);
   assert.equal(r.truncated, false);
   const out = r.text.split('\n');
@@ -441,14 +452,14 @@ test('tg-4: 20 MB under maxLines keeps every line, in bounded time and memory', 
 
 test('tg-4: a 20 MB single line and a 18 MB full-screen redraw flood both project in bounded time', async () => {
   const long = await timed(() => project([`${'z'.repeat(20 * MB)}\r\n`], { cols: 120 }));
-  assert.ok(long.ms < 5000, `long line took ${long.ms} ms`);
+  assert.ok(long.cpu < 5000, `long line took ${Math.round(long.cpu)} ms of CPU`);
   assert.equal(long.value.text.length, 20 * MB);
   assert.equal(long.value.truncated, false);
   let tui = '$ top\r\n\x1b[?1049h';
   for (let f = 0; f < 40_000; f++) tui += `\x1b[H\x1b[2J\x1b[1;1Hframe ${f}\x1b[10;5H${'status '.repeat(60)}\x1b[20;1H${f}`;
   tui += '\x1b[?1049l$ ';
   const redraw = await timed(() => project(chunksOf(tui, 4096), { cols: 120, rows: 30 }));
-  assert.ok(redraw.ms < 8000, `redraw flood took ${redraw.ms} ms`);
+  assert.ok(redraw.cpu < 8000, `redraw flood took ${Math.round(redraw.cpu)} ms of CPU`);
   const out = redraw.value.text.split('\n');
   assert.equal(out[0], '$ top');
   assert.equal(out[1], 'frame 39999');
@@ -484,6 +495,7 @@ test('Cost: with maxInputBytes, memory follows the budget, not the range (chunks
 
 test('emu-3: many tiny chunks cost parser time, not a timer each', async () => {
   const chunks = Array.from({ length: 20_000 }, (_, i) => `${i}\r\n`);
+  // The wall clock: what this pins is a wait, a timer a chunk, which CPU time doesn't count.
   const { value: r, ms } = await timed(() => project(chunks, { cols: 80, maxLines: 20_000 }));
   assert.ok(ms < 2000, `20 000 chunks took ${ms} ms`);
   assert.equal(r.text.split('\n').length, 20_000);
