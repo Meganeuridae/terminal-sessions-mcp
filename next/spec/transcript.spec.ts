@@ -1049,6 +1049,19 @@ test('a cursor the program moves by rows meets the terminal’s where a margin s
     assert.deepEqual(await read([`${short}${move}${lines}`]), [false, undefined], `the terminal alone: ${JSON.stringify(move)}`);
     assert.deepEqual(await read([short, { hole: true }, `${move}${lines}`]), [false, undefined], `a row pending: ${JSON.stringify(move)}`);
   }
+  // VPR passes the bottom margin and stops at the screen's last row, where both cursors meet; the program moves back
+  // up into the region and scrolls it as the terminal does (the house's review of bc4bc85..5d8ce0e, PR #22, I62).
+  const vpr = '\x1b[9e\x1b[4AA\r\nB\r\n';
+  assert.deepEqual(await read([`${short}${vpr}`]), [false, undefined], 'the terminal alone: VPR');
+  assert.deepEqual(await read([short, { hole: true }, vpr]), [false, undefined], 'a row pending: VPR');
+  // One row down with VPR moves both alike: still a row ahead, so the program's line end at the margin takes `r3` from
+  // the projection alone, while the terminal shows it.
+  assert.deepEqual(await read([short, { hole: true }, '\x1b[1eA\r\n']), [true, true], 'a row pending, VPR by one');
+  // Three rows down takes both past the bottom margin, the screen's edge stopping neither: still a row apart, and back
+  // up four, the projection's line end at the margin scrolls the region alone. Read as CUD stops, the two would have met
+  // at the margin, and that scroll would have counted as the terminal's too.
+  assert.deepEqual(await read([`${short}\x1b[3e\x1b[4AA\r\nB\r\nC\r\n`]), [false, undefined], 'the terminal alone: past the margin and back');
+  assert.deepEqual(await read([short, { hole: true }, '\x1b[3e\x1b[4AA\r\nB\r\nC\r\n']), [true, true], 'a row pending: past the margin and back');
 });
 
 test('a blank row the program writes on goes as a row with text: a Run’s line on it, then the program’s own over it (the house’s review of bc4bc85..5d8ce0e, PR #22, I38)', async () => {
