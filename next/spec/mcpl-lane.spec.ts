@@ -2961,9 +2961,17 @@ test("a grant that lets a connection carry a session again pins it until the act
     await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
     await f.app.sessionOpen(f.caller, { id: 'rw' });
     const s = live(f.registry, 'rw');
+    // The Run's message is built and met by the lane, subscribed first (`sessionCreated`), while push is off. Waited on
+    // for a fixed time, a message built only after the grant would go out live, and the test could pass with the regain
+    // pin removed (the house's review of bc4bc85..5d8ce0e, PR #22).
+    const built = new Set<unknown>();
+    const off = f.app.segmenter(s).subscribe((x) => {
+      if (x.kind === 'run') built.add(x.runId);
+    });
     const r = await f.app.run(f.caller, { session: 'rw', command: 'echo rw-unowed', target: 'process', wait: 0 });
-    await until(() => s.run(r.runId!).seq.end !== undefined, 5000, 'the Run to end while nothing carries the session');
-    await sleep(100);
+    await until(() => built.has(r.runId), 5000, "the Run's message built while nothing carries the session");
+    off();
+    assert.equal(sentAbout(f.sent, r.runId!).length, 0, 'nothing of it went out while push was off');
     // The activation runs after the receipt is on the wire, as the endpoint's `after` does; meanwhile the live path settles.
     const later: Array<() => void> = [];
     await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, { isRequest: true, after: (fn: () => void) => later.push(fn) });
