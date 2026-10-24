@@ -197,6 +197,8 @@ const HOLD_MS = 2000;
 const HOLD_POLL_MS = 100;
 /** Message ids remembered per connection so one message is delivered once (mcpl-8). */
 const SENT_MAX = 4096;
+/** The lane's retry cadence: 500 ms, doubling to 30 s against a host, or a store, that keeps failing. */
+const retryDelay = (attempt: number): number => Math.min(30_000, 500 * 2 ** Math.min(attempt, 6));
 
 /**
  * Notes (mcpl-5): small, a few a second per principal, and never more than a share of the
@@ -322,6 +324,8 @@ export class McplLane {
   private catchingUp: Promise<void> | undefined;
   /** A catch-up wanted while one runs: for every session (a grant change) or for the named ones (channels opened). */
   private catchUpAgain: Set<string> | 'all' | undefined;
+  /** A catch-up whose scan failed is run again on the retry cadence; its sessions stay pinned at `delivered` meanwhile (see `scanAgain`). */
+  private catchUpRetry: { attempt: number; scope: Set<string> | 'all'; timer?: NodeJS.Timeout | undefined } | undefined;
   private disposed = false;
   /** Warns, once, when the host has sent no grant this long after initializing: the connection is then on the core tools with no deliveries, and the log should say so rather than look like a profile. */
   static grantWarnMs = 5000;
@@ -477,7 +481,10 @@ export class McplLane {
       return this.catchingUp;
     }
     this.catchingUp = this.catchUpAll(scope === 'all' ? undefined : scope)
-      .catch((e) => this.log(`catch-up failed: ${(e as Error).message}`))
+      .then(() => {
+        if (this.catchUpRetry) this.catchUpRetry.attempt = 0;
+      })
+      .catch((e) => this.scanAgain(scope, e as Error))
       .finally(() => {
         this.catchingUp = undefined;
         const again = this.catchUpAgain;
@@ -485,6 +492,29 @@ export class McplLane {
         if (again && !this.disposed) void this.startCatchUp(again === 'all' ? undefined : again);
       });
     return this.catchingUp;
+  }
+
+  /**
+   * A catch-up whose scan failed (a store that could not be read) is run again after a backoff on the retry cadence,
+   * and the regain pins of its sessions stay until a scan succeeds. Released at the failure, as `scanningFrom` is,
+   * nothing ran the scan again: the lane had owed nothing while it could not carry the session, so its next settle
+   * lifted `delivered` past completions no connection had delivered, with only the failure logged. A cursor held is
+   * recoverable; a completion passed is not (an independent read of the lane fixes on PR #22, comment 6376365550).
+   * One timer stands at a time; a failure meanwhile widens its scope.
+   */
+  private scanAgain(scope: Set<string> | 'all', e: Error): void {
+    const r = (this.catchUpRetry ??= { attempt: 0, scope: new Set() });
+    r.scope = r.scope === 'all' || scope === 'all' ? 'all' : new Set([...r.scope, ...scope]);
+    const wait = retryDelay(r.attempt++);
+    this.log(`catch-up failed: ${e.message}; its sessions stay pinned at delivered, and it is scanned again in ${wait} ms`);
+    if (r.timer || this.disposed) return;
+    r.timer = setTimeout(() => {
+      r.timer = undefined;
+      const again = r.scope;
+      r.scope = new Set();
+      if (!this.disposed) void this.startCatchUp(again === 'all' ? undefined : again);
+    }, wait);
+    r.timer.unref?.();
   }
 
   /** After the receipt: follow visible sessions, register channels and catch up when delivery becomes possible. */
@@ -1019,12 +1049,15 @@ export class McplLane {
    * A message was accepted, or is owed to nobody here: `delivered` advances, but never
    * past a lifecycle message still owed to this principal (G22). A completion the
    * principal's synchronous call returned counts as accepted (mcpl-1); so does a host's
-   * `duplicate` answer (mcpl-7). Refusal is not delivery: it keeps pinning the cursor.
+   * `duplicate` answer (mcpl-7). Refusal is not delivery: it keeps pinning the cursor. Only a lifecycle message
+   * pays a debt, as only one carries it (see `carried`): an ambient message accepted at a summary's own seq, a gap
+   * ending exactly there, paid the summary's debt before the host had the summary (an independent read of the lane
+   * fixes on PR #22, comment 6376365550).
    */
-  private settle(t: Target, seq: Seq, how: Settled): void {
+  private settle(t: Target, seq: Seq, how: Settled, lifecycle = true): void {
     const st = this.stateOf(t);
     if (how === 'refused') return;
-    st.owed.delete(seq);
+    if (lifecycle) st.owed.delete(seq);
     if (seq > st.clearTo) st.clearTo = seq;
     this.advance(t, st);
   }
@@ -1049,7 +1082,7 @@ export class McplLane {
       if (seg.seq > st.clearTo) st.clearTo = seg.seq;
       return this.advance(t, st);
     }
-    this.settle(t, seg.seq, how);
+    this.settle(t, seg.seq, how, seg.lifecycle);
   }
 
   private advance(t: Target, st: LaneState): void {
@@ -1083,7 +1116,10 @@ export class McplLane {
 
   /** Can this connection carry the session now, or once an open of its channel in flight completes? Only such a lane counts in `floorAcross`. */
   private mayCarry(t: Target): boolean {
-    return this.carries(t.id) || this.opening.get(channelId(t.id))?.lineage === t.journal.runs;
+    // An open completes into carrying only with channels.incoming: asked of the opening alone, a lane granted
+    // channels.lifecycle without it was pinned at the open and counted here through the history read, then could
+    // carry nothing, its pin left inert (an independent read of the lane fixes on PR #22, comment 6376365550).
+    return this.carries(t.id) || (this.opening.get(channelId(t.id))?.lineage === t.journal.runs && this.enabled('terminal.channels', 'channels.incoming'));
   }
 
   /** The sessions this lane may carry now (see `mayCarry`), among those its principal may observe. */
@@ -1190,7 +1226,7 @@ export class McplLane {
       // Nothing to carry it on: the retry can't fire again, so it goes, and so does its debt (see `uncarried`).
       if (st.retries.get(id) === retry) st.retries.delete(id);
       this.uncarried(t, st, seg.seq);
-    }, Math.min(30_000, 500 * 2 ** Math.min(retry.attempt++, 6)));
+    }, retryDelay(retry.attempt++));
     retry.timer.unref?.();
   }
 
@@ -1494,9 +1530,10 @@ export class McplLane {
       const retire = [...st.summaries.keys()].filter((id) => !st.inflight.has(id));
       plans.push({ t, st, src: this.sourceOf(entry), from, open: this.openOrOpening(channelId(t.id)), covered: new Set(), retire, pin: st.regainPin });
     }
-    // A regain pin goes with the scan planned under it, as `scanningFrom` does, failed or not. One set while this
-    // catch-up scans is the queued catch-up's to release: this one planned before the session was regained, and its
-    // scan may have read past what the lane then owed nothing for (see `regain`).
+    // A regain pin goes with the scan planned under it once that scan has returned; a scan that fails keeps it, and
+    // runs again (see `scanAgain`). One set while this catch-up scans is the queued catch-up's to release: this one
+    // planned before the session was regained, and its scan may have read past what the lane then owed nothing for
+    // (see `regain`).
     const unpin = (): void => {
       for (const p of plans) if (p.pin !== undefined && p.st.regainPin === p.pin) p.st.regainPin = undefined;
     };
@@ -1512,8 +1549,9 @@ export class McplLane {
         } });
       }
     } catch (e) {
+      // The regain pins stay: with the scan still to come (see `scanAgain`), they are the only hold on the cursor of a
+      // lane that owed nothing while it could not carry the session.
       for (const p of plans) p.st.scanningFrom = undefined;
-      unpin();
       throw e;
     }
     unpin();
@@ -1715,6 +1753,7 @@ export class McplLane {
     this.watched.clear();
     this.opening.clear();
     if (this.batchTimer) clearTimeout(this.batchTimer);
+    if (this.catchUpRetry?.timer) clearTimeout(this.catchUpRetry.timer);
     for (const st of this.states.values()) for (const h of st.held.values()) if (h.timer) clearTimeout(h.timer);
     for (const st of this.states.values()) for (const r of st.retries.values()) if (r.timer) clearTimeout(r.timer);
   }

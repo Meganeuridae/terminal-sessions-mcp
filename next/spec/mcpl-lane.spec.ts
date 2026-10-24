@@ -1374,14 +1374,15 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     open: Set<string>;
     registered: Set<string>;
     watched: Map<string, unknown>;
-    states: Map<string, { owed: Set<number>; inflight: Map<string, number>; retries: Map<string, { kind: string }>; held: Map<string, { since: number; seq?: number }>; summaries: Map<string, { from: number; folded?: { count: number }; owes?: number; covered: Set<number> }> }>;
+    states: Map<string, { owed: Set<number>; inflight: Map<string, number>; retries: Map<string, { kind: string }>; held: Map<string, { since: number; seq?: number }>; summaries: Map<string, { from: number; folded?: { count: number }; owes?: number; covered: Set<number> }>; regainPin?: { at: number } }>;
     closes: Map<string, number>;
     batch: unknown[];
     flush(): Promise<void>;
     startCatchUp(sessions: string[]): Promise<void>;
     catchingUp: Promise<void> | undefined;
+    mayCarry(t: Session): boolean;
     carried(t: Session, st: unknown): Set<number>;
-    settleSegment(t: Session, seg: unknown, how: 'accepted'): void;
+    settleSegment(t: Session, seg: unknown, how: 'accepted' | 'not-owed'): void;
     retireSummaries(t: Session, st: unknown, ids: string[]): Set<number>;
     budgetOf(journal: Journal): { retained: unknown[]; seed(journal: Journal): Promise<void> };
     deliver(t: Session, seg: unknown, opts: { released: true }): void;
@@ -2962,6 +2963,112 @@ test("an ambient message carries no debt: a summary whose own seq it shares sett
     assert.ok(!st.owed.has(x), "the summary's acceptance settles its own seq");
     f.late.value = false;
     for (const p of f.pending.splice(0)) p.answer();
+  } finally {
+    await f.close();
+  }
+});
+
+// ───────────── an independent read of the lane fixes (#22 comment 6376365550) ─────────────
+
+/** Every read of the session's journal pages fails while `failing.value` holds, as a store that cannot be read does. */
+function failPages(s: Session, failing: { value: boolean }): void {
+  const journal = s.journal as Journal & { pages: Journal['pages'] };
+  const pages = journal.pages.bind(journal);
+  journal.pages = function* (...a: Parameters<Journal['pages']>) {
+    if (failing.value) throw new Error('EIO: the store could not be read');
+    yield* pages(...a);
+  } as Journal['pages'];
+}
+
+test("a regain whose scan fails keeps the session pinned and scans again, so a settle meanwhile lifts the cursor past nothing undelivered", { timeout: 30_000 }, async () => {
+  // Released at the failure, as scanningFrom is, with nothing to run the scan again: the lane had owed nothing while
+  // it could not carry the session, so its next settle lifted `delivered` past completions no connection had
+  // delivered, and only the failure was logged.
+  const f = await bareLane('rescan');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'rs' });
+    const s = live(f.registry, 'rs');
+    const st = () => f.inside.states.get('rs')!;
+    const ended = async (command: string): Promise<{ runId: string; end: number }> => {
+      const r = await f.app.run(f.caller, { session: 'rs', command, target: 'process', wait: 0 });
+      await until(() => s.run(r.runId!).seq.end !== undefined, 5000, `${command} to end`);
+      return { runId: r.runId!, end: s.run(r.runId!).seq.end! };
+    };
+    const earlier = await ended('echo rs-earlier');
+    assert.equal(s.cursorsOf(A).delivered, 0, 'nothing carried the completion: the cursor has not moved');
+    // Push comes back while the store cannot be read: the regain pins the session, and every scan fails until it heals.
+    const failing = { value: true };
+    failPages(s, failing);
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => f.logs.some((l) => /catch-up failed: EIO/.test(l)), 5000, 'the first scan failing');
+    assert.ok(st().regainPin !== undefined, 'the failed scan keeps the regain pin');
+    assert.ok(f.logs.some((l) => /scanned again in \d+ ms/.test(l)), 'the failure says the scan comes again');
+    // A completion the lane now carries is accepted: its settle must not lift the cursor past the earlier one.
+    const later = await ended('echo rs-later');
+    await until(() => sentAbout(f.sent, later.runId).length >= 1 && st().inflight.size === 0, 5000, 'the later completion pushed and accepted');
+    assert.ok(s.cursorsOf(A).delivered < earlier.end, `the pin holds the cursor below the earlier completion (delivered ${s.cursorsOf(A).delivered}, earlier ${earlier.end})`);
+    // The store heals: the scan run again succeeds, delivers the earlier completion and releases the pin.
+    failing.value = false;
+    await until(() => s.cursorsOf(A).delivered >= later.end, 15_000, `the cursor past both completions once a scan succeeds (delivered ${s.cursorsOf(A).delivered})`);
+    assert.equal(st().regainPin, undefined, 'the scan that succeeded released the pin');
+    assert.ok(sentAbout(f.sent, earlier.runId).length >= 1, 'the earlier completion reached the host through the catch-up');
+  } finally {
+    await f.close();
+  }
+});
+
+test("an open with history on a lane granted no channels.incoming regains nothing: not pinned, counting for nothing during the read, and holding no pin after", { timeout: 20_000 }, async () => {
+  // mayCarry's opening branch did not ask channels.incoming: granted channels.lifecycle alone (push off), such a lane
+  // was pinned at its open and counted in floorAcross through the history read, then could carry nothing, the pin
+  // left inert.
+  const f = await bareLane('ni-push');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'ni' });
+    const s = live(f.registry, 'ni');
+    const g = await secondLane(f, 'ni-lifecycle', NO_PUSH.filter((c) => c !== 'channels.incoming'));
+    try {
+      // The page's Run, refused on the push connection so its completion is still owed when the open begins.
+      f.refuse.value = true;
+      const page = await f.app.run(f.caller, { session: 'ni', command: 'echo ni-page', target: 'process', wait: 0 });
+      await until(() => [...(f.inside.states.get('ni')?.retries.values() ?? [])].some((x) => x.kind === 'run'), 5000, 'the completion refused and retried on the push connection');
+      const end = s.run(page.runId!).seq.end!;
+      assert.ok(s.cursorsOf(A).delivered < end, 'the cursor is below it');
+      const hold = holdTranscripts(s, page.runId);
+      const opening = g.lane.openChannel({ channelId: 'terminal:ni', history: { limit: 5 } });
+      await hold.reached;
+      assert.equal(g.inside.mayCarry(s), false, 'opening without channels.incoming, the lane may not carry the session');
+      assert.equal(g.inside.states.get('ni')?.regainPin, undefined, 'so the open pins nothing');
+      // Accepted on the push connection during the read, the completion moves the cursor: the opening lane counts for nothing.
+      f.refuse.value = false;
+      await until(() => s.cursorsOf(A).delivered >= end, 5000, `the cursor past the completion while the other lane's open reads history (delivered ${s.cursorsOf(A).delivered})`);
+      hold.release();
+      await opening;
+      hold.restore();
+      assert.equal(g.lane.carries('ni'), false, 'open, the channel still carries nothing without channels.incoming');
+      assert.equal(g.inside.states.get('ni')?.regainPin, undefined, 'and no pin is left');
+    } finally {
+      g.lane.dispose();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("an ambient message accepted at a summary's own seq pays no debt: only a lifecycle settle does", async () => {
+  const f = await bareLane('ambient-pays');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'ap' });
+    const s = live(f.registry, 'ap');
+    await f.settledRun('ap', 'echo ap');
+    const st = f.inside.states.get('ap')!;
+    // A seq past every real event, owed as a catch-up summary's own: a gap ending exactly at an ambient message.
+    const x = s.journal.lastSeq + 100;
+    st.owed.add(x);
+    st.summaries.set(`${NODE_NAME}/ap-gap-summary`, { from: 1, covered: new Set(), owes: x });
+    f.inside.settleSegment(s, { kind: 'output', lifecycle: false, seq: x, messageId: 'ap-digest' }, 'accepted');
+    assert.ok(st.owed.has(x), "the ambient message's acceptance leaves the summary's own seq owed");
+    assert.ok(s.cursorsOf(A).delivered < x, 'and the summary still pins the cursor');
   } finally {
     await f.close();
   }
