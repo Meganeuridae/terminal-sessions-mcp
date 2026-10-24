@@ -18,7 +18,6 @@ import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { TOOLS } from '../src/api/tools.js';
 import type { UsageRecord } from '../src/api/usage.js';
-import { ScriptedBackend } from '../src/backends/scripted.js';
 import { TermServer } from '../src/transport/server.js';
 import { fakeShellBackend, until, type FakeShell } from './fake-shell.js';
 import { unusedPort } from './testhost.js';
@@ -85,7 +84,7 @@ test('tsm exit codes: the Run exit code, 124 while running, 75 when busy, 1 on e
     assert.equal(bad.code, 1, 'a validation error');
     const denied = await tsm(['sessions'], { ...env, TSM_TOKEN: 'wrong' });
     assert.equal(denied.code, 1);
-    assert.match(denied.stderr, /refused the credential \(401\): set TSM_TOKEN/, 'ux-18: a bad token is reported as such');
+    assert.match(denied.stderr, /refused this credential \(401\).*Ask its operator.*TSM_TOKEN/, 'ux-18: a bad token directs the agent to the operator');
     // The CLI is the native family, with the GUI: `tsm usage` does not read its calls as an agent's.
     assert.ok(usage.length >= 6, `usage records: ${usage.length}`);
     assert.deepEqual(new Set(usage.map((u) => u.host)), new Set(['native']), JSON.stringify(usage.map((u) => [u.tool, u.host])));
@@ -95,21 +94,84 @@ test('tsm exit codes: the Run exit code, 124 while running, 75 when busy, 1 on e
   }
 });
 
+test('CLI recovery commands distinguish active Runs from completed journal records', async () => {
+  const backend = fakeShellBackend((sh) => sh.on('echo done', () => ({ output: 'done\r\n', exit: 0 })));
+  const registry = new SessionRegistry({ dataDir: path.join(tmp, 'd-recover-advice'), backend, defaultShell: '/bin/bash', noUserRc: true });
+  const server = new TermServer({ app: new App({ registry, defaultWaitMs: 2000 }), resolver: new TokenMapResolver({ tokens: { tk: 'agent:cli@test' } }), host: '127.0.0.1', port: 0 });
+  const { port } = await server.listen();
+  const env = { TSM_URL: `ws://127.0.0.1:${port}`, TSM_TOKEN: 'tk' };
+  try {
+    const r = await tsm(['run', 'recovery', 'echo', 'done', '--json'], env);
+    assert.equal(r.code, 0, r.stderr);
+    const run = JSON.parse(r.stdout) as { runId: string; state: string };
+    assert.equal(run.state, 'exited');
+    const listed = await tsm(['sessions', '--json'], env);
+    assert.equal(listed.code, 0, listed.stderr);
+    const sessions = (JSON.parse(listed.stdout) as { sessions: Array<{ id: string; runs?: Array<{ runId: string }> }> }).sessions;
+    const summary = sessions.find((s) => s.id === 'recovery');
+    assert.ok(summary);
+    assert.ok(!summary.runs?.some((candidate) => candidate.runId === run.runId), 'sessions lists only active Runs');
+    const read = await tsm(['read', 'recovery', '--as', 'events', '--since', '0', '--json'], env);
+    assert.equal(read.code, 0, read.stderr);
+    const events = (JSON.parse(read.stdout) as { events: Array<{ type: string; runId?: string }> }).events;
+    assert.ok(events.some((e) => e.type === 'run.admit' && e.runId === run.runId), 'an events read shows the admission');
+    assert.ok(events.some((e) => e.type === 'run.end' && e.runId === run.runId), 'an events read shows the completion');
+    const waited = await tsm(['await', run.runId, '--json'], env);
+    assert.equal(waited.code, 0, waited.stderr);
+    const awaited = JSON.parse(waited.stdout) as { runId: string; state: string };
+    assert.equal(awaited.runId, run.runId);
+    assert.equal(awaited.state, 'exited');
+  } finally {
+    await server.close();
+    await registry.closeAll();
+  }
+});
+
+test('a connection lost during initialization says the command was not sent', async () => {
+  const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise<void>((resolve) => wss.once('listening', resolve));
+  wss.on('connection', (ws) => ws.once('message', (data) => {
+    assert.equal((JSON.parse(data.toString()) as { method: string }).method, 'initialize');
+    ws.terminate();
+  }));
+  try {
+    const port = (wss.address() as { port: number }).port;
+    const r = await tsm(['run', 'build', 'echo never-sent'], { TSM_URL: `ws://127.0.0.1:${port}` });
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /no command was sent/i);
+    assert.doesNotMatch(r.stderr, /outcome is unknown|\(1006\)/, 'a pre-command drop does not claim an unknown command result');
+  } finally {
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+  }
+});
+
 test('jr-18: tsm exits 1 with a message when the daemon connection closes before the result', async () => {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise<void>((r) => wss.once('listening', () => r()));
+  let sawToolCall = false;
   wss.on('connection', (ws) => {
     ws.on('message', (d) => {
       const m = JSON.parse(d.toString()) as { id: number; method: string };
       if (m.method === 'initialize') ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-06-18', capabilities: {} } }));
-      else setTimeout(() => ws.terminate(), 100); // the daemon dies mid-call
+      else if (m.method === 'tools/list') ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { tools: [{ name: 'run', inputSchema: TOOLS.find((tool) => tool.name === 'run')!.inputSchema }] } }));
+      else {
+        assert.equal(m.method, 'tools/call');
+        sawToolCall = true;
+        setTimeout(() => ws.terminate(), 100); // the daemon dies after receiving the command
+      }
     });
   });
   try {
     const port = (wss.address() as { port: number }).port;
     const r = await tsm(['run', 'build', 'npm test'], { TSM_URL: `ws://127.0.0.1:${port}` });
+    assert.equal(sawToolCall, true, 'the fake daemon received the command before the connection failed');
     assert.equal(r.code, 1, `exit ${String(r.code)}; stdout=${r.stdout}`);
-    assert.match(r.stderr, /closed .*before a result; the outcome is unknown/);
+    assert.match(r.stderr, /outcome is unknown/);
+    assert.match(r.stderr, /tsm read <session> --as events --since 0.*tsm await <runId>/i, 'a lost response names journal and known-run checks before retrying');
+    assert.match(r.stderr, /original.*--idempotency-key.*retention is bounded/i, 'a keyed retry needs the original key and a retention warning');
+    assert.match(r.stderr, /outcome stays unclear.*ask.*operator.*before resubmitting/i, 'uncertain mutating work asks for help rather than repeating');
+    assert.doesNotMatch(r.stderr, /tsm sessions/, 'an active-only list cannot establish completed Run outcomes');
+    assert.doesNotMatch(r.stderr, /closed \(1006\)|Unexpected server response/, 'protocol details do not replace the next step');
     assert.equal(r.stdout, '');
   } finally {
     await new Promise<void>((r) => wss.close(() => r()));
@@ -463,20 +525,27 @@ test('--until-done awaits again and again until the Run has ended, not once', as
   }
 });
 
-test('tsg-12/ux-18: a Host the daemon does not serve is explained, naming --allow-host', async (t) => {
-  const backend = new ScriptedBackend();
-  const registry = new SessionRegistry({ dataDir: path.join(tmp, 'd3'), backend, defaultShell: '/bin/bash', noUserRc: true });
-  const server = new TermServer({ app: new App({ registry }), resolver: new TokenMapResolver({ anonymous: 'token:local-test' }), host: '127.0.0.1', port: 0 });
-  const { port } = await server.listen();
+test('upgrade refusals give the agent an operator action without protocol text or a second daemon', async () => {
+  let status = 401;
+  const refused = new WebSocketServer({ port: 0, host: '127.0.0.1', verifyClient: (_info, done) => done(false, status) });
+  await new Promise<void>((resolve) => refused.once('listening', resolve));
   try {
-    // A name that is not a loopback name (resolves to loopback, so no network is involved).
-    const r = await tsm(['sessions'], { TSM_URL: `ws://localhost.:${port}` });
-    if (/ENOTFOUND|EAI_AGAIN/.test(r.stderr)) return t.skip('this resolver does not resolve localhost.');
-    assert.equal(r.code, 1);
-    assert.match(r.stderr, /--allow-host/, r.stderr);
+    const port = (refused.address() as { port: number }).port;
+    for (const [code, advice] of [
+      [401, /ask.*operator.*token/i],
+      [403, /ask.*operator.*(origin|proxy|url)/i],
+      [421, /--allow-host.*restart/i],
+      [429, /wait.*retry/i],
+      [503, /unavailable.*retry/i],
+    ] as const) {
+      status = code;
+      const r = await tsm(['sessions'], { TSM_URL: `ws://127.0.0.1:${port}`, TSM_TOKEN: 'incorrect' });
+      assert.equal(r.code, 1, `${code}: ${r.stderr}`);
+      assert.match(r.stderr, advice, `${code}: ${r.stderr}`);
+      assert.doesNotMatch(r.stderr, /Unexpected server response|start termd with|--allow-host 127\.0\.0\.1/, `${code}: no raw protocol or second-daemon advice`);
+    }
   } finally {
-    await server.close();
-    await registry.closeAll();
+    await new Promise<void>((resolve) => refused.close(() => resolve()));
   }
 });
 
@@ -579,6 +648,10 @@ test('without a daemon, only what the syntax alone can tell is said: a stray wor
   const json = await tsm(['open', 's', '--cwd', '{work}'], env);
   assert.match(json.stderr, /cannot reach the daemon/);
   assert.doesNotMatch(json.stderr, /not valid JSON/);
+  const absent = await tsm(['sessions'], env);
+  assert.equal(absent.code, 1);
+  assert.match(absent.stderr, /ask.*operator.*URL/i, 'an unreachable daemon has a next step');
+  assert.doesNotMatch(absent.stderr, /ECONNREFUSED|AggregateError/, 'the agent sees advice instead of library details');
 });
 
 test('an empty TSM_URL is unset: the default daemon address is dialled', async (t) => {

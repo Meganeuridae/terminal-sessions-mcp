@@ -203,6 +203,36 @@ const structured = (m: Msg) => (m.result as { structuredContent: Record<string, 
 /** No answer to a replayed request (id `tsm-shim:replay:N`) may reach the host. */
 const noReplayedAnswer = (s: Shim) => s.out.every((m) => !String(m.id).startsWith('tsm-shim:replay:'));
 
+test('the stdio shim explains upgrade refusals without raw protocol text or a second daemon', async () => {
+  let status = 401;
+  const refused = new WebSocketServer({ port: 0, host: '127.0.0.1', verifyClient: (_info, done) => done(false, status) });
+  await new Promise<void>((resolve) => refused.once('listening', resolve));
+  try {
+    const port = (refused.address() as net.AddressInfo).port;
+    for (const [code, advice] of [
+      [401, /ask.*operator.*TSM_TOKEN/i],
+      [403, /ask.*operator.*(origin|proxy|url)/i],
+      [421, /--allow-host.*restart/i],
+      [429, /wait.*retry/i],
+      [503, /unavailable.*retry/i],
+    ] as const) {
+      status = code;
+      const s = shim({ TSM_URL: `ws://127.0.0.1:${port}`, TSM_TOKEN: 'incorrect', TSM_NO_SPAWN: '1' });
+      try {
+        await until(() => s.err.join('').includes(`(${code})`) || s.err.join('').includes(`response: ${code}`), 5000, `shim refusal ${code}: ${s.err.join('')}`);
+        const said = s.err.join('');
+        assert.match(said, advice, `${code}: ${said}`);
+        assert.doesNotMatch(said, /Unexpected server response|start termd with/, `${code}: no raw protocol or second-daemon advice`);
+      } finally {
+        s.child.kill();
+        await s.exited;
+      }
+    }
+  } finally {
+    await new Promise<void>((resolve) => refused.close(() => resolve()));
+  }
+});
+
 test('tg-19: piped stdin that ends before the socket opens still gets every answer, then exit 0', async () => {
   const d = await daemon();
   try {
@@ -760,6 +790,8 @@ test("tg-19: --help (and -h) prints the settings and exits 0 before anything is 
     });
     for (const name of ['TSM_URL', 'TSM_TOKEN', 'TSM_PROFILE', 'TSM_RESULT_TEXT', 'TSM_CONNECT_TIMEOUT_MS', 'TSM_DATA_DIR', 'TSM_NO_SPAWN', 'SESSION_SERVER_URL', 'SESSION_SERVER_TOKEN']) assert.ok(text.includes(name), `${flag} names ${name}`);
     assert.match(text, /starts termd/);
+    assert.match(text, /They take SESSION_SERVER_TOKEN when set/, 'the documented 1.x address keeps its own credential');
+    assert.match(text, /TSM_TOKEN.*not sent.*TSM_URL.*SESSION_SERVER_TOKEN/, 'mixed-era help gives both settings-family remedies');
   }
   assert.equal(fs.existsSync(dir), false, 'nothing was started');
 });
@@ -1434,6 +1466,80 @@ test('atc-6/ux-15: the 1.x settings reach the daemon they name, TSM_* wins, and 
     assert.equal(fs.existsSync(path.join(spawnDir, 'termd.log')), false, 'no termd was started');
   } finally {
     await stopSpawned(spawnDir);
+    await d.close();
+  }
+});
+
+test('a shim credential follows the selected daemon address family', async () => {
+  const d = await daemon(0, undefined, { 'tok-1x': 'agent:old@x', 'tok-2x': 'agent:new@x' });
+  try {
+    const url = `ws://127.0.0.1:${d.port}`;
+    for (const [name, address, legacyToken] of [
+      ['legacy-url', { TSM_URL: '', SESSION_SERVER_URL: url }, 'tok-1x'],
+      ['legacy-host-port', { TSM_URL: '', SESSION_SERVER_HOST: '127.0.0.1', SESSION_SERVER_PORT: String(d.port) }, 'tok-1x'],
+      ['legacy-url-query', { TSM_URL: '', SESSION_SERVER_URL: `${url}/?token=tok-1x` }, ''],
+    ] as const) {
+      const s = shim({ ...address, TSM_TOKEN: 'tok-2x', SESSION_SERVER_TOKEN: legacyToken });
+      try {
+        s.send(init(1));
+        s.send(call(2, 'session_open', { session: name }));
+        const opened = await s.next(byId(2));
+        assert.equal((structured(opened).info as { owner: string }).owner, 'agent:old@x', name + ' uses the credential for its selected address');
+      } finally {
+        s.end();
+        assert.equal(await s.exited, 0);
+      }
+    }
+    const current = shim({ TSM_URL: url, SESSION_SERVER_URL: 'ws://127.0.0.1:9', TSM_TOKEN: 'tok-2x', SESSION_SERVER_TOKEN: 'tok-1x' });
+    try {
+      current.send(init(1));
+      current.send(call(2, 'session_open', { session: 'current-url' }));
+      const opened = await current.next(byId(2));
+      assert.equal((structured(opened).info as { owner: string }).owner, 'agent:new@x', 'an explicit 2.0 address uses its 2.0 credential');
+    } finally {
+      current.end();
+      assert.equal(await current.exited, 0);
+    }
+    const currentQuery = shim({ TSM_URL: `${url}/?token=tok-2x`, SESSION_SERVER_URL: 'ws://127.0.0.1:9', TSM_TOKEN: '', SESSION_SERVER_TOKEN: 'tok-1x' });
+    try {
+      currentQuery.send(init(1));
+      currentQuery.send(call(2, 'session_open', { session: 'current-url-query' }));
+      const opened = await currentQuery.next(byId(2));
+      assert.equal((structured(opened).info as { owner: string }).owner, 'agent:new@x', 'a token in the selected 2.0 URL stands when TSM_TOKEN is unset');
+    } finally {
+      currentQuery.end();
+      assert.equal(await currentQuery.exited, 0);
+    }
+  } finally {
+    await d.close();
+  }
+});
+
+test('the shim does not substitute a credential from another address family', async () => {
+  const d = await daemon(0, undefined, { 'tok-1x': 'agent:old@x', 'tok-2x': 'agent:new@x' });
+  try {
+    for (const [name, address] of [
+      ['legacy-url', { TSM_URL: '', SESSION_SERVER_URL: `ws://127.0.0.1:${d.port}`, TSM_TOKEN: 'tok-2x', SESSION_SERVER_TOKEN: '' }],
+      ['current-url', { TSM_URL: `ws://127.0.0.1:${d.port}`, SESSION_SERVER_URL: '', TSM_TOKEN: '', SESSION_SERVER_TOKEN: 'tok-1x' }],
+    ] as const) {
+      const s = shim({ ...address, TSM_CONNECT_TIMEOUT_MS: '900' });
+      try {
+        s.send(init(1));
+        s.end();
+        const result = await s.next(byId(1), 4000);
+        assert.equal(result.error?.code, -32000, name + ' has no matching credential to offer');
+        const said = result.error?.message ?? '';
+        assert.match(said, new RegExp(name === 'legacy-url' ? 'SESSION_SERVER_TOKEN' : 'TSM_TOKEN'), name + ' names the credential setting for the selected address');
+        if (name === 'legacy-url') {
+          assert.match(said, /SESSION_SERVER_URL.*TSM_TOKEN.*not sent/, 'the mixed settings explain why no credential was sent');
+          assert.match(said, /TSM_URL.*SESSION_SERVER_TOKEN/, 'the note gives both ways to pair this address and token');
+        }
+      } finally {
+        if (s.child.exitCode === null && s.child.signalCode === null) s.child.kill();
+        await s.exited;
+      }
+    }
+  } finally {
     await d.close();
   }
 });

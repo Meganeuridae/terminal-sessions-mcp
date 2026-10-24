@@ -274,7 +274,7 @@ const CLOSE_IDLE = 1008;
 /** A history attach reads this many lines of the end of the journal and carries at most this many. */
 const TRANSCRIPT_READ_LINES = 5000;
 const TRANSCRIPT_LINES = 3000;
-const MISDIRECTED = 'misdirected request: this Host is not served here; start termd with --allow-host <host:port> to serve it';
+const MISDIRECTED = 'misdirected request: this Host is not served here; use a served URL (omit a trailing dot), or ask the operator to configure --allow-host with a valid name and restart the existing daemon';
 
 export class TermServer {
   private readonly http: HttpServer;

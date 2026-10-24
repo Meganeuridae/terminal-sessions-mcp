@@ -45,12 +45,10 @@
  *    CLAUDECODE, NODE_OPTIONS…) nor its TSM_TOKEN may become the daemon's (tsg-3).
  *    It runs loopback-open, which accepts this shim's token as well.
  *
- * Where it connects: TSM_URL (default ws://127.0.0.1:3101) and TSM_TOKEN. The 1.x
- * bridge's settings still work (atc-6): SESSION_SERVER_URL, or
- * SESSION_SERVER_HOST + SESSION_SERVER_PORT, and SESSION_SERVER_TOKEN, each used
- * only when its TSM_* counterpart is unset. An address taken from them is never
- * replaced by a daemon started here — a 1.x config naming another machine must
- * never run its commands on this one — and a failure names the variable.
+ * Where it connects: TSM_URL (default ws://127.0.0.1:3101) uses TSM_TOKEN.
+ * Without TSM_URL, a 1.x bridge address from SESSION_SERVER_URL or SESSION_SERVER_HOST + SESSION_SERVER_PORT uses SESSION_SERVER_TOKEN when set, or a token in its URL.
+ * A TSM_TOKEN with only a 1.x address and no legacy or URL token is not sent. Put the address in TSM_URL, or the token in SESSION_SERVER_TOKEN.
+ * A 1.x address is never replaced by a daemon started here: a config naming another machine must not run its commands on this one, and a failure names the setting.
  *
  * Profile (§11): `--profile core|full|compat`, else TSM_PROFILE, else by the
  * name the host invoked: `terminal-sessions-mcp` (the 1.x name) serves the 1.x
@@ -98,14 +96,17 @@ Usage: tsm-shim [--profile core|full|compat]
 
 Settings (an empty value is unset):
   TSM_URL                 the daemon, default ws://127.0.0.1:3101
-  TSM_TOKEN               credential, sent as ?token=
+  TSM_TOKEN               credential for TSM_URL or the default; sent as ?token=
   TSM_PROFILE             core (default) | full | compat (the 1.x tool names); --profile wins
   TSM_RESULT_TEXT         json (default) | transcript: the text form of tool results
   TSM_CONNECT_TIMEOUT_MS  how long a request may wait for a connection, default 15000 (a duration: 15s, 2m, 1h also read)
   TSM_DATA_DIR            data dir of a termd started here, default ~/.tsm (relative: from the cwd)
   TSM_NO_SPAWN=1          never start termd
-  1.x names, read where the TSM_* name is unset: SESSION_SERVER_URL, or SESSION_SERVER_HOST +
-  SESSION_SERVER_PORT, and SESSION_SERVER_TOKEN. No termd is ever started for an address from them.
+  1.x address names when TSM_URL is unset: SESSION_SERVER_URL, or SESSION_SERVER_HOST +
+  SESSION_SERVER_PORT. They take SESSION_SERVER_TOKEN when set, or a token in their URL.
+  TSM_TOKEN applies to TSM_URL or the default address. Set TSM_URL to pair it with an old address.
+  With a 1.x address and only TSM_TOKEN, TSM_TOKEN is not sent: use TSM_URL for that address or SESSION_SERVER_TOKEN for that token.
+  No termd is started for a 1.x address.
 
 When nothing listens on a plain ws:// loopback TSM_URL, the shim starts termd on that port
 (detached, log <data-dir>/termd.log, stderr <data-dir>/termd.stderr.log), unless TSM_NO_SPAWN=1
@@ -126,22 +127,23 @@ const INVOKED_AS = Symbol.for('term-sessions.shim.invokedAs');
 /** The tool profiles the daemon serves (transport/server.ts PROFILES; the shim imports nothing of the transport's). */
 const PROFILES: ReadonlySet<string> = new Set(['core', 'full', 'compat']);
 
-/** Where to connect, and whether this address may be served by a daemon we start (atc-6). */
+/** The selected address determines both its credential family and whether a local daemon may start (atc-6). */
 function target1x(): { base: string; token: string | undefined; from: string | undefined } {
-  const token = setting('TSM_TOKEN') ?? setting('SESSION_SERVER_TOKEN');
+  const currentToken = setting('TSM_TOKEN');
+  const legacyToken = setting('SESSION_SERVER_TOKEN');
   const url = setting('TSM_URL');
-  if (url) return { base: url, token, from: undefined };
+  if (url) return { base: url, token: currentToken, from: undefined };
   const oneX = setting('SESSION_SERVER_URL');
-  if (oneX) return { base: oneX, token, from: 'SESSION_SERVER_URL' };
+  if (oneX) return { base: oneX, token: legacyToken, from: 'SESSION_SERVER_URL' };
   const host = setting('SESSION_SERVER_HOST');
   const port = setting('SESSION_SERVER_PORT');
   if (host || port) {
     const h = host ?? 'localhost'; // what 1.x's own frontend dialed when only the port was set
     const hostPart = h.includes(':') && !h.startsWith('[') ? `[${h}]` : h;
     const from = [host ? 'SESSION_SERVER_HOST' : '', port ? 'SESSION_SERVER_PORT' : ''].filter(Boolean).join(' + ');
-    return { base: `ws://${hostPart}:${port ?? '3100'}`, token, from };
+    return { base: `ws://${hostPart}:${port ?? '3100'}`, token: legacyToken, from };
   }
-  return { base: 'ws://127.0.0.1:3101', token, from: undefined };
+  return { base: 'ws://127.0.0.1:3101', token: currentToken, from: undefined };
 }
 
 /** `--profile p` / `--profile=p`, then TSM_PROFILE, then the invoked name (atc-19). */
@@ -183,7 +185,7 @@ function msSetting(name: string, fallback: number): number {
 
 const chosen = target1x();
 if (chosen.from) log(`using ${chosen.from} (a 1.x setting) for the daemon address; TSM_URL is the 2.0 name`);
-if (!setting('TSM_TOKEN') && setting('SESSION_SERVER_TOKEN')) log('using SESSION_SERVER_TOKEN (a 1.x setting); TSM_TOKEN is the 2.0 name');
+if (chosen.from && chosen.token) log('using SESSION_SERVER_TOKEN (a 1.x setting) for this daemon address');
 const base = chosen.base;
 let url: URL;
 try {
@@ -740,6 +742,9 @@ setInterval(expireQueue, 250).unref();
 
 /** What to do about an address that does not answer, when the answer is not "wait". */
 function unreachableHint(): string {
+  if (chosen.from && setting('TSM_TOKEN') && chosen.token === undefined && !url.searchParams.has('token')) {
+    return `; ${chosen.from} selected a 1.x address. TSM_TOKEN belongs to TSM_URL or the default 2.0 address and was not sent here; put this address in TSM_URL or put the token in SESSION_SERVER_TOKEN`;
+  }
   if (chosen.from) {
     return `; the address came from ${chosen.from} (a 1.x setting), so no local daemon was started for it — 2.0's termd listens on 3101 by default: set TSM_URL, or start termd on that address`;
   }
@@ -756,9 +761,11 @@ const seconds = (since: number) => (Math.round((clocks.monotonic() - since) / 10
 /** Say what a refused upgrade means (the ws library reports only the status). */
 function explain(message: string): string {
   const status = /Unexpected server response: (\d+)/.exec(message)?.[1];
-  if (status === '401') return `${message}: the daemon refused the credential (check TSM_TOKEN)`;
-  if (status === '421') return `${message}: the daemon does not serve this Host name; start termd with --allow-host <host:port>`;
-  if (status === '429' || status === '503') return `${message}: the daemon has too many connections`;
+  if (status === '401') return `the daemon refused this credential (401): ask its operator for a valid ${chosen.from ? 'SESSION_SERVER_TOKEN' : 'TSM_TOKEN'} for this address`;
+  if (status === '403') return 'the daemon refused this connection (403): ask its operator to check the configured URL, proxy and Origin policy before retrying';
+  if (status === '421') return 'the daemon does not serve this Host (421): ask its operator for a served URL; remove a trailing dot if present. For another valid name, configure --allow-host and restart the running daemon';
+  if (status === '429') return 'the daemon refused another connection (429): wait until capacity is available, then retry';
+  if (status === '503') return 'the daemon is unavailable or at its connection limit (503): wait until it is available, then retry';
   return message;
 }
 

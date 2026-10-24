@@ -24,7 +24,7 @@ import { Journal } from '../src/core/journal.js';
 import { clocks } from '../src/core/clock.js';
 import { MemoryStore } from '../src/core/stores.js';
 import { Follower } from '../src/transport/follower.js';
-import { TermServer, type LogRecord, type ServerOptions, type UsageRecord } from '../src/transport/server.js';
+import { TermServer, parseAllowHost, type LogRecord, type ServerOptions, type UsageRecord } from '../src/transport/server.js';
 import { McplLane } from '../src/transport/mcpl.js';
 import { fakeShellBackend } from './fake-shell.js';
 import { sleep, until } from './testhost.js';
@@ -1367,6 +1367,12 @@ test('tsg-12: on a loopback bind the loopback names are served on any port (port
     const refused = await httpGet(p, '/health', { Host: 'devbox.example:13101' });
     assert.equal(refused.status, 421);
     assert.match(refused.body, /--allow-host/);
+    const dotted = await httpGet(p, '/health', { Host: `localhost.:${p}` });
+    assert.equal(dotted.status, 421, 'the trailing-dot Host is refused without DNS lookup');
+    assert.equal(parseAllowHost('localhost.'), undefined, 'the daemon cannot accept that spelling as an allow-host setting');
+    assert.match(dotted.body, /omit a trailing dot/);
+    assert.doesNotMatch(dotted.body, /--allow-host localhost\./, 'the advice never names the rejected Host as an allow-host value');
+    assert.match(dotted.body, /restart the existing daemon/);
   } finally {
     await h.close();
   }
