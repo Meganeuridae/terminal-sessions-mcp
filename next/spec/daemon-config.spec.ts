@@ -272,6 +272,8 @@ test('the bridge entry and the gate wake on what the README promises and the ser
   const holds = wake.hold.flat();
   assert.deepEqual(promised.filter((t) => !wakes.includes(t)), [], 'the bridge wakes on every promised tag (the house\'s read of 59f660b, #22: two service tags were missing)');
   assert.deepEqual(ambient.filter((t) => !holds.includes(t)), [], 'and holds every ambient one');
+  // The bridge applies its wake rules first, so an ambient tag on the wake list would wake whatever the hold list says.
+  assert.deepEqual(ambient.filter((t) => wakes.includes(t)), [], 'and wakes on none of them');
   assert.deepEqual([...wakes, ...holds].filter((t) => !(t in ontology.tags)), [], 'no entry names a tag the server never sends');
   // The gate: first match wins, and a trailing * matches a family.
   const gate = (JSON.parse(fs.readFileSync(path.join(CONFIG, 'agent-framework.gate.json'), 'utf8')) as { policies: Array<{ name: string; match: { source: string; tagsAny: string[] }; behavior: unknown }> }).policies;
