@@ -3,7 +3,8 @@
  * thin translation of these operations. Verbs are enforced here for every
  * adapter (G18); the seat is enforced in the core. Every operation that runs,
  * types, declares or changes something takes an optional idempotency key (G16): a
- * retry within the window gets the original outcome instead of a second execution.
+ * ordinary retry within the window gets the original outcome without a second execution.
+ * A keyed `run` or `start` re-awaits its Run, whose state may have changed.
  * `note` takes none: it records an annotation, and a repeated note is a repeated
  * annotation, nothing worse (the house's read of 1cabc6a, #22).
  */
@@ -225,8 +226,9 @@ function idemIdentity(idem: string): { key: string; tool: string; digest: string
 }
 
 /**
- * Per-principal memory of idempotency keys (G16). A replay returns the original outcome,
- * success or failure; a key reused for another tool or other arguments is refused. Nothing
+ * Per-principal memory of idempotency keys (G16). An ordinary replay returns the first outcome,
+ * success or failure; `run` and `start` re-await while their Runs remain indexed and
+ * the key remains in its 15-minute window. A key reused for another tool or other arguments is refused then. Nothing
  * is kept for a call that admitted nothing (`busy`), so its retry can run — except the one
  * refusal that exists to be seen (see `remembered`). Bounded: keys are
  * at most 200 characters, a principal holds at most `perPrincipal` keys and the daemon
@@ -798,7 +800,7 @@ export class App {
     return mono ?? Date.now() - run.admittedAt;
   }
 
-  /** A retried `run` or `start` (G16): the same Run, awaited again — never a second execution. */
+  /** A retained-key `run` or `start` replay inside its 15-minute window re-awaits the same Run. */
   private async replayRun(caller: Caller, prev: RunResult, wait: number | undefined): Promise<RunResult> {
     if (prev.runId === undefined) return { ...prev, replayed: true };
     let again: RunResult;
@@ -1339,8 +1341,8 @@ export class App {
   // ───────────── the journal ─────────────
 
   /**
-   * Read by cursor (G11). An explicit read advances the caller's `read` cursor on delivery
-   * (G22). `advance: false` makes a nonadvancing preview for history attach and compat's
+   * Read by cursor (G11). An explicit direct read advances the caller's `read` cursor now;
+   * a deferred transport read advances it on delivery (G22). `advance: false` makes a nonadvancing preview for history attach and compat's
    * incidental tails; the explicit `read` tool does not pass it (a reviewer's read of the
    * fixes for comment 6270045466, #22).
    */

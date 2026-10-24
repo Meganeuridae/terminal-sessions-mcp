@@ -371,24 +371,15 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 
 ### Control and collaboration
 
-- **G16.** Every mutating operation — input, run, start, cancel, signal, resize, open,
-  close, watch, unwatch, control, env capture — carries a principal and may carry an
-  idempotency key (at most 200 characters; a UUID per operation). For an ordinary
-  mutating call, a retry while its key is retained and inside its 15-minute window
-  returns the first outcome, success or failure, without executing twice. A retried
-  `run` or `start` instead re-awaits the same Run while its admission identity remains
-  indexed; that Run may have changed state since the first answer. Its identity can
-  survive cache eviction or a daemon restart. After a restart, the journal's wall-clock
-  admission time is the only age stamp. The in-memory cache keeps the newest 1,024
-  keys per principal and 16,384 in total, so it can forget a key before its time
-  window ends. After a session is forgotten,
-  the first outcome is returned while its key remains in memory. A key reused for another
-  tool or with other arguments is refused while its identity is retained; `run.admit`
-  records that identity separately from the arguments' fingerprint. A call that admitted
-  nothing (`busy`) is not remembered, so its retry can run. The exception is
-  `busy: declared-shell-ended`: its refusal is remembered, and a new key expresses an
-  intent to run in the session's own shell. A client never blindly resends input after
-  an ambiguous outcome.
+- **G16.** Every mutating operation — input, run, start, cancel, signal, resize, open, close, watch, unwatch, control, env capture — carries a principal and may carry an idempotency key (at most 200 characters; a UUID per operation). For an ordinary mutating call, a retry while its key is retained and inside its 15-minute window returns the first outcome, success or failure, without executing twice.
+
+  A retried `run` or `start` instead re-awaits the same Run within that 15-minute window while its admission identity remains indexed; that Run may have changed state since the first answer. Its identity can survive cache eviction or a daemon restart. After a restart, the journal's wall-clock admission time is the only age stamp.
+
+  The in-memory cache keeps the newest 1,024 keys per principal and 16,384 in total, so it can forget a key before its time window ends. Once the window ends or an identity is lost, a retry can admit new work.
+
+  After a session is forgotten, a retry within the window may return a cached result while its key remains in memory; output no longer retained by the session is marked truncated. A key reused for another tool or with other arguments is refused within the window while its identity is retained; `run.admit` records that identity separately from the arguments' fingerprint.
+
+  A call that admitted nothing (`busy`) is not remembered, so its retry can run. The exception is `busy: declared-shell-ended`: its refusal is remembered, and a new key expresses an intent to run in the session's own shell. A client never blindly resends input after an ambiguous outcome.
 - **G17.** A session has at most one controller at a time. Observers may not type, signal,
   resize or destroy, with two exceptions that need no seat: a principal may `cancel` a Run it
   started, and the owner may `session_close` its own session. The controller is visible in

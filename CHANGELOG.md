@@ -45,10 +45,8 @@ later release (`next/README.md`, "Upgrading from 1.x").
   can begin with an `[earlier output not shown (…)]` line, which names the `read` that shows what
   came before (and, when the first line is cut at its head, the read that shows it from there),
   and the logs, raw ones included, mark a hole with a `[… N journal events missing …]` line where
-  output was lost: a host that parses the logs sees these lines. The shim also reads the 1.x settings
-  (`SESSION_SERVER_URL`, `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT`, `SESSION_SERVER_TOKEN`)
-  where the `TSM_*` ones are unset, and `termd` accepts a 1.x `session-server` command line
-  (`--headless`, `--host localhost`, the same variables).
+  output was lost: a host that parses the logs sees these lines.
+- **Address and credential migration:** The shim selects `TSM_URL` or its default address with `TSM_TOKEN` (or a token in that URL). When `TSM_URL` is unset, a 1.x address from `SESSION_SERVER_URL` or `SESSION_SERVER_HOST` and `SESSION_SERVER_PORT` uses `SESSION_SERVER_TOKEN` (or a token already in `SESSION_SERVER_URL`). It does not substitute a token from the other address family. In contrast, `termd` uses `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT` and `SESSION_SERVER_TOKEN` as individual fallbacks when the matching `TSM_HOST`, `TSM_PORT` and `TSM_TOKEN` settings are unset. It also accepts `--headless` and `--host localhost` from a 1.x `session-server` command line.
 - Shipped host and supervisor configurations in `next/config/`.
 
 ### Changed

@@ -2,8 +2,10 @@
  * The daemon's one endpoint (§12): JSON-RPC 2.0 over WebSocket with two method
  * families — MCP+MCPL (tools, channels, manifest, policy) and `terminal/*` (the
  * native family for the GUI and CLI: subscribe, attach, detach) — plus `/health`
- * and the GUI's static files over HTTP. Every WebSocket connection is a caller
- * with its own attachments, cursors and MCPL lane.
+ * and the GUI's static files over HTTP. Every WebSocket connection has a
+ * server-generated connection ID for its attachments and a principal resolved
+ * from its credential. Each session keeps delivery and read cursors per
+ * principal. A client declaring `experimental.mcpl` also has an MCPL lane.
  *
  * Who may talk to it:
  *  1. For both HTTP requests and upgrades, Host must name this daemon:
@@ -15,9 +17,10 @@
  *     other Origin is 403. Browsers supply Origin on WebSocket handshakes:
  *     without this check, another page could drive the user's shells. HTTP
  *     no-cors GETs may omit Origin, so its absence does not authenticate HTTP.
- *  3. HTTP routes then serve the GUI's static files without a credential and
- *     accept an optional credential on `/health` (otherwise counts only, or
- *     the anonymous principal where configured). A WebSocket upgrade first
+ *  3. HTTP routes serve the GUI's static files without a credential. `/health`
+ *     accepts an optional credential; without one it uses an anonymous principal
+ *     where available, or reports liveness, version, pid, endpoint elapsed time,
+ *     counts and any degraded reason without session details. A WebSocket upgrade first
  *     checks the connection limit, then resolves `?token=` or
  *     `Authorization: Bearer` to a principal (§4.5), or returns 401.
  *     A same-origin browser WebSocket uses the GUI's human principal,

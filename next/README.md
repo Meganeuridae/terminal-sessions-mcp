@@ -93,12 +93,11 @@ shipped configs set it) and the envelope as JSON otherwise — the default, for 
 scripts parse tool text (agent-framework's code execution). The hints below — that a line
 looks like it opened another shell, turned on `set -e`, or ran `ssh` without a terminal — are
 part of the status line, so a host reading the JSON gets the facts (`line`, `state`, `reason`)
-and no hint field. Opt-in tiers: `terminal.control` (`signal`, `control`, `resize`,
-`session_env_capture`), `terminal.services` (`start` with readiness and health probes),
-`terminal.watch` (`watch`, `unwatch`, `watches`, `wait_for`), `terminal.search` (`search`). Mutating tools of these
-tiers take an `idempotencyKey` (a fresh UUID per operation): a retry returns the first outcome
-instead of running twice, also across a daemon restart for `run` and `start`. The 1.x
-compatibility tools do not take one (1.x had none) and ignore one passed to them.
+and no hint field.
+
+Opt-in tiers are `terminal.control` (`signal`, `control`, `resize`, `session_env_capture`), `terminal.services` (`start` with readiness and health probes), `terminal.watch` (`watch`, `unwatch`, `watches`, `wait_for`), and `terminal.search` (`search`).
+
+Mutating tools in these tiers accept an optional `idempotencyKey` (a fresh UUID per operation). An ordinary retry within 15 minutes returns the first outcome only while the key is retained. A keyed `run` or `start` retried in that window re-awaits the same Run while its admission remains indexed; its state may have changed, including after a daemon restart. Once the window ends or the key identity is lost, a retry can execute work again. The 1.x compatibility tools ignore an `idempotencyKey` passed to them because 1.x had none.
 
 The patterns of `search`, `watch`, `wait_for` and a service's readiness and failure probes match
 one output line at a time, as the terminal shows it: escape sequences are gone, and a tab is the
@@ -215,11 +214,9 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   presence. The daemon log says which it is for each connection (`initialized: …`), what the
   grant came to (`grant received: … enabled … not enabled …`), and warns when a host has sent
   no grant five seconds after initializing.
-- **From 1.x.** A daemon command written for 1.x starts termd: `--headless` is accepted and changes nothing (the GUI is at the daemon's address), and `--host localhost` binds 127.0.0.1. In termd itself, `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT` and `SESSION_SERVER_TOKEN` are fallback settings when the matching `TSM_HOST`, `TSM_PORT` and `TSM_TOKEN` are unset. In the shim, a 1.x address (`SESSION_SERVER_URL`, or `SESSION_SERVER_HOST` and `SESSION_SERVER_PORT`) is selected only when `TSM_URL` is unset. For that address, `SESSION_SERVER_TOKEN` supplies the credential when set; otherwise any token in `SESSION_SERVER_URL` stays in the URL. `TSM_TOKEN` belongs to `TSM_URL` or the default 2.0 address. With `SESSION_SERVER_URL` and `TSM_TOKEN` but neither `TSM_URL` nor `SESSION_SERVER_TOKEN`, the shim sends no token. Put the address in `TSM_URL` or the token in `SESSION_SERVER_TOKEN`. See [`next/config/README.md`](config/README.md) for shipped configurations.
+- **From 1.x.** A daemon command written for 1.x starts termd: `--headless` is accepted and changes nothing (the GUI is at the daemon's address), and `--host localhost` binds 127.0.0.1. In termd itself, `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT` and `SESSION_SERVER_TOKEN` are fallback settings when the matching `TSM_HOST`, `TSM_PORT` and `TSM_TOKEN` are unset. In the shim, a 1.x address (`SESSION_SERVER_URL`, or `SESSION_SERVER_HOST` and `SESSION_SERVER_PORT`) is selected only when `TSM_URL` is unset. For that address, `SESSION_SERVER_TOKEN` supplies the credential when set; otherwise any token in `SESSION_SERVER_URL` stays in the URL. `TSM_TOKEN` belongs to `TSM_URL` or the default 2.0 address. With `SESSION_SERVER_URL` and `TSM_TOKEN` but neither `TSM_URL` nor `SESSION_SERVER_TOKEN`, the shim does not send `TSM_TOKEN`; a token already in `SESSION_SERVER_URL` stays in use. Put the address in `TSM_URL` to pair it with `TSM_TOKEN`, or put that token in `SESSION_SERVER_TOKEN`. See [`next/config/README.md`](config/README.md) for shipped configurations.
 - **Permissions.** termd's own files (journals, logs, keys, the usage log) are owner-only by mode whatever the umask. The per-session `shell/` command directory must be a real directory owned by termd with mode `0700`. termd refuses to open a session on a filesystem that cannot preserve that owner and mode. Sessions' shells and process Runs inherit the umask termd was started with, so files a session creates get the usual permissions. Start termd with the mask you want sessions to have (a supervisor's default is 022).
-- **Safety.** Only loopback or `--allow-host` names are accepted as Host; a browser Origin
-  other than the daemon's own is refused. A non-loopback bind needs a token. Session shells
-  never inherit the daemon's credentials or the launching terminal's identity variables.
+- **Safety.** termd accepts Host values naming loopback, its specific bind address, or a name configured with `--allow-host`. It refuses a browser Origin other than its own. A non-loopback bind needs a token. Session shells never inherit the daemon's credentials or the launching terminal's identity variables.
 - **Persistence.** Sessions outlive connections; journals (`~/.tsm/sessions/<id>/`) outlive
   the daemon, and after a restart each old session is readable as `history-only` with its
   in-flight Runs reported `lost` (reason `daemon-restart`). A power loss can take the newest

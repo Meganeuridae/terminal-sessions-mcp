@@ -524,7 +524,7 @@ function connectError(url: URL, message: string): string {
   if (status === '401') return `${at} refused this credential (401). Ask its operator for a valid token for this address; set TSM_TOKEN to that token or use the URL they provide.`;
   if (status === '403') return `${at} refused this connection (403). Ask its operator to check the URL, proxy and Origin policy before retrying.`;
   if (status === '421') return `${at} does not serve Host ${url.host} (421). Ask its operator for a served URL. If the Host ends in a dot, remove that dot; to serve another valid name, have the operator add --allow-host <name> to the running daemon configuration and restart it.`;
-  if (status === '429') return `${at} refused another connection (429). Wait until capacity is available, then retry.`;
+  if (status === '429') return `${at} reached its per-principal connection limit (429). Close idle connections using the same token or local identity, then retry. Ask its operator to free connections held by other clients.`;
   if (status === '503') return `${at} is unavailable or at its connection limit (503). Wait until it is available, then retry.`;
   return `cannot reach ${at}. Ask its operator to check the URL and whether the daemon is running before retrying.`;
 }

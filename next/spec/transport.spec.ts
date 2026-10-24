@@ -916,7 +916,7 @@ test('sec-10: /health reports per-session state, backend, controller, integratio
     const gui = await Client.open(h.port, { token: 'tb' }, { origin: `http://127.0.0.1:${h.port}` });
     await gui.request('ping');
     type Health = { status: string; pid: number; connections: Record<string, number>; sessionCount: number; sessions?: Array<Record<string, unknown>> };
-    // tsg-17: with tokens configured, no credential gets liveness and counts only.
+    // tsg-17: with tokens required, /health without a credential returns public endpoint metadata and counts, not session details.
     const bare = JSON.parse((await httpGet(h.port, '/health')).body) as Health;
     assert.equal(bare.status, 'ok');
     assert.equal(bare.pid, process.pid);

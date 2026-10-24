@@ -51,8 +51,8 @@ const idempotencyKey = {
   minLength: 1,
   description:
     'Optional; use a fresh unique value (a UUID) per operation. An ordinary call retried with its retained key within 15 minutes returns the first ' +
-    'outcome instead of running again. A run or start re-awaits the same Run while its journal admission remains indexed; its state may have changed, including after a daemon restart. ' +
-    'The in-memory cache keeps the newest 1,024 keys per caller and 16,384 in all, so other keys may be forgotten sooner. A key reused for another tool or with other arguments is refused while its identity remains retained. ' +
+    'outcome instead of running again. A run or start retried within 15 minutes re-awaits the same Run while its journal admission remains indexed; its state may have changed, including after a daemon restart. ' +
+    'The in-memory cache keeps the newest 1,024 keys per caller and 16,384 in all, so other keys may be forgotten sooner. Once the 15-minute window ends or the key identity is lost, reusing it can execute work again; inspect retained events before retrying an uncertain call. A key reused for another tool or with other arguments is refused only while its identity remains retained within that window. ' +
     'A `busy` outcome (nothing ran) is not remembered, so its retry can run — except `busy: declared-shell-ended`, which the retry gets ' +
     'again: use a new key once you mean the session’s own shell.',
 } as const satisfies Schema;

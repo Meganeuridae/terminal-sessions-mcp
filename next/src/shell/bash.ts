@@ -442,8 +442,9 @@ __tsm_word_in() {
 # assignment from one inside quotes (echo 'PROMPT_COMMAND="cmd"'), and a quoted one after the line's
 # own run of cmd hid that run, so the heal closed the Run while the line went on (the house's read of
 # the 38 commits, #22 comment 6274841346). Of the two errors an ambiguous line can cause, a late close
-# costs nothing past the prompt, where PS1 closes the Run with the status the trap kept (see __tsm_a);
-# an early one types the next Run into a running command. The late side remains for quoted
+# can leave the Run open until PS1, where a start without a prompt-end mark makes it lost rather
+# than using an earlier DEBUG status as its exit. An early close types the next Run into a
+# running command. The late side remains for quoted
 # install-shaped text before a real run-then-install, and for a line that installs last a command it
 # also runs (the house's read of the 33 commits, #22 comment 6307351617, item 2).
 __tsm_line_has() {
