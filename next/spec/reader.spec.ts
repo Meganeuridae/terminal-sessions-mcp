@@ -2079,3 +2079,23 @@ test("a page MAX_SCAN stopped on a carriage return, every event it collected tak
   assert.equal(pages[0]!.splitLine, undefined);
   assert.equal(text, 'p9\nZ0');
 });
+
+test("a Run's page reads its open sequence's head only within HEAD_EVENTS journal events back, and applies lasting state only within MAX_SCAN (the house's review of bc4bc85..5d8ce0e, PR #22, I49)", async () => {
+  // Each look-back is bounded in journal events, other Runs' included, rather than read back through the Run's output.
+  const page = async (set: string, rest: string, others: number) => {
+    const src = source();
+    startRun(src.journal, 'r1');
+    out(src.journal, set, 'stdout', 'r1');
+    startRun(src.journal, 'r2');
+    for (let i = 0; i < others; i++) out(src.journal, `o${i}\n`, 'stdout', 'r2');
+    const at = out(src.journal, `\n${rest}\n`, 'stdout', 'r1');
+    return (await readJournal(src, { runId: 'r1', since: at - 1, offset: 1 }, { resultBytes: 4096 })).text!.split('\n')[0];
+  };
+  // An open CSI's head: its rest `1mB` reads `B` while the head is found.
+  assert.equal(await page('x\x1b[3', '1mB', 3), 'B');
+  assert.equal(await page('x\x1b[3', '1mB', 600), '1mB', 'past HEAD_EVENTS (512)');
+  // DEC line drawing, lasting state: `qq` reads `──` while it applies.
+  assert.equal(await page('\x1b(0', 'qq', 3), '──');
+  // It reads back in batches of 512 while it has read fewer than MAX_SCAN (20,000), so up to 20,480 events.
+  assert.equal(await page('\x1b(0', 'qq', 21_000), 'qq', 'past MAX_SCAN and its last batch');
+});
