@@ -395,7 +395,7 @@ async function checkSupervisor(): Promise<Supervisor> {
 
 /** Why a systemd unit's ExecStart gives no port or data dir, worded as a whole note. */
 const unshaped = (prop: (k: string) => string): string =>
-  prop('ExecStart') ? `the systemd user unit termd's ExecStart is not in the shape read here, or names a variable not known here (${prop('ExecStart').slice(0, 120)}), so its port and data dir are unknown` : 'the systemd user unit termd has no ExecStart, so its port and data dir are unknown';
+  prop('ExecStart') ? "the systemd user unit termd's ExecStart is not in the shape read here or names an unknown variable, so its port and data dir are unknown" : 'the systemd user unit termd has no ExecStart, so its port and data dir are unknown';
 
 /**
  * The unit's text read with the user manager's environment, which every unit it starts inherits (see

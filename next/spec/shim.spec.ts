@@ -1051,6 +1051,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     env?: Record<string, string>;
     expect: 'unknown' | 'managed' | 'shared' | 'dangling' | 'start';
     says: RegExp;
+    notSays?: RegExp;
   }
   const spaced = (name: string) => path.join(tmp, `sup ${name} with spaces`);
   /** A process of this user's standing in for the unit's running termd, with the environment given: its pid. */
@@ -1150,7 +1151,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     { name: 'launchctl-not-loaded-plist-unreadable', when: darwin && process.getuid?.() !== 0, stub: 'none', home: unreadablePlistHome('unreadable', port), expect: 'unknown', says: /the LaunchAgent com\.animalabs\.termd is on disk \(\S+\.plist\) but could not be read \(EACCES\), so its port and data dir are unknown/ },
     { name: 'launchctl-not-loaded-plist-binary', when: darwin, stub: 'none', home: darwin ? otherFormPlistHome('launchctl-not-loaded-plist-binary', 'binary') : '', expect: 'unknown', says: /the LaunchAgent com\.animalabs\.termd is on disk \(\S+\.plist\) but could not be read \(a binary plist, which is not read here\), so its port and data dir are unknown/ },
     { name: 'launchctl-not-loaded-plist-program-only', when: darwin, stub: 'none', home: darwin ? otherFormPlistHome('launchctl-not-loaded-plist-program-only', 'program') : '', expect: 'unknown', says: /the LaunchAgent com\.animalabs\.termd is on disk \(\S+\.plist\) but could not be read \(no ProgramArguments array in it\), so its port and data dir are unknown/ },
-    { name: 'execstart-in-another-shape', when: linux, stub: () => ({ launchctl: 'exit 113', systemctl: "printf '%s\\n' 'LoadState=loaded' 'ActiveState=active' 'UnitFileState=disabled' 'ExecStart=/bin/sh /pkg/next/config/termd-launch.sh --port 3101' 'Environment='" }), expect: 'unknown', says: /ExecStart is not in the shape read here/ },
+    { name: 'execstart-in-another-shape', when: linux, stub: () => ({ launchctl: 'exit 113', systemctl: "printf '%s\\n' 'LoadState=loaded' 'ActiveState=active' 'UnitFileState=disabled' 'ExecStart=/bin/sh /pkg/next/config/termd-launch.sh --port 3101 --token SOL_PROBE_SENTINEL' 'Environment='" }), expect: 'unknown', says: /ExecStart is not in the shape read here/, notSays: /SOL_PROBE_SENTINEL/ },
     { name: 'data-dir-flag-without-a-value', when: true, stub: () => unitStub({ argv: ['--data-dir', '--port', '3101'] }), expect: 'dangling', says: /names --data-dir without a value, so the data dir its termd uses is unknown: none is started here/ },
     // A --port with no value, which termd refuses, was read on as the environment's port or 3101 (the house's read of the 40 commits, #22).
     // Its own argument for both supervisors: a data dir of '/srv/unit-data --port' named it only in systemctl's
@@ -1261,6 +1262,10 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     assert.equal(failed.error?.code, -32000, c.name);
     const said = `${failed.error?.message ?? ''}\n${s.err.join('')}`;
     assert.match(said, c.says, c.name);
+    if (c.notSays) {
+      assert.doesNotMatch(failed.error?.message ?? '', c.notSays, `${c.name}: the result omits unit credential values`);
+      assert.doesNotMatch(s.err.join(''), c.notSays, `${c.name}: stderr omits unit credential values`);
+    }
     if (c.expect === 'start') assert.match(s.err.join(''), /started termd/, c.name);
     else assert.doesNotMatch(s.err.join(''), /started termd/, c.name);
     if (c.expect === 'unknown') assert.match(failed.error?.message ?? '', /no termd is started here while that is unknown \(TSM_NO_SPAWN=1 skips the check/, c.name);
