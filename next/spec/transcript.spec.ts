@@ -801,16 +801,17 @@ test('a live Run’s transcript renders its gaps as holes too', async () => {
     const t = await h.session.runTranscript(a.run.runId);
     assert.deepEqual(t.text.split('\n'), ['ready', 'ERROR: boom']);
     assert.equal(t.truncated, true);
-    // What the hole took no read gives: lost, not omitted (the house's review of bc4bc85..5d8ce0e, PR #22, I14), as journalRunText says; and so is what
-    // retention took from the Run's start, while what the byte cap left out is omitted, which a read gives.
-    assert.deepEqual([t.omitted, t.lost], [undefined, true], 'a hole');
+    // What the hole took no read gives: gone, not omitted (the house's review of bc4bc85..5d8ce0e, PR #22, I14, I15),
+    // as journalRunText says; and so is what retention took from the Run's start, while what the byte cap left out is
+    // omitted, which a read gives.
+    assert.deepEqual([t.omitted, t.lost, t.gone], [undefined, undefined, true], 'a hole');
     const plain = { events: [out(10, 'a\r\n'), out(16, 'b\r\n')], from: 9, to: 17, truncated: true };
     h.session.runOutput = () => ({ ...plain, older: true });
     const gone = await h.session.runTranscript(a.run.runId);
-    assert.deepEqual([gone.truncated, gone.omitted, gone.lost], [true, undefined, true], 'retention took the start');
+    assert.deepEqual([gone.truncated, gone.omitted, gone.lost, gone.gone], [true, undefined, undefined, true], 'retention took the start');
     h.session.runOutput = () => ({ ...plain, older: true, cut: true });
     const cut = await h.session.runTranscript(a.run.runId);
-    assert.deepEqual([cut.truncated, cut.omitted, cut.lost], [true, true, undefined], 'the cap cut the start');
+    assert.deepEqual([cut.truncated, cut.omitted, cut.lost, cut.gone], [true, true, undefined, undefined], 'the cap cut the start');
   } finally {
     await h.session.close();
   }
@@ -1029,29 +1030,31 @@ test('margins the replayed state set have no known owner: no source’s scroll o
 test('a Run’s text tells rows its projection lost apart from what a cut omitted', async () => {
   // The house's review of 4860d4c..bc4bc85 (PR #22, I73): a Run's text carried only `truncated`, and its completion
   // said "earlier output omitted · read … for all of it" for rows a hole's line end scrolled out of a region, which
-  // no read shows (Projection.lost).
+  // no text of the range shows (Projection.lost).
   const region = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6';
   const output = (data: string, seq: number) => ({ type: 'output' as const, seq, ts: 0, runId: 'r1', stream: 'pty' as const, data });
   const run = (cut: boolean): RunOutput => ({ events: [output(region, 1), output('X\r\n', 5)], gaps: [{ from: 1, to: 5 }], from: 1, to: 5, truncated: cut, ...(cut ? { cut } : {}) }) as unknown as RunOutput;
   const lost = await journalRunText(run(false), { cols: 20, rows: 10 });
-  assert.deepEqual([lost.text.split('\n'), lost.truncated, lost.omitted, lost.lost], [['top1', 'top2', 'r5', 'r6', 'X'], true, undefined, true]);
+  // The hole is gone from the journal as well, a loss of another kind (RunText.gone).
+  assert.deepEqual([lost.text.split('\n'), lost.truncated, lost.omitted, lost.lost, lost.gone], [['top1', 'top2', 'r5', 'r6', 'X'], true, undefined, true, true]);
   const both = await journalRunText(run(true), { cols: 20, rows: 10 });
-  assert.deepEqual([both.truncated, both.omitted, both.lost], [true, true, true], 'a range cut short as well');
+  assert.deepEqual([both.truncated, both.omitted, both.lost, both.gone], [true, true, true, true], 'a range cut short as well');
   const budget = await journalRunText(run(false), { cols: 20, rows: 10, maxInputBytes: 10 });
   assert.deepEqual([budget.truncated, budget.omitted], [true, true], `the projection's own cut: ${JSON.stringify(budget)}`);
-  // The house's review of bc4bc85..5d8ce0e (PR #22), I14: output the journal no longer has is lost, not omitted, since no read gives it back: retention that
-  // took the range's start (`truncated` with no byte cap's `cut`), and a hole within it.
+  // The house's review of bc4bc85..5d8ce0e (PR #22), I14: output the journal no longer has is gone, not omitted, since
+  // no read gives it back: retention that took the range's start (`older` with no byte cap's `cut`), and a hole within
+  // it. Nor is it `lost`, whose rows a raw read has (I15).
   const plain = (o: Partial<RunOutput>): RunOutput => ({ events: [output('a\r\n', 3), output('b\r\n', 6)], from: 1, to: 6, truncated: false, ...o }) as unknown as RunOutput;
-  const shown = async (o: Partial<RunOutput>) => { const t = await journalRunText(plain(o), { cols: 20, rows: 10 }); return [t.truncated, t.omitted, t.lost]; };
-  assert.deepEqual(await shown({}), [false, undefined, undefined], 'whole');
-  assert.deepEqual(await shown({ truncated: true, older: true }), [true, undefined, true], 'retention took the start');
+  const shown = async (o: Partial<RunOutput>) => { const t = await journalRunText(plain(o), { cols: 20, rows: 10 }); return [t.truncated, t.omitted, t.lost, t.gone]; };
+  assert.deepEqual(await shown({}), [false, undefined, undefined, undefined], 'whole');
+  assert.deepEqual(await shown({ truncated: true, older: true }), [true, undefined, undefined, true], 'retention took the start');
   // `truncated` alone, as a range with `since` reads when retention took only the Run's start before it: nothing of
   // the range is gone.
-  assert.deepEqual(await shown({ truncated: true }), [true, undefined, undefined], 'retention took only what came before the range');
-  assert.deepEqual(await shown({ truncated: true, gaps: [{ type: 'gap', seq: 5, from: 4, to: 5 }] as never }), [true, undefined, true], 'a hole within');
-  assert.deepEqual(await shown({ truncated: true, older: true, cut: true }), [true, true, undefined], 'a byte cap cut the start');
-  // A hole the cap's page still holds is lost, though the cap's cut is what `truncated` says.
-  assert.deepEqual(await shown({ truncated: true, older: true, cut: true, gaps: [{ type: 'gap', seq: 5, from: 4, to: 5 }] as never }), [true, true, true], 'a cap and a hole');
+  assert.deepEqual(await shown({ truncated: true }), [true, undefined, undefined, undefined], 'retention took only what came before the range');
+  assert.deepEqual(await shown({ truncated: true, gaps: [{ type: 'gap', seq: 5, from: 4, to: 5 }] as never }), [true, undefined, undefined, true], 'a hole within');
+  assert.deepEqual(await shown({ truncated: true, older: true, cut: true }), [true, true, undefined, undefined], 'a byte cap cut the start');
+  // A hole the cap's page still holds is gone, though the cap's cut is what `truncated` says.
+  assert.deepEqual(await shown({ truncated: true, older: true, cut: true, gaps: [{ type: 'gap', seq: 5, from: 4, to: 5 }] as never }), [true, true, undefined, true], 'a cap and a hole');
 });
 
 test('a head kept to maxLines counts what it dropped as omitted: the lines fed in the batch where the limit falls, the whole rest of a range that fits on the screen, and a share of what made lines with no line end', async () => {
@@ -1098,10 +1101,10 @@ test('a live Run’s text tells rows its projection lost apart from what a cut o
     const read = (truncated: boolean) => () => ({ events: [out(1, region), out(5, 'X\r\n')], from: 1, to: 5, truncated, ...(truncated ? { cut: true as const } : {}), gaps: [gap] });
     h.session.runOutput = read(false);
     const lost = await h.session.runTranscript(a.run.runId);
-    assert.deepEqual([lost.truncated, lost.omitted, lost.lost], [true, undefined, true], `rows lost, nothing omitted: ${JSON.stringify(lost)}`);
+    assert.deepEqual([lost.truncated, lost.omitted, lost.lost, lost.gone], [true, undefined, true, true], `rows lost and the hole gone, nothing omitted: ${JSON.stringify(lost)}`);
     h.session.runOutput = read(true);
     const both = await h.session.runTranscript(a.run.runId);
-    assert.deepEqual([both.truncated, both.omitted, both.lost], [true, true, true], `a range cut short as well: ${JSON.stringify(both)}`);
+    assert.deepEqual([both.truncated, both.omitted, both.lost, both.gone], [true, true, true, true], `a range cut short as well: ${JSON.stringify(both)}`);
   } finally {
     await h.session.close();
   }

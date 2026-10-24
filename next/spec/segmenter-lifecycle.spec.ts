@@ -13,9 +13,11 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { Journal } from '../src/core/journal.js';
+import type { RunOutput } from '../src/core/runindex.js';
 import { FileStore, MemoryStore } from '../src/core/stores.js';
 import {
   columnIndex,
+  journalRunText,
   journalSource,
   liveSource,
   promptLine,
@@ -492,15 +494,38 @@ test('a long output cut to its tail keeps a torn line that is most of the budget
   endRun(src, 'json');
   await until(() => out.length === 1, 5000, 'the completion');
   assert.match(out[0]!.body ?? '', /omitted[^\n]*\n…v+"}\n$/);
-  // Rows the projection lost are in no read: the message says so, and no earlier output was omitted (the house's
-  // review of 4860d4c..bc4bc85, PR #22, I73).
+  // Rows the projection lost are in no text of the Run's whole output: the message says they may have been, and that a
+  // raw read has them, and no earlier output was omitted (the house's review of 4860d4c..bc4bc85, PR #22, I73; of
+  // bc4bc85..5d8ce0e, I15, I86).
   src.runTranscript = async () => ({ text: 'r5\nr6\nX', truncated: true, lost: true, seq: [1, 2], nextCursor: 2 });
   out.length = 0;
   startRun(src, 'lost');
   endRun(src, 'lost');
   await until(() => out.length === 1, 5000, 'the completion');
-  assert.match(out[0]!.body ?? '', /^\[… some of this output may be missing, gone from the journal or lost as it was rendered, and no read shows it\]\nr5\nr6\nX$/);
+  assert.match(out[0]!.body ?? '', /^\[… some rows of this output may have been lost as it was rendered · read session=s1 runId=lost as=raw for all of it\]\nr5\nr6\nX$/);
   assert.equal(out[0]!.metadata.truncated, true);
+  // Output the journal no longer has is in no read: its own note, apart from the rows a raw read has (the house's
+  // review of bc4bc85..5d8ce0e, PR #22, I14, I15). Retention took the start of this one.
+  src.runTranscript = async () => ({ text: 'b', truncated: true, gone: true, seq: [1, 2], nextCursor: 2 });
+  out.length = 0;
+  startRun(src, 'gone');
+  endRun(src, 'gone');
+  await until(() => out.length === 1, 5000, 'the completion');
+  assert.match(out[0]!.body ?? '', /^\[… some of this output is gone from the journal, and no read shows it\]\nb$/);
+  // A hole whose line end scrolls a region: the hole is gone, and the rows it scrolled out are lost, each said once, as
+  // history's text reads them.
+  const region = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6';
+  const output = (data: string, seq: number) => ({ type: 'output' as const, seq, ts: 0, runId: 'both', stream: 'pty' as const, data });
+  const holed = { events: [output(region, 1), output('X\r\n', 5)], gaps: [{ from: 2, to: 4 }], from: 1, to: 5, truncated: false } as unknown as RunOutput;
+  src.runTranscript = () => journalRunText(holed, { cols: 20, rows: 10 });
+  out.length = 0;
+  startRun(src, 'both');
+  endRun(src, 'both');
+  await until(() => out.length === 1, 5000, 'the completion');
+  assert.match(
+    out[0]!.body ?? '',
+    /^\[… some of this output is gone from the journal, and no read shows it\]\n\[… some rows of this output may have been lost as it was rendered · read session=s1 runId=both as=raw for all of it\]\ntop1\ntop2\n/,
+  );
   seg.dispose();
 });
 
