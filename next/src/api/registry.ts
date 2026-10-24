@@ -28,7 +28,7 @@ import { err, TermError } from '../core/errors.js';
 import { Journal, reservationHonoured, type JournalOptions } from '../core/journal.js';
 import { acquireDataDirLock, groupAlive, listProcesses, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
 import { RunIndex, type RunOutput, type RunOutputRange } from '../core/runindex.js';
-import { Session, assertPrivateSessionDir, type SessionOptions } from '../core/session.js';
+import { Session, assertPrivateSessionDir, assertTypedCommandDir, type SessionOptions } from '../core/session.js';
 import { FileStore, FreeSpaceFloor, MemoryStore, syncDir, type DiskFloor, type DurableWrite, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
 import { DEFAULT_GEOMETRY, SYSTEM, type ControlPolicy, type Cursors, type JournalEvent, type Principal, type RunInfo, type Seq, type Visibility } from '../core/types.js';
 import { prepareIntegration } from '../shell/integration.js';
@@ -1691,6 +1691,7 @@ function writeMeta(dir: string, meta: Meta): DurableWrite {
 /** A session's shell-side files: command files and the shell's own history (0700). */
 function shellDir(dir: string): string {
   const d = path.join(dir, 'shell');
+  assertTypedCommandDir(d);
   fs.mkdirSync(d, { recursive: true, mode: 0o700 });
   assertPrivateSessionDir(d);
   return d;

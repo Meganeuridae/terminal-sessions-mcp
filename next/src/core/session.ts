@@ -425,6 +425,14 @@ function declaredFlavor(name: string): 'posix' | 'fish' {
 type OutputEvent = EventOf<'output'>;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** A command path goes through a shell's interactive editor, where ASCII controls act as keys, not filename text. */
+export function assertTypedCommandDir(dir: string): void {
+  if (/[\x00-\x1f\x7f]/.test(dir)) {
+    const shown = JSON.stringify(dir).replace(/\x7f/g, '\\u007f');
+    throw err('invalid_argument', `session command directory path has a terminal control character: ${shown}. Choose a path without ASCII control characters`);
+  }
+}
+
 /** A session's command directory must be a real, owner-only directory before any shell starts. */
 export function assertPrivateSessionDir(dir: string): void {
   const st = fs.lstatSync(dir);
@@ -669,6 +677,7 @@ export class Session {
     this.lastActivity = this.createdAt;
     this.lastActivityMono = clocks.monotonic();
     if (!opts.tempDir) throw err('invalid_argument', 'Session requires a private per-session tempDir');
+    assertTypedCommandDir(opts.tempDir);
     assertPrivateSessionDir(opts.tempDir);
     this.tempDir = opts.tempDir;
     this.safeId = this.id.replace(/[^a-zA-Z0-9_-]/g, '_');

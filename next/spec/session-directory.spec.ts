@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Journal } from '../src/core/journal.js';
-import { Session } from '../src/core/session.js';
+import { Session, assertTypedCommandDir } from '../src/core/session.js';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -26,6 +26,75 @@ test('direct Session construction requires an explicit tempDir before spawning',
     /tempDir/,
   );
   assert.equal(spawned, 0, 'no directory supplied never starts the shell');
+});
+
+test('only ASCII editor-control characters are refused in a typed command path', () => {
+  for (const c of ['\x00', '\x01', '\t', '\n', '\x1f', '\x7f']) {
+    assert.throws(() => assertTypedCommandDir(`/data/${c}/shell`), (e: unknown) => {
+      assert.equal((e as { code?: string }).code, 'invalid_argument');
+      assert.ok(!/[\x00-\x1f\x7f]/.test((e as Error).message), 'the diagnostic escapes its own control characters');
+      if (c === '\x7f') assert.ok((e as Error).message.includes('\\u007f'), 'DEL is escaped even though JSON.stringify leaves it literal');
+      return true;
+    });
+  }
+  assert.doesNotThrow(() => assertTypedCommandDir("/data/it's $; ordinary ü/shell"));
+});
+
+test('a typed command path with a TAB is refused before direct Session spawn', async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-control-\t-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  let spawned = 0;
+  const backend = { spawnShell() { spawned++; throw new Error('spawn before path validation'); } } as unknown as ExecutionBackend;
+  await assert.rejects(Session.start({ id: 'control', owner: AGENT, shell: '/bin/bash', cwd: os.homedir(), backend, journal: new Journal(), tempDir }), (e: unknown) => {
+    assert.equal((e as { code?: string }).code, 'invalid_argument');
+    assert.match((e as Error).message, /terminal control/);
+    assert.ok((e as Error).message.includes('\\t'), 'the error shows TAB as escaped text');
+    assert.ok(!(e as Error).message.includes('\t'), 'the error does not type a TAB into the operator terminal');
+    return true;
+  });
+  assert.equal(spawned, 0);
+});
+
+test('a Registry refuses a TAB command path before shell spawn', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-control-\t-'));
+  const backend = fakeShellBackend(() => {}, { marks: 'rich' });
+  const reg = new SessionRegistry({ dataDir, backend, defaultShell: '/bin/bash', noUserRc: true });
+  t.after(async () => { await reg.closeAll(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  await assert.rejects(reg.create({ id: 'control', owner: AGENT }), (e: unknown) => {
+    assert.equal((e as { code?: string }).code, 'invalid_argument');
+    assert.match((e as Error).message, /terminal control/);
+    assert.ok((e as Error).message.includes('\\t'));
+    assert.ok(!(e as Error).message.includes('\t'));
+    return true;
+  });
+  assert.equal(backend.ptys.length, 0);
+});
+
+test('real Bash rejects a TAB data dir before its editor receives a source line', { skip: !hasShell('/bin/bash') }, async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-real-tab-\t-'));
+  const reg = new SessionRegistry({ dataDir, backend: new NodePtyBackend(), defaultShell: '/bin/bash', noUserRc: true });
+  t.after(async () => { await reg.closeAll(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  await assert.rejects(reg.ensure({ id: 'tab', owner: AGENT }), (e: unknown) => {
+    assert.equal((e as { code?: string }).code, 'invalid_argument');
+    assert.match((e as Error).message, /terminal control/);
+    return true;
+  });
+});
+
+test('recovery still cleans an owner-only command directory under a TAB-containing data dir', async (t) => {
+  const original = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-recovery-'));
+  const backend = fakeShellBackend(() => {}, { marks: 'rich' });
+  const first = new SessionRegistry({ dataDir: original, backend, defaultShell: '/bin/bash', noUserRc: true });
+  await first.create({ id: 'history', owner: AGENT });
+  await first.closeAll();
+  const dataDir = `${original}\t`;
+  fs.renameSync(original, dataDir);
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const leftover = path.join(dataDir, 'sessions', 'history', 'shell', 'tsm-cmd-old');
+  fs.writeFileSync(leftover, 'echo prior life\n');
+  const second = new SessionRegistry({ dataDir, backend, defaultShell: '/bin/bash', noUserRc: true });
+  t.after(() => second.closeAll());
+  assert.equal(fs.existsSync(leftover), false, 'private recovery cleanup still inspects the directory without typing it');
 });
 
 test('scripted Sessions have distinct private command directories', async () => {
