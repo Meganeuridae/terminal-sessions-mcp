@@ -21,7 +21,11 @@
  *    When `open` says a next range continues this one (a page), the blank lines
  *    the range ended with are kept (every line begun up to the cursor's row), and
  *    an unfinished last line keeps its trailing whitespace, so the pages joined
- *    read as the whole range does. The cursor's row is begun when something was
+ *    read as the whole range does, with one exception: a line the range ends
+ *    returned over (below) is a line of its own on that page, where the whole
+ *    range would have let the next text overwrite it, so a run of `\rL<n>`
+ *    overwrites cut into pages shows one line per page where the range shows
+ *    one. The cursor's row is begun when something was
  *    written on it; a row it was moved onto without a write (an erase of the
  *    display left it there, a cursor motion took it there) is no line yet. The
  *    projection says how its last line stands for the next range (`lastLine`):
