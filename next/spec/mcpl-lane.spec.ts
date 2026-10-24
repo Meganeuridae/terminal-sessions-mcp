@@ -1380,6 +1380,7 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     flush(): Promise<void>;
     startCatchUp(sessions: string[]): Promise<void>;
     catchingUp: Promise<void> | undefined;
+    catchUpRetry: { attempt: number; scope: Set<string> | 'all' } | undefined;
     mayCarry(t: Session): boolean;
     carried(t: Session, st: unknown): Set<number>;
     settleSegment(t: Session, seg: unknown, how: 'accepted' | 'not-owed'): void;
@@ -2259,18 +2260,15 @@ test("a catch-up whose scan fails retires nothing: the refused fold summary stil
     const folded = [...st().summaries.keys()];
     f.refuse.value = false;
     f.late.value = false;
-    // The next catch-up's scan fails at its first page.
-    const journal = s.journal as Journal & { pages: Journal['pages'] };
-    const pages = journal.pages.bind(journal);
-    let failures = 1;
-    journal.pages = function* (...a: Parameters<Journal['pages']>) {
-      if (failures-- > 0) throw new Error('EIO: the store could not be read');
-      yield* pages(...a);
-    } as Journal['pages'];
+    // The next catch-up's scan fails, and keeps failing until the store heals: failed once, the scan run again 500 ms
+    // later would retire the fold and move the cursor before the assertions below if the event loop stalled that long.
+    const failing = { value: true };
+    failPages(s, failing);
     await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
     await until(() => f.logs.some((l) => /catch-up failed: EIO/.test(l)), 5000, 'the catch-up failure logged');
     assert.deepEqual([...st().summaries.keys()].filter((k) => folded.includes(k)), folded, 'the fold summary still stands');
     assert.ok(s.cursorsOf(A).delivered < Math.min(...ends), `the cursor stays below the folded completions (delivered ${s.cursorsOf(A).delivered})`);
+    failing.value = false;
     await f.inside.startCatchUp(['rx']);
     await until(() => s.cursorsOf(A).delivered >= Math.max(...ends), 10_000, 'the cursor to pass every completion once a catch-up scans');
   } finally {
@@ -2327,11 +2325,15 @@ test("a catch-up retires no session's summaries until every session's scan has r
     await f.app.sessionOpen(f.caller, { id: 'rb' });
     const b = live(f.registry, 'rb');
     await f.app.run(f.caller, { session: 'rb', command: 'echo rb', target: 'process', wait: 0 });
-    onFirstPage(b);
+    // The second session's store keeps failing until healed below, so the scan run again cannot retire the first
+    // session's fold before the assertions.
+    const failing = { value: true };
+    failPages(b, failing);
     await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
     await until(() => f.logs.some((l) => /catch-up failed: EIO/.test(l)), 5000, 'the catch-up failure logged');
     assert.deepEqual([...a.st().summaries.keys()].filter((k) => a.folded.includes(k)), a.folded, "the first session's fold summary still stands");
     assert.ok(a.s.cursorsOf(A).delivered < Math.min(...a.ends), `its cursor stays below the folded completions (delivered ${a.s.cursorsOf(A).delivered})`);
+    failing.value = false;
   } finally {
     McplLane.retryMax = was;
     await f.close();
@@ -3071,6 +3073,35 @@ test("an ambient message accepted at a summary's own seq pays no debt: only a li
     f.inside.settleSegment(s, { kind: 'output', lifecycle: false, seq: x, messageId: 'ap-digest' }, 'accepted');
     assert.ok(st.owed.has(x), "the ambient message's acceptance leaves the summary's own seq owed");
     assert.ok(s.cursorsOf(A).delivered < x, 'and the summary still pins the cursor');
+  } finally {
+    await f.close();
+  }
+});
+
+test("a scan that keeps failing backs off: a catch-up of another scope succeeding meanwhile does not reset its wait", { timeout: 30_000 }, async () => {
+  // Reset by any success, a channel opened elsewhere had a session whose store kept failing scanned again at 500 ms
+  // instead of backing off towards 30 s (an independent read of the lane fixes on PR #22, comment 6376365550).
+  const f = await bareLane('backoff');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'bo' });
+    const s = live(f.registry, 'bo');
+    await f.app.sessionOpen(f.caller, { id: 'bo-other' });
+    const r = await f.app.run(f.caller, { session: 'bo', command: 'echo bo', target: 'process', wait: 0 });
+    await until(() => s.run(r.runId!).seq.end !== undefined, 5000, 'the Run to end');
+    const failing = { value: true };
+    failPages(s, failing);
+    const failures = () => f.logs.filter((l) => /catch-up failed: EIO/.test(l));
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => failures().length >= 1, 5000, 'the first scan failing');
+    assert.match(failures()[0]!, /in 500 ms/);
+    // A catch-up of the other session succeeds meanwhile: no scan of the failing one, so its backoff goes on.
+    await f.inside.startCatchUp(['bo-other']);
+    await until(() => failures().length >= 2, 5000, 'the scan run again failing');
+    assert.match(failures()[1]!, /in 1000 ms/, "the wait doubled: the other scope's success did not end the backoff");
+    failing.value = false;
+    await until(() => s.cursorsOf(A).delivered >= s.run(r.runId!).seq.end!, 15_000, 'the cursor past the completion once a scan of the session succeeds');
+    await until(() => f.inside.catchUpRetry?.attempt === 0, 5000, 'the covering scan ends the backoff');
   } finally {
     await f.close();
   }

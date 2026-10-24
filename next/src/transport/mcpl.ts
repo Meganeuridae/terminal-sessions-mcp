@@ -482,7 +482,14 @@ export class McplLane {
     }
     this.catchingUp = this.catchUpAll(scope === 'all' ? undefined : scope)
       .then(() => {
-        if (this.catchUpRetry) this.catchUpRetry.attempt = 0;
+        // Only a scan that covered the sessions awaiting one ends the backoff: reset by any success, a channel opened
+        // elsewhere had a store that kept failing scanned again at 500 ms instead of backing off (an independent read
+        // of the lane fixes on PR #22, comment 6376365550).
+        const r = this.catchUpRetry;
+        if (r && (scope === 'all' || (r.scope !== 'all' && [...r.scope].every((id) => scope.has(id))))) {
+          r.attempt = 0;
+          r.scope = new Set();
+        }
       })
       .catch((e) => this.scanAgain(scope, e as Error))
       .finally(() => {
@@ -510,9 +517,11 @@ export class McplLane {
     if (r.timer || this.disposed) return;
     r.timer = setTimeout(() => {
       r.timer = undefined;
+      // The sessions stay recorded until a scan covering them succeeds (see `startCatchUp`); none left, a covering scan
+      // came meanwhile and there is nothing to run.
       const again = r.scope;
-      r.scope = new Set();
-      if (!this.disposed) void this.startCatchUp(again === 'all' ? undefined : again);
+      if (this.disposed || (again !== 'all' && !again.size)) return;
+      void this.startCatchUp(again === 'all' ? undefined : again);
     }, wait);
     r.timer.unref?.();
   }
