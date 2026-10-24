@@ -26,10 +26,9 @@
           ["terminal:service-ready"],
           ["terminal:service-running"],
           ["terminal:recovered"],
-          ["terminal:missed"],
-          ["terminal:human-input"]
+          ["terminal:missed"]
         ],
-        "hold": [["terminal:output"], ["terminal:screen"], ["terminal:control"], ["terminal:note"]]
+        "hold": [["terminal:output"], ["terminal:screen"], ["terminal:control"], ["terminal:note"], ["terminal:human-input"]]
       },
       "reconnect": true,
       "reconnectIntervalMs": 1000

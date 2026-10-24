@@ -2,12 +2,12 @@
   "policies": [
     {
       "name": "terminal-wakes",
-      "match": { "source": "terminal", "tagsAny": ["terminal:run-finished", "terminal:run-lost", "terminal:needs-input", "terminal:watch", "terminal:session-exited", "terminal:service-*", "terminal:recovered", "terminal:missed", "terminal:human-input"] },
+      "match": { "source": "terminal", "tagsAny": ["terminal:run-finished", "terminal:run-lost", "terminal:needs-input", "terminal:watch", "terminal:session-exited", "terminal:service-*", "terminal:recovered", "terminal:missed"] },
       "behavior": "always"
     },
     {
       "name": "terminal-ambient",
-      "match": { "source": "terminal", "tagsAny": ["terminal:output", "terminal:screen", "terminal:control"] },
+      "match": { "source": "terminal", "tagsAny": ["terminal:output", "terminal:screen", "terminal:control", "terminal:human-input"] },
       "behavior": { "debounce": 30000 }
     }
   ]

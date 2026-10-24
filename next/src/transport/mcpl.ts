@@ -101,8 +101,11 @@ const TAG_ONTOLOGY = {
   },
   suggestedTreatment: [
     { tagsAny: ['terminal:needs-input', 'terminal:watch', 'terminal:session-exited', 'terminal:recovered', 'terminal:service-unhealthy', 'terminal:service-exited', 'terminal:service-lost'], behavior: 'immediate' },
-    { tagsAny: ['terminal:run-finished', 'terminal:run-lost', 'terminal:service-ready', 'terminal:service-running', 'terminal:human-input', 'terminal:missed'], behavior: 'immediate' },
-    { tagsAny: ['terminal:output', 'terminal:screen', 'terminal:control', 'terminal:note'], behavior: 'throttle' },
+    { tagsAny: ['terminal:run-finished', 'terminal:run-lost', 'terminal:service-ready', 'terminal:service-running', 'terminal:missed'], behavior: 'immediate' },
+    // A person's typed line is held like ordinary output, not a wake: an agent sharing a terminal with someone in a
+    // long interactive session would otherwise run inference on every line (Aster's call, 2026-10-24). A host that
+    // wants it as a wake can key on `chat:from-human`, which the same message carries.
+    { tagsAny: ['terminal:output', 'terminal:screen', 'terminal:control', 'terminal:note', 'terminal:human-input'], behavior: 'throttle' },
   ],
   open: true,
 };

@@ -43,8 +43,8 @@ Then connect a host (configurations in [`next/config/`](config/)):
 - **Claude Code with `mcpl-cc-bridge`**: add the `terminal` entry from
   `next/config/mcpl-bridge.json` to your bridge config, and allow
   `mcp__plugin_mcpl-bridge_mcpl__terminal__*`. Completions, questions, watch firings, service
-  changes, recoveries after a daemon restart, missed-message summaries and a person typing into
-  the session wake it; progress is held.
+  changes, recoveries after a daemon restart and missed-message summaries wake the session;
+  progress, and a person typing into the session, are held.
 - **agent-framework**: the `mcplServers` entry from `next/config/agent-framework.recipe.json` and
   the gate policies from `next/config/agent-framework.gate.json`.
 - **Any MCP host** (Cursor, Claude Desktop, Claude Code without the bridge):

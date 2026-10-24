@@ -882,9 +882,15 @@ and hosts match them with globs; bare tags name distinct event classes
   { "tagsAny": ["terminal:needs-input", "terminal:watch", "terminal:session-exited", "terminal:recovered",
                 "terminal:service-unhealthy", "terminal:service-exited", "terminal:service-lost"], "behavior": "immediate" },
   { "tagsAny": ["terminal:run-finished", "terminal:run-lost", "terminal:service-ready", "terminal:service-running",
-                "terminal:human-input", "terminal:missed"], "behavior": "immediate" },
-  { "tagsAny": ["terminal:output", "terminal:screen", "terminal:control", "terminal:note"], "behavior": "throttle" } ]
+                "terminal:missed"], "behavior": "immediate" },
+  { "tagsAny": ["terminal:output", "terminal:screen", "terminal:control", "terminal:note", "terminal:human-input"],
+    "behavior": "throttle" } ]
 ```
+
+A person's typed line (`terminal:human-input`) is held like ordinary output, not a wake: an agent
+sharing a terminal with someone in a long interactive session would otherwise run inference on
+every line. A host that wants to be woken by it can key on `chat:from-human`, which the same
+message carries.
 
 The five service classes are the statuses a Service reports after `starting` (§10.2):
 `ready`, `running`, `unhealthy`, `exited`, `lost`; the shipped bridge configuration wakes on

@@ -259,12 +259,13 @@ test('the bridge entry and the gate wake on what the README promises and the ser
   }
   const treated = (behavior: string) => ontology.suggestedTreatment.filter((t) => t.behavior === behavior).flatMap((t) => t.tagsAny);
   // Everything the server marks immediate wakes a bridged session: completions, lost Runs, needs-input, session exits,
-  // watch firings, service changes, recoveries, missed-message summaries and a person's typing. The shipped lists once
-  // named only what the README promised, and the three tags added to the ontology later never reached them (the
-  // house's question, PR #22 comment 6376365550).
+  // watch firings, service changes, recoveries and missed-message summaries. The shipped lists once named only what the
+  // README promised, and tags added to the ontology later never reached them (the house's question, PR #22 comment
+  // 6376365550). A person's typed line is held like ordinary output, by the same rule in the server and both lists.
   const promised = treated('immediate');
   assert.ok(promised.includes('terminal:service-lost') && promised.includes('terminal:service-running'), 'the server marks every service change immediate');
-  assert.ok(promised.includes('terminal:recovered') && promised.includes('terminal:missed') && promised.includes('terminal:human-input'), 'the server marks recoveries, missed summaries and human input immediate');
+  assert.ok(promised.includes('terminal:recovered') && promised.includes('terminal:missed'), 'the server marks recoveries and missed summaries immediate');
+  assert.ok(treated('throttle').includes('terminal:human-input'), "a person's typed line is held, not a wake");
   const ambient = treated('throttle');
   const { wake } = bridgeEntry();
   const wakes = wake.wake.flat();
