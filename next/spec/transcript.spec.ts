@@ -1064,6 +1064,33 @@ test('a cursor the program moves by rows meets the terminal’s where a margin s
   assert.deepEqual(await read([short, { hole: true }, '\x1b[3e\x1b[4AA\r\nB\r\nC\r\n']), [true, true], 'a row pending: past the margin and back');
 });
 
+test('a row a Run’s line end begins is the projection’s alone at once, and a scroll of the same batch takes it as such (the house’s review of bc4bc85..5d8ce0e, PR #22, I63)', async () => {
+  // From an empty row of the region, a Run's first line end begins a row without scrolling; its later line ends scroll
+  // the region, and from the fifth line on, the row the first one began is taken in the same batch. Owed only once the
+  // batch ended, it was read as the terminal's row, and a loss was reported where the terminal shows nothing the
+  // projection lacks.
+  const read = async (chunks: ProjectChunk[]) => {
+    const p = await project(chunks, { cols: 20, rows: 10 });
+    return [p.text.split('\n'), p.truncated, p.lost];
+  };
+  const pty = (data: string): ProjectChunk => ({ data, stream: 'pty' });
+  const run = (data: string): ProjectChunk => ({ data, stream: 'stdout', runId: 'r1' });
+  const start = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\n';
+  const tail = 'X\r\nY\r\nZ\r\nW\r\nV\r\nU\r\n';
+  const alone = [['top1', 'top2', 'W', 'V', 'U'], false, undefined];
+  assert.deepEqual(await read([pty(`${start}${tail}`)]), alone, 'the terminal alone');
+  for (let k = 3; k <= 8; k++) {
+    const lines = Array.from({ length: k }, (_, i) => `L${i + 1}\n`).join('');
+    assert.deepEqual(await read([pty(start), run(lines), pty(tail)]), alone, `${k} lines, then the program's`);
+  }
+  // Without the program's lines the terminal still shows `r3` and `r4`, which the Run's scrolls took: lost.
+  assert.deepEqual((await read([pty(start), run('L1\nL2\nL3\nL4\nL5\nL6\n')])).slice(1), [true, true], 'r3 and r4 lacking');
+  // A Run that sets the same margins partway owns them from then on, and the rows it writes after that are its
+  // terminal's: the pty's lines, scrolling them out of the region, take rows the Run's terminal still shows.
+  const owning = Array.from({ length: 7 }, (_, i) => `M${i + 1}\n`).join('');
+  assert.deepEqual((await read([pty(start), run(`L1\n\x1b[3;6r${owning}`), pty(tail)])).slice(1), [true, true], 'a Run that took the margins partway');
+});
+
 test('a blank row the program writes on goes as a row with text: a Run’s line on it, then the program’s own over it (the house’s review of bc4bc85..5d8ce0e, PR #22, I38)', async () => {
   // A Run's line on the empty row the program's line end left marks that row blank: the terminal's is empty, so its
   // going says nothing. The program then set its cursor onto it and wrote its own line, on both screens, and a Run's
@@ -1123,7 +1150,11 @@ test('margins the replayed state set have no known owner: no source’s scroll o
   assert.deepEqual(await read([run('l1\n'), pty('\x1b[5;1Ha5\r\na6\r\na7\r\n'), run('l2\nl3\n')], '\x1b[5;8r'), [['a7', 'l2', 'l3'], false, undefined], 'r1 scrolls a5 and a6: nobody’s margins');
   assert.deepEqual(await read([run('l1\n'), pty('\x1b[5;8r\x1b[5;1Ha5\r\na6\r\na7\r\n'), run('l2\nl3\n')]), [['a7', 'l2', 'l3'], true, true], 'the pty’s margins: another source took its rows');
   assert.deepEqual(await read([run('l1\n'), pty('\x1b[5;1Ha5\r\na6\r\na7\r\na8\r\na9\r\n')], '\x1b[5;8r'), [['a7', 'a8', 'a9'], false, undefined], 'the pty scrolls past a7: nobody’s margins');
-  assert.deepEqual(await read([run('\x1b[5;8rl1\n'), pty('\x1b[5;1Ha5\r\na6\r\na7\r\na8\r\na9\r\n')]), [['a7', 'a8', 'a9'], true, true], 'r1’s margins: the pty took their rows');
+  // r1's margins, and the pty's lines in their region: those rows are the projection's alone, r1 having written none
+  // there, so the pty's scrolls take nothing r1 showed. This said lost while a batch's rows were owed only once it ended
+  // (the house's review of bc4bc85..5d8ce0e, PR #22, I63).
+  assert.deepEqual(await read([run('\x1b[5;8rl1\n'), pty('\x1b[5;1Ha5\r\na6\r\na7\r\na8\r\na9\r\n')]), [['a7', 'a8', 'a9'], false, undefined], 'r1’s margins: the pty’s rows are its own');
+  assert.deepEqual(await read([run('\x1b[5;8rl1\n')]), [['l1'], false, undefined], 'r1 alone');
   // The projection's own line end still takes a row the terminal keeps.
   assert.deepEqual(await read([pty('\x1b[5;1Ha5\r\na6\r\na7\r\na8'), { hole: true }, pty('X\r\n')], '\x1b[5;8r'), [['a7', 'a8', 'X'], true, true], 'a hole’s line end');
 });

@@ -416,6 +416,21 @@ class Projector {
    * them too, one for each row the program itself scrolls out (regionScroll).
    */
   private ahead: boolean[] = [];
+  /**
+   * The row below the one the last batch not the program's began on (feedBatch), or undefined after the program's own.
+   * A scroll in a region not from row 1 owes the rows from there to the bottom margin (`owed`, the projection's alone)
+   * before it reads the row it takes: those the batch's line ends began, as feedBatch would owe once the batch ended,
+   * and below them nothing, since a batch begins below every row with text (freshLine). Owed only then, a Run's lines
+   * from an empty row of the region that scrolled out a row its own line end had begun read it as the terminal's, and
+   * a loss was reported where nothing went (the house's review of bc4bc85..5d8ce0e, PR #22, I63). The row isn't moved
+   * up with the scrolls: after a batch's first scroll, the rows it owed stay owed as they move, and each new bottom row
+   * is owed as it comes, so the rows from there down are the batch's own or empty. Until the next batch sets it again,
+   * only the boundaries' line ends can scroll, and what they take from there down is the same. A batch that sets the
+   * margins partway becomes their owner, and the rows it begins after that are its terminal's, so a DECSTBM clears it
+   * (onMargins): kept, a Run that took the margins partway and wrote seven lines in their region had them scrolled out
+   * by the pty's lines after it, which no longer owned the margins, and the loss went unreported.
+   */
+  private batchFrom: number | undefined;
   /** Scrolls of a region not from row 1 so far (feedBatch counts the ones a batch makes). */
   private scrolls = 0;
   /** Bumped by settle: a batch fed across one adds nothing (feedBatch). */
@@ -486,6 +501,8 @@ class Projector {
     let bottom = params.length < 2 ? 0 : num(params[1]);
     if (bottom === 0 || bottom > this.rows) bottom = this.rows;
     if (bottom <= top) return false;
+    // Its source owns the margins from here on, so the rows a batch of its begins after this are its terminal's.
+    this.batchFrom = undefined;
     const now = this.margins();
     if (top - 1 !== now.top || bottom - 1 !== now.bottom) this.settle();
     else {
@@ -559,6 +576,7 @@ class Projector {
   private regionScroll(top: number, bottom: number): void {
     this.scrolls++;
     const others = this.others;
+    if (this.batchFrom !== undefined) for (let r = Math.max(top, this.batchFrom); r <= bottom; r++) this.owed.add(r);
     if (!this.owed.delete(top)) {
       const left = this.blank.get(top);
       const blank = this.blank.delete(top);
@@ -656,6 +674,7 @@ class Projector {
     const b = this.term.buffer.active;
     const before = this.others && b.type === 'normal' ? { y: b.cursorY, scrolls: this.scrolls, generation: this.generation, ...this.margins() } : undefined;
     if (before && before.top > 0 && before.y >= before.top && before.y <= before.bottom && b.cursorX === 0 && !this.owed.has(before.y) && rowText(b, before.y) === '') this.blank.set(before.y, undefined);
+    this.batchFrom = before && before.top > 0 && before.y <= before.bottom ? before.y + 1 : undefined;
     await this.feed(data);
     // What this batch left on the blank row it began (`blank`).
     for (const [r, left] of this.blank) if (left === undefined) this.blank.set(r, rowText(this.term.buffer.normal, r));
