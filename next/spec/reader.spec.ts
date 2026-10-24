@@ -2065,3 +2065,17 @@ test("a page cut at one source's line end never leaves another source's control 
   assert.doesNotMatch(text, /1mRED|\[3/, shown);
   assert.match(text, /RED/, shown);
 });
+
+test("a page MAX_SCAN stopped on a carriage return, every event it collected taken, says its line doesn't go on (the house's review of bc4bc85..5d8ce0e, PR #22, I40)", async () => {
+  // A CR delivered on its own, 20,000 events in: more follows, so text, not a LF, comes next, and writes over the line.
+  const src = source();
+  for (let i = 0; i < 10001; i++) {
+    out(src.journal, `p${i % 10}`);
+    out(src.journal, '\r');
+  }
+  out(src.journal, 'Z');
+  const { text, pages } = await readAll(src, { since: 0, maxBytes: 1024 * 1024 });
+  assert.equal(pages.length, 2);
+  assert.equal(pages[0]!.splitLine, undefined);
+  assert.equal(text, 'p9\nZ0');
+});

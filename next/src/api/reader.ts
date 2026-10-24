@@ -678,7 +678,10 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // The next page goes on with this page's last line when the page's own projection ends with the cursor on that line
   // past its start, and output may follow (the module comment). A line a CR returned the cursor over is written over
   // by the text that follows, which the pages show as a line of its own; when nothing follows yet, the LF of a CRLF may.
-  const goesOn = p.lastLine === 'unfinished' || (p.lastLine === 'returned' && allTaken);
+  // Nothing follows yet only where the page took every event the range holds so far: a scan cut short leaves events
+  // after the page, and a page MAX_SCAN stopped, which took all it collected, ended `p9`, then joined the next page's `Z0`
+  // (the house's review of bc4bc85..5d8ce0e, PR #22, I40).
+  const goesOn = p.lastLine === 'unfinished' || (p.lastLine === 'returned' && allTaken && exhausted);
   if (goesOn && (more || open)) r.splitLine = true;
   return withGapInfo(r, metHoles(journal, r.seq[0], r.seq[1], chosen.gaps));
 }
