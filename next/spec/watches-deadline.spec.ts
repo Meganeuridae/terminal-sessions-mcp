@@ -567,6 +567,9 @@ test("a live Run's silence isn't aged from its newest retained output when a hol
   // The Run printed before this manager existed. Its newest retained output is a minute old; aged from it, a 30 s
   // silence answered at once, though the hole after it may have held output from a moment ago.
   const f = bare();
+  const mono = clocks.monotonic;
+  let shift = 0;
+  t.mock.method(clocks, 'monotonic', () => mono() + shift);
   try {
     f.startRun('h');
     const early = f.out('early\n', 'h').seq;
@@ -586,6 +589,13 @@ test("a live Run's silence isn't aged from its newest retained output when a hol
       hole = true;
       const cut = await later.waitFor({ silenceMs: 30_000, runId: 'h' }, 300);
       assert.equal(cut.matched, false, `with a hole after it, the quiet known is since the manager began: ${JSON.stringify(cut)}`);
+      // And it is that: once the manager has run past the silence, the wait answers at once, with the manager's age and
+      // no output to name. Judged only by the miss above, a wait that never armed passed too (the house's read of
+      // bc4bc85..5d8ce0e, #22).
+      shift = 40_000;
+      const since = await later.waitFor({ silenceMs: 30_000, runId: 'h' }, 300);
+      assert.ok(since.matched && Number(/(\d+)ms$/.exec(String(since.match))?.[1]) >= 40_000, JSON.stringify(since));
+      assert.equal(since.seq, undefined, JSON.stringify(since));
     } finally {
       later.dispose();
     }
