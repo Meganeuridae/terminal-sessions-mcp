@@ -190,9 +190,16 @@ try {
   fs.writeFileSync(released, '');
 
   await check('a useful completion notification through the host, and the inference call it woke', async () => {
+    // The poll looks for the completion as well as the output text, so the recount below counts from the poll's first
+    // sight of it: sampled once after the loop, a completion that showed after the text left the recount no window and
+    // its log saying none had shown (the house's review of bc4bc85..5d8ce0e, PR #22).
     const until = now() + 8000;
-    while (!context().includes('acceptance-output') && now() < until) await sleep(100);
-    if (completionMessages(runId).length) firstCompletionAt = now();
+    const sighted = () => {
+      if (firstCompletionAt === undefined && completionMessages(runId).length) firstCompletionAt = now();
+      return firstCompletionAt !== undefined;
+    };
+    while (!(sighted() && context().includes('acceptance-output')) && now() < until) await sleep(100);
+    sighted();
     const ctx = context();
     assert.ok(ctx.includes(`${SESSION}: \`${COMMAND}\` → exit 0`), `agent context:\n${ctx.slice(-800)}`);
     assert.match(ctx, /acceptance-output/);
@@ -278,7 +285,7 @@ try {
     // house's read of 4860d4c..bc4bc85, #22).
     const sinceFirst = firstCompletionAt === undefined ? undefined : now() - firstCompletionAt;
     if (firstCompletionAt !== undefined) await sleep(Math.max(0, firstCompletionAt + 2000 - now()));
-    log(`   the recount: ${sinceFirst === undefined ? 'no completion had shown' : `the check reached it ${Math.round(sinceFirst)} ms after its poll first saw the completion${sinceFirst < 2000 ? ', and waited to two seconds' : ''}`}`);
+    log(`   the recount: ${sinceFirst === undefined ? 'no completion showed within the poll' : `the check reached it ${Math.round(sinceFirst)} ms after its poll first saw the completion${sinceFirst < 2000 ? ', and waited to two seconds' : ''}`}`);
     assert.equal(completionMessages(runId).length, 1, "the Run's completion messages two seconds after the check first saw one");
   });
 
