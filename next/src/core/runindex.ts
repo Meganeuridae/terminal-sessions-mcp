@@ -6,6 +6,7 @@
  * session, a closed one, and the previous lives of a reused name, whose runIds
  * stay valid because the journal is continuous.
  */
+import { clocks } from './clock.js';
 import { err } from './errors.js';
 import type { Journal } from './journal.js';
 import { lineBytes } from './stores.js';
@@ -251,6 +252,7 @@ const terminal = (s: RunInfo['state']) => s === 'exited' || s === 'cancelled' ||
 /** Events per page when a Run's output is read in pieces. */
 const OUTPUT_PAGE = 512;
 const copy = (r: RunInfo): RunInfo => ({ ...r, seq: { ...r.seq } });
+const keyedIdentity = (idem: string | undefined): string | undefined => /^([a-f0-9]{24}):/.exec(idem ?? '')?.[1];
 /**
  * Runs remembered at most, a bound on the index's memory (10,000 Runs cost about 450 MiB
  * unbounded, core 3 of the house's review of #11); beyond it the oldest ended Runs are
@@ -265,6 +267,10 @@ const MAX_GAPS = 10_000;
 
 export class RunIndex {
   private readonly runs = new Map<string, RunInfo>();
+  /** One lookup per retained keyed Run identity, released with its Run. */
+  private readonly keyed = new Map<string, RunInfo>();
+  /** Only this daemon life's keyed Runs get a monotonic stamp; weak keys do not keep evicted Runs alive. */
+  private readonly admittedMono = new WeakMap<RunInfo, number>();
   private readonly openIds = new Set<string>();
   /** The journal's gap events, in seq order: a Run's reads ask for those over its range, wherever each sits (see `gapsWithin`). */
   private readonly gaps: GapEvent[] = [];
@@ -277,6 +283,25 @@ export class RunIndex {
 
   /** `sessionId` is stamped on every RunInfo. */
   constructor(readonly sessionId: string) {}
+
+  /** Keep a keyed Run's admission clock while its journal index entry survives Session pruning. */
+  stampAdmission(runId: string, mono: number): void {
+    const r = this.runs.get(runId);
+    if (r) this.admittedMono.set(r, mono);
+  }
+
+  /** Same-life age; absent after an index eviction or a daemon restart. */
+  admissionAgeMs(runId: string): number | undefined {
+    const r = this.runs.get(runId);
+    const mono = r ? this.admittedMono.get(r) : undefined;
+    return mono === undefined ? undefined : clocks.monotonic() - mono;
+  }
+
+  /** The newest retained admission with this principal-and-key identity, independent of Session pruning. */
+  byKeyIdentity(identity: string): RunInfo | undefined {
+    const r = this.keyed.get(identity);
+    return r ? copy(r) : undefined;
+  }
 
   /**
    * Feed the index from what a store retains, in one streaming pass: run lifecycle events, gaps, and the
@@ -469,11 +494,16 @@ export class RunIndex {
 
   private add(r: RunInfo): RunInfo {
     this.runs.set(r.runId, r);
+    const key = keyedIdentity(r.idem);
+    if (key) this.keyed.set(key, r);
     if (!terminal(r.state)) this.openIds.add(r.runId);
     if (this.runs.size > MAX_RUNS) {
       for (const [id, old] of this.runs) {
         if (this.runs.size <= MAX_RUNS) break;
-        if (terminal(old.state)) this.runs.delete(id);
+        if (!terminal(old.state)) continue;
+        this.runs.delete(id);
+        const oldKey = keyedIdentity(old.idem);
+        if (oldKey && this.keyed.get(oldKey) === old) this.keyed.delete(oldKey);
       }
     }
     return r;

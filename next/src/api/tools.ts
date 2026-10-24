@@ -50,10 +50,10 @@ const idempotencyKey = {
   type: 'string',
   minLength: 1,
   description:
-    'Optional; use a fresh unique value (a UUID) per operation. Retrying the same call with the same key within 15 minutes returns the first ' +
-    'call’s outcome instead of doing it again (for run and start: the same Run, awaited again — also after a daemon restart); the daemon keeps ' +
-    'the newest 1,024 keys per caller and 16,384 in all, so under that load a key can be forgotten sooner. A key reused with other arguments is ' +
-    'refused. A `busy` outcome (nothing ran) is not remembered, so its retry can run — except `busy: declared-shell-ended`, which the retry gets ' +
+    'Optional; use a fresh unique value (a UUID) per operation. An ordinary call retried with its retained key within 15 minutes returns the first ' +
+    'outcome instead of running again. A run or start re-awaits the same Run while its journal admission remains indexed; its state may have changed, including after a daemon restart. ' +
+    'The in-memory cache keeps the newest 1,024 keys per caller and 16,384 in all, so other keys may be forgotten sooner. A key reused for another tool or with other arguments is refused while its identity remains retained. ' +
+    'A `busy` outcome (nothing ran) is not remembered, so its retry can run — except `busy: declared-shell-ended`, which the retry gets ' +
     'again: use a new key once you mean the session’s own shell.',
 } as const satisfies Schema;
 const fmt = (ms: number) => (ms >= 60_000 ? `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s` : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`);
@@ -618,7 +618,7 @@ export const TOOLS: ToolDef[] = [
       if (o.since === undefined && o.tail === undefined && o.runId === undefined) o.tail = 50;
       const r = await ctx.app.read(ctx.caller, o);
       const res = renderRead(r, ctx.resultText, o);
-      // The read cursor advances only once this result reaches the caller (G22; the house's read of 1cabc6a, #22).
+      // The read cursor advances after a successful socket write without requiring remote receipt (G22).
       res.onSent = () => commitReadDelivery(r);
       return res;
     },
@@ -634,7 +634,7 @@ export const TOOLS: ToolDef[] = [
     async run(ctx, a) {
       const s = await ctx.app.screen(ctx.caller, { session: a.session as string });
       const structured = env(s);
-      // The read cursor advances only once this result reaches the caller (G22; the house's read of 1cabc6a, #22).
+      // The read cursor advances after a successful socket write without requiring remote receipt (G22).
       const onSent = () => commitReadDelivery(s);
       if (ctx.resultText === 'json') return { text: JSON.stringify(s, null, 2), structured, onSent };
       const status = `[screen ${a.session as string} ${s.cols}x${s.rows}${s.alt ? ' · full-screen program' : ''} · cursor ${s.cursor.x},${s.cursor.y} · seq ${s.seq}${s.title ? ` · title "${s.title}"` : ''}${s.droppedUnits ? ` · approximate: ${s.droppedUnits} output units dropped under backlog` : ''}]`;

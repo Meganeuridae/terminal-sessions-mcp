@@ -284,10 +284,33 @@ test('78c4d6e 7 and 8: launch’s start keeps another Run’s unread output unre
   // A launch in the same session: its tail shows the last lines, its own service Run starts after them.
   const launched = await callTool('launch', { name: 'lc', command: 'sleep 30' }, { app, caller: deferred, resultText: 'json' }, compat);
   assert.equal(live.session.cursorsOf(A.principal).read, 0, 'nothing committed before the write');
-  launched.onSent!();
-  assert.ok(live.session.cursorsOf(A.principal).read < firstOut, `the start’s cursor stops before the earlier Run’s unread output (${live.session.cursorsOf(A.principal).read} < ${firstOut})`);
+  launched.onSent?.();
+  assert.equal(live.session.cursorsOf(A.principal).read, 0, 'launch previews output without marking it read');
+  assert.ok(live.session.cursorsOf(A.principal).read < firstOut, 'the earlier Run remains unread');
   assert.notEqual(live.session.cursorsOf(A.principal).read, live.session.journal.lastSeq, 'not the journal end');
   await call('killSession', { session: 'lc', graceful: false });
+});
+
+test('G22: compat launch leaves omitted start output unread for direct and deferred callers', async () => {
+  const command = "for n in $(seq 1 80); do printf 'OLD-%s\\n' \"$n\"; done; echo SERVICE-READY; sleep 30";
+  const deferred: Caller = { principal: A.principal, connectionId: 'ca-ws-launch-preview', deferReadDelivery: true };
+  for (const [mode, caller] of [['direct', A], ['deferred', deferred]] as const) {
+    const s = `launch-preview-${mode}`;
+    await app.sessionOpen(A, { id: s });
+    const live = registry.get(s);
+    assert.ok(live?.kind === 'live');
+    const before = live.session.cursorsOf(A.principal).read;
+    const launched = await callTool('launch', { name: s, command, readyPatterns: ['SERVICE-READY'] }, { app, caller, resultText: 'json' }, compat);
+    assert.equal(launched.isError, undefined, `${mode}: ${launched.text}`);
+    const logs = (launched.structured as { logs: string[] }).logs;
+    assert.ok(logs.some((l) => l.includes('SERVICE-READY')), `${mode}: the latest service output is returned`);
+    assert.ok(!logs.includes('OLD-1'), `${mode}: the bounded response omitted the first start-output line`);
+    assert.equal(live.session.cursorsOf(A.principal).read, before, `${mode}: preparing the preview moves no cursor`);
+    launched.onSent?.();
+    assert.equal(live.session.cursorsOf(A.principal).read, before, `${mode}: writing the preview moves no cursor`);
+    const runId = (launched.structured as { runId: string }).runId;
+    await app.cancel(A, { session: s, runId });
+  }
 });
 
 test('78c4d6e 18: a many-page runCommand advances the deferred cursor across every page once written', async () => {

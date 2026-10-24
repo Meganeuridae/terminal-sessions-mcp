@@ -19,6 +19,7 @@ import { callTool, TOOLS, type ResultText, type ToolResult } from '../src/api/to
 import { validate } from '../src/api/validate.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { until } from './testhost.js';
+import { fakeShellBackend } from './fake-shell.js';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-the App read of 1cabc6a-'));
 let registry: SessionRegistry;
@@ -244,9 +245,10 @@ test('a Run of an earlier life, awaited on the new life, moves the read cursor b
   assert.equal(again.state, 'exited');
   assert.match(again.output.text, /three/);
   assert.equal(life2.session.cursorsOf(A.principal).read, cursor, 'r2’s output is still unread: the earlier life’s Run did not move the cursor past it');
-  // Reading r2 itself does: nothing unread lies before its end any more.
+  // Reading r2 bridges to r3, whose result was already delivered before this same-daemon reopen.
   const rd = await app.read(A, { session: s, runId: r2.runId });
-  assert.equal(life2.session.cursorsOf(A.principal).read, rd.nextCursor);
+  assert.ok(rd.nextCursor < r3.output.nextCursor, 'r3’s already-delivered output is above r2');
+  assert.equal(life2.session.cursorsOf(A.principal).read, r3.output.nextCursor);
 });
 
 test('a read whose result is never delivered leaves the read cursor where it was (G22): the advance waits for the write', async () => {
@@ -292,8 +294,93 @@ test('78c4d6e 6: two deferred results outstanding at once leave the cursor at th
   assert.match(ry.text!, /Y/);
   assert.equal(live.session.cursorsOf(A.principal).read, 0, 'both staged, nothing committed yet');
   commitReadDelivery(rx);
+  assert.ok(live.session.cursorsOf(A.principal).read < ry.nextCursor, 'staging Y did not count its output as delivered');
   commitReadDelivery(ry);
   assert.equal(live.session.cursorsOf(A.principal).read, ry.nextCursor, 'after both are delivered the cursor is at Y’s end, with nothing unread between');
+});
+
+test('G22: reverse-order Run reads remember the higher delivered range until the lower gap closes', async () => {
+  const s = 'two-deferred-reverse';
+  await callTool('session_open', { session: s, visibility: 'shared' }, { app, caller: B, resultText: 'transcript' }, TOOLS);
+  const x = await app.run(B, { session: s, command: 'echo X', wait: 5000 });
+  const y = await app.run(B, { session: s, command: 'echo Y', wait: 5000 });
+  assert.equal(x.state, 'exited');
+  assert.equal(y.state, 'exited');
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-reverse', deferReadDelivery: true };
+  const rx = await app.read(deferred, { session: s, runId: x.runId! });
+  const ry = await app.read(deferred, { session: s, runId: y.runId! });
+  assert.match(rx.text!, /X/);
+  assert.match(ry.text!, /Y/);
+  commitReadDelivery(ry);
+  assert.ok(live.session.cursorsOf(A.principal).read < ry.nextCursor, 'X still blocks the scalar read cursor');
+  const other: Caller = { principal: 'agent:c@test', connectionId: 'c-ws-reverse' };
+  const otherX = await app.read(other, { session: s, runId: x.runId! });
+  assert.equal(live.session.cursorsOf(other.principal).read, otherX.nextCursor, 'another principal cannot inherit A’s pending Y delivery');
+  assert.ok(otherX.nextCursor < ry.nextCursor);
+  commitReadDelivery(rx);
+  assert.equal(live.session.cursorsOf(A.principal).read, ry.nextCursor, 'delivering X joins the earlier delivered Y without reading Y again');
+});
+
+test('G22: a remembered higher Run cannot carry read past a third, still-unread Run', async () => {
+  const s = 'three-deferred-gap';
+  await callTool('session_open', { session: s, visibility: 'shared' }, { app, caller: B, resultText: 'transcript' }, TOOLS);
+  const x = await app.run(B, { session: s, command: 'echo X', wait: 5000 });
+  const y = await app.run(B, { session: s, command: 'echo Y', wait: 5000 });
+  const z = await app.run(B, { session: s, command: 'echo Z', wait: 5000 });
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-three-gap', deferReadDelivery: true };
+  const rx = await app.read(deferred, { session: s, runId: x.runId! });
+  const ry = await app.read(deferred, { session: s, runId: y.runId! });
+  const rz = await app.read(deferred, { session: s, runId: z.runId! });
+  commitReadDelivery(rz);
+  commitReadDelivery(rx);
+  assert.ok(live.session.cursorsOf(A.principal).read < ry.nextCursor, 'unread Y still blocks the delivered Z');
+  commitReadDelivery(ry);
+  assert.equal(live.session.cursorsOf(A.principal).read, rz.nextCursor, 'Y delivery joins the earlier delivered Z');
+});
+
+test('G22: a session-level page closes an unread Run gap and joins a higher delivered Run', async () => {
+  const s = 'session-bridges-run-gap';
+  await callTool('session_open', { session: s, visibility: 'shared' }, { app, caller: B, resultText: 'transcript' }, TOOLS);
+  const x = await app.run(B, { session: s, command: 'echo X', wait: 5000 });
+  const y = await app.run(B, { session: s, command: 'echo Y-DELIVERED-ONLY', wait: 5000 });
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-session-gap', deferReadDelivery: true };
+  const ry = await app.read(deferred, { session: s, runId: y.runId! });
+  commitReadDelivery(ry);
+  assert.ok(live.session.cursorsOf(A.principal).read < ry.nextCursor);
+  const page = await app.read(deferred, { session: s, since: 0, until: x.output.nextCursor });
+  assert.match(page.text!, /(?:^|\n)X(?:\n|$)/);
+  assert.doesNotMatch(page.text!, /Y-DELIVERED-ONLY/);
+  assert.ok(page.nextCursor < ry.nextCursor);
+  commitReadDelivery(page);
+  assert.equal(live.session.cursorsOf(A.principal).read, ry.nextCursor, 'the session page bridged the gap below the earlier delivered Y');
+});
+
+test('G22: a first page of one Run leaves its remaining output unread below a higher delivered Run', async () => {
+  const s = 'partial-run-gap';
+  await callTool('session_open', { session: s, visibility: 'shared' }, { app, caller: B, resultText: 'transcript' }, TOOLS);
+  const x = await app.run(B, { session: s, command: `awk 'BEGIN { for (i = 0; i < 5000; i++) printf "X"; printf "\\nX-END\\n" }'`, wait: 5000 });
+  const y = await app.run(B, { session: s, command: 'echo Y', wait: 5000 });
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-partial-gap', deferReadDelivery: true };
+  const ry = await app.read(deferred, { session: s, runId: y.runId! });
+  commitReadDelivery(ry);
+  const first = await app.read(deferred, { session: s, runId: x.runId!, since: 0, maxBytes: 1024 });
+  assert.equal(first.more, true, 'X has output beyond this page');
+  assert.ok(first.nextCursor < ry.nextCursor);
+  commitReadDelivery(first);
+  assert.ok(live.session.cursorsOf(A.principal).read < ry.nextCursor, 'part of X is still unread');
+  const whole = await app.read(deferred, { session: s, runId: x.runId!, since: 0, maxBytes: 16384 });
+  assert.match(whole.text!, /X-END/);
+  assert.equal(whole.more, false);
+  commitReadDelivery(whole);
+  assert.equal(live.session.cursorsOf(A.principal).read, ry.nextCursor, 'all of X has now been delivered');
 });
 
 test('78c4d6e 19: the read commit does not survive into an idempotency entry’s compact copy', async () => {
@@ -317,6 +404,28 @@ test('78c4d6e 19: the read commit does not survive into an idempotency entry’s
   assert.equal(stored.output.text, '', 'it is the compact copy (no output text)');
 });
 
+test('G22/G16: a keyed Run replay carries its own deferred read commit', async () => {
+  const s = 'replay-delivery';
+  await app.sessionOpen(A, { id: s });
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-replay', deferReadDelivery: true };
+  const command = 'echo REPLAY-READ-OUTPUT';
+  const opts = { session: s, command, idempotencyKey: 'k-replay-delivery', wait: 5000 };
+  const before = live.session.cursorsOf(A.principal).read;
+  const first = await app.run(deferred, opts);
+  assert.equal(first.state, 'exited');
+  assert.equal(live.session.cursorsOf(A.principal).read, before, 'the first result has not been written');
+  const replay = await app.run(deferred, opts);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.runId, first.runId, 'the command ran only once');
+  assert.match(replay.output.text, /REPLAY-READ-OUTPUT/, 'the replay returned the Run output');
+  assert.equal(live.session.cursorsOf(A.principal).read, before, 'replaying the method does not itself count as delivery');
+  commitReadDelivery(replay);
+  assert.ok(live.session.cursorsOf(A.principal).read > before, 'the replay write advances the read cursor');
+  assert.deepEqual(Object.getOwnPropertySymbols(replay), [], 'its commit was consumed exactly once');
+});
+
 test('78c4d6e: run, await, start and screen advance a deferred caller’s read cursor only once their result is written', async () => {
   const s = 'deferred-tools';
   await callTool('session_open', { session: s }, { app, caller: A, resultText: 'transcript' }, TOOLS);
@@ -325,22 +434,27 @@ test('78c4d6e: run, await, start and screen advance a deferred caller’s read c
   const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-tools', deferReadDelivery: true };
   const cur = () => live.session.cursorsOf(A.principal).read;
 
-  const commits = async (name: string, args: Record<string, unknown>): Promise<void> => {
+  const commits = async (name: string, args: Record<string, unknown>, shown: string): Promise<void> => {
     const before = cur();
     const r = await callTool(name, args, { app, caller: deferred, resultText: 'transcript' }, TOOLS);
     assert.equal(r.isError, undefined, `${name}: ${r.text}`);
+    assert.match(r.text, new RegExp(shown), `${name}: the result returned new output`);
     assert.equal(cur(), before, `${name}: nothing committed before the write`);
     assert.equal(typeof r.onSent, 'function', `${name}: the result carries its commit`);
     r.onSent!();
-    assert.ok(cur() >= before, `${name}: the cursor advances on the write`);
+    assert.ok(cur() > before, `${name}: its new output advances the cursor after the write`);
   };
 
-  await commits('run', { session: s, command: 'echo one' });
+  await commits('run', { session: s, command: 'echo one' }, 'one');
   const two = await callTool('run', { session: s, command: 'echo two' }, { app, caller: deferred, resultText: 'transcript' }, TOOLS);
-  two.onSent!();
-  await commits('await', { runId: (two.structured as { runId: string }).runId });
-  await commits('start', { session: s, command: 'sleep 30', name: 'svc', target: 'process' });
-  await commits('screen', { session: s });
+  assert.equal(two.isError, undefined, two.text);
+  assert.equal(typeof two.onSent, 'function');
+  // The prior run response stays unwritten: await is the first result that shows its output.
+  await commits('await', { runId: (two.structured as { runId: string }).runId }, 'two');
+  await commits('start', { session: s, command: 'echo START-FRESH; sleep 30', name: 'svc', target: 'process', ready: { pattern: 'START-FRESH' }, wait: 5000 }, 'START-FRESH');
+  live.session.input('echo SCREEN-FRESH\n', { principal: A.principal });
+  await until(() => live.session.snapshot().lines.some((l) => l.includes('SCREEN-FRESH')), 5000, 'the new shell output to reach the screen');
+  await commits('screen', { session: s }, 'SCREEN-FRESH');
   const st = live.session.listRuns().find((x) => x.target === 'process');
   if (st) await app.cancel(A, { session: s, runId: st.runId });
 });
@@ -374,6 +488,91 @@ test('78c4d6e 9: a staged commit that runs after a close and reopen lands on the
   assert.ok(hist.cursorsOf(A.principal).read >= ahead, `the persisted cursor did not fall behind (${hist.cursorsOf(A.principal).read} >= ${ahead})`);
 });
 
+test('G22: deferred read commits stay with their journal after forget and name reuse', async () => {
+  const s = 'forgotten-read';
+  await app.sessionOpen(A, { id: s, visibility: 'shared' });
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-forgotten', deferReadDelivery: true };
+  const old = await app.run(deferred, { session: s, command: 'echo OLD-LINEAGE', wait: 5000 });
+  assert.ok(old.runId, 'the old Run was admitted');
+  const first = registry.get(s);
+  assert.ok(first?.kind === 'live');
+  const whole = await app.read(deferred, { session: s, since: 0 });
+  const oneRun = await app.awaitRun(deferred, { session: s, runId: old.runId });
+  assert.match(whole.text ?? '', /OLD-LINEAGE/);
+  assert.match(oneRun.output.text, /OLD-LINEAGE/);
+  assert.equal(first.session.cursorsOf(A.principal).read, 0, 'the old results still wait for transport writes');
+  const oldRuns = first.session.journal.runs;
+  await app.sessionClose(A, { session: s, forget: true });
+  await app.sessionOpen(A, { id: s });
+  const fresh = registry.get(s);
+  assert.ok(fresh?.kind === 'live');
+  assert.notEqual(fresh.session.journal.runs, oldRuns, 'forget made a new journal lineage under the same name');
+  const wanted = Math.max(whole.nextCursor, oneRun.output.nextCursor);
+  while (fresh.session.journal.lastSeq <= wanted) fresh.session.journal.append({ type: 'note', text: 'new-life event', principal: A.principal });
+  const before = fresh.session.cursorsOf(A.principal).read;
+  commitReadDelivery(whole);
+  assert.equal(fresh.session.cursorsOf(A.principal).read, before, 'the old whole-session read does not advance the new journal');
+  commitReadDelivery(oneRun);
+  assert.equal(fresh.session.cursorsOf(A.principal).read, before, 'the old Run read does not advance the new journal');
+});
+
+test('G22: screen refuses a replaced session while its snapshot is settling', async () => {
+  const s = 'screen-replaced';
+  await app.sessionOpen(A, { id: s });
+  const first = registry.get(s);
+  assert.ok(first?.kind === 'live');
+  const screen = first.session.screen;
+  const settled = screen.settled.bind(screen);
+  let entered!: () => void;
+  let release!: () => void;
+  const inside = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  screen.settled = async () => { entered(); await gate; await settled(); };
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-screen-replaced', deferReadDelivery: true };
+  const pending = app.screen(deferred, { session: s });
+  void pending.catch(() => {});
+  await inside;
+  screen.settled = settled;
+  try {
+    await app.sessionClose(A, { session: s, forget: true });
+    await app.sessionOpen(A, { id: s });
+  } finally {
+    release();
+  }
+  await assert.rejects(pending, (e: unknown) => (e as { code?: string }).code === 'session_not_found', 'the old screen does not answer for the replacement');
+});
+
+test('G22: a closed life cannot lower the reopened journal cursor book', async () => {
+  const s = 'old-life-cursors';
+  await app.sessionOpen(A, { id: s });
+  const first = registry.get(s);
+  assert.ok(first?.kind === 'live');
+  const old = first.session;
+  assert.deepEqual(old.cursorsOf(A.principal), { delivered: 0, read: 0 });
+  await app.sessionClose(A, { session: s });
+  await app.sessionOpen(A, { id: s });
+  const reopened = registry.get(s);
+  assert.ok(reopened?.kind === 'live');
+  const top = reopened.session.journal.lastSeq;
+  assert.ok(top > 1, 'the new life has journal events beyond the stale update');
+  reopened.session.markRead(A.principal, top);
+  reopened.session.markDelivered(A.principal, top);
+  type Book = { get(principal: string): { read: number; delivered: number }; flush(): void };
+  const slots = (registry as unknown as { slots: Map<string, { cursors: Book }> }).slots;
+  const book = slots.get(s)?.cursors;
+  assert.ok(book);
+  const expected = { read: top, delivered: top };
+  assert.deepEqual(book.get(A.principal), expected, 'the reopened Session advanced both persisted fields');
+  old.markDelivered(A.principal, 1);
+  assert.deepEqual(book.get(A.principal), expected, 'an old delivered update cannot lower the new read or delivered cursor');
+  old.markRead(A.principal, 1);
+  assert.deepEqual(book.get(A.principal), expected, 'an old read update cannot lower either cursor');
+  book.flush();
+  const file = path.join(dataDir, 'sessions', s, 'cursors.json');
+  const stored = (JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, { read: number; delivered: number }>)[A.principal];
+  assert.deepEqual(stored, expected, 'the journal persists both newer cursor fields');
+});
+
 test('78c4d6e 10: a service outcome marks the status event the result rendered, so a ready→unhealthy→ready flap before the write does not swallow the recovery', async () => {
   const s = 'flap';
   await app.sessionOpen(A, { id: s });
@@ -397,6 +596,34 @@ test('78c4d6e 10: a service outcome marks the status event the result rendered, 
   await app.cancel(A, { session: s, runId });
 });
 
+test('G16/G22/G28: a keyed start replay keeps its read commit and rendered service status', async () => {
+  const s = 'start-replay';
+  await app.sessionOpen(A, { id: s });
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const deferred: Caller = { principal: A.principal, connectionId: 'a-ws-start-replay', deferReadDelivery: true };
+  const opts = { session: s, name: 'start-replay-svc', target: 'process' as const, command: 'echo START-READY; sleep 30', ready: { pattern: 'START-READY' }, idempotencyKey: 'k-start-replay', wait: 5000 };
+  const before = live.session.cursorsOf(A.principal).read;
+  const first = await app.start(deferred, opts);
+  assert.equal(first.service, 'ready', JSON.stringify(first));
+  assert.ok(first.runId);
+  const replay = await app.start(deferred, opts);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.runId, first.runId, 'the service was admitted once');
+  assert.equal(replay.service, 'ready');
+  assert.match(replay.output.text, /START-READY/, 'the replay returns the service Run output');
+  assert.equal(live.session.cursorsOf(A.principal).read, before, 'neither deferred result was written');
+  const seq = app.extras(live.session).services.get(first.runId)!.info().seq;
+  assert.ok(seq !== undefined, 'ready has a journaled status event');
+  const key = serviceOutcomeKey(first.runId, 'ready', seq);
+  assert.equal(live.session.outcomeDeliveredTo(key, A.principal), false);
+  app.outcomeSent(deferred, replay);
+  assert.equal(live.session.outcomeDeliveredTo(key, A.principal), true, 'the replay marks the rendered ready event delivered');
+  commitReadDelivery(replay);
+  assert.ok(live.session.cursorsOf(A.principal).read > before, 'the replay write marks its returned output read');
+  await app.cancel(A, { session: s, runId: first.runId });
+});
+
 test('a reviewer’s read (6270045466): a read with `advance: false` stages no commit and moves no cursor, deferred or not', async () => {
   const s = 'no-advance';
   await app.sessionOpen(A, { id: s });
@@ -418,6 +645,41 @@ test('a reviewer’s read (6270045466): a read with `advance: false` stages no c
   assert.equal(live.session.cursorsOf(A.principal).read, at, 'neither read moved the cursor');
   const counted = await app.read(A, { session: s, since: 0 });
   assert.equal(live.session.cursorsOf(A.principal).read, counted.nextCursor, 'an ordinary read still does');
+});
+
+test('a pruned same-life Run retains monotonic age when a keyed retry finds it in the index', { timeout: 90_000 }, async (t) => {
+  const local = new SessionRegistry({ dataDir: path.join(dataDir, 'idem-pruned'), backend: fakeShellBackend((sh) => sh.on(/^echo /, () => ({ exit: 0 }))), defaultShell: '/bin/bash', noUserRc: true });
+  const app = new App({ registry: local, defaultWaitMs: 1000 });
+  const session = 'idem-pruned';
+  try {
+    await app.sessionOpen(A, { id: session });
+    const call = () => app.run(A, { session, command: 'echo once', wait: 1000, idempotencyKey: 'pruned-first' });
+    const first = await call();
+    assert.equal(first.state, 'exited');
+    assert.ok(first.runId, 'the first Run was admitted');
+    // 1,025 keyed Runs exceed both the Session's 1,000 ended Runs and this principal's 1,024 cached keys.
+    for (let i = 0; i < 1024; i++) {
+      const r = await app.run(A, { session, command: `echo ${i}`, wait: 1000, idempotencyKey: `pruned-next-${i}` });
+      assert.equal(r.state, 'exited', `filler ${i}`);
+    }
+    const live = local.get(session);
+    assert.ok(live?.kind === 'live');
+    assert.equal(live.session.runAgeMs(first.runId), undefined, 'the live Session pruned the first ended Run');
+    assert.ok(live.session.journal.runs.has(first.runId), 'its older Run remains in the bounded journal index');
+    const realNow = Date.now.bind(Date);
+    t.mock.method(Date, 'now', () => realNow() + 60 * 60_000);
+    await assert.rejects(() => app.run(A, { session, command: 'echo different', wait: 1000, idempotencyKey: 'pruned-first' }), /other arguments/, 'an indexed key still rejects different arguments after the cache evicts it');
+    const replayed = await call();
+    assert.equal(replayed.runId, first.runId, 'a wall-clock step cannot expire a same-life indexed Run');
+    assert.equal(replayed.replayed, true);
+    const realMono = clocks.monotonic;
+    t.mock.method(clocks, 'monotonic', () => realMono() + 16 * 60_000);
+    const expired = await call();
+    assert.notEqual(expired.runId, first.runId, 'the monotonic window still expires the key');
+  } finally {
+    t.mock.restoreAll();
+    await local.closeAll();
+  }
 });
 
 test('the 38 commits 7: the idempotency window is measured on the monotonic clock: a wall-clock step never expires a young key', async (t) => {

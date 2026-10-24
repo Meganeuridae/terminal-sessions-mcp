@@ -373,15 +373,22 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 
 - **G16.** Every mutating operation — input, run, start, cancel, signal, resize, open,
   close, watch, unwatch, control, env capture — carries a principal and may carry an
-  idempotency key (at most 200 characters; a UUID per operation). A retry with the same key
-  within the window (15 minutes) returns the first call's outcome, success or failure, and
-  never executes twice; a retried `run` or `start` is the same Run, awaited again, also
-  after a daemon restart (the key's identity is journaled on `run.admit`) and after the
-  session was forgotten (the first outcome is returned). A key reused for a different tool
-  or with different arguments is refused, also after a restart: the journaled identity keeps
-  the key apart from the tool and the arguments' fingerprint. A call that admitted nothing (`busy`) is not
-  remembered, so its retry can run. The memory is bounded per principal and in total, oldest
-  evicted first. A client never blindly resends input after an ambiguous outcome.
+  idempotency key (at most 200 characters; a UUID per operation). For an ordinary
+  mutating call, a retry while its key is retained and inside its 15-minute window
+  returns the first outcome, success or failure, without executing twice. A retried
+  `run` or `start` instead re-awaits the same Run while its admission identity remains
+  indexed; that Run may have changed state since the first answer. Its identity can
+  survive cache eviction or a daemon restart. After a restart, the journal's wall-clock
+  admission time is the only age stamp. The in-memory cache keeps the newest 1,024
+  keys per principal and 16,384 in total, so it can forget a key before its time
+  window ends. After a session is forgotten,
+  the first outcome is returned while its key remains in memory. A key reused for another
+  tool or with other arguments is refused while its identity is retained; `run.admit`
+  records that identity separately from the arguments' fingerprint. A call that admitted
+  nothing (`busy`) is not remembered, so its retry can run. The exception is
+  `busy: declared-shell-ended`: its refusal is remembered, and a new key expresses an
+  intent to run in the session's own shell. A client never blindly resends input after
+  an ambiguous outcome.
 - **G17.** A session has at most one controller at a time. Observers may not type, signal,
   resize or destroy, with two exceptions that need no seat: a principal may `cancel` a Run it
   started, and the owner may `session_close` its own session. The controller is visible in
@@ -433,10 +440,14 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 
 - **G22.** Delivery is tracked per `(principal, session)` with two cursors whose meanings
   are fixed. `delivered`: the highest `seq` the host accepted, from a `channels/incoming`
-  result or a `push/event` response. `read`: the highest `seq` whose content a tool result
-  *delivered* to that principal (`run`, `await`, `read`, `screen`) — advanced when the result
-  is written to the connection, not when the method computes it, so a call orphaned by a
-  dropped connection counts nothing read. Presence says "new since
+  result or a `push/event` response. `read`: the highest `seq` through which output from
+  tool results (`run`, `await`, `read`, `screen`) has been counted read for that principal.
+  A Run-specific result delivered above another Run's unread output leaves the scalar
+  cursor below the gap. The daemon remembers the higher delivered target and joins it
+  when the missing output arrives. Only the scalar persists: after a daemon restart,
+  output delivered above an unresolved gap can appear unread again. `read` advances when
+  the result is written to the connection, not when the method computes it, so a call
+  orphaned by a dropped connection counts nothing read. Presence says "new since
   your last read" from `read`; catch-up after reconnect resumes from `delivered`, and
   `delivered` never advances past a lifecycle message still owed to that principal (a
   completion settles a moment after its `run.end`, so a later event can be accepted first).

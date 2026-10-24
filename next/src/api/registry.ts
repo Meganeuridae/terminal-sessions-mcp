@@ -178,12 +178,13 @@ class CursorBook {
     return c ? { ...c } : { delivered: 0, read: 0 };
   }
 
-  /** Take a principal's cursors as the live Session reports them. */
+  /** Merge each field from a Session's report: an earlier life can still report an older full snapshot. */
   set(principal: Principal, c: Cursors): void {
     if (this.cancelled) return;
     const cur = this.map.get(principal);
-    if (cur && cur.delivered === c.delivered && cur.read === c.read) return;
-    this.map.set(principal, { delivered: c.delivered, read: c.read });
+    const next = { delivered: Math.max(cur?.delivered ?? 0, c.delivered), read: Math.max(cur?.read ?? 0, c.read) };
+    if (cur && cur.delivered === next.delivered && cur.read === next.read) return;
+    this.map.set(principal, next);
     this.schedule();
   }
 
@@ -195,10 +196,7 @@ class CursorBook {
   }
 
   merge(all: Record<Principal, Cursors>): void {
-    for (const [p, c] of Object.entries(all)) {
-      const cur = this.get(p);
-      this.set(p, { delivered: Math.max(cur.delivered, c.delivered), read: Math.max(cur.read, c.read) });
-    }
+    for (const [p, c] of Object.entries(all)) this.set(p, c);
   }
 
   snapshot(): Record<Principal, Cursors> {

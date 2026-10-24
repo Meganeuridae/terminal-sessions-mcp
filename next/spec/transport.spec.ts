@@ -1727,6 +1727,9 @@ test('2f357bd smaller: a history attach says when its transcript was cut; a clos
     assert.ok(cut.transcript.split('\n').length <= 3000);
     assert.match(cut.transcript, /line 4000/);
     assert.doesNotMatch(cut.transcript, /\bline 500\b/);
+    const longHistory = h.registry.get('long');
+    assert.ok(longHistory?.kind === 'history');
+    assert.equal(longHistory.cursorsOf('agent:a@test').read, 0, 'the bounded preview does not mark omitted earlier lines read');
     const whole = (await c.request('terminal/attach', { session: 'short' })) as { transcript: string; truncated: boolean };
     assert.equal(whole.truncated, false);
     assert.match(whole.transcript, /only line/);
@@ -1882,7 +1885,7 @@ test('2f357bd paths: a journal that fails to read ends the subscription visibly 
   }
 });
 
-// ───────────── the house's read of 78c4d6e (#22): names, removal, the deferred history attach ─────────────
+// ───────────── the house's read of 78c4d6e (#22): names, removal, history preview ─────────────
 
 test('78c4d6e: isSessionId’s alphabet is checked, not only the length, and the endpoint refuses a bad name', async () => {
   // The alphabet: a letter or digit first, then letters, digits, dot, underscore or dash, 1–64 in all.
@@ -1922,7 +1925,7 @@ test('78c4d6e: a subscribed history session that is forgotten drives terminal/cl
   }
 });
 
-test('78c4d6e 5: a history attach advances the read cursor on the write, not before — a reply that never reaches the client moves nothing', async () => {
+test('G22: a history attach previews output without marking the session read', async () => {
   const h = await start({ prepare: (dataDir) => historyDir(dataDir, 'hcursor', 'shared', [1, 2, 3, 4, 5].map((i) => ({ type: 'output', data: `line ${i}\r\n`, stream: 'pty' }))) });
   try {
     const hist = h.registry.get('hcursor');
@@ -1932,9 +1935,7 @@ test('78c4d6e 5: a history attach advances the read cursor on the write, not bef
     const viewer = await Client.open(h.port, { token: 'tb' });
     const r = (await viewer.request('terminal/attach', { session: 'hcursor' })) as { transcript: string };
     assert.match(r.transcript, /line 5/);
-    // The response reached the client: its write ran the deferred commit, so the cursor is now advanced.
-    await until(() => read() > 0, 3000, 'the cursor advances once the attach response is written');
-    assert.ok(read() >= 5);
+    assert.equal(read(), 0, 'attach only previews history; the read cursor remains unchanged');
     viewer.close();
   } finally {
     await h.close();

@@ -76,11 +76,11 @@ class Drawn {
 }
 
 /**
- * A read for a tool's answer carries its commit in `d`. A read for what the tool shows beside its
- * answer, unasked (the launch's tail: `d` null), asks the App for no cursor advance at all
- * (`advance: false`): a tail reads the session's end, and its commit would take the cursor past
- * other Runs' older output the tail did not show; start's own rule covers the service Run's output
- * (the house's read of 78c4d6e, #22; a reviewer's read of the fixes for comment 6270045466).
+ * A read whose content forms the tool's answer carries its commit in `d`. An incidental
+ * preview beside another answer (such as launch's bounded tail, with `d` null) uses
+ * `advance: false`: reading from the journal does not mark output the caller did not explicitly
+ * request. Launch also discards the start result's commit because it returns only status and a
+ * bounded preview (the house's read of 78c4d6e, #22; comment 6270045466).
  */
 async function readFor(ctx: ToolContext, d: Drawn | null, o: Parameters<App['read']>[1]): Promise<ReadResult> {
   if (d) return d.track(await ctx.app.read(ctx.caller, o));
@@ -571,9 +571,11 @@ export const COMPAT_TOOLS: ToolDef[] = [
       if (a.cwd !== undefined && !exists) o.cwd = a.cwd as string;
       if (ready) o.ready = { pattern: ready };
       if (fail) o.fail = { pattern: fail };
-      const d = new Drawn();
       try {
-        const r = d.track(await ctx.app.start(ctx.caller, o));
+        // Launch discards the App.start result. Stage its read commit even for a direct caller,
+        // then discard it; otherwise App.start would advance read before launch can decide.
+        const r = await ctx.app.start({ ...ctx.caller, deferReadDelivery: true }, o);
+        takeReadCommit(r);
         if (r.state === 'busy') {
           const b = r.busy;
           return json({ status: 'error', logs: [`Failed to start service: session ${name} is busy${b?.runId ? ` running ${b.runId}${b.line ? ` (${b.line})` : ''}` : ''} (${b?.reason ?? 'busy'}); killSession it first, or use another name`], sessionId: name });
@@ -590,11 +592,10 @@ export const COMPAT_TOOLS: ToolDef[] = [
             evidence = later.evidence;
           }
         }
-        // The tail is shown with the start, not asked for: it moves no cursor (readFor), and says when it was cut, as tailLogs does.
+        // The bounded logs are a preview and move no read cursor (readFor); say when they were cut.
         const res: Record<string, unknown> = { status: launchStatus(service), logs: await tailLogLines(ctx, name, 50, a.raw === true, null), sessionId: name, runId: r.runId, service };
         if (evidence !== undefined) res.evidence = evidence;
-        // The start result's own read commit (the Run's output) rides on d; the tail moved nothing.
-        return d.sent(json(res));
+        return json(res);
       } catch (e) {
         return json({ status: 'error', logs: [`Failed to start service: ${compatWords((e as Error).message)}`] });
       }

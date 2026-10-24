@@ -1561,6 +1561,7 @@ export class Session {
     };
     if (init.envBasis) rec.envBasis = init.envBasis;
     this.runs.set(runId, rec);
+    if (init.idem !== undefined) this.journal.runs.stampAdmission(runId, rec.admittedMono);
     return rec;
   }
 
@@ -2905,7 +2906,8 @@ export class Session {
    * How long ago the Run was admitted, on the monotonic clock, for a hold or a window this daemon
    * life measures: against the journaled wall-clock stamp, a step forward ended a young service
    * Run's hold (a reviewer's read of the fixes for #22 comment 6270045466). Undefined for a Run this
-   * session does not hold (pruned, or another daemon life's), whose only stamp is the journal's wall clock.
+   * session no longer holds. The journal's RunIndex keeps this life's keyed stamp after pruning;
+   * a Run from another daemon life has only the journal's wall clock.
    */
   runAgeMs(runId: string): number | undefined {
     const r = this.runs.get(runId);

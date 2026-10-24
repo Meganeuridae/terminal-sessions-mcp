@@ -18,6 +18,27 @@ import type { EventInput, JournalEvent, RunInfo } from '../src/core/types.js';
 
 const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-runindex-'));
 
+test('keyed identity follows the bounded RunIndex: evicted entries leave, newer admissions stay', () => {
+  const index = new RunIndex('bounded-keys');
+  const oldKey = `${'a'.repeat(24)}:run:${'b'.repeat(16)}`;
+  const replacedKey = `${'c'.repeat(24)}:run:${'d'.repeat(16)}`;
+  const admit = (i: number, idem?: string) => {
+    const runId = `r${i}`;
+    const seq = 2 * i + 1;
+    index.feed({ type: 'run.admit', seq, ts: seq, runId, target: 'shell', principal: 'agent:a@test', origin: 'self', queued: false, ...(idem === undefined ? {} : { idem }) });
+    index.feed({ type: 'run.end', seq: seq + 1, ts: seq + 1, runId, state: 'exited', exit: 0, durationMs: 1 });
+  };
+  admit(0, oldKey);
+  admit(1, replacedKey);
+  for (let i = 2; i < 100_000; i++) admit(i);
+  assert.equal(index.byKeyIdentity(oldKey.slice(0, 24))?.runId, 'r0');
+  admit(100_000, replacedKey);
+  assert.equal(index.byKeyIdentity(oldKey.slice(0, 24)), undefined, 'the oldest keyed Run and its identity leave together');
+  assert.equal(index.byKeyIdentity(replacedKey.slice(0, 24))?.runId, 'r100000');
+  admit(100_001);
+  assert.equal(index.byKeyIdentity(replacedKey.slice(0, 24))?.runId, 'r100000', 'evicting an older admission with the same identity preserves the newer one');
+});
+
 /** A small deterministic PRNG (mulberry32), so a failure reproduces from its seed. */
 function rng(seed: number): () => number {
   let a = seed >>> 0;

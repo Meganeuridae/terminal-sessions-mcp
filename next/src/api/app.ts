@@ -141,10 +141,10 @@ export interface Caller {
   /** Identifies the connection for attachments. */
   connectionId: string;
   /**
-   * The caller reaches the daemon over a connection that can drop before a result is written: its
-   * `read` cursor must advance only once the result has been delivered (G22), so output a dropped
-   * connection never received is not counted read (the house's read of 1cabc6a, #22, comment
-   * 6263057673). The transport sets this; a direct caller leaves it off and the cursor advances at once.
+   * A connection can close before the transport writes a result. G22 advances `read` after a
+   * successful socket write; a skipped or failed write leaves it unchanged. Socket acceptance
+   * does not establish a remote receipt. The transport sets this; a direct caller leaves it off
+   * and the cursor advances at once (the house's read of 1cabc6a, #22, comment 6263057673).
    */
   deferReadDelivery?: boolean;
 }
@@ -175,7 +175,7 @@ export function takeReadCommit(result: unknown): (() => void) | undefined {
   return commit as () => void;
 }
 
-/** Advance a deferred caller's `read` cursor now that its result was delivered (no-op if nothing was staged). */
+/** Advance a deferred caller's `read` cursor after the transport reports a successful write (no-op if nothing was staged). */
 export function commitReadDelivery(result: unknown): void {
   takeReadCommit(result)?.();
 }
@@ -339,15 +339,10 @@ class Idempotency {
 
 /**
  * A RunResult without its output text: what an idempotency entry keeps (the replay awaits the Run
- * again). It carries no staged read commit either: the spread leaves it, since it is not
- * enumerable, and it is dropped here as well so the entry can never hold a Session through it
- * (the house's read of 78c4d6e, #22).
+ * again). Its spread omits the nonenumerable staged read commit, so the idempotency entry
+ * holds neither output text nor a Session through that callback (the house's read of 78c4d6e, #22).
  */
-const compactRun = (r: RunResult): RunResult => {
-  const c: RunResult = { ...r, output: { ...r.output, text: '' } };
-  takeReadCommit(c);
-  return c;
-};
+const compactRun = (r: RunResult): RunResult => ({ ...r, output: { ...r.output, text: '' } });
 /**
  * A busy outcome admitted nothing, so the key forgets it and the retry can run — except the once-only
  * refusal `declared-shell-ended` (§8.1), which fails closed because the declared shell the line may have
@@ -363,9 +358,9 @@ export class App {
   readonly resultBytes: number;
   private readonly idem: Idempotency;
   private readonly extrasBySession = new Map<Session, Extras>();
+  /** Run-specific reads delivered above the scalar cursor's gap, kept only for this journal life. */
+  private readonly pendingRunReads = new WeakMap<object, Map<Principal, Map<string, Seq>>>();
   private readonly segmenterOptions: SegmenterOptions;
-  private recoveredIdem: Map<string, { session: string; run: RunInfo }> | undefined;
-  private readonly recoveredKeys = new Map<string, { tool: string; digest: string; at: number }>();
   /** Names whose shell ended and whose new life is being started: the old life's watches, as they stand when it closes (m2-14). */
   private readonly carried = new Map<string, WatchInfo[]>();
 
@@ -376,9 +371,9 @@ export class App {
     this.maxWaitMs = opts.maxWaitMs ?? 55_000;
     this.resultBytes = opts.resultBytes ?? 16 * 1024;
     this.idem = new Idempotency(opts.idempotencyWindowMs ?? 15 * 60_000, (key) => {
-      this.indexRecoveredIdem();
-      const hit = this.recoveredKeys.get(key);
-      return hit && Date.now() - hit.at <= this.idem.windowMs ? hit : undefined;
+      const hit = this.indexedKey(key);
+      const identity = hit && idemIdentity(hit.run.idem ?? '');
+      return identity ? { tool: identity.tool, digest: identity.digest } : undefined;
     });
     this.registry.onChange((c) => {
       if (c.type === 'created') return;
@@ -769,42 +764,38 @@ export class App {
     );
   }
 
-  /**
-   * A keyed Run admitted before a restart (G16): its admission journaled the key's identity, so a
-   * retry finds it instead of executing again. The index is built once, from what recovery loaded.
-   */
-  private indexRecoveredIdem(): void {
-    if (!this.recoveredIdem) {
-      this.recoveredIdem = new Map();
-      const since = Date.now() - this.idem.windowMs;
-      for (const s of this.registry.list()) {
-        for (const r of s.listRuns()) {
-          if (r.idem === undefined || r.admittedAt < since) continue;
-          this.recoveredIdem.set(r.idem, { session: sessionId(s), run: r });
-          const identity = idemIdentity(r.idem);
-          if (identity && r.admittedAt > (this.recoveredKeys.get(identity.key)?.at ?? -Infinity)) {
-            this.recoveredKeys.set(identity.key, { tool: identity.tool, digest: identity.digest, at: r.admittedAt });
-          }
-        }
-      }
+  /** Find a retained keyed admission, live or recovered, without caching a stale view of the journal. */
+  private indexedKey(identity: string): { session: string; run: RunInfo; ageMs: number } | undefined {
+    let newest: { session: string; run: RunInfo; ageMs: number } | undefined;
+    for (const s of this.registry.list()) {
+      const run = (s.kind === 'live' ? s.session.journal : s.journal).runs.byKeyIdentity(identity);
+      if (!run) continue;
+      const session = sessionId(s);
+      const ageMs = this.runAgeMs(session, run);
+      if (ageMs > this.idem.windowMs) continue;
+      if (!newest || ageMs < newest.ageMs) newest = { session, run, ageMs };
     }
+    return newest;
   }
 
-  /** A keyed Run the journal knows, and its age, while that is inside the idempotency window. */
+  /** A keyed Run the journal still knows, and its age, inside the retained window. */
   private recoverRun(idem: string): { value: RunResult; ageMs: number } | undefined {
-    this.indexRecoveredIdem();
-    const hit = this.recoveredIdem!.get(idem);
-    const ageMs = hit ? this.runAgeMs(hit.session, hit.run) : Infinity;
-    if (!hit || ageMs > this.idem.windowMs) return undefined;
+    const identity = idemIdentity(idem);
+    const hit = identity ? this.indexedKey(identity.key) : undefined;
+    if (!hit || hit.run.idem !== idem) return undefined;
+    const { ageMs } = hit;
     const r = hit.run;
     const last = r.seq.end ?? r.seq.admit;
     return { value: { runId: r.runId, session: hit.session, target: r.target, state: r.state, cwd: r.cwd ?? '', attribution: r.attribution, output: { text: '', truncated: false, seq: [r.seq.admit, last], nextCursor: last } }, ageMs };
   }
 
-  /** The Run's age for a window this daemon life measures: monotonic when this life admitted it, else the wall clock's, the only stamp a recovered Run has (a reviewer's read of the fixes for #22 comment 6270045466). */
+  /** Use this life's monotonic admission stamp, including after Session pruning; a restarted daemon has only the journal's wall-clock stamp. */
   private runAgeMs(sessionId: string, run: RunInfo): number {
     const s = this.registry.get(sessionId);
-    return (s?.kind === 'live' ? s.session.runAgeMs(run.runId) : undefined) ?? Date.now() - run.admittedAt;
+    const mono = s?.kind === 'live'
+      ? s.session.runAgeMs(run.runId) ?? s.session.journal.runs.admissionAgeMs(run.runId)
+      : s?.journal.runs.admissionAgeMs(run.runId);
+    return mono ?? Date.now() - run.admittedAt;
   }
 
   /** A retried `run` or `start` (G16): the same Run, awaited again — never a second execution. */
@@ -819,9 +810,11 @@ export class App {
       if (e instanceof TermError && (e.code === 'session_not_found' || e.code === 'run_not_found')) return { ...prev, replayed: true, output: { ...prev.output, truncated: true } };
       throw e;
     }
-    const res: RunResult = { ...again, replayed: true };
-    if (prev.created) res.created = true;
-    return res;
+    // awaitRun made a fresh result. Keep that object so its nonenumerable read commit
+    // survives until the replay's transport write; a spread would drop it.
+    again.replayed = true;
+    if (prev.created) again.created = true;
+    return again;
   }
 
   async awaitRun(caller: Caller, o: { session?: string; runId: string; wait?: number }): Promise<RunResult> {
@@ -840,8 +833,8 @@ export class App {
    * A result returned content to the caller: advance its `read` cursor (G22). When the caller's
    * delivery is deferred (a connection that can drop), stage the advance on the result for the
    * transport to run once the write succeeded; otherwise advance now (the house's read of 1cabc6a,
-   * #22). The commit finds the session by name when it runs (see markRead), and decides where the
-   * cursor lands then, not when the result is staged (see advanceReadAfterRun).
+   * #22). The commit finds the current life of the same journal by name when it runs (see
+   * markRead), and decides where the cursor lands then (see advanceReadAfterRun).
    */
   private advanceRead<T extends object>(result: T, caller: Caller, commit: () => void): T {
     if (caller.deferReadDelivery) stageReadCommit(result, commit);
@@ -849,11 +842,18 @@ export class App {
     return result;
   }
 
-  /** Stage the caller's `read`-cursor advance to `to` for a result that showed the session's output as a whole (a page, a tail, the screen). */
-  private advanceReadTo<T extends object>(result: T, caller: Caller, id: string, to: Seq): T {
+  /** A journal's RunIndex survives its reopened lives; a forgotten and recreated name has a new one. */
+  private journalLineage(s: AnySession): object {
+    return (s.kind === 'live' ? s.session.journal : s.journal).runs;
+  }
+
+  /** Stage the caller's `read`-cursor advance for a result that showed this journal's output as a whole. */
+  private advanceReadTo<T extends object>(result: T, caller: Caller, s: AnySession, to: Seq): T {
+    const id = sessionId(s);
+    const lineage = this.journalLineage(s);
     return this.advanceRead(result, caller, () => {
       const now = this.registry.get(id);
-      if (now) this.markRead(now, caller.principal, to);
+      if (now && this.journalLineage(now) === lineage) this.markRead(now, caller.principal, to);
     });
   }
 
@@ -925,17 +925,28 @@ export class App {
   }
 
   /**
-   * Stage the caller's `read`-cursor advance for a result that showed one Run's output (run, await,
-   * start, read with a runId), on a live session or history: where it lands is readCursorAfterRun's
-   * rule, applied when the commit runs. Decided when the result was staged, two results outstanding
-   * at once would each freeze a target below the other's unread output, and the cursor would stay
-   * behind after both were delivered (the house's read of 78c4d6e, #22).
+   * Stage a Run-specific read until delivery. The scalar cursor stops at another Run's unread
+   * output; keep only delivered targets above that gap, then join them when the gap closes.
+   * This same-daemon hint is lost on restart, so a restarted reader may conservatively reread it.
    */
   private advanceReadAfterRun<T extends object>(result: T, caller: Caller, s: AnySession, runId: string, to: Seq): T {
     const id = sessionId(s);
+    const lineage = this.journalLineage(s);
     return this.advanceRead(result, caller, () => {
       const now = this.registry.get(id);
-      if (now) this.markRead(now, caller.principal, this.readCursorAfterRun(now, caller.principal, runId, to));
+      if (!now || this.journalLineage(now) !== lineage) return;
+      const seen = this.pendingRunReads.get(lineage)?.get(caller.principal);
+      let high = to;
+      if (seen) for (const target of seen.values()) high = Math.max(high, target);
+      const at = this.readCursorAfterRun(now, caller.principal, high, { runId, through: to });
+      if (at < to) {
+        let principals = this.pendingRunReads.get(lineage);
+        if (!principals) this.pendingRunReads.set(lineage, (principals = new Map()));
+        let runs = principals.get(caller.principal);
+        if (!runs) principals.set(caller.principal, (runs = new Map()));
+        runs.set(runId, Math.max(runs.get(runId) ?? 0, to));
+      }
+      this.markRead(now, caller.principal, at);
     });
   }
 
@@ -951,6 +962,25 @@ export class App {
     if (s.kind === 'live') {
       if (at <= s.session.journal.lastSeq) s.session.markRead(principal, at);
     } else s.markRead(principal, at);
+    const lineage = this.journalLineage(s);
+    const principals = this.pendingRunReads.get(lineage);
+    const seen = principals?.get(principal);
+    if (!seen) return;
+    let read = (s.kind === 'live' ? s.session : s).cursorsOf(principal).read;
+    let high = read;
+    for (const target of seen.values()) high = Math.max(high, target);
+    if (high > read) {
+      const joined = this.readCursorAfterRun(s, principal, high);
+      if (joined > read) {
+        if (s.kind === 'live') {
+          if (joined <= s.session.journal.lastSeq) s.session.markRead(principal, joined);
+        } else s.markRead(principal, joined);
+        read = (s.kind === 'live' ? s.session : s).cursorsOf(principal).read;
+      }
+    }
+    const index = (s.kind === 'live' ? s.session.journal : s.journal).runs;
+    for (const [runId, to] of seen) if (to <= read || !index.has(runId)) seen.delete(runId);
+    if (seen.size === 0) principals?.delete(principal);
   }
 
   /**
@@ -959,13 +989,15 @@ export class App {
    * caller, its output not read since): then just before that output, so presence keeps reporting
    * it (the house's read of 1cabc6a, #22: a later Run's result hid an earlier Run's unread output).
    */
-  private readCursorAfterRun(s: AnySession, principal: Principal, runId: string, to: Seq): Seq {
+  private readCursorAfterRun(s: AnySession, principal: Principal, to: Seq, current?: { runId: string; through: Seq }): Seq {
     const read = (s.kind === 'live' ? s.session : s).cursorsOf(principal).read;
+    const seen = this.pendingRunReads.get(this.journalLineage(s))?.get(principal);
     let at = to;
     for (const r of s.listRuns()) {
-      if (r.runId === runId || (r.seq.end !== undefined && r.seq.end <= read) || (r.seq.start ?? r.seq.admit) > at) continue;
+      if ((r.seq.end !== undefined && r.seq.end <= read) || (r.seq.start ?? r.seq.admit) > at) continue;
       if (s.kind === 'live' && s.session.outcomeDeliveredTo(r.runId, principal)) continue;
-      const first = s.runOutput(r.runId, { since: read, until: at, limit: 1 }).events[0];
+      const from = Math.max(read, seen?.get(r.runId) ?? 0, current?.runId === r.runId ? current.through : 0);
+      const first = from < at ? s.runOutput(r.runId, { since: from, until: at, limit: 1 }).events[0] : undefined;
       if (first) at = first.seq - 1;
     }
     return at;
@@ -1273,7 +1305,7 @@ export class App {
     const session = this.liveFor(caller, o.session, 'observe');
     await session.screen.settled();
     const snap = session.snapshot();
-    return this.advanceReadTo(snap, caller, session.id, snap.seq);
+    return this.advanceReadTo(snap, caller, this.entry(session), snap.seq);
   }
 
   async control(caller: Caller, o: { session: string; action: 'take' | 'release' | 'status'; idempotencyKey?: string }): Promise<{ controller: Principal | null; replayed?: boolean }> {
@@ -1307,10 +1339,10 @@ export class App {
   // ───────────── the journal ─────────────
 
   /**
-   * Read by cursor (G11); see `readJournal`. Advances the caller's `read` cursor (G22) unless
-   * `advance: false`: a read for output a tool shows beside its answer without being asked for
-   * (the compat launch's tail) counts as nothing read (a reviewer's read of the fixes for comment
-   * 6270045466, #22). The tools never pass it.
+   * Read by cursor (G11). An explicit read advances the caller's `read` cursor on delivery
+   * (G22). `advance: false` makes a nonadvancing preview for history attach and compat's
+   * incidental tails; the explicit `read` tool does not pass it (a reviewer's read of the
+   * fixes for comment 6270045466, #22).
    */
   async read(caller: Caller, o: { session: string; advance?: boolean } & ReadOptions): Promise<ReadResult> {
     const s = this.find(caller, o.session, 'observe');
@@ -1320,7 +1352,7 @@ export class App {
     if (advance === false) return r;
     // A page of one Run leaves other Runs' unread output unread (see readCursorAfterRun); a page of the session reads to its cursor.
     if (opts.runId !== undefined) return this.advanceReadAfterRun(r, caller, s, opts.runId, r.nextCursor);
-    return this.advanceReadTo(r, caller, sessionId(s), r.nextCursor);
+    return this.advanceReadTo(r, caller, s, r.nextCursor);
   }
 
   /**
