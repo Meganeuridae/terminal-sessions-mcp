@@ -1412,6 +1412,7 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
     carried(t: Session, st: unknown): Set<number>;
     settleSegment(t: Session, seg: unknown, how: 'accepted' | 'not-owed'): void;
     retireSummaries(t: Session, st: unknown, ids: string[]): Set<number>;
+    regain(t: Session): void;
     budgetOf(journal: Journal): { retained: unknown[]; seed(journal: Journal): Promise<void> };
     deliver(t: Session, seg: unknown, opts: { released: true }): void;
   };
@@ -3170,6 +3171,91 @@ test("a scan that keeps failing backs off: a catch-up of another scope succeedin
     failing.value = false;
     await until(() => s.cursorsOf(A).delivered >= s.run(r.runId!).seq.end!, 15_000, 'the cursor past the completion once a scan of the session succeeds');
     await until(() => f.inside.catchUpRetry?.attempt === 0, 5000, 'the covering scan ends the backoff');
+  } finally {
+    await f.close();
+  }
+});
+
+test("a summary left standing on a closed channel is retired when the channel opens again on a session another connection has delivered to its end", { timeout: 60_000 }, async () => {
+  // Its retry found the channel closed and its debt went, but the summary stayed, holding this lane's floor below its
+  // oldest message. The other connection then delivered everything, so the session was current when the channel opened
+  // again: no catch-up ran to retire the summary, and through floorAcross it held every connection's cursor for good
+  // (the house's review of bc4bc85..5d8ce0e, PR #22).
+  const was = McplLane.retryMax;
+  McplLane.retryMax = 2;
+  const f = await bareLane('sum-strand');
+  try {
+    await f.app.sessionOpen(f.caller, { id: 'ss' });
+    const s = live(f.registry, 'ss');
+    const g = await secondLane(f, 'sum-strand-channels', NO_PUSH);
+    try {
+      await g.lane.openChannel({ channelId: 'terminal:ss' });
+      await until(() => g.inside.catchingUp === undefined, 4000, "the channel's catch-up to finish");
+      const gst = () => g.inside.states.get('ss')!;
+      // The channel's host refuses four completions: past retryMax, the oldest fold into a summary, retried.
+      g.refuse.value = true;
+      for (let i = 0; i < 4; i++) {
+        const r = await f.app.run(f.caller, { session: 'ss', command: `echo ss-${i}`, target: 'process', wait: 0 });
+        await until(() => s.run(r.runId!).seq.end !== undefined, 5000, `Run ${i} to end`);
+      }
+      await until(() => [...gst().summaries.values()].some((x) => x.folded), 10_000, "the channel's refusals to fold");
+      // The channel closes: each retry's timer then finds nothing to carry its message on, and goes.
+      g.lane.closeChannel('terminal:ss');
+      await until(() => gst().retries.size === 0, 30_000, 'every retry on the closed channel to go');
+      assert.equal(gst().summaries.size, 1, 'the summary stands, with no retry');
+      // The push connection, the only one carrying the session now, catches up to its end.
+      await f.inside.startCatchUp(['ss']);
+      await until(() => s.cursorsOf(A).delivered >= s.journal.lastSeq, 5000, 'the cursor at the end of the session');
+      g.refuse.value = false;
+      await g.lane.openChannel({ channelId: 'terminal:ss' });
+      assert.equal(gst().summaries.size, 0, 'opening on a current session, the lane retired the summary left standing');
+      const after = await f.app.run(f.caller, { session: 'ss', command: 'echo ss-after', target: 'process', wait: 0 });
+      await until(() => s.run(after.runId!).seq.end !== undefined, 5000, 'the Run after the reopening to end');
+      const end = s.run(after.runId!).seq.end!;
+      await until(() => s.cursorsOf(A).delivered >= end, 5000, 'the cursor past the completion after the reopening');
+    } finally {
+      g.lane.dispose();
+    }
+  } finally {
+    McplLane.retryMax = was;
+    await f.close();
+  }
+});
+
+test("a regain on a session delivered to its end retires the summaries standing, with the debts only they carried, and leaves one in flight", { timeout: 30_000 }, async () => {
+  // No catch-up runs on a current session, so the regain retires what would otherwise stand for good (the house's
+  // review of bc4bc85..5d8ce0e, PR #22).
+  const f = await bareLane('c-regain-current');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'rc' });
+    const s = live(f.registry, 'rc');
+    const r = await f.app.run(f.caller, { session: 'rc', command: 'echo rc', target: 'process', wait: 0 });
+    await until(() => f.inside.states.has('rc') && s.run(r.runId!).seq.end !== undefined, 5000, 'the Run to end');
+    const st = f.inside.states.get('rc')! as unknown as { owed: Set<number>; inflight: Map<string, number>; retries: Map<string, unknown>; summaries: Map<string, unknown>; regainPin?: { at: number } | undefined };
+    const [covered, alsoCarried] = [5, 6];
+    st.owed.add(covered);
+    st.owed.add(alsoCarried);
+    st.retries.set('a-retried-completion', { seq: alsoCarried, kind: 'run', attempt: 0 });
+    const standing = `${NODE_NAME}/rc-standing`;
+    const flying = `${NODE_NAME}/rc-in-flight`;
+    st.summaries.set(standing, { from: 1, covered: new Set([covered, alsoCarried]) });
+    st.summaries.set(flying, { from: 1, covered: new Set() });
+    st.inflight.set(flying, 1);
+    // Below the session's end, the regain pins and retires nothing: the catch-up it starts does that.
+    assert.ok(s.cursorsOf(A).delivered < s.journal.lastSeq);
+    f.inside.regain(s);
+    assert.ok(st.regainPin !== undefined && st.summaries.has(standing), 'below the end, the regain pins and leaves the summary to the catch-up');
+    st.regainPin = undefined;
+    s.markDelivered(A, s.journal.lastSeq);
+    f.inside.regain(s);
+    assert.equal(st.regainPin, undefined, 'at the end, nothing to pin');
+    assert.ok(!st.summaries.has(standing), 'the summary standing is retired');
+    assert.ok(st.summaries.has(flying), 'the one in flight stays, to settle by its answer');
+    assert.ok(!st.owed.has(covered), 'a debt only the retired summary carried goes');
+    assert.ok(st.owed.has(alsoCarried), 'a debt another message still carries stays');
+    st.inflight.delete(flying);
+    st.retries.delete('a-retried-completion');
   } finally {
     await f.close();
   }

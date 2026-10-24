@@ -1149,17 +1149,27 @@ export class McplLane {
    * The lane can carry the session again: a channel opens, or the grant widens. While it could not, it dropped each
    * debt whose message it met with nothing to carry it on (see `uncarried`): what it still owes is carried by a message
    * of its own, or is a message still to be built, which settles when it comes, and a summary left standing with no
-   * retry is retired by the catch-up the regain starts. So the session is only pinned at `delivered`, until a catch-up
-   * planned after this scans it: a lane owing nothing has no floor, and its first settle would lift `delivered` past
-   * what no connection delivered, such as a completion the opening parked whose outcome a synchronous call returned
-   * meanwhile, settled as the open finishes, or anything settled before a catch-up already running lets the queued
-   * one start (an independent read of the lane fixes, #22 comment 6376365550).
+   * retry is retired by the catch-up the regain starts, or here when the session is current and none will run (see
+   * below). So the session is only pinned at `delivered`, until a catch-up planned after this scans it: a lane owing
+   * nothing has no floor, and its first settle would lift `delivered` past what no connection delivered, such as a
+   * completion the opening parked whose outcome a synchronous call returned meanwhile, settled as the open finishes,
+   * or anything settled before a catch-up already running lets the queued one start (an independent read of the lane
+   * fixes, #22 comment 6376365550).
    */
   private regain(t: Target): void {
     if (!this.current(t)) return;
     const st = this.stateOf(t);
     const { delivered } = t.cursorsOf(this.me);
     st.regainPin = delivered < t.journal.lastSeq ? { at: delivered } : undefined;
+    // With `delivered` at the session's end, no catch-up runs (`carryNow`, `catchUpAll`), so none retires what this
+    // lane left standing while it could not carry the session, and nothing is undelivered for it to stand for. Kept, a
+    // summary held this lane's floor below its oldest message, which another connection had delivered meanwhile, so
+    // `delivered` never rose again, on this connection or, through `floorAcross`, any other (the house's review of
+    // bc4bc85..5d8ce0e, PR #22). One in flight settles by its answer; the debts a retired one covered go with
+    // it unless another message still carries them.
+    if (st.regainPin === undefined) {
+      for (const seq of this.retireSummaries(t, st, [...st.summaries.keys()])) if (!this.carried(t, st).has(seq)) st.owed.delete(seq);
+    }
   }
 
   /**
