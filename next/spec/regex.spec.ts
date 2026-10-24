@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { cpuMs } from './testhost.js';
 import { compileUserRegex, execBounded, foldCase, LINEAR_LOOKBEHIND, LINEAR_NULLABLE_REPETITION, LINEAR_REGEX, MAX_MATCH_INPUT, MIN_WINDOW, matchWindow, testBounded } from '../src/core/regex.js';
 
 test('regex: the linear-time engine is in force on this Node', () => {
@@ -9,14 +10,13 @@ test('regex: the linear-time engine is in force on this Node', () => {
 test('regex: catastrophic patterns match in linear time', () => {
   for (const p of ['(a+)+$', '(a|a)+$', '(\\w+\\s?)+$', '(.*a){16}', '^(([a-z])+.)+[A-Z]([a-z])+$']) {
     const re = compileUserRegex(p);
-    const t = Date.now();
-    re.test(`${'a'.repeat(5000)}!`);
-    assert.ok(Date.now() - t < 500, `${p} took ${Date.now() - t} ms`);
+    const { ms } = cpuMs(() => re.test(`${'a'.repeat(5000)}!`));
+    assert.ok(ms < 500, `${p} took ${Math.round(ms)} ms of CPU`);
   }
   const re = compileUserRegex('(a+)+$', 'i');
-  const t = Date.now();
-  assert.equal(re.test(`${'A'.repeat(5000)}!`), false);
-  assert.ok(Date.now() - t < 500);
+  const { value: matched, ms } = cpuMs(() => re.test(`${'A'.repeat(5000)}!`));
+  assert.equal(matched, false);
+  assert.ok(ms < 500, `took ${Math.round(ms)} ms of CPU`);
 });
 
 test('regex: i is honoured by folding letters into classes', () => {
@@ -188,11 +188,9 @@ test('er-9 / atc-2: nothing a caller writes takes more than a bounded time per l
   for (const p of patterns) {
     const re = compileUserRegex(p);
     for (const line of lines) {
-      const t = performance.now();
-      testBounded(re, line);
-      const ms = performance.now() - t;
-      // The point is that it stays bounded; a loaded CI runner stalls a run by itself (seen past 1,000 ms), so the bound is generous.
-      assert.ok(ms < 2500, `${p.slice(0, 40)} on ${line.length} chars took ${Math.round(ms)} ms`);
+      const { ms } = cpuMs(() => testBounded(re, line));
+      // The point is that it stays bounded (see cpuMs).
+      assert.ok(ms < 2500, `${p.slice(0, 40)} on ${line.length} chars took ${Math.round(ms)} ms of CPU`);
     }
   }
 });
@@ -206,9 +204,8 @@ test('er-9: a large pattern gets a smaller match window, and testBounded says wh
   const huge = compileUserRegex('a'.repeat(1000));
   assert.equal(matchWindow(huge), MIN_WINDOW);
   assert.ok(MIN_WINDOW * 1000 <= 2_000_000, 'the largest common pattern costs at most twice MATCH_COST');
-  const t0 = performance.now();
-  testBounded(huge, 'b'.repeat(MAX_MATCH_INPUT));
-  assert.ok(performance.now() - t0 < 1000, `the floor case took ${Math.round(performance.now() - t0)} ms`);
+  const { ms } = cpuMs(() => testBounded(huge, 'b'.repeat(MAX_MATCH_INPUT)));
+  assert.ok(ms < 1000, `the floor case took ${Math.round(ms)} ms of CPU`);
   // execBounded gives the match itself, from the same window.
   assert.deepEqual(execBounded(small, `${'x'.repeat(100)}ERROR`).match?.[0], 'ERROR');
   assert.equal(execBounded(small, `${'x'.repeat(MAX_MATCH_INPUT)}ERROR`).match, null);

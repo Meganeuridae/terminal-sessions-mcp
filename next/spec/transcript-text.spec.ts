@@ -1,6 +1,7 @@
 /** api-20: UTF-8-safe cutting (src/core/text.ts) for byte-capped results (G11). */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { cpuMs } from './testhost.js';
 import { cutTail, executedIn, headAt, headIndex, indexAtByte, isStringStart, lineCarry, lineEnds, tailIndex, tailStart, utf8Length, safeCut, sequenceEnd, sequenceHead, stripEscapes, unfinishedSequence } from '../src/core/text.js';
 
 const bytes = (s: string) => Buffer.byteLength(s);
@@ -230,11 +231,9 @@ test('a tail cut steps back over a run of STs in time linear in the text (our re
   // Each ST stepped over searched the window again from its start for an ESC: 50,000 STs after 1 MB of text took 496 ms
   // in one tailStart, and the time grew with the text before them times the STs.
   const text = `${'x'.repeat(4_000_000)}${'\x1b\\'.repeat(50_000)}tail`;
-  const t0 = performance.now();
-  const start = tailStart(text, 3);
-  const ms = performance.now() - t0;
+  const { value: start, ms } = cpuMs(() => tailStart(text, 3));
   assert.equal(text.slice(start), 'ail');
-  assert.ok(ms < 500, `${ms.toFixed(0)} ms`);
+  assert.ok(ms < 500, `${ms.toFixed(0)} ms of CPU`);
 });
 
 test('the heads of a CSI holding many line feeds cost its length, not its square, and each is the head read from its start (an independent read of the house’s fixes for #22)', () => {
@@ -243,13 +242,11 @@ test('the heads of a CSI holding many line feeds cost its length, not its square
   const lfs = `\x1b[${'\n'.repeat(64 * 1024 - 2)}`;
   const params = `\x1b[${'1;'.repeat(32 * 1024)}${'\n'.repeat(64 * 1024)}`;
   for (const [data, name] of [[lfs, 'line feeds'], [params, 'parameters, then line feeds']] as const) {
-    const t0 = performance.now();
     const inside = new Map<number, string>();
     const carry = lineCarry();
-    const ends = lineEnds(data, carry, Number.POSITIVE_INFINITY, false, inside);
-    const ms = performance.now() - t0;
+    const { value: ends, ms } = cpuMs(() => lineEnds(data, carry, Number.POSITIVE_INFINITY, false, inside));
     assert.equal(ends.length, (data.match(/\n/g) ?? []).length, name);
-    assert.ok(ms < 1000, `${name}: ${ms.toFixed(0)} ms`);
+    assert.ok(ms < 1000, `${name}: ${ms.toFixed(0)} ms of CPU`);
     assert.equal(carry.open, data === lfs ? '\x1b[' : '\x1b[0', `${name}: the carry`);
   }
   // Read on as the line feeds come, each head is the one read afresh from the CSI's start to that point.

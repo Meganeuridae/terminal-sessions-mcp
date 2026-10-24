@@ -9,6 +9,7 @@ import { Journal } from '../src/core/journal.js';
 import { FileStore, MemoryStore } from '../src/core/stores.js';
 import { pageOutput } from '../src/core/runindex.js';
 import type { JournalEvent } from '../src/core/types.js';
+import { cpuMs } from './testhost.js';
 
 const out = (data: string) => ({ type: 'output', data, stream: 'pty' }) as const;
 
@@ -173,10 +174,10 @@ test('jr-21: eviction is O(1) amortized once the ring is full of small events', 
   const ring = new MemoryStore(8 * 1024 * 1024);
   let seq = 0;
   for (let i = 0; i < 200_000; i++) ring.append({ type: 'output', data: 'a', stream: 'pty', seq: ++seq, ts: 0 });
-  const t0 = performance.now();
-  for (let i = 0; i < 200_000; i++) ring.append({ type: 'output', data: 'a', stream: 'pty', seq: ++seq, ts: 0 });
-  const ms = performance.now() - t0;
-  assert.ok(ms < 1500, `200k appends with eviction took ${ms.toFixed(0)} ms`);
+  const { ms } = cpuMs(() => {
+    for (let i = 0; i < 200_000; i++) ring.append({ type: 'output', data: 'a', stream: 'pty', seq: ++seq, ts: 0 });
+  });
+  assert.ok(ms < 1500, `200k appends with eviction took ${ms.toFixed(0)} ms of CPU`);
   const r = ring.read();
   assert.equal(r[r.length - 1]!.seq, seq);
   assert.equal(ring.oldestSeq(), r[0]!.seq);

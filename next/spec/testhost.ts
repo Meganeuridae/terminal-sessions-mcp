@@ -201,6 +201,21 @@ export async function until(pred: () => boolean, ms = 3000, what = 'condition'):
   }
 }
 
+/**
+ * Run synchronous work and give the process's CPU time it took, in ms. A bound on what code costs reads this rather than
+ * the wall clock: with the suite's files run side by side, a busy machine keeps the process waiting for a core, and that
+ * wait is no cost of the code. Wall time stays the measure where waiting is the point (a timer, a close, a budget, a
+ * disk). It counts every thread of the process, the garbage collector's helpers included, so it can read above the wall
+ * clock. An async `f` would be timed only to its first await, so a promise back is refused.
+ */
+export function cpuMs<T>(f: () => T): { value: T; ms: number } {
+  const start = process.cpuUsage();
+  const value = f();
+  const { user, system } = process.cpuUsage(start);
+  if (typeof (value as { then?: unknown } | null | undefined)?.then === 'function') throw new TypeError('cpuMs times synchronous work only');
+  return { value, ms: (user + system) / 1000 };
+}
+
 /** A port nothing listens on right now, for a test that must name one before it starts a server. */
 export function unusedPort(): Promise<number> {
   return new Promise<number>((resolve) => {

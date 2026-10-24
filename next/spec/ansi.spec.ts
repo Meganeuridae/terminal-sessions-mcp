@@ -10,7 +10,7 @@ import { cleanLine, compileLinePattern, LineSplitter, MAX_LINE, StreamMatcher, t
 import { LINEAR_REGEX, MIN_WINDOW, matchWindow } from '../src/core/regex.js';
 import { TermError } from '../src/core/errors.js';
 import { transcript } from '../src/core/transcript.js';
-import { sleep, until } from './testhost.js';
+import { cpuMs, sleep, until } from './testhost.js';
 
 const matcher = (pattern: string, opts?: ConstructorParameters<typeof StreamMatcher>[1]) => new StreamMatcher(compileLinePattern(pattern), opts);
 const matches = (pattern: string, chunks: string[]) => {
@@ -87,6 +87,11 @@ test('cleanLine renders a line as the transcript does: erase in line and in-line
   assert.ok(crawl.endsWith('x'));
 });
 
+test('cpuMs times synchronous work only: a promise back is refused, since it would be timed only to its first await', () => {
+  assert.throws(() => cpuMs(async () => 1), TypeError);
+  assert.equal(cpuMs(() => 7).value, 7);
+});
+
 test('cleanLine erases to the start at a cost that does not grow with the row: a move past a short row, or a long row erased again and again, never holds the event loop', () => {
   // The house's read of the 33 commits (#22, comment 6307351104): a 55 kB line of `ESC [ 65536 C` and `ESC [ 1 K` took the
   // cleaner 395 ms, its erase blanking every column up to a cursor the move had carried to MAX_LINE; bounded at the row's end,
@@ -98,12 +103,13 @@ test('cleanLine erases to the start at a cost that does not grow with the row: a
     'a row of wide characters': '日'.repeat(16_000) + '\rx\x1b[99999C\x1b[1K'.repeat(4000),
   };
   for (const [name, line] of Object.entries(lines)) {
-    const t = performance.now();
-    const read = cleanLine(line);
-    new LineSplitter().feed(`${line}\n`);
-    const ms = performance.now() - t;
-    // Over a second each on the old code, alone; a few milliseconds now, and the bound leaves room for a loaded machine.
-    assert.ok(ms < 400, `${name}: ${Math.round(ms)} ms`);
+    const { value: read, ms } = cpuMs(() => {
+      const read = cleanLine(line);
+      new LineSplitter().feed(`${line}\n`);
+      return read;
+    });
+    // Over a second each on the old code; tens of milliseconds of CPU now (see cpuMs).
+    assert.ok(ms < 400, `${name}: ${Math.round(ms)} ms of CPU`);
     assert.equal(read.trim(), '', `${name}: the last erase blanked the row`);
   }
   // Erases that reach less far than an earlier one, with writes between them.
@@ -179,20 +185,20 @@ test('a line is matched on its head within the pattern’s match window, and a h
   assert.equal(hits[0]!.line.length, 3024, 'the whole line is still reported');
   assert.equal(m.feed(`${'x'.repeat(999)}0\n`)[0]!.clipped, undefined, 'a line within the window is not clipped');
   // The point of the window: a thousand-character pattern on a 64 KiB line costs a bounded match.
-  const t0 = performance.now();
-  assert.deepEqual(m.feed(`${'q'.repeat(MAX_LINE)}\n`), []);
-  const ms = performance.now() - t0;
-  assert.ok(ms < 2500, `took ${Math.round(ms)} ms`);
+  const { value: hits2, ms } = cpuMs(() => m.feed(`${'q'.repeat(MAX_LINE)}\n`));
+  assert.deepEqual(hits2, []);
+  assert.ok(ms < 2500, `took ${Math.round(ms)} ms of CPU`);
 });
 
 test('m2-5: every pattern runs on the linear-time engine — a nested quantifier cannot stall the daemon', () => {
-  const t0 = Date.now();
-  const m = matcher('(\\w+\\s?)+ready');
-  // 48 characters took ~51 s before; a hundred words now take nothing.
-  const line = Array.from({ length: 100 }, (_, i) => `word${i}`).join(' ') + ' !\n';
-  assert.deepEqual(m.feed(line), []);
-  assert.deepEqual(matches('(a+)+$', ['a'.repeat(5000) + 'b\n']), []);
-  assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0} ms`);
+  const { ms } = cpuMs(() => {
+    const m = matcher('(\\w+\\s?)+ready');
+    // 48 characters took ~51 s before; a hundred words now take nothing.
+    const line = Array.from({ length: 100 }, (_, i) => `word${i}`).join(' ') + ' !\n';
+    assert.deepEqual(m.feed(line), []);
+    assert.deepEqual(matches('(a+)+$', ['a'.repeat(5000) + 'b\n']), []);
+  });
+  assert.ok(ms < 1000, `took ${Math.round(ms)} ms of CPU`);
   if (LINEAR_REGEX) refused(() => compileLinePattern('(a)\\1'));
   refused(() => compileLinePattern('(unclosed'));
 });
@@ -305,11 +311,9 @@ test('a watch reads a CSI holding many line feeds in time linear in it (an indep
   // Each line after a LF the CSI executes began with the CSI's head, read from its start each time: one 64 KiB read held
   // LineSplitter.feed for 5.2 s.
   const data = `\x1b[${'\n'.repeat(64 * 1024 - 2)}mready\r\n`;
-  const t0 = performance.now();
-  const lines = matcher('^ready$').feed(data);
-  const ms = performance.now() - t0;
+  const { value: lines, ms } = cpuMs(() => matcher('^ready$').feed(data));
   assert.deepEqual(lines.map((h) => h.line), ['ready']);
-  assert.ok(ms < 1000, `${ms.toFixed(0)} ms`);
+  assert.ok(ms < 1000, `${ms.toFixed(0)} ms of CPU`);
 });
 
 test('a line says where its first character came from, and that it holds output from elsewhere too, for a stream whose writers take turns (a process Run’s pipes)', () => {
@@ -354,11 +358,11 @@ test('a line of many parts that show nothing costs each part its own length (Ima
   // splitter took about 20 ms before the pipe was decided by the first character shown. 65,000 here, so the line's `x`
   // comes before MAX_LINE's cut.
   const s = new LineSplitter();
-  const t0 = performance.now();
-  for (let i = 0; i < 65_000; i++) s.feed('\t', 'stdout');
-  const [line] = s.feed('x\n', 'stderr');
-  const ms = performance.now() - t0;
+  const { value: [line], ms } = cpuMs(() => {
+    for (let i = 0; i < 65_000; i++) s.feed('\t', 'stdout');
+    return s.feed('x\n', 'stderr');
+  });
   s.dispose();
   assert.deepEqual([line?.from, line?.mixed], ['stderr', undefined], 'tabs show no character, so the line is stderr\'s');
-  assert.ok(ms < 500, `${ms.toFixed(0)} ms`);
+  assert.ok(ms < 500, `${ms.toFixed(0)} ms of CPU`);
 });

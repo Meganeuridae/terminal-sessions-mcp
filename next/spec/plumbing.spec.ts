@@ -11,6 +11,7 @@ import { journalRunText } from '../src/core/segmenter.js';
 import { transcript } from '../src/core/transcript.js';
 import type { RunOutput } from '../src/core/runindex.js';
 import type { RunInfo } from '../src/core/types.js';
+import { cpuMs } from './testhost.js';
 
 /** What the shell prints for a typed line: the split words joined. */
 const printed = (typed: string) => typed.replace(/""|''/g, '');
@@ -376,16 +377,14 @@ test('no pattern the grammar builds backtracks: every typed line, cut anywhere a
       for (const fill of [' ', line[i]!]) {
         const s = `${line.slice(0, i)}${fill.repeat(2000)}\u0001`;
         for (const [name, read] of readers) {
-          const t = performance.now();
-          read(s);
-          const ms = performance.now() - t;
+          const { ms } = cpuMs(() => read(s));
           if (ms > worst.ms) worst = { ms, what: `${name} on ${JSON.stringify(line.slice(0, i))} and 2,000 × ${JSON.stringify(fill)}` };
         }
       }
     }
   }
-  // Seconds each on the old pattern; a millisecond or two now, and the bound leaves room for a loaded machine.
-  assert.ok(worst.ms < 250, `${worst.what}: ${Math.round(worst.ms)} ms`);
+  // Seconds each on the old pattern; a millisecond or two of CPU now (see cpuMs).
+  assert.ok(worst.ms < 250, `${worst.what}: ${Math.round(worst.ms)} ms of CPU`);
 });
 
 test('under the marker strategy the start mark the command file prints bounds the output: whatever came before it is the shell’s, an echo-shaped line after it is the program’s', () => {
@@ -637,13 +636,11 @@ test('the cut reads a long line of probe-shaped fragments in time linear in it, 
   for (const fragment of ['<<<PRO""BE:zz ', "<<<PRO''BE:zz ", '<<<PROBE:zz:1:yy>>> ']) {
     const raw = `${echo}\r\n<<<START:${n}:42>>>\r\nout ${fragment.repeat(100_000)}\r\nafter\r\n<<<EXIT:${n}:0>>>\r\n`;
     for (const of of [{ strategy: 'marker' as const }, {}]) {
-      const t = performance.now();
-      const cut = cutPlumbing(raw, of);
-      const ms = performance.now() - t;
+      const { value: cut, ms } = cpuMs(() => cutPlumbing(raw, of));
       // Echo-shaped fragments nothing answered are struck from the first, and an answer's line whole.
       assert.equal(cut, fragment.startsWith('<<<PROBE') ? 'after\r\n' : 'out\r\nafter\r\n', `${fragment}: the fragments are struck`);
-      // Tens of seconds on the old pass; about 150 ms now, and the bound leaves room for a loaded machine.
-      assert.ok(ms < 2000, `${fragment} ${JSON.stringify(of)}: ${Math.round(ms)} ms`);
+      // Tens of seconds on the old pass; about 150 ms now (see cpuMs).
+      assert.ok(ms < 2000, `${fragment} ${JSON.stringify(of)}: ${Math.round(ms)} ms of CPU`);
     }
   }
 });
@@ -755,19 +752,10 @@ test('the cut decides each probe echo with one pass over the answers: 120,000 ec
   for (const [name, of, probe, answer] of shapes) {
     const answered = wrap((probe + answer).repeat(120_000));
     const unanswered = wrap((probe + answer.replace('PROBE', 'PROBX')).repeat(120_000));
-    let ms = Infinity;
-    let base = Infinity;
-    // Measured again, keeping each one's fastest, only when a moment's load made the first pair miss.
-    for (let i = 0; i < 2 && !(ms < 3 * base + 50); i++) {
-      let t = performance.now();
-      const cut = cutPlumbing(answered, of);
-      ms = Math.min(ms, performance.now() - t);
-      assert.equal(cut, 'after\r\n', name);
-      t = performance.now();
-      cutPlumbing(unanswered, of);
-      base = Math.min(base, performance.now() - t);
-    }
-    assert.ok(ms < 3 * base + 50, `${name}: ${Math.round(ms)} ms with the answers, ${Math.round(base)} ms without`);
+    const { value: cut, ms } = cpuMs(() => cutPlumbing(answered, of));
+    assert.equal(cut, 'after\r\n', name);
+    const { ms: base } = cpuMs(() => cutPlumbing(unanswered, of));
+    assert.ok(ms < 3 * base + 50, `${name}: ${Math.round(ms)} ms of CPU with the answers, ${Math.round(base)} ms without`);
   }
 });
 
