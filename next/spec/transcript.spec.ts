@@ -1036,6 +1036,21 @@ test('entering the alternate screen decides what the region showed, and no later
   }
 });
 
+test('a cursor the program moves by rows meets the terminal’s where a margin stops both: nothing is pending after (the house’s review of bc4bc85..5d8ce0e, PR #22, I48)', async () => {
+  // A hole's line end inside the region puts the projection's cursor a row below the terminal's. A move down to the
+  // bottom margin, or up to the top one, stops both cursors on the same row, after which the program's scrolls are the
+  // terminal's too: no test moved the cursor by rows while a row was pending.
+  const read = async (chunks: ProjectChunk[]) => {
+    const p = await project(chunks, { cols: 20, rows: 10 });
+    return [p.truncated, p.lost];
+  };
+  const short = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4';
+  for (const [move, lines] of [['\x1b[9B', 'A\r\nB\r\n'], ['\x1b[9A', 'A\r\nB\r\nC\r\nD\r\nE\r\n']] as const) {
+    assert.deepEqual(await read([`${short}${move}${lines}`]), [false, undefined], `the terminal alone: ${JSON.stringify(move)}`);
+    assert.deepEqual(await read([short, { hole: true }, `${move}${lines}`]), [false, undefined], `a row pending: ${JSON.stringify(move)}`);
+  }
+});
+
 test('a blank row the program writes on goes as a row with text: a Run’s line on it, then the program’s own over it (the house’s review of bc4bc85..5d8ce0e, PR #22, I38)', async () => {
   // A Run's line on the empty row the program's line end left marks that row blank: the terminal's is empty, so its
   // going says nothing. The program then set its cursor onto it and wrote its own line, on both screens, and a Run's
