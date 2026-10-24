@@ -281,7 +281,13 @@ test('tsg-7: keystrokes typed while the connection is down are dropped with a no
     proxy.resume();
     await page.waitForFunction(`document.getElementById('conn-text').textContent === 'connected'`, { timeout: 15_000 });
     await page.waitForFunction(`${rows}.includes('DURING-10')`, { timeout: 10_000 });
-    await new Promise((r) => setTimeout(r, 1000));
+    // A key typed now, on the connection the queue would have used, arrives after anything queued: waited for in
+    // place of a sleep, it shows the queue had its chance to arrive and nothing came. The seat is taken again first,
+    // since a client that held its queue until it had the seat back would send it then.
+    await takeSeat(page, a, 'outage');
+    await page.click('#term');
+    await page.keyboard.type('~');
+    await until(() => inputsOf('outage').some((e) => e.data.includes('~')), 5000, 'a key typed after the reconnect reached the terminal');
     assert.deepEqual(inputsOf('outage').filter((e) => e.data.includes('QUEUED')), [], 'nothing typed during the outage reached the terminal');
     assert.ok(!(await page.evaluate<string>(rows)).includes('QUEUED-5'));
   } finally {

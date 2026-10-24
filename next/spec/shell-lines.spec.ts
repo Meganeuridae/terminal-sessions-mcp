@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { hasShell, realSession } from './fake-shell.js';
+import { hasShell, realSession, until } from './fake-shell.js';
 
 const shells = ['/bin/bash', '/bin/zsh'].filter(hasShell);
 
@@ -92,7 +92,7 @@ for (const shell of shells) {
     try {
       assert.equal((await x.run('echo "$HISTFILE"')).text, path.join(x.tmp, 'tsm-history-real'));
       x.session.input('echo typed-by-a-human\n', { principal: 'agent:a@test' });
-      await new Promise((r) => setTimeout(r, 400));
+      await until(() => x.session.listRuns().some((r) => r.origin === 'agent' && r.line === 'echo typed-by-a-human'), 5000, 'the typed command recorded as a Run');
       await x.run('true');
       const hist = await x.run(shell.endsWith('zsh') ? 'fc -ln 1' : 'history');
       assert.match(hist.text, /echo typed-by-a-human/, 'typed commands are in the session history');
@@ -155,11 +155,12 @@ test('/bin/zsh: emu-11/shell-8: output without a trailing newline has no PROMPT_
 test('/bin/bash: emu-12/shell-10: a typed command that history did not keep is recorded as itself, not the previous entry', async () => {
   const x = await realSession('/bin/bash', { env: { HISTCONTROL: 'ignoreboth' }, login: false });
   try {
+    const typedRuns = () => x.session.listRuns().filter((r) => r.origin === 'agent');
     x.session.input('echo first-command\n', { principal: 'agent:a@test' });
-    await new Promise((r) => setTimeout(r, 400));
+    await until(() => typedRuns().length >= 1, 5000, 'the first typed command recorded');
     x.session.input(' echo second-with-leading-space\n', { principal: 'agent:a@test' });
-    await new Promise((r) => setTimeout(r, 400));
-    const typed = x.session.listRuns().filter((r) => r.origin === 'agent');
+    await until(() => typedRuns().length >= 2, 5000, 'the second typed command recorded');
+    const typed = typedRuns();
     assert.deepEqual(typed.map((r) => r.line), ['echo first-command', 'echo second-with-leading-space']);
   } finally {
     await x.close();
@@ -174,10 +175,13 @@ test('/bin/bash: shell-10: after a bind -x widget at the prompt, the next daemon
   const x = await realSession('/bin/bash', { rc: { '.bashrc': `bind -x '"\\C-t": echo widget-ran'\n` }, login: false });
   try {
     assert.equal((await x.run('echo before')).text, 'before');
+    const shown = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
     x.session.input('\x14', { principal: 'agent:a@test' });
-    await new Promise((r) => setTimeout(r, 300));
-    x.session.input('echo typed\r', { principal: 'agent:a@test' });
-    await new Promise((r) => setTimeout(r, 400));
+    await until(() => shown().includes('widget-ran'), 5000, 'the widget ran');
+    // Its output, which its echoed line doesn't hold, and not a Run of its own: on bash 3.2 the widget's command
+    // opened the prompt's Run, so a line typed after it at the same prompt runs inside that Run.
+    x.session.input("echo typ''ed\r", { principal: 'agent:a@test' });
+    await until(() => shown().includes('typed'), 5000, 'the typed command ran');
     const r = await x.run('echo after', 3000);
     assert.equal(r.state, 'exited', JSON.stringify(r));
     assert.equal(r.text, 'after');

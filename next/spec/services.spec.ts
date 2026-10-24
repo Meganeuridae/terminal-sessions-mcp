@@ -89,7 +89,13 @@ test('m2-6: a Run that ends lost leaves the service `lost` — its process may s
 test('m2-15: a fail-pattern verdict is not overridden by health.tcp; a ready line after it clears it, with true evidence', async () => {
   const f = fake();
   let accepting = true;
-  const connect: Connect = async () => accepting;
+  let connects = 0;
+  const connect: Connect = async () => (connects++, accepting);
+  // Three more completed health checks, waited for rather than slept through, so a verdict is read after they ran.
+  const checked = async (what: string) => {
+    const from = connects;
+    await until(() => connects >= from + 3, 3000, what);
+  };
   const m = f.monitor({ ready: { pattern: 'listening' }, fail: { pattern: 'FATAL' }, health: { tcp: { port: 1 }, intervalMs: 20 } }, { connect });
   f.start();
   f.out('listening\n');
@@ -97,7 +103,7 @@ test('m2-15: a fail-pattern verdict is not overridden by health.tcp; a ready lin
   f.out('FATAL: database connection lost\n');
   assert.equal(m.status, 'unhealthy');
   assert.equal(m.info().cause, 'fail-pattern');
-  await sleep(150);
+  await checked('health checks while the fail line stands');
   assert.equal(m.status, 'unhealthy', 'the port still accepting does not undo what the service said');
   f.out('listening\n');
   assert.equal(m.status, 'ready');
@@ -115,7 +121,7 @@ test('m2-15: a fail-pattern verdict is not overridden by health.tcp; a ready lin
   f.out('FATAL: again\n');
   assert.equal(m.info().cause, 'fail-pattern');
   accepting = true;
-  await sleep(100);
+  await checked('accepting health checks after the second fail line');
   assert.equal(m.status, 'unhealthy');
   m.dispose();
 });
@@ -639,15 +645,17 @@ test('health checks start after a fail-pattern recovery too, when the fail line 
   f.out('ERROR boom\n');
   assert.equal(m.status, 'unhealthy');
   accepting = true;
-  await until(() => f.statuses().length === 2 && m.info().cause === 'fail-pattern' && m.status === 'unhealthy', 1000, 'tcp met while the fail verdict stands');
-  await sleep(300);
+  // The readiness probe's next connect, the one that finds the port up, and a turn after it for its verdict to land.
+  const from = connects;
+  await until(() => connects > from, 3000, 'the readiness probe finds the port accepting');
+  await sleep(0);
   assert.equal(m.status, 'unhealthy', 'the port coming up does not clear a fail line');
+  assert.deepEqual([f.statuses().length, m.info().cause], [2, 'fail-pattern'], 'tcp met while the fail verdict stands');
   f.out('READY\n');
   assert.equal(m.status, 'ready');
   assert.match(String(m.info().evidence), /ready pattern matched again/);
   connects = 0;
-  await sleep(150);
-  assert.ok(connects >= 3, `health checks run after the recovery: ${connects} connects in 150 ms`);
+  await until(() => connects >= 3, 3000, 'health checks run after the recovery');
   accepting = false;
   await until(() => m.status === 'unhealthy', 1000, 'a health failure after recovery');
   assert.equal(m.info().cause, 'health');
@@ -759,7 +767,8 @@ test('m2-6 (real bash): closing the shell under a service that ignores SIGHUP re
 
 test('m2-15 (real process): a fail line while the port keeps accepting stays unhealthy through health checks', async () => {
   const js = `const s=require('net').createServer().listen(0,'127.0.0.1',()=>{console.log('listening '+s.address().port);setTimeout(()=>console.log('FATAL: database connection lost'),300)});`;
-  const probe = net.createServer().listen(0, '127.0.0.1');
+  let accepted = 0;
+  const probe = net.createServer(() => accepted++).listen(0, '127.0.0.1');
   await new Promise((r) => probe.once('listening', r));
   const port = (probe.address() as net.AddressInfo).port;
   try {
@@ -767,7 +776,9 @@ test('m2-15 (real process): a fail line while the port keeps accepting stays unh
     assert.equal(r.service, 'ready');
     const mon = app.extras(live('svc-fatal')).services.get(r.runId!)!;
     await until(() => mon.status === 'unhealthy', 3000, 'unhealthy');
-    await sleep(900);
+    // Three more health checks that found the port accepting, counted at the port rather than slept through.
+    const from = accepted;
+    await until(() => accepted >= from + 3, 5000, 'health checks after the fail line');
     assert.equal(mon.status, 'unhealthy', serviceEvents(live('svc-fatal').journal).map((e) => `${e.status}(${e.evidence})`).join(' → '));
     await app.cancel(C, { runId: r.runId! });
   } finally {
