@@ -15,6 +15,7 @@ import { SessionRegistry } from '../src/api/registry.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
 import { Journal } from '../src/core/journal.js';
 import { cleanLine } from '../src/core/ansi.js';
+import { MAX_LINE_RAW, MAX_SHOWN } from '../src/core/search.js';
 import { MemoryStore } from '../src/core/stores.js';
 import { endRun, out, source, startRun } from './reader-fixture.spec.js';
 
@@ -351,6 +352,28 @@ test('jr2-10: the after-context of the last match is complete even when the next
   const strict = await search(src, { pattern: '.', since: 0, limit: 1, context: 2 });
   assert.deepEqual(lines(strict), ['m1']);
   assert.deepEqual(strict.matches[0]!.after, ['m2', 'x']);
+});
+
+test('a line cut for display or by the raw bound ends on a whole character, never half a surrogate pair (the house\'s review of bc4bc85..5d8ce0e, PR #22, I16)', async () => {
+  const lone = (t: string) => /[\uD800-\uDBFF]$/.test(t.replace(/…$/, ''));
+  // The display clip: a non-BMP character straddling MAX_SHOWN's cut.
+  const shownSrc = source();
+  out(shownSrc.journal, `needle${'a'.repeat(MAX_SHOWN - 7)}😀tail\r\n`);
+  const clip = await search(shownSrc, { pattern: '^needle', since: 0 });
+  assert.equal(clip.matches[0]!.clipped, true);
+  assert.equal(lone(clip.matches[0]!.line), false, `the clip ends on a whole character: ${JSON.stringify(clip.matches[0]!.line.slice(-4))}`);
+  // The raw bound: the pair straddling MAX_LINE_RAW in a context line, after colour codes that show nothing, so its
+  // text is short and the display clip doesn't reach it.
+  let fives = Math.floor((MAX_LINE_RAW - 2) / 5);
+  let rest = MAX_LINE_RAW - 2 - fives * 5;
+  while (rest % 4 !== 0) { fives--; rest += 5; }
+  const codes = `${'\x1b[31m'.repeat(fives)}${'\x1b[1m'.repeat(rest / 4)}`;
+  assert.equal(codes.length, MAX_LINE_RAW - 2);
+  const rawSrc = source();
+  out(rawSrc.journal, `${codes}z😀more\r\nneedle\r\n`);
+  const raw = await search(rawSrc, { pattern: '^needle', since: 0, context: 1 });
+  assert.equal(raw.matches[0]!.clipped, true);
+  assert.equal(lone(raw.matches[0]!.before[0]!), false, 'the raw cut ends on a whole character');
 });
 
 test('a context line cut by the raw bound is marked clipped on the match it belongs to', async () => {

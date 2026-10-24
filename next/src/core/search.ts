@@ -58,7 +58,7 @@
  */
 import { cleanLine } from './ansi.js';
 import { testBounded } from './regex.js';
-import { headAt, indexAtByte, isStringStart, lineCarry, lineEnds, showsCharacter, unfinishedSequence, utf8Length, type LineCarry } from './text.js';
+import { headAt, indexAtByte, isStringStart, lineCarry, lineEnds, safeCut, showsCharacter, utf8Length, type LineCarry } from './text.js';
 import type { JournalEvent, OutputStream, Seq } from './types.js';
 
 export interface SearchMatch {
@@ -117,7 +117,8 @@ interface Carry {
 
 const before = (a: Resume, b: Resume): boolean => a.cursor < b.cursor || (a.cursor === b.cursor && a.offset < b.offset);
 
-const shown = (s: string): { text: string; cut: boolean } => (s.length > MAX_SHOWN ? { text: `${s.slice(0, MAX_SHOWN)}…`, cut: true } : { text: s, cut: false });
+/** A line as shown, cut at MAX_SHOWN where it's longer, never inside a surrogate pair (the house's review of bc4bc85..5d8ce0e, PR #22, I16). */
+const shown = (s: string): { text: string; cut: boolean } => (s.length > MAX_SHOWN ? { text: `${s.slice(0, safeCut(s, MAX_SHOWN))}…`, cut: true } : { text: s, cut: false });
 
 /** UTF-8 byte length of a string that may be all ASCII (the common case costs nothing). */
 const bytesOf = (s: string, ascii: boolean): number => (ascii ? s.length : Buffer.byteLength(s));
@@ -260,9 +261,11 @@ export class LineScanner {
       if (!carry.cut) {
         const room = MAX_LINE_RAW - carry.raw.length;
         if (piece.length > room) {
-          // Cut before a control sequence the cut would split, so no half of one shows as text.
-          const head = carry.raw + piece.slice(0, room);
-          const at = unfinishedSequence(head);
+          // Cut before a control sequence or a surrogate pair the cut would split, as the splitter's cut is (ansi.ts),
+          // so no half of one shows as text (the house's review of bc4bc85..5d8ce0e, PR #22, I16): one unit past the
+          // cut lets safeCut see a pair.
+          const head = carry.raw + piece.slice(0, room + 1);
+          const at = safeCut(head, MAX_LINE_RAW);
           kept = piece.slice(0, Math.max(0, at - carry.raw.length));
           carry.raw = head.slice(0, at);
           carry.cut = true;
