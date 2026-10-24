@@ -1096,8 +1096,8 @@ export class McplLane {
    * The lowest floor among this principal's connections for the session: `delivered` is theirs together (see `lanesByApp`).
    * A connection that can't carry the session counts for nothing: what it owed before it lost the session is the
    * principal's, found again from `delivered` when it carries again. Counted, one refused completion of a connection
-   * that then closed its channel held the cursor of every connection that could deliver (Imago's question on #22's
-   * shared cursor, comment 6355747725).
+   * that then closed its channel held the cursor of every connection that could deliver (the question left open in
+   * #22 comment 6355747725).
    */
   private floorAcross(t: Target, st: LaneState): Seq {
     let f = this.floor(st);
@@ -1140,7 +1140,7 @@ export class McplLane {
    * planned after this scans it: a lane owing nothing has no floor, and its first settle would lift `delivered` past
    * what no connection delivered, such as a completion the opening parked whose outcome a synchronous call returned
    * meanwhile, settled as the open finishes, or anything settled before a catch-up already running lets the queued
-   * one start (Abigail-2459's read of our lean on #22's shared cursor).
+   * one start (an independent read of the lane fixes, #22 comment 6376365550).
    */
   private regain(t: Target): void {
     if (!this.current(t)) return;
@@ -1154,8 +1154,8 @@ export class McplLane {
    * push off and the channel closed: its debt goes, unless another message of its own still carries the seq, and the
    * cursor stays where it is. The message is the principal's, found from `delivered` by a catch-up if it is still
    * owed then. Kept, a debt owed only while the channel was open, which no catch-up finds owed after it closed, held
-   * every connection of the principal below it for good once this lane could carry the session again (Abigail-2459's
-   * read of the regain).
+   * every connection of the principal below it for good once this lane could carry the session again (an independent
+   * read of the lane fixes, #22 comment 6376365550).
    */
   private uncarried(t: Target, st: LaneState, seq: Seq): void {
     if (!this.carried(t, st).has(seq)) st.owed.delete(seq);
@@ -1373,8 +1373,8 @@ export class McplLane {
     if (!this.enabled('terminal.live', 'pushEvents')) {
       // Push off and the channel closed: nothing carries the message (see `uncarried`). Its own retry goes too when it
       // has already fired, as one whose message the channel's close sent back from the batch has: kept until an answer
-      // that will never come, it counted as carrying the seq and could not fire again (Abigail-2459's read of the
-      // drops). One whose timer is still pending fires, and its debt stays.
+      // that will never come, it counted as carrying the seq and could not fire again (an independent read of the lane
+      // fixes, #22 comment 6376365550). One whose timer is still pending fires, and its debt stays.
       this.settleSegment(t, seg, 'refused');
       const own = st.retries.get(id);
       if (own && !own.timer) st.retries.delete(id);

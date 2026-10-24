@@ -2059,7 +2059,7 @@ test("a note budget whose first count failed counts again at the next note, and 
     await f.app.sessionOpen(f.caller, { id: 'sf', visibility: 'shared', retention: { maxBytes: 64 * 1024 } });
     const s = live(f.registry, 'sf');
     f.app.note(f.caller, { session: 'sf', text: 'an earlier note' }); // counted only by the seed
-    // The count fails after it has counted its first page (Ambrose-2449's shape: failing before any page,
+    // The count fails after it has counted its first page (a reviewer's shape, #22: failing before any page,
     // it had nothing to forget, and the spec passed with the counts kept).
     const journal = s.journal as Journal & { pages: Journal['pages'] };
     const pages = journal.pages.bind(journal);
@@ -2152,7 +2152,7 @@ test("a catch-up retires a refused fold summary that nothing carried, so the com
 test("a catch-up that retires a refused catch-up summary retires the seq it owed, so a gap's end that retention moved past doesn't pin the cursor", { timeout: 90_000 }, async () => {
   // A catch-up's summary owes its own seq, here the end of the gone range. Retired without it, that seq stayed
   // owed once retention moved past it: the next scan's gap ended later, nothing had the old seq, and the cursor
-  // stayed below it for the life of the connection (Ambrose-2449's read of the retirement).
+  // stayed below it for the life of the connection (a reviewer's read of the retirement, #22).
   const f = await bareLane('c-retire-owes');
   try {
     const st = () => f.inside.states.get('ro')!;
@@ -2647,7 +2647,7 @@ test("a forgotten name's late settlement writes nothing into the cursors.json of
   }
 });
 
-// ───────────── a lane owes only what it can carry (the house's lean on Imago's two lane questions, #22) ─────────────
+// ───────────── a lane owes only what it can carry (the two lane questions left open in #22 comment 6355747725) ─────────────
 
 /** Another connection of `f`'s principal on the same App, with a host that accepts, or refuses deliveries while `refuse.value`. */
 async function secondLane(f: Awaited<ReturnType<typeof bareLane>>, connection: string, grant: string[]) {
@@ -2684,7 +2684,7 @@ const NO_PUSH = FULL_GRANT.filter((c) => c !== 'pushEvents');
 
 test("a connection that can't carry a session owes it nothing, so another connection of the principal moves the cursor past what it delivers", { timeout: 30_000 }, async () => {
   // Owed on lineage alone, each completion the second connection could only push into a refusal pinned the first
-  // connection's cursor, and its owed set grew for as long as it lived (Imago's question on #22, comment 6355747725).
+  // connection's cursor, and its owed set grew for as long as it lived (the question left open in #22 comment 6355747725).
   const f = await bareLane('nc-push');
   try {
     await f.app.sessionOpen(f.caller, { id: 'nc' });
@@ -2719,7 +2719,9 @@ test("a completion refused on a channel that then closed doesn't hold the cursor
       await until(() => sentAbout(g.sent, runId).length >= 1 && sentAbout(f.sent, runId).length >= 1, 5000, 'the completion sent on both connections and refused');
       await until(() => [...(g.inside.states.get('lc')?.retries.values() ?? [])].some((x) => x.kind === 'run'), 5000, "the channel's refusal retried");
       g.lane.closeChannel('terminal:lc');
-      await sleep(800); // the channel's retry fires with nothing to carry it on
+      // The channel's retry fires with nothing to carry it on and goes: waited on, not timed, since fired late its
+      // entry could still stand when the last wait below passed.
+      await until(() => ![...(g.inside.states.get('lc')?.retries.values() ?? [])].some((x) => x.kind === 'run'), 5000, "the channel's retry to fire with nothing to carry it on and go");
       f.refuse.value = false;
       const end = s.run(runId).seq.end!;
       await until(() => s.cursorsOf(A).delivered >= end, 5000, 'pushed again and accepted: the cursor passes it, the closed channel counting for nothing');
@@ -2775,7 +2777,7 @@ test("a completion queued on a channel that closed before it went out leaves no 
 test("a retry that fired onto a channel closed before its flush leaves neither the debt nor the retry", { timeout: 20_000 }, async () => {
   // Fired with the lane carrying, a retry keeps its entry, with no timer, until an answer settles it. Sent back from
   // the batch to the refused settle when the channel closed before the flush, that entry still counted as carrying
-  // the seq, so the debt stayed, and the entry could never fire again (Abigail-2459's read of the drops).
+  // the seq, so the debt stayed, and the entry could never fire again (an independent read of the lane fixes, #22 comment 6376365550).
   const f = await bareLane('rf');
   try {
     await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
@@ -2816,7 +2818,7 @@ test("a debt owed only while a channel was open, which no catch-up finds owed af
   // Another principal's completion is owed only on an open channel. Refused there, its retry's timer then found the
   // channel closed, and the debt stayed: kept at a grant's regain above `delivered`, it was never owed again by the
   // catch-up, scanning with the channel closed, and once the lane counted again it held the cursor below it for good
-  // (Abigail-2459's read of the regain).
+  // (an independent read of the lane fixes, #22 comment 6376365550).
   const f = await bareLane('oo-a');
   try {
     await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
@@ -2829,7 +2831,7 @@ test("a debt owed only while a channel was open, which no catch-up finds owed af
     const r = await f.app.run(other, { session: 'oo', command: 'echo theirs', target: 'process', wait: 0 });
     await until(() => [...(f.inside.states.get('oo')?.retries.values() ?? [])].some((x) => x.kind === 'run'), 5000, 'their completion refused on the channel and retried');
     f.lane.closeChannel('terminal:oo');
-    await sleep(800); // the retry fires with nothing to carry it on
+    await until(() => ![...(f.inside.states.get('oo')?.retries.values() ?? [])].some((x) => x.kind === 'run'), 5000, 'the retry to fire with nothing to carry it on and go');
     f.refuse.value = false;
     const end = s.run(r.runId!).seq.end!;
     await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
@@ -2843,7 +2845,7 @@ test("a debt owed only while a channel was open, which no catch-up finds owed af
 test("a connection that couldn't carry a session regains it as its channel's open begins: a completion the open finishes settled doesn't lift the cursor past one it no longer owed", { timeout: 20_000 }, async () => {
   // Owing nothing while it could not carry the session, the lane has no floor there: without the pin, the first
   // settle after the open would lift `delivered` past the earlier completion before any catch-up pinned the session
-  // (Abigail-2459's read of the house's lean on #22's shared cursor).
+  // (an independent read of the lane fixes, #22 comment 6376365550).
   const d = await daemon();
   try {
     const a = await d.host('ta', 'rg-a', { grant: NO_PUSH });
