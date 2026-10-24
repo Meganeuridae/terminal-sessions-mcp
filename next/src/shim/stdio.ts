@@ -381,6 +381,10 @@ async function checkSupervisor(): Promise<Supervisor> {
       // start uses (the house's read of 4860d4c..bc4bc85, #22).
       return withNext(managed(`the systemd user unit termd (${from})`, unit), r, prop, changed);
     }
+    // With a daemon-reload pending, systemctl shows the loaded text, while the next login reads the file on disk: read as
+    // the next start's, the loaded text named what that start may not take, and a termd was started on it (see nextText;
+    // the house's review of bc4bc85..5d8ce0e, #22).
+    if (prop('NeedDaemonReload') === 'yes') return { kind: 'unknown', why: "the systemd user unit termd's file on disk awaits a daemon-reload, so systemctl shows the loaded text, not the file the next login reads, and the port and data dir its next start takes are unknown (systemctl --user daemon-reload reads it)" };
     const text = await managerUnit(r, prop);
     if ('why' in text) return { kind: 'unknown', why: text.why };
     const from = proc ? `its environment read from the user manager's, as its running termd's, pid ${pid}, could not be: ${proc.error}${notAsked}` : "its environment read from the user manager's, as no termd of it runs";
