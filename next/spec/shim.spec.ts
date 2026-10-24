@@ -1541,6 +1541,8 @@ test('the shim does not substitute a credential from another address family', as
     for (const [name, address] of [
       ['legacy-url', { TSM_URL: '', SESSION_SERVER_URL: `ws://127.0.0.1:${d.port}`, TSM_TOKEN: 'tok-2x', SESSION_SERVER_TOKEN: '' }],
       ['current-url', { TSM_URL: `ws://127.0.0.1:${d.port}`, SESSION_SERVER_URL: '', TSM_TOKEN: '', SESSION_SERVER_TOKEN: 'tok-1x' }],
+      ['current-url-with-current-token', { TSM_URL: `ws://127.0.0.1:${d.port}`, SESSION_SERVER_URL: '', TSM_TOKEN: 'incorrect', SESSION_SERVER_TOKEN: 'tok-1x' }],
+      ['current-url-with-query-token', { TSM_URL: `ws://127.0.0.1:${d.port}/?token=incorrect`, SESSION_SERVER_URL: '', TSM_TOKEN: '', SESSION_SERVER_TOKEN: 'tok-1x' }],
     ] as const) {
       const s = shim({ ...address, TSM_CONNECT_TIMEOUT_MS: '900' });
       try {
@@ -1553,7 +1555,13 @@ test('the shim does not substitute a credential from another address family', as
         if (name === 'legacy-url') {
           assert.match(said, /SESSION_SERVER_URL.*TSM_TOKEN.*not sent/, 'the mixed settings explain why no credential was sent');
           assert.match(said, /TSM_URL.*SESSION_SERVER_TOKEN/, 'the note gives both ways to pair this address and token');
+        } else if (name === 'current-url') {
+          assert.match(said, /SESSION_SERVER_TOKEN.*not sent/, 'the current address names the withheld 1.x token');
+          assert.match(said, /TSM_TOKEN.*SESSION_SERVER_URL/, 'the note gives both ways to pair this address and token');
+        } else {
+          assert.doesNotMatch(said, /SESSION_SERVER_TOKEN.*not sent/, `${name}: a credential was sent, so the mismatch note would be false`);
         }
+        assert.doesNotMatch(said, /tok-1x|incorrect/, `${name}: diagnostics name settings, not credential values`);
       } finally {
         if (s.child.exitCode === null && s.child.signalCode === null) s.child.kill();
         await s.exited;

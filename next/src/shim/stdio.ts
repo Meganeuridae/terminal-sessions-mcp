@@ -790,7 +790,12 @@ const seconds = (since: number) => (Math.round((clocks.monotonic() - since) / 10
 /** Say what a refused upgrade means (the ws library reports only the status). */
 function explain(message: string): string {
   const status = /Unexpected server response: (\d+)/.exec(message)?.[1];
-  if (status === '401') return `the daemon refused this credential (401): ask its operator for a valid ${chosen.from ? 'SESSION_SERVER_TOKEN' : 'TSM_TOKEN'} for this address`;
+  if (status === '401') {
+    if (!chosen.from && setting('SESSION_SERVER_TOKEN') && chosen.token === undefined && !url.searchParams.has('token')) {
+      return 'the daemon refused this connection (401): SESSION_SERVER_TOKEN belongs to a 1.x address and was not sent here. Ask its operator for a valid TSM_TOKEN for this address, or select the 1.x daemon with SESSION_SERVER_URL and leave TSM_URL unset';
+    }
+    return `the daemon refused this credential (401): ask its operator for a valid ${chosen.from ? 'SESSION_SERVER_TOKEN' : 'TSM_TOKEN'} for this address`;
+  }
   if (status === '403') return 'the daemon refused this connection (403): ask its operator to check the configured URL, proxy and Origin policy before retrying';
   if (status === '421') return 'the daemon does not serve this Host (421): ask its operator for a served URL; remove a trailing dot if present. For another valid name, configure --allow-host and restart the running daemon';
   if (status === '429') return 'the daemon refused another connection (429): wait until capacity is available, then retry';

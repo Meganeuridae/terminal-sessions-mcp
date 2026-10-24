@@ -474,20 +474,20 @@ async function ask(argv: string[], syntax: Parsed): Promise<void> {
   });
   // A socket that closes (or fails) before the answer settles every pending call as an error:
   // `tsm run build 'npm test' && ./deploy` must not deploy when the daemon died mid-run (jr-18).
-  const failAll = () => {
-    lost ??= new Error(toolSent
+  const failAll = (detail?: string) => {
+    lost ??= new Error((toolSent
       ? `daemon connection to ${url.origin} ended before a result; the outcome is unknown. After reconnecting, inspect retained journal events with tsm read <session> --as events --since 0 (page forward), or await a known Run with tsm await <runId>. If the outcome stays unclear, ask the daemon operator before resubmitting work. On a retry of an originally keyed call, reuse its --idempotency-key; reuse alone is no guarantee because retention is bounded.`
-      : `daemon connection to ${url.origin} ended during setup; no command was sent. Reconnect and retry this command; ask the daemon operator if it remains unavailable.`);
+      : `daemon connection to ${url.origin} ended during setup; no command was sent. Reconnect and retry this command; ask the daemon operator if it remains unavailable.`) + (detail ? ` (${detail})` : ''));
     for (const p of pending.values()) p.reject(lost);
     pending.clear();
   };
   await new Promise<void>((resolve, reject) => {
     ws.once('open', () => resolve());
     // A stray word is a usage error before it is a connection problem: said even when no daemon answers.
-    ws.once('error', (e) => reject(new Error(syntax.stray !== undefined ? strayHint(cmd, syntax.stray, undefined) : connectError(url, e.message))));
+    ws.once('error', (e) => reject(new Error(syntax.stray !== undefined ? strayHint(cmd, syntax.stray, undefined) : connectError(url, e))));
   });
-  ws.on('error', () => failAll());
-  ws.on('close', () => failAll());
+  ws.on('error', (e) => failAll((e as NodeJS.ErrnoException).code));
+  ws.on('close', (code) => failAll(`close ${code}`));
   await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'tsm', version: '0' } });
   // The daemon's schema for the tool says what each flag's value is (see coerce); a daemon that
   // lists nothing leaves the values to their look.
@@ -518,15 +518,16 @@ async function ask(argv: string[], syntax: Parsed): Promise<void> {
 }
 
 /** What a refused or failed connect means, in words (ux-18): the ws library reports only the status. */
-function connectError(url: URL, message: string): string {
-  const status = /Unexpected server response: (\d+)/.exec(message)?.[1];
+function connectError(url: URL, failure: Error): string {
+  const status = /Unexpected server response: (\d+)/.exec(failure.message)?.[1];
   const at = `the daemon at ${url.origin}`;
   if (status === '401') return `${at} refused this credential (401). Ask its operator for a valid token for this address; set TSM_TOKEN to that token or use the URL they provide.`;
   if (status === '403') return `${at} refused this connection (403). Ask its operator to check the URL, proxy and Origin policy before retrying.`;
   if (status === '421') return `${at} does not serve Host ${url.host} (421). Ask its operator for a served URL. If the Host ends in a dot, remove that dot; to serve another valid name, have the operator add --allow-host <name> to the running daemon configuration and restart it.`;
   if (status === '429') return `${at} reached its per-principal connection limit (429). Close idle connections using the same token or local identity, then retry. Ask its operator to free connections held by other clients.`;
   if (status === '503') return `${at} is unavailable or at its connection limit (503). Wait until it is available, then retry.`;
-  return `cannot reach ${at}. Ask its operator to check the URL and whether the daemon is running before retrying.`;
+  const code = (failure as NodeJS.ErrnoException).code;
+  return `cannot reach ${at}. Ask its operator to check the URL and whether the daemon is running before retrying.${typeof code === 'string' ? ` (${code})` : ''}`;
 }
 
 main().catch((e: unknown) => end(1, e instanceof Error ? e.message : String(e), process.stderr));

@@ -139,7 +139,8 @@ test('a connection lost during initialization says the command was not sent', as
     const r = await tsm(['run', 'build', 'echo never-sent'], { TSM_URL: `ws://127.0.0.1:${port}` });
     assert.equal(r.code, 1);
     assert.match(r.stderr, /no command was sent/i);
-    assert.doesNotMatch(r.stderr, /outcome is unknown|\(1006\)/, 'a pre-command drop does not claim an unknown command result');
+    assert.doesNotMatch(r.stderr, /outcome is unknown/, 'a pre-command drop does not claim an unknown command result');
+    assert.match(r.stderr, /no command was sent.*\(close 1006\)/s, 'the diagnostic keeps the close code after the advice');
   } finally {
     await new Promise<void>((resolve) => wss.close(() => resolve()));
   }
@@ -167,6 +168,7 @@ test('jr-18: tsm exits 1 with a message when the daemon connection closes before
     assert.equal(sawToolCall, true, 'the fake daemon received the command before the connection failed');
     assert.equal(r.code, 1, `exit ${String(r.code)}; stdout=${r.stdout}`);
     assert.match(r.stderr, /outcome is unknown/);
+    assert.match(r.stderr, /\(close 1006\)/, 'the uncertain-result advice keeps the close code');
     assert.match(r.stderr, /tsm read <session> --as events --since 0.*tsm await <runId>/i, 'a lost response names journal and known-run checks before retrying');
     assert.match(r.stderr, /original.*--idempotency-key.*retention is bounded/i, 'a keyed retry needs the original key and a retention warning');
     assert.match(r.stderr, /outcome stays unclear.*ask.*operator.*before resubmitting/i, 'uncertain mutating work asks for help rather than repeating');
@@ -651,7 +653,8 @@ test('without a daemon, only what the syntax alone can tell is said: a stray wor
   const absent = await tsm(['sessions'], env);
   assert.equal(absent.code, 1);
   assert.match(absent.stderr, /ask.*operator.*URL/i, 'an unreachable daemon has a next step');
-  assert.doesNotMatch(absent.stderr, /ECONNREFUSED|AggregateError/, 'the agent sees advice instead of library details');
+  assert.match(absent.stderr, /Ask its operator.*\(ECONNREFUSED\)/, 'the advice keeps the socket code for diagnosis');
+  assert.doesNotMatch(absent.stderr, /AggregateError/, 'the agent does not see a raw library error');
 });
 
 test('an empty TSM_URL is unset: the default daemon address is dialled', async (t) => {
