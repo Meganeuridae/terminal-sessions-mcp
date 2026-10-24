@@ -1046,3 +1046,28 @@ test('a head kept to maxLines counts what it dropped as omitted: the lines fed i
   // Nothing dropped, nothing omitted.
   assert.deepEqual(await project([{ data: 'a\nb\nc', stream: 'stdout' }], { cols: 80, rows: 24, keep: 'head', maxLines: 3 }), { text: 'a\nb\nc', truncated: false, omittedInputBytes: 0 });
 });
+
+test('a live Run’s text tells rows its projection lost apart from what a cut omitted, as history’s does', async () => {
+  // The completion's spec stood a mock in for runTranscript, and the case above reads history's journalRunText, so the
+  // live session's own `omitted` and `lost` went untested (the house's review of bc4bc85..5d8ce0e, PR #22).
+  const h = await scriptedSession();
+  try {
+    const a = h.session.admit({ target: 'shell', line: 'echo hello', principal: 'agent:a@test' });
+    assert.ok(a.admitted);
+    await h.session.awaitRun(a.run.runId, 1000);
+    // The region case above, as the Run's read returns it: a hole's line end scrolls rows out of the margins.
+    const region = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6';
+    const out = (seq: number, data: string): JournalEvent => ({ seq, ts: 0, type: 'output', stream: 'pty', runId: a.run.runId, data });
+    const gap = { seq: 6, ts: 0, type: 'gap', from: 2, to: 4, reason: 'store-error' } as Extract<JournalEvent, { type: 'gap' }>;
+    // `cut` stands for a read a byte cap cut short, where a build marks that apart from retention's.
+    const read = (truncated: boolean) => () => ({ events: [out(1, region), out(5, 'X\r\n')], from: 1, to: 5, truncated, ...(truncated ? { cut: true as const } : {}), gaps: [gap] });
+    h.session.runOutput = read(false);
+    const lost = await h.session.runTranscript(a.run.runId);
+    assert.deepEqual([lost.truncated, lost.omitted, lost.lost], [true, undefined, true], `rows lost, nothing omitted: ${JSON.stringify(lost)}`);
+    h.session.runOutput = read(true);
+    const both = await h.session.runTranscript(a.run.runId);
+    assert.deepEqual([both.truncated, both.omitted, both.lost], [true, true, true], `a range cut short as well: ${JSON.stringify(both)}`);
+  } finally {
+    await h.session.close();
+  }
+});
