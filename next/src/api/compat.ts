@@ -179,10 +179,12 @@ const START = startMark();
 const PROBE_ECHO = probeEcho();
 /**
  * How far below its echo's line a probe's answer can come: on the next line, or under `set -x` after the probe's
- * own trace, two lines in bash and zsh (the pid's command substitution, then the printf) and one in fish. A
+ * own trace, two lines in bash and zsh (the pid's command substitution, then the printf) and one in fish, and four
+ * in bash's restricted mode, which traces the `exec` it refuses, prints its refusal of the redirect, then traces the
+ * fallback's `echo` and the printf (the house's review of bc4bc85..5d8ce0e, PR #22, by run in bash 5.2.37). A
  * search's lines end only where the output's do, never at the terminal's width.
  */
-const PROBE_ANSWER_LINES = 3;
+const PROBE_ANSWER_LINES = 5;
 
 /**
  * The lines a probe line's echo spans, by index in `lines`, each with the length of its head that stays: found by

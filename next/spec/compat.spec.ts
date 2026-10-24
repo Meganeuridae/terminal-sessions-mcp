@@ -1081,7 +1081,7 @@ test("searchLogs judges a probe answered as tailLogs does: an answered probe's p
   }
 });
 
-test("searchLogs judges a probe answered when its own `set -x` trace stands between its echo and its answer, whatever context is asked (the house's review of 4860d4c..bc4bc85, PR #22)", { skip: !fs.existsSync('/bin/bash') }, async () => {
+test("searchLogs judges a probe answered when its own `set -x` trace stands between its echo and its answer, in bash and in its restricted mode, whatever context is asked (the house's review of 4860d4c..bc4bc85, PR #22)", { skip: !fs.existsSync('/bin/bash') }, async () => {
   // A line of context reached bash's trace of the probe's pid substitution and no further, so the prompt the answered
   // probe was typed after came back as a hit at context 0 and 1 (by run, bash 5.2.37).
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'compat-search-traced-'));
@@ -1097,14 +1097,20 @@ test("searchLogs judges a probe answered when its own `set -x` trace stands betw
     if (live?.kind !== 'live') throw new Error('no live session');
     // The probe as a declared shell's inline strategy types it, and bash's own trace of it: the substitution, then the printf.
     const probe = inlineProbe('n1nce', false).trimStart();
-    const traced = execFileSync('/bin/sh', ['-c', 'exec "$0" -c "$1" 2>&1', '/bin/bash', `set -x; ${probe}`], { encoding: 'utf8' }).replace(/\n/g, '\r\n');
+    const traceOf = (flags: string[]) => execFileSync('/bin/sh', ['-c', 'exec "$0" "$@" 2>&1', '/bin/bash', ...flags, '-c', `set -x; ${probe}`], { encoding: 'utf8' }).replace(/\n/g, '\r\n');
+    const traced = traceOf([]);
     // Two trace lines before the answer (`++ exec /bin/sh -c 'echo $PPID'`, `+ printf …` in bash 5.2): its answer is the third.
     assert.ok(/^[^\r\n]+\r\n[^\r\n]+\r\n<<<PROBE:n1nce:\d+:>>>\r\n$/.test(traced), `bash's trace: ${JSON.stringify(traced)}`);
-    live.session.journal.append({ type: 'output', data: `\r\nmyhost$ ${probe}\r\n${traced}myhost$ ok\r\n`, stream: 'pty' });
+    // In bash's restricted mode, four in bash 5.2.37: the refused exec's trace, its refusal of the redirect, the fallback's
+    // `echo`, the printf's; the answer is the fifth, as far below the echo as a search looks (the house's review of
+    // bc4bc85..5d8ce0e, PR #22, by run).
+    const restricted = traceOf(['-r']);
+    assert.ok(/^(?:[^\r\n]*\r\n){1,4}<<<PROBE:n1nce:\d+:>>>\r\n$/.test(restricted), `restricted bash's trace: ${JSON.stringify(restricted)}`);
+    live.session.journal.append({ type: 'output', data: `\r\nmyhost$ ${probe}\r\n${traced}myhost$ ok\r\nmyhost$ ${probe}\r\n${restricted}myhost$ ok2\r\n`, stream: 'pty' });
     for (const context of [0, 1, 3]) {
       const hits = (await call('searchLogs', { session: 'st', pattern: 'myhost', context })) as Array<{ line: string; context: string[] }>;
-      assert.deepEqual(hits.map((h) => h.line), ['myhost$ ok'], `context ${context}: ${JSON.stringify(hits)}`);
-      assert.ok(hits[0]!.context.length <= 2 * context + 1, `context ${context}: ${JSON.stringify(hits[0]!.context)}`);
+      assert.deepEqual(hits.map((h) => h.line), ['myhost$ ok', 'myhost$ ok2'], `context ${context}: ${JSON.stringify(hits)}`);
+      for (const h of hits) assert.ok(h.context.length <= 2 * context + 1, `context ${context}: ${JSON.stringify(h.context)}`);
     }
   } finally {
     await registry.closeAll();
