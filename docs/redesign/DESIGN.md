@@ -622,17 +622,7 @@ and `screen` keep working on whatever program is in front.
 
 ### 8.1 Shell target
 
-Wait for the shell terminal to be available (G4); write the command to a file and type
-` . '<dir>/tsm-cmd-N'` (G6); correlate the `C` whose command line is that one, and the
-following `D`, to this `runId`; the result's output is the transcript and raw decoded text between
-`C` and `D`, attributed temporally (G12); the exit is `D`'s payload. The command directory is
-a short private `/tmp/tsm-<uid>/<hash>` (checked to be ours and closed to others, falling
-back to the session's own directory), because the typed line is echoed at the prompt and
-shows in transcripts and screens. A partial line a human abandoned in the editor goes stale
-after 30 s and is cleared before the daemon's line. Cwd and environment effects persist;
-this is the target for `cd`, `export`, virtualenv activation, shell functions, and any
-program that needs a terminal. A human typing at the prompt produces the same marks and the
-same Run, with `origin: human`.
+Wait for the shell terminal to be available (G4); write the command to a file and type ` . '<dir>/tsm-cmd-N'` (G6); correlate the `C` whose command line is that one, and the following `D`, to this `runId`; the result's output is the transcript and raw decoded text between `C` and `D`, attributed temporally (G12); the exit is `D`'s payload. The command file stays in `<dataDir>/sessions/<name>/shell/`, a real daemon-owned 0700 directory checked before the shell starts and shared by the daemon's write and the shell's later source. Shell integration identifies daemon commands by the final `tsm-cmd-N` filename, not the parent directory's text. The longer source path may wrap on the live screen. Run output and retained history omit its echoed line. That live-screen readability cost is accepted in exchange for one per-session source path. Direct Session callers supply their own private per-session `tempDir`, which Session checks before spawning. A partial line a human abandoned in the editor goes stale after 30 s and is cleared before the daemon's line. Cwd and environment effects persist; this is the target for `cd`, `export`, virtualenv activation, shell functions, and any program that needs a terminal. A human typing at the prompt produces the same marks and the same Run, with `origin: human`.
 
 *Fallback strategy* (`integration: none`): PR #7's mechanism — the command file plus
 `; { printf '%s:%s>>>\n' "<<<EXI""T:<nonce>" "$?"; } 2>/dev/null` on the same line, resolved by
@@ -1317,7 +1307,7 @@ through the editor is changed by history expansion and completion, so every daem
 a command file; hosts publish an agent's replies to the channel that woke it; a user's rc
 can load another terminal's shell integration (Ghostty), hence keyed marks; the manifest
 digest forbids `=` in declared identifiers, hence bare tag classes for statuses; a
-`/tmp` directory can vanish under a cleaner, hence the command directory's fallback.
+private session shell directory keeps the same command source path through the daemon's write and the shell's read.
 
 **Review round (2026-10-13).** An external review of the draft PR tried combinations of
 failures rather than single edge cases, and found five places where a heuristic had become

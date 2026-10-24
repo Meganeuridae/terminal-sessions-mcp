@@ -7,7 +7,6 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
@@ -137,10 +136,6 @@ const seqsOnDisk = (dir: string) =>
 const cleanup = async (...rigs: Rig[]) => {
   for (const r of rigs) await r.reg.closeAll();
   const dir = rigs[0]!.dir;
-  // Command directories live in /tmp, outside the data dir (jr2-12).
-  for (const id of fs.readdirSync(path.join(dir, 'sessions'))) {
-    fs.rmSync(path.join(`/tmp/tsm-${process.getuid!()}`, createHash('sha256').update(`${path.resolve(dir)}\0${id}`).digest('hex').slice(0, 8)), { recursive: true, force: true });
-  }
   fs.rmSync(dir, { recursive: true, force: true });
 };
 
@@ -432,13 +427,14 @@ test('sec-9/G26: the data layout is private: sessions 0700, session.json and jou
   const mode = (p: string) => fs.statSync(path.join(r.dir, p)).mode & 0o777;
   assert.equal(mode('sessions'), 0o700);
   assert.equal(mode('sessions/m'), 0o700);
+  assert.equal(mode('sessions/m/shell'), 0o700);
   assert.equal(mode('sessions/m/session.json'), 0o600);
   assert.equal(mode('sessions/m/journal.jsonl'), 0o600);
   await r.reg.closeAll();
   for (const p of ['sessions', 'sessions/m']) fs.chmodSync(path.join(r.dir, p), 0o755);
   for (const p of ['sessions/m/session.json', 'sessions/m/journal.jsonl']) fs.chmodSync(path.join(r.dir, p), 0o644);
   const r2 = restart(r);
-  assert.deepEqual(['sessions', 'sessions/m', 'sessions/m/session.json', 'sessions/m/journal.jsonl'].map(mode), [0o700, 0o700, 0o600, 0o600]);
+  assert.deepEqual(['sessions', 'sessions/m', 'sessions/m/shell', 'sessions/m/session.json', 'sessions/m/journal.jsonl'].map(mode), [0o700, 0o700, 0o700, 0o600, 0o600]);
   await cleanup(r2, r);
 });
 

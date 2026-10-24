@@ -7,8 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import type { ScriptedProcess } from '../src/backends/scripted.js';
 import { configuredEnv, redactSnapshot } from '../src/core/env.js';
 import { CLEAR_LINE_KEYS } from '../src/core/marks.js';
@@ -461,15 +460,27 @@ test('core-15: a synchronous throw from the backend\'s spawnProcess ends the Run
   await h.session.close();
 });
 
-test('core-16: a temp-file failure ends the Run lost with the reason and leaves the shell available', async () => {
-  const h = await harness({ tempDir: path.join(os.tmpdir(), 'tsm-no-such-dir-for-test', String(process.pid)) });
-  const a = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT });
-  assert.ok(a.admitted);
-  const r = h.session.run(a.run.runId);
-  assert.equal(r.state, 'lost');
-  assert.match(r.reason ?? '', /^temp-file: ENOENT/);
-  assert.ok(h.session.shellAvailable().ok);
-  await h.session.close();
+test('core-16: a command-file write failure ends the Run lost with the reason and leaves the shell available', async () => {
+  const h = await harness();
+  const fsc = createRequire(import.meta.url)('node:fs') as typeof fs;
+  const open = fsc.openSync;
+  try {
+    fsc.openSync = ((file: fs.PathLike, flags: string | number, mode?: fs.Mode) => {
+      if (String(file).includes('tsm-cmd-')) throw Object.assign(new Error('EIO: command file could not be opened'), { code: 'EIO' });
+      return open(file, flags, mode);
+    }) as typeof fs.openSync;
+    syncBuiltinESMExports();
+    const a = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT });
+    assert.ok(a.admitted);
+    const r = h.session.run(a.run.runId);
+    assert.equal(r.state, 'lost');
+    assert.match(r.reason ?? '', /^temp-file: EIO/);
+    assert.ok(h.session.shellAvailable().ok);
+  } finally {
+    fsc.openSync = open;
+    syncBuiltinESMExports();
+    await h.session.close();
+  }
 });
 
 test('G28: awaitRun records the waiting principal until its waiter resolves; run.end is journaled while it is recorded', async () => {

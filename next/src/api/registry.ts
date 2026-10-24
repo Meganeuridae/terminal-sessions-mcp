@@ -19,7 +19,6 @@
  * beside its journal, so a new life — after the shell ended, or after a
  * restart — is the session it was.
  */
-import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ExecutionBackend } from '../backends/types.js';
@@ -29,7 +28,7 @@ import { err, TermError } from '../core/errors.js';
 import { Journal, reservationHonoured, type JournalOptions } from '../core/journal.js';
 import { acquireDataDirLock, groupAlive, listProcesses, sleepSync, type DataDirLock, type ProcessRow } from '../core/lock.js';
 import { RunIndex, type RunOutput, type RunOutputRange } from '../core/runindex.js';
-import { Session, trustedDir, type SessionOptions } from '../core/session.js';
+import { Session, assertPrivateSessionDir, type SessionOptions } from '../core/session.js';
 import { FileStore, FreeSpaceFloor, MemoryStore, syncDir, type DiskFloor, type DurableWrite, type FileStoreOptions, type Retention, writeDurably } from '../core/stores.js';
 import { DEFAULT_GEOMETRY, SYSTEM, type ControlPolicy, type Cursors, type JournalEvent, type Principal, type RunInfo, type Seq, type Visibility } from '../core/types.js';
 import { prepareIntegration } from '../shell/integration.js';
@@ -564,12 +563,12 @@ export class SessionRegistry {
       journal.close();
       // No events, no open Runs and no reservation above them: nothing to recover. Past its retention (every
       // file aged out), the files go.
-      if (gone) this.removeFiles(id, dir);
+      if (gone) this.removeFiles(dir);
       return undefined;
     }
     // Nothing runs under this name now: a dead life's command files (command text, env captures) go (jr2-12,
     // G26) — from a session past its retention too, which is kept when its Runs' groups go unjudged.
-    removeLeftovers(this.opts.dataDir, id, dir);
+    removeLeftovers(dir);
     return { id, dir, store, meta, retention, journal, last, lastAliveTs, gone };
   }
 
@@ -582,7 +581,7 @@ export class SessionRegistry {
     if (r.gone && !unjudged) {
       // Past its retention: the whole session expires (G21, G26), now that its Runs' groups are ended.
       journal.close();
-      this.removeFiles(id, dir);
+      this.removeFiles(dir);
       return;
     }
     if (r.gone) this.opts.log?.('warn', "a session past its retention is kept: no process listing answered, so its Runs' process groups are not judged; a recovery that can list processes judges them, and the session expires after that", { session: id });
@@ -1075,10 +1074,9 @@ export class SessionRegistry {
         rows: options.rows!,
         backend: this.opts.backend,
         journal,
-        // The shell's own files (its history, env captures) live apart from the journal's;
-        // command files go to a short private directory, since each is echoed at the prompt.
+        // The shell's own files (command text, history, env captures) live together
+        // in its private per-session directory, apart from the journal.
         tempDir: shellDir(dir),
-        commandDir: commandDir(this.opts.dataDir, id, shellDir(dir)),
         // Delivery cursors continue across lives and restarts (G22); the book persists them.
         cursors: cursors.snapshot(),
         onCursors: (p, c) => cursors.set(p, c),
@@ -1307,7 +1305,7 @@ export class SessionRegistry {
   /** A history entry and its files go. */
   private drop(slot: Slot, view: HistoryEntry): void {
     view.journal.close();
-    this.removeFiles(slot.id, slot.dir);
+    this.removeFiles(slot.dir);
     // Only once its files are gone: cancelled before a removal that then failed, the book stayed cancelled in a
     // slot that stayed, and every later life of the name wrote no cursors (the house's review of 4f4c067..a8b6f28,
     // PR #22). Nothing runs between the synchronous removal and this, so a forgotten life's late settlement is
@@ -1318,10 +1316,9 @@ export class SessionRegistry {
     this.emit({ type: 'removed', id: slot.id });
   }
 
-  /** A name's files: its session directory and its command directory (command text, G26). */
-  private removeFiles(id: string, dir: string): void {
+  /** A name's files, including private shell command text (G26). */
+  private removeFiles(dir: string): void {
     fs.rmSync(dir, { recursive: true, force: true });
-    removeCommandDir(this.opts.dataDir, id);
   }
 
   private async closeLive(slot: Slot, o: { graceful?: boolean; reason?: string; persist: boolean }): Promise<void> {
@@ -1694,51 +1691,8 @@ function writeMeta(dir: string, meta: Meta): DurableWrite {
 function shellDir(dir: string): string {
   const d = path.join(dir, 'shell');
   fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  assertPrivateSessionDir(d);
   return d;
-}
-
-const uid = (): number | undefined => (typeof process.getuid === 'function' && process.platform !== 'win32' ? process.getuid() : undefined);
-
-/** `/tmp/tsm-<uid>/<8 hex>` for a name: the path only, nothing created. */
-function commandDirPath(dataDir: string, id: string, u: number): { base: string; dir: string } {
-  const base = `/tmp/tsm-${u}`;
-  return { base, dir: path.join(base, createHash('sha256').update(`${path.resolve(dataDir)}\0${id}`).digest('hex').slice(0, 8)) };
-}
-
-
-/**
- * A short private directory for a session's command files, `/tmp/tsm-<uid>/<8 hex>`: the
- * daemon types ` . '<dir>/tsm-cmd-N'` for every Run and the shell echoes it at the prompt,
- * so transcripts and screens stay readable with a short path. Trusted only when it is a real
- * directory owned by us and closed to others (as tmux checks its socket directory);
- * otherwise `fallback` (the session's own directory).
- */
-function commandDir(dataDir: string, id: string, fallback: string): string {
-  const u = uid();
-  if (u === undefined) return fallback;
-  const trusted = (d: string): boolean => {
-    try {
-      fs.mkdirSync(d, { mode: 0o700 });
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') return false;
-    }
-    return trustedDir(d, u);
-  };
-  const { base, dir } = commandDirPath(dataDir, id, u);
-  return trusted(base) && trusted(dir) ? dir : fallback;
-}
-
-/** Remove a name's command directory when it is ours to remove; never creates anything (jr2-12). */
-function removeCommandDir(dataDir: string, id: string): void {
-  const u = uid();
-  if (u === undefined) return;
-  const { base, dir } = commandDirPath(dataDir, id, u);
-  if (!trustedDir(base, u) || !trustedDir(dir, u)) return;
-  try {
-    fs.rmSync(dir, { recursive: true, force: true });
-  } catch {
-    // a cleaner got there first
-  }
 }
 
 /**
@@ -1746,11 +1700,11 @@ function removeCommandDir(dataDir: string, id: string): void {
  * command files, which hold command text, and env captures (G26). The session's own shell
  * history stays: it is the session's.
  */
-function removeLeftovers(dataDir: string, id: string, dir: string): void {
-  removeCommandDir(dataDir, id);
+function removeLeftovers(dir: string): void {
   const shell = path.join(dir, 'shell');
   let names: string[];
   try {
+    assertPrivateSessionDir(shell);
     names = fs.readdirSync(shell);
   } catch {
     return;

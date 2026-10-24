@@ -7,7 +7,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { hasShell, realSession } from './fake-shell.js';
 
@@ -183,21 +182,6 @@ test('/bin/bash: shell-10: after a bind -x widget at the prompt, the next daemon
     assert.equal(r.state, 'exited', JSON.stringify(r));
     assert.equal(r.text, 'after');
     assert.equal(r.line, 'echo after');
-  } finally {
-    await x.close();
-  }
-});
-
-test('/bin/bash: a command directory that disappears (a /tmp cleaner) never costs a Run: the session falls back to its own directory', async () => {
-  const cmd = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cmddir-'));
-  const x = await realSession('/bin/bash', { commandDir: cmd });
-  try {
-    assert.equal((await x.run('echo first')).text, 'first');
-    fs.rmSync(cmd, { recursive: true, force: true });
-    const r = await x.run('echo after-cleanup');
-    assert.equal(r.state, 'exited', `${r.state} ${r.reason ?? ''}`);
-    assert.equal(r.text, 'after-cleanup');
-    assert.ok(!fs.existsSync(cmd), 'the vanished directory is not recreated');
   } finally {
     await x.close();
   }

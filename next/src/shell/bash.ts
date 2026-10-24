@@ -3,6 +3,12 @@
  *
  * Written as a template literal: `$\{` below is the shell's `${`, `\\` is one backslash.
  */
+// HISTIGNORE globs cannot require an all-digit final component without extglob, which we do not set in the user's shell.
+// A JS command-file counter has at most 16 decimal digits, so enumerate those basename lengths.
+const commandHistoryPatterns = Array.from({ length: 16 }, (_, n) => {
+  const digits = '[0-9]'.repeat(n + 1);
+  return [` . '*/tsm-cmd-${digits}'`, ` . 'tsm-cmd-${digits}'`];
+}).flat().join(':');
 export const BASH_RC = `__tsm_st0=$?
 # --- tsm shell integration (bash) --- generated; do not edit
 #
@@ -163,14 +169,22 @@ __tsm_restore() {
 # always BASH_COMMAND: it is exactly what the daemon matches, whatever the history
 # numbers say (a bind -x widget on bash 3.2, which has no READLINE_LINE to tell it
 # apart from a line, leaves them stale).
+# Only a sourced command file's final path component is daemon plumbing. The directory may
+# itself contain the same text, and a user's ordinary sourced file still belongs in history.
+__tsm_own_file() {
+  local __t=$1 __f
+  __t=$\{__t#"$\{__t%%[! ]*}"}
+  case $__t in ". '"*"'") ;; *) return 1 ;; esac
+  __f=$\{__t#". '"}
+  __f=$\{__f%"'"}
+  [[ $\{__f##*/} =~ ^tsm-cmd-[0-9]+$ ]]
+}
 __tsm_cmdline() {
   local __h __n
-  case $BASH_COMMAND in
-    ". '"*tsm-cmd-*"'")
-      __tsm_ret=$BASH_COMMAND
-      return 0
-      ;;
-  esac
+  if __tsm_own_file "$BASH_COMMAND"; then
+    __tsm_ret=$BASH_COMMAND
+    return 0
+  fi
   __h=$(HISTTIMEFORMAT= builtin history 1)
   __h=$\{__h#"$\{__h%%[! ]*}"}
   __n=$\{__h%%[!0-9]*}
@@ -214,15 +228,13 @@ __tsm_open() {
 __tsm_text() {
   local __t=$1 __f
   __t=$\{__t#"$\{__t%%[! ]*}"}
-  case $__t in
-    ". '"*tsm-cmd-*"'")
-      __f=$\{__t#". '"}
-      __f=$\{__f%"'"}
-      __f=$\{__f//"'\\\\''"/"'"}
-      __t=
-      IFS= read -r -d '' __t 2>/dev/null < "$__f"
-      ;;
-  esac
+  if __tsm_own_file "$__t"; then
+    __f=$\{__t#". '"}
+    __f=$\{__f%"'"}
+    __f=$\{__f//"'\\\\''"/"'"}
+    __t=
+    IFS= read -r -d '' __t 2>/dev/null < "$__f"
+  fi
   __tsm_ret=$__t
 }
 # Does the text ($1) exec (replace this shell)?
@@ -249,7 +261,7 @@ __tsm_preexec() {
   # text is kept, not a flag: a later firing is the line's own only if the line runs that command
   # (__tsm_line_has) — a flag alone stood the heal down at the next prompt too, where it was the only
   # closer of a line that merely assigned PROMPT_COMMAND (the reviewer's read of 2f32e8a..a088780).
-  case $__line in ". '"*tsm-cmd-*"'") __tsm_line_text= ;; *) __tsm_line_text=$__line ;; esac
+  if __tsm_own_file "$__line"; then __tsm_line_text=; else __tsm_line_text=$__line; fi
   __tsm_opened=0
   __tsm_ps1_opened=0
   __tsm_text "$__line"
@@ -648,7 +660,7 @@ bind -m vi-command '"\\e[23;8~": kill-whole-line' 2>/dev/null
 __tsm_own_history_keys
 # The session's own history, and none of the daemon's plumbing in it.
 if [ -n "$__tsm_histfile" ]; then HISTFILE=$__tsm_histfile; fi
-HISTIGNORE="$\{HISTIGNORE:+$HISTIGNORE:} . '*tsm-cmd-*'"
+HISTIGNORE="$\{HISTIGNORE:+$HISTIGNORE:}${commandHistoryPatterns}"
 __tsm_restore "$__tsm_o"
 unset __tsm_o
 # Re-integrated after an exec, inside the inherited PROMPT_COMMAND: run this prompt's

@@ -1,7 +1,7 @@
 /**
  * What a name keeps across lives and restarts, and what recovery cleans up:
- * orphaned process groups of a dead daemon (jr2-4, G19c), command files left in
- * /tmp (jr2-12, G26), the session's creation options (ux-4), per-principal
+ * orphaned process groups of a dead daemon (jr2-4, G19c), command files in
+ * the private shell directory (jr2-12, G26), creation options (ux-4), per-principal
  * delivery cursors (m2-4, mcpl-2; G22), the journal's epoch (mcpl-4), events a
  * failing disk refused (jr2-6; G10, G11), and age retention on live sessions
  * (jr2-7; G21). Each test is named for the finding it encodes.
@@ -9,7 +9,6 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -29,14 +28,7 @@ const A = 'agent:a@test';
 const B = 'agent:b@test';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-recovery-'));
 let dirs = 0;
-after(() => {
-  // Command directories live in /tmp, outside the data dirs (jr2-12).
-  for (let i = 1; i <= dirs; i++) {
-    const dir = path.join(tmp, `d${i}`, 'sessions');
-    for (const id of fs.existsSync(dir) ? fs.readdirSync(dir) : []) fs.rmSync(commandDirOf(path.join(tmp, `d${i}`), id), { recursive: true, force: true });
-  }
-  fs.rmSync(tmp, { recursive: true, force: true });
-});
+after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 interface Rig {
   dir: string;
@@ -77,8 +69,6 @@ const shellExits = async (r: Rig, s: Session, code = 0) => {
   r.backend.ptys[r.backend.ptys.length - 1]!.exit({ exitCode: code });
   await until(() => s.state === 'exited');
 };
-const commandDirOf = (dataDir: string, id: string) =>
-  path.join(`/tmp/tsm-${process.getuid!()}`, createHash('sha256').update(`${path.resolve(dataDir)}\0${id}`).digest('hex').slice(0, 8));
 const onDisk = (sdir: string) =>
   fs
     .readdirSync(sdir)
@@ -1127,26 +1117,23 @@ test('jr2-4 (Linux): recovery ties a group to its Run by the leader\'s start tic
 
 // ───────────── jr2-12: command files ─────────────
 
-test('jr2-12/G26: recovery deletes a crashed life\'s command files, and forget deletes the command directory', async () => {
+test('jr2-12/G26: command files stay in the private shell directory; recovery deletes leftovers and forget removes the session', async () => {
   const r1 = rig();
   const s = (await r1.reg.ensure({ id: 'k3', owner: A })).session;
   await run(s, 'echo export API_TOKEN=sekrit');
-  const cmd = commandDirOf(r1.dir, 'k3');
-  assert.ok(fs.readdirSync(cmd).some((n) => n.startsWith('tsm-cmd-')), 'the life keeps its command files while it runs');
   const shellDir = path.join(r1.dir, 'sessions', 'k3', 'shell');
-  fs.writeFileSync(path.join(shellDir, 'tsm-cmd-9'), 'export API_TOKEN=fallback-copy\n', { mode: 0o600 });
+  assert.equal(fs.statSync(shellDir).mode & 0o077, 0, 'the shell directory excludes other users');
+  assert.ok(fs.readdirSync(shellDir).some((n) => n.startsWith('tsm-cmd-')), 'the session keeps command files inside its private shell directory');
+  fs.writeFileSync(path.join(shellDir, 'tsm-cmd-9'), 'export API_TOKEN=stale-copy\n', { mode: 0o600 });
   fs.writeFileSync(path.join(shellDir, 'tsm-history-k3'), ': the session history stays\n', { mode: 0o600 });
   // The daemon dies (never closed); a new one recovers the data dir.
   const r2 = restart(r1);
-  assert.equal(fs.existsSync(cmd), false, 'the /tmp command directory is gone');
   // The session's history stays (its HISTFILE and atuin directory, ux-3), and the integration files the next life rewrites.
-  assert.deepEqual(fs.readdirSync(shellDir).sort(), ['integration', 'tsm-history-k3', 'tsm-history-k3.d'], 'fallback command files go, the session history stays');
+  assert.deepEqual(fs.readdirSync(shellDir).sort(), ['integration', 'tsm-history-k3', 'tsm-history-k3.d'], 'command files go, session history stays');
   // A crashed life's leftovers again, then forget.
-  fs.mkdirSync(cmd, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(path.join(cmd, 'tsm-cmd-3'), 'export API_TOKEN=sekrit; sleep 403\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(shellDir, 'tsm-cmd-3'), 'export API_TOKEN=stale-copy\n', { mode: 0o600 });
   await r2.reg.remove('k3');
-  assert.equal(fs.existsSync(cmd), false, 'forget removes the command directory');
-  assert.equal(fs.existsSync(path.join(r2.dir, 'sessions', 'k3')), false);
+  assert.equal(fs.existsSync(path.join(r2.dir, 'sessions', 'k3')), false, 'forget removes the private directory and its command text');
   await r2.reg.closeAll();
   await r1.reg.closeAll();
 });

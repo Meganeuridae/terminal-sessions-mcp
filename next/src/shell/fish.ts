@@ -110,7 +110,7 @@ if test -n "$__tsm_k"; and not set -q __tsm_key; and status is-interactive
     # What the accepted line runs: for a daemon line (" eval (__tsm_collect '<tmp>/tsm-cmd-…' $status)")
     # the file's text.
     function __tsm_text
-        set -l m (string match -r "^\\s*(?:eval \\(__tsm_collect |source )'(.*tsm-cmd-[^/]*)'(?: [\\$]status\\))?\\s*\\$" -- $argv[1])
+        set -l m (string match -r "^\\s*(?:eval \\(__tsm_collect |source )'((?:.*/)?tsm-cmd-[0-9]+)'(?: [\\$]status\\))?\\s*\\$" -- $argv[1])
         if set -q m[2]
             set -l f (string replace -a -- "'\\\\''" "'" $m[2])
             set -l t

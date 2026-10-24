@@ -743,7 +743,7 @@ test('a reader holding the terminal gets none of the kept replies: not after the
 
 test('an empty line whose file cannot be removed at its prompt still frees the shell, and the Run admitted after the cancel runs', async () => {
   // The empty line's file goes inside the prompt's own handling (dropPromptProbe). An unlink that threw
-  // there (EACCES on the command directory, say) ended that handling before the shell's state was set:
+  // there (EACCES in the session's private directory, say) ended that handling before the shell's state was set:
   // the shell stayed busy, and the queued Run with it.
   const h = await harness();
   h.shell.stop();
@@ -1235,55 +1235,25 @@ test('ss-10: a process group outliving its leader writes unattributed output; ca
   assert.equal(second.kills[0], 'SIGINT', 'close signalled the outliving group');
 });
 
-// ───────────── jr2-3: the /tmp command directory is re-checked before every write ─────────────
+// ───────────── jr2-3: command files stay in the session's private directory ─────────────
 
-test('jr2-3: a command directory replaced by someone else\'s is never written through; the session falls back to its own', { skip: process.platform === 'win32' }, async () => {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-jr23-'));
-  fs.chmodSync(base, 0o700);
-  const cmd = path.join(base, 'cmd');
-  fs.mkdirSync(cmd, { mode: 0o700 });
-  const own = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-jr23-own-'));
+test('jr2-3: close removes private command files from both completed and in-flight Runs', async () => {
+  const own = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-jr23-close-'));
   const h = await harness({ tempDir: own });
-  // (the harness has no commandDir option: set the session's the way the registry does)
-  (h.session as unknown as { commandDir: string }).commandDir = cmd;
-  const a = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT });
-  assert.ok(a.admitted);
-  assert.ok(h.pty.written.includes(`'${cmd}/tsm-cmd-1'`));
-  await h.session.awaitRun(a.run.runId, 500);
-  // A cleaner removes it; another user plants a world-writable directory with a symlink.
-  fs.rmSync(cmd, { recursive: true, force: true });
-  fs.mkdirSync(cmd, { mode: 0o777 });
-  fs.chmodSync(cmd, 0o777);
-  const victim = path.join(base, 'victim');
-  fs.writeFileSync(victim, 'untouched\n');
-  fs.symlinkSync(victim, path.join(cmd, 'tsm-cmd-2'));
-  const b = await h.session.admitWhenAvailable({ target: 'shell', line: 'echo hello', principal: AGENT });
-  assert.ok(b.admitted);
-  assert.equal((await h.session.awaitRun(b.run.runId, 500)).state, 'exited');
-  assert.equal(fs.readFileSync(victim, 'utf8'), 'untouched\n', 'nothing was written through the symlink');
-  assert.ok(h.pty.written.includes(`'${own}/tsm-cmd-2'`), 'the session\'s own directory served');
-  assert.ok(ofType(h.journal.since(0).events, 'note').some((e) => /no longer private/.test(e.text)));
-  await h.session.close();
-  fs.rmSync(base, { recursive: true, force: true });
-  fs.rmSync(own, { recursive: true, force: true });
-});
-
-test('jr2-3: close takes its command directory along, even while Runs that just ended still have files being removed', async () => {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-jr23-close-'));
-  fs.chmodSync(base, 0o700);
-  const cmd = path.join(base, 'cmd');
-  fs.mkdirSync(cmd, { mode: 0o700 });
-  const h = await harness();
-  (h.session as unknown as { commandDir: string }).commandDir = cmd;
-  const a = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT });
-  assert.equal(a.admitted && h.session.run(a.run.runId).state, 'exited');
-  h.shell.promptNow();
-  const b = h.session.admit({ target: 'shell', line: 'sleep 5', principal: AGENT }); // in flight: close ends it
-  assert.ok(b.admitted);
-  h.session.admit({ target: 'shell', line: 'echo queued', principal: AGENT, queue: true });
-  await h.session.close();
-  assert.equal(fs.existsSync(cmd), false, 'no command directory left behind');
-  fs.rmSync(base, { recursive: true, force: true });
+  try {
+    const a = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT });
+    assert.ok(a.admitted);
+    assert.equal((await h.session.awaitRun(a.run.runId, 500)).state, 'exited');
+    h.shell.promptNow();
+    const b = h.session.admit({ target: 'shell', line: 'sleep 5', principal: AGENT });
+    assert.ok(b.admitted);
+    h.session.admit({ target: 'shell', line: 'echo queued', principal: AGENT, queue: true });
+    assert.ok(fs.readdirSync(own).some((n) => n.startsWith('tsm-cmd-')), 'a Run wrote a command file inside the session directory');
+    await h.session.close();
+    assert.ok(!fs.readdirSync(own).some((n) => n.startsWith('tsm-cmd-')), 'close removes the command files, not the private directory');
+  } finally {
+    fs.rmSync(own, { recursive: true, force: true });
+  }
 });
 
 test('jr2-3: command files are created exclusively — a file an earlier life left under the name is replaced, never followed', async () => {

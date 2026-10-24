@@ -409,6 +409,7 @@ export interface Harness {
 export interface HarnessOptions extends FakeShellOptions {
   control?: 'seat' | 'owner-priority' | 'open';
   setup?: (s: FakeShell) => void;
+  /** Supplied private directory, or a new per-session one beneath the harness's private root. */
   tempDir?: string;
   daemonEnv?: NodeJS.ProcessEnv;
   env?: Record<string, string>;
@@ -475,7 +476,7 @@ export async function scriptedSession(opts: HarnessOptions = {}): Promise<Harnes
     backend,
     journal,
     integrationGraceMs: opts.integrationGraceMs ?? 100,
-    tempDir: opts.tempDir ?? harnessTmp,
+    tempDir: opts.tempDir ?? fs.mkdtempSync(path.join(harnessTmp, 'session-')),
   };
   if (opts.seatGraceMs !== undefined) so.seatGraceMs = opts.seatGraceMs;
   if (opts.editingStaleMs !== undefined) so.editingStaleMs = opts.editingStaleMs;
@@ -490,8 +491,6 @@ export async function scriptedSession(opts: HarnessOptions = {}): Promise<Harnes
 // ───────────── real shells, with a fake HOME holding the "user's" rc files ─────────────
 
 export interface RealOptions {
-  /** A separate directory for command files (the registry's short /tmp one). */
-  commandDir?: string;
   /** Files to create under the fake HOME (relative path → content). */
   rc?: Record<string, string>;
   /** The session's creation-time env. */
@@ -570,7 +569,6 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
   if (opts.cols !== undefined) so.cols = opts.cols;
   if (opts.editingStaleMs !== undefined) so.editingStaleMs = opts.editingStaleMs;
   if (opts.control !== undefined) so.control = opts.control;
-  if (opts.commandDir !== undefined) so.commandDir = opts.commandDir;
   if (integ.kind !== 'none' && opts.integration !== false) so.integration = integ;
   const t0 = Date.now();
   const session = await Session.start(so);

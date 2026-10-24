@@ -2,8 +2,7 @@
  * Real shells, second review: `exec` into another shell (ss-4), fish jobs that cancel and
  * signal reaches (ss-2) and `set -l` that lasts (ss-11), close that leaves no foreground
  * job behind (ss-6), a creation PATH that login files cannot reorder (ss-7), process
- * groups outliving their leader (ss-10), the /tmp command directory (jr2-3), and a
- * password typed at a prompt (m2-2). Every shell runs with a fake HOME.
+ * groups outliving their leader (ss-10), and a password typed at a prompt (m2-2). Every shell runs with a fake HOME.
  */
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -190,28 +189,6 @@ test('ss-10: members of a process Run\'s group that outlive the leader: output u
   }
 });
 
-test('jr2-3: after a cleaner, a command directory someone else recreated is not written through; the session falls back to its own', async () => {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cmdbase-'));
-  fs.chmodSync(base, 0o700);
-  const cmd = path.join(base, 'h1');
-  fs.mkdirSync(cmd, { mode: 0o700 });
-  const x = await realSession('/bin/bash', { commandDir: cmd });
-  try {
-    assert.equal((await x.run('echo first')).text, 'first');
-    fs.rmSync(cmd, { recursive: true, force: true });
-    fs.mkdirSync(cmd);
-    fs.chmodSync(cmd, 0o777);
-    const victim = path.join(base, 'victim');
-    fs.writeFileSync(victim, 'untouched\n');
-    fs.symlinkSync(victim, path.join(cmd, 'tsm-cmd-2'));
-    const r = await x.run('echo second');
-    assert.deepEqual([r.state, r.text], ['exited', 'second']);
-    assert.equal(fs.readFileSync(victim, 'utf8'), 'untouched\n');
-  } finally {
-    await x.close();
-    fs.rmSync(base, { recursive: true, force: true });
-  }
-});
 
 test('m2-2: a password typed at a real `read -s` prompt is journaled redacted and never promoted into a Run', async () => {
   const x = await realSession('/bin/bash');

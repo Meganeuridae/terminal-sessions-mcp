@@ -54,10 +54,8 @@ export interface SessionOptions {
   startupCapMs?: number;
   /** Linux: the shell's and process Runs' oom_score_adj (0 or unset: unchanged); see the daemon's --session-oom-score-adj. */
   oomScoreAdj?: number;
-  /** Temp files and the session's own shell history live here. */
-  tempDir?: string;
-  /** Where the command files the daemon sources live (default tempDir); keep it short, it is echoed at the prompt. */
-  commandDir?: string;
+  /** Caller supplies a private directory unique to this Session for commands and shell history. */
+  tempDir: string;
   /** Start the shell as a login shell: bash emulates it, zsh and fish get `-l` (default true). */
   login?: boolean;
   /** How long the seat stays reserved for a holder whose last attachment went away (default 30 s). */
@@ -426,11 +424,20 @@ function declaredFlavor(name: string): 'posix' | 'fish' {
 
 type OutputEvent = EventOf<'output'>;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-/** The position of whichever of `needles` comes first in `text`; -1 when none does. */
+
+/** A session's command directory must be a real, owner-only directory before any shell starts. */
+export function assertPrivateSessionDir(dir: string): void {
+  const st = fs.lstatSync(dir);
+  const uid = process.getuid?.();
+  if (!st.isDirectory() || (uid !== undefined && st.uid !== uid) || (st.mode & 0o777) !== 0o700) {
+    throw err('backend_failure', `session command directory is not private (owner-only 0700, real directory): ${dir}`);
+  }
+}
+
 /**
- * Create a command file that did not exist, never through a symlink (jr2-3). The directory
- * was checked to be ours, so an existing name is a file an earlier life of this session left
- * behind (the counter restarts): it is removed and the file created afresh.
+ * Create a command file that did not exist, never through a symlink (jr2-3). The caller
+ * supplies a private directory unique to this Session; an existing name is a file an earlier
+ * life left behind (the counter restarts): remove it and create a fresh file.
  */
 function writeExclusive(file: string, text: string): string {
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0);
@@ -621,7 +628,6 @@ export class Session {
   private readyResolve!: () => void;
   private readonly readyPromise: Promise<void>;
   private readonly tempDir: string;
-  private commandDir: string;
   private readonly extraTempFiles = new Set<string>();
   /** Discarded Runs whose command file could be neither removed nor emptied: a late read of the line runs it. */
   private readonly commandsLeft = new WeakSet<RunRecord>();
@@ -662,8 +668,9 @@ export class Session {
     this.createdAt = this.now();
     this.lastActivity = this.createdAt;
     this.lastActivityMono = clocks.monotonic();
-    this.tempDir = opts.tempDir ?? os.tmpdir();
-    this.commandDir = opts.commandDir ?? this.tempDir;
+    if (!opts.tempDir) throw err('invalid_argument', 'Session requires a private per-session tempDir');
+    assertPrivateSessionDir(opts.tempDir);
+    this.tempDir = opts.tempDir;
     this.safeId = this.id.replace(/[^a-zA-Z0-9_-]/g, '_');
     this.histFile = path.join(this.tempDir, `tsm-history-${this.safeId}`);
     this.configured = configuredEnv(opts.daemonEnv ?? process.env, opts.env ?? {});
@@ -1674,8 +1681,8 @@ export class Session {
     if (outcome.leftovers) run.leftovers = true;
     if (outcome.pipeStatus) run.pipeStatus = [...outcome.pipeStatus];
     // A line the shell never started goes with its file too: a late read of it sources a
-    // missing file and never runs the command unawaited (ss-8). Close waits for the removal,
-    // then removes the command directory.
+    // missing file and never runs the command unawaited (ss-8). Close waits for the removal;
+    // the registry keeps or removes the private session directory according to its lifecycle.
     if (run.tempFile) {
       // A removal that fails is said and left to close, which tries again and says so if it fails there too
       // (cleanupTempFiles): dropped here, it stayed with no word (the house's review of 4f4c067..a8b6f28), and
@@ -2329,8 +2336,8 @@ export class Session {
   }
 
   private writeTempFile(body: string, capturePipeStatus = false, markerNonce?: string): string {
-    // Typed (and echoed at the prompt) as ` . '<dir>/tsm-cmd-N'`: the integration scripts know
-    // plumbing by that name, and a short command directory keeps the echo short.
+    // Typed (and echoed at the prompt) as ` . '<dir>/tsm-cmd-N'`: the command file
+    // stays in this Session's private directory until the Run ends.
     const name = commandFile(++this.tempCounter);
     let text = body.endsWith('\n') ? body : body + '\n';
     // The marker strategy's start mark, from the file's first line (plumbing.ts markerCommandText): what
@@ -2346,31 +2353,7 @@ export class Session {
     // line in as its last lines — into whatever it feeds (the house's read of e1d2b8b): no capture
     // then, and the Run reports no pipeStatus. (Fish has no heredocs.)
     if (capturePipeStatus && (this.flavor === 'fish' || !hasOpenHeredoc(text))) text += this.flavor === 'fish' ? '\nset -g __tsm_pst $pipestatus $status; __tsm_setst $__tsm_pst[-1]\n' : '\n__tsm_st=$? __tsm_ps="${PIPESTATUS[*]-}${pipestatus[*]-}"; return $__tsm_st\n';
-    if (this.commandDir !== this.tempDir && !this.commandDirTrusted()) {
-      // jr2-3: the short directory lives under /tmp, where a cleaner may remove it and anyone
-      // may create a directory of that name. Not provably ours: the session's own directory
-      // serves from now on.
-      this.note(`the command directory ${this.commandDir} is no longer private to the daemon; command files go to the session's own directory`);
-      this.commandDir = this.tempDir;
-    }
-    try {
-      return writeExclusive(path.join(this.commandDir, name), text);
-    } catch (e) {
-      if (this.commandDir === this.tempDir) throw e;
-      this.commandDir = this.tempDir;
-      return writeExclusive(path.join(this.tempDir, name), text);
-    }
-  }
-
-  /**
-   * jr2-3: before every command file, `/tmp/tsm-<uid>` and its session directory are checked
-   * again with lstat — a real directory, not a symlink, owned by us, closed to others. A
-   * directory that is gone (a cleaner) is not recreated mid-life: whoever holds the name now
-   * is unknown, so the caller falls back to the session's own directory (§8.1).
-   */
-  private commandDirTrusted(): boolean {
-    const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
-    return uid !== undefined && trustedDir(path.dirname(this.commandDir), uid) && trustedDir(this.commandDir, uid);
+    return writeExclusive(path.join(this.tempDir, name), text);
   }
 
   /** A command file whose removal failed: said, and left for close to try again (cleanupTempFiles). */
@@ -2397,7 +2380,7 @@ export class Session {
   }
 
   private cleanupTempFiles(): void {
-    // Each file goes on its own: one that cannot be removed (the command directory made read-only, say)
+    // Each file goes on its own: one that cannot be removed (its parent made read-only, say)
     // is said and left, and close goes on (a throw here left close rejected for good, after the shell was
     // killed: the house's review of the 40 commits through 4f4c067).
     const remove = (f: string) => {
@@ -2415,14 +2398,6 @@ export class Session {
     }
     for (const f of this.extraTempFiles) remove(f);
     this.extraTempFiles.clear();
-    // A command directory of its own goes with the shell (when empty; a new life recreates it).
-    if (this.commandDir !== this.tempDir) {
-      try {
-        fs.rmdirSync(this.commandDir);
-      } catch {
-        // not empty, or already gone
-      }
-    }
   }
 
   private scanMarker(run: RunRecord, chunk: string): void {
@@ -2752,7 +2727,7 @@ export class Session {
   /**
    * The empty line's file goes at the prompt after its pre-execution mark, or once the session gave up on
    * it. This runs inside the prompt's handling, which must go on whatever the unlink does: a file that
-   * cannot be removed now (the command directory made read-only, say) stays listed for the session's
+   * cannot be removed now (its parent made read-only, say) stays listed for the session's
    * cleanup at close, and its line runs nothing if it is read late, since the file is empty.
    */
   private dropPromptProbe(): void {
@@ -3429,16 +3404,6 @@ export class Session {
 
   private assertAlive(): void {
     if (this.shellState === 'exited') throw err('session_exited', `session ${this.id} has exited`);
-  }
-}
-
-/** A real directory (not a link) of ours, closed to others: the only kind the daemon trusts in /tmp (§8.1). */
-export function trustedDir(d: string, uid: number): boolean {
-  try {
-    const st = fs.lstatSync(d);
-    return st.isDirectory() && !st.isSymbolicLink() && st.uid === uid && (st.mode & 0o077) === 0;
-  } catch {
-    return false;
   }
 }
 

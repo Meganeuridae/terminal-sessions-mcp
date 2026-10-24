@@ -139,7 +139,7 @@ __tsm_preexec() {
 __tsm_execs() {
   emulate -L zsh -o extended_glob
   local t=$\{1##[[:space:]]#} f
-  if [[ $t == ". '"*tsm-cmd-*"'"[[:space:]]# ]]; then
+  if [[ $t == ". '"*/tsm-cmd-<->"'"[[:space:]]# || $t == ". 'tsm-cmd-"<->"'"[[:space:]]# ]]; then
     f=$\{t#". '"}
     f=$\{f%%\\'[[:space:]]#}
     f=$\{f//"'\\\\''"/"'"}
@@ -165,7 +165,7 @@ __tsm_line_init() {
 # Daemon plumbing (" . '<tmp>/tsm-cmd-…'") never enters history.
 __tsm_addhistory() {
   emulate -L zsh -o extended_glob
-  if [[ $1 == [[:space:]]#.\\ \\'*tsm-cmd-*\\'[[:space:]]# ]]; then return 1; fi
+  if [[ $1 == [[:space:]]#.\\ \\'*/tsm-cmd-<->\\'[[:space:]]# || $1 == [[:space:]]#.\\ \\'tsm-cmd-<->\\'[[:space:]]# ]]; then return 1; fi
   return 0
 }
 # An exec replaces this process: tell the daemon (it watches whether the program that
