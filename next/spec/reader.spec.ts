@@ -105,6 +105,35 @@ test('a tail says truncated where the projection lost rows, as a page does: a ho
   assert.deepEqual([tail.text, tail.truncated], ['top1\ntop2\nr5\nr6\nr7', false]);
 });
 
+test('margins set before a page or a tail are no source’s: the pty’s own scrolls of them are not read as lost, a hole’s line end taking a row still is', async () => {
+  // The house's review of 4860d4c..bc4bc85 (PR #22, comment 6357989601, "Who owns replayed margins"): the lasting state
+  // before a page went in as the first source's output, and a labelled tail's dropped head's was the next source's. So
+  // margins 5–8 the pty set before the page, with r1's line first in it, were r1's, and the pty's own scrolls past `a7`
+  // read as lost; a tail whose dropped head set them read the same.
+  const page = new Journal({ sessionId: 's' });
+  out(page, '\x1b[5;8r');
+  startRun(page, 'r1');
+  out(page, 'l1\n', 'stdout', 'r1');
+  out(page, '\x1b[5;1Ha5\r\na6\r\na7\r\na8\r\na9\r\n');
+  const r = await readJournal(source({ journal: page, cols: 20, rows: 10 }), { since: 1 }, { resultBytes: 16384 });
+  assert.deepEqual([r.text!.split('\n'), r.truncated], [['[run r1]', 'l1', '[terminal]', '', 'a7', 'a8', 'a9'], false]);
+  const tail = new Journal({ sessionId: 's' });
+  out(tail, `\x1b[5;8r\x1b[5;1H${'h'.repeat(300)}\r\n`);
+  startRun(tail, 'r1');
+  out(tail, 'l1\n', 'stdout', 'r1');
+  out(tail, 'a5\r\na6\r\na7\r\na8\r\na9\r\n');
+  const t = await readJournal(source({ journal: tail, cols: 20, rows: 10 }), { tail: 6 }, { resultBytes: 16384 });
+  assert.deepEqual([t.text!.split('\n').slice(-3), t.truncated], [['a7', 'a8', 'a9'], false]);
+  // The projection's own line end, a hole's, still takes a row the terminal keeps (`a5`, then `a6` as the pty scrolls on).
+  const holed = new Journal({ sessionId: 's' });
+  out(holed, '\x1b[5;8r');
+  out(holed, '\x1b[5;1Ha5\r\na6\r\na7\r\na8');
+  holed.append({ type: 'gap', from: 3, to: 3, reason: 'store-error', exact: true });
+  out(holed, 'X\r\n');
+  const h = await readJournal(source({ journal: holed, cols: 20, rows: 10 }), { since: 1 }, { resultBytes: 16384 });
+  assert.deepEqual([h.text!.split('\n').at(-1), h.text!.includes('a5'), h.truncated], ['X', false, true]);
+});
+
 /** A small seeded PRNG, so a failing case reproduces. */
 function rng(seed: number): () => number {
   return () => {

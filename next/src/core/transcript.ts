@@ -62,9 +62,11 @@
  *    follow at the end of the range (or before a note), in the order they
  *    began. When the source changes, the next source starts on a fresh line,
  *    under a header line when `label` gives one. Where that line end, a note,
- *    a header or another source's output scrolls a row with text out of a
- *    scroll region that doesn't start at row 1, the projection is `truncated`
- *    and `lost` (Projector.hookScroll). A `note` chunk is a line of its
+ *    a header or another source's output scrolls a scroll region that doesn't
+ *    start at row 1, the projection's region runs ahead of the terminal's, and
+ *    the projection is `truncated` and `lost` when, at the range's end, a row
+ *    the terminal alone still shows is gone from it (Projector.regionScroll).
+ *    A `note` chunk is a line of its
  *    own (a reader's `[… events missing …]` marker), never part of any source;
  *    a `hole` chunk stands where output was lost (`runChunks`), and the
  *    projection starts afresh there as at a note, with no line of its own, so
@@ -136,6 +138,11 @@ export interface ProjectOptions {
   label?: (source: SourceInfo) => string | undefined;
   /** A next range continues this one: its trailing blank lines are kept, and an unfinished last line keeps its trailing whitespace (rule 3). */
   open?: boolean;
+  /**
+   * Lasting terminal state the output before the range set (`persistentState`: the scroll region, modes, character
+   * sets), applied ahead of the first chunk as no source's output (rule 7; Projector.owner).
+   */
+  state?: string;
 }
 
 export interface Projection {
@@ -150,9 +157,10 @@ export interface Projection {
   /** Input omitted or lines dropped: what a cut left out, which another page or tail shows. `truncated` counts it. */
   cut?: true;
   /**
-   * Rows the projection lost after projecting them: scrolled out of its scratch scrollback unread, or taken from a
-   * scroll region by what the program did not write (rule 6, Projector.hookScroll). `truncated` counts them too; unlike
-   * what a cut omits or drops, no other page or tail shows them.
+   * Rows the projection lost after projecting them: scrolled out of its scratch scrollback unread, or gone from a
+   * scroll region where the terminal alone still shows them, scrolled out ahead of it by what the program did not
+   * write (rule 6, Projector.regionScroll). `truncated` counts them too; unlike what a cut omits or drops, no other
+   * page or tail shows them.
    */
   lost?: true;
   /**
@@ -358,16 +366,44 @@ class Projector {
   private readonly capacity: number;
   /** The source being fed (a segment's key); undefined while the projection writes its own: a boundary's line end, a note, a header. */
   private source: string | undefined;
-  /** The source whose output set the scroll margins. */
-  private owner: string | undefined;
-  /** The margins were set ahead of any source (the lasting state of a dropped head, before a header): the next source fed owns them. */
-  private adopt = false;
   /**
-   * Rows others added to the region without taking one with text: a blank row their scroll took, or a row a boundary's
-   * line end moved down to. Each leaves the region a row short of what the program's own output leaves the terminal's,
-   * so the program's own later scroll that takes a row with text took one the terminal still shows.
+   * The source whose output set the scroll margins: the program, whose scrolls of its region are the terminal's.
+   * Undefined while no source is known to have set them: margins the replayed state set (`ProjectOptions.state`, a
+   * dropped head's lasting state) came from no source fed, so no source's scroll of them is reported, only the
+   * projection's own. Fed as the first source's output, replayed margins were that source's: a Run's lines scrolling
+   * the pty's rows away reported nothing, and the pty's own scrolls read as lost (the house's review of
+   * 4860d4c..bc4bc85, PR #22, comment 6357989601).
    */
-  private owed = 0;
+  private owner: string | undefined;
+  /**
+   * Rows of the screen (0-based) the projection alone holds: each begun by a line end the program did not write (a
+   * boundary's, a note's, a header's, another source's), which the terminal has no row for. They move up with the
+   * region's scrolls (regionScroll) and leave it as any row does.
+   */
+  private owed = new Set<number>();
+  /**
+   * Rows of the region the program left empty and something else wrote on, from their start (a Run's first line, a
+   * note, on the blank row after the program's line end): the terminal has the row, blank, so what it holds here is not
+   * the program's, and its going says nothing. They move with the region's scrolls as `owed` does.
+   */
+  private blank = new Set<number>();
+  /**
+   * Such line ends that moved the cursor down inside the region without a scroll: each puts the projection's cursor a
+   * row ahead of the terminal's, so the program's next scroll of the region is one the terminal does not make.
+   */
+  private pending = 0;
+  /** The cursor-motion handlers, while a row is pending (watchCursor). */
+  private cursorWatch: Array<{ dispose(): void }> | undefined;
+  /**
+   * Rows the projection scrolled out of the region ahead of the terminal, oldest first: whether each held text. The
+   * terminal still shows them (at its region's top), and the projection lacks them, until the terminal's own scrolls take
+   * them too, one for each row the program itself scrolls out (regionScroll).
+   */
+  private ahead: boolean[] = [];
+  /** Scrolls of a region not from row 1 so far (feedBatch counts the ones a batch makes). */
+  private scrolls = 0;
+  /** Bumped by settle: a batch fed across one adds nothing (feedBatch). */
+  private generation = 0;
 
   constructor(readonly cols: number, readonly rows: number, keep: 'head' | 'tail', maxLines: number) {
     this.term = new Terminal({ cols, rows, scrollback: SCRATCH_SCROLLBACK, allowProposedApi: true });
@@ -383,20 +419,40 @@ class Projector {
     this.hookScroll();
   }
 
-  /** What is fed next comes from `source` (a segment's key), or from the projection itself (undefined). */
-  feeding(source: string | undefined): void {
-    this.source = source;
-    if (source !== undefined && this.adopt) {
-      this.owner = source;
-      this.adopt = false;
+  /**
+   * The cursor-motion handlers (onCursorMove, onCursorSet) are registered only while a row is pending, and go when
+   * none is: registered throughout, they cost every cursor move of every projection (9% over 200,000 lines each set
+   * by CUP), for a case that needs a line end the program did not write inside a region not from row 1.
+   */
+  private watchCursor(): void {
+    if (this.pending > 0 && !this.cursorWatch) {
+      const p = this.term.parser;
+      this.cursorWatch = [
+        ...['A', 'B', 'E', 'F'].map((final) => p.registerCsiHandler({ final }, (params) => this.onCursorMove(final === 'A' || final === 'F' ? -(num(params[0]) || 1) : num(params[0]) || 1))),
+        ...['H', 'f', 'd', 'u'].map((final) => p.registerCsiHandler({ final }, () => this.onCursorSet())),
+        p.registerEscHandler({ final: '8' }, () => this.onCursorSet()),
+      ];
+    } else if (this.pending === 0 && this.cursorWatch) {
+      for (const h of this.cursorWatch) h.dispose();
+      this.cursorWatch = undefined;
     }
   }
 
+  /** What is fed next comes from `source` (a segment's key), or from the projection itself (undefined). */
+  feeding(source: string | undefined): void {
+    this.source = source;
+  }
+
+  /** What is being fed is not the program's: the projection's own writes, and, once a source set the margins, another source's. */
+  private get others(): boolean {
+    return this.owner === undefined ? this.source === undefined : this.source !== this.owner;
+  }
+
   /**
-   * DECSTBM: whose output set the margins. Margins it changes owe no row; the margins already in force, set again,
-   * restore none, so what is owed stays. The margins it sets are read as xterm's setScrollRegion reads them: a bottom
-   * left out, 0 or past the last row is the last row, and one not below the top sets nothing, so it leaves the count
-   * and the owner as they were.
+   * DECSTBM: whose output set the margins. Margins it changes settle what the region's rows said (settle); the margins
+   * already in force, set again, restore no row, so the account stays. The margins it sets are read as xterm's
+   * setScrollRegion reads them: a bottom left out, 0 or past the last row is the last row, and one not below the top
+   * sets nothing, so it leaves the account and the owner as they were.
    */
   private onMargins(params: (number | number[])[]): boolean {
     const top = num(params[0]) || 1;
@@ -404,28 +460,36 @@ class Projector {
     if (bottom === 0 || bottom > this.rows) bottom = this.rows;
     if (bottom <= top) return false;
     const now = this.margins();
-    if (top - 1 !== now.top || bottom - 1 !== now.bottom) this.owed = 0;
-    if (this.source === undefined) this.adopt = true;
-    else {
-      this.owner = this.source;
-      this.adopt = false;
-    }
+    if (top - 1 !== now.top || bottom - 1 !== now.bottom) this.settle();
+    this.owner = this.source;
     return false;
+  }
+
+  /**
+   * Decide what the region's rows say and start the account afresh: a row the terminal alone still shows is gone from
+   * the projection when one it scrolled out ahead of the terminal held text (`ahead`). At the range's end, and where
+   * the terminal's screen and the projection's part: the margins changed, or the screen erased or reset, after which
+   * such a row never comes back the way the program's own scrolls bring the two screens together again.
+   */
+  private settle(): void {
+    if (this.ahead.includes(true)) this.lost = true;
+    this.ahead = [];
+    this.owed.clear();
+    this.blank.clear();
+    this.pending = 0;
+    this.watchCursor();
+    this.generation++;
   }
 
   /**
    * Watch the scrolls xterm makes of a scroll region through BufferService.scroll: a line end at the region's last row,
    * a line wrapping there, IND, NEL. SU, SD, IL, DL and RI move a region's rows without it, and aren't watched: a row
-   * one of them takes isn't reported, whoever sent it. On the normal screen a region not starting at row 1 keeps no
-   * scrollback, and its top row goes. When something other than the source that set the margins causes the scroll (a
-   * boundary's line end, a note, a header, another source's output) and that row holds text, the projection lost it
-   * (`lost`): the margins stay as the program set them, since resetting them would change how its later output scrolls
-   * (the house's review of a8b6f28..4860d4c, PR #22, comment 6341260318). A blank row such a scroll takes is owed
-   * (`owed`), and the program's own next scroll that takes a row with text is reported: it took one the terminal still
-   * shows (a blank top row, then `X` and `Y`, lost `r5` silently: an independent read of the fixes for #22). The
-   * program's own scrolls otherwise lose what the terminal loses. After any scroll of such a region its new top row
-   * joins no row above the region, which it was wrapped from only inside it: a note's tail read glued onto the row
-   * above (an independent read of the fixes for #22). xterm internals: skipped, and nothing reported, if they change.
+   * one of them takes isn't reported, whoever sent it, the program's own while a row is owed included (the house's
+   * review of 4860d4c..bc4bc85, PR #22, comment 6357989601). On the normal screen a region not starting at row 1
+   * keeps no scrollback, and its top row goes: what that says is regionScroll's. After any scroll of such a region
+   * its new top row joins no row above the region, which it was wrapped from only inside it: a note's tail read glued
+   * onto the row above (an independent read of the fixes for #22). xterm internals: skipped, and nothing reported, if
+   * they change.
    */
   private hookScroll(): void {
     const core = (this.term as unknown as { _core?: Core })._core;
@@ -436,21 +500,104 @@ class Projector {
       // Read on every line end that scrolls: a region of the normal screen only, from xterm's buffer directly.
       const buf = core.buffer;
       const top = buf !== undefined && buf === core.buffers?.normal && typeof buf.scrollTop === 'number' ? buf.scrollTop : 0;
-      const others = this.adopt || this.source !== this.owner;
-      if (top > 0 && (others || this.owed > 0)) {
-        const text = rowText(this.term.buffer.normal, top) !== '';
-        if (others) {
-          if (text) this.lost = true;
-          else this.owed++;
-        } else if (text) {
-          this.lost = true;
-          this.owed--;
-        }
-      }
+      if (top > 0) this.regionScroll(top, typeof buf?.scrollBottom === 'number' ? buf.scrollBottom : this.rows - 1);
       scroll.apply(service, args);
       const line = top > 0 && typeof buf?.ybase === 'number' ? buf.lines?.get?.(buf.ybase + top) : undefined;
       if (line) line.isWrapped = false;
     };
+  }
+
+  /**
+   * A scroll of a region not from row 1 is about to take its top row. The margins stay as the program set them, since
+   * resetting them would change how its later output scrolls (the house's review of a8b6f28..4860d4c, PR #22, comment
+   * 6341260318), so the account is kept of how the projection's region differs from the terminal's, and what the rows
+   * say is decided where they leave the screen and at the range's end (settle). A scroll the program did not make (a
+   * boundary's line end, a note's, a header's, another source's: `others`), or that the terminal does not make with it
+   * (`pending`), puts the projection a scroll ahead: the row it takes is one the terminal keeps (`ahead`), unless the
+   * projection alone held it (`owed`). The program's own scroll is the terminal's too: its top row goes from both, the
+   * terminal's being the oldest row the projection took ahead of it. So a row is lost only while the terminal shows it
+   * and the projection does not: set at the program's own scroll that took text while a row was owed, `lost` stayed
+   * although, once the program had scrolled on, the two screens were the same again (margins 3–6, a blank top row, a
+   * hole's line end, then five of the program's lines: after two the projection lacked `r4`, after five neither showed
+   * it, and `lost` was true: the house's review of 4860d4c..bc4bc85, PR #22, comment 6357989601). A row the program
+   * puts back by moving the cursor onto it is beyond the account: a program that redraws its region by absolute moves
+   * can still report a loss that isn't there.
+   */
+  private regionScroll(top: number, bottom: number): void {
+    this.scrolls++;
+    const others = this.others;
+    if (!this.owed.delete(top)) {
+      const blank = this.blank.delete(top);
+      // The program's own scroll with nothing ahead takes the same row from both screens: nothing to read.
+      if (others || this.pending > 0 || this.ahead.length > 0) this.ahead.push(!blank && rowText(this.term.buffer.normal, top) !== '');
+    }
+    // The rows move up one; the new bottom row is the projection's alone when the program did not begin it.
+    const up = (rows: Set<number>) => (rows.size ? new Set([...rows].map((r) => r - 1)) : rows);
+    this.owed = up(this.owed);
+    this.blank = up(this.blank);
+    if (others) this.owed.add(bottom);
+    else if (this.pending > 0) {
+      this.pending--;
+      this.watchCursor();
+    } else this.ahead.shift();
+  }
+
+  /**
+   * CUU, CUD, CNL, CPL: the program's own cursor moved `dy` rows while its cursor runs ahead of the terminal's
+   * (`pending`): both move alike, and meet where a margin or the screen's edge stops one of them (cursorAfter).
+   */
+  private onCursorMove(dy: number): boolean {
+    if (this.pending > 0 && !this.others && this.term.buffer.active.type === 'normal') {
+      const y = this.term.buffer.active.cursorY;
+      this.pending = Math.max(0, this.cursorAfter(y, dy) - this.cursorAfter(y - this.pending, dy));
+      this.watchCursor();
+    }
+    return false;
+  }
+
+  /**
+   * CUP, HVP, VPA, DECRC, SCORC: the program's own cursor set to a row, where the terminal's cursor then is too, so
+   * no row between the two is pending (`pending`). What it writes there lands on the same row of both screens, which
+   * stays the projection's alone when it was (`owed`): a hole's blank row owed, then `CSI 6;1 H`, `X` and four
+   * lines, ends with the two screens the same, the row with `X` being the one the hole's line end began.
+   */
+  private onCursorSet(): boolean {
+    if (!this.others && this.term.buffer.active.type === 'normal') {
+      this.pending = 0;
+      this.watchCursor();
+    }
+    return false;
+  }
+
+  /** Where xterm's CUU or CUD takes the cursor from row `y` by `dy`: it stops at the margin on its side when it is within it, else at the screen's edge. */
+  private cursorAfter(y: number, dy: number): number {
+    const { top, bottom } = this.margins();
+    if (dy > 0) return Math.min(y + dy, y <= bottom ? bottom : this.rows - 1);
+    return Math.max(y + dy, y >= top ? top : 0);
+  }
+
+  /**
+   * Feed a batch of a segment's data, and when it is not the program's (`others`), account for the rows it added to a
+   * region not from row 1 besides the scrolls regionScroll saw: each row the cursor moved down to inside the region
+   * is the projection's alone (`owed`), and puts the program's next scroll ahead of the terminal's (`pending`): a
+   * note longer than a row, a Run's lines, a header on the region's last row. One that begins on an empty row of the
+   * region the program's line end left (no boundary line end was needed) writes on the terminal's blank row (`blank`).
+   * Nothing is added across a settle, or when the batch set the margins and so became the program's.
+   */
+  async feedBatch(data: string): Promise<void> {
+    const b = this.term.buffer.active;
+    const before = this.others && b.type === 'normal' ? { y: b.cursorY, scrolls: this.scrolls, generation: this.generation, ...this.margins() } : undefined;
+    if (before && before.top > 0 && before.y >= before.top && before.y <= before.bottom && b.cursorX === 0 && !this.owed.has(before.y) && rowText(b, before.y) === '') this.blank.add(before.y);
+    await this.feed(data);
+    const after = this.term.buffer.active;
+    if (!before || before.top === 0 || before.generation !== this.generation || !this.others || after.type !== 'normal') return;
+    const { top, bottom } = this.margins();
+    if (top !== before.top || bottom !== before.bottom || before.y > bottom) return;
+    const scrolls = this.scrolls - before.scrolls;
+    const to = Math.min(after.cursorY, bottom);
+    this.pending += Math.max(0, to - before.y);
+    this.watchCursor();
+    for (let r = Math.max(top, before.y + 1 - scrolls); r <= to; r++) this.owed.add(r);
   }
 
   /**
@@ -527,7 +674,9 @@ class Projector {
    * as the projection's own output: a scroll region its line end scrolls is watched as any other (hookScroll). Margins
    * from row 1, as apt's progress bar sets them, scroll into the scrollback and lose nothing. Below the region, on the
    * screen's last row, the line end moves nothing, so the next segment begins on that row's text, which is reported.
-   * Inside a region not from row 1, a line end that moves down adds a row the terminal doesn't have, and is owed.
+   * At or above a region not from row 1, each row the cursor moves down puts the program's next scroll ahead of the
+   * terminal's (`pending`), and the row the line end begins, when it does not scroll, is the projection's alone
+   * (`owed`); the rows a cursor down passes hold the program's text (regionScroll).
    */
   async boundary(): Promise<void> {
     const { line, row } = this.freshLine();
@@ -535,7 +684,11 @@ class Projector {
     if (line !== '' && b.type === 'normal') {
       const { top, bottom } = this.margins();
       if (row === this.rows - 1 && row !== bottom && rowText(b, row) !== '') this.lost = true;
-      else if (top > 0 && row >= top && row < bottom) this.owed++;
+      else if (top > 0 && row <= bottom) {
+        this.pending += row - b.cursorY + (row < bottom ? 1 : 0);
+        this.watchCursor();
+        if (row < bottom && row + 1 >= top) this.owed.add(row + 1);
+      }
     }
     this.feeding(undefined);
     await this.feed(`\x18${line}`);
@@ -554,6 +707,7 @@ class Projector {
 
   /** The final text: kept lines, then the normal buffer, then the frame if a full-screen program is still up. */
   finish(open = false): string[] {
+    this.settle();
     const n = this.term.buffer.normal;
     const alt = this.term.buffer.active.type === 'alternate';
     let last = lastNonEmpty(n);
@@ -610,9 +764,9 @@ class Projector {
       this.out.close();
       // Drop the kept rows; the cursor's row moves to the top and the erase blanks it.
       this.clearToCursorRow();
-      // The terminal's screen is blank now too: no row is owed, and the program's own next scroll that takes a row
-      // with text takes one the terminal loses as well.
-      this.owed = 0;
+      // The terminal's screen is blank now too: what its region showed that the projection lacked is decided on the
+      // rows kept, and the program's own next scroll that takes a row takes one the terminal loses as well.
+      this.settle();
     }
     return false;
   }
@@ -643,12 +797,13 @@ class Projector {
     return false;
   }
 
-  /** RIS clears both buffers: keep them first (rule 4). */
+  /** RIS clears both buffers: keep them first (rule 4), and decide what the region's rows said (settle). */
   private onReset(): boolean {
     const n = this.term.buffer.normal;
     this.rowsOut(n, 0, lastNonEmpty(n) + 1);
     this.out.close();
     if (this.term.buffer.active.type === 'alternate') this.frameOut(this.term.buffer.alternate);
+    this.settle();
     return false;
   }
 }
@@ -1076,7 +1231,9 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
   const segs = segments(chunks, opts.label, budget);
   const headers = new Set(segs.flatMap((s) => (s.header ? [s.data.slice(0, -1)] : [])));
   let omitted = budget?.omitted ?? 0;
-  const dropped: string[] = budget?.state ? [budget.state] : [];
+  const dropped: string[] = [];
+  if (opts.state) dropped.push(opts.state);
+  if (budget?.state) dropped.push(budget.state);
   if (budget) omitted += cutInput(segs, budget.max, keep, dropped);
   if (keep === 'tail') omitted += cutToLastNewlines(segs, maxLines + 2 * rows, rows, dropped);
   // A cut inside a source's data keeps the header naming that source: the tail budget, cutInput and
@@ -1104,14 +1261,15 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
     delete seg.head;
   }
   const input = (seg: Segment, from = 0) => (seg.header ? 0 : utf8Length(seg.data.slice(Math.max(from, seg.lead ?? 0))));
-  // The omitted head still set lasting terminal state (rule 7): a scroll region, modes, character sets.
-  // It applies before the first thing kept, a restored header too, as before a header a cut kept whole,
-  // so a header lands in the state of the lines it names.
+  // The output before the range (`opts.state`) and the omitted head set lasting terminal state (rule 7): a scroll
+  // region, modes, character sets. It applies before the first thing kept, a restored header too, as before a header a
+  // cut kept whole, so a header lands in the state of the lines it names; and as no source's output, so margins it
+  // sets have no known owner (Projector.owner).
   const state = dropped.length ? persistentState(dropped.map(persistentState).join('')) : '';
-  if (state && segs[0]) segs[0].data = state + segs[0].data;
 
   const pr = new Projector(cols, rows, keep, maxLines);
   try {
+    if (state) await pr.feed(state);
     let slice = performance.now();
     let headersFed = 0;
     // Where feeding stopped, when the head's lines were complete before the range's end.
@@ -1132,7 +1290,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
         }
         const end = batchEnd(seg.data, pos, pr.budget, cols);
         const raw = seg.data.slice(pos, end);
-        await pr.feed(seg.pipe ? pipeToTty(raw) : raw);
+        await pr.feedBatch(seg.pipe ? pipeToTty(raw) : raw);
         await pr.afterBatch();
         pos = end;
         if (performance.now() - slice > 16) {

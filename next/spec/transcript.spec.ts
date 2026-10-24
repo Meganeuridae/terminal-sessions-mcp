@@ -211,9 +211,9 @@ test('rule 7: the lasting state of an omitted head still applies: a scroll regio
   const region = await project([`\x1b[2;5r${'h'.repeat(300)}\r\n`, lines], { cols: 80, rows: 10, maxInputBytes: 100 });
   assert.deepEqual(region.text.split('\n'), ['line 0', 'line 5', 'line 6', 'line 7']);
   assert.equal(region.omittedInputBytes, 6 + 300 + 2);
-  // Labelled, the margins go in with the omitted head's state ahead of the first header, from no source, and the source
-  // fed next owns them (Projector.feeding): its own scrolls lose what the terminal loses, and report no row lost (the
-  // house's review of 4860d4c..bc4bc85).
+  // Labelled, the margins go in with the omitted head's state ahead of the first header, from no source, and no source
+  // owns them (Projector.owner): a source's scrolls of them lose what the terminal loses, and report no row lost (the
+  // house's review of 4860d4c..bc4bc85, PR #22, comment 6357989601).
   const labelled = await project([`\x1b[2;5r${'h'.repeat(300)}\r\n`, lines], { cols: 80, rows: 10, maxInputBytes: 100, label: () => '[terminal]' });
   assert.deepEqual([labelled.text.split('\n').slice(-3), labelled.lost], [['line 5', 'line 6', 'line 7'], undefined]);
   // G1 = DEC graphics and shift out, set in the omitted head, draw the box characters of the tail.
@@ -934,6 +934,74 @@ test('a row owed stays owed through the same margins set again, and goes when th
   // the alternate screen's region: `n3` is its third row when the region from row 3 scrolls.
   const normalUnder = '\x1b[1;1Hn1\r\nn2\r\nn3\r\nn4\r\nn5\r\nn6\x1b[H';
   assert.deepEqual(await read([`${normalUnder}${altRegion}`, { hole: true }, 'X\r\n']).then((r) => r.slice(1)), [false, 0, undefined], 'text under it on the normal screen');
+});
+
+test('what a region’s rows say is decided where they leave the screen and at the range’s end: lost only while the terminal alone still shows a row the projection lacks', async () => {
+  // The house's review of 4860d4c..bc4bc85 (PR #22, comment 6357989601, "Your offer on the over-report"): `lost` was set
+  // at the program's own scroll that took a row with text while one was owed, and stayed, though once the program had
+  // scrolled on the two screens were the same again. Margins 3–6, a blank top row, a hole whose line end takes it, then
+  // the program's lines: after one, both screens show everything (`r6X` as `r6` and `X`); after two to four the
+  // projection lacks `r4`, `r5`, then the `r6` of `r6X`; after five neither shows them, and the projection said lost.
+  const read = async (chunks: ProjectChunk[]) => {
+    const p = await project(chunks, { cols: 20, rows: 10 });
+    return [p.text.split('\n').slice(2), p.truncated, p.lost];
+  };
+  const lines = ['X', 'Y', 'Z', 'W', 'V'];
+  const body = (n: number, end = '') => lines.slice(0, n).join('\r\n') + end;
+  const blankTop = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\n\r\nr4\r\nr5\r\nr6';
+  assert.deepEqual(await read([`${blankTop}${body(1)}`]), [['', 'r4', 'r5', 'r6X'], false, undefined], 'the terminal alone, one line');
+  assert.deepEqual(await read([blankTop, { hole: true }, body(1)]), [['r4', 'r5', 'r6', 'X'], false, undefined], 'one line: nothing lacking');
+  assert.deepEqual(await read([blankTop, { hole: true }, body(2)]), [['r5', 'r6', 'X', 'Y'], true, true], 'two: r4 lacking');
+  assert.deepEqual(await read([blankTop, { hole: true }, body(3)]), [['r6', 'X', 'Y', 'Z'], true, true], 'three: r5 lacking');
+  assert.deepEqual(await read([blankTop, { hole: true }, body(4)]), [['X', 'Y', 'Z', 'W'], true, true], 'four: r6 of r6X lacking');
+  assert.deepEqual(await read([`${blankTop}${body(5)}`]), [['Y', 'Z', 'W', 'V'], false, undefined], 'the terminal alone, five lines');
+  assert.deepEqual(await read([blankTop, { hole: true }, body(5)]), [['Y', 'Z', 'W', 'V'], false, undefined], 'five: the same screens');
+  // A row with text the hole's line end took is lost while the terminal shows it; its own scrolls take it in turn.
+  const region = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6';
+  assert.deepEqual(await read([region, { hole: true }, body(1)]), [['r4', 'r5', 'r6', 'X'], true, true], 'r3 lacking');
+  assert.deepEqual(await read([region, { hole: true }, body(5)]), [['Y', 'Z', 'W', 'V'], false, undefined], 'all taken by the terminal too');
+  // A row the line end moved the cursor down to: the program's next scroll is one the terminal does not make.
+  const short = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4';
+  assert.deepEqual(await read([short, { hole: true }, body(3, '\r\n')]), [['X', 'Y', 'Z'], true, true], 'r4X lacking');
+  assert.deepEqual(await read([`${short}${body(4, '\r\n')}`]), [['Y', 'Z', 'W'], false, undefined], 'the terminal alone, four lines');
+  assert.deepEqual(await read([short, { hole: true }, body(4, '\r\n')]), [['Y', 'Z', 'W'], false, undefined], 'four: the same screens');
+  // The program's own cursor set to a row, where the terminal's cursor then is too (a hole's blank row owed, then
+  // `CSI 6;1 H`): the row it writes on stays the projection's alone, and the screens come together as before.
+  assert.deepEqual(await read([blankTop, { hole: true }, `\x1b[6;1H${body(2)}`]), [['r5', 'r6', 'X', 'Y'], true, true], 'r4 lacking (the terminal shows r4, r5, X6, Y)');
+  assert.deepEqual(await read([blankTop, { hole: true }, `\x1b[6;1H${body(5)}`]), [['Y', 'Z', 'W', 'V'], false, undefined], 'cursor set, five lines');
+  // Two holes, the second in an open line: each row the projection scrolls out ahead of the terminal is accounted for.
+  const twice = (rest: string) => read([blankTop, { hole: true }, 'X\r\nY', { hole: true }, rest]);
+  assert.deepEqual(await twice('Z\r\nW\r\nV\r\nU'), [['Z', 'W', 'V', 'U'], true, true], 'Y of YZ lacking');
+  assert.deepEqual(await read([`${blankTop}X\r\nYZ\r\nW\r\nV\r\nU\r\nT`]), [['W', 'V', 'U', 'T'], false, undefined], 'the terminal alone');
+  assert.deepEqual(await twice('Z\r\nW\r\nV\r\nU\r\nT'), [['W', 'V', 'U', 'T'], false, undefined], 'the same screens');
+  // Another source's lines in the pty's region, then the pty's own lines until the rows they displaced have left the
+  // terminal too: its rows are the projection's alone, and take nothing from the terminal when they go.
+  const pty = (data: string): ProjectChunk => ({ data, stream: 'pty' });
+  const run = (data: string): ProjectChunk => ({ data, stream: 'stdout', runId: 'r1' });
+  assert.deepEqual(await read([pty(region), run('L1\nL2\n'), pty(body(2, '\r\n'))]), [['L2', 'r6X', 'Y'], true, true], 'r5 lacking (the pty’s r6 is held until it ends the line)');
+  // The Run's first line went on the blank row the pty's line end had left: that row is the terminal's, blank, so its
+  // going says nothing, and the pty's line is on a row of the projection's own.
+  assert.deepEqual(await read([pty(region), run('L1\nL2\n'), pty(body(3, '\r\n'))]), [['r6X', 'Y', 'Z'], false, undefined], 'the same rows as the terminal alone, L2 gone');
+  assert.deepEqual(await read([pty(region), run('L1\nL2\n'), pty(body(4, '\r\n'))]), [['Y', 'Z', 'W'], false, undefined], 'the pty scrolled them out too');
+});
+
+test('margins the replayed state set have no known owner: no source’s scroll of them is reported, the projection’s own line ends still are', async () => {
+  // The house's review of 4860d4c..bc4bc85 (PR #22, comment 6357989601, "Who owns replayed margins"): fed as the first
+  // source's output, the margins set before a page were that source's, and the loss of their rows was told the wrong way
+  // round. Margins 5–8 before the range, the pty's `a5`..`a7` in the region: r1's two lines scrolling `a5` and `a6` away
+  // reported nothing, and the pty's own scrolls past `a7` read as lost. With `state`, no source owns them.
+  const read = async (chunks: ProjectChunk[], state?: string) => {
+    const p = await project(chunks, { cols: 20, rows: 10, ...(state ? { state } : {}) });
+    return [p.text.split('\n').slice(-3), p.truncated, p.lost];
+  };
+  const pty = (data: string): ProjectChunk => ({ data, stream: 'pty' });
+  const run = (data: string): ProjectChunk => ({ data, stream: 'stdout', runId: 'r1' });
+  assert.deepEqual(await read([run('l1\n'), pty('\x1b[5;1Ha5\r\na6\r\na7\r\n'), run('l2\nl3\n')], '\x1b[5;8r'), [['a7', 'l2', 'l3'], false, undefined], 'r1 scrolls a5 and a6: nobody’s margins');
+  assert.deepEqual(await read([run('l1\n'), pty('\x1b[5;8r\x1b[5;1Ha5\r\na6\r\na7\r\n'), run('l2\nl3\n')]), [['a7', 'l2', 'l3'], true, true], 'the pty’s margins: another source took its rows');
+  assert.deepEqual(await read([run('l1\n'), pty('\x1b[5;1Ha5\r\na6\r\na7\r\na8\r\na9\r\n')], '\x1b[5;8r'), [['a7', 'a8', 'a9'], false, undefined], 'the pty scrolls past a7: nobody’s margins');
+  assert.deepEqual(await read([run('\x1b[5;8rl1\n'), pty('\x1b[5;1Ha5\r\na6\r\na7\r\na8\r\na9\r\n')]), [['a7', 'a8', 'a9'], true, true], 'r1’s margins: the pty took their rows');
+  // The projection's own line end still takes a row the terminal keeps.
+  assert.deepEqual(await read([pty('\x1b[5;1Ha5\r\na6\r\na7\r\na8'), { hole: true }, pty('X\r\n')], '\x1b[5;8r'), [['a7', 'a8', 'X'], true, true], 'a hole’s line end');
 });
 
 test('a Run’s text tells rows its projection lost apart from what a cut omitted', async () => {

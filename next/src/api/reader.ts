@@ -629,11 +629,11 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // Lasting terminal state set before the page (a scroll region, the alternate screen, modes)
   // still applies to it: a page deep in apt's output keeps apt's scroll region (§6 rule 7, er-2).
   const firstOut = pieces.find((q): q is OutPiece => q.kind === 'out');
-  const state = firstOut && o.since !== undefined ? stateBefore(src, o, firstOut.ev, firstOut.start) + head : '';
+  const state = firstOut && o.since !== undefined ? stateBefore(src, o, firstOut.ev, firstOut.start) : '';
   let budget = maxBytes;
   let chosen = choose(pieces, budget, hold);
   const continued = (c: Chosen) => open || scanCut || c.taken < pieces.length || c.nextOffset !== undefined;
-  const projectChosen = (c: Chosen) => projectPage(c, geometry, maxBytes, continued(c), state, firstOut);
+  const projectChosen = (c: Chosen) => projectPage(c, geometry, maxBytes, continued(c), state, head, firstOut);
   let p = await projectChosen(chosen);
   for (let attempt = 1; attempt < FIT_ATTEMPTS && (p.over || p.omitted > 0) && chosen.inputBytes > 1; attempt++) {
     // Scale by what the projected part of the input produced.
@@ -1058,14 +1058,18 @@ function lastEndBefore(ends: readonly number[], before: number): number {
 /** The piece ends with a line end. */
 const endsWithLine = (pc: OutPiece | undefined): boolean => pc !== undefined && pc.ends[pc.ends.length - 1] === pc.data.length - 1;
 
-async function projectPage(chosen: Chosen, geometry: { cols: number; rows: number }, maxBytes: number, continued: boolean, state = '', first?: OutPiece) {
+async function projectPage(chosen: Chosen, geometry: { cols: number; rows: number }, maxBytes: number, continued: boolean, state = '', head = '', first?: OutPiece) {
   // maxLines never binds before the byte budget does: every line costs at least its LF.
   const opts: Parameters<typeof project>[1] = { cols: geometry.cols, rows: geometry.rows, keep: 'head', maxLines: maxBytes + 2 };
   if (chosen.labelled) opts.label = label;
   // A page the next one continues keeps its trailing blank lines and an unfinished line's spaces (§6 rule 3).
   if (continued) opts.open = true;
-  // The state goes in as the first source's output, so it starts no source of its own.
-  const chunks = state && first ? [chunkOf(first.ev, state), ...chosen.chunks] : chosen.chunks;
+  // The lasting state set before the page goes in ahead of it as no source's output (ProjectOptions.state): fed as
+  // the first source's, margins another source set were its, and the loss of their rows was told the wrong way round
+  // (the house's review of 4860d4c..bc4bc85, PR #22, comment 6357989601). The head of a sequence the page begins
+  // inside (headBefore) is the first source's own, and goes in before its data.
+  if (state) opts.state = state;
+  const chunks = head && first ? [chunkOf(first.ev, head), ...chosen.chunks] : chosen.chunks;
   const p = await project(chunks, opts);
   const textBytes = utf8Length(p.text);
   // `omittedInputBytes` can only come from maxLines here: the text is over budget by then.
@@ -1369,12 +1373,10 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const sources = new Set<string>();
   /** What the text is made of, in order: output, and the notes (a hole, a command); where the lines shown begin is counted over it. */
   const items: TextItem[] = [];
-  // The lasting state set before the window (a scroll region, the alternate screen) applies to it.
+  // The lasting state set before the window (a scroll region, the alternate screen) applies to it, as no source's
+  // output (ProjectOptions.state).
   const firstOut = events.find(isOutput);
-  if (older && firstOut) {
-    const state = stateBefore(src, o, firstOut);
-    if (state) chunks.push(chunkOf(firstOut, state));
-  }
+  const state = older && firstOut ? stateBefore(src, o, firstOut) : '';
   const notes = new Set<string>();
   /** The notes of holes, a subset of `notes`. */
   const holes = new Set<string>();
@@ -1445,6 +1447,7 @@ async function tailRead(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   const projectTail = async (maxLines: number): Promise<string[]> => {
     const opts: Parameters<typeof project>[1] = { cols: geometry.cols, rows: geometry.rows, maxInputBytes: cap, keep: 'tail', maxLines };
     if (multi) opts.label = label;
+    if (state) opts.state = state;
     const p = await project(chunks, opts);
     lost = p.lost === true;
     return p.text === '' ? [] : p.text.split('\n');
