@@ -24,7 +24,10 @@
           ["terminal:service-exited"],
           ["terminal:service-lost"],
           ["terminal:service-ready"],
-          ["terminal:service-running"]
+          ["terminal:service-running"],
+          ["terminal:recovered"],
+          ["terminal:missed"],
+          ["terminal:human-input"]
         ],
         "hold": [["terminal:output"], ["terminal:screen"], ["terminal:control"], ["terminal:note"]]
       },

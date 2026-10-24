@@ -258,9 +258,13 @@ test('the bridge entry and the gate wake on what the README promises and the ser
     await d.close();
   }
   const treated = (behavior: string) => ontology.suggestedTreatment.filter((t) => t.behavior === behavior).flatMap((t) => t.tagsAny);
-  // What the README promises wakes a bridged session: completions, lost Runs, needs-input, session exits, watch firings and service changes.
-  const promised = treated('immediate').filter((t) => /^terminal:(run-finished|run-lost|needs-input|session-exited|watch|service-)/.test(t));
+  // Everything the server marks immediate wakes a bridged session: completions, lost Runs, needs-input, session exits,
+  // watch firings, service changes, recoveries, missed-message summaries and a person's typing. The shipped lists once
+  // named only what the README promised, and the three tags added to the ontology later never reached them (the
+  // house's question, PR #22 comment 6376365550).
+  const promised = treated('immediate');
   assert.ok(promised.includes('terminal:service-lost') && promised.includes('terminal:service-running'), 'the server marks every service change immediate');
+  assert.ok(promised.includes('terminal:recovered') && promised.includes('terminal:missed') && promised.includes('terminal:human-input'), 'the server marks recoveries, missed summaries and human input immediate');
   const ambient = treated('throttle');
   const { wake } = bridgeEntry();
   const wakes = wake.wake.flat();
