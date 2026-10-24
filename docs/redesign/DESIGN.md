@@ -995,9 +995,10 @@ this server:
   (`tools`, `pushEvents`, `channels.{register,lifecycle,incoming,publish}`,
   `contextHooks.beforeInference.inject.beforeUser`, no `observe`), `openChannels` for the
   agent's own sessions, a wake policy that wakes on `terminal:run-finished`,
-  `terminal:run-lost`, `terminal:needs-input`, `terminal:watch`, `terminal:session-exited`
-  and the `terminal:service-*` classes and holds `terminal:output`, `terminal:screen` and
-  `terminal:control` (shipped as `next/config/mcpl-bridge.json`), and the
+  `terminal:run-lost`, `terminal:needs-input`, `terminal:watch`, `terminal:session-exited`,
+  the `terminal:service-*` classes, `terminal:recovered` and `terminal:missed`, and holds
+  `terminal:output`, `terminal:screen`, `terminal:control`, `terminal:note` and
+  `terminal:human-input` (shipped as `next/config/mcpl-bridge.json`), and the
   permissions allowlist — one wildcard entry covers every proxied tool, which is one reason
   the tool names share a prefix — so `terminal__run` and `terminal__input` do not stall
   behind prompts.
