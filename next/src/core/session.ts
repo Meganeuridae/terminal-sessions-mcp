@@ -435,7 +435,13 @@ export function assertTypedCommandDir(dir: string): void {
 
 /** A session's command directory must be a real, owner-only directory before any shell starts. */
 export function assertPrivateSessionDir(dir: string): void {
-  const st = fs.lstatSync(dir);
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(dir);
+  } catch (e) {
+    const errno = (e as NodeJS.ErrnoException).code;
+    throw err('backend_failure', `session command directory cannot be inspected (${errno ?? 'error'}): ${dir}`, { errno });
+  }
   const uid = process.getuid?.();
   if (!st.isDirectory() || (uid !== undefined && st.uid !== uid) || (st.mode & 0o777) !== 0o700) {
     throw err('backend_failure', `session command directory is not private (owner-only 0700, real directory): ${dir}`);

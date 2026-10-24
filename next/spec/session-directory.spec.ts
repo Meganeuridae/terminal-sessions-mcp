@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Journal } from '../src/core/journal.js';
-import { Session, assertTypedCommandDir } from '../src/core/session.js';
+import { Session, assertPrivateSessionDir, assertTypedCommandDir } from '../src/core/session.js';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -95,6 +95,44 @@ test('recovery still cleans an owner-only command directory under a TAB-containi
   const second = new SessionRegistry({ dataDir, backend, defaultShell: '/bin/bash', noUserRc: true });
   t.after(() => second.closeAll());
   assert.equal(fs.existsSync(leftover), false, 'private recovery cleanup still inspects the directory without typing it');
+});
+
+test('a real 0700 command directory is refused when its owner differs from the daemon', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-other-owner-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const uid = process.getuid?.();
+  if (uid === undefined) return t.skip('no owner ID on this host');
+  const methods = process as unknown as { getuid: (() => number) | undefined };
+  const original = methods.getuid;
+  methods.getuid = () => uid + 1;
+  try {
+    assert.throws(() => assertPrivateSessionDir(dir), (e: unknown) => {
+      assert.equal((e as { code?: string }).code, 'backend_failure');
+      assert.match((e as Error).message, /not private/);
+      return true;
+    });
+  } finally {
+    methods.getuid = original;
+  }
+});
+
+test('a missing direct Session command directory has a typed refusal before spawn', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-missing-dir-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const tempDir = path.join(root, 'missing');
+  assert.throws(() => assertPrivateSessionDir(tempDir), (e: unknown) => {
+    assert.equal((e as { code?: string }).code, 'backend_failure');
+    assert.equal((e as { data?: { errno?: string } }).data?.errno, 'ENOENT');
+    return true;
+  });
+  let spawned = 0;
+  const backend = { spawnShell() { spawned++; throw new Error('spawn before private directory check'); } } as unknown as ExecutionBackend;
+  await assert.rejects(Session.start({ id: 'missing-on-disk', owner: AGENT, shell: '/bin/bash', cwd: root, backend, journal: new Journal(), tempDir }), (e: unknown) => {
+    assert.equal((e as { code?: string }).code, 'backend_failure');
+    assert.match((e as Error).message, /directory/);
+    return true;
+  });
+  assert.equal(spawned, 0);
 });
 
 test('scripted Sessions have distinct private command directories', async () => {

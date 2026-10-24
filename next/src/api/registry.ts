@@ -1709,7 +1709,7 @@ function removeLeftovers(dir: string): string | undefined {
     assertPrivateSessionDir(shell);
     names = fs.readdirSync(shell);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return;
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT' || (e instanceof TermError && e.data?.errno === 'ENOENT')) return;
     const reason = e instanceof Error ? e.message : String(e);
     return `skipped leftover command and environment-capture file cleanup in ${shell}: ${reason}`;
   }
