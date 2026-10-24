@@ -1036,6 +1036,23 @@ test('entering the alternate screen decides what the region showed, and no later
   }
 });
 
+test('a blank row the program writes on goes as a row with text: a Run’s line on it, then the program’s own over it (the house’s review of bc4bc85..5d8ce0e, PR #22, I38)', async () => {
+  // A Run's line on the empty row the program's line end left marks that row blank: the terminal's is empty, so its
+  // going says nothing. The program then set its cursor onto it and wrote its own line, on both screens, and a Run's
+  // lines scrolled it out of the projection alone: read as blank whatever it held, that loss went unreported.
+  const read = async (chunks: ProjectChunk[]) => {
+    const p = await project(chunks, { cols: 20, rows: 10 });
+    return [p.text.split('\n'), p.truncated, p.lost];
+  };
+  const pty = (data: string): ProjectChunk => ({ data, stream: 'pty' });
+  const run = (data: string): ProjectChunk => ({ data, stream: 'stdout', runId: 'r1' });
+  const base = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\n';
+  assert.deepEqual(await read([pty(`${base}\x1b[3;1HQ\r\n`)]), [['top1', 'top2', 'Q'], false, undefined], 'the terminal alone shows Q');
+  const lacking = [['top1', 'top2', 'M2', 'M3', 'M4'], true, true];
+  assert.deepEqual(await read([pty(`${base}Q\r\n`), run('M1\nM2\nM3\nM4\n')]), lacking, 'Q lacking, no blank row');
+  assert.deepEqual(await read([pty(base), run('L1\n'), pty('\x1b[3;1HQ\r\n'), run('M1\nM2\nM3\nM4\n')]), lacking, 'Q lacking, written on the blank row');
+});
+
 test('a cursor the program saves and restores is as far ahead of the terminal’s as when it was saved (the house’s review of bc4bc85..5d8ce0e, PR #22, I3)', async () => {
   // A hole's line end inside the region puts the projection's cursor a row ahead of the terminal's. A restore was read as
   // a set to one row, so a cursor saved and at once restored, which moves neither, made the program's next scroll the

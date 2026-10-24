@@ -389,9 +389,14 @@ class Projector {
   /**
    * Rows of the region the program left empty and something else wrote on, from their start (a Run's first line, a
    * note, on the blank row after the program's line end): the terminal has the row, blank, so what it holds here is not
-   * the program's, and its going says nothing. They move with the region's scrolls as `owed` does.
+   * the program's, and its going says nothing. Each keeps the text the batch that began it left there (undefined while
+   * that batch is fed). One holding other text when it goes was written on since, by the program as on the terminal's
+   * row (or by a later batch that went on writing there, which then reports a loss that isn't one), and goes as any row
+   * with text does. Read as blank whatever it held, a Run's line on the empty row, then the program's cursor set onto
+   * it and its own line written there, then a Run's lines that scrolled it out, lost the program's line unreported (the
+   * house's review of bc4bc85..5d8ce0e, PR #22, I38). They move with the region's scrolls as `owed` does.
    */
-  private blank = new Set<number>();
+  private blank = new Map<number, string | undefined>();
   /**
    * Such line ends that moved the cursor down inside the region without a scroll: each puts the projection's cursor a
    * row ahead of the terminal's, so the program's next scroll of the region is one the terminal does not make.
@@ -554,14 +559,17 @@ class Projector {
     this.scrolls++;
     const others = this.others;
     if (!this.owed.delete(top)) {
+      const left = this.blank.get(top);
       const blank = this.blank.delete(top);
       // The program's own scroll with nothing ahead takes the same row from both screens: nothing to read.
-      if (others || this.pending > 0 || this.ahead.length > 0) this.ahead.push(!blank && rowText(this.term.buffer.normal, top) !== '');
+      if (others || this.pending > 0 || this.ahead.length > 0) {
+        const text = rowText(this.term.buffer.normal, top);
+        this.ahead.push(text !== '' && !(blank && (left === undefined || left === text)));
+      }
     }
     // The rows move up one; the new bottom row is the projection's alone when the program did not begin it.
-    const up = (rows: Set<number>) => (rows.size ? new Set([...rows].map((r) => r - 1)) : rows);
-    this.owed = up(this.owed);
-    this.blank = up(this.blank);
+    if (this.owed.size) this.owed = new Set([...this.owed].map((r) => r - 1));
+    if (this.blank.size) this.blank = new Map([...this.blank].map(([r, left]) => [r - 1, left]));
     if (others) this.owed.add(bottom);
     else if (this.pending > 0) {
       this.pending--;
@@ -638,8 +646,10 @@ class Projector {
   async feedBatch(data: string): Promise<void> {
     const b = this.term.buffer.active;
     const before = this.others && b.type === 'normal' ? { y: b.cursorY, scrolls: this.scrolls, generation: this.generation, ...this.margins() } : undefined;
-    if (before && before.top > 0 && before.y >= before.top && before.y <= before.bottom && b.cursorX === 0 && !this.owed.has(before.y) && rowText(b, before.y) === '') this.blank.add(before.y);
+    if (before && before.top > 0 && before.y >= before.top && before.y <= before.bottom && b.cursorX === 0 && !this.owed.has(before.y) && rowText(b, before.y) === '') this.blank.set(before.y, undefined);
     await this.feed(data);
+    // What this batch left on the blank row it began (`blank`).
+    for (const [r, left] of this.blank) if (left === undefined) this.blank.set(r, rowText(this.term.buffer.normal, r));
     const after = this.term.buffer.active;
     if (!before || before.top === 0 || before.generation !== this.generation || !this.others || after.type !== 'normal') return;
     const { top, bottom } = this.margins();
