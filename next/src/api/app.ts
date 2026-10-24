@@ -1305,9 +1305,16 @@ export class App {
 
   async screen(caller: Caller, o: { session: string }): Promise<ScreenSnapshot> {
     const session = this.liveFor(caller, o.session, 'observe');
+    const source = this.entry(session);
+    const lineage = this.journalLineage(source);
     await session.screen.settled();
+    const current = this.registry.get(session.id);
+    // A closed life remains readable in history, but a forgotten or replaced life must not answer for this name.
+    if (!current || this.journalLineage(current) !== lineage || (current.kind === 'live' && current.session !== session)) {
+      throw err('session_not_found', `session ${session.id} is gone`, { session: session.id });
+    }
     const snap = session.snapshot();
-    return this.advanceReadTo(snap, caller, this.entry(session), snap.seq);
+    return this.advanceReadTo(snap, caller, source, snap.seq);
   }
 
   async control(caller: Caller, o: { session: string; action: 'take' | 'release' | 'status'; idempotencyKey?: string }): Promise<{ controller: Principal | null; replayed?: boolean }> {

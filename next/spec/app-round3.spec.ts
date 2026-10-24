@@ -315,12 +315,17 @@ test('G22: reverse-order Run reads remember the higher delivered range until the
   assert.match(ry.text!, /Y/);
   commitReadDelivery(ry);
   assert.ok(live.session.cursorsOf(A.principal).read < ry.nextCursor, 'X still blocks the scalar read cursor');
+  type PendingReads = WeakMap<object, Map<string, Map<string, number>>>;
+  const pendingReads = (app as unknown as { pendingRunReads: PendingReads }).pendingRunReads;
+  const lineage = live.session.journal.runs;
+  assert.equal(pendingReads.get(lineage)?.get(A.principal)?.get(y.runId!), ry.nextCursor, 'the higher delivered Run is retained until the gap closes');
   const other: Caller = { principal: 'agent:c@test', connectionId: 'c-ws-reverse' };
   const otherX = await app.read(other, { session: s, runId: x.runId! });
   assert.equal(live.session.cursorsOf(other.principal).read, otherX.nextCursor, 'another principal cannot inherit A’s pending Y delivery');
   assert.ok(otherX.nextCursor < ry.nextCursor);
   commitReadDelivery(rx);
   assert.equal(live.session.cursorsOf(A.principal).read, ry.nextCursor, 'delivering X joins the earlier delivered Y without reading Y again');
+  assert.ok(!pendingReads.get(lineage)?.has(A.principal), 'joining the higher Run removes its hint and the now-empty principal');
 });
 
 test('G22: a remembered higher Run cannot carry read past a third, still-unread Run', async () => {
@@ -514,6 +519,97 @@ test('G22: deferred read commits stay with their journal after forget and name r
   assert.equal(fresh.session.cursorsOf(A.principal).read, before, 'the old whole-session read does not advance the new journal');
   commitReadDelivery(oneRun);
   assert.equal(fresh.session.cursorsOf(A.principal).read, before, 'the old Run read does not advance the new journal');
+});
+
+test('G22: a screen request keeps its snapshot when its live session becomes readable history', async () => {
+  const s = 'screen-closing-to-history';
+  await app.sessionOpen(A, { id: s });
+  const first = registry.get(s);
+  assert.ok(first?.kind === 'live');
+  const screen = first.session.screen;
+  const row = await app.run(A, { session: s, command: 'echo; echo SCREEN_CONTENT', wait: 5000 });
+  assert.equal(row.state, 'exited');
+  await screen.settled();
+  const beforeClose = first.session.snapshot();
+  assert.ok(beforeClose.lines.includes('SCREEN_CONTENT'), 'the live screen has a complete content row');
+  const settled = screen.settled.bind(screen);
+  let entered!: () => void;
+  let release!: () => void;
+  const inside = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  screen.settled = async () => { entered(); await gate; await settled(); };
+  const pending = app.screen(A, { session: s });
+  void pending.catch(() => {});
+  await inside;
+  screen.settled = settled;
+  try {
+    await app.sessionClose(A, { session: s });
+  } finally {
+    release();
+  }
+  const snap = await pending;
+  const history = registry.get(s);
+  assert.ok(history?.kind === 'history');
+  assert.ok(snap.lines.includes('SCREEN_CONTENT'), 'the content row survives settlement and disposal even if a later prompt arrives');
+  assert.equal(history.cursorsOf(A.principal).read, snap.seq, 'the snapshot is delivered to the same journal after it becomes history');
+});
+
+test('G22: a screen from a forgotten journal does not answer for later history with the same name', async () => {
+  const s = 'screen-replaced-history';
+  await app.sessionOpen(A, { id: s });
+  const first = registry.get(s);
+  assert.ok(first?.kind === 'live');
+  const screen = first.session.screen;
+  const settled = screen.settled.bind(screen);
+  let entered!: () => void;
+  let release!: () => void;
+  const inside = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  screen.settled = async () => { entered(); await gate; await settled(); };
+  const pending = app.screen(A, { session: s });
+  void pending.catch(() => {});
+  await inside;
+  screen.settled = settled;
+  try {
+    await app.sessionClose(A, { session: s, forget: true });
+    await app.sessionOpen(A, { id: s });
+    await app.sessionClose(A, { session: s });
+    const replacement = registry.get(s);
+    assert.ok(replacement?.kind === 'history');
+    assert.notEqual(replacement.journal.runs, first.session.journal.runs, 'name reuse has another journal lineage');
+  } finally {
+    release();
+  }
+  await assert.rejects(pending, (e: unknown) => (e as { code?: string }).code === 'session_not_found');
+});
+
+test('G22: a screen from an old live life does not answer for a reopened life of the same journal', async () => {
+  const s = 'screen-reopened-life';
+  await app.sessionOpen(A, { id: s });
+  const first = registry.get(s);
+  assert.ok(first?.kind === 'live');
+  const screen = first.session.screen;
+  const settled = screen.settled.bind(screen);
+  let entered!: () => void;
+  let release!: () => void;
+  const inside = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  screen.settled = async () => { entered(); await gate; await settled(); };
+  const pending = app.screen(A, { session: s });
+  void pending.catch(() => {});
+  await inside;
+  screen.settled = settled;
+  try {
+    await app.sessionClose(A, { session: s });
+    await app.sessionOpen(A, { id: s });
+    const reopened = registry.get(s);
+    assert.ok(reopened?.kind === 'live');
+    assert.notEqual(reopened.session, first.session);
+    assert.equal(reopened.session.journal.runs, first.session.journal.runs, 'the life changes while its journal lineage persists');
+  } finally {
+    release();
+  }
+  await assert.rejects(pending, (e: unknown) => (e as { code?: string }).code === 'session_not_found', 'a prior screen cannot answer as the current live life');
 });
 
 test('G22: screen refuses a replaced session while its snapshot is settling', async () => {
