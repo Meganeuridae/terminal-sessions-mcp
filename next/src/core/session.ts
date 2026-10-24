@@ -1919,10 +1919,11 @@ export class Session {
    * shell's startup, up to `settleMs`. A Run that is actually running still answers
    * `busy` at once.
    */
-  async admitWhenAvailable(opts: AdmitOptions, settleMs = 1500): Promise<AdmitResult> {
+  async admitWhenAvailable(opts: AdmitOptions | (() => AdmitOptions), settleMs = 1500): Promise<AdmitResult> {
     const deadline = clocks.monotonic() + settleMs;
     for (;;) {
-      const a = this.admit(opts);
+      // A waiting caller may need to render for the shell in front now, not the one before the wait.
+      const a = this.admit(typeof opts === 'function' ? opts() : opts);
       if (a.admitted || (a.reason !== 'prompt-pending' && a.reason !== 'cancel-unanswered' && a.reason !== 'starting')) return a;
       const remaining = deadline - clocks.monotonic();
       if (remaining <= 0) return a;
@@ -3161,11 +3162,15 @@ export class Session {
     };
     let text: string;
     try {
-      // The file already has owner-only mode. POSIX/zsh use >| to override noclobber;
-      // fish uses > because it parses >| as a pipe.
+      // The file already has owner-only mode. POSIX/zsh use >| to override noclobber; fish parses >| as a pipe.
       writeExclusive(out, '');
-      const redirect = this.flavor === 'fish' ? '>' : '>|';
-      const admitted = await this.admitWhenAvailable({ target: 'shell', line: `env -0 ${redirect} ${shellQuote(out)}`, principal, internal: true, origin: 'system' });
+      const admitted = await this.admitWhenAvailable(() => {
+        // waitAvailable can change the declared shell: choose syntax just before each attempt to admit.
+        const front = this.layers.at(-1);
+        const flavor = front ? declaredFlavor(front.shell) : this.flavor;
+        const redirect = flavor === 'fish' ? '>' : '>|';
+        return { target: 'shell', line: `env -0 ${redirect} ${shellQuote(out)}`, principal, internal: true, origin: 'system' };
+      });
       if (!admitted.admitted) throw err('busy', `shell not available: ${admitted.reason}`, { reason: admitted.reason });
       capture = this.getRun(admitted.run.runId);
       const run = await this.awaitRun(capture.runId, waitMs);

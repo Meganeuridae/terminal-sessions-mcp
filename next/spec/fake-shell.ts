@@ -40,6 +40,8 @@ export interface FakeShellOptions {
   ignoreSignals?: boolean;
   /** Emit the integration's handshake before the first prompt (default: with marks). */
   hello?: boolean;
+  /** The shell kind named by the fake handshake (default: fake). */
+  helloKind?: string;
   /** dash-like: a ^C that kills the job also aborts the rest of the typed line. */
   abortListOnInterrupt?: boolean;
   /** SIGTERM/SIGKILL to the job's process group do not end it either. */
@@ -124,7 +126,7 @@ export class FakeShell {
   start(): void {
     if (this.started) return;
     this.started = true;
-    if (this.marks !== 'none' && (this.opts.hello ?? true)) this.pty.emit(this.mark('633;P;TsmHello=fake'));
+    if (this.marks !== 'none' && (this.opts.hello ?? true)) this.pty.emit(this.mark(`633;P;TsmHello=${this.opts.helloKind ?? 'fake'}`));
     this.prompt();
   }
 
@@ -407,6 +409,8 @@ export interface Harness {
 }
 
 export interface HarnessOptions extends FakeShellOptions {
+  /** The scripted outer shell's grammar (default: the POSIX-like fake). */
+  shell?: string;
   control?: 'seat' | 'owner-priority' | 'open';
   setup?: (s: FakeShell) => void;
   /** Supplied private directory, or a new per-session one beneath the harness's private root. */
@@ -469,7 +473,7 @@ export async function scriptedSession(opts: HarnessOptions = {}): Promise<Harnes
     id: 't',
     owner: opts.owner ?? AGENT,
     control: opts.control ?? 'seat',
-    shell: '/bin/fake',
+    shell: opts.shell ?? '/bin/fake',
     cwd: '/home/t',
     env: opts.env ?? { SESSION_VAR: 'yes' },
     daemonEnv: opts.daemonEnv ?? { PATH: '/bin' },
