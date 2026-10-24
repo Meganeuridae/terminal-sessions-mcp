@@ -2099,3 +2099,16 @@ test("a Run's page reads its open sequence's head only within HEAD_EVENTS journa
   // It reads back in batches of 512 while it has read fewer than MAX_SCAN (20,000), so up to 20,480 events.
   assert.equal(await page('\x1b(0', 'qq', 21_000), 'qq', 'past MAX_SCAN and its last batch');
 });
+
+test("rows a range's projection lost show in a read that ends before they were lost, and in a raw read (the house's review of bc4bc85..5d8ce0e, PR #22, I15)", async () => {
+  const src = source({ cols: 20, rows: 10 });
+  out(src.journal, '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6');
+  src.journal.append({ type: 'gap', from: 2, to: 2, reason: 'store-error', exact: true });
+  out(src.journal, 'X\r\n');
+  const whole = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
+  assert.equal(whole.truncated, true);
+  assert.doesNotMatch(whole.text!, /r3/);
+  const before = await readJournal(src, { since: 0, until: 1 }, { resultBytes: 16384 });
+  assert.deepEqual(before.text!.split('\n'), ['top1', 'top2', 'r3', 'r4', 'r5', 'r6']);
+  assert.match((await readJournal(src, { since: 0, as: 'raw' }, { resultBytes: 16384 })).text!, /r3\r\nr4/);
+});

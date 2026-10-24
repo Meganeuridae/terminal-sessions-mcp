@@ -26,10 +26,14 @@
  *   cursor-addressed output) is taken again from less input, so the head of a
  *   page is never cut away. A page the next one continues keeps its trailing
  *   blank lines and an unfinished line's trailing spaces (§6 rule 3, `open`), so
- *   pages joined read as the whole range does, with one exception: a line longer
- *   than the rest of its page is cut mid-line, and its rest begins the next page
- *   at column 0, so a tab or cursor motion in that rest lands on a different
- *   column than it would unsplit.
+ *   pages joined read as the whole range does, with the two exceptions rule 3
+ *   names: a line a page ends returned over is a line of its own on that page;
+ *   and a line longer than the rest of its page is cut mid-line, its rest
+ *   beginning the next page at column 0, so a tab, a backspace or cursor motion
+ *   at the cut or in that rest lands on a different column than it would
+ *   unsplit: a motion forward carried into the page keeps none of its spacing,
+ *   and the text after a motion back joins after what it would have written
+ *   over.
  * - A shell Run's pages and tails (`runId`) show what the Run's own result
  *   shows: the daemon's plumbing in its range (a marker Run's typed line,
  *   marks and the prompt after its end mark, a declared shell's end mark, a
@@ -49,9 +53,14 @@
  *   cut before an erase said its `x352` went on, so pages joined by `splitLine`
  *   read `x352x353` (the house's review of 4860d4c..bc4bc85, PR #22, comment
  *   6357989601). A page that took every event of a live range and ends with a
- *   CR may be continued by the LF of a CRLF, and says so. The controls are
- *   carried up to CARRY_CONTROLS past the cut; a longer run is left to the
- *   next page, and this page answers for what it holds, as if text followed.
+ *   CR may be continued by the LF of a CRLF, and says so. At that edge nothing
+ *   follows yet to say otherwise, so a progress bar's next update, `60%` after
+ *   `50%\r` or `\r60%` after `\r50%`, joins as `50%60%`, where the range shows
+ *   `60%`. The controls are carried up to CARRY_CONTROLS past the cut; a longer
+ *   run is left to the next page, and this page answers for what it holds, as
+ *   if text followed. A page that ends on the alternate screen shows the
+ *   full-screen program's frame (§6 rule 5) and says nothing of its last line:
+ *   frames don't join as lines.
  * - `more` is true whenever retained events of the range remain after the page.
  * - The projection (§6) runs at the session's geometry, and a Run's at the
  *   geometry it started with. A page starts in the lasting terminal state the

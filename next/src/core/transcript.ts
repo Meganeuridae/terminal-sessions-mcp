@@ -21,11 +21,15 @@
  *    When `open` says a next range continues this one (a page), the blank lines
  *    the range ended with are kept (every line begun up to the cursor's row), and
  *    an unfinished last line keeps its trailing whitespace, so the pages joined
- *    read as the whole range does, with one exception: a line the range ends
+ *    read as the whole range does, with two exceptions. A line the range ends
  *    returned over (below) is a line of its own on that page, where the whole
  *    range would have let the next text overwrite it, so a run of `\rL<n>`
  *    overwrites cut into pages shows one line per page where the range shows
- *    one. The cursor's row is begun when something was
+ *    one. And a range that ends inside a line leaves the rest of it to the next
+ *    range, which begins it at column 0: a tab, a backspace or cursor motion at
+ *    the end or in that rest lands on a different column than in the whole
+ *    range, and cursor motion past the line's last character keeps no
+ *    whitespace. The cursor's row is begun when something was
  *    written on it; a row it was moved onto without a write (an erase of the
  *    display left it there, a cursor motion took it there) is no line yet. The
  *    projection says how its last line stands for the next range (`lastLine`):
@@ -160,7 +164,8 @@ export interface Projection {
    * Rows the projection lost after projecting them: scrolled out of its scratch scrollback unread, or gone from a
    * scroll region where the terminal alone still shows them, scrolled out ahead of it by what the program did not
    * write (rule 6, Projector.regionScroll). `truncated` counts them too; unlike what a cut omits or drops, no other
-   * page or tail shows them.
+   * page or tail of this range shows them. A read that ends before they were lost shows them, and a raw read has
+   * their bytes.
    */
   lost?: true;
   /**
