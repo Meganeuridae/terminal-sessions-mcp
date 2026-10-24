@@ -659,7 +659,11 @@ test("a read of /proc/net/tcp torn by sockets changing under it lists the connec
   });
   try {
     assert.equal(await connectionOf(socket, process.pid), undefined, "listed once, it is shown as this process's");
+    // The connection's server side, by both its addresses: the listener's own row has the same local address, and listed
+    // before it, that row took the edits, so a row "left out" of the first read was the listener's, the connection was
+    // found on that read, and the case passed with the retry taken away (the house's review of bc4bc85..5d8ce0e, #22).
     const serverSide = procAddress('127.0.0.1', port, false)!;
+    const clientSide = procAddress('127.0.0.1', socket.localPort!, false)!;
     const fields = (line: string) => line.trim().split(/\s+/);
     const withInode = (line: string, inode: string) => {
       const f = fields(line);
@@ -668,13 +672,13 @@ test("a read of /proc/net/tcp torn by sockets changing under it lists the connec
     };
     const tables = (edit: (line: string) => string[]) => (table: string) => {
       const text = fs.readFileSync(table, 'utf8');
-      return table === '/proc/net/tcp' ? text.split('\n').flatMap((line) => (fields(line)[1] === serverSide ? edit(line) : [line])).join('\n') : text;
+      return table === '/proc/net/tcp' ? text.split('\n').flatMap((line) => (fields(line)[1] === serverSide && fields(line)[2] === clientSide ? edit(line) : [line])).join('\n') : text;
     };
     assert.equal(await connectionOf(socket, process.pid, { read: tables((line) => [line, line]) }), undefined, 'listed twice with one inode, it is one socket');
     // Before termd accepts, the row has no inode; a torn read can give the row before and after the accept.
     assert.equal(await connectionOf(socket, process.pid, { read: tables((line) => [withInode(line, '0'), line]) }), undefined, 'the row with an inode is the socket');
     // A row the tear left out is looked up again: the first read of the table lacks it, the next has it.
-    let rowsMet = 0; // the server side's row is met once per read of the table
+    let rowsMet = 0; // the connection's server-side row is met once per read of the table
     const leftOutOnce = (table: string) => tables((line) => (table === '/proc/net/tcp' && rowsMet++ === 0 ? [] : [line]))(table);
     assert.equal(await connectionOf(socket, process.pid, { read: leftOutOnce }), undefined, 'found on a later read');
     assert.ok(rowsMet >= 2, `the table was read again (its row met ${rowsMet} times)`);
