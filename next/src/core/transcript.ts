@@ -397,7 +397,13 @@ class Projector {
    * row ahead of the terminal's, so the program's next scroll of the region is one the terminal does not make.
    */
   private pending = 0;
-  /** The cursor-motion handlers, while a row is pending (watchCursor). */
+  /**
+   * `pending` when the program last saved its cursor (DECSC, SCOSC, mode 1048): the projection saved its cursor that many
+   * rows below the terminal's, so restoring both puts it that far ahead again (onCursorRestore). Counted from that save,
+   * whatever moved the cursors since; a settle starts it afresh with the rest of the account.
+   */
+  private savedPending = 0;
+  /** The cursor-motion handlers, while a row is pending or a saved cursor carries one (watchCursor). */
   private cursorWatch: Array<{ dispose(): void }> | undefined;
   /**
    * Rows the projection scrolled out of the region ahead of the terminal, oldest first: whether each held text. The
@@ -425,19 +431,25 @@ class Projector {
   }
 
   /**
-   * The cursor-motion handlers (onCursorMove, onCursorSet) are registered only while a row is pending, and go when
-   * none is: registered throughout, they cost every cursor move of every projection (9% over 200,000 lines each set
-   * by CUP), for a case that needs a line end the program did not write inside a region not from row 1.
+   * The cursor-motion handlers (onCursorMove, onCursorSet, and the saved cursor's onCursorSave and onCursorRestore) are
+   * registered only while a row is pending or a saved cursor carries one, and go when neither does: registered
+   * throughout, they cost every cursor move of every projection (9% over 200,000 lines each set by CUP), for a case that
+   * needs a line end the program did not write inside a region not from row 1. A save made while they're away carries
+   * nothing pending, which is what `savedPending` then holds.
    */
   private watchCursor(): void {
-    if (this.pending > 0 && !this.cursorWatch) {
+    const watch = this.pending > 0 || this.savedPending > 0;
+    if (watch && !this.cursorWatch) {
       const p = this.term.parser;
       this.cursorWatch = [
         ...['A', 'B', 'E', 'F'].map((final) => p.registerCsiHandler({ final }, (params) => this.onCursorMove(final === 'A' || final === 'F' ? -(num(params[0]) || 1) : num(params[0]) || 1))),
-        ...['H', 'f', 'd', 'u'].map((final) => p.registerCsiHandler({ final }, () => this.onCursorSet())),
-        p.registerEscHandler({ final: '8' }, () => this.onCursorSet()),
+        ...['H', 'f', 'd'].map((final) => p.registerCsiHandler({ final }, () => this.onCursorSet())),
+        p.registerCsiHandler({ final: 's' }, () => this.onCursorSave()),
+        p.registerEscHandler({ final: '7' }, () => this.onCursorSave()),
+        p.registerCsiHandler({ final: 'u' }, () => this.onCursorRestore()),
+        p.registerEscHandler({ final: '8' }, () => this.onCursorRestore()),
       ];
-    } else if (this.pending === 0 && this.cursorWatch) {
+    } else if (!watch && this.cursorWatch) {
       for (const h of this.cursorWatch) h.dispose();
       this.cursorWatch = undefined;
     }
@@ -482,6 +494,7 @@ class Projector {
     this.owed.clear();
     this.blank.clear();
     this.pending = 0;
+    this.savedPending = 0;
     this.watchCursor();
     this.generation++;
   }
@@ -561,14 +574,38 @@ class Projector {
   }
 
   /**
-   * CUP, HVP, VPA, DECRC, SCORC: the program's own cursor set to a row, where the terminal's cursor then is too, so
-   * no row between the two is pending (`pending`). What it writes there lands on the same row of both screens, which
-   * stays the projection's alone when it was (`owed`): a hole's blank row owed, then `CSI 6;1 H`, `X` and four
-   * lines, ends with the two screens the same, the row with `X` being the one the hole's line end began.
+   * CUP, HVP, VPA: the program's own cursor set to a row, where the terminal's cursor then is too, so no row between
+   * the two is pending (`pending`). What it writes there lands on the same row of both screens, which stays the
+   * projection's alone when it was (`owed`): a hole's blank row owed, then `CSI 6;1 H`, `X` and four lines, ends with
+   * the two screens the same, the row with `X` being the one the hole's line end began.
    */
   private onCursorSet(): boolean {
     if (!this.others && this.term.buffer.active.type === 'normal') {
       this.pending = 0;
+      this.watchCursor();
+    }
+    return false;
+  }
+
+  /** DECSC, SCOSC, mode 1048: the program saves its cursor, the projection's that many rows below the terminal's (`savedPending`). */
+  private onCursorSave(): boolean {
+    if (!this.others && this.term.buffer.active.type === 'normal') {
+      this.savedPending = this.pending;
+      this.watchCursor();
+    }
+    return false;
+  }
+
+  /**
+   * DECRC, SCORC, mode 1048: the program restores its saved cursor, and each screen's goes back to where it was saved,
+   * the projection's as far ahead of the terminal's as it was then (`savedPending`): a hole's line end, then a cursor
+   * saved and at once restored, which moves neither, left the projection's region a scroll ahead as before, where
+   * taking the restore for a set to one row lost that, and the row it took went unreported (the house's review of
+   * bc4bc85..5d8ce0e, PR #22, I3).
+   */
+  private onCursorRestore(): boolean {
+    if (!this.others && this.term.buffer.active.type === 'normal') {
+      this.pending = this.savedPending;
       this.watchCursor();
     }
     return false;
@@ -776,8 +813,9 @@ class Projector {
     return false;
   }
 
-  /** Entering the alternate screen: keep the content above the cursor (rule 5). */
+  /** Entering the alternate screen: keep the content above the cursor (rule 5). Mode 1048 saves the cursor alone (onCursorSave). */
   private onAltEnter(params: (number | number[])[]): boolean {
+    if (params.some((p) => num(p) === 1048)) this.onCursorSave();
     const buf = this.term.buffer.active;
     if (buf.type !== 'normal' || !params.some((p) => ALT_MODES.has(num(p)))) return false;
     // clear() keeps the cursor's row and does nothing when it is already the top row.
@@ -794,8 +832,9 @@ class Projector {
     return false;
   }
 
-  /** Leaving the alternate screen: keep its final frame (rule 5). */
+  /** Leaving the alternate screen: keep its final frame (rule 5). Mode 1048 restores the cursor alone (onCursorRestore). */
   private onAltExit(params: (number | number[])[]): boolean {
+    if (params.some((p) => num(p) === 1048)) this.onCursorRestore();
     const buf = this.term.buffer.active;
     if (buf.type !== 'alternate' || !params.some((p) => ALT_MODES.has(num(p)))) return false;
     this.frameOut(buf);

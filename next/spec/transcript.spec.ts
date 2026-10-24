@@ -1008,6 +1008,34 @@ test('what a region’s rows say is decided where they leave the screen and at t
   assert.deepEqual(await read([pty(region), run('L1\nL2\n'), pty(body(4, '\r\n'))]), [['Y', 'Z', 'W'], false, undefined], 'the pty scrolled them out too');
 });
 
+test('a cursor the program saves and restores is as far ahead of the terminal’s as when it was saved (the house’s review of bc4bc85..5d8ce0e, PR #22, I3)', async () => {
+  // A hole's line end inside the region puts the projection's cursor a row ahead of the terminal's. A restore was read as
+  // a set to one row, so a cursor saved and at once restored, which moves neither, made the program's next scroll the
+  // terminal's too, and the row it took from the projection alone went unreported.
+  const read = async (chunks: ProjectChunk[]) => {
+    const p = await project(chunks, { cols: 20, rows: 10 });
+    return [p.text.split('\n'), p.truncated, p.lost];
+  };
+  const short = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4';
+  const lines = 'X\r\nY\r\nZ\r\n';
+  const ahead = await read([short, { hole: true }, lines]);
+  assert.deepEqual(ahead, [['top1', 'top2', 'X', 'Y', 'Z'], true, true], 'r4X lacking');
+  for (const [save, restore] of [['\x1b7', '\x1b8'], ['\x1b[s', '\x1b[u'], ['\x1b[?1048h', '\x1b[?1048l']] as const) {
+    assert.deepEqual(await read([short, { hole: true }, `${save}${restore}${lines}`]), ahead, `saved and restored: ${JSON.stringify(save)}`);
+    // Set to the region's last row in between, where both cursors meet, and restored: ahead again, as when saved.
+    assert.deepEqual(await read([short, { hole: true }, `${save}\x1b[6;1H${restore}${lines}`]), ahead, `set in between: ${JSON.stringify(save)}`);
+  }
+  // Saved before the hole, the two saved cursors agree, and restored, nothing is ahead.
+  const together = [['top1', 'top2', 'r4X', 'Y', 'Z'], false, undefined];
+  assert.deepEqual(await read([`${short}\x1b7\x1b8${lines}`]), together, 'the terminal alone');
+  assert.deepEqual(await read([`${short}\x1b7`, { hole: true }, `\x1b8${lines}`]), together, 'saved before the hole');
+  // A full erase starts the account afresh, the saved cursor's count with it: the projection's saved cursor moved up with
+  // the rows the erase kept, so restored it is not ahead of the terminal's.
+  const erased = `\x1b7\x1b[2J\x1b8${lines}W\r\nV\r\nU\r\n`;
+  assert.deepEqual((await read([`${short}${erased}`])).slice(1), [false, undefined], 'the terminal alone, erased');
+  assert.deepEqual((await read([short, { hole: true }, erased])).slice(1), [false, undefined], 'saved ahead, then erased');
+});
+
 test('margins the replayed state set have no known owner: no source’s scroll of them is reported, the projection’s own line ends still are', async () => {
   // The house's review of 4860d4c..bc4bc85 (PR #22, comment 6357989601, "Who owns replayed margins"): fed as the first
   // source's output, the margins set before a page were that source's, and the loss of their rows was told the wrong way
