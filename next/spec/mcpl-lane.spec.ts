@@ -2816,6 +2816,47 @@ test("a retry that fired onto a channel closed before its flush leaves neither t
   }
 });
 
+test("a session's exit built while no connection carried it is caught up for a principal with a Run in the session then, and not for one whose Runs had ended", { timeout: 30_000 }, async () => {
+  // The live path owes the exit to a principal with a Run in the session when it exits (onJournal's hasRunIn); the
+  // catch-up asked only owed(), which has no such clause, so an exit built while the lane couldn't carry the session
+  // was never caught up (the question on #22 comment 6381722513).
+  const f = await bareLane('ex-a');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
+    const other = { principal: B, connectionId: 'ex-b' };
+    // This principal's Run is under way when the other principal's shell exits.
+    await f.app.sessionOpen(other, { id: 'ex1', visibility: 'shared' });
+    const s1 = live(f.registry, 'ex1');
+    // The seat passes from the owner to this principal for its Run, and back for the exit.
+    const releaseSeat = async (from: typeof other, id: string) => void (await f.app.control(from, { session: id, action: 'release' }));
+    await releaseSeat(other, 'ex1');
+    const mine = await f.app.run(f.caller, { session: 'ex1', command: 'sleep 5', target: 'process', wait: 0 });
+    await until(() => s1.run(mine.runId!).state === 'running', 5000, "this principal's Run to start");
+    await releaseSeat(f.caller, 'ex1');
+    await f.app.run(other, { session: 'ex1', command: 'exit 7', wait: 0 });
+    // This principal's Run has ended when the other principal's shell exits.
+    await f.app.sessionOpen(other, { id: 'ex2', visibility: 'shared' });
+    const s2 = live(f.registry, 'ex2');
+    await releaseSeat(other, 'ex2');
+    const ended = await f.app.run(f.caller, { session: 'ex2', command: 'echo mine-ended', target: 'process', wait: 5000 });
+    assert.equal(ended.state, 'exited', 'its own Run ended before the exit');
+    await releaseSeat(f.caller, 'ex2');
+    await f.app.run(other, { session: 'ex2', command: 'exit 8', wait: 0 });
+    const exitOf = (s: typeof s1) => s.journal.since(0).events.find((e) => e.type === 'session.exit');
+    await until(() => exitOf(s1) !== undefined && exitOf(s2) !== undefined, 8000, 'both shells to exit');
+    const atExit = s1.run(mine.runId!);
+    assert.ok(atExit.seq.admit < exitOf(s1)!.seq && (atExit.seq.end === undefined || atExit.seq.end > exitOf(s1)!.seq), 'its Run was under way at the exit');
+    const exitPushed = (id: string) =>
+      f.sent.filter((m) => m.method === 'push/event' && /session-exit/.test(String((m.params as { eventId: string }).eventId)) && (m.params as { origin: Record<string, unknown> }).origin.channelId === `terminal:${id}`);
+    assert.equal(exitPushed('ex1').length + exitPushed('ex2').length, 0, 'nothing pushed while push is off');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => f.inside.catchingUp === undefined && exitPushed('ex1').length === 1, 5000, 'the exit of the session it had a Run in caught up');
+    assert.equal(exitPushed('ex2').length, 0, 'no exit for a session where every Run of its own had ended');
+  } finally {
+    await f.close();
+  }
+});
+
 test("a debt owed only while a channel was open, which no catch-up finds owed after it closed, goes when the connection carries the session again", { timeout: 30_000 }, async () => {
   // Another principal's completion is owed only on an open channel. Refused there, its retry's timer then found the
   // channel closed, and the debt stayed: kept at a grant's regain above `delivered`, it was never owed again by the

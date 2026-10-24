@@ -678,6 +678,17 @@ function goneRanges(recorded: Gone[], inferred: Gone[], from: Seq, to: Seq): Gon
   return out;
 }
 
+/**
+ * The principals whose Runs a shell exit at `seq` cut short (G28): admitted before it, and ended after it or not at all,
+ * read from the run index as the live path reads the session's Runs at the exit. Replayed with no one, an exit reached
+ * no principal but the owner, so one built while a Run's principal had no connection to carry it was never caught up
+ * for them (the question on #22 comment 6381722513).
+ */
+export function cutShortBy(src: Pick<ReplaySource, 'journal'>, seq: Seq): Principal[] {
+  const runs = src.journal.runs.list().filter((r) => r.seq.admit < seq && (r.seq.end === undefined || r.seq.end > seq));
+  return [...new Set(runs.map((r) => r.principal))];
+}
+
 /** Render picked events as segments, oldest first (a Run's text is read here, once per kept event). */
 export async function renderPicked(src: ReplaySource, picked: Picked[]): Promise<Segment[]> {
   const r = new Render(src);
@@ -699,7 +710,7 @@ async function renderOne(r: Render, p: Picked): Promise<Segment | undefined> {
     case 'watch.fired':
       return r.watch(ev);
     case 'session.exit':
-      return r.exit(ev, []);
+      return r.exit(ev, cutShortBy(r.src, ev.seq));
     case 'recovered':
       return r.recovered(ev, p.lost ?? { principals: [], count: 0 }, p.exit);
     case 'run.waiting':
