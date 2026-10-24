@@ -674,10 +674,10 @@ test("a read of /proc/net/tcp torn by sockets changing under it lists the connec
     // Before termd accepts, the row has no inode; a torn read can give the row before and after the accept.
     assert.equal(await connectionOf(socket, process.pid, { read: tables((line) => [withInode(line, '0'), line]) }), undefined, 'the row with an inode is the socket');
     // A row the tear left out is looked up again: the first read of the table lacks it, the next has it.
-    let reads = 0;
-    const leftOutOnce = (table: string) => tables((line) => (table === '/proc/net/tcp' && reads++ === 0 ? [] : [line]))(table);
+    let rowsMet = 0; // the server side's row is met once per read of the table
+    const leftOutOnce = (table: string) => tables((line) => (table === '/proc/net/tcp' && rowsMet++ === 0 ? [] : [line]))(table);
     assert.equal(await connectionOf(socket, process.pid, { read: leftOutOnce }), undefined, 'found on a later read');
-    assert.ok(reads >= 2, `the table was read again (${reads} reads)`);
+    assert.ok(rowsMet >= 2, `the table was read again (its row met ${rowsMet} times)`);
     // Two rows with distinct inodes cannot be one socket, and which of them answered cannot be told.
     const another = (line: string) => withInode(line, String(Number(fields(line)[9]) + 1));
     assert.equal(await connectionOf(socket, process.pid, { read: tables((line) => [line, another(line)]) }), `more than one socket is the other end of this connection on port ${port}`);
