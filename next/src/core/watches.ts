@@ -49,7 +49,10 @@
  * retention or a hole took other events from its range, or its read failed; and one whose newest
  * retained output has a hole after it is said to be quiet since the manager began, which may be less
  * than it has been. A Run admitted under this manager with no stamp printed nothing, and arms on its
- * first output.
+ * first output. A silence wait on no Run measures from the session's newest output by the same rules: with a
+ * hole after it, from a newer stamp when there is one, else from the manager's start for output from before
+ * it (sessionQuiet; the house's read of bc4bc85..5d8ce0e, #22). A silence watch on no Run arms from its
+ * creation.
  */
 import { randomBytes } from 'node:crypto';
 import { compileLinePattern, PARTIAL_QUIET_MS, StreamMatcher, type LineMatch } from './ansi.js';
@@ -575,6 +578,34 @@ export class WatchManager {
     return { age: Math.max(0, Math.round(clocks.monotonic() - this.began.at)) };
   }
 
+  /**
+   * How long the session has been quiet, for a silence wait on no Run: from its newest output in the journal's last 2000
+   * events, or from now when there is none. A hole after that output may have held later output: then from the newest
+   * stamp, when one is newer, which retention or a hole cannot take; else from that output when this manager stamped it
+   * (anything printed since would carry a newer stamp); else, from before this manager began, since the manager began,
+   * with no output to name. Aged from that output, a wait answered at once with a silence the read could not give, and
+   * one whose newest output a lost stretch took was aged on the wall clock from an older one (the house's read of
+   * bc4bc85..5d8ce0e, #22).
+   */
+  private sessionQuiet(): { seq?: Seq; age: number } {
+    const recent = this.host.journal.tail(2000);
+    // The highest seq a hole after the scan's point reaches: a gap event comes after the range it records, so one whose
+    // range lies before the newest output can follow it in the journal too.
+    let holeTo = 0;
+    for (let i = recent.length - 1; i >= 0; i--) {
+      const e = recent[i]!;
+      if (e.type === 'gap') holeTo = Math.max(holeTo, e.to);
+      if (e.type !== 'output') continue;
+      if (holeTo <= e.seq) return { seq: e.seq, age: this.ageOf(e) };
+      let stamp: Stamp | undefined;
+      for (const streams of [...this.live.values(), ...this.ended.values()]) for (const st of Object.values(streams)) if (st && (!stamp || st.seq > stamp.seq)) stamp = st;
+      if (stamp && stamp.seq > e.seq) return { seq: stamp.seq, age: Math.max(0, Math.round(clocks.monotonic() - stamp.at)) };
+      if (e.seq > this.began.seq) return { seq: e.seq, age: this.ageOf(e) };
+      return { age: Math.max(0, Math.round(clocks.monotonic() - this.began.at)) };
+    }
+    return { age: 0 };
+  }
+
   private onHit(w: WatchRecord, hit: Hit): void {
     if (!this.watches.has(w.watchId)) return;
     const now = clocks.monotonic();
@@ -738,17 +769,19 @@ export class WatchManager {
         const gone = run ? undefined : exited();
         if (gone) return abort(gone);
         const cur = run && (this.host.journal.runs.get(run.runId) ?? run);
-        const sessionLast = run ? undefined : lastOutput(this.host.journal);
-        const newest: RunNewest = run ? this.newestRunOutput(run.runId) : sessionLast ? { seq: sessionLast.seq, age: this.ageOf(sessionLast) } : {};
+        const newest: RunNewest = run ? this.newestRunOutput(run.runId) : {};
         if (cur && isTerminal(cur.state)) {
           // A Run that printed nothing has no output to age, and says so as a watch on it does: its quiet was
           // taken from the journal's wall-clock end, so a clock step put any figure there (the house's read
-          // of the 40 commits, #22). One whose output is gone, or could not be read, says that instead.
-          const quiet = newest.age !== undefined ? ` no output for ${newest.age}ms` : ` ${newest.none ?? 'no output'}`;
+          // of the 40 commits, #22). One whose output is gone, or could not be read, says that instead. One whose
+          // newest retained output has a hole after it says how old that output is, not that the Run was quiet
+          // since: the hole may have held later output (the house's read of bc4bc85..5d8ce0e, #22).
+          const quiet =
+            newest.age === undefined ? ` ${newest.none ?? 'no output'}` : newest.unread ? ` its newest retained output is ${newest.age}ms old, with a hole after it` : ` no output for ${newest.age}ms`;
           return finish(result({ matched: true, match: `${endText(cur)};${quiet}`, seq: cur.seq.end ?? this.host.journal.lastSeq }));
         }
-        // The session's quiet is from its last output, or from now; a live Run's is quietOf's.
-        const quiet = run ? this.quietOf(run, newest) : { ...newest, age: newest.age ?? 0 };
+        // The session's quiet is sessionQuiet's; a live Run's is quietOf's.
+        const quiet = run ? this.quietOf(run, newest) : this.sessionQuiet();
         const age = quiet.age;
         if (age !== undefined && age >= spec.silenceMs!) return finish(result({ matched: true, match: `no output for ${age}ms`, ...(quiet.seq !== undefined ? { seq: quiet.seq } : {}) }));
         // A Run that has printed nothing yet starts the clock at its first output (or its end answers).
@@ -769,12 +802,3 @@ export class WatchManager {
   }
 }
 
-/** The newest output event among the last 2000 events, if any. */
-function lastOutput(journal: Journal): JournalEvent | undefined {
-  const recent = journal.tail(2000);
-  for (let i = recent.length - 1; i >= 0; i--) {
-    const e = recent[i]!;
-    if (e.type === 'output') return e;
-  }
-  return undefined;
-}

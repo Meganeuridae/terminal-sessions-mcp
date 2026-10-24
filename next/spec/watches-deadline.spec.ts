@@ -535,6 +535,34 @@ test('a silence watch or wait on a live Run whose output from before this manage
   }
 });
 
+test("a silence wait answering for an ended Run whose newest retained output has a hole after it says how old that output is, not that the Run was quiet since (the house's read of bc4bc85..5d8ce0e, #22)", async (t) => {
+  // The hole may have held later output: "no output for N ms" named a quiet the read could not give.
+  const f = bare();
+  try {
+    f.startRun('q');
+    const printed = f.out('printed\n', 'q').seq;
+    f.journal.append({ type: 'run.end', runId: 'q', state: 'exited', exit: 0, durationMs: 1 });
+    // Ended before this manager existed, as before a restart: it holds no stamp, and only the journal can say.
+    const later = new WatchManager(f.host);
+    try {
+      const output = f.journal.runs.output.bind(f.journal.runs);
+      t.mock.method(f.journal.runs, 'output', (...a: Parameters<typeof output>) => {
+        const out = output(...a);
+        const lost = printed + 1;
+        const events = out.events.map((e) => ({ ...e, ts: e.ts - 60_000 }));
+        return { ...out, events, gaps: [{ seq: lost, ts: Date.now(), type: 'gap' as const, from: lost, to: lost, reason: 'torn-write' as const }] };
+      });
+      const w = await later.waitFor({ silenceMs: 200, runId: 'q' }, 5000);
+      const m = /^run q ended \(exited 0\); its newest retained output is (\d+)ms old, with a hole after it$/.exec(String(w.match));
+      assert.ok(w.matched && m && Number(m[1]) >= 60_000, JSON.stringify(w));
+    } finally {
+      later.dispose();
+    }
+  } finally {
+    f.close();
+  }
+});
+
 test("a live Run's silence isn't aged from its newest retained output when a hole follows it, which may have held later output: it is quiet since this manager began (the house's read of 4860d4c..bc4bc85, #22)", async (t) => {
   // The Run printed before this manager existed. Its newest retained output is a minute old; aged from it, a 30 s
   // silence answered at once, though the hole after it may have held output from a moment ago.
@@ -561,6 +589,98 @@ test("a live Run's silence isn't aged from its newest retained output when a hol
     } finally {
       later.dispose();
     }
+  } finally {
+    f.close();
+  }
+});
+
+test("a silence wait on no Run isn't aged from the session's newest retained output when a hole follows it: from a newer stamp, else, for output from before this manager, since it began (the house's read of bc4bc85..5d8ce0e, #22)", async (t) => {
+  const f = bare();
+  const mono = clocks.monotonic;
+  let shift = 0;
+  t.mock.method(clocks, 'monotonic', () => mono() + shift);
+  try {
+    // The session printed before this manager existed, a minute ago by the journal; a hole after it may hold later output.
+    const early = f.out('early\n');
+    const later = new WatchManager(f.host);
+    try {
+      let hole = false;
+      const tail = f.journal.tail.bind(f.journal);
+      t.mock.method(f.journal, 'tail', (...a: Parameters<typeof tail>) => {
+        const events = tail(...a).map((e) => (e.seq === early.seq ? { ...e, ts: e.ts - 60_000 } : e));
+        if (!hole) return events;
+        const lost = f.journal.lastSeq + 1;
+        return [...events, { seq: lost, ts: Date.now(), type: 'gap' as const, from: early.seq + 1, to: lost, reason: 'torn-write' as const }];
+      });
+      const whole = await later.waitFor({ silenceMs: 30_000 }, 300);
+      assert.deepEqual([whole.matched, whole.seq], [true, early.seq], `with nothing lost after it, its newest output is a minute old: ${JSON.stringify(whole)}`);
+      hole = true;
+      // Aged from that output, this answered at once.
+      const cut = await later.waitFor({ silenceMs: 30_000 }, 300);
+      assert.equal(cut.matched, false, `with a hole after it, the quiet known is since the manager began: ${JSON.stringify(cut)}`);
+      shift = 40_000;
+      const since = await later.waitFor({ silenceMs: 30_000 }, 300);
+      assert.ok(since.matched && Number(/(\d+)ms$/.exec(String(since.match))?.[1]) >= 40_000, JSON.stringify(since));
+      assert.equal(since.seq, undefined, JSON.stringify(since));
+    } finally {
+      later.dispose();
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("a silence wait on no Run whose newest output, printed under this manager, has a hole after it that held no output is aged from that output's own stamp, not from the manager's start (the house's read of bc4bc85..5d8ce0e, #22)", async (t) => {
+  // Anything printed since would carry a newer stamp, so with none the hole held no output, and the output's stamp is
+  // exact; measured from the manager's start, the wait said the session had been quiet longer than it had.
+  const mono = clocks.monotonic;
+  let shift = 0;
+  t.mock.method(clocks, 'monotonic', () => mono() + shift);
+  const f = bare();
+  try {
+    shift = 20_000;
+    const printed = f.out('printed\n');
+    const tail = f.journal.tail.bind(f.journal);
+    t.mock.method(f.journal, 'tail', (...a: Parameters<typeof tail>) => {
+      const lost = f.journal.lastSeq + 1;
+      return [...tail(...a), { seq: lost, ts: Date.now(), type: 'gap' as const, from: lost, to: lost, reason: 'store-error' as const }];
+    });
+    // 20 s since the output, 40 s since the manager began.
+    shift = 40_000;
+    const young = await f.manager.waitFor({ silenceMs: 30_000 }, 300);
+    assert.equal(young.matched, false, `the output is 20 s old: ${JSON.stringify(young)}`);
+    shift = 55_000;
+    const old = await f.manager.waitFor({ silenceMs: 30_000 }, 300);
+    const age = Number(/(\d+)ms$/.exec(String(old.match))?.[1]);
+    assert.deepEqual([old.matched, old.seq], [true, printed.seq], JSON.stringify(old));
+    assert.ok(age >= 35_000 && age < 55_000, `aged from the output, not the manager's start: ${JSON.stringify(old)}`);
+  } finally {
+    f.close();
+  }
+});
+
+test("a silence wait on no Run whose newest output a lost stretch took is aged from that output's stamp, not on the wall clock from an older one (the house's read of bc4bc85..5d8ce0e, #22)", async (t) => {
+  const f = bare();
+  const mono = clocks.monotonic;
+  let shift = 0;
+  t.mock.method(clocks, 'monotonic', () => mono() + shift);
+  try {
+    // Both printed under this manager, so both were stamped; the journal kept the older one, a minute old by its time,
+    // and lost the newer.
+    const older = f.out('older\n');
+    const newer = f.out('newer\n');
+    const tail = f.journal.tail.bind(f.journal);
+    t.mock.method(f.journal, 'tail', (...a: Parameters<typeof tail>) => {
+      const kept = tail(...a).filter((e) => e.seq !== newer.seq).map((e) => (e.seq === older.seq ? { ...e, ts: e.ts - 60_000 } : e));
+      return [...kept, { seq: newer.seq, ts: Date.now(), type: 'gap' as const, from: newer.seq, to: newer.seq, reason: 'store-error' as const }];
+    });
+    // Aged on the wall clock from the older output, this answered at once.
+    const now = await f.manager.waitFor({ silenceMs: 30_000 }, 300);
+    assert.equal(now.matched, false, `the newer output was stamped a moment ago: ${JSON.stringify(now)}`);
+    shift = 40_000;
+    const later = await f.manager.waitFor({ silenceMs: 30_000 }, 300);
+    assert.deepEqual([later.matched, later.seq], [true, newer.seq], JSON.stringify(later));
+    assert.ok(Number(/(\d+)ms$/.exec(String(later.match))?.[1]) >= 40_000, JSON.stringify(later));
   } finally {
     f.close();
   }
