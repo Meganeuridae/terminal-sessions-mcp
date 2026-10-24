@@ -502,7 +502,8 @@ test('the reader check through ps and lsof finds a reader that holds the termina
   // 4860d4c..bc4bc85, PR #22, by run with lsof 4.95.0). It runs where lsof is, Linux included, beside the platform's own check.
   const backend = new NodePtyBackend();
   const home = fs.mkdtempSync(path.join(tmp, 'reader-300-'));
-  fs.writeFileSync(path.join(home, 'rc'), `echo | /bin/bash -c 'echo $$ >> "$HOME/pids"; exec 300</dev/tty; echo READY">"; read -r -u 300 __x'\n`);
+  // Job control off, so the reader runs in the shell's own group on every host (the assertion below holds it to that).
+  fs.writeFileSync(path.join(home, 'rc'), `set +m; echo | /bin/bash -c 'echo $$ >> "$HOME/pids"; exec 300</dev/tty; echo READY">"; read -r -u 300 __x'\n`);
   const p = backend.spawnShell({ shell: '/bin/bash', args: ['--rcfile', path.join(home, 'rc'), '-i'], cwd: home, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', TERM: 'dumb', HOME: home }, cols: 80, rows: 24 });
   let out = '';
   p.onData((d) => (out += d));
@@ -511,6 +512,11 @@ test('the reader check through ps and lsof finds a reader that holds the termina
     await until(() => out.includes('READY>'), 5000, 'ready');
     const tty = `/dev/${execFileSync('ps', ['-o', 'tty=', '-p', String(p.pid)], { encoding: 'utf8' }).trim()}`;
     assert.match(tty, /^\/dev\/\w/, 'the terminal’s name');
+    // The reader is in the shell's own group, which holds the terminal: else both checks answer true at their first
+    // test (the terminal held by another group) and pass without the descriptor walk this exists for (the house's review
+    // of bc4bc85..5d8ce0e, PR #22).
+    const [pgid, tpgid] = execFileSync('ps', ['-o', 'pgid=,tpgid=', '-p', String(p.pid)], { encoding: 'utf8' }).trim().split(/\s+/).map(Number);
+    assert.ok(pgid !== undefined && pgid > 0 && pgid === tpgid, `the shell's group holds the terminal: pgid ${pgid}, tpgid ${tpgid}`);
     assert.equal(p.otherReader?.(), true, 'the platform’s own check (the control)');
     assert.equal(otherReaderPs(p.pid, tty), true, 'through ps and lsof');
   } finally {
