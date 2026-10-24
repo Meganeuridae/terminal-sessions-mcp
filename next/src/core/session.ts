@@ -3154,26 +3154,48 @@ export class Session {
     if (principal !== SYSTEM && this.control !== 'open') this.requireSeat(principal, 'run', opts);
     const out = path.join(this.tempDir, `tsm-env-${process.pid}-${this.safeId}-${++this.tempCounter}.bin`);
     this.extraTempFiles.add(out);
-    const admitted = await this.admitWhenAvailable({ target: 'shell', line: `env -0 > ${shellQuote(out)}`, principal, internal: true, origin: 'system' });
-    if (!admitted.admitted) throw err('busy', `shell not available: ${admitted.reason}`, { reason: admitted.reason });
-    const run = await this.awaitRun(admitted.run.runId, waitMs);
-    if (run.state !== 'exited') throw err('timeout', `env capture did not complete (${run.state})`, { runId: run.runId });
+    let capture: RunRecord | undefined;
     const discard = () => {
-      fs.rmSync(out, { force: true });
-      this.extraTempFiles.delete(out);
+      try {
+        fs.rmSync(out, { force: true });
+        // A Run cancellation could not stop may still create the file later. Keep it registered until
+        // its end, where the waiter below removes that later write too; close also tries it.
+        if (!capture || isTerminal(capture.state)) this.extraTempFiles.delete(out);
+      } catch (e) {
+        this.leaveForClose(out, e);
+      }
     };
-    if (run.exit !== 0) {
-      // A capture that failed (no `env` on the PATH, a full disk) leaves an empty or cut file: not a
-      // snapshot (the house's read of a6d0c35, #22: process Runs would have started with no environment).
-      discard();
-      throw err('backend_failure', `env capture failed: env -0 exited ${run.exit ?? '?'}`, { runId: run.runId });
-    }
     let text: string;
     try {
-      text = fs.readFileSync(out, 'utf8');
-    } catch (e) {
-      throw err('backend_failure', `env capture produced no output (exit ${run.exit ?? '?'}): ${errMessage(e)}`, { runId: run.runId });
+      // The file already has owner-only mode. POSIX/zsh use >| to override noclobber;
+      // fish uses > because it parses >| as a pipe.
+      writeExclusive(out, '');
+      const redirect = this.flavor === 'fish' ? '>' : '>|';
+      const admitted = await this.admitWhenAvailable({ target: 'shell', line: `env -0 ${redirect} ${shellQuote(out)}`, principal, internal: true, origin: 'system' });
+      if (!admitted.admitted) throw err('busy', `shell not available: ${admitted.reason}`, { reason: admitted.reason });
+      capture = this.getRun(admitted.run.runId);
+      const run = await this.awaitRun(capture.runId, waitMs);
+      if (run.state !== 'exited') {
+        if (!isTerminal(capture.state)) {
+          try {
+            await this.cancel(capture.runId, SYSTEM);
+          } catch (e) {
+            this.note(`${capture.runId}: env capture cancellation failed (${errMessage(e)}); its raw file is removed again when the Run ends or the session closes`);
+          }
+        }
+        throw err('timeout', `env capture did not complete (${run.state})`, { runId: run.runId });
+      }
+      if (run.exit !== 0) {
+        // A failed command may leave a partial file: never install it as the process environment.
+        throw err('backend_failure', `env capture failed: env -0 exited ${run.exit ?? '?'}`, { runId: run.runId });
+      }
+      try {
+        text = fs.readFileSync(out, 'utf8');
+      } catch (e) {
+        throw err('backend_failure', `env capture produced no output (exit ${run.exit ?? '?'}): ${errMessage(e)}`, { runId: run.runId });
+      }
     } finally {
+      if (capture && !isTerminal(capture.state)) capture.waiters.push(() => discard());
       discard();
     }
     const vars = redactSnapshot(parseEnvNul(text));

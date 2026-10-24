@@ -368,8 +368,8 @@ test('G7/G26 (core-7, api-4, jr-6, sec-4): shells and process Runs never see the
 test('G26/G17 (api-3, core-7): env capture needs the seat, keeps values out of raw output, and never journals credentials', async () => {
   const h = await harness({
     setup: (s) =>
-      s.on(/^env -0 > '(.*)'$/, (l) => {
-        fs.writeFileSync(/^env -0 > '(.*)'$/.exec(l)![1]!, 'A=1\0TSM_TOKEN=user-exported-secret\0PATH=/bin\0');
+      s.on(/^env -0 >\| '(.*)'$/, (l) => {
+        fs.writeFileSync(/^env -0 >\| '(.*)'$/.exec(l)![1]!, 'A=1\0TSM_TOKEN=user-exported-secret\0PATH=/bin\0');
         return { exit: 0 };
       }),
   });
@@ -386,8 +386,8 @@ test('core-7: an env capture whose `env -0` failed is not installed as the snaps
   // refused, not become the process basis (the house's read of a6d0c35, #22). The exit status is the check.
   const h = await harness({
     setup: (s) =>
-      s.on(/^env -0 > '(.*)'$/, (l) => {
-        fs.writeFileSync(/^env -0 > '(.*)'$/.exec(l)![1]!, 'PARTIAL=only\0');
+      s.on(/^env -0 >\| '(.*)'$/, (l) => {
+        fs.writeFileSync(/^env -0 >\| '(.*)'$/.exec(l)![1]!, 'PARTIAL=only\0');
         return { exit: 127 };
       }),
   });

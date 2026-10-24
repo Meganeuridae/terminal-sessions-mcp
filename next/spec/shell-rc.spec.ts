@@ -5,6 +5,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { JournalEvent } from '../src/core/types.js';
@@ -26,6 +27,28 @@ PS1="$PS1"'\\[\\033]133;B\\007\\]'
 `;
 
 const prompts = (evs: JournalEvent[], phase: 'start' | 'end') => evs.filter((e) => e.type === 'prompt' && e.phase === phase).length;
+
+test('realSession keeps its private HOME and XDG directories when a test supplies daemonEnv', { skip: !hasShell('/bin/bash') }, async () => {
+  const supplied = {
+    PATH: process.env.PATH,
+    HOME: '/fixture-host-home',
+    XDG_CONFIG_HOME: '/fixture-host-config',
+    XDG_DATA_HOME: '/fixture-host-data',
+    XDG_CACHE_HOME: '/fixture-host-cache',
+    XDG_STATE_HOME: '/fixture-host-state',
+    ZDOTDIR: '/fixture-host-zdotdir',
+    KEEP_FIXTURE_VALUE: 'kept',
+  };
+  const x = await realSession('/bin/bash', { daemonEnv: supplied, login: false });
+  try {
+    assert.equal(supplied.ZDOTDIR, '/fixture-host-zdotdir', 'fixture setup preserves the caller-owned environment object');
+    const r = await x.run("printf '%s\\n' \"$HOME\" \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_CACHE_HOME\" \"$XDG_STATE_HOME\" \"$KEEP_FIXTURE_VALUE\"");
+    assert.equal(r.state, 'exited');
+    assert.deepEqual(r.text.split('\n'), [x.home, path.join(x.home, '.config'), path.join(x.home, '.local', 'share'), path.join(x.home, '.cache'), path.join(x.home, '.local', 'state'), 'kept']);
+  } finally {
+    await x.close();
+  }
+});
 
 for (const shell of ['/bin/bash', '/bin/zsh'].filter(hasShell)) {
   const zsh = shell.endsWith('zsh');
@@ -359,19 +382,129 @@ for (const line of ['PROMPT_COMMAND="history -a"', 'PROMPT_COMMAND="if true; the
   });
 }
 
-test('/bin/bash: a typed line that runs a command and then installs it as PROMPT_COMMAND last ends at its prompt, with its status and cwd, and the session goes idle; one that then empties PROMPT_COMMAND ends lost, with no exit made up', { skip: !hasShell('/bin/bash') }, async () => {
-  // At the prompt, PROMPT_COMMAND's run of `true` reads by its text as the line's own (the line does run
-  // it), so the heal stood down, our hook did not run, and the Run stayed open at a prompt already shown
-  // until someone typed (the house's read of the 33 commits, #22 comment 6307351617, item 2). The start
-  // of PS1 now prints the end mark with the status and cwd the DEBUG trap kept. `$(exit 4)` gives the
-  // last assignment, and so the line, a status of 4. A line that empties PROMPT_COMMAND after its own
-  // run of `true` leaves a status kept from before its end: that prompt ends the Run lost (ss-3), never
-  // with the kept 0 for the line's 5.
+for (const [kind, assignment] of [
+  ['whitespace', 'PROMPT_COMMAND="   "$(exit 5)'],
+  ['a comment', 'PROMPT_COMMAND="# nothing runs"$(exit 5)'],
+  ['an array of noncommands', 'PROMPT_COMMAND=("   " "# nothing runs"$(exit 5))'],
+  ['continued comment', String.raw`PROMPT_COMMAND=$'\\\n# nothing runs'$(exit 5)`],
+] as const) {
+  test(`/bin/bash: a commandless but nonempty PROMPT_COMMAND (${kind}) cannot turn an uncertain exit into success`, { skip: !hasShell('/bin/bash') }, async () => {
+    const x = await realSession('/bin/bash', { login: false });
+    try {
+      // An earlier DEBUG firing saves zero. The final assignment installs a commandless
+      // prompt value but its substitution exits 5. Nothing runs at the prompt to attest it.
+      const line = `echo own; PROMPT_COMMAND=true; true; ${assignment}`;
+      const before = x.session.listRuns().length;
+      x.session.input(`${line}\n`, { principal: AGENT });
+      await until(() => x.session.listRuns().slice(before).some((r) => r.origin === 'agent' && (r.state === 'exited' || r.state === 'lost')), 5000, 'the typed Run to settle at its prompt');
+      const typed = x.session.listRuns().slice(before).find((r) => r.origin === 'agent')!;
+      assert.deepEqual({ state: typed.state, exit: typed.exit, reason: typed.reason }, { state: 'lost', exit: undefined, reason: 'prompt-without-end-mark' }, 'a saved zero is not the final exit');
+      await until(() => x.session.shellAvailable().ok, 3000, 'the shell to return to its prompt');
+      const next = await x.run('echo recovered', 4000);
+      assert.deepEqual([next.state, next.exit, next.text.trim()], ['exited', 0, 'recovered']);
+    } finally {
+      await x.close();
+    }
+  });
+}
+
+test('/bin/bash: an array cannot certify a typed line when its prompt hook was replaced', { skip: !hasShell('/bin/bash') }, async () => {
+  const x = await realSession('/bin/bash', { login: false });
+  try {
+    const line = 'echo own; PROMPT_COMMAND=true; true; PROMPT_COMMAND=("   " "true"$(exit 5))';
+    const before = x.session.listRuns().length;
+    x.session.input(`${line}\n`, { principal: AGENT });
+    await until(() => x.session.listRuns().slice(before).some((r) => r.origin === 'agent' && (r.state === 'exited' || r.state === 'lost')), 5000, 'the mixed-array line to settle');
+    const typed = x.session.listRuns().slice(before).find((r) => r.origin === 'agent')!;
+    assert.deepEqual([typed.state, typed.reason], ['lost', 'prompt-without-end-mark'], 'the user prompt array supplies no authenticated end mark');
+    const next = await x.run('echo recovered', 4000);
+    assert.deepEqual([next.state, next.exit, next.text.trim()], ['exited', 0, 'recovered']);
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: an associative PROMPT_COMMAND is inert on Bash 5.1+', { skip: !hasShell('/bin/bash') }, async (t) => {
+  const [major = 0, minor = 0] = execFileSync('/bin/bash', ['-c', 'printf "%s.%s" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}"'], { encoding: 'utf8' }).split('.').map(Number);
+  if (!(major > 5 || (major === 5 && minor >= 1))) return t.skip('associative prompt commands are a Bash 5.1+ case');
+  const x = await realSession('/bin/bash', { login: false });
+  try {
+    const line = 'echo own; PROMPT_COMMAND=true; true; unset PROMPT_COMMAND; declare -A PROMPT_COMMAND=([x]=true)';
+    const before = x.session.listRuns().length;
+    x.session.input(`${line}\n`, { principal: AGENT });
+    await until(() => x.session.listRuns().slice(before).some((r) => r.origin === 'agent' && (r.state === 'exited' || r.state === 'lost')), 5000, 'the associative prompt line to settle');
+    const typed = x.session.listRuns().slice(before).find((r) => r.origin === 'agent')!;
+    assert.deepEqual([typed.state, typed.reason], ['lost', 'prompt-without-end-mark'], 'associative values were not run at the prompt');
+    const next = await x.run('echo recovered', 4000);
+    assert.deepEqual([next.state, next.exit, next.text.trim()], ['exited', 0, 'recovered']);
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: promptvars off still marks successive empty prompts and admits the next Run', { skip: !hasShell('/bin/bash') }, async () => {
+  const x = await realSession('/bin/bash', { login: false, rc: { '.bashrc': "shopt -u promptvars\nPS1='PV-OFF> '\n" } });
+  try {
+    const starts = () => prompts(x.journal.since(0).events, 'start');
+    const visible = () => x.journal.since(0).events.flatMap((e) => e.type === 'output' && e.stream === 'pty' ? [e.data] : []).join('').split('PV-OFF> ').length - 1;
+    const before = starts();
+    const prompt = visible();
+    assert.ok(prompt >= 1, 'the initial prompt is visible with promptvars off');
+    const observed: number[] = [];
+    for (let i = 1; i <= 2; i++) {
+      x.session.input('\n', { principal: AGENT });
+      await until(() => visible() >= prompt + i, 5000, `empty prompt ${i} to become visible`);
+      observed.push(starts());
+    }
+    assert.deepEqual(observed, [before + 1, before + 2], 'each visible prompt has its own keyed A mark');
+    assert.equal(x.session.shellAvailable().ok, true);
+    const next = await x.run('echo after-empty', 5000);
+    assert.deepEqual([next.state, next.exit, next.text.trim()], ['exited', 0, 'after-empty']);
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: PS1 still expands the command status after its prompt-start prefix', { skip: !hasShell('/bin/bash') }, async () => {
+  const x = await realSession('/bin/bash', { rc: { '.bashrc': "PS1='[ps1=$?]$ '\n" }, login: false });
+  try {
+    const before = prompts(x.journal.since(0).events, 'end');
+    assert.equal((await x.run('false')).exit, 1);
+    await until(() => prompts(x.journal.since(0).events, 'end') > before, 3000, 'the prompt after false to finish');
+    await x.session.screen.settled();
+    const shown = x.session.snapshot().lines.filter((l) => l.includes('[ps1='));
+    assert.match(shown.at(-1) ?? '', /\[ps1=1\]/, `the latest user PS1 sees the line's exit; screen: ${JSON.stringify(shown)}`);
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: a negated status under set -e survives the PS1 marks', { skip: !hasShell('/bin/bash') }, async () => {
+  const x = await realSession('/bin/bash', { login: false });
+  try {
+    assert.equal((await x.run('set -e')).exit, 0);
+    const before = x.session.listRuns().length;
+    x.session.input('! true\n', { principal: AGENT });
+    await until(() => x.session.listRuns().slice(before).some((r) => r.origin === 'agent' && r.state === 'exited'), 5000, 'the negated typed line to finish at its prompt');
+    const typed = x.session.listRuns().slice(before).find((r) => r.origin === 'agent')!;
+    assert.equal(typed.exit, 1, 'Bash keeps the negated exit as the Run status');
+    const next = await x.run('echo still-here', 4000);
+    assert.deepEqual([next.state, next.exit, next.text.trim()], ['exited', 0, 'still-here'], 'the shell survives a nonzero prompt status under errexit');
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: a typed line that replaces PROMPT_COMMAND last loses its unobserved exit, and the prompt stays usable', { skip: !hasShell('/bin/bash') }, async () => {
+  // The line and the prompt can both run `true`: DEBUG's earlier saved status cannot certify
+  // the typed line after it replaces the hook. PS1 marks the next prompt without an end mark,
+  // making the Run lost. An empty replacement has the same outcome. The next line heals the hook.
   const x = await realSession('/bin/bash', { login: false });
   try {
     fs.mkdirSync(path.join(x.tmp, 'sub'));
+    const initialCwd = x.session.info().cwd;
     for (const [line, want] of [
-      ['cd sub; echo x-$((40+2)); PROMPT_COMMAND=true; true; PROMPT_COMMAND=true$(exit 4)', { state: 'exited', exit: 4 }],
+      ['cd sub; echo x-$((40+2)); PROMPT_COMMAND=true; true; PROMPT_COMMAND=true$(exit 4)', { state: 'lost', reason: 'prompt-without-end-mark' }],
       ['echo y-$((40+2)); PROMPT_COMMAND=true; true; PROMPT_COMMAND=$(exit 5)', { state: 'lost', reason: 'prompt-without-end-mark' }],
     ] as const) {
       const before = x.session.listRuns().length;
@@ -381,10 +514,39 @@ test('/bin/bash: a typed line that runs a command and then installs it as PROMPT
       assert.deepEqual({ state: typed.state, ...(typed.exit !== undefined && { exit: typed.exit }), ...(typed.reason !== undefined && { reason: typed.reason }) }, want, line);
       await until(() => x.session.shellAvailable().ok, 3000, `the session went idle: ${line}`);
     }
-    assert.match(x.session.info().cwd, /\/sub$/, 'the cwd the first line left');
-    const back = await x.run('echo back', 4000);
-    assert.deepEqual([back.state, back.exit, back.text.trim()], ['exited', 0, 'back']);
+    assert.equal(x.session.info().cwd, initialCwd, 'no authenticated cwd mark followed those lost Runs');
+    const back = await x.run('pwd; echo back', 4000);
+    assert.deepEqual([back.state, back.exit], ['exited', 0]);
+    assert.match(back.text, /\/sub/, 'the shell itself is still in the directory the lost line entered');
+    assert.match(back.text, /back/, 'the next Run executes after the hook heals');
+    await until(() => /\/sub$/.test(x.session.info().cwd), 3000, 'the healed prompt publishes its cwd mark');
+    assert.match(x.session.info().cwd, /\/sub$/, 'the authenticated prompt updates the recorded cwd');
     assert.equal(x.session.listRuns().filter((r) => r.origin === 'agent').length, 2, 'one Run per typed line');
+  } finally {
+    await x.close();
+  }
+});
+
+test('/bin/bash: healing a missed hook preserves a nonempty user prompt command', { skip: !hasShell('/bin/bash') }, async () => {
+  const x = await realSession('/bin/bash', { login: false });
+  try {
+    const stamp = path.join(x.tmp, 'user-prompt-stamps');
+    const setupEnd = prompts(x.journal.since(0).events, 'end');
+    assert.equal((await x.run(`user_pcstamp() { printf x >> ${JSON.stringify(stamp)}; }`)).exit, 0);
+    await until(() => prompts(x.journal.since(0).events, 'end') > setupEnd, 5000, 'the setup command prompt to finish');
+    const before = x.session.listRuns().length;
+    const beforeEnd = prompts(x.journal.since(0).events, 'end');
+    x.session.input('user_pcstamp; PROMPT_COMMAND=user_pcstamp; user_pcstamp; PROMPT_COMMAND=user_pcstamp$(exit 4)\n', { principal: AGENT });
+    await until(() => x.session.listRuns().slice(before).some((r) => r.origin === 'agent' && r.state === 'lost'), 5000, 'the typed line to become lost at its missed prompt');
+    await until(() => prompts(x.journal.since(0).events, 'end') > beforeEnd, 5000, 'the missed-hook prompt to finish');
+    const size = () => fs.existsSync(stamp) ? fs.readFileSync(stamp, 'utf8').length : 0;
+    assert.ok(size() >= 3, 'the user prompt command ran after the typed line');
+    const previous = size();
+    const nextEnd = prompts(x.journal.since(0).events, 'end');
+    const next = await x.run('echo following', 4000);
+    assert.deepEqual([next.state, next.exit, next.text.trim()], ['exited', 0, 'following']);
+    await until(() => prompts(x.journal.since(0).events, 'end') > nextEnd, 5000, 'the healed prompt to finish');
+    assert.equal(size(), previous + 1, 'the user prompt part runs once at the next prompt');
   } finally {
     await x.close();
   }

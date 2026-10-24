@@ -741,7 +741,16 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
       created = true;
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
-      if (code === 'EEXIST' && readRaw(file) === raw) {
+      let linkedOurs = false;
+      if (code === 'EEXIST') {
+        try {
+          linkedOurs = readRaw(file) === raw;
+        } catch (readError) {
+          rmTemp(tmp);
+          throw readError;
+        }
+      }
+      if (linkedOurs) {
         // link(2), BUGS: on NFS the link may have been made and EEXIST returned anyway. The file holds this
         // attempt's record, nonce and all, so the take is this attempt's: registered, and released like any
         // other — read as "self" it returned a no-op handle and left the lock behind a clean exit (comment 6274603516).
@@ -780,7 +789,13 @@ export function acquireDataDirLock(dataDir: string, opts: { link?: (existing: st
       rmTemp(tmp);
       return publish();
     }
-    const current = readRaw(file);
+    let current: string | undefined;
+    try {
+      current = readRaw(file);
+    } catch (readError) {
+      rmTemp(tmp);
+      throw readError;
+    }
     if (current === undefined) {
       rmTemp(tmp);
       continue; // released meanwhile: try again

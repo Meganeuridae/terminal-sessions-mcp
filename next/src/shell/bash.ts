@@ -206,6 +206,7 @@ __tsm_open() {
   case $\{PS1-} in *"$__tsm_a"*) ;; *) PS1="$__tsm_a$\{PS1-}" ;; esac
   __tsm_osc '133;A'
   __tsm_opened=1
+  __tsm_ps1_opened=1
   __tsm_unclosed=0
 }
 # What the accepted line runs, into __tsm_ret: for a daemon line (" . '<tmp>/tsm-cmd-…'")
@@ -249,7 +250,8 @@ __tsm_preexec() {
   # (__tsm_line_has) — a flag alone stood the heal down at the next prompt too, where it was the only
   # closer of a line that merely assigned PROMPT_COMMAND (the reviewer's read of 2f32e8a..a088780).
   case $__line in ". '"*tsm-cmd-*"'") __tsm_line_text= ;; *) __tsm_line_text=$__line ;; esac
-  __tsm_opened=
+  __tsm_opened=0
+  __tsm_ps1_opened=0
   __tsm_text "$__line"
   # A command that may set a DEBUG trap — one that names trap, or sources a file or evals text that
   # could (the house's read of 1d83ffa: a sourced file's trap lost the next Run): check ours at the
@@ -289,8 +291,11 @@ __tsm_precmd() {
   fi
   # (Already opened when the DEBUG trap healed a reassigned PROMPT_COMMAND this prompt:
   # a second prompt start would end a Run the daemon just wrote.)
-  if [ -z "$__tsm_opened" ]; then __tsm_open; fi
-  __tsm_opened=
+  if [ "$__tsm_opened" != 1 ]; then __tsm_open; fi
+  # This flag prevents a second A inside the current hook; clear it here so a blank
+  # line gets another A even when promptvars is off and PS1 expands no shell code.
+  # The separate PS1 flag stays set until PS1's end when expansion is enabled.
+  __tsm_opened=0
   # Arm pre-execution detection at the end of PROMPT_COMMAND (the B mark in PS1 arms it
   # too, unless promptvars is off). Commands after the hook (the append idiom, or later
   # elements of an array PROMPT_COMMAND on bash >= 5.1) still run after this function:
@@ -339,25 +344,13 @@ __tsm_debug() {
       # run is the prompt's own at the next prompt, healed as before: for a line that only assigned
       # PROMPT_COMMAND the heal is the only closer (the reviewer's read of 2f32e8a..a088780).
       __tsm_fold_pc
-      # Text alone cannot tell this firing from the prompt's own run of the same command when the line
-      # installs it last (echo x; PROMPT_COMMAND=true; true; PROMPT_COMMAND=true): then this is the
-      # prompt's, our hook does not run before PS1, and the Run stayed open at a prompt already shown
-      # (the house's read of the 33 commits, #22 comment 6307351617, item 2). So keep what the heal
-      # would have closed it with — the status and the cwd as they are now — and the start of PS1
-      # prints that end mark, the cwd and the prompt start (__tsm_a) unless our hook ran first. A
-      # firing that was the line's own after all is overtaken before PS1: the line ends at our hook
-      # (folded back here), at the next of these firings or at a heal at its prompt, or — when it then
-      # emptied PROMPT_COMMAND — lost at the prompt start PS1 prints for that (ss-3), which PS1 checks
-      # first, so no exit is ever made up from a status the line went on past.
-      if [ "$\{__tsm_in_cmd:-0}" != 0 ]; then
-        __tsm_unclosed=1
-        __tsm_ust=$__st
-        __tsm_escape "$PWD"
-        __tsm_ucwd=$__tsm_ret
-      fi
+      # A firing that was the line's own is overtaken before PS1: the line ends at our hook,
+      # at a later heal, or as lost when PS1 sees that our hook did not open this prompt.
+      # The DEBUG status precedes this firing, so it cannot certify the line's eventual exit.
+      if [ "$\{__tsm_in_cmd:-0}" != 0 ]; then __tsm_unclosed=1; fi
     else
       # A command of the prompt's own (it stands in PROMPT_COMMAND) is never a Run.
-      # (Not one of the prompt's after all: a status kept above is not this prompt's to report.)
+      # If this firing was the line's after all, no prior DEBUG status certifies its end.
       if __tsm_heal_pc "$__st"; then __tsm_prompt_active=; else __tsm_unclosed=0; fi
     fi
   fi
@@ -589,7 +582,8 @@ __tsm_own_history_keys() {
 __tsm_in_cmd=
 __tsm_prompt_active=
 __tsm_line_text=
-__tsm_opened=
+__tsm_opened=0
+__tsm_ps1_opened=0
 __tsm_dbg_tick=
 __tsm_hist_n=
 __tsm_hist_init=
@@ -603,8 +597,6 @@ __tsm_u=
 __tsm_user_now=
 __tsm_heal_at=
 __tsm_unclosed=0
-__tsm_ust=0
-__tsm_ucwd=
 __tsm_prompt_no=0
 __tsm_pc_lost=0
 __tsm_pc='__tsm_precmd; eval "$__tsm_top"'
@@ -630,27 +622,19 @@ else
   unset __tsm_t
   trap '__tsm_debug' DEBUG
 fi
-# The prompt-end mark, at the end of PS1. The key is referenced, not written into PS1,
-# so an rc that exports PS1 hands children no key. PS1's expansion also heals a
-# PROMPT_COMMAND a command emptied or unset (ss-3), where no hook ever runs to put it
-# back: while PROMPT_COMMAND is empty, the start of PS1 prints the prompt-start mark (the
-# Run that did it ends lost, G5), and its end flags the loss and assigns the hook again —
-# all inside invisible \\[ \\] parts, empty otherwise. The end numbers the prompts, and
-# arms pre-execution detection. The start of PS1 also closes a typed line's Run that the
-# DEBUG trap left open (__tsm_unclosed, see __tsm_debug): our hook did not run before this
-# prompt, so PS1 prints the end mark it would have printed, with the status and cwd the trap
-# kept, then the prompt start; the end of PS1 clears it. Not while PROMPT_COMMAND is empty:
-# that prompt's start mark ends the Run lost, as above. (With promptvars off, PS1 expands
-# nothing: that Run stays open until the next line or a cancel.)
-# (No variable holds a raw mark: bash 3.2's \`set\` prints values raw, and a printed keyed
-# mark is a mark. The start of PS1 picks the mark from its own text: element 0 of __tsm_sel,
-# and element 1 of __tsm_shut, are unset.)
+# The prompt-end mark is at the end of PS1. When our hook did not open this prompt,
+# PS1 prints a keyed prompt-start mark without a final-status mark: an open Run is lost (G5).
+# An earlier DEBUG status cannot prove the exit of a line that changed PROMPT_COMMAND.
+# When our hook did open it, it already printed any applicable end, cwd and start marks; PS1
+# suppresses a second start when PS1 expands. Its end then resets the PS1 flag and
+# restores an empty PROMPT_COMMAND; a nonempty replacement is folded at the next DEBUG.
+# (With promptvars off, PS1 expands nothing: that Run stays open until the next line
+# or a cancel.) No variable holds a raw mark, since bash 3.2's set builtin prints values raw.
 __tsm_sel=([10]='')
-__tsm_shut=([0]='')
 __tsm_one=([0]=1 [10]=0)
 __tsm_nz=$__tsm_pcv
-__tsm_a='\\[$\{__tsm_shut[0$\{PROMPT_COMMAND:+|__tsm_unclosed}]-\\033]133;D;$\{__tsm_ust};k=$\{__tsm_key}\\007\\033]633;P;Cwd=$\{__tsm_ucwd};k=$\{__tsm_key}\\007\\033]133;A;k=$\{__tsm_key}\\007}$\{__tsm_sel[$\{PROMPT_COMMAND:+1}0]-\\033]133;A;k=$\{__tsm_key}\\007}\\]'
-__tsm_b='\\[\\033]133;B;h=$((__tsm_pc_lost|=__tsm_one[$\{PROMPT_COMMAND:+1}0]))$\{__tsm_nz#$\{PROMPT_COMMAND:=$__tsm_pcv}};a=$((__tsm_reinit_pending=0,__tsm_in_cmd=__tsm_in_cmd&&!__tsm_unclosed,__tsm_unclosed=0,__tsm_prompt_active=1,__tsm_prompt_no+=1));k=$\{__tsm_key}\\007\\]'
+__tsm_a='\\[$\{__tsm_sel[$\{__tsm_ps1_opened}0]-\\033]133;A;k=$\{__tsm_key}\\007}\\]'
+__tsm_b='\\[\\033]133;B;h=$((__tsm_pc_lost|=__tsm_one[$\{PROMPT_COMMAND:+1}0]))$\{__tsm_nz#$\{PROMPT_COMMAND:=$__tsm_pcv}};a=$((__tsm_reinit_pending=0,__tsm_in_cmd=__tsm_in_cmd&&__tsm_ps1_opened&&!__tsm_unclosed,__tsm_unclosed=0,__tsm_opened=0,__tsm_ps1_opened=0,__tsm_prompt_active=1,__tsm_prompt_no+=1));k=$\{__tsm_key}\\007\\]'
 PS1="$__tsm_a$\{PS1-}$__tsm_b"
 # ss-1: the daemon types these two keys (ctrl-alt-shift-F12, -F11) before every line, so
 # nothing left in the editor merges with it, in any keymap: F12 empties the line (and in

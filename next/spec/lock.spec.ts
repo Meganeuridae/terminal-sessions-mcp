@@ -433,6 +433,33 @@ test('an EEXIST from a link that took effect (NFS) is this attempt\'s take when 
   assert.equal(fs.existsSync(file), false, 'released, so a clean exit leaves no lock naming a dead pid');
 });
 
+for (const readNumber of [1, 2]) {
+  test(`a failed existing-lock read ${readNumber} removes this start's attempt temp`, () => {
+    const dir = dataDir();
+    const held = acquireDataDirLock(dir);
+    const file = path.join(dir, LOCK_FILE);
+    const realRead = fsc.readFileSync;
+    let reads = 0;
+    fsc.readFileSync = ((target: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (String(target) === file && ++reads === readNumber) {
+        throw Object.assign(new Error('EACCES: lock read denied'), { code: 'EACCES' });
+      }
+      return (realRead as (...args: unknown[]) => ReturnType<typeof fs.readFileSync>)(target, ...rest);
+    }) as typeof fs.readFileSync;
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => acquireDataDirLock(dir), /lock read denied/);
+      assert.deepEqual(fs.readdirSync(dir).filter((n) => n.startsWith(LOCK_FILE + '.') && n.endsWith('.tmp')), [], 'a failed start leaves no attempt temp');
+      assert.equal(fs.existsSync(file), true, 'the existing holder remains');
+    } finally {
+      fsc.readFileSync = realRead;
+      syncBuiltinESMExports();
+      for (const n of fs.readdirSync(dir).filter((n) => n.startsWith(LOCK_FILE + '.') && n.endsWith('.tmp'))) fs.rmSync(path.join(dir, n), { force: true });
+      held.release();
+    }
+  });
+}
+
 test('a zombie\'s stat reads state Z after any comm, which the lock and the listing count as gone (the house\'s read of the 38 commits, PR #22, comment 6274603516, item 5)', () => {
   assert.equal(parseProcStat(`1234 (node) ${STAT_TAIL}`)?.state, 'S');
   assert.equal(parseProcStat(`1234 (my (odd) comm) ${STAT_TAIL.replace(/^S/, 'Z')}`)?.state, 'Z');

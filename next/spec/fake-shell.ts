@@ -456,8 +456,8 @@ export async function scriptedSession(opts: HarnessOptions = {}): Promise<Harnes
       sh.cwd = l.split(' ')[1]!;
       return { exit: 0 };
     });
-    shell.on(/^env -0 > '(.*)'$/, (l) => {
-      fs.writeFileSync(/^env -0 > '(.*)'$/.exec(l)![1]!.replace(/'\\''/g, "'"), 'A=1\0B=two\0');
+    shell.on(/^env -0 >\| '(.*)'$/, (l) => {
+      fs.writeFileSync(/^env -0 >\| '(.*)'$/.exec(l)![1]!.replace(/'\\''/g, "'"), 'A=1\0B=two\0');
       return { exit: 0 };
     });
     opts.setup?.(shell);
@@ -496,7 +496,7 @@ export interface RealOptions {
   rc?: Record<string, string>;
   /** The session's creation-time env. */
   env?: Record<string, string>;
-  /** The daemon's env (default: this process's env with HOME set to the fake home). */
+  /** The daemon's other variables. The fixture supplies HOME and XDG directories after these. Defaults to this process's env. */
   daemonEnv?: NodeJS.ProcessEnv;
   login?: boolean;
   noUserRc?: boolean;
@@ -544,8 +544,8 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
   if (opts.userZdotdir !== undefined) userEnv.ZDOTDIR = opts.userZdotdir.replace(/^~\//, `${home}/`);
   const integ = prepareIntegration(shell, { noUserRc: opts.noUserRc ?? false, userEnv, dir: path.join(tmp, 'integration') });
   const journal = new Journal();
-  const daemonEnv = opts.daemonEnv ?? {
-    ...process.env,
+  const daemonEnv: NodeJS.ProcessEnv = {
+    ...(opts.daemonEnv ?? process.env),
     HOME: home,
     XDG_CONFIG_HOME: path.join(home, '.config'),
     XDG_DATA_HOME: path.join(home, '.local', 'share'),
