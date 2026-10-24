@@ -1514,3 +1514,14 @@ test("tsg-3: a termd the shim starts gets a minimal environment, $HOME as its cw
     await stopSpawned(dataDir);
   }
 });
+
+test('invalid daemon addresses omit credential values from shim diagnostics', async () => {
+  for (const value of ['http://user:secret-url-pass@localhost/?token=secret-url-query', 'ws://[broken/?token=secret-url-query']) {
+    const s = shim({ TSM_URL: value });
+    s.end();
+    assert.equal(await exitWithin(s), 2);
+    const said = s.err.join('');
+    assert.match(said, /TSM_URL.*(not a URL|must be a ws:)/);
+    assert.doesNotMatch(said, /secret-url/);
+  }
+});

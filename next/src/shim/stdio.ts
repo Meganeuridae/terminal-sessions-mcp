@@ -189,11 +189,11 @@ let url: URL;
 try {
   url = new URL(base);
 } catch {
-  log(`${chosen.from ?? 'TSM_URL'} is not a URL: ${base}`);
+  log(`${chosen.from ?? 'TSM_URL'} is not a URL: set it to a ws:// or wss:// daemon address`);
   process.exit(2);
 }
 if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
-  log(`${chosen.from ?? 'TSM_URL'} must be a ws:// or wss:// URL, not ${base}`);
+  log(`${chosen.from ?? 'TSM_URL'} must be a ws:// or wss:// daemon address`);
   process.exit(2);
 }
 if (chosen.token) url.searchParams.set('token', chosen.token);
