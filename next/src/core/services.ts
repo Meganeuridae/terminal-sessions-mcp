@@ -26,7 +26,12 @@
  *   stdout's `ERROR a`, then `ERROR b` and a LF on stderr, then stdout's LF, are two lines, the read's `ERROR aERROR b`
  *   with stderr's `ERROR b`, and stdout's `ERROR a`, whose text is not the read's line begun there. stderr's
  *   `Password: `, stdout's LF, then stderr's LF are one line, the read's ended at stdout's LF and stderr's at its own.
- * - A quiet prompt pairs with the other reading's line that began where it did, whether that line is still open or
+ * - A quiet prompt pairs with the other readings' open lines that hold bytes of its own, all at once: the read's with
+ *   every pipe's open line written to since the read's line began, begun inside it or before it, and a pipe's with the
+ *   read's line begun no later than the pipe's last write, and through it with the other pipe's. So stdout's `server
+ *   ready` left quiet, then stderr's `FATAL` left
+ *   quiet, is one line, the FATAL counted once as it is when stderr's LF ends both, not twice (an independent read of
+ *   the fixes for PR #22 comment 6357989601). It pairs too with the other reading's line that began where it did and
  *   already ended when the prompt is offered: stderr's `Password: ` that stdout's LF ended in the read counts once. So
  *   stdout's `ERROR a`, left quiet before its LF, is a prompt begun where the read's `ERROR aERROR b` began, and the
  *   first rule's two lines are one (the house's review of a8b6f28..4860d4c, #22, comment 6341260318, question 6).
@@ -118,6 +123,8 @@ const endOrder = (a: Begun | undefined, b: Begun | undefined): number => (a && b
 interface Reading {
   splitter: LineSplitter;
   pipe?: OutputStream;
+  /** The seq of the event last fed: a pipe's open line holds bytes of the read's when the pipe wrote since the read's line began (twins). */
+  last?: number;
 }
 
 /** TCP poll interval while starting (ms). */
@@ -311,6 +318,7 @@ export class ServiceMonitor {
 
   /** Feed one reading an output event: the one source takes the event's stream as the source of what it reads; each line says where it began. */
   private feed(r: Reading, ev: EventOf<'output'>): SplitLine[] {
+    r.last = ev.seq;
     return r.splitter.feed(ev.data, r.pipe === undefined ? ev.stream : undefined, ev.seq);
   }
 
@@ -326,26 +334,61 @@ export class ServiceMonitor {
   }
 
   /**
-   * A quiet prompt `r` offered: tested together with its twin, the other reading's open line that began where it did,
-   * both texts at once (the pipe's first), as a completed pair is, for what their place still allows. Taken alone, the
-   * first offer's verdict stood for its twin's different text: stderr's `Password: ` was never tested when the read's
-   * `Passxword: ` had failed. Told apart by the seq each reading was last fed, one prompt counted twice when the other
-   * pipe wrote in between (our review of the 73 commits through 4860d4c, PR #22). A twin the other reading has already
-   * ended was matched as a completed line: a fail there spends the prompt with it, a ready leaves the prompt's text to
-   * be tried for fail (stdout's `READY FA` ended by stderr's LF in the read, then `TAL` on stdout), and otherwise the
-   * prompt's own text is tried. Paired only with an open twin, stderr's `Password: ` matched again after the read had
-   * matched it, ended at stdout's LF (the house's review of a8b6f28..4860d4c, #22, comment 6341260318, question 6).
-   * True spends the line in its splitter: only a fail is final, so a ready prompt is offered again as its line grows
-   * and comes out once more when it completes, each time tested for fail alone (the house's review of
-   * 4860d4c..bc4bc85, #22, comment 6357989601).
+   * A quiet prompt `r` offered: tested together with its twins, the other readings' open lines that hold bytes of its
+   * own (twins), all texts at once (the pipes' first), as a completed pair is, for what their places still allow, and
+   * the verdict recorded under every place, so a twin's own offer finds it. Taken alone, the first offer's verdict
+   * stood for its twin's different text: stderr's `Password: ` was never tested when the read's `Passxword: ` had
+   * failed. Told apart by the seq each reading was last fed, one prompt counted twice when the other pipe wrote in
+   * between (our review of the 73 commits through 4860d4c, PR #22). A twin the other reading has already ended was
+   * matched as a completed line: a fail there spends the prompt with it, a ready leaves the prompt's text to be tried
+   * for fail (stdout's `READY FA` ended by stderr's LF in the read, then `TAL` on stdout), and otherwise the prompt's
+   * own text is tried. Paired only with an open twin, stderr's `Password: ` matched again after the read had matched
+   * it, ended at stdout's LF (the house's review of a8b6f28..4860d4c, #22, comment 6341260318, question 6). True
+   * spends the line in its splitter: only a fail is final, so a ready prompt is offered again as its line grows and
+   * comes out once more when it completes, each time tested for fail alone (the house's review of 4860d4c..bc4bc85,
+   * #22, comment 6357989601).
    */
   private once(r: Reading, line: SplitLine): boolean {
     const at = placeOf(line.begun, line);
-    const sofar = stronger(this.prompted.get(at)?.verdict, this.completed.get(at)?.verdict);
-    const twin = sofar === 'fail' ? undefined : this.readings().find((o) => o !== r && line.begun && samePlace(o.splitter.opened(), line.begun))?.splitter.peek();
-    const verdict = this.onLine(twin ? (r.pipe !== undefined ? [line, twin] : [twin, line]) : [line], sofar);
-    this.prompted.set(at, { at: line.begun, verdict });
+    const own = this.judged(at);
+    if (own === 'fail') {
+      this.prompted.set(at, { at: line.begun, verdict: own });
+      return true;
+    }
+    // Its twins' places too: stdout's `READY FA` ended by stderr's LF in the read is the completed line stdout's open
+    // `READY FATAL` continues, and the read's `TAL` offered first is that prompt's twin.
+    const twins = this.twins(r, line);
+    const sofar = twins.reduce<Verdict>((v, t) => stronger(v, this.judged(placeOf(t.begun, t))), own);
+    const verdict = this.onLine(r.pipe !== undefined ? [line, ...twins] : [...twins, line], sofar);
+    for (const l of [line, ...twins]) this.prompted.set(placeOf(l.begun, l), { at: l.begun, verdict });
     return verdict === 'fail';
+  }
+
+  /** What a place has been judged so far, as a quiet prompt (prompted) or as a line one reading completed (completed). */
+  private judged(at: string): Verdict {
+    return stronger(this.prompted.get(at)?.verdict, this.completed.get(at)?.verdict);
+  }
+
+  /**
+   * The other readings' open lines that hold bytes of a quiet prompt's line, with their text, the pipes' first: the
+   * read's open line and every pipe's open line written to since the read's line began, begun inside it (stderr's
+   * `FATAL` after stdout's `server ready`) or before it (stdout's `Server listening on 8080`, the read's `ing on 8080`
+   * begun after stderr's LF), whichever of them offers. A pipe's open line written before the read's line began shares
+   * no byte with it, nor with another pipe's, and has no twin. Paired by where they began alone, stdout's `server ready`
+   * left quiet and then stderr's `FATAL` left quiet counted the FATAL twice, in the read's `server readyFATAL` and in
+   * stderr's `FATAL`, where stderr's LF ending both counted it once (an independent read of the fixes for PR #22
+   * comment 6357989601). The whole group at once: stdout's `x` paired with the read's `Passxword: ` alone matched
+   * ready, where stderr's `Password: `, the read's other twin, fails.
+   */
+  private twins(r: Reading, line: SplitLine): SplitLine[] {
+    const read = this.lines;
+    const began = r.pipe === undefined ? line.begun : read?.splitter.opened();
+    if (!read || !began || (r !== read && (r.last === undefined || r.last < began.at))) return [];
+    const open = (o: Reading): SplitLine[] => {
+      const t = o === r ? undefined : o.splitter.peek();
+      return t ? [t] : [];
+    };
+    return [...[...this.pipes.values()].filter((p) => p.last !== undefined && p.last >= began.at).flatMap(open), ...open(read)];
   }
 
   /** A completed line the other reading completed already, begun at the same place with the same text. */

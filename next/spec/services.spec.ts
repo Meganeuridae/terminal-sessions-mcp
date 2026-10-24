@@ -529,6 +529,63 @@ test('a fail is counted once per line, whether it matched quiet or after a ready
   n.dispose();
 });
 
+test('a quiet prompt and the other readings\' open lines that hold its bytes are one line, so a fail is counted once whatever the timing (an independent read of the fixes for PR #22 comment 6357989601)', async (t) => {
+  // stdout's `server ready`, quiet (ready), then stderr's `FATAL`, quiet: the read offers `server readyFATAL` again,
+  // begun at stdout's place, and stderr offers `FATAL`, begun at its own. Paired by where they began alone, both
+  // failed: unhealthy with a repeat, the journal saying `server readyFATAL` and the service `FATAL`, where stderr's LF
+  // ending both lines counts the FATAL once.
+  const f = fake('process');
+  const m = f.monitor({ ready: { pattern: 'ready' }, fail: { pattern: 'FATAL' } }, { partialAfterMs: 30 });
+  const offered = offers(t, m);
+  f.start();
+  f.out('server ready', 'stdout');
+  await until(() => offered.mock.callCount() >= 2, 2000, 'the read and stdout each offered the prompt');
+  assert.equal(m.status, 'ready');
+  f.out('FATAL', 'stderr');
+  await until(() => offered.mock.callCount() >= 4, 2000, 'the read offered its grown line and stderr its own');
+  assert.equal(m.status, 'unhealthy');
+  assert.equal(m.info().repeats, undefined, 'one FATAL, one fail');
+  assert.equal(m.info().evidence, 'FATAL', 'as stderr wrote it');
+  assert.deepEqual(f.journal.since(0).events.flatMap((e) => (e.type === 'service' && e.status === 'unhealthy' ? [e.evidence] : [])), ['FATAL']);
+  // Both lines completing afterwards count nothing more.
+  f.out('\n', 'stderr');
+  f.out('\n', 'stdout');
+  assert.equal(m.info().repeats, undefined, 'spent lines complete silently');
+  assert.deepEqual(f.statuses(), ['starting', 'ready', 'unhealthy']);
+  m.dispose();
+  // The same with a first prompt that matched nothing: stdout's `foo`, quiet, then stderr's `FATAL`, quiet.
+  const g = fake('process');
+  const n = g.monitor({ ready: { pattern: 'ready' }, fail: { pattern: 'FATAL' } }, { partialAfterMs: 30 });
+  const asked = offers(t, n);
+  g.start();
+  g.out('foo', 'stdout');
+  await until(() => asked.mock.callCount() >= 2, 2000, 'the read and stdout each offered `foo`');
+  assert.equal(n.status, 'starting');
+  g.out('FATAL', 'stderr');
+  await until(() => asked.mock.callCount() >= 4, 2000, 'the read offered `fooFATAL` and stderr `FATAL`');
+  assert.equal(n.status, 'unhealthy');
+  assert.equal(n.info().repeats, undefined, 'one FATAL, one fail');
+  assert.equal(n.info().evidence, 'FATAL', 'as stderr wrote it');
+  n.dispose();
+  // A pipe's open line begun before the read's, written to since: stdout's `Server listen`, stderr's `x` and LF, then
+  // stdout's `ing ERROR`, quiet. The read's `ing ERROR` and stdout's `Server listening ERROR` hold the same bytes, and
+  // are one line, as they are when stdout's LF ends both; paired by where they began alone, each failed.
+  const h = fake('process');
+  const o = h.monitor({ fail: { pattern: 'ERROR' } }, { partialAfterMs: 30 });
+  const both = offers(t, o);
+  h.start();
+  h.out('Server listen', 'stdout');
+  h.out('x\n', 'stderr');
+  h.out('ing ERROR', 'stdout');
+  await until(() => both.mock.callCount() >= 2, 2000, 'the read and stdout each offered its prompt');
+  assert.equal(o.status, 'unhealthy');
+  assert.equal(o.info().repeats, undefined, 'one line, one fail');
+  assert.equal(o.info().evidence, 'Server listening ERROR', 'as stdout wrote it');
+  h.out('\n', 'stdout');
+  assert.equal(o.info().repeats, undefined, 'the spent lines complete silently');
+  o.dispose();
+});
+
 test('a service\'s lines are taken in the order their ends came, the read\'s and a pipe\'s interleaved (our review of the 73 commits through 4860d4c, PR #22)', () => {
   // stdout `FATAL`, stderr `x` and its LF (the read's `FATALx` ends), then stdout's LF, `READY` and LF: stdout's FATAL
   // ends before READY. The read's lines were all taken first, READY before FATAL, and the service ended unhealthy.
