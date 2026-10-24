@@ -467,9 +467,13 @@ class Projector {
 
   /**
    * DECSTBM: whose output set the margins. Margins it changes settle what the region's rows said (settle); the margins
-   * already in force, set again, restore no row, so the account stays. The margins it sets are read as xterm's
-   * setScrollRegion reads them: a bottom left out, 0 or past the last row is the last row, and one not below the top
-   * sets nothing, so it leaves the account and the owner as they were.
+   * already in force, set again, restore no row, so the account's rows stay. But a DECSTBM xterm takes homes the cursor
+   * (setScrollRegion), the projection's and that of the terminal of the source that sent it, which owns the margins
+   * from then on, so no row is pending between them: kept, the program's next scroll after a hole's line end and its
+   * margins set again was read as the projection's alone, and reported a row both screens let go (the house's review
+   * of bc4bc85..5d8ce0e, PR #22, I22). The margins it sets are read as xterm's setScrollRegion reads them: a bottom
+   * left out, 0 or past the last row is the last row, and one not below the top sets nothing, so it leaves the account
+   * and the owner as they were.
    */
   private onMargins(params: (number | number[])[]): boolean {
     const top = num(params[0]) || 1;
@@ -478,6 +482,10 @@ class Projector {
     if (bottom <= top) return false;
     const now = this.margins();
     if (top - 1 !== now.top || bottom - 1 !== now.bottom) this.settle();
+    else {
+      this.pending = 0;
+      this.watchCursor();
+    }
     this.owner = this.source;
     return false;
   }

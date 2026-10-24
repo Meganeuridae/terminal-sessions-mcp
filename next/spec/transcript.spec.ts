@@ -932,6 +932,14 @@ test('a row owed stays owed through the same margins set again, and goes when th
   const owed = await read([blankTop, { hole: true }, '\x1b[6;1HX\r\nY\r\n']);
   assert.deepEqual(owed.slice(1), [true, 0, true], JSON.stringify(owed));
   assert.deepEqual(await read([blankTop, { hole: true }, '\x1b[3;6r\x1b[6;1HX\r\nY\r\n']), owed, 'the same margins set again');
+  // Set again after a hole's line end inside the region, they home both cursors, so nothing is pending between them: the
+  // program's next scroll is the terminal's too, and takes a row both screens let go (the house's review of
+  // bc4bc85..5d8ce0e, PR #22, I22).
+  const short = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4';
+  const again = '\x1b[3;6ra\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng';
+  const homed = [['aop1', 'bop2', 'd4', 'e', 'f', 'g'], false, 0, undefined];
+  assert.deepEqual(await read([`${short}${again}`]), homed, 'the terminal alone, margins set again');
+  assert.deepEqual(await read([short, { hole: true }, again]), homed, 'a row pending, the same margins set again');
   assert.deepEqual(await read([blankTop, { hole: true }, '\x1b[3;7r\x1b[7;1HX\r\nY\r\n']).then((r) => r.slice(1)), [false, 0, undefined], 'margins changed');
   // Read as xterm reads DECSTBM: a bottom not below the top sets nothing, and a bottom left out, 0 or past the last
   // row is the last row, so over margins that reach it each of those sets them again.
