@@ -1663,6 +1663,39 @@ test('a text read prints a hole wider than a batch once: one joined past MAX_LOS
   }
 });
 
+test("a raw read notes a hole joined past MAX_LOST once, where it ends, though it spans events every page holds (the house's review of bc4bc85..5d8ce0e, PR #22, I41)", async () => {
+  const dir = tmpDir();
+  try {
+    const first = new Journal({ cold: new FileStore(dir), sessionId: 's' });
+    for (let i = 0; i < 3200; i++) first.append(out(`e${i}\n`));
+    first.close();
+    // As in the text read's test above: the two oldest of 256 inherited holes, 1 and 2600, are joined past MAX_LOST.
+    const cold = new Flaky(dir);
+    cold.budget = 0;
+    const holes = [1, 2600, ...Array.from({ length: 254 }, (_, k) => 2602 + 2 * k)].map((s) => ({ from: s, to: s, reason: 'store-error' as const, exact: true as const }));
+    const j = new Journal({ hot: new MemoryStore(1), cold, startSeq: first.lastSeq, lost: holes, sessionId: 's' });
+    j.append(out('last\n'));
+    assert.ok(j.gapsWithin(1, j.lastSeq).some((g) => g.from === 1 && g.to === 2600), 'the two oldest holes were joined');
+    const src = { id: 's', journal: j, cols: 80, rows: 24, runOutput: (runId: string, range: Parameters<typeof j.runs.output>[2]) => j.runs.output(j, runId, range), run: (runId: string) => j.runs.get(runId) };
+    let raw = '';
+    let since = 0;
+    for (let k = 0; k < 100; k++) {
+      const r = await readJournal(src, { since, as: 'raw', limit: 500 }, { resultBytes: 4 << 20 });
+      raw += r.text ?? '';
+      since = r.nextCursor;
+      if (!r.more) break;
+    }
+    const notes = raw.split('\n').filter((l) => /seq 1–2600/.test(l));
+    assert.equal(notes.length, 1, notes.join('\n'));
+    assert.ok(raw.indexOf(notes[0]!) > raw.indexOf('e2598\n'), 'noted where it ends, after the events it spans');
+    // A range that ends inside the hole: its last page notes it, once (the walk places it among that page's events).
+    const until = (await readJournal(src, { since: 0, until: 50, as: 'raw' }, { resultBytes: 4 << 20 })).text ?? '';
+    assert.equal(until.split('\n').filter((l) => /seq 1–2600/.test(l)).length, 1, until.slice(-200));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a store syncs its own directory into its parent at its first metadata write, though an earlier open made the directory and died before syncing it', () => {
   const root = tmpDir();
   try {

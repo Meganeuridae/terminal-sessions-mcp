@@ -1255,8 +1255,14 @@ function rawPage(src: ReadSource, o: ReadOptions, maxBytes: number, run: RunInfo
   // where the seqs they stand for fall among the events, as a text page has them: all of them first, ahead of a
   // recorded gap that lies between two of them, printed the notes out of order (an independent read of the fixes for
   // the review of the 40 commits, PR #22).
+  // A hole whose end lies past the page is noted by the page that holds its end, as a text page notes it there: a hole
+  // joined past MAX_LOST spans events that are there, and every raw page that met it noted it, each before its end (the
+  // house's review of bc4bc85..5d8ce0e, PR #22, I41). A range that ends inside it has it among its last page's events,
+  // as the walk places it there (Walk), so that page notes it.
   const recorded = new Set(events.filter(isGap).map((e) => `${e.from}:${e.to}`));
-  const inferred = (page.gaps ?? (page.gap ? [page.gap] : [])).filter((g) => !recorded.has(`${g.from}:${g.to}`)).sort((a, b) => a.to - b.to);
+  const inferred = (page.gaps ?? (page.gap ? [page.gap] : []))
+    .filter((g) => !recorded.has(`${g.from}:${g.to}`) && g.to <= page.seq[1])
+    .sort((a, b) => a.to - b.to);
   let k = 0;
   events.forEach((e, i) => {
     while (k < inferred.length && inferred[k]!.to < e.seq) note(inferred[k++]!);
