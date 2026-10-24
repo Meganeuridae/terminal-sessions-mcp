@@ -481,7 +481,7 @@ test('a long output cut to its tail keeps a torn line that is most of the budget
   const out = collect(seg);
   startRun(src, 'cut');
   endRun(src, 'cut');
-  await sleep(60);
+  await until(() => out.length === 1, 5000, 'the completion');
   assert.equal(out.length, 1);
   assert.match(out[0]!.body ?? '', /^\[… earlier output omitted · read session=s1 runId=cut for all of it\]\ntail only$/);
   assert.equal(out[0]!.metadata.truncated, true);
@@ -490,7 +490,7 @@ test('a long output cut to its tail keeps a torn line that is most of the budget
   out.length = 0;
   startRun(src, 'json');
   endRun(src, 'json');
-  await sleep(60);
+  await until(() => out.length === 1, 5000, 'the completion');
   assert.match(out[0]!.body ?? '', /omitted[^\n]*\n…v+"}\n$/);
   // Rows the projection lost are in no read: the message says so, and no earlier output was omitted (the house's
   // review of 4860d4c..bc4bc85, PR #22, I73).
@@ -498,7 +498,7 @@ test('a long output cut to its tail keeps a torn line that is most of the budget
   out.length = 0;
   startRun(src, 'lost');
   endRun(src, 'lost');
-  await sleep(60);
+  await until(() => out.length === 1, 5000, 'the completion');
   assert.match(out[0]!.body ?? '', /^\[… some rows of this output were lost as it was rendered, and no read shows them\]\nr5\nr6\nX$/);
   assert.equal(out[0]!.metadata.truncated, true);
   seg.dispose();
