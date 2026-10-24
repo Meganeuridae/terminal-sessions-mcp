@@ -455,6 +455,11 @@ async function ask(argv: string[], syntax: Parsed): Promise<void> {
   const request = (method: string, params?: unknown) =>
     new Promise<unknown>((resolve, reject) => {
       if (lost) return reject(lost);
+      // ws drops a send on CLOSING/CLOSED without a callback: classify it before marking a tool as sent.
+      if (ws.readyState !== WebSocket.OPEN) {
+        failAll('socket not open');
+        return reject(lost!);
+      }
       const id = nextId++;
       pending.set(id, { settle: (m) => (m.error ? reject(new DaemonError(m.error.message)) : resolve(m.result)), reject });
       ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
