@@ -568,7 +568,8 @@ export class SessionRegistry {
     }
     // Nothing runs under this name now: a dead life's command files (command text, env captures) go (jr2-12,
     // G26) — from a session past its retention too, which is kept when its Runs' groups go unjudged.
-    removeLeftovers(dir);
+    const skippedCleanup = removeLeftovers(dir);
+    if (skippedCleanup) this.opts.log?.('warn', skippedCleanup, { session: id });
     return { id, dir, store, meta, retention, journal, last, lastAliveTs, gone };
   }
 
@@ -1700,14 +1701,16 @@ function shellDir(dir: string): string {
  * command files, which hold command text, and env captures (G26). The session's own shell
  * history stays: it is the session's.
  */
-function removeLeftovers(dir: string): void {
+function removeLeftovers(dir: string): string | undefined {
   const shell = path.join(dir, 'shell');
   let names: string[];
   try {
     assertPrivateSessionDir(shell);
     names = fs.readdirSync(shell);
-  } catch {
-    return;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return;
+    const reason = e instanceof Error ? e.message : String(e);
+    return `skipped leftover command and environment-capture file cleanup in ${shell}: ${reason}`;
   }
   for (const n of names) {
     if (!/^tsm-(cmd|env)-/.test(n)) continue;

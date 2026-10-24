@@ -94,12 +94,33 @@ test('recovery does not follow an untrusted shell link or remove its command-lik
   const sentinel = path.join(outside, 'tsm-cmd-outside');
   fs.writeFileSync(sentinel, 'outside');
   fs.symlinkSync(outside, shell, 'dir');
-  const second = new SessionRegistry(options);
+  const warnings: Array<{ message: string; session: unknown }> = [];
+  const second = new SessionRegistry({ ...options, log: (level, message, fields) => {
+    if (level === 'warn' && message.includes('leftover')) warnings.push({ message, session: fields?.session });
+  } });
   t.after(() => second.closeAll());
   assert.equal(fs.readFileSync(sentinel, 'utf8'), 'outside', 'cleanup left the linked target alone');
+  assert.equal(warnings.length, 1, 'recovery names the single skipped cleanup');
+  assert.ok(warnings[0]!.message.includes(shell), 'the warning names the directory that still holds any leftovers');
+  assert.match(warnings[0]!.message, /not private/);
+  assert.equal(warnings[0]!.session, 'linked', 'the warning is searchable by session ID');
   const before = options.backend.ptys.length;
   await assert.rejects(second.create({ id: 'linked', owner: AGENT }), /private|directory/);
   assert.equal(options.backend.ptys.length, before);
+});
+
+test('a missing old shell directory is not reported as a failed cleanup', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-shell-missing-'));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const options = { dataDir, backend: fakeShellBackend(() => {}, { marks: 'rich' }), defaultShell: '/bin/bash', noUserRc: true };
+  const first = new SessionRegistry(options);
+  await first.create({ id: 'missing', owner: AGENT });
+  await first.closeAll();
+  fs.rmSync(path.join(dataDir, 'sessions', 'missing', 'shell'), { recursive: true, force: true });
+  const warnings: string[] = [];
+  const second = new SessionRegistry({ ...options, log: (level, message) => { if (level === 'warn' && message.includes('leftover')) warnings.push(message); } });
+  t.after(() => second.closeAll());
+  assert.deepEqual(warnings, []);
 });
 
 for (const [name, shell] of [
