@@ -362,6 +362,9 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
     // The lock: anything typed while it is on is sensitive.
     await page.click('#secret');
     assert.equal(await page.evaluate<string>(`document.getElementById('secret').textContent`), 'Secret: on');
+    const secretHelp = await page.evaluate<string>(`document.getElementById('secret').title`);
+    assert.match(secretHelp, /input events.*\[redacted\]/i, 'the lock describes input-event redaction');
+    assert.match(secretHelp, /output.*visible/i, 'the lock warns that program output may expose what was typed');
     await page.click('#term');
     await page.keyboard.type('# locked-text');
     // Waits on the journal, not fixed sleeps: a slow delivery failed the sensitive count, and passed the absence checks
@@ -482,6 +485,8 @@ test('tsg-22/tsg-23/mcpl-14/tsg-16: open private or shared; a process Run shows 
   try {
     // tsg-22: the Open form offers private (the default) and shared.
     assert.equal(await page.evaluate<string>(`document.getElementById('new-vis').value`), 'private');
+    const visibilityHelp = await page.evaluate<string>(`document.getElementById('new-vis').title`);
+    assert.match(visibilityHelp, /owner principal.*credential/i, 'privacy follows credential identity, not a person or tab');
     await page.evaluate(`document.getElementById('new-name').value = 'mine-private'`);
     await page.click('#new-form button[type=submit]');
     await page.waitForFunction(`document.getElementById('title').textContent === 'mine-private'`, { timeout: 8000 });
@@ -688,6 +693,34 @@ test('2f357bd: ^C interrupts the foreground job; Close asks twice; the activity 
   }
 });
 
+test('a Close confirmation authorizes only the session that was selected when it was armed', async (t) => {
+  if (skip || !browser) return t.skip(skip || 'no browser');
+  const a = await agent();
+  await a.call('session_open', { session: 'close-arm-one', visibility: 'shared' });
+  await a.call('session_open', { session: 'close-arm-two', visibility: 'shared' });
+  const problems: string[] = [];
+  const page = await openGui(`http://127.0.0.1:${port}/?token=tg`, problems);
+  try {
+    await pick(page, 'close-arm-one');
+    await page.waitForFunction(`document.getElementById('title').textContent === 'close-arm-one'`, { timeout: 8000 });
+    await page.click('#close');
+    assert.equal(await page.evaluate<string>(`document.getElementById('close').textContent`), 'Confirm close');
+    await pick(page, 'close-arm-two');
+    await page.waitForFunction(`document.getElementById('title').textContent === 'close-arm-two'`, { timeout: 8000 });
+    assert.equal(await page.evaluate<string>(`document.getElementById('close').textContent`), 'Close', 'switching sessions disarms the first confirmation');
+    await page.click('#close');
+    assert.equal(await page.evaluate<string>(`document.getElementById('close').textContent`), 'Confirm close', 'the new session needs its own first click');
+    assert.equal(registry.get('close-arm-two')?.kind, 'live', 'the first click closed nothing');
+    await page.click('#close');
+    await until(() => registry.get('close-arm-two')?.kind === 'history', 8000, 'the confirmed second session closes');
+    assert.equal(registry.get('close-arm-one')?.kind, 'live', 'the former session remains open');
+    assert.deepEqual(problems, []);
+  } finally {
+    await page.close();
+    a.close();
+  }
+});
+
 test('78c4d6e 20: the output pane trims on a code-point boundary and counts bytes, not UTF-16 units', async (t) => {
   if (skip || !browser) return t.skip(skip || 'no browser');
   const a = await agent();
@@ -696,21 +729,107 @@ test('78c4d6e 20: the output pane trims on a code-point boundary and counts byte
   const page = await openGui(`http://127.0.0.1:${port}/?token=tg`, problems);
   try {
     await pick(page, 'emoji');
-    await page.waitForFunction(`document.getElementById('title').textContent === 'emoji'`, { timeout: 8000 });
-    await new Promise((r) => setTimeout(r, 300));
+    await page.waitForFunction(`document.getElementById('title').textContent === 'emoji' && document.getElementById('node').textContent.includes('agent:g@test')`, { timeout: 8000 });
+    const following = () => [...(server as unknown as { conns: Set<{ gui: boolean; followers: Map<string, { state: string }> }> }).conns].some((c) => c.gui && c.followers.get('emoji')?.state === 'live');
+    await until(following, 8000, 'the GUI connection to follow emoji before output is produced');
     // ~200 KB of 😀 (four UTF-8 bytes, two UTF-16 units each), streamed live so the pane trims it: the
     // 64 KiB cap is counted in bytes, and the cut falls on a code point, never between a surrogate pair.
-    const ran = await a.call('run', { session: 'emoji', target: 'process', command: `sleep 0.3; awk 'BEGIN { for (i = 0; i < 1000; i++) s = s "\\360\\237\\230\\200"; for (i = 0; i < 50; i++) printf "%s", s; printf "\\nEMOJI-END\\n" }'` });
+    const ran = await a.call('run', { session: 'emoji', target: 'process', command: `awk 'BEGIN { for (i = 0; i < 1000; i++) s = s "\\360\\237\\230\\200"; for (i = 0; i < 50; i++) printf "%s", s; printf "\\nEMOJI-END\\n" }'` });
     assert.equal(ran.state, 'exited');
     await page.waitForFunction(`[...document.querySelectorAll('.run-out')].some((d) => d.textContent.includes('EMOJI-END') && d.querySelector('summary').textContent.includes('not shown'))`, { timeout: 10_000 });
     const pane = await page.evaluate<{ text: string; summary: string }>(`(() => { const d = [...document.querySelectorAll('.run-out')].find((d) => d.textContent.includes('EMOJI-END')); return { text: d.querySelector('pre').textContent, summary: d.querySelector('summary').textContent }; })()`);
     // No lone surrogate anywhere: the front cut did not split a pair.
     assert.doesNotMatch(pane.text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, 'the trimmed pane holds no lone surrogate');
+    assert.ok(pane.text.endsWith('\nEMOJI-END\n'), 'the latest streamed suffix survives the trim');
+    const keptBytes = Buffer.byteLength(pane.text, 'utf8');
+    assert.ok(keptBytes >= 64 * 1024 - 3 && keptBytes <= 64 * 1024, `the pane retains its byte cap without dropping extra spans: ${keptBytes}`);
     // The dropped count is in bytes: about 130 KB of the 200 KB, far more than the ~33 KB a UTF-16-unit count would report.
     const kb = Number(/first (\d+) KB not shown/.exec(pane.summary)?.[1]);
     assert.ok(kb > 100, `the summary counts bytes: ${pane.summary}`);
     assert.deepEqual(problems, []);
   } finally {
+    await page.close();
+    a.close();
+  }
+});
+test('G22: history output bytes and streamed output share the GUI pane cap', async (t) => {
+  if (skip || !browser) return t.skip(skip || 'no browser');
+  const s = 'emoji-history';
+  const gate = path.join(dataDir, 'emoji-history-release');
+  const glyph = '\\360\\237\\230\\200';
+  const command = `awk 'BEGIN { for (i = 0; i < 3000; i++) printf "${glyph}"; fflush() }'; while [ ! -f ${JSON.stringify(gate)} ]; do sleep 0.02; done; awk 'BEGIN { for (i = 0; i < 20000; i++) printf "${glyph}"; printf "\\nHISTORY-END\\n" }'`;
+  const a = await agent();
+  await a.call('session_open', { session: s, visibility: 'shared' });
+  const r = await a.call('run', { session: s, target: 'process', command, wait: 0 });
+  const runId = r.runId as string;
+  assert.ok(runId, 'the process Run was admitted');
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const output = () => live.session.journal.since(0).events.flatMap((e) => e.type === 'output' && e.runId === runId ? [e.data] : []).join('');
+  await until(() => Buffer.byteLength(output(), 'utf8') >= 12_000, 8000, 'the pre-attach emoji output');
+  const problems: string[] = [];
+  const page = await openGui(`http://127.0.0.1:${port}/?token=tg`, problems);
+  try {
+    await page.setViewport({ width: 1100, height: 700 });
+    await pick(page, s);
+    const pane = `[data-run="${runId}"] .run-out`;
+    await page.waitForFunction(`document.getElementById('title').textContent === '${s}' && document.querySelector('${pane} summary')`, { timeout: 8000 });
+    await page.click(`${pane} summary`);
+    await page.waitForFunction(`document.querySelector('${pane} pre')?.textContent.includes('😀')`, { timeout: 8000 });
+    const following = () => [...(server as unknown as { conns: Set<{ gui: boolean; followers: Map<string, { state: string }> }> }).conns].some((c) => c.gui && c.followers.get(s)?.state === 'live');
+    await until(following, 8000, 'the GUI to follow history output before the gate opens');
+    fs.writeFileSync(gate, '');
+    const end = await a.call('await', { session: s, runId, wait: 10_000 });
+    assert.equal(end.state, 'exited');
+    await page.waitForFunction(`document.querySelector('${pane} pre')?.textContent.includes('HISTORY-END')`, { timeout: 10_000 });
+    const shown = await page.evaluate<{ text: string; summary: string }>(`(() => { const d = document.querySelector('${pane}'); return { text: d.querySelector('pre').textContent, summary: d.querySelector('summary').textContent }; })()`);
+    const visibleBytes = Buffer.byteLength(shown.text, 'utf8');
+    assert.ok(visibleBytes >= 64 * 1024 - 3 && visibleBytes <= 64 * 1024, `the retained suffix fills the byte cap: ${visibleBytes}`);
+    assert.ok(shown.text.endsWith('\nHISTORY-END\n'), 'the last streamed suffix remains visible');
+    const dropped = Buffer.byteLength(output(), 'utf8') - visibleBytes;
+    const kb = Number(/first (\d+) KB not shown/.exec(shown.summary)?.[1]);
+    assert.ok(dropped > 20 * 1024 && dropped < 35 * 1024, `both history and streamed bytes contributed to the cut: ${dropped}`);
+    assert.equal(kb, Math.round(dropped / 1024), `the summary accounts for non-ASCII history bytes: ${shown.summary}`);
+    assert.deepEqual(problems, []);
+  } finally {
+    fs.writeFileSync(gate, '');
+    await page.close();
+    a.close();
+  }
+});
+
+test('the GUI trims many small writes without re-encoding the retained front span', async (t) => {
+  if (skip || !browser) return t.skip(skip || 'no browser');
+  const s = 'pane-encode-work';
+  const a = await agent();
+  await a.call('session_open', { session: s, visibility: 'shared' });
+  const run = await a.call('run', { session: s, target: 'process', command: 'sleep 30', wait: 0 });
+  const runId = run.runId as string;
+  assert.ok(runId);
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const problems: string[] = [];
+  const page = await openGui(`http://127.0.0.1:${port}/?token=tg`, problems);
+  try {
+    await page.setViewport({ width: 1100, height: 700 });
+    await pick(page, s);
+    await page.waitForFunction(`document.getElementById('title').textContent === '${s}' && document.getElementById('node').textContent.includes('agent:g@test')`, { timeout: 8000 });
+    const following = () => [...(server as unknown as { conns: Set<{ gui: boolean; followers: Map<string, { state: string }> }> }).conns].some((c) => c.gui && c.followers.get(s)?.state === 'live');
+    await until(following, 8000, 'the GUI follower before the synthetic process output');
+    const pane = `[data-run="${runId}"] .run-out pre`;
+    await page.evaluate(`(() => { const encode = TextEncoder.prototype.encode; window.__encodedUnits = 0; TextEncoder.prototype.encode = function(text) { window.__encodedUnits += text.length; return encode.call(this, text); }; })()`);
+    // Feed the same journal-to-follower path as process stdout, with one retained 64 KiB span.
+    live.session.journal.append({ type: 'output', data: 'A'.repeat(64 * 1024), stream: 'stdout', runId });
+    await page.waitForFunction(`document.querySelector('${pane}')?.textContent.length === ${64 * 1024}`, { timeout: 8000 });
+    const baseline = await page.evaluate<number>('window.__encodedUnits');
+    for (let i = 0; i < 60; i++) live.session.journal.append({ type: 'output', data: 'x', stream: 'stdout', runId });
+    await page.waitForFunction(`document.querySelector('${pane}')?.textContent.endsWith('${'x'.repeat(60)}')`, { timeout: 8000 });
+    const view = await page.evaluate<{ text: string; encoded: number }>(`(() => ({ text: document.querySelector('${pane}').textContent, encoded: window.__encodedUnits }))()`);
+    assert.equal(view.text.length, 64 * 1024, 'the pane trims each byte while retaining its suffix');
+    assert.ok(view.encoded - baseline < 1024, `small appends encoded only small input, not the retained span: ${view.encoded - baseline} UTF-16 units`);
+    assert.deepEqual(problems, []);
+  } finally {
+    await a.call('cancel', { session: s, runId }).catch(() => {});
     await page.close();
     a.close();
   }

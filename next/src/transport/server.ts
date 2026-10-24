@@ -2,24 +2,26 @@
  * The daemon's one endpoint (§12): JSON-RPC 2.0 over WebSocket with two method
  * families — MCP+MCPL (tools, channels, manifest, policy) and `terminal/*` (the
  * native family for the GUI and CLI: subscribe, attach, detach) — plus `/health`
- * and the GUI's static files over HTTP. Every connection is a caller with its
- * own attachments, cursors and MCPL lane.
+ * and the GUI's static files over HTTP. Every WebSocket connection is a caller
+ * with its own attachments, cursors and MCPL lane.
  *
- * Who may talk to it. Checked on every HTTP request and every upgrade, in this
- * order, before anything else runs:
- *  1. Host must name this daemon: `localhost`, `127.0.0.1` or `[::1]` (and the
- *     bind address when it is a specific one) with our port or none, or a name
- *     given with `--allow-host` (required for non-loopback binds). Anything else
- *     is 421: a DNS-rebinding page sends its own name, so it never gets through.
- *  2. Origin, when present, must be same-origin with that allowed Host — that is
- *     our own GUI. Any other Origin is 403. The browser's same-origin policy does
- *     not cover WebSocket connects, so without this any page the user visits could
- *     drive their shells (cross-site WebSocket hijacking). No Origin at all means a
- *     non-browser client (shim, CLI, agent hosts); a page cannot send none.
- *  3. The credential: `?token=` or `Authorization: Bearer` resolves to a principal
- *     (§4.5), or 401. A same-origin browser connection is the GUI's human: its
- *     principal is `human:gui:<token principal>` (unchanged when the token's
- *     is already `human:…`).
+ * Who may talk to it:
+ *  1. For both HTTP requests and upgrades, Host must name this daemon:
+ *     `localhost`, `127.0.0.1` or `[::1]` (and a specific bind address) with our
+ *     port or none, or a name given with `--allow-host` (required for
+ *     non-loopback binds). Anything else is 421: a DNS-rebinding page sends its
+ *     own name, so it never gets through.
+ *  2. Origin, when present, must be same-origin with that allowed Host; any
+ *     other Origin is 403. Browsers supply Origin on WebSocket handshakes:
+ *     without this check, another page could drive the user's shells. HTTP
+ *     no-cors GETs may omit Origin, so its absence does not authenticate HTTP.
+ *  3. HTTP routes then serve the GUI's static files without a credential and
+ *     accept an optional credential on `/health` (otherwise counts only, or
+ *     the anonymous principal where configured). A WebSocket upgrade first
+ *     checks the connection limit, then resolves `?token=` or
+ *     `Authorization: Bearer` to a principal (§4.5), or returns 401.
+ *     A same-origin browser WebSocket uses the GUI's human principal,
+ *     `human:gui:<token principal>` (unchanged for `human:…`).
  *
  * Loopback names are served on any port while the bind is loopback: a port
  * forward (`ssh -L 13101:127.0.0.1:3101`) changes the port, and pinning it adds
@@ -280,7 +282,7 @@ export class TermServer {
   private readonly conns = new Set<Conn>();
   private readonly opts: ServerOptions;
   private readonly statics: StaticFiles;
-  /** When this endpoint was built, on the monotonic clock: `/health`'s uptime is an elapsed time inside one process, which a wall-clock step must not move or make negative (the house's read of the 33 commits, #22, comment 6307351372). It counts from here, after the daemon's startup and its sessions' recovery, so it reads less than the time since termd started, and the more so after a sleep, since that clock does not advance while the host is suspended. */
+  /** The monotonic origin for /health's endpointElapsedMs: this endpoint's construction, after registry recovery. Wall-clock steps cannot move it; a host whose monotonic clock pauses during suspend omits that interval. */
   private readonly startedAt = clocks.monotonic();
   private offRegistry: (() => void) | undefined;
   private allowed: HostPattern[] = [];
@@ -412,7 +414,7 @@ export class TermServer {
     return undefined;
   }
 
-  /** `none`: no Origin (not a browser). `same`: our own GUI. `refused`: any other page. */
+  /** `none`: no Origin header (possible on HTTP GET). `same`: our own origin. `refused`: another origin. */
   private originOf(origin: string | undefined, host: string): 'none' | 'same' | 'refused' {
     if (origin === undefined) return 'none';
     let u: URL;
@@ -568,12 +570,13 @@ export class TermServer {
 
   /**
    * §15: per-session state, backend, controller, integration, the current Run,
-   * retention, and connections by kind. /health sees what a WebSocket connection
-   * with the same credential would (G18): a presented token must be valid (else
-   * 401) and scopes the sessions to what its principal may observe; without one,
-   * the daemon's anonymous principal when it has one (a loopback daemon without
-   * tokens). A daemon that requires a credential tells an unauthenticated caller
-   * only that it is alive, with counts — never another agent's private sessions
+   * retention, and connections by kind. /health scopes sessions by the credential's
+   * principal (G18); a same-origin browser WebSocket instead uses its derived GUI
+   * human, so its private-session view can differ. A presented token must be
+   * valid (else 401); without one, the daemon's anonymous principal is used when
+   * configured (including an unconfigured loopback daemon). A daemon that
+   * requires a credential tells an unauthenticated caller only that it is
+   * alive, with counts — never another agent's private sessions
    * (tsg-17). History sessions report `closed` or `recovered`, their retention and
    * oldest seq (G20, G21; jr2-14). A caller that has a principal and a loopback peer
    * address is also told the data dir.
@@ -594,7 +597,7 @@ export class TermServer {
       status: 'ok',
       version: this.opts.version ?? 'dev',
       pid: process.pid,
-      uptimeMs: Math.round(clocks.monotonic() - this.startedAt),
+      endpointElapsedMs: Math.round(clocks.monotonic() - this.startedAt),
       connections: { total: this.conns.size, ...byKind },
       sessionCount: all.length,
     };
@@ -1001,7 +1004,7 @@ export class TermServer {
       case 'tools/call': {
         const name = typeof p.name === 'string' ? p.name : '';
         const args = (p.arguments ?? {}) as Record<string, unknown>;
-        // The call's latency in its usage record, on the monotonic clock as /health's uptime is.
+        // The usage latency and /health's endpointElapsedMs use monotonic intervals with different origins.
         const t0 = clocks.monotonic();
         // A tool's advice about notifications holds only when this connection's grant delivers them for the
         // session it names; being an MCPL host is not enough (the house's read of 2f357bd, #22).

@@ -11,9 +11,10 @@
 // while disconnected or attaching, they are dropped with a notice, never queued to
 // run seconds later against whatever the terminal shows by then (tsg-7). Input can
 // be marked secret (the lock), and is automatically while the text left of the
-// cursor looks like a password prompt: the daemon journals it as a redacted
-// placeholder (G26, tsg-8). The session list is pushed by the daemon on change
-// (terminal/sessions) and refreshed slowly only while the page is visible (tsg-16).
+// cursor looks like a password prompt: the daemon journals sensitive input events
+// as placeholders (G26, tsg-8). Program output can still echo the typed text.
+// The session list is pushed by the daemon on change (terminal/sessions) and
+// refreshed slowly only while the page is visible (tsg-16).
 'use strict';
 (() => {
   // The token arrives once in the page URL (`tsm gui` prints it). Keep it for this tab only and take it
@@ -292,7 +293,7 @@
     btn.setAttribute('aria-pressed', String(on));
     btn.classList.toggle('on', on);
     btn.textContent = secret.manual ? 'Secret: on' : secret.auto ? 'Secret: auto' : 'Secret: off';
-    btn.title = on ? 'What you type is sent as sensitive input: the journal keeps a placeholder, observers see [redacted]' : 'Send what you type as sensitive input (journaled redacted)';
+    btn.title = on ? 'Input events are [redacted] in the journal; shell or program output may still be visible to observers, including text you entered.' : 'Mark input events sensitive in the journal; shell or program output may remain visible.';
   }
 
   $('secret').onclick = () => {
@@ -395,9 +396,17 @@
 
   // ───────────── attach and events ─────────────
 
+  let closeArmed = null; // timer for this selection's confirmation
+  function disarmClose() {
+    if (closeArmed) clearTimeout(closeArmed);
+    closeArmed = null;
+    $('close').textContent = 'Close';
+  }
+
   async function select(id) {
     // Clicking the current session again reattaches when its stream ended (closed, exited, history; tsg-9).
     if (state.current === id && !(state.exited || state.history || state.streamEnded)) return;
+    disarmClose(); // switching or reattaching cannot carry a prior confirmation to this selection
     // Text still coalescing was typed into the session being left: it goes there, now.
     flush();
     if (state.current && state.current !== id) rpc.request('terminal/detach', { session: state.current }).catch(() => undefined);
@@ -806,13 +815,15 @@
         continue;
       }
       const excess = out.bytes - OUT_MAX;
-      const n = utf8(first.textContent);
-      if (n <= excess) {
+      const front = first.textContent;
+      // UTF-8 bytes are at least UTF-16 units: a shorter excess cannot remove this span.
+      const n = excess < front.length ? undefined : utf8(front);
+      if (n !== undefined && n <= excess) {
         out.bytes -= n;
         out.cut += n;
         first.remove();
       } else {
-        const { text, cut } = cutFront(first.textContent, excess);
+        const { text, cut } = cutFront(front, excess);
         first.textContent = text;
         out.bytes -= cut;
         out.cut += cut;
@@ -903,29 +914,24 @@
     if (state.current) tool('signal', { session: state.current, signal: 'SIGINT' }).catch((e) => notice(e.message));
   };
 
-  let closeArmed = null;
   $('close').onclick = async () => {
-    if (!state.current) return;
+    const id = state.current;
+    if (!id) return;
     if (!closeArmed) {
       $('close').textContent = 'Confirm close';
-      closeArmed = setTimeout(() => {
-        closeArmed = null;
-        $('close').textContent = 'Close';
-      }, 3000);
+      closeArmed = setTimeout(disarmClose, 3000);
       return;
     }
-    clearTimeout(closeArmed);
-    closeArmed = null;
-    $('close').textContent = 'Close';
+    disarmClose();
     try {
-      await tool('session_close', { session: state.current });
+      await tool('session_close', { session: id });
     } catch (e) {
       notice(e.message);
     }
     refreshSessions();
   };
 
-  // Who may see a session opened here (§9): private (you only — not even agents using your token) or shared.
+  // Who may see a session opened here (§9): private follows its owner principal, not a person or browser tab.
   // The choice is remembered per browser, a convenience only: storage may be blocked.
   try {
     if (localStorage.getItem('tsm-new-visibility') === 'shared') $('new-vis').value = 'shared';

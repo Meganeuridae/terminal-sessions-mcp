@@ -168,8 +168,7 @@ the initial cwd forever; four declared dependencies nothing imports.
 - **Extensible at named seams,** each with two implementations from day one.
 - **Testable.** The core has no network and no PTY dependency; guarantees are encoded as
   tests against a scripted backend, and re-run against real shells.
-- **Operable.** One supervised daemon per machine; loopback plus token today, `aid1`
-  tomorrow; a health endpoint that reports session and run states.
+- **Operable.** One supervised daemon per machine. An unconfigured loopback daemon accepts local clients as `token:local-<user>`; configured tokens identify their principals, and a network bind requires a credential. The health endpoint reports session and Run states.
 
 **Non-goals (v1)**
 
@@ -787,8 +786,7 @@ draft reserved channels for conversational surfaces and used push events for lif
 the org's servers (discord-mcpl, portal-mcpl) resolve this with **dual delivery**, and so
 does this design: while a channel is open, everything flows as `channels/incoming`; while
 it is closed, lifecycle-class events (run exited, service ready or unhealthy, session
-exited, watch fired, needs-input) are delivered as `push/event` with a flat `origin` that
-includes `mcplChannelId`, and ambient output is not delivered at all. The agent chooses its
+exited, watch fired, needs-input) are delivered as `push/event` with a flat `origin` that names the session in `channelId`. It omits `mcplChannelId`, which would give the host a channel for replying to the completion. Ambient output is not delivered at all. The agent chooses its
 attention by opening and closing channels; the host's gate chooses wake by tags.
 
 Descriptor:
@@ -1148,8 +1146,7 @@ release so existing recipes keep working, and is removed in the release after.
 └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **termd**: supervised by launchd/systemd as today (units in `next/config/`); loopback plus
-  token by default, `aid1` when available. A connection names itself in its URL's query:
+- **termd**: supervised by launchd/systemd as today (units in `next/config/`). With no credential configured, a loopback daemon accepts clients as `token:local-<user>`. Configured tokens identify their principals, and a non-loopback bind requires a credential. A connection names itself in its URL's query:
   `token` (or an `Authorization: Bearer` header), `profile` (plain MCP only: `core | full |
   compat`), `resultText` (`json | transcript`, §11), `connection` (a label for logs and usage
   records; the daemon generates the identity), and `client=cli`, which the `tsm` CLI sends so

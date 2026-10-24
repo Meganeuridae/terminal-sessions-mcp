@@ -136,13 +136,18 @@ test('MCP host: core tools, dual-rendered results, validation errors, health', a
   h.close();
 });
 
-test('auth: unknown tokens are refused', async () => {
+test('auth: unknown tokens receive a 401 at WebSocket upgrade', async () => {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/?token=nope`);
-  const outcome = await new Promise<string>((resolve) => {
-    ws.once('open', () => resolve('open'));
-    ws.once('error', () => resolve('refused'));
+  const status = await new Promise<number>((resolve, reject) => {
+    ws.once('open', () => resolve(101));
+    ws.once('unexpected-response', (_request, response) => {
+      response.resume();
+      ws.terminate();
+      resolve(response.statusCode ?? 0);
+    });
+    ws.once('error', reject);
   });
-  assert.equal(outcome, 'refused');
+  assert.equal(status, 401);
 });
 
 test('native family: terminal/subscribe replays from a cursor and streams new events', async () => {

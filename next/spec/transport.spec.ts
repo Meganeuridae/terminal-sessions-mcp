@@ -21,6 +21,7 @@ import { NodePtyBackend } from '../src/backends/node-pty.js';
 import type { ScriptedBackend, ScriptedPty } from '../src/backends/scripted.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { Journal } from '../src/core/journal.js';
+import { clocks } from '../src/core/clock.js';
 import { MemoryStore } from '../src/core/stores.js';
 import { Follower } from '../src/transport/follower.js';
 import { TermServer, type LogRecord, type ServerOptions, type UsageRecord } from '../src/transport/server.js';
@@ -48,7 +49,7 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function start(opts: Partial<ServerOptions> & { prepare?: (dataDir: string) => void; registry?: Partial<ConstructorParameters<typeof SessionRegistry>[0]> } = {}): Promise<Harness> {
+async function start(opts: Partial<ServerOptions> & { prepare?: (dataDir: string) => void; afterRegistry?: () => void; registry?: Partial<ConstructorParameters<typeof SessionRegistry>[0]> } = {}): Promise<Harness> {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-transport-'));
   roots.push(dataDir);
   opts.prepare?.(dataDir);
@@ -58,9 +59,10 @@ async function start(opts: Partial<ServerOptions> & { prepare?: (dataDir: string
   });
   const registry = new SessionRegistry({ dataDir, backend, defaultShell: '/bin/bash', noUserRc: true, ...opts.registry });
   const app = new App({ registry, defaultWaitMs: 2000 });
+  opts.afterRegistry?.(); // tests may advance the clock past synchronous recovery before TermServer exists
   const logs: LogRecord[] = [];
   const usage: UsageRecord[] = [];
-  const { prepare: _p, registry: _r, ...rest } = opts;
+  const { prepare: _p, afterRegistry: _a, registry: _r, ...rest } = opts;
   const so: ServerOptions = {
     app,
     resolver: new TokenMapResolver({ tokens: TOKENS }),
@@ -273,6 +275,36 @@ test('sec-1: Host rebinding is refused (421) on HTTP and on upgrade; loopback na
     assert.ok('ws' in good, 'an --allow-host name is served');
     good.ws.close();
     assert.ok(h.logs.some((l) => l.msg === 'upgrade refused: Host not served (serve it with --allow-host)' && l.status === 421));
+  } finally {
+    await h.close();
+  }
+});
+
+test('a specific-bind Host policy applies port restrictions to real HTTP requests and upgrades', async () => {
+  // Bind the socket to the loopback interface on every CI host, but ask TermServer for the
+  // policy it would use with a specific network address. This tests Host admission, not
+  // reachability of that address or whether an OS has a second loopback alias.
+  const address = '192.0.2.1';
+  const h = await start({ allowHosts: ['proxy.example:8443'] });
+  try {
+    const policy = h.server as unknown as {
+      hostPatterns(bind: string): Array<{ name: string; port?: string; anyPort?: boolean }>;
+      allowed: Array<{ name: string; port?: string; anyPort?: boolean }>;
+    };
+    policy.allowed = policy.hostPatterns(address);
+    const p = h.port;
+    const get = (host: string) => httpGet(p, '/health', { Host: host });
+    for (const host of [`${address}:${p}`, address, `127.0.0.1:${p}`, 'proxy.example:8443']) {
+      assert.equal((await get(host)).status, 200, host);
+    }
+    for (const host of [`${address}:${p + 1}`, `127.0.0.1:${p + 1}`, 'proxy.example']) {
+      assert.equal((await get(host)).status, 421, host);
+    }
+    const url = `ws://127.0.0.1:${p}/?token=ta`;
+    assert.deepEqual(await tryUpgrade(url, { headers: { Host: `${address}:${p + 1}` } }), { status: 421 });
+    const good = await tryUpgrade(url, { headers: { Host: `${address}:${p}` } });
+    assert.ok('ws' in good, 'the specific bind policy serves its address at the bound port');
+    good.ws.close();
   } finally {
     await h.close();
   }
@@ -740,8 +772,10 @@ test('terminal/attach: the owner takes the free seat; detach releases it and sto
     assert.ok(!s.listAttachments().some((x) => x.attachmentId === r.attachmentId), 'the attachment is gone');
     const n = eventsOf(c, 'seat1').length;
     s.journal.append({ type: 'note', text: 'after detach', principal: 'agent:a@test' });
-    await sleep(50);
-    assert.equal(eventsOf(c, 'seat1').length, n, 'no events after detach');
+    // Append synchronously offers the event to every live follower. A ping response on this same
+    // WebSocket follows any event that follower queued, so receiving it is a delivery barrier.
+    assert.deepEqual(await c.request('ping'), {});
+    assert.equal(eventsOf(c, 'seat1').length, n, 'no event was delivered after detach');
 
     const hist = (await c.request('terminal/attach', { session: 'past' })) as { snapshot: null; transcript: string; lastSeq: number; runs: Array<{ runId: string; state: string; exit: number; line: string; durationMs: number }> };
     assert.equal(hist.snapshot, null);
@@ -760,10 +794,25 @@ test('terminal/attach: the owner takes the free seat; detach releases it and sto
   }
 });
 
-test('/health’s uptime and a tool call’s latency are elapsed times on the monotonic clock, which a wall-clock step moves in neither direction', async (t) => {
-  // Both read Date.now (the house's read of the 33 commits, #22, comment 6307351372): a step back made
-  // the uptime negative, a step forward added the step, and a step during a call made its latency in the
-  // usage record negative. Neither the server nor the call can have taken an hour.
+test('/health endpointElapsedMs begins at endpoint construction, after registry recovery', async (t) => {
+  let monotonic = 1_000;
+  t.mock.method(clocks, 'monotonic', () => monotonic);
+  // Advance after the registry has been built: process-start or recovery time must not
+  // count as endpoint elapsed time, even if recovery took 9,000 monotonic milliseconds.
+  const h = await start({ afterRegistry: () => { monotonic = 10_000; } });
+  try {
+    monotonic = 10_250;
+    const body = JSON.parse((await httpGet(h.port, '/health')).body) as Record<string, unknown>;
+    assert.equal(body.endpointElapsedMs, 250, 'the clock starts after recovery, when the endpoint is built');
+    assert.equal('uptimeMs' in body, false, 'the response does not call this process uptime');
+  } finally {
+    await h.close();
+  }
+});
+
+test('/health’s endpoint elapsed time and a tool call’s latency use a monotonic clock through wall-clock steps', async (t) => {
+  // Before monotonic timing, a wall-clock step back made the health value or call latency
+  // negative, and a step forward added the step. Neither operation can have taken an hour.
   const realNow = Date.now;
   let wall = (): number => realNow();
   t.mock.method(Date, 'now', () => wall());
@@ -771,13 +820,13 @@ test('/health’s uptime and a tool call’s latency are elapsed times on the mo
   try {
     const c = await Client.open(h.port);
     await c.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
-    const uptime = async () => (JSON.parse((await httpGet(h.port, '/health')).body) as { uptimeMs: number }).uptimeMs;
+    const elapsed = async () => (JSON.parse((await httpGet(h.port, '/health')).body) as { endpointElapsedMs: number }).endpointElapsedMs;
     wall = () => realNow() - 3_600_000;
-    const afterBack = await uptime();
-    assert.ok(afterBack >= 0, `uptime after a step back: ${afterBack} ms`);
+    const afterBack = await elapsed();
+    assert.ok(afterBack >= 0, `endpoint elapsed after a step back: ${afterBack} ms`);
     wall = () => realNow() + 3_600_000;
-    const afterForward = await uptime();
-    assert.ok(afterForward < 3_600_000, `uptime after a step forward: ${afterForward} ms`);
+    const afterForward = await elapsed();
+    assert.ok(afterForward < 3_600_000, `endpoint elapsed after a step forward: ${afterForward} ms`);
     // Each read of the wall clock during the call is a second earlier than the one before.
     let reads = 0;
     wall = () => realNow() - 1000 * reads++;

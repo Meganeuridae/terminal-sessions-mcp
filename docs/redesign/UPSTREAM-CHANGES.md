@@ -24,8 +24,7 @@ Repo: `github.com/anima-research/mcpl-cc-bridge`, source under `bridge/`, plugin
 **Why.** Wake rules are AND-sets of exact tag strings, so a rule cannot name a faceted tag
 family such as `terminal:watch=*` or `terminal:exit=*`. (termd's service statuses became
 distinct classes — `terminal:service-ready` and so on — because the manifest's identifier
-charset excludes `=` in `suggestedTreatment`, so only watch labels and exit kinds remain
-faceted; termd emits the bare `terminal:watch` beside the facet in the meantime.) agent-framework's gate already
+charset excludes `=` in `suggestedTreatment`. Watch labels, exit kinds, Run origin, Run target, and recovery class remain faceted; termd emits the bare `terminal:watch` beside the watch facet in the meantime.) agent-framework's gate already
 matches tags with `*` globs (`agent-framework/src/gate/types.ts`, `tagsAny/tagsAll/tagsNone`
 doc comment). Parity removes the need for producers to emit a bare tag beside every facet.
 

@@ -19,7 +19,7 @@ import { TokenMapResolver } from '../src/api/principals.js';
 import { SessionRegistry } from '../src/api/registry.js';
 import { CORE_TOOLS } from '../src/api/tools.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
-import type { Journal } from '../src/core/journal.js';
+import { Journal } from '../src/core/journal.js';
 import type { SegmenterOptions } from '../src/core/segmenter.js';
 import { seqOfMessageId } from '../src/core/segmenter.js';
 import type { Session } from '../src/core/session.js';
@@ -1369,6 +1369,7 @@ async function bareLane(connection: string, o: { announce?: boolean; removals?: 
   const ctx = { isRequest: true, after: (fn: () => void) => fn() };
   await lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, ctx);
   const inside = lane as unknown as {
+    enabledFeatureSets: Set<string>;
     opening: Map<string, { held: Map<string, unknown> }>;
     open: Set<string>;
     registered: Set<string>;
@@ -1808,6 +1809,88 @@ test('without a byte cap the note budget keeps no sizes, only the rates apply; u
     await f.app.sessionOpen(f.caller, { id: 'nc', visibility: 'shared', retention: { maxBytes: 64 * 1024 } });
     for (let i = 0; i < 2; i++) await publish('terminal:nc', `note ${i}`);
     assert.equal(kept('nc'), 2, 'a cap: each retained note counts');
+  } finally {
+    await f.close();
+  }
+});
+
+test('a note budget refills tokens, enforces a separate per-minute cap, and reaps retained bytes', async () => {
+  const f = await bareLane('c-note-rates');
+  type Budget = {
+    take(p: string, bytes: number, journal: Journal, retentionBytes: number, now: number): { message: string; retryAfterMs: number } | undefined;
+    record(seq: number, bytes: number): void;
+    retained: Array<[number, number]>;
+    bytes: number;
+  };
+  const budget = (journal: Journal) => f.inside.budgetOf(journal) as unknown as Budget;
+  try {
+    const burstJournal = new Journal();
+    const burst = budget(burstJournal);
+    for (let i = 0; i < 5; i++) assert.equal(burst.take(A, 1, burstJournal, Infinity, 1_000), undefined);
+    assert.match(burst.take(A, 1, burstJournal, Infinity, 1_000)?.message ?? '', /bursts of 5/);
+    assert.equal(burst.take(A, 1, burstJournal, Infinity, 1_000)?.retryAfterMs, 500);
+    assert.equal(burst.take(A, 1, burstJournal, Infinity, 1_250)?.retryAfterMs, 250);
+    assert.equal(burst.take(B, 1, burstJournal, Infinity, 1_000), undefined, 'another principal has its own tokens');
+    assert.equal(burst.take(A, 1, burstJournal, Infinity, 1_500), undefined, 'one token refilled without a wall-clock wait');
+
+    const minuteJournal = new Journal();
+    const minute = budget(minuteJournal);
+    for (let i = 0; i < 30; i++) assert.equal(minute.take(B, 1, minuteJournal, Infinity, 10_000 + i * 500), undefined);
+    const minuteCap = minute.take(B, 1, minuteJournal, Infinity, 25_000);
+    assert.match(minuteCap?.message ?? '', /at most 30 notes a minute/);
+    assert.equal(minuteCap?.retryAfterMs, 45_000, 'the oldest of thirty notes sets the next retry');
+    assert.equal(minute.take(B, 1, minuteJournal, Infinity, 70_000), undefined, 'the minute window releases the first slot');
+
+    const capped = budget(new Journal());
+    const retained = { oldestSeq: 1 } as unknown as Journal;
+    capped.record(1, 900);
+    assert.match(capped.take(A, 300, retained, 16 * 1024, 1_000)?.message ?? '', /space frees as retention moves past them/);
+    (retained as unknown as { oldestSeq: number }).oldestSeq = 2;
+    assert.equal(capped.take(A, 300, retained, 16 * 1024, 1_000), undefined, 'an evicted note returns its byte share');
+    assert.deepEqual(capped.retained, []);
+    assert.equal(capped.bytes, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test('a feature-set notification reduces immediately and ignores unacknowledgeable widening', async () => {
+  const f = await bareLane('c-policy-notification');
+  const notification = { isRequest: false, after: () => { throw new Error('a notification has no receipt to defer'); } };
+  try {
+    assert.equal(f.inside.enabledFeatureSets.has('terminal.live'), true);
+    await f.lane.handle('featureSets/update', { disabled: ['terminal.live'] }, notification);
+    assert.equal(f.inside.enabledFeatureSets.has('terminal.live'), false, 'a notification may withdraw live delivery immediately');
+    assert.equal(f.lane.toolAllowed('session_list'), true, 'a notification reduction keeps unrelated core tools');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: ['tools'] }, f.ctx);
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT, enabled: ['*'], disabled: ['terminal.channels'] }, notification);
+    assert.equal(f.lane.has('pushEvents'), false, 'the notification cannot widen a prior tools-only grant');
+    assert.equal(f.lane.grant?.disabledFeatureSets.includes('terminal.channels'), true, 'its disabled reduction still applies');
+  } finally {
+    await f.close();
+  }
+});
+
+test('disabled feature sets take precedence over an enabled wildcard in a policy Request', async () => {
+  const f = await bareLane('c-policy-disabled');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT, enabled: ['*'], disabled: ['terminal.live'] }, f.ctx);
+    assert.equal(f.inside.enabledFeatureSets.has('terminal.core'), true, 'enabled wildcard retains other granted sets');
+    assert.equal(f.inside.enabledFeatureSets.has('terminal.live'), false, 'disabled takes precedence');
+    assert.equal(f.lane.toolAllowed('session_list'), true);
+  } finally {
+    await f.close();
+  }
+});
+
+test('a policy Request without effectiveCapabilities removes a previous full grant', async () => {
+  const f = await bareLane('c-policy-absent');
+  try {
+    assert.equal(f.lane.toolAllowed('session_list'), true);
+    await f.lane.handle('featureSets/update', { enabled: ['*'] }, f.ctx);
+    assert.equal(f.lane.has('tools'), false, 'absence is denial, not the previous grant');
+    assert.equal(f.lane.toolAllowed('session_list'), false, 'the earlier core grant cannot survive');
+    assert.equal(f.inside.enabledFeatureSets.size, 0);
   } finally {
     await f.close();
   }

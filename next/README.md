@@ -36,6 +36,8 @@ worse failure. It keeps serving history, the GUI and the lane meanwhile, and `/h
 `"status":"degraded"` with the same message as `unsupported`. The same holds for a `/dev/fd` that does
 not list the process's own descriptors.
 
+`/health` reports `endpointElapsedMs` from endpoint construction after session recovery, using a monotonic clock. This value is not the process's age. On a host whose monotonic clock pauses during suspend, it omits the time asleep.
+
 Then connect a host (configurations in [`next/config/`](config/)):
 
 - **Claude Code with `mcpl-cc-bridge`**: add the `terminal` entry from
