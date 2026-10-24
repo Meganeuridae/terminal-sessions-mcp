@@ -300,7 +300,9 @@ const PIDLESS_PROBES = [...FLAVORS.map((f) => ` ${untraced(printedMark('PRO""BE'
  * house's review of 4860d4c..bc4bc85, PR #22).
  */
 const EARLIER_INLINE_PROBES = ['"$$"', EVALUATING_PID].map((pid) => inlineProbeNaming(AT_NONCE, pid, false));
-for (const line of [...FLAVORS.map((f) => markerProbe(AT_NONCE, f)), ...PIDLESS_PROBES, LEGACY_PROBE, inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true), ...EARLIER_INLINE_PROBES]) {
+/** Before the inline probe printed the Run token, both shells printed one pid field. Retained echoes still have this form. */
+const PRE_TOKEN_INLINE_PROBES = ['"$$"', '$fish_pid'].map((pid) => ` printf '<<<PRO''BE:${AT_NONCE}:%s>>>\\n' ${pid}`);
+for (const line of [...FLAVORS.map((f) => markerProbe(AT_NONCE, f)), ...PIDLESS_PROBES, LEGACY_PROBE, inlineProbe(AT_NONCE, false), inlineProbe(AT_NONCE, true), ...EARLIER_INLINE_PROBES, ...PRE_TOKEN_INLINE_PROBES]) {
   const [before, after] = line.split(AT_NONCE) as [string, string];
   const at = before.indexOf('<<<');
   const lines = PROBE_LINES.get(before.slice(at)) ?? { leads: [], rests: [] };

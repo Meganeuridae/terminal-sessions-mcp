@@ -47,6 +47,12 @@ test('history is cut by shape as the live transcript cuts by nonce: wrapper echo
   assert.equal(cutPlumbing(probed), 'OUT\n', 'from the probe echo on is plumbing');
   const probedInline = 'OUT\n printf \'<<<PRO\'\'BE:74ef5182:%s>>>\\n\' "$$"\n<<<PROBE:74ef5182:4242>>>\n';
   assert.equal(cutPlumbing(probedInline), 'OUT\n', 'the probe shape from before tokens, with no start marker to judge it by, ends the output');
+  const oldWrapped = 'OUT\n printf \'<<<PRO\'\'BE:74ef5182\r\n:%s>>>\\n\' "$$"\r\n<<<PROBE:74ef5182:4242>>>\r\n';
+  assert.equal(cutPlumbing(oldWrapped), 'OUT\n', 'the pre-token POSIX inline probe echo wrapped after its nonce is cut whole');
+  const oldFishWrapped = 'OUT\n printf \'<<<PRO\'\'BE:74ef5182\r\n:%s>>>\\n\' $fish_pid\r\n<<<PROBE:74ef5182:4242>>>\r\n';
+  assert.equal(cutPlumbing(oldFishWrapped), 'OUT\n', 'the pre-token fish inline probe echo wrapped after its nonce is cut whole');
+  const otherRunLine = 'OUT\n printf \'<<<PRO\'\'BE:74ef5182:%s>>>\\n\' "$$"\r\nmore\r\n';
+  assert.equal(cutPlumbing(otherRunLine, { strategy: 'inline', nonce: 'deadbeef' }), otherRunLine, 'a probe-shaped line with another Run nonce stays output');
   const coloured = '\x1b[31mA\x1b[0m\n<<<EXIT:74ef5182:0>>>\n';
   assert.equal(cutPlumbing(coloured), '\x1b[31mA\x1b[0m\n', 'the cut is made in the raw text, escapes kept');
   assert.equal(cutPlumbing('line one\nline two\n'), 'line one\nline two\n', 'nothing to cut');
