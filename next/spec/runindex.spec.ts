@@ -220,7 +220,11 @@ test('maxBytes counts UTF-8 bytes, as every cap does: box-drawing output is narr
   const narrowed = narrowOutput({ events, from: 1, to: 5, truncated: false }, { maxBytes: 100 });
   assert.equal(narrowed.events.length, 1);
   assert.equal(narrowed.truncated, true);
-  assert.equal(narrowOutput({ events, from: 1, to: 5, truncated: false }, { maxBytes: 240 }).events.length, 4);
+  assert.equal(narrowed.cut, true, 'the cap\'s own cut, which a read of the range without it gives (the house\'s review of bc4bc85..5d8ce0e, PR #22, I14)');
+  const whole = narrowOutput({ events, from: 1, to: 5, truncated: false }, { maxBytes: 240 });
+  assert.deepEqual([whole.events.length, whole.cut], [4, undefined]);
+  // Retention's truncation is carried, and isn't a cut: what it took no read gives.
+  assert.deepEqual(narrowOutput({ events, from: 1, to: 5, truncated: true, older: true }, { maxBytes: 240 }).cut, undefined);
 });
 
 test('a Run\'s output carries the gap events of the part it covers, as narrowOutput narrows them (the house\'s read of 1cabc6a)', () => {

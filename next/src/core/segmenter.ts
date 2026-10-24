@@ -21,7 +21,7 @@
 import { cellWidth, cleanLine } from './ansi.js';
 import { clocks } from './clock.js';
 import type { Journal } from './journal.js';
-import type { RunOutput } from './runindex.js';
+import { journalLost, type RunOutput } from './runindex.js';
 import { cutPlumbing, runEcho, startMark } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
 import { lineCarry, lineEnds, pastSequence, tailStart, unfinishedSequence, type LineCarry } from './text.js';
@@ -99,11 +99,16 @@ export interface SegmenterOptions {
 
 export interface RunText {
   text: string;
-  /** Some of the output isn't in `text`: a cut omitted it, or rows were lost. */
+  /** Some of the output isn't in `text`: a cut omitted it, or it was lost. */
   truncated: boolean;
-  /** A cut left output out (older output, or input or lines past a limit), which a read of the Run shows. */
+  /** A cut left output out (older output past a byte cap, or input or lines past a limit), which a read of the Run shows. */
   omitted?: true;
-  /** Rows were lost as the output was rendered (Projection.lost), which no read shows. */
+  /**
+   * Output is missing that no read shows: output the journal no longer has (retention took the range's start, or a
+   * hole lies within it), or rows the projection lost as it rendered them (Projection.lost, which can report a loss a
+   * program's redraw undid). One flag for both, and so the completion's note says "may": a choice that could go
+   * either way (the house's review of bc4bc85..5d8ce0e, PR #22, I14, I86).
+   */
   lost?: true;
   seq: [Seq, Seq];
   nextCursor: Seq;
@@ -279,8 +284,9 @@ export async function journalRunText(o: RunOutput, how: HistoryRender = {}, run?
       : undefined;
   const chunks = runChunks(events, o.gaps, cut);
   const p = await project(chunks, { cols: run?.cols ?? how.cols ?? DEFAULT_GEOMETRY.cols, rows: run?.rows ?? how.rows ?? DEFAULT_GEOMETRY.rows, maxInputBytes: how.maxInputBytes ?? HISTORY_RUN_INPUT_BYTES, keep: 'tail' });
-  const omitted = o.truncated || p.cut === true;
-  return { text: p.text, truncated: o.truncated || p.truncated, ...(omitted ? { omitted } : {}), ...(p.lost ? { lost: p.lost } : {}), seq: [o.from, o.to], nextCursor: o.to };
+  const omitted = o.cut === true || p.cut === true;
+  const lost = p.lost === true || journalLost(o);
+  return { text: p.text, truncated: o.truncated || p.truncated, ...(omitted ? { omitted } : {}), ...(lost ? { lost } : {}), seq: [o.from, o.to], nextCursor: o.to };
 }
 
 /**
@@ -365,8 +371,9 @@ class Render {
     // independent read of the fixes for the review of the 40 commits, PR #22). The heads' `read since=…` are deltas
     // inside a head that names its session first, as read's own status line has them.
     if (cut || t.omitted) body = `[… earlier output omitted · read session=${this.src.id} runId=${ev.runId} for all of it]\n${body}`;
-    // Rows the projection lost are in no page or tail either: a read can't give them (Projection.lost).
-    if (t.lost) body = `[… some rows of this output were lost as it was rendered, and no read shows them]\n${body}`;
+    // Output the journal no longer has, and rows the projection lost, are in no page or tail either: a read can't give
+    // them (RunText.lost). A projection's loss can be one a program's redraw undid, so the note says "may".
+    if (t.lost) body = `[… some of this output may be missing, gone from the journal or lost as it was rendered, and no read shows it]\n${body}`;
     if (unreadable !== undefined) body = `[the Run's output could not be read: ${oneLine(unreadable, 160)} · read session=${this.src.id} runId=${ev.runId} to try again]`;
     const status =
       ev.state === 'exited'

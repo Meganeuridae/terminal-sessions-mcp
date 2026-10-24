@@ -20,7 +20,7 @@ import { livingGroups } from './lock.js';
 import { clocks, timerMs } from './clock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
-import { pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
+import { journalLost, pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
 import { commandFile, cutPlumbing, exitMark, inlineProbe, markerCommandText, markerProbe, probeMark, shellQuote, sourceLine, startMark, type ShellFlavor } from './plumbing.js';
 import { stripEscapes } from './text.js';
 import { project, runChunks } from './transcript.js';
@@ -2950,8 +2950,9 @@ export class Session {
     const input = runChunks(events, out.gaps, cut);
     const p = await project(input, { cols: run.cols ?? this.screen.cols, rows: run.rows ?? this.screen.rows, maxInputBytes: TRANSCRIPT_INPUT_CHARS, keep: 'tail' });
     // What a cut omitted and the rows the projection lost are told apart, as the Run's completion says them (RunText).
-    const omitted = out.truncated || p.cut === true;
-    return { text: p.text, truncated: out.truncated || p.truncated, ...(omitted ? { omitted } : {}), ...(p.lost ? { lost: p.lost } : {}), seq: [out.from, out.to], nextCursor: out.to };
+    const omitted = out.cut === true || p.cut === true;
+    const lost = p.lost === true || journalLost(out);
+    return { text: p.text, truncated: out.truncated || p.truncated, ...(omitted ? { omitted } : {}), ...(lost ? { lost } : {}), seq: [out.from, out.to], nextCursor: out.to };
   }
 
   // ───────────────────────────── terminal capabilities (G8) ─────────────────────────────

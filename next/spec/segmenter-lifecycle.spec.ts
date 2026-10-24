@@ -499,7 +499,7 @@ test('a long output cut to its tail keeps a torn line that is most of the budget
   startRun(src, 'lost');
   endRun(src, 'lost');
   await until(() => out.length === 1, 5000, 'the completion');
-  assert.match(out[0]!.body ?? '', /^\[… some rows of this output were lost as it was rendered, and no read shows them\]\nr5\nr6\nX$/);
+  assert.match(out[0]!.body ?? '', /^\[… some of this output may be missing, gone from the journal or lost as it was rendered, and no read shows it\]\nr5\nr6\nX$/);
   assert.equal(out[0]!.metadata.truncated, true);
   seg.dispose();
 });

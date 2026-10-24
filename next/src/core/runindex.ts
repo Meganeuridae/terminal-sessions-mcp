@@ -102,6 +102,11 @@ export interface RunOutput {
    * say: narrowOutput carries it from the output it is given and adds the `maxBytes` cut.
    */
   older?: boolean;
+  /**
+   * `maxBytes` left out older output of the range, which a read of the range without it gives. Unlike `truncated`
+   * and `older`, retention and a hole don't set it: what they took no read gives (the house's review of bc4bc85..5d8ce0e, PR #22, I14).
+   */
+  cut?: true;
   /** With `limit`: output events of the range remain after the last one returned. */
   more?: boolean;
   /**
@@ -123,6 +128,16 @@ export interface RunOutputRange {
   limit?: number;
   /** Only the newest part: output events ending at the range's end, at most this many bytes (at least one event). */
   maxBytes?: number;
+}
+
+/**
+ * Whether a Run's output, as read, lacks output the journal no longer has: a hole within it, or, where no byte cap
+ * cut it, retention that took the range's start (`older` without `cut`; `older`, not `truncated`, which with `since`
+ * says retention took the Run's start, before the range). Where both a cap and retention cut the start, the cap's
+ * omission is said and a read of the Run shows what retention took is gone.
+ */
+export function journalLost(o: Pick<RunOutput, 'older' | 'cut' | 'gaps'>): boolean {
+  return (o.gaps?.length ?? 0) > 0 || (o.older === true && o.cut !== true);
 }
 
 /** Apply a range to a Run's whole output (the reference semantics; stores may do it without loading everything). */
@@ -156,6 +171,7 @@ export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
   }
   let truncated = o.truncated;
   let older = o.older === true;
+  let cut = o.cut === true;
   if (range.maxBytes !== undefined) {
     let bytes = 0;
     let k = events.length;
@@ -172,10 +188,12 @@ export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
       events = events.slice(k);
       truncated = true;
       older = true;
+      cut = true;
     }
   }
   const out: RunOutput = { events, from: o.from, to: range.until !== undefined ? Math.min(o.to, range.until) : o.to, truncated };
   if (older) out.older = true;
+  if (cut) out.cut = true;
   if (range.limit !== undefined) out.more = more;
   if (gaps?.length) out.gaps = gaps;
   return out;
