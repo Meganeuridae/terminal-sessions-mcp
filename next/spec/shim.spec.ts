@@ -1084,6 +1084,11 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     });
     return ready ? child.pid : undefined;
   };
+  // A unit file copied in with its times kept before any termd here started: unchanged since each start, its times
+  // and its inode's change both before it. Made after, the copy itself changes the inode, which counts as an edit.
+  const unedited = path.join(tmp, 'unedited-termd.service');
+  fs.writeFileSync(unedited, '[Service]\n');
+  fs.utimesSync(unedited, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
   const toldDir = path.join(tmp, 'sup-data-dir-told-by-the-running-termd');
   const told = linux ? await liveTermd(toldDir) : undefined;
   // A termd that requires a credential: it tells the shim, whose own goes once the socket is shown to be the termd's.
@@ -1121,10 +1126,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   fs.writeFileSync(edited, '[Service]\n');
   // Edited after its termd started, and read since by a daemon-reload: newer than any process here.
   fs.utimesSync(edited, new Date(Date.now() + 600_000), new Date(Date.now() + 600_000));
-  // A unit file older than any process here, beside a drop-in edited since (the house's read of the 17 commits over our fixes, #22).
-  const unedited = path.join(tmp, 'unedited-termd.service');
-  fs.writeFileSync(unedited, '[Service]\n');
-  fs.utimesSync(unedited, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
+  // A drop-in edited since, beside the unit file made before any process here (the house's read of the 17 commits over our fixes, #22).
   const dropIn = path.join(tmp, 'termd.service.d-edited.conf');
   fs.writeFileSync(dropIn, '[Service]\n');
   fs.utimesSync(dropIn, new Date(Date.now() + 600_000), new Date(Date.now() + 600_000));
@@ -1132,6 +1134,15 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   const editedEnv = path.join(tmp, 'edited-termd.env');
   fs.writeFileSync(editedEnv, 'TSM_PORT=3101\n');
   fs.utimesSync(editedEnv, new Date(Date.now() + 600_000), new Date(Date.now() + 600_000));
+  // One replaced since its termd started by a copy that keeps the old file's times (cp -p, rsync -a): its mtime is older
+  // than the start, and only the inode's change says it was edited. Its unit otherwise names what its termd runs with, so
+  // nothing else says its next start differs: by mtime alone, a termd was started here (the house's review of
+  // bc4bc85..5d8ce0e, #22).
+  const keptEnv = path.join(tmp, 'kept-times-termd.env');
+  fs.writeFileSync(keptEnv, 'TSM_PORT=3101\n');
+  fs.utimesSync(keptEnv, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
+  // An optional environment file that is there, so that it may set what the unit's termd reads.
+  fs.writeFileSync(path.join(tmp, 'termd.env'), '');
   const cases: Case[] = [
     { name: 'shared-data-dir-with-spaces-in-argv', when: true, stub: (dataDir) => unitStub({ port: 3101, dataDir }), dataDir: spaced('argv'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup argv with spaces, which a termd for port \d+ started here would use too/ },
     { name: 'shared-data-dir-with-spaces-in-environment', when: true, stub: (dataDir) => unitStub({ port: 3101, env: { TSM_DATA_DIR: dataDir } }), dataDir: spaced('env'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup env with spaces, which a termd/ },
@@ -1194,8 +1205,8 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // The house's review of a8b6f28..4860d4c (#22 comment 6341260318), question 4: where the unit's text may have changed
     // since its running termd started, the unit's next start takes the text's port and data dir. A collision with either is
     // refused and said as the text's; compared with the running termd alone, a termd was started here on them.
-    { name: 'next-start-names-this-port', when: told !== undefined, stub: () => unitStub({ port, dataDir: '/srv/next-start', fragment: edited, mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+edited-termd\.service is newer than its start\), names port \d+ for its next start, which would find a termd started here on it: none is started here/ },
-    { name: 'next-start-names-this-data-dir', when: told !== undefined, stub: (dataDir) => unitStub({ port: 3101, dataDir, fragment: edited, mainPid: told!.pid }), expect: 'shared', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+edited-termd\.service is newer than its start\), names the data dir \S+ for its next start, which a termd for port \d+ started here would use too: none is started here/ },
+    { name: 'next-start-names-this-port', when: told !== undefined, stub: () => unitStub({ port, dataDir: '/srv/next-start', fragment: edited, mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+edited-termd\.service was changed after its start\), names port \d+ for its next start, which would find a termd started here on it: none is started here/ },
+    { name: 'next-start-names-this-data-dir', when: told !== undefined, stub: (dataDir) => unitStub({ port: 3101, dataDir, fragment: edited, mainPid: told!.pid }), expect: 'shared', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+edited-termd\.service was changed after its start\), names the data dir \S+ for its next start, which a termd for port \d+ started here would use too: none is started here/ },
     // A text that names another port than its running termd's has changed, though no file is newer and no reload is
     // pending (a drop-in removed and reloaded, a file copied with its times kept): compared only on that evidence, it
     // was not compared, and a termd was started on the port the unit's next start takes (a reviewer's read of the fixes for #22).
@@ -1206,9 +1217,15 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // file the next login reads: read as the next start's, it named what runs, and a start went ahead.
     { name: 'next-start-awaits-a-daemon-reload', when: told !== undefined, stub: () => unitStub({ port: 3101, dataDir: '/srv/next-start', needReload: true, mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(systemd says the unit needs a daemon-reload\), could not be read \(its file on disk awaits a daemon-reload, [^)]*\), so the port its next start takes is unknown: none is started here/ },
     // An environment file edited in place is read by the next start with no daemon-reload, and says nothing to systemd.
-    { name: 'next-start-environment-file-newer', when: told !== undefined, stub: () => unitStub({ port: 'none', dataDir: '/srv/next-start', envFiles: [`${editedEnv} (ignore_errors=no)`], mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+edited-termd\.env is newer than its start\), names no --port and reads EnvironmentFile=\S+edited-termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so the port its next start takes is unknown: none is started here/ },
+    { name: 'next-start-environment-file-newer', when: told !== undefined, stub: () => unitStub({ port: 'none', dataDir: '/srv/next-start', envFiles: [`${editedEnv} (ignore_errors=no)`], mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+edited-termd\.env was changed after its start\), names no --port and reads EnvironmentFile=\S+edited-termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so the port its next start takes is unknown: none is started here/ },
+    { name: 'next-start-environment-file-replaced-with-its-times-kept', when: told !== undefined, stub: () => unitStub({ port: 'none', dataDir: toldDir, envFiles: [`${keptEnv} (ignore_errors=no)`], mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+kept-times-termd\.env was changed after its start\), names no --port and reads EnvironmentFile=\S+kept-times-termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so the port its next start takes is unknown: none is started here/ },
+    // An optional environment file that is gone gives the next start nothing, as systemd skips it. Read as one that may
+    // set anything, the next start's port was unknown, nothing was compared, and a file removed since its termd started,
+    // which had given it its port, went unseen: a termd was started on the port the next start takes (the house's review
+    // of bc4bc85..5d8ce0e, #22).
+    { name: 'next-start-optional-environment-file-gone', when: told !== undefined, stub: () => unitStub({ port: 'none', env: { TSM_PORT: String(port) }, envFiles: [`${path.join(tmp, 'gone-termd.env')} (ignore_errors=yes)`], mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, read with the user manager's environment, differs from what its running termd was started with \(it names port \d+, which differs from its running termd's port \d+\), and names port \d+ for its next start, which would find a termd started here on it: none is started here/ },
     // The port the next start takes is known and free, its data dir is not: refused as unknown too (the house's read of 4860d4c..bc4bc85, #22).
-    { name: 'next-start-data-dir-unknown', when: told !== undefined, stub: () => unitStub({ port: 3101, envFiles: [`${editedEnv} (ignore_errors=no)`], mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+edited-termd\.env is newer than its start\), names no --data-dir and reads EnvironmentFile=\S+edited-termd\.env, which may set TSM_DATA_DIR, so the data dir its next start uses is unknown: none is started here/ },
+    { name: 'next-start-data-dir-unknown', when: told !== undefined, stub: () => unitStub({ port: 3101, envFiles: [`${editedEnv} (ignore_errors=no)`], mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+edited-termd\.env was changed after its start\), names no --data-dir and reads EnvironmentFile=\S+edited-termd\.env, which may set TSM_DATA_DIR, so the data dir its next start uses is unknown: none is started here/ },
     // Nothing says the text changed and it can't be read: the start goes ahead, and its log says the comparison wasn't made.
     { name: 'next-start-text-unread', when: told !== undefined, stub: () => unitStub({ port: 3101, dataDir: '/srv/next-start', managerFails: true, mainPid: told!.pid }), expect: 'start', says: /and the text its next start takes could not be read to compare \(systemctl --user show \(the user manager's environment, which the unit's termd inherits\) failed \(Failed to connect to bus: No medium found\), so the unit's port and data dir are unknown\): a termd for \d+ is started here/ },
     // A running termd that cannot be asked: its next start takes the manager's environment, not the one it started with.
@@ -1218,8 +1235,8 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     { name: 'data-dir-told-past-an-impostor-on-127-0-0-1', when: impostor, stub: () => unitStub({ port: 3101, dataDir: '/srv/edited-since', mainPid: v6!.pid }), dataDir: v6Dir, expect: 'shared', says: /the systemd user unit termd \(its port and data dir told by its running termd, pid \d+\) serves port \d+ out of the data dir \S+sup-data-dir-told-past-an-impostor-on-127-0-0-1, which a termd for port \d+ started here would use too/ },
     // One that cannot be asked leaves the text, and the note says when the text may have changed since it started.
     { name: 'running-unit-needs-a-daemon-reload', when: linux, stub: (dataDir) => unitStub({ port: 3101, needReload: true, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /\(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"; the unit's text may have changed since that termd started: systemd says the unit needs a daemon-reload\) serves port 3101 out of the data dir/ },
-    { name: 'running-unit-file-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: edited, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+edited-termd\.service is newer than its start\) serves port 3101 out of the data dir/ },
-    { name: 'running-unit-drop-in-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: unedited, dropIn, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+termd\.service\.d-edited\.conf is newer than its start\) serves port 3101 out of the data dir/ },
+    { name: 'running-unit-file-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: edited, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+edited-termd\.service was changed after its start\) serves port 3101 out of the data dir/ },
+    { name: 'running-unit-drop-in-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: unedited, dropIn, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+termd\.service\.d-edited\.conf was changed after its start\) serves port 3101 out of the data dir/ },
     // This user's live termd whose environment reads EACCES: unknown, not the manager's (which here names the shim's own data dir).
     { name: 'running-termd-alive-and-unreadable', when: sealed !== undefined, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir }, mainPid: sealed! }), expect: 'unknown', says: /the systemd user unit termd's running termd, pid \d+, is this user's, and its environment could not be read \(EACCES\); its running termd could not be asked: .*, so its port and data dir are unknown/ },
     // An env prefix is environment, as env applies it: read as arguments, these units were $HOME/.tsm.

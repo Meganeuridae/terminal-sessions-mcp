@@ -843,7 +843,7 @@ test("a unit's data dir is resolved from the HOME its environment gives termd, w
 });
 
 test("a running unit's text that names another port or data dir than its running termd's has changed, though systemd and the files say nothing: its next start is compared too (a reviewer's read of the fixes for #22)", () => {
-  // Read only when a daemon-reload was pending or a file was newer than termd's start, the text was never compared here.
+  // Read only when a daemon-reload was pending or a file was changed after termd's start, the text was never compared here.
   const running = { port: '4100', dataDir: '/srv/run' };
   const read = (argv: string[], manager = 'HOME=/home/a') => {
     const u = systemctlUnit(execStart(argv), '', { manager });
@@ -851,7 +851,7 @@ test("a running unit's text that names another port or data dir than its running
     return u;
   };
   // A drop-in that moved termd to port 4100, removed and then reloaded: the text names the unit's own port again,
-  // and no file is newer than termd's start (a file copied with its times kept, or a package's install, reads the same).
+  // and no file was changed after termd's start (a manager environment set since reads the same).
   assert.deepEqual(nextStart(running, read(['--port', '3101', '--data-dir', '/srv/run']), ''), {
     why: "it names port 3101, which differs from its running termd's port 4100",
     certain: true,

@@ -457,7 +457,7 @@ export function sameDir(a: string, b: string): boolean {
  * What a unit's next start takes beside its running termd, to be compared with a start here as the running
  * termd's port and data dir are: the port and data dir the unit's text gives now, and why the text is taken
  * for one that may differ from what the running termd was started with. `changed` is what systemd or the
- * files say (a daemon-reload pending, a unit file or drop-in newer than the termd's start); without it, a
+ * files say (a daemon-reload pending, a unit file or drop-in changed after the termd's start); without it, a
  * text that names another port or data dir than the running termd's has changed all the same, and says so
  * (`certain`). Read only on that evidence, a drop-in removed and then reloaded, or a text changed with no
  * newer file (a file copied with its times kept, a package's install, a manager environment set or imported

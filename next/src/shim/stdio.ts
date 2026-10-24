@@ -404,7 +404,10 @@ const unshaped = (prop: (k: string) => string): string =>
 async function managerUnit(r: { out: string }, prop: (k: string) => string): Promise<{ unit: UnitText } | { why: string }> {
   const m = await ask('systemctl', ['--user', 'show', '--property=Environment']);
   if (m === 'timeout' || m === 'missing' || 'failed' in m) return { why: `systemctl --user show (the user manager's environment, which the unit's termd inherits) ${m === 'timeout' ? `did not answer within ${SUPERVISOR_CHECK_MS} ms` : `failed (${m === 'missing' ? 'not found' : m.failed})`}, so the unit's port and data dir are unknown` };
-  const files = [...r.out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim());
+  // An optional file that is not there gives the start nothing, as systemd skips it: named, it made every value the
+  // unit's environment gives unknown, so a file removed since the unit's termd started, which had set its port, left
+  // nothing to compare (the house's review of bc4bc85..5d8ce0e, #22).
+  const files = [...r.out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim()).filter((f) => !absentOptional(f));
   const unit = systemctlUnit(prop('ExecStart'), prop('Environment'), { manager: /^Environment=(.*)$/m.exec(m.out)?.[1]?.trim() ?? '', files, unset: prop('UnsetEnvironment') });
   return unit ? { unit } : { why: unshaped(prop) };
 }
@@ -431,14 +434,35 @@ async function withNext(sup: Supervisor, r: { out: string }, prop: (k: string) =
   return 'why' in text ? { ...sup, nextUnread: text.why } : sup;
 }
 
+/**
+ * Whether an EnvironmentFiles= line, as systemctl shows it, is an optional (`-`) file that is not there, which a start
+ * skips. A glob is not looked up here, and a file that cannot be looked up for another reason may be there.
+ */
+function absentOptional(line: string): boolean {
+  const optional = / \(ignore_errors=yes\)$/.exec(line);
+  if (!optional) return false;
+  const file = line.slice(0, optional.index);
+  if (/[*?[]/.test(file)) return false;
+  try {
+    fs.statSync(file);
+    return false;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR';
+  }
+}
+
 /** The unit's EnvironmentFiles= paths, one a line as systemctl shows them, without their ` (ignore_errors=…)`. */
 const envFilesOf = (out: string): string[] => [...out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim().replace(/ \(ignore_errors=\w+\)$/, ''));
 
 /**
  * Why the unit's text may not be what its running termd was started with: systemd says it needs a
- * daemon-reload (an edit not yet read), or its file, a drop-in or an environment file is newer than the
+ * daemon-reload (an edit not yet read), or its file, a drop-in or an environment file was changed after the
  * termd's start (an edit read since, or read at the next start); empty when none. A start that cannot be
- * read is said too.
+ * read is said too. A file's change is the later of its mtime and its inode's change (ctime): a replacement
+ * that keeps the old file's times (cp -p, rsync -a, a rename of an older file) sets mtime back, which went
+ * unseen, while the kernel sets ctime at each change and a copy cannot set it back. A chmod or chown counts
+ * as a change too, which errs towards not starting a termd here (the house's review of bc4bc85..5d8ce0e, #22).
  */
 function unitChanged(pid: number, prop: (k: string) => string, out: string): string {
   if (prop('NeedDaemonReload') === 'yes') return 'systemd says the unit needs a daemon-reload';
@@ -450,13 +474,14 @@ function unitChanged(pid: number, prop: (k: string) => string, out: string): str
   const started = processInfo(pid);
   if (!started) return 'when it started cannot be read';
   for (const file of files) {
-    let mtime: number;
+    let changedMs: number;
     try {
-      mtime = fs.statSync(file).mtimeMs;
+      const st = fs.statSync(file);
+      changedMs = Math.max(st.mtimeMs, st.ctimeMs);
     } catch {
       continue;
     }
-    if (mtime > started.startMs + (started.startSlackMs ?? 1000)) return `${file} is newer than its start`;
+    if (changedMs > started.startMs + (started.startSlackMs ?? 1000)) return `${file} was changed after its start`;
   }
   return '';
 }
