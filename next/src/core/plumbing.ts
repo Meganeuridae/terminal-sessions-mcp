@@ -148,10 +148,10 @@ const EVALUATING_PID = `"$(exec /bin/sh -c 'echo $PPID')"`;
  * token the Run's own line set in that shell (its nonce again). A nested shell the Run started
  * prints its own pid and an empty token: pids alone repeat across PID namespaces (`docker run -it
  * … sh` is pid 1), the variable does not travel (the house's read of 39787b3, #22). The pid is the
- * evaluating process's (EVALUATING_PID), as the marker probe's is: a subshell keeps both the shell's
- * `$$` and the unexported token, and with job control off a subshell of the Run that evaluated what it
- * read answered as the declared shell, so the Run ended cancelled and the next Run ran inside the
- * subshell (the house's review of a8b6f28..4860d4c, PR #22, by run with a declared dash). Its child is
+ * evaluating process's (INLINE_PID), as the marker probe's is, but for the fallback below: a
+ * subshell keeps both the shell's `$$` and the unexported token, and with job control off a subshell
+ * of the Run that evaluated what it read answered as the declared shell, so the Run ended cancelled
+ * and the next Run ran inside the subshell (the house's review of a8b6f28..4860d4c, PR #22, by run with a declared dash). Its child is
  * the declared shell's `/bin/sh`, on that shell's host, which may be a container or another machine:
  * where it has none, the pid prints empty (the error goes to /dev/null), the answer is no probe mark,
  * and a cancel there cannot end by the probe. bash's restricted mode (rbash, as a jump host may
