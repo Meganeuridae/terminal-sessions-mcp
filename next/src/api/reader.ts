@@ -950,6 +950,13 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
   let end = k;
   let cut: Pos | undefined;
   let held = false;
+  const upTo = (c: Pos | undefined): Piece[] => (c ? [...pieces.slice(0, c.j), { ...out(c.j)!, data: out(c.j)!.data.slice(0, c.at) }] : pieces.slice(0, end));
+  // The page ends before the earliest control sequence any source leaves open at its end, and again until none is: a
+  // cut moved back before one source's sequence can leave open another source's, which an event after the cut ended.
+  const beforeOpen = (c: Pos | undefined): Pos | undefined => {
+    for (let o = openSequence(upTo(c)); o; o = openSequence(upTo(c))) c = o;
+    return c;
+  };
   if (k < pieces.length) {
     const crossing = out(k)!;
     const room = headIndex(crossing.data, budget - used);
@@ -979,6 +986,10 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
       else cut = safe; // the page starts with a control sequence longer than it: below
     }
     if (cut === undefined && end === boundary + 1) while (end < pieces.length && pieces[end]!.kind === 'gap') end++;
+    // Each rule above keeps whole the sequences of the source it cuts. Another source can have one open there, its rest
+    // in an event the page doesn't take, which the next page would begin as text: a pty line's end, chosen between a
+    // Run's `ESC [ 3` and its `1mRED`, showed `1mRED` (the house's review of bc4bc85..5d8ce0e, PR #22, I6).
+    cut = beforeOpen(cut);
     // Every page makes progress. One that would end before its first output starts with a
     // control sequence longer than the page: it takes that sequence whole, then its line to
     // the line end or the budget, so no page starts inside a sequence and none is only one.
@@ -997,12 +1008,27 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
         const n3 = lastEndBefore(lineEnds(fwd.text.slice(0, e + after)), e + after);
         const at = n3 >= e ? n3 + 1 : Math.max(e + 1, e + safeCut(fwd.text.slice(e), after));
         cut = throughLineEnd(pieces, fwd.locate(Math.min(at, fwd.text.length)));
+        // Another source's sequence begun before that cut is taken whole too, as far as it goes: a cut before it would
+        // leave this one open. Two Runs' sequences, each split across events, interleaved so (the house's review of
+        // bc4bc85..5d8ce0e, PR #22, I6).
+        for (let o = openSequence(upTo(cut)); o; o = openSequence(upTo(cut))) {
+          const src = sourceForward(pieces, o.j);
+          const e2 = sequenceEnd(src.text, o.at);
+          if (e2 !== undefined) {
+            cut = src.locate(e2);
+            continue;
+          }
+          const hole = pieces.findIndex((q, i) => i > o!.j && q.kind === 'gap');
+          end = hole === -1 ? pieces.length : hole + 1;
+          cut = undefined;
+          break;
+        }
       }
     }
   } else if (hold) {
     // Only the sequence waits when it is in the last output; an earlier source's open sequence defers
     // visible output after it too, which is `more`.
-    cut = openSequence(pieces);
+    cut = beforeOpen(undefined);
     held = cut !== undefined && !pieces.some((q, i) => i > cut!.j && q.kind === 'out');
   }
   if (cut && cut.at >= (out(cut.j)?.data.length ?? 0)) {

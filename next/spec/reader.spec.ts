@@ -2009,3 +2009,59 @@ test('a raw page whose retention hole trails every event it holds is that hole\'
   const r = await readJournal(src, { since: 0, until: 3, as: 'raw', maxBytes: 1 << 20 }, { resultBytes: 1 << 20 });
   assert.equal(r.text, '\n[… 3 journal events missing (seq 1–3: past retention) …]\n');
 });
+
+// ───────────── the house's review of bc4bc85..5d8ce0e (#22) ─────────────
+
+test("a page moved back before one Run's open control sequence leaves no other Run's open either (the house's review of bc4bc85..5d8ce0e, PR #22, I6)", async () => {
+  // Two Runs' sequences each split across events and interleaved, with a pty line between: a cut before one sequence
+  // left open the other, whose end the event after the cut held, and the page that starts with a sequence takes the
+  // other whole too.
+  for (const r2First of [true, false]) {
+    const src = source({ cols: 2000 });
+    startRun(src.journal, 'r1');
+    startRun(src.journal, 'r2');
+    out(src.journal, 'x\x1b[3', 'stdout', 'r1');
+    if (r2First) out(src.journal, 'y\x1b[4', 'stdout', 'r2');
+    out(src.journal, `${'P'.repeat(1000)}\n`);
+    if (!r2First) out(src.journal, 'y\x1b[4', 'stdout', 'r2');
+    out(src.journal, '1mRED\x1b[0m\n', 'stdout', 'r1');
+    out(src.journal, '2mBLUE\x1b[0m\n', 'stdout', 'r2');
+    out(src.journal, `${'Q'.repeat(600)}\n`);
+    const { text, pages } = await readAll(src, { since: 0, maxBytes: 1024 });
+    const shown = `${r2First ? 'r2 first' : 'pty first'}: ${JSON.stringify(pages.map((p) => p.text))}`;
+    assert.doesNotMatch(text, /1mRED|2mBLUE|\[3|\[4/, shown);
+    assert.match(text, /RED/, shown);
+    assert.match(text, /BLUE/, shown);
+  }
+});
+
+test("a page that holds everything ends before every Run's open control sequence, not only the earliest left open (the house's review of bc4bc85..5d8ce0e, PR #22, I6)", async () => {
+  const src = source();
+  startRun(src.journal, 'r1');
+  startRun(src.journal, 'r2');
+  out(src.journal, 'x\x1b[3', 'stdout', 'r1');
+  out(src.journal, 'y\x1b[4', 'stdout', 'r2');
+  out(src.journal, '1mRED\x1b[0m\n', 'stdout', 'r1');
+  const p1 = await readJournal(src, { since: 0 }, { resultBytes: 16384 });
+  out(src.journal, '2mBLUE\x1b[0m\n', 'stdout', 'r2');
+  const p2 = await readJournal(src, { since: p1.nextCursor, ...(p1.nextOffset !== undefined ? { offset: p1.nextOffset } : {}) }, { resultBytes: 16384 });
+  const shown = JSON.stringify([p1.text, p2.text]);
+  assert.doesNotMatch(`${p1.text}${p2.text}`, /1mRED|2mBLUE/, shown);
+  assert.match(`${p1.text}${p2.text}`, /RED[^]*BLUE|BLUE[^]*RED/, shown);
+});
+
+test("a page cut at one source's line end never leaves another source's control sequence open (the house's review of bc4bc85..5d8ce0e, PR #22, I6)", async () => {
+  // A Run's `ESC [ 3` waits for its `1mRED` in a later event; the pty's line between ends where the budget wants a cut.
+  const src = source({ cols: 2000 });
+  startRun(src.journal, 'r1');
+  out(src.journal, 'x\x1b[3', 'stdout', 'r1');
+  out(src.journal, `${'P'.repeat(1000)}\n`);
+  out(src.journal, '1mRED\x1b[0m\n', 'stdout', 'r1');
+  out(src.journal, `${'Q'.repeat(600)}\n`);
+  out(src.journal, `${'R'.repeat(600)}\n`);
+  const { text, pages } = await readAll(src, { since: 0, maxBytes: 1024 });
+  assert.ok(pages.length > 1, 'the budget cuts the range');
+  const shown = JSON.stringify(pages.map((p) => p.text));
+  assert.doesNotMatch(text, /1mRED|\[3/, shown);
+  assert.match(text, /RED/, shown);
+});
