@@ -165,6 +165,10 @@ function health(host: string, port: number, pid: number, o: AskOptions, ms: numb
  * few thousand connections a second). Rows with one inode are one socket; the refusal, for a connection two
  * sockets claim, stands only for distinct inodes, and a row left out is met by the next try (two shim tests
  * hit the refusal in our fork's run of e8b55ad on Ubuntu). Tests read the tables through `o.read`.
+ *
+ * A table that cannot be read shows no socket. Where the last try could read no table, the answer says
+ * so: said as a connection not found accepted, it told the shim's log what was not known (the house's review
+ * of bc4bc85..5d8ce0e, #22).
  */
 export interface ConnectionOfOptions {
   /** The text of a /proc/net table (`/proc/net/tcp` or `tcp6`), or a throw where it cannot be read; the file itself by default. */
@@ -185,16 +189,22 @@ export async function connectionOf(socket: net.Socket, pid: number, o: Connectio
       ];
   if (wanted.some((w) => w.local === undefined || w.remote === undefined)) return `the connection's addresses are not read here (${remoteAddress}, ${localAddress})`;
   const giveUp = clocks.monotonic() + ACCEPT_WAIT_MS;
+  // Why the last try read no table, when it read none.
+  let unread: string | undefined;
   while (!socket.destroyed) {
     // The sockets listed as the server side, by inode: a torn read lists one socket in more than one row.
     const inodes = new Set<string>();
+    let listed = false;
+    let failed: string | undefined;
     for (const w of wanted) {
       let text: string;
       try {
         text = read(w.table);
-      } catch {
+      } catch (e) {
+        failed ??= `${w.table}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`;
         continue;
       }
+      listed = true;
       for (const line of text.split('\n').slice(1)) {
         const f = line.trim().split(/\s+/);
         // sl local_address rem_address st … uid timeout inode; 01 is ESTABLISHED. A row with inode 0 is the
@@ -202,6 +212,7 @@ export async function connectionOf(socket: net.Socket, pid: number, o: Connectio
         if (f[1] === w.local && f[2] === w.remote && f[3] === '01' && f[9] !== undefined && f[9] !== '0') inodes.add(f[9]);
       }
     }
+    unread = listed ? undefined : failed;
     if (inodes.size > 1) return `more than one socket is the other end of this connection on port ${port}`;
     const [inode] = inodes;
     if (inode !== undefined) {
@@ -223,7 +234,7 @@ export async function connectionOf(socket: net.Socket, pid: number, o: Connectio
     if (clocks.monotonic() >= giveUp) break;
     await new Promise((r) => setTimeout(r, 10));
   }
-  return `the socket that answered on port ${port} was not found accepted`;
+  return unread !== undefined ? `whose the socket on port ${port} is cannot be read (${unread})` : `the socket that answered on port ${port} was not found accepted`;
 }
 
 /**

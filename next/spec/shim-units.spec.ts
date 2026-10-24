@@ -691,6 +691,40 @@ test("a read of /proc/net/tcp torn by sockets changing under it lists the connec
   }
 });
 
+test("a connection no read of the tables lists is given up at the lookup's own deadline, and tables that cannot be read show no socket and say so (the house's review of bc4bc85..5d8ce0e, #22)", { skip: process.platform !== 'linux' && 'Linux shows whose a socket is' }, async () => {
+  // No case reached the give-up: a lookup that never gave up would run for as long as its socket stood, and in the ask
+  // that is the rest of the deadline the next address is tried with. Tables that could not be read were said as a
+  // connection not found accepted, which is not known.
+  const server = net.createServer(() => {});
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as { port: number }).port;
+  const socket = await new Promise<net.Socket>((resolve, reject) => {
+    const c = net.connect({ host: '127.0.0.1', port });
+    c.once('connect', () => resolve(c));
+    c.once('error', reject);
+  });
+  // A lookup that never gives up ends when its socket does: closed here well past the deadline, so that it fails, not hangs.
+  const stop = setTimeout(() => socket.destroy(), 20_000);
+  try {
+    let reads = 0;
+    const headerOnly = (table: string) => {
+      if (table === '/proc/net/tcp') reads++;
+      return '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n';
+    };
+    assert.equal(await connectionOf(socket, process.pid, { read: headerOnly }), `the socket that answered on port ${port} was not found accepted`);
+    assert.ok(!socket.destroyed, 'given up at its own deadline, not when its socket closed');
+    assert.ok(reads > 1, `looked up again before giving up (${reads} reads)`);
+    const denied = () => {
+      throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    };
+    assert.equal(await connectionOf(socket, process.pid, { read: denied }), `whose the socket on port ${port} is cannot be read (/proc/net/tcp: EACCES)`);
+  } finally {
+    clearTimeout(stop);
+    socket.destroy();
+    await new Promise((r) => server.close(r));
+  }
+});
+
 test("an answer counts only from the termd's own socket: a listener of another process that echoes its pid is not asked, and is sent no credential (a reviewer's read of the fixes for #22)", async () => {
   if (process.platform !== 'linux') {
     // Whose a socket is cannot be shown here, so no answer is taken.
