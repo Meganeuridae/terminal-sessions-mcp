@@ -29,9 +29,12 @@
  * - A quiet prompt pairs with the other readings' open lines that hold bytes of its own, all at once: the read's with
  *   every pipe's open line written to since the read's line began, begun inside it or before it, and a pipe's with the
  *   read's line begun no later than the pipe's last write, and through it with the other pipe's. So stdout's `server
- *   ready` left quiet, then stderr's `FATAL` left
- *   quiet, is one line, the FATAL counted once as it is when stderr's LF ends both, not twice (an independent read of
- *   the fixes for PR #22 comment 6357989601). It pairs too with the other reading's line that began where it did and
+ *   ready` left quiet, then stderr's `FATAL` left quiet, is one line, the FATAL counted once as it is when stderr's LF
+ *   ends both, not twice (an independent read of the fixes for PR #22 comment 6357989601). The one shape the two paths
+ *   read apart: two pipes each writing a fail line into one read line, stderr's `FATAL a` then stdout's `FATAL b`, is
+ *   one fail when both are left quiet (the group marks stdout's place through the read's `FATAL aFATAL b`) and two when
+ *   each ends at its own LF, by the first rule; the status is unhealthy either way, and only `repeats` and the latest
+ *   evidence differ. It pairs too with the other reading's line that began where it did and
  *   already ended when the prompt is offered: stderr's `Password: ` that stdout's LF ended in the read counts once. So
  *   stdout's `ERROR a`, left quiet before its LF, is a prompt begun where the read's `ERROR aERROR b` began, and the
  *   first rule's two lines are one (the house's review of a8b6f28..4860d4c, #22, comment 6341260318, question 6).
