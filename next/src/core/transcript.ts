@@ -485,8 +485,9 @@ class Projector {
   /**
    * Decide what the region's rows say and start the account afresh: a row the terminal alone still shows is gone from
    * the projection when one it scrolled out ahead of the terminal held text (`ahead`). At the range's end, and where
-   * the terminal's screen and the projection's part: the margins changed, or the screen erased or reset, after which
-   * such a row never comes back the way the program's own scrolls bring the two screens together again.
+   * the terminal's screen and the projection's part: the margins changed, the screen erased or reset, or the alternate
+   * screen entered over a normal screen the projection rebuilt (onAltEnter), after which such a row never comes back
+   * the way the program's own scrolls bring the two screens together again.
    */
   private settle(): void {
     if (this.ahead.includes(true)) this.lost = true;
@@ -829,6 +830,12 @@ class Projector {
       this.out.close();
     }
     this.clearToCursorRow();
+    // The projection's normal screen is rebuilt from the cursor's row, while the terminal's stays as it was under the
+    // alternate screen: the account's rows no longer match it, and what the region showed is decided on the rows kept
+    // here (settle), as at a full erase. Kept, it read later scrolls against moved rows: a hole that owed a row, then
+    // the alternate screen and six of the program's lines, reported a loss where nothing went (the house's review of
+    // bc4bc85..5d8ce0e, PR #22, I4).
+    this.settle();
     return false;
   }
 

@@ -1008,6 +1008,26 @@ test('what a region’s rows say is decided where they leave the screen and at t
   assert.deepEqual(await read([pty(region), run('L1\nL2\n'), pty(body(4, '\r\n'))]), [['Y', 'Z', 'W'], false, undefined], 'the pty scrolled them out too');
 });
 
+test('entering the alternate screen decides what the region showed, and no later scroll is read against the rows the projection rebuilt (the house’s review of bc4bc85..5d8ce0e, PR #22, I4)', async () => {
+  // The projection keeps the normal screen above the cursor at the alternate screen's entry and clears it (rule 5), so
+  // its rows move up while the terminal's stay. The account kept indexing them by their old places: a hole that took no
+  // row, then the alternate screen and six or seven of the program's lines, reported a loss where nothing went.
+  const read = async (chunks: ProjectChunk[]) => {
+    const p = await project(chunks, { cols: 20, rows: 10 });
+    return [p.truncated, p.lost];
+  };
+  const alt = '\x1b[?1049halt\x1b[?1049l';
+  const body = (n: number) => ['X', 'Y', 'Z', 'W', 'V', 'U', 'T', 'S'].slice(0, n).map((l) => `${l}\r\n`).join('');
+  const short = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4';
+  const region = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4\r\nr5\r\nr6';
+  for (let n = 0; n <= 8; n++) {
+    assert.deepEqual(await read([`${short}${alt}${body(n)}`]), [false, undefined], `the terminal alone, ${n} lines`);
+    assert.deepEqual(await read([short, { hole: true }, `${alt}${body(n)}`]), [false, undefined], `a row owed, nothing taken, ${n} lines`);
+    // The hole's line end took `r3` while the terminal showed it, and the screen kept at the entry lacks it.
+    assert.deepEqual(await read([region, { hole: true }, `${alt}${body(n)}`]), [true, true], `r3 lacking, ${n} lines`);
+  }
+});
+
 test('a cursor the program saves and restores is as far ahead of the terminal’s as when it was saved (the house’s review of bc4bc85..5d8ce0e, PR #22, I3)', async () => {
   // A hole's line end inside the region puts the projection's cursor a row ahead of the terminal's. A restore was read as
   // a set to one row, so a cursor saved and at once restored, which moves neither, made the program's next scroll the
