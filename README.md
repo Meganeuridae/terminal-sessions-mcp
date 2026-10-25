@@ -460,7 +460,7 @@ npx ts-node examples/service-management.ts
 
 ## Requirements
 
-- **Node.js** 20.19 or later within 20.x, or 22.12 or later within 22.x, or 24.x (`engines`: `>=20.19.0 <21 || >=22.12.0 <25.0.0`; `session-cli` requires an ES-module-only dependency, which `require` loads from those versions on; Node 21 and 22.0 to 22.11 are out; Node 25+ not yet supported due to node-pty compatibility)
+- **Node.js** 22.12 or later within 22.x, or 24.x (`engines`: `>=22.12.0 <25.0.0`; Node 20 reached its end of life on 2026-04-30; `session-cli` requires an ES-module-only dependency, which `require` loads from 22.12 on, and Puppeteer 25 asks for 22.12 too; Node 21 and 22.0 to 22.11 are out; Node 25+ not yet supported due to node-pty compatibility)
 - **Headless Chrome** (via Puppeteer) for screenshots
 - **Modern browser** for web GUI (Chrome, Firefox, Safari, Edge)
 

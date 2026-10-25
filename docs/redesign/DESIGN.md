@@ -1238,9 +1238,9 @@ addition; nothing about them touches the live PTY.
 
 ## 15. Quality bar
 
-- TypeScript strict, ESM, Node ≥ 20.19 (`engines` says `>=20.19.0 <21 || >=22.12.0 <25.0.0`: 20.19 is the
-  earliest Node 20 that loads the package's dependencies, Node 18 has reached its end of
-  life, and 21 and 22 before 22.12 are left out because the 1.x session-cli cannot run on them). No `any` at boundaries. Every operation validated
+- TypeScript strict, ESM, Node ≥ 22.12 (`engines` says `>=22.12.0 <25.0.0`: Node 20 reached its end
+  of life on 2026-04-30, 22.12 is the earliest Node 22 whose `require` loads an ES module, which the
+  1.x session-cli needs, and puppeteer 25 asks for it too; 21 and 22 before 22.12 are left out). No `any` at boundaries. Every operation validated
   against its schema before dispatch. Errors are typed with codes. A tool's failure reaches
   hosts as MCP carries one: an `isError` result whose text opens with the code
   (`session_not_found: …`) and carries no envelope; a protocol failure is a JSON-RPC error.

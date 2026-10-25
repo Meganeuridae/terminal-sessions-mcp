@@ -52,7 +52,7 @@ later release (`next/README.md`, "Upgrading from 1.x").
 ### Changed
 
 - `/health` reports `endpointElapsedMs` instead of `uptimeMs`. The value measures the endpoint's life after recovery, not process uptime.
-- Node 20.19 or later within 20, or 22.12 or later (`engines`: `>=20.19.0 <21 || >=22.12.0 <25.0.0`): the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 20.19 on Node 20 and from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out; `@animalabs/mcpl-core` asks for 20; Node 18 reached its end of life.
+- Node 22.12 or later (`engines`: `>=22.12.0 <25.0.0`), and `puppeteer` `^25.16.0` (from `^24.29.1`): Node 20 reached its end of life on 2026-04-30, and Puppeteer 25, which the 1.x screenshot path and 2.0's GUI tests use, asks for 22.12; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
 - `npm run build` compiles both trees; `npm test` runs 1.x's suite and `npm run test:next` 2.0's.
 - The `@xterm` packages and `ws` are pinned at the versions 2.0 uses (`@xterm/xterm` 6.0.0,
   `@xterm/addon-fit` 0.11.0, `@xterm/addon-web-links` 0.12.0, `ws` 8.21.3); the 1.x GUI loads
