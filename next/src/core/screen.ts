@@ -418,11 +418,7 @@ export class Screen {
     return snap;
   }
 
-  /**
-   * The text of the cells left of the cursor on its row, as the GUI's page reads a prompt there.
-   * A wide character takes two cells, so a snapshot's row cut at the cursor's column would also take
-   * what the row holds to the cursor's right.
-   */
+  /** The text of the cells left of the cursor on its row. */
   textBeforeCursor(): string {
     const buf = this.term.buffer.active;
     return buf.getLine(buf.baseY + buf.cursorY)?.translateToString(true, 0, buf.cursorX) ?? '';

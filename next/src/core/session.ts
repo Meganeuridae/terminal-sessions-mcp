@@ -3019,8 +3019,7 @@ export class Session {
     // The last line printed (the screen may not have parsed it yet when an agent answers at once)…
     const last = stripEscapes(this.outputTail).text.split(/\n/).pop() ?? '';
     if (looksLikeSecretPrompt(last)) return true;
-    // …or the text of the cells left of the cursor (a full-screen prompt such as pinentry's), read by
-    // cells as the page reads it, so a wide character before the prompt takes in nothing to its right.
+    // …or the text left of the cursor (a full-screen prompt such as pinentry's).
     return looksLikeSecretPrompt(this.screen.textBeforeCursor());
   }
 

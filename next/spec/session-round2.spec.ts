@@ -1572,10 +1572,6 @@ test('m2-2: the secret-prompt test on realistic prompts (false positives measure
 });
 
 test('m2-2: a prompt drawn on the screen is read by the cells left of the cursor, so a wide character before it pulls in no text from its right', async () => {
-  // A full-screen prompt drawn over a row that held other text, then a status line elsewhere, then the cursor back
-  // after the prompt: the last line printed ends with the status line, so only the screen's read can see the prompt.
-  // '認証' takes two cells a character, so the row's string read to the cursor's column would take two characters
-  // of what the row held before. The first case, one cell a character, is the control.
   for (const [prompt, cursorCol] of [['Old Password: ', 15], ['認証 Password: ', 16]] as const) {
     const draw = '\x1b[10;1H' + 'x'.repeat(30) + '\x1b[10;1H' + prompt + '\x1b[30;1Hstatus: waiting' + `\x1b[10;${cursorCol}H`;
     assert.equal(looksLikeSecretPrompt(draw.replace(/\x1b\[[0-9;]*H/g, '')), false, 'premise: the last line printed is no prompt');
