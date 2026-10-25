@@ -9,8 +9,8 @@
  * The answer counts only from the termd itself: before a byte is sent, the connection's other end is
  * shown to be the pid's (Linux's /proc), since its pid is public and another process may listen on its
  * port, bound to 127.0.0.1 beside a termd on ::1. Only then does the shim's own credential go, so a
- * termd that requires one tells the shim too; an unproven listener never sees it. Where whose the socket
- * is cannot be shown, termd is not asked, and the shim reads the unit's text.
+ * termd that requires one tells the shim too; an unproven listener never sees it. Where who holds the
+ * socket cannot be shown, termd is not asked, and the shim reads the unit's text.
  */
 import * as fs from 'node:fs';
 import * as http from 'node:http';
@@ -166,9 +166,11 @@ function health(host: string, port: number, pid: number, o: AskOptions, ms: numb
  * sockets claim, stands only for distinct inodes, and a row left out is met by the next try (two shim tests
  * hit the refusal in our fork's run of e8b55ad on Ubuntu). Tests read the tables through `o.read`.
  *
- * A table that cannot be read shows no socket. Where the last try could read no table, the answer says
- * so: said as a connection not found accepted, it told the shim's log what was not known (the house's review
- * of bc4bc85..5d8ce0e, #22).
+ * A table that cannot be read shows no socket. Where the last try found no row and could not read a
+ * table that may list the connection, the answer says so: said as a connection not found accepted, it told
+ * the shim's log what was not known (the house's review of bc4bc85..5d8ce0e, #22). An IPv4 connection may
+ * be listed in either table (tcp6 lists a dual-stack listener's mapped addresses), so one table read
+ * without the row says nothing of the other.
  */
 export interface ConnectionOfOptions {
   /** The text of a /proc/net table (`/proc/net/tcp` or `tcp6`), or a throw where it cannot be read; the file itself by default. */
@@ -189,12 +191,11 @@ export async function connectionOf(socket: net.Socket, pid: number, o: Connectio
       ];
   if (wanted.some((w) => w.local === undefined || w.remote === undefined)) return `the connection's addresses are not read here (${remoteAddress}, ${localAddress})`;
   const giveUp = clocks.monotonic() + ACCEPT_WAIT_MS;
-  // Why the last try read no table, when it read none.
+  // Why the last try could not read a table that may list the connection, when it could not.
   let unread: string | undefined;
   while (!socket.destroyed) {
     // The sockets listed as the server side, by inode: a torn read lists one socket in more than one row.
     const inodes = new Set<string>();
-    let listed = false;
     let failed: string | undefined;
     for (const w of wanted) {
       let text: string;
@@ -204,7 +205,6 @@ export async function connectionOf(socket: net.Socket, pid: number, o: Connectio
         failed ??= `${w.table}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`;
         continue;
       }
-      listed = true;
       for (const line of text.split('\n').slice(1)) {
         const f = line.trim().split(/\s+/);
         // sl local_address rem_address st … uid timeout inode; 01 is ESTABLISHED. A row with inode 0 is the
@@ -212,7 +212,7 @@ export async function connectionOf(socket: net.Socket, pid: number, o: Connectio
         if (f[1] === w.local && f[2] === w.remote && f[3] === '01' && f[9] !== undefined && f[9] !== '0') inodes.add(f[9]);
       }
     }
-    unread = listed ? undefined : failed;
+    unread = failed;
     if (inodes.size > 1) return `more than one socket is the other end of this connection on port ${port}`;
     const [inode] = inodes;
     if (inode !== undefined) {
@@ -220,7 +220,7 @@ export async function connectionOf(socket: net.Socket, pid: number, o: Connectio
       try {
         fds = fs.readdirSync(`/proc/${pid}/fd`);
       } catch (e) {
-        return `whose the socket on port ${port} is cannot be read (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`;
+        return `who holds the socket on port ${port} cannot be read (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`;
       }
       const owned = fds.some((fd) => {
         try {
@@ -234,7 +234,7 @@ export async function connectionOf(socket: net.Socket, pid: number, o: Connectio
     if (clocks.monotonic() >= giveUp) break;
     await new Promise((r) => setTimeout(r, 10));
   }
-  return unread !== undefined ? `whose the socket on port ${port} is cannot be read (${unread})` : `the socket that answered on port ${port} was not found accepted`;
+  return unread !== undefined ? `who holds the socket on port ${port} cannot be read (${unread})` : `the socket that answered on port ${port} was not found accepted`;
 }
 
 /**

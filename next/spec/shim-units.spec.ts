@@ -717,7 +717,18 @@ test("a connection no read of the tables lists is given up at the lookup's own d
     const denied = () => {
       throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
     };
-    assert.equal(await connectionOf(socket, process.pid, { read: denied }), `whose the socket on port ${port} is cannot be read (/proc/net/tcp: EACCES)`);
+    assert.equal(await connectionOf(socket, process.pid, { read: denied }), `who holds the socket on port ${port} cannot be read (/proc/net/tcp: EACCES)`);
+    for (const unreadable of ['/proc/net/tcp', '/proc/net/tcp6']) {
+      const partly = (table: string) => (table === unreadable ? denied() : headerOnly(table));
+      assert.equal(await connectionOf(socket, process.pid, { read: partly }), `who holds the socket on port ${port} cannot be read (${unreadable}: EACCES)`, `${unreadable} unreadable, its sibling read without the row`);
+    }
+    let tries = 0;
+    const deniedFirst = (table: string) => {
+      if (table === '/proc/net/tcp' && tries++ === 0) denied();
+      return headerOnly(table);
+    };
+    assert.equal(await connectionOf(socket, process.pid, { read: deniedFirst }), `the socket that answered on port ${port} was not found accepted`);
+    assert.ok(tries > 1, `looked up again after the failed read (${tries} reads of /proc/net/tcp)`);
   } finally {
     clearTimeout(stop);
     socket.destroy();
