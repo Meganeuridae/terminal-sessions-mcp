@@ -1688,13 +1688,14 @@ export class McplLane {
     return covered;
   }
 
-  private owedOnCatchUp(t: Target, st: LaneState, src: ReplaySource, { ev, lost }: Picked, open: boolean): boolean {
+  private owedOnCatchUp(t: Target, st: LaneState, src: ReplaySource, { ev, lost, exit }: Picked, open: boolean): boolean {
     // A held completion is the live path's to decide; what a synchronous call returned is settled.
     if (ev.type === 'run.end' && (st.held.has(ev.runId) || this.returned(t, ev.runId))) return false;
     if (ev.type === 'service' && this.returned(t, ev.runId, { status: ev.status, seq: ev.seq })) return false;
     // As the live path owes a session's exit to a principal whose Run it cuts short (see `onJournal`), so does the
     // catch-up, by the run index (see `cutShortBy`, which the replayed message's interest reads too).
-    if (ev.type === 'session.exit' && cutShortBy(src, ev.seq).includes(this.me)) return true;
+    const exitSeq = ev.type === 'session.exit' ? ev.seq : ev.type === 'recovered' ? exit?.seq : undefined;
+    if (exitSeq !== undefined && cutShortBy(src, exitSeq).includes(this.me)) return true;
     return this.owed(t, ev, open, src, lost?.principals);
   }
 

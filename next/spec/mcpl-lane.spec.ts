@@ -2885,6 +2885,33 @@ test("a session's exit built while no connection carried it is caught up for a p
   }
 });
 
+test("after a daemon restart, the recovery message holding a shell's exit is caught up for a principal whose Run the exit ended before the restart", { timeout: 60_000 }, async () => {
+  const d1 = await daemon();
+  let d2: Awaited<ReturnType<typeof daemon>> | undefined;
+  try {
+    const owner = { principal: A, connectionId: 'rx-a' };
+    const other = { principal: B, connectionId: 'rx-b' };
+    await d1.app.sessionOpen(owner, { id: 'rx', visibility: 'shared' });
+    const s = live(d1.registry, 'rx');
+    await d1.app.control(owner, { session: 'rx', action: 'release' });
+    const theirs = await d1.app.run(other, { session: 'rx', command: 'sleep 60', target: 'process', wait: 0 });
+    await until(() => s.run(theirs.runId!).state === 'running', 5000, "the other principal's Run to start");
+    await d1.app.control(other, { session: 'rx', action: 'release' });
+    await d1.app.run(owner, { session: 'rx', command: 'exit 3', wait: 0 });
+    await until(() => s.run(theirs.runId!).state === 'cancelled', 8000, 'the exit to end it');
+    await d1.stop({ keep: true, reason: 'daemon-shutdown' });
+    d2 = await daemon({ dataDir: d1.dataDir });
+    const b = await d2.host('tb', 'rx-b2');
+    await b.delivery(aboutRun(theirs.runId), 5000);
+    const rec = await b.delivery((x) => x.tags.includes('terminal:recovered'), 5000);
+    assert.ok(rec.tags.includes('terminal:session-exited'), `${rec.tags}`);
+    assert.match(rec.text, /the shell had ended with code 3/);
+    await b.close();
+  } finally {
+    await (d2 ?? d1).stop();
+  }
+});
+
 test("a debt owed only while a channel was open, which no catch-up finds owed after it closed, goes when the connection carries the session again", { timeout: 30_000 }, async () => {
   // Another principal's completion is owed only on an open channel. Refused there, its retry's timer then found the
   // channel closed, and the debt stayed: kept at a grant's regain above `delivered`, it was never owed again by the

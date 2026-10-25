@@ -198,6 +198,24 @@ test('m2-4/mcpl-2: a restart is one recovery message with the exit it cut short 
   assert.match(h.segments[1]!.head, /the shell had ended with code 1/);
 });
 
+test('a restart folding in the exit names whoever the exit cut short, the Runs it ended before the restart too, each once', async () => {
+  const C = 'agent:c@t';
+  const src = fakeSource();
+  startRun(src, 'ended', B, 'sleep 60');
+  startRun(src, 'lost', C, 'sleep 90');
+  src.journal.append({ type: 'session.exit', code: 1 });
+  endRun(src, 'ended', { state: 'cancelled', reason: 'shell-exited' });
+  endRun(src, 'lost', { state: 'lost', reason: 'daemon-shutdown' });
+  src.journal.append({ type: 'recovered', class: 'history-only' });
+  const history = journalSource({ id: 's1', journal: src.journal, owner: A, run: (id) => src.journal.runs.run(id) });
+  const scan = await scanLifecycle(history, 0);
+  const segs = await renderPicked(history, scan.picked);
+  const recovery = segs.find((s) => s.kind === 'recovered');
+  assert.ok(recovery, `a recovery message: ${segs.map((s) => s.kind)}`);
+  assert.equal(segs.filter((s) => s.kind === 'session-exit').length, 0, 'the exit is folded in');
+  assert.deepEqual([...recovery.interested].sort(), [B, C], 'B, whose Run the exit ended, and C, who lost one at the restart, once');
+});
+
 test('ux-25: an exit a later life superseded is not caught up', async () => {
   const src = fakeSource();
   src.journal.append({ type: 'session.exit', code: 0 });

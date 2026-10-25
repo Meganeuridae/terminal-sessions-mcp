@@ -465,7 +465,7 @@ class Render {
    * behind. A shell exit it cut short is folded in; the Runs it made lost have their
    * own completions.
    */
-  recovered(ev: Recovered, lost: Lost, exit?: SessionExit): Segment {
+  recovered(ev: Recovered, lost: Lost, exit?: SessionExit, cutShort: Principal[] = []): Segment {
     const gone = ev.class === 'history-only';
     const shell = exit ? ` (the shell had ended${howEnded(exit)})` : '';
     const runs = lost.count ? ` · ${lost.count} Run${lost.count > 1 ? 's' : ''} lost (each is reported)` : '';
@@ -479,7 +479,7 @@ class Render {
       lifecycle: true,
       tags,
       head: `[terminal] ${this.src.id}: ${what}${runs} · read session=${this.src.id}`,
-      interested: [...new Set(lost.principals)],
+      interested: [...new Set([...lost.principals, ...cutShort])],
     };
   }
 
@@ -727,7 +727,7 @@ async function renderOne(r: Render, p: Picked): Promise<Segment | undefined> {
     case 'session.exit':
       return r.exit(ev, cutShortBy(r.src, ev.seq));
     case 'recovered':
-      return r.recovered(ev, p.lost ?? { principals: [], count: 0 }, p.exit);
+      return r.recovered(ev, p.lost ?? { principals: [], count: 0 }, p.exit, p.exit ? cutShortBy(r.src, p.exit.seq) : []);
     case 'run.waiting':
       return r.waiting(ev);
     case 'note':
