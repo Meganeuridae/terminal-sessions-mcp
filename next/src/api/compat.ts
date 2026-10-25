@@ -11,7 +11,7 @@
 import { clocks } from '../core/clock.js';
 import { TermError } from '../core/errors.js';
 import { compileUserRegex } from '../core/regex.js';
-import { ackMark, exitMark, goneMark, inlineTypedLine, nonceOf, probeEcho, probeMark, shellQuote, sourceLineEcho, startMark } from '../core/plumbing.js';
+import { ackMark, exitMark, goneMark, inlineTypedLine, nonceOf, probeAnswerMark, probeEcho, shellQuote, sourceLineEcho, startMark } from '../core/plumbing.js';
 import { countLines, cutTail, utf8Length } from '../core/text.js';
 import { keepLines as tailOfLines } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type JournalEvent, type Seq, type ServiceStatus } from '../core/types.js';
@@ -139,9 +139,11 @@ async function runOutput(ctx: ToolContext, session: string, runId: string, raw: 
  * cutter's own matcher (keptLines). 1.x kept these out of its logs and logged `$ <command>` in their
  * place (the house's read of 1cabc6a, #22). The inline strategy's body, its start mark and its
  * pieces' marks reached the logs while this held a copy of the marker strategy's shapes alone, and
- * that copy had no line for fish's marker strategy (a reviewer's read of the fixes for #22).
+ * that copy had no line for fish's marker strategy (a reviewer's read of the fixes for #22). A probe's
+ * answer is the cut's shape (probeAnswerMark), an answer whose pid came out empty included, which the
+ * session's own shape (probeMark) passes over (macOS CI on #22 at 1c88566).
  */
-const PLUMBING = new RegExp([sourceLineEcho(), inlineTypedLine(), startMark(), exitMark(), probeMark(), ackMark(), goneMark()].map((re) => re.source).join('|'), 'g');
+const PLUMBING = new RegExp([sourceLineEcho(), inlineTypedLine(), startMark(), exitMark(), probeAnswerMark(), ackMark(), goneMark()].map((re) => re.source).join('|'), 'g');
 
 /**
  * What tells the daemon's plumbing from a program's in a stretch of the session's text: the nonces

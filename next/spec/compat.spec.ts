@@ -921,6 +921,29 @@ test('6307351617 5: a declared Run typed but not started carries its nonce, so i
   await call('killSession', { session: 'unstarted', graceful: false });
 });
 
+test('a probe answer with a Run’s nonce and an empty pid stays out of the logs, inline with the Run’s token or none, and the marker strategy’s', async () => {
+  // macOS CI on #22 at 1c88566: a Run's history held `^\<<<PROBE:nonce::nonce>>>`, an answer whose pid came out empty after the
+  // cancel's ^\. The logs took a probe's answer by the session's shape, which takes a pid only as digits, so it kept that line.
+  const opened = await call('runCommand', { session: 'emptypid', command: 'cat', timeout: -1 });
+  await until(() => summary('emptypid')?.runs?.some((x) => x.runId === opened.runId && x.state === 'running') === true, 5000, 'cat in front');
+  await call('session_declare_shell', { session: 'emptypid', shell: 'sh' });
+  const typed = await call('runCommand', { session: 'emptypid', command: 'echo typed', timeout: 300 });
+  const live = registry.get('emptypid');
+  assert.ok(live?.kind === 'live');
+  const n = live.session.run(String(typed.runId)).nonce!;
+  assert.match(n, /^[0-9a-f]{8}$/);
+  const answers = [`$ ^\\<<<PROBE:${n}::${n}>>>`, `<<<PROBE:${n}::>>>`, `<<<PROBE:${n}:>>>`].map((m) => `${m}\r\n`).join('');
+  live.session.journal.append({ type: 'output', data: `${answers}a program line\r\n`, stream: 'pty' });
+  for (const raw of [false, true]) {
+    const tail = lines(await call('tailLogs', { session: 'emptypid', lines: 40, raw }));
+    const said = `raw ${raw}: ${JSON.stringify(tail.map((l) => l.slice(0, 80)))}`;
+    assert.ok(!tail.some((l) => l.includes(n)), `no answer of the Run: ${said}`);
+    assert.ok(tail.includes('a program line'), `the program's line stays: ${said}`);
+  }
+  assert.deepEqual(await call('searchLogs', { session: 'emptypid', pattern: n }), [], 'a search finds no answer of the Run');
+  await call('killSession', { session: 'emptypid', graceful: false });
+});
+
 test('a raw tail counts a crash’s hole as up to its range, as a read does', async () => {
   // An independent read of the fix for the house's read of the 33 commits (#22, comment 6307350650): the range a
   // crash skipped above the last synced reservation may be mostly seqs never issued.

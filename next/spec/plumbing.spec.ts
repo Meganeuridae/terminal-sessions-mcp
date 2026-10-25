@@ -742,6 +742,22 @@ test('a marker probe names the shell that answered it: an answer from another pi
   assert.equal(cutPlumbing(`${typed}${probe(5151)}more\r\n${probe(4242)}`, { ...marker, pid: '4242' }), 'read by a program\r\nmore\r\n');
 });
 
+test('a probe answer with the Run’s nonce and an empty pid is no shell’s: struck and no end, inline with the Run’s token or none, and under the marker strategy', () => {
+  // macOS CI on #22 at 1c88566: the nested-shell spec's history held `^\<<<PROBE:nonce::nonce>>>`, an answer whose pid came out
+  // empty after the cancel's ^\, which the cut did not read as an answer at all, so it stayed in the Run's text. Why the pid came
+  // out empty there is not known.
+  const inline = { strategy: 'inline' as const, nonce: N };
+  for (const answer of [`<<<PROBE:${N}::${N}>>>`, `<<<PROBE:${N}::>>>`]) {
+    const raw = `\r\nA\r\n$ ^C\r\n$ ${inlineProbe(N, false)}\r\n$ ^\\${answer}\r\nB\r\n<<<EXIT:${N}:0>>>`;
+    assert.equal(cutPlumbing(raw, inline), 'A\r\n$ ^C\r\nB\r\n', `${answer}, no pid known`);
+    assert.equal(cutPlumbing(raw, { ...inline, pid: '1000' }), 'A\r\n$ ^C\r\nB\r\n', `${answer}, the shell's pid known`);
+  }
+  // The marker strategy's probe has no fallback for its pid, so a lookup that fails leaves it empty the same way.
+  const marker = { strategy: 'marker' as const, nonce: N };
+  const start = `${sourceLine('/tmp/tsm-501/abc/tsm-cmd-1', 'posix', N)}\r\n<<<START:${N}:4242>>>\r\nout\r\n`;
+  assert.equal(cutPlumbing(`${start}^C${markerProbe(N)}\r\n<<<PROBE:${N}:>>>\r\nmore\r\n<<<EXIT:${N}:0>>>\r\n`, marker), 'out\r\nmore\r\n');
+});
+
 test('the cut decides each probe echo with one pass over the answers: 120,000 echoes each followed by a rejected answer cost what as many echoes with no answer do', () => {
   // An independent read of the fixes for #22: each echo's decision looked through every answer from the start, 2.3 s by shape
   // and 3.9 s with a nonce at 100,000 pairs; a Run's text reads up to 4 MiB, about 80,000 such pairs. Timed against the same

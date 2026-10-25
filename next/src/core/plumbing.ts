@@ -347,8 +347,16 @@ const PROBE_ECHO_ANY = probeEchoSource();
  * spans, as cutPlumbing does, and the compat pack's logs use it so they cut the same echo.
  */
 export const probeEcho = (nonce?: string): RegExp => new RegExp(nonce === undefined ? PROBE_ECHO_ANY : probeEchoSource(nonce), 'g');
-/** A probe answer with its nonce (1), pid (2) and token (3). */
-const probeAnswer = (nonce: string): RegExp => new RegExp(`<<<PROBE:(${nonce})(?::(\\d+)(?::(${NONCE}|))?)?>>>`, 'g');
+/**
+ * A probe answer as a reader that strikes the plumbing takes it, with its nonce (1), pid (2) and token (3):
+ * the cut, and the compat pack's logs. The pid may be empty: it is a command substitution, which comes out
+ * empty when its subshell ends without printing (a refused `exec`, as in zsh's restricted mode, or whatever
+ * ended it on macOS CI, where an answer came back with no pid after the cancel's `^\`: the cause there is
+ * not known). Its nonce says it is still the Run's plumbing, and it is no shell's answer. The session
+ * decides answers by probeMark, which takes a pid only as digits, so such an answer ends nothing.
+ */
+export const probeAnswerMark = (nonce: string = NONCE): RegExp => new RegExp(`<<<PROBE:(${nonce})(?::(\\d*)(?::(${NONCE}|))?)?>>>`);
+const probeAnswer = (nonce: string): RegExp => new RegExp(probeAnswerMark(nonce).source, 'g');
 
 /**
  * How each line the inline strategy types for a Run's body begins (session.ts inlineLines): the
@@ -594,8 +602,10 @@ export function keptRanges(raw: string, of: PlumbingOf = {}): Array<[number, num
     // the session rejects, and the cutter accepted, ending the result at it (the house's read of
     // 78c4d6e, #22, comment 6269901528). With no pid known, the token is the one evidence: the
     // Run's token is accepted, an empty one is not; from before tokens, any pid; and a marker probe's
-    // answer from before it named a pid, which names none, ends the Run as it did.
-    const ok = m[2] === undefined || (pid !== undefined ? m[2] === pid && (m[3] === undefined || m[3] === '' || m[3] === m[1]) : m[3] === undefined || m[3] === m[1]);
+    // answer from before it named a pid, which names none, ends the Run as it did. An answer whose pid
+    // came out empty names no shell, so it ends nothing and is struck like a stranger's: read as no
+    // answer at all, it stayed in the Run's text (macOS CI on #22 at 1c88566, the nested-shell spec).
+    const ok = m[2] !== '' && (m[2] === undefined || (pid !== undefined ? m[2] === pid && (m[3] === undefined || m[3] === '' || m[3] === m[1]) : m[3] === undefined || m[3] === m[1]));
     answers.push(m.index);
     if (ok) {
       to = m.index;
