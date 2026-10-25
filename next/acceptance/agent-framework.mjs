@@ -160,6 +160,10 @@ try {
   const released = path.join(tmp, 'reconnected');
   const COMMAND = 'until [ -e reconnected ]; do sleep 0.1; done; echo acceptance-out""put';
   let runId;
+  const sighted = () => {
+    if (firstCompletionAt === undefined && completionMessages(runId).length) firstCompletionAt = now();
+    return firstCompletionAt !== undefined;
+  };
   await check('start work, receive a run id, stop waiting', async () => {
     const r = await call('run', { session: SESSION, command: COMMAND, wait: 100 });
     assert.equal(r.structured?.state, 'running', r.text);
@@ -194,10 +198,6 @@ try {
     // sight of it: sampled once after the loop, a completion that showed after the text left the recount no window and
     // its log saying none had shown (the house's review of bc4bc85..5d8ce0e, PR #22).
     const until = now() + 8000;
-    const sighted = () => {
-      if (firstCompletionAt === undefined && completionMessages(runId).length) firstCompletionAt = now();
-      return firstCompletionAt !== undefined;
-    };
     while (!(sighted() && context().includes('acceptance-output')) && now() < until) await sleep(100);
     sighted();
     const ctx = context();
@@ -283,6 +283,7 @@ try {
     // #22). The two seconds cover a copy sent on a timer within them, as a retry from 500 ms would be; a copy
     // sent later than that isn't seen here. The poll's time, not the first showing, is what is measured (the
     // house's read of 4860d4c..bc4bc85, #22).
+    sighted();
     const sinceFirst = firstCompletionAt === undefined ? undefined : now() - firstCompletionAt;
     if (firstCompletionAt !== undefined) await sleep(Math.max(0, firstCompletionAt + 2000 - now()));
     log(`   the recount: ${sinceFirst === undefined ? 'no completion showed within the poll' : `the check reached it ${Math.round(sinceFirst)} ms after its poll first saw the completion${sinceFirst < 2000 ? ', and waited to two seconds' : ''}`}`);
