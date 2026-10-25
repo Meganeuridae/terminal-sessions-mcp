@@ -228,7 +228,7 @@ function tailMarks(l: NonNullable<ReadResult['lines']>, runId: string | undefine
 
 /** The holes a read or a search spanned, as a status-line item (the reader words them). */
 const gapsBit = (r: { gap?: GapInfo; gaps?: GapInfo[] }): string => item(gapsText(r));
-/** A process Run's line, as a hit names it: the pipe that wrote its first character that showed, and `mixed` when both wrote characters to it that showed (search and watches read the two as one source); '' for the terminal's. */
+/** A process Run's line, as a hit names it: the pipe that wrote its first character that showed, and `mixed` when both wrote characters to it that showed, within the head the line keeps (search and watches read the two as one source); '' for the terminal's. */
 const pipeOf = (h: { stream?: string; mixed?: boolean }): string => (h.stream ? `${h.stream}${h.mixed ? ' · mixed' : ''}` : '');
 const item = (text: string | undefined): string => (text ? ` · ${text}` : '');
 
@@ -403,7 +403,7 @@ const SUMMARY: Schema = {
 
 /** A hit's pipe and whether both pipes wrote to its line (search and watches read a process Run's stdout and stderr as one source). */
 const STREAM: Schema = { type: 'string', enum: ['stdout', 'stderr'], description: "A process Run's line: the pipe that wrote its first character that showed, kept though a later backspace or cursor move wrote over it." };
-const MIXED: Schema = { type: 'boolean', description: "Both of the Run's pipes wrote characters to the line that showed when written, whether or not they still show." };
+const MIXED: Schema = { type: 'boolean', description: "Both of the Run's pipes wrote characters to the line that showed when written, whether or not they still show; on a line too long to keep whole, within the head it keeps." };
 
 const WAIT_OUTPUT: Schema = {
   type: 'object',
@@ -854,7 +854,8 @@ export const TOOLS: ToolDef[] = [
       'prompt with no newline counts after 0.5 s of quiet), `silenceMs` (output stopped for ' +
       'that long), or `idle` (the shell became free after running something). Give exactly one. `label` names it in notifications; `once` removes ' +
       'it after the first firing. A process Run\'s stdout and stderr are one source, as `read` shows them: a line can hold both, and a firing names ' +
-      'the pipe that wrote its line\'s first character that showed and says when both pipes wrote characters to it that showed. ' +
+      'the pipe that wrote its line\'s first character that showed and says when both pipes wrote characters to it that showed (on a line too long to ' +
+      'keep whole, within the head it keeps). ' +
       'Notifications need an MCPL connection; on plain MCP a watch only counts its firings (see `watches`) — use ' +
       '`wait_for` to block on the same conditions instead.',
     inputSchema: {
@@ -909,7 +910,7 @@ export const TOOLS: ToolDef[] = [
       'already printed after that cursor counts, so a line printed before the call is not missed. Patterns match per output line, as the terminal shows it: ' +
       'a tab is the spaces up to the next tab stop, so match it with ` +` or `\\s+`, not `\\t`. A process Run\'s stdout and stderr are one source, as ' +
       '`read` shows them: a line can hold both, and a match names the pipe that wrote its first character that showed (`stream`) and says `mixed` when both ' +
-      'pipes wrote characters to it that showed. Returns ' +
+      'pipes wrote characters to it that showed (on a line too long to keep whole, within the head it keeps). Returns ' +
       'matched: false when the wait ends first, and at once with a `reason` when it can no longer be met (the shell exited, the Run ended). ' +
       '`nextCursor` is the position of the match (or the journal’s end when nothing matched): pass it as the next wait’s `since` to go on from there.',
     inputSchema: {
@@ -945,7 +946,7 @@ export const TOOLS: ToolDef[] = [
       'Patterns run on a linear-time engine: no back-references or lookahead. A line reads as the terminal shows it: a tab is the spaces up to the next ' +
       'tab stop, so match it with ` +` or `\\s+`, not `\\t`. A process Run\'s stdout and stderr are one source, as `read` shows them: a line can hold ' +
       'both, and a match names the pipe that wrote its first character that showed (`stream`) and says `mixed` when both pipes wrote characters to it that ' +
-      'showed. Without `since`, the recent past is ' +
+      'showed (on a line too long to keep whole, within the head it keeps). Without `since`, the recent past is ' +
       'scanned and the result says if older history was left out, as it says what it skipped (gaps, over-long lines). Use `read` to page through output.',
     inputSchema: {
       type: 'object',

@@ -11,7 +11,8 @@
  * stdout and stderr together, so `abc` on stdout then `def` and a LF on stderr is
  * the line `abcdef`, as the transcript and the digests show it; a hit on a Run's
  * line names the pipe of the first character written to it that shows (`stream`),
- * and says `mixed` when both pipes wrote characters to it that showed, as written
+ * and says `mixed` when both pipes wrote characters to it that showed, as written,
+ * within the head the line keeps (MAX_LINE)
  * (the house's review of f3750e4..4f4c067,
  * #22, comment 6315636412, question 4).
  * A line is read as it displays (`cleanLine`: backspaces, erases and in-line
@@ -189,7 +190,7 @@ const endText = (r: { runId: string; state: string; exit?: number; signal?: stri
  * or for a line a flush completed the event its last output came in; `cursor` and `offset` where it began, as
  * search's match names it), whether the line was matched on its head only (longer than the pattern's match window),
  * and for a process Run's line the pipe that wrote its first character that showed, and whether both pipes wrote
- * characters to it that showed.
+ * characters to it that showed, within the head the line keeps (MAX_LINE).
  */
 type Hit = { match?: string; line?: string; seq: Seq; cursor?: Seq; offset?: number; clipped?: boolean; stream?: 'stdout' | 'stderr'; mixed?: boolean };
 
