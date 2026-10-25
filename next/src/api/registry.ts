@@ -1688,7 +1688,10 @@ function writeMeta(dir: string, meta: Meta): DurableWrite {
 }
 
 
-/** A session's shell-side files: command files and the shell's own history (0700). */
+/**
+ * A session's shell-side files: command files and the shell's own history (0700). A path with an ASCII
+ * control character is refused (`invalid_argument`).
+ */
 function shellDir(dir: string): string {
   const d = path.join(dir, 'shell');
   assertTypedCommandDir(d);
@@ -1700,7 +1703,8 @@ function shellDir(dir: string): string {
 /**
  * What a life that ended without its own cleanup (a daemon killed mid-Run) left on disk: its
  * command files, which hold command text, and env captures (G26). The session's own shell
- * history stays: it is the session's.
+ * history stays: it is the session's. When the directory is there but isn't private or can't be read,
+ * it skips the cleanup and returns a warning for the caller to log.
  */
 function removeLeftovers(dir: string): string | undefined {
   const shell = path.join(dir, 'shell');
