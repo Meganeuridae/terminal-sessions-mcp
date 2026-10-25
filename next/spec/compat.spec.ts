@@ -1102,6 +1102,31 @@ test("searchLogs judges a probe answered as tailLogs does: an answered probe's p
   }
 });
 
+test("searchLogs judges a probe answered when its answer lies below the context asked, as tailLogs does (the house's review of 5d8ce0e..21fed2f, PR #22, I28)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'compat-search-edge-'));
+  const backend = fakeShellBackend((sh) => { sh.on(/^echo /, (line) => ({ output: `${line.slice(5)}\r\n`, exit: 0 })); }, { marks: 'none' });
+  const registry = new SessionRegistry({ dataDir: dir, backend, defaultShell: '/bin/bash', noUserRc: true });
+  const app = new App({ registry, defaultWaitMs: 2000 });
+  const C: Caller = { principal: 'agent:a@test', connectionId: 'cs' };
+  const compat = toolsFor('compat');
+  const call = async (name: string, args: Record<string, unknown>) => JSON.parse((await callTool(name, args, { app, caller: C, resultText: 'json' }, compat)).text);
+  try {
+    await call('runCommand', { session: 'se', command: 'echo hello' });
+    const live = registry.get('se');
+    if (live?.kind !== 'live') throw new Error('no live session');
+    const probe = inlineProbe('n1nce', false).trimStart();
+    const filler = Array.from({ length: 5 }, (_, i) => `filler${i}\r\n`).join('');
+    live.session.journal.append({ type: 'output', data: `\r\nHIT\r\n${filler}myhost$ ${probe}\r\n<<<PROBE:n1nce:4242:>>>\r\nmyhost$ ok\r\n`, stream: 'pty' });
+    const hits = (await call('searchLogs', { session: 'se', pattern: 'HIT', context: 6 })) as Array<{ line: string; context: string[] }>;
+    assert.deepEqual(hits.map((h) => h.line), ['HIT']);
+    assert.ok(hits[0]!.context.includes('filler4'), JSON.stringify(hits[0]!.context));
+    assert.ok(!hits[0]!.context.some((l) => l.startsWith('myhost')), JSON.stringify(hits[0]!.context));
+  } finally {
+    await registry.closeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("searchLogs judges a probe answered when its own `set -x` trace stands between its echo and its answer, in bash and in its restricted mode, whatever context is asked (the house's review of 4860d4c..bc4bc85, PR #22)", { skip: !fs.existsSync('/bin/bash') }, async () => {
   // A line of context reached bash's trace of the probe's pid substitution and no further, so the prompt the answered
   // probe was typed after came back as a hit at context 0 and 1 (by run, bash 5.2.37).
