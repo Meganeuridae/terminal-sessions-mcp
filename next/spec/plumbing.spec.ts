@@ -12,6 +12,7 @@ import { transcript } from '../src/core/transcript.js';
 import type { RunOutput } from '../src/core/runindex.js';
 import type { RunInfo } from '../src/core/types.js';
 import { cpuMs } from './testhost.js';
+import { AGENT, scriptedSession, until } from './fake-shell.js';
 
 /** What the shell prints for a typed line: the split words joined. */
 const printed = (typed: string) => typed.replace(/""|''/g, '');
@@ -240,6 +241,36 @@ test('a probe’s echo broken over two lines is struck on every line it spans, t
   assert.equal(cutPlumbing(`\r\nout\r\n${fish}\r\nmore\r\n<<<EXIT:${nonce}:0>>>`, inline), 'out\r\nmore\r\n', 'fish’s probe line');
   const marker = { strategy: 'marker' as const, nonce };
   assert.equal(cutPlumbing(`${typed(nonce)}out\n echo "<<<PRO""BE:a1b2\r\nc3d4>>>"\nmore\n<<<EXIT:${nonce}:0>>>\n`, marker), 'out\nmore\n', 'the marker strategy’s probe line');
+});
+
+test("a basic Run's history cuts its typed line's echo when a hole lies inside its output, and keeps its first line when retention or a hole took its start (the house's review of 5d8ce0e..21fed2f, PR #22, I27)", async () => {
+  const run = { runId: 'r1', target: 'shell', strategy: 'basic' } as unknown as RunInfo;
+  const ev = (seq: number, data: string) => ({ type: 'output', seq, ts: 0, stream: 'pty', data, runId: 'r1' });
+  const holed = { events: [ev(5, ` . '/tmp/x/tsm-cmd-1'\r\nA\r\n`), ev(7, 'B\r\n')], from: 5, to: 7, truncated: true, gaps: [{ from: 6, to: 6, seq: 9, reason: 'store-error' }] } as unknown as RunOutput;
+  assert.equal((await journalRunText(holed, { cols: 80, rows: 24 }, run)).text, 'A\nB');
+  const older = { events: [ev(7, 'B\r\n')], from: 5, to: 7, truncated: true, older: true } as unknown as RunOutput;
+  assert.equal((await journalRunText(older, { cols: 80, rows: 24 }, run)).text, 'B');
+  for (const seat of [6, 20]) {
+    const echoLost = { events: [ev(7, 'B\r\n')], from: 5, to: 7, truncated: true, gaps: [{ from: 5, to: 6, seq: seat, reason: 'store-error' }] } as unknown as RunOutput;
+    assert.equal((await journalRunText(echoLost, { cols: 80, rows: 24 }, run)).text, 'B', `the hole seated at ${seat}`);
+  }
+});
+
+test("a basic Run's live transcript cuts its typed line's echo when a hole lies inside its output (the house's review of 5d8ce0e..21fed2f, PR #22, I27)", async () => {
+  const h = await scriptedSession({ marks: 'basic', setup: (s) => s.on(/^longjob$/, () => ({ output: 'A\r\n', hang: true })) });
+  const first = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT });
+  assert.ok(first.admitted);
+  await h.session.awaitRun(first.run.runId, 2000);
+  const a = h.session.admit({ target: 'shell', line: 'longjob', principal: AGENT });
+  assert.ok(a.admitted);
+  await until(() => h.journal.since(0).events.some((e) => e.type === 'output' && e.data.includes('A\r\n')), 2000, 'the first output');
+  const at = h.journal.lastSeq + 1;
+  h.journal.append({ type: 'gap', from: at, to: at, reason: 'store-error', exact: true });
+  h.shell.finishHung(0, 'B\r\n');
+  const r = await h.session.awaitRun(a.run.runId, 2000);
+  assert.equal(h.session.run(r.runId).strategy, 'basic', 'premise: the basic strategy');
+  assert.equal((await h.session.runTranscript(r.runId)).text, 'A\nB');
+  await h.session.close();
 });
 
 test('history judges a probe answer by the shell pid the Run’s run.start recorded, as the live transcript does', async () => {
@@ -722,7 +753,7 @@ test('a page or tail of a declared shell’s Run that begins with a blank line k
   assert.equal(cutPlumbing(raw, inline), '\r\nline\r\n', 'a whole read: the start mark’s line end goes');
   assert.equal(cutPlumbing(raw, { ...inline, truncated: true }), '\r\n\r\nline\r\n', 'a window: its blank line stays');
   const run = { runId: 'r1', target: 'shell', strategy: 'inline', nonce: N } as unknown as RunInfo;
-  const window = (truncated: boolean) => ({ events: [{ type: 'output', seq: 5, ts: 0, stream: 'pty', data: raw, runId: 'r1' }], from: 5, to: 5, truncated }) as unknown as RunOutput;
+  const window = (truncated: boolean) => ({ events: [{ type: 'output', seq: 5, ts: 0, stream: 'pty', data: raw, runId: 'r1' }], from: 5, to: 5, truncated, ...(truncated ? { older: true } : {}) }) as unknown as RunOutput;
   assert.equal((await journalRunText(window(false), { cols: 80, rows: 24 }, run)).text, '\nline');
   assert.equal((await journalRunText(window(true), { cols: 80, rows: 24 }, run)).text, '\n\nline', 'a tail window');
 });

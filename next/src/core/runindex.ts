@@ -140,6 +140,12 @@ export function journalLost(o: Pick<RunOutput, 'older' | 'cut' | 'gaps'>): boole
   return (o.gaps?.length ?? 0) > 0 || (o.older === true && o.cut !== true);
 }
 
+export function firstOutputMayBeGone(o: Pick<RunOutput, 'events' | 'older' | 'gaps'>): boolean {
+  if (o.older === true) return true;
+  const first = o.events.find((e) => e.type === 'output');
+  return (o.gaps ?? []).some((g) => first === undefined || g.from < first.seq);
+}
+
 /** Apply a range to a Run's whole output (the reference semantics; stores may do it without loading everything). */
 export function narrowOutput(o: RunOutput, range: RunOutputRange): RunOutput {
   if (range.since === undefined && range.until === undefined && range.limit === undefined && range.maxBytes === undefined) return o;

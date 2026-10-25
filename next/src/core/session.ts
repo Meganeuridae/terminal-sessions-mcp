@@ -20,7 +20,7 @@ import { livingGroups } from './lock.js';
 import { clocks, timerMs } from './clock.js';
 import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
-import { journalLost, pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
+import { firstOutputMayBeGone, journalLost, pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
 import { commandFile, cutPlumbing, exitMark, inlineProbe, markerCommandText, markerProbe, probeMark, shellQuote, sourceLine, startMark, type ShellFlavor } from './plumbing.js';
 import { stripEscapes } from './text.js';
 import { project, runChunks } from './transcript.js';
@@ -2961,7 +2961,7 @@ export class Session {
     // (core/plumbing.ts; the house's reads of 39787b3, #22). Process output comes from pipes (LF → CRLF, rule 6).
     const cut =
       run.target === 'shell' && run.strategy !== undefined
-        ? (raw: string) => cutPlumbing(raw, { strategy: run.strategy, nonce: run.markerNonce, truncated: out.truncated, pid: run.shellPid !== undefined ? String(run.shellPid) : undefined })
+        ? (raw: string) => cutPlumbing(raw, { strategy: run.strategy, nonce: run.markerNonce, truncated: firstOutputMayBeGone(out), pid: run.shellPid !== undefined ? String(run.shellPid) : undefined })
         : undefined;
     const input = runChunks(events, out.gaps, cut);
     const p = await project(input, { cols: run.cols ?? this.screen.cols, rows: run.rows ?? this.screen.rows, maxInputBytes: TRANSCRIPT_INPUT_CHARS, keep: 'tail' });

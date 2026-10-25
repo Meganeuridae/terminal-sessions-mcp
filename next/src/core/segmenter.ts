@@ -21,7 +21,7 @@
 import { cellWidth, cleanLine } from './ansi.js';
 import { clocks } from './clock.js';
 import type { Journal } from './journal.js';
-import { journalLost, type RunOutput } from './runindex.js';
+import { firstOutputMayBeGone, journalLost, type RunOutput } from './runindex.js';
 import { cutPlumbing, runEcho, startMark } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
 import { lineCarry, lineEnds, pastSequence, tailStart, unfinishedSequence, type LineCarry } from './text.js';
@@ -285,7 +285,7 @@ export async function journalRunText(o: RunOutput, how: HistoryRender = {}, run?
   const events = o.events.filter((e): e is Output => e.type === 'output');
   const cut =
     run?.target === 'shell' && events.every((e) => e.stream === 'pty')
-      ? (raw: string) => cutPlumbing(raw, { strategy: run.strategy, nonce: run.nonce, truncated: o.truncated, pid: run.shellPid !== undefined ? String(run.shellPid) : undefined })
+      ? (raw: string) => cutPlumbing(raw, { strategy: run.strategy, nonce: run.nonce, truncated: firstOutputMayBeGone(o), pid: run.shellPid !== undefined ? String(run.shellPid) : undefined })
       : undefined;
   const chunks = runChunks(events, o.gaps, cut);
   const p = await project(chunks, { cols: run?.cols ?? how.cols ?? DEFAULT_GEOMETRY.cols, rows: run?.rows ?? how.rows ?? DEFAULT_GEOMETRY.rows, maxInputBytes: how.maxInputBytes ?? HISTORY_RUN_INPUT_BYTES, keep: 'tail' });
