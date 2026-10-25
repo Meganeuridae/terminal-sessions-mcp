@@ -638,6 +638,61 @@ test('G22: screen refuses a replaced session while its snapshot is settling', as
   await assert.rejects(pending, (e: unknown) => (e as { code?: string }).code === 'session_not_found', 'the old screen does not answer for the replacement');
 });
 
+test('G22: a screen whose session is forgotten while it settles is refused as not found', async () => {
+  const s = 'screen-forgotten';
+  await app.sessionOpen(A, { id: s });
+  const first = registry.get(s);
+  assert.ok(first?.kind === 'live');
+  const screen = first.session.screen;
+  const settled = screen.settled.bind(screen);
+  let entered!: () => void;
+  let release!: () => void;
+  const inside = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  screen.settled = async () => { entered(); await gate; await settled(); };
+  const pending = app.screen(A, { session: s });
+  void pending.catch(() => {});
+  await inside;
+  screen.settled = settled;
+  try {
+    await app.sessionClose(A, { session: s, forget: true });
+    assert.equal(registry.get(s), undefined, 'nothing holds the name now');
+  } finally {
+    release();
+  }
+  await assert.rejects(pending, (e: unknown) => (e as { code?: string }).code === 'session_not_found');
+});
+
+test('G22: a screen does not answer for a later life of its journal that closed while it settled', async () => {
+  const s = 'screen-reclosed-life';
+  await app.sessionOpen(A, { id: s });
+  const first = registry.get(s);
+  assert.ok(first?.kind === 'live');
+  const screen = first.session.screen;
+  const settled = screen.settled.bind(screen);
+  let entered!: () => void;
+  let release!: () => void;
+  const inside = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  screen.settled = async () => { entered(); await gate; await settled(); };
+  const pending = app.screen(A, { session: s });
+  void pending.catch(() => {});
+  await inside;
+  screen.settled = settled;
+  try {
+    await app.sessionClose(A, { session: s });
+    await app.sessionOpen(A, { id: s });
+    await app.sessionClose(A, { session: s });
+    const later = registry.get(s);
+    assert.ok(later?.kind === 'history');
+    assert.equal(later.journal.runs, first.session.journal.runs, 'the later life keeps the journal lineage');
+    assert.notEqual(later.journal, first.session.journal, 'and is a life of its own');
+  } finally {
+    release();
+  }
+  await assert.rejects(pending, (e: unknown) => (e as { code?: string }).code === 'session_not_found', 'the earlier life does not answer for the later one');
+});
+
 test('G22: a closed life cannot lower the reopened journal cursor book', async () => {
   const s = 'old-life-cursors';
   await app.sessionOpen(A, { id: s });

@@ -1306,11 +1306,10 @@ export class App {
   async screen(caller: Caller, o: { session: string }): Promise<ScreenSnapshot> {
     const session = this.liveFor(caller, o.session, 'observe');
     const source = this.entry(session);
-    const lineage = this.journalLineage(source);
     await session.screen.settled();
     const current = this.registry.get(session.id);
     // A closed life remains readable in history, but a forgotten or replaced life must not answer for this name.
-    if (!current || this.journalLineage(current) !== lineage || (current.kind === 'live' && current.session !== session)) {
+    if (!current || (current.kind === 'live' ? current.session !== session : current.journal !== session.journal)) {
       throw err('session_not_found', `session ${session.id} is gone`, { session: session.id });
     }
     const snap = session.snapshot();
