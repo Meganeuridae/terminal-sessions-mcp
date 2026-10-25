@@ -270,6 +270,7 @@ test('tsg-7: keystrokes typed while the connection is down are dropped with a no
     await pick(page, 'outage');
     await page.waitForFunction(`${rows}.includes('$')`, { timeout: 10_000 });
     await takeSeat(page, a, 'outage');
+    const typedBefore = inputsOf('outage').length;
     proxy.drop();
     await page.waitForFunction(`document.getElementById('conn-text').textContent === 'reconnecting'`, { timeout: 5000 });
     await page.click('#term');
@@ -288,7 +289,7 @@ test('tsg-7: keystrokes typed while the connection is down are dropped with a no
     await page.click('#term');
     await page.keyboard.type('~');
     await until(() => inputsOf('outage').some((e) => e.data.includes('~')), 5000, 'a key typed after the reconnect reached the terminal');
-    assert.deepEqual(inputsOf('outage').filter((e) => e.data.includes('QUEUED')), [], 'nothing typed during the outage reached the terminal');
+    assert.equal(inputsOf('outage').slice(typedBefore).map((e) => e.data).join(''), '~', 'nothing typed during the outage reached the terminal, whole or in part');
     assert.ok(!(await page.evaluate<string>(rows)).includes('QUEUED-5'));
   } finally {
     await page.close();
