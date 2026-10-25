@@ -168,7 +168,13 @@ __tsm_restore() {
 # previous command under ignorespace, HISTIGNORE or set +o history. A daemon line is
 # always BASH_COMMAND: it is exactly what the daemon matches, whatever the history
 # numbers say (a bind -x widget on bash 3.2, which has no READLINE_LINE to tell it
-# apart from a line, leaves them stale).
+# apart from a line, leaves them stale). The same missing READLINE_LINE is a second
+# part of that limit: a widget's command passes the DEBUG trap's prompt check as a
+# line would, so the trap clears __tsm_prompt_active and runs __tsm_preexec, and
+# readline returns to the same prompt without expanding PS1 again. A line typed next
+# then runs inside the widget's Run, which carries the widget's command as its line,
+# and starts no Run of its own. The daemon's next Run is still matched by its own
+# line (shell-10).
 # Only a sourced command file's final path component is daemon plumbing. The directory may
 # itself contain the same text, and a user's ordinary sourced file still belongs in history.
 __tsm_own_file() {
