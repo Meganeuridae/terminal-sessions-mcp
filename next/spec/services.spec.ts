@@ -671,6 +671,67 @@ test('a quiet line\'s twin counts its verdict only when it was given since the r
   n.dispose();
 });
 
+test('the same bytes give a service the same status whether its lines are left quiet or ended at their LF (I5, I55, I56 and I57 in the house\'s review of 5d8ce0e..21fed2f, PR #22)', async (t) => {
+  type Step = [string, OutputStream] | { offered: string };
+  const fromFail = async (spec: ServiceSpec, steps: Step[], quiet: boolean) => {
+    const f = fake('process');
+    const m = f.monitor(spec, { partialAfterMs: quiet ? 30 : 60_000 });
+    const offered = offers(t, m);
+    f.start();
+    for (const s of steps) {
+      if (Array.isArray(s)) f.out(s[0], s[1]);
+      else if (quiet) await until(() => offered.mock.calls.some((c) => (c.arguments[1] as { text: string }).text === s.offered), 2000, `\`${s.offered}\` offered`);
+    }
+    const seen = f.statuses();
+    m.dispose();
+    return seen.slice(seen.indexOf('unhealthy'));
+  };
+  const both = async (shape: string, spec: ServiceSpec, steps: Step[], expected: string[]) => {
+    assert.deepEqual(await fromFail(spec, steps, true), expected, `${shape}, left quiet`);
+    assert.deepEqual(await fromFail(spec, steps, false), expected, `${shape}, ended at its LF`);
+  };
+  const readyFatal = { ready: { pattern: 'READY' }, fail: { pattern: 'FATAL' } };
+  const okFatal = { ready: { pattern: 'OK' }, fail: { pattern: 'FATAL' } };
+  await both('a pipe line matched ready, then a fail its whole text makes', { ready: { pattern: 'OK' }, fail: { pattern: 'FATAL|^OK.*BROKEN' } },
+    [['OK', 'stdout'], { offered: 'OK' }, ['x\n', 'stderr'], ['FATAL\n', 'stderr'], [' OK BROKEN', 'stdout'], { offered: ' OK BROKEN' }, { offered: 'OK OK BROKEN' }, ['\n', 'stdout']],
+    ['unhealthy']);
+  await both('a READY on a line the read failed at its start', readyFatal,
+    [['READY FA', 'stdout'], { offered: 'READY FA' }, ['FATAL\n', 'stderr'], [' READY', 'stdout'], { offered: ' READY' }, ['\n', 'stdout']],
+    ['unhealthy']);
+  await both('an OK written after a fail, on a line the read failed at its start', okFatal,
+    [['OK\n', 'stdout'], ['READY FA', 'stdout'], ['FATAL\n', 'stderr'], [' OK', 'stdout'], { offered: ' OK' }, ['\n', 'stdout']],
+    ['unhealthy']);
+  await both('a ready matched before a fail on another line', { ready: { pattern: 'ready' }, fail: { pattern: 'FATAL' } },
+    [['ready', 'stdout'], { offered: 'ready' }, ['x\n', 'stderr'], ['FATAL\n', 'stderr'], ['\n', 'stdout']],
+    ['unhealthy']);
+  await both('an OK written after a fail, on a line matched ready before it', okFatal,
+    [['OK', 'stdout'], { offered: 'OK' }, ['x\n', 'stderr'], ['FATAL\n', 'stderr'], [' OK', 'stdout'], { offered: ' OK' }, ['\n', 'stdout']],
+    ['unhealthy', 'ready']);
+  await both('a FATAL a pipe completes after a recovery, on a line the read failed at its start', readyFatal,
+    [['READY FA', 'stdout'], ['FATAL\n', 'stderr'], ['READY\n', 'stderr'], ['TAL', 'stdout'], { offered: 'TAL' }, ['\n', 'stdout']],
+    ['unhealthy', 'ready', 'unhealthy']);
+  await both('a stale FATAL on a pipe line the read failed, ended after a recovery', readyFatal,
+    [['FATAL x', 'stderr'], ['\nREADY\n more', 'stdout'], [' more', 'stderr'], ['hello', 'stdout'], { offered: ' more morehello' }, ['\n', 'stderr']],
+    ['unhealthy', 'ready', 'unhealthy']);
+  for (const quiet of [true, false]) {
+    const f = fake('process');
+    const m = f.monitor(readyFatal, { partialAfterMs: 100 });
+    const offered = offers(t, m);
+    f.start();
+    f.out('foo', 'stdout');
+    await sleep(50);
+    f.out('FATAL x', 'stderr');
+    await until(() => offered.mock.callCount() > 0, 2000, 'stdout offered `foo`');
+    assert.deepEqual(offered.mock.calls.map((c) => (c.arguments[1] as { text: string }).text), ['foo'], 'stdout\'s offer alone, before stderr\'s and the read\'s');
+    f.out('\nREADY\n', 'stdout');
+    f.out(quiet ? ' FATAL z' : ' FATAL z\n', 'stderr');
+    await until(() => m.status === 'unhealthy' && f.statuses().length === 4, 2000, 'FATAL z reported');
+    assert.deepEqual(f.statuses(), ['starting', 'unhealthy', 'ready', 'unhealthy'], quiet ? 'left quiet' : 'ended at stderr\'s LF');
+    assert.equal(m.info().evidence, 'FATAL z', 'the new fail');
+    m.dispose();
+  }
+});
+
 test('a service\'s lines are taken in the order their ends came, the read\'s and a pipe\'s interleaved (our review of the 73 commits through 4860d4c, PR #22)', () => {
   // stdout `FATAL`, stderr `x` and its LF (the read's `FATALx` ends), then stdout's LF, `READY` and LF: stdout's FATAL
   // ends before READY. The read's lines were all taken first, READY before FATAL, and the service ended unhealthy.

@@ -46,7 +46,7 @@
  * FATAL. The cost is a ready prompt offered again as its line grows, tested for fail only. A line the other pipe ends
  * at a spent line's end is matched on its own (stdout's `ERROR a` matched quiet, then `ERROR b` and a LF on stderr,
  * are two matches). A fail another reading completed at a line's place forbids a ready there, and the line is still
- * tested for fail. A twin's verdict counts for a quiet line only when it was given since the read's current line began.
+ * tested for fail.
  */
 import { compileLinePattern, LineSplitter, type Begun, type SplitLine } from './ansi.js';
 import { headOnlyText, testBounded } from './regex.js';
@@ -302,10 +302,10 @@ export class ServiceMonitor {
         // LF and stderr's at its own, where a quiet between them counted it once (the house's review of
         // a8b6f28..4860d4c, #22, comment 6341260318, question 6).
         const fresh = this.completed.size ? texts.filter((line) => !this.sameCompleted(line)) : texts;
-        const verdict = fresh.length > 0 ? this.onLines(fresh) : undefined;
+        const verdict = fresh.length > 0 ? this.onLines(fresh, texts.length > 1 ? texts[texts.length - 1]!.begun : undefined) : undefined;
         // A line the other reading holds open from where it began (stderr's `Password: `, the read's ended at stdout's
         // LF) is that reading's prompt's twin, or its completed line's when the text is the same.
-        for (const line of fresh) if (line.begun && this.heldOpen(line.begun)) this.completed.set(placeOf(line.begun, line), { at: line.begun, verdict, given: line.ended ?? this.now(), text: line.text });
+        for (const line of fresh) if (line.begun && this.heldOpen(line.begun)) this.completed.set(placeOf(line.begun, line), { at: line.begun, verdict: stronger(this.judged(placeOf(line.begun, line)), verdict), given: line.ended ?? this.now(), text: line.text });
       }
       this.pruneTwins();
     } else if (ev.type === 'run.start' && ev.runId === this.runId) {
@@ -336,12 +336,30 @@ export class ServiceMonitor {
    * `FATAL` and a LF ending the read's line begun at it (the house's review of 4860d4c..bc4bc85, #22, comment
    * 6357989601). The place's verdict now.
    */
-  private onLines(texts: SplitLine[]): Verdict {
-    return this.onLine(texts, texts.reduce<Verdict>((v, line) => stronger(v, this.prompted.get(placeOf(line.begun, line))?.verdict), this.forbidsReady(texts)));
+  private onLines(texts: SplitLine[], since: Begun | undefined): Verdict {
+    const group = this.group(texts, since);
+    return this.onLine(group.tested, group.sofar, group.readyable);
   }
 
-  private forbidsReady(lines: SplitLine[]): Verdict {
-    return lines.some((line) => this.completed.get(placeOf(line.begun, line))?.verdict === 'fail') ? 'ready' : undefined;
+  private group(lines: SplitLine[], since: Begun | undefined): { tested: SplitLine[]; readyable: SplitLine[]; sofar: Verdict } {
+    const tested: SplitLine[] = [];
+    const readyable: SplitLine[] = [];
+    let sofar: Verdict;
+    for (const line of lines) {
+      const at = placeOf(line.begun, line);
+      const p = this.prompted.get(at);
+      if (p?.verdict === 'fail' && (since === undefined || !before(p.given, since))) sofar = 'fail';
+      else if (p?.verdict === 'fail' && this.completed.get(at)?.verdict !== 'fail') continue;
+      tested.push(line);
+      if (this.judged(at) === undefined) readyable.push(line);
+    }
+    if (lines.some((line) => this.completed.get(placeOf(line.begun, line))?.verdict === 'fail')) return { tested, readyable: [], sofar: stronger(sofar, 'ready') };
+    return { tested, readyable, sofar };
+  }
+
+  /** What a place has been judged so far, as a quiet prompt (prompted) or as a line one reading completed (completed). */
+  private judged(at: string): Verdict {
+    return stronger(this.prompted.get(at)?.verdict, this.completed.get(at)?.verdict);
   }
 
   /**
@@ -361,34 +379,28 @@ export class ServiceMonitor {
    */
   private once(r: Reading, line: SplitLine): boolean {
     const at = placeOf(line.begun, line);
-    const own = this.judged(at);
-    if (own === 'fail') {
-      const was = this.prompted.get(at)?.verdict === 'fail' ? this.prompted.get(at)! : this.completed.get(at)!;
-      this.prompted.set(at, { at: line.begun, verdict: own, given: was.given });
+    const own = this.prompted.get(at);
+    const ended = this.completed.get(at);
+    if (ended?.verdict === 'fail') {
+      this.prompted.set(at, { at: line.begun, verdict: 'fail', given: own?.verdict === 'fail' ? own.given : ended.given });
       return true;
     }
     // Its twins' places too: stdout's `READY FA` ended by stderr's LF in the read is the completed line stdout's open
     // `READY FATAL` continues, and the read's `TAL` offered first is that prompt's twin.
     const { lines: twins, began } = this.twins(r, line);
-    const counted = twins.filter((t) => !began || !this.older(placeOf(t.begun, t), began));
-    const sofar = counted.reduce<Verdict>((v, t) => stronger(v, this.judged(placeOf(t.begun, t))), own);
-    const verdict = this.onLine(r.pipe !== undefined ? [line, ...counted] : [...counted, line], sofar);
+    if (own?.verdict === 'fail' && (began === undefined || !before(own.given, began))) return true;
+    const group = this.group(r.pipe !== undefined ? [line, ...twins] : [...twins, line], began);
+    const verdict = this.onLine(group.tested, group.sofar, group.readyable);
     const given = this.now();
-    for (const l of [line, ...counted]) this.prompted.set(placeOf(l.begun, l), { at: l.begun, verdict, given });
+    for (const l of group.tested) {
+      const place = placeOf(l.begun, l);
+      this.prompted.set(place, { at: l.begun, verdict: stronger(this.judged(place), verdict), given });
+    }
     return verdict === 'fail';
   }
 
   private now(): Begun {
     return { at: this.lines?.last ?? 0, offset: Number.POSITIVE_INFINITY };
-  }
-
-  private older(at: string, since: Begun): boolean {
-    return [this.prompted.get(at), this.completed.get(at)].some((t) => t?.verdict !== undefined && before(t.given, since));
-  }
-
-  /** What a place has been judged so far, as a quiet prompt (prompted) or as a line one reading completed (completed). */
-  private judged(at: string): Verdict {
-    return stronger(this.prompted.get(at)?.verdict, this.completed.get(at)?.verdict);
   }
 
   /**
@@ -464,28 +476,28 @@ export class ServiceMonitor {
    * matched. It names the line, whichever reading it is: m2-21's says `Server listening on 8080`. The place's verdict
    * now.
    */
-  private onLine(texts: SplitLine[], sofar: Verdict): Verdict {
+  private onLine(texts: SplitLine[], sofar: Verdict, readyable: SplitLine[] = texts): Verdict {
     if (this.disposed || ended(this.statusValue) || sofar === 'fail') return sofar;
     // Matched on the line's head within the pattern's match window, as watches and search are
     // (the house's read of ed4ecac, #22: a long pattern on a 64 KiB line held the thread for seconds),
     // and on the head the splitter kept of a line longer than MAX_LINE; the evidence says when only
     // the head was looked at.
     const evidenceOf = (line: SplitLine, clipped: boolean) => (clipped || line.cut ? `${line.text.trim()} (${headOnlyText()})` : line.text.trim());
-    const first = (re: RegExp | undefined) => {
+    const first = (re: RegExp | undefined, lines: SplitLine[]) => {
       if (!re) return undefined;
-      for (const line of texts) {
+      for (const line of lines) {
         const t = testBounded(re, line.text);
         if (t.matched) return evidenceOf(line, t.clipped);
       }
       return undefined;
     };
-    const fail = first(this.failRe);
+    const fail = first(this.failRe, texts);
     if (fail !== undefined) {
       this.onFail(fail);
       return 'fail';
     }
     if (sofar === 'ready') return sofar;
-    const ready = first(this.readyRe);
+    const ready = first(this.readyRe, readyable);
     if (ready !== undefined) {
       this.onReadyLine(ready);
       return 'ready';
