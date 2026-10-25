@@ -12,13 +12,14 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { clocks } from '../src/core/clock.js';
 import type { ScriptedProcess } from '../src/backends/scripted.js';
 import type { TermError } from '../src/core/errors.js';
 import { Journal } from '../src/core/journal.js';
 import { CLEAR_LINE_KEYS } from '../src/core/marks.js';
 import { narrowOutput, pageOutput, type RunOutputRange } from '../src/core/runindex.js';
-import { looksLikeSecretPrompt } from '../src/core/session.js';
+import { looksLikeSecretPrompt, SECRET_PROMPT } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { AGENT, code, COOKED_MODE, EDITOR_MODE, HUMAN, OSC, ofType, scriptedSession as harness, tick, until } from './fake-shell.js';
 
@@ -1590,4 +1591,12 @@ test('m2-2: a prompt drawn on the screen is read by the cells left of the cursor
     await tick();
     await h.session.close();
   }
+});
+
+test('m2-2 and G26: the GUI asks the daemon’s question of the text left of its cursor (I94 in the house’s review of bc4bc85..5d8ce0e, PR #22; settled in comment 6394922501)', () => {
+  const app = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'gui', 'app.js'), 'utf8');
+  const literal = /^\s*const SECRET_PROMPT = \/(.+)\/([a-z]*);$/m.exec(app);
+  assert.ok(literal, 'gui/app.js declares SECRET_PROMPT as a regular expression literal');
+  const page = new RegExp(literal[1]!, literal[2]);
+  assert.deepEqual([page.source, page.flags], [SECRET_PROMPT.source, SECRET_PROMPT.flags], 'the page’s pattern is the daemon’s');
 });

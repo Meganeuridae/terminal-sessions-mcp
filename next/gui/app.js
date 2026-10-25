@@ -273,19 +273,14 @@
   // ───────────── typing: never queued, secret when asked or when it looks like a password prompt ─────────────
 
   /** A no-echo prompt's usual last line: `Password:`, `[sudo] password for x:`, `Enter passphrase for key …:`, `PIN:`. */
-  const SECRET_PROMPT = /(pass(word|phrase|code)?|\bpin\b|passcode|\botp\b|one-time code|verification code|secret|token)[^\n]{0,80}[:?]\s*$/i;
+  const SECRET_PROMPT = /(?:pass(?:word|phrase|code)|\bpins?\b|\bsecrets?\b|\btokens?\b|\botp\b|one[- ]time (?:password|code)|verification code|auth(?:entication)? code|\bapi[ _-]?key\b|\baccess key\b)[^\n]*:\s*$/i;
   const secret = { manual: false, auto: false };
 
   /**
    * The text left of the cursor on its row, the place the daemon's m2-2 also reads a prompt on the screen (the second of
    * `atSecretPrompt`'s two reads): what a row held before the prompt was printed over it can stay to the cursor's right.
    * Read whole, a row left so by readline's redraw for a resize took `Password: o "len=${#PW}"` for no prompt (a
-   * reviewer's read of the fixes for #22). The test on it is the page's own, not the daemon's. Among the differences,
-   * SECRET_PROMPT here takes `?` as well as `:`, `pass` alone or inside a word, and `secret` or `token` inside a word,
-   * which the daemon's doesn't; and it misses the daemon's `api key`, `access key` and `auth code`, and a keyword more
-   * than 80 characters before the colon. Nor does the page have the daemon's exemption for an idle prompt under rich
-   * shell integration, whose state it doesn't know, so a PS1 ending `token-service:` marks what is typed there secret
-   * (the house's review of bc4bc85..5d8ce0e, PR #22, I94).
+   * reviewer's read of the fixes for #22).
    */
   function textBeforeCursor() {
     if (!term) return '';

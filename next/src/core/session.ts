@@ -505,7 +505,7 @@ function flavorOf(command: string | undefined): ShellFlavor {
  * package-manager logins, `read -s -p "Password: "`). Evidence for redacting what is typed
  * next; measured against realistic prompts in session-round2.spec.
  */
-const SECRET_PROMPT =
+export const SECRET_PROMPT =
   /(?:pass(?:word|phrase|code)|\bpins?\b|\bsecrets?\b|\btokens?\b|\botp\b|one[- ]time (?:password|code)|verification code|auth(?:entication)? code|\bapi[ _-]?key\b|\baccess key\b)[^\n]*:\s*$/i;
 
 export const looksLikeSecretPrompt = (textBeforeCursor: string): boolean => SECRET_PROMPT.test(textBeforeCursor);
