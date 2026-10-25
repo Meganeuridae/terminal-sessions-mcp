@@ -45,7 +45,8 @@
  * ready`, left quiet, then ` FATAL` on the same line is unhealthy, where a ready that spent the line never saw the
  * FATAL. The cost is a ready prompt offered again as its line grows, tested for fail only. A line the other pipe ends
  * at a spent line's end is matched on its own (stdout's `ERROR a` matched quiet, then `ERROR b` and a LF on stderr,
- * are two matches).
+ * are two matches). A fail another reading completed at a line's place forbids a ready there, and the line is still
+ * tested for fail.
  */
 import { compileLinePattern, LineSplitter, type Begun, type SplitLine } from './ansi.js';
 import { headOnlyText, testBounded } from './regex.js';
@@ -333,7 +334,11 @@ export class ServiceMonitor {
    * 6357989601). The place's verdict now.
    */
   private onLines(texts: SplitLine[]): Verdict {
-    return this.onLine(texts, texts.reduce<Verdict>((v, line) => stronger(v, this.prompted.get(placeOf(line.begun, line))?.verdict), undefined));
+    return this.onLine(texts, texts.reduce<Verdict>((v, line) => stronger(v, this.prompted.get(placeOf(line.begun, line))?.verdict), this.forbidsReady(texts)));
+  }
+
+  private forbidsReady(lines: SplitLine[]): Verdict {
+    return lines.some((line) => this.completed.get(placeOf(line.begun, line))?.verdict === 'fail') ? 'ready' : undefined;
   }
 
   /**

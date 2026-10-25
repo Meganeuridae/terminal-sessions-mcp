@@ -592,6 +592,56 @@ test('a quiet prompt and the other readings\' open lines that hold its bytes are
   o.dispose();
 });
 
+test('a fail another reading completed at a line\'s place forbids a ready there, and the line is still tested for fail, whatever the timing (I7 in the house\'s review of bc4bc85..5d8ce0e, PR #22; settled in comment 6394922501)', async (t) => {
+  const unhealthy = (j: Journal) => j.since(0).events.flatMap((e) => (e.type === 'service' && e.status === 'unhealthy' ? [e.evidence] : []));
+  const f = fake('process');
+  const m = f.monitor({ ready: { pattern: 'READY' }, fail: { pattern: 'FATAL' } }, { partialAfterMs: 60_000 });
+  f.start();
+  f.out('READY\n', 'stdout');
+  f.out('READY FA', 'stdout');
+  f.out('FATAL\n', 'stderr');
+  assert.equal(m.status, 'unhealthy');
+  f.out(' OK\n', 'stdout');
+  assert.equal(m.status, 'unhealthy', 'stdout\'s `READY FA OK` began where the read\'s fail line did');
+  assert.deepEqual(f.statuses(), ['starting', 'ready', 'unhealthy']);
+  m.dispose();
+  const g = fake('process');
+  const n = g.monitor({ ready: { pattern: 'READY' }, fail: { pattern: 'FATAL' } }, { partialAfterMs: 30 });
+  const asked = offers(t, n);
+  g.start();
+  g.out('READY\n', 'stdout');
+  g.out('READY FA', 'stdout');
+  await until(() => asked.mock.callCount() >= 2, 2000, 'the read and stdout each offered `READY FA`');
+  g.out('FATAL\n', 'stderr');
+  g.out(' OK\n', 'stdout');
+  assert.equal(n.status, 'unhealthy');
+  assert.deepEqual(g.statuses(), ['starting', 'ready', 'unhealthy']);
+  n.dispose();
+  const h = fake('process');
+  const o = h.monitor({ ready: { pattern: 'READY' }, fail: { pattern: 'FATAL' } }, { partialAfterMs: 30 });
+  const both = offers(t, o);
+  h.start();
+  h.out('READY\n', 'stdout');
+  h.out('READY FA', 'stdout');
+  h.out('FATAL\n', 'stderr');
+  h.out(' OK', 'stdout');
+  await until(() => both.mock.callCount() >= 2, 2000, 'the read offered ` OK` and stdout `READY FA OK`');
+  h.out('\n', 'stdout');
+  assert.equal(o.status, 'unhealthy');
+  assert.deepEqual(h.statuses(), ['starting', 'ready', 'unhealthy']);
+  o.dispose();
+  const k = fake('process');
+  const q = k.monitor({ ready: { pattern: 'READY' }, fail: { pattern: 'FATAL' } }, { partialAfterMs: 60_000 });
+  k.start();
+  k.out('READY FA', 'stdout');
+  k.out('FATAL\n', 'stderr');
+  k.out(' FATAL\n', 'stdout');
+  assert.equal(q.info().repeats, 1, 'two fail lines, each once');
+  assert.deepEqual(unhealthy(k.journal), ['FATAL'], 'the first, as stderr wrote it');
+  assert.equal(q.info().evidence, 'READY FA FATAL', 'the second, as stdout wrote it');
+  q.dispose();
+});
+
 test('a service\'s lines are taken in the order their ends came, the read\'s and a pipe\'s interleaved (our review of the 73 commits through 4860d4c, PR #22)', () => {
   // stdout `FATAL`, stderr `x` and its LF (the read's `FATALx` ends), then stdout's LF, `READY` and LF: stdout's FATAL
   // ends before READY. The read's lines were all taken first, READY before FATAL, and the service ended unhealthy.
