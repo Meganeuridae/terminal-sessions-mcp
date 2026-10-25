@@ -641,7 +641,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // Fit: choose input for at most `budget` bytes, project, and take less input while
   // the text is over maxBytes (never cut the head of a head-first page: er-1, ux-1).
   const open = rangeOpen(src, o, run);
-  const hold = open && !scanCut;
+  const hold = scanCut ? 'scan' : open ? 'open' : undefined;
   // Lasting terminal state set before the page (a scroll region, the alternate screen, modes)
   // still applies to it: a page deep in apt's output keeps apt's scroll region (§6 rule 7, er-2).
   const firstOut = pieces.find((q): q is OutPiece => q.kind === 'out');
@@ -986,9 +986,11 @@ function safeBefore(pieces: Piece[], pos: Pos): Pos {
  * line, so the cursor stays a seq; else inside an event); else at the budget, at
  * a safe point (a line longer than the rest of the page: mid-line); else at any
  * line end. When everything fits and the range may go on (`hold`), a control
- * sequence left unfinished at the end waits for the next page, where its end is.
+ * sequence left unfinished at the end waits for the next page, where its end is:
+ * the range is open, or the scan stopped short of its end (`scan`), where the page
+ * still holds output before that sequence.
  */
-function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
+function choose(pieces: Piece[], budget: number, hold: 'open' | 'scan' | undefined): Chosen {
   const out = (i: number) => (pieces[i]?.kind === 'out' ? (pieces[i] as OutPiece) : undefined);
   let used = 0;
   let k = 0;
@@ -1082,6 +1084,8 @@ function choose(pieces: Piece[], budget: number, hold: boolean): Chosen {
     // Only the sequence waits when it is in the last output; an earlier source's open sequence defers
     // visible output after it too, which is `more`.
     cut = beforeOpen(undefined);
+    const first = pieces.findIndex((q) => q.kind === 'out');
+    if (hold === 'scan' && cut && (cut.j < first || (cut.j === first && cut.at === 0))) cut = undefined;
     held = cut !== undefined && !pieces.some((q, i) => i > cut!.j && q.kind === 'out');
   }
   if (cut && cut.at >= (out(cut.j)?.data.length ?? 0)) {

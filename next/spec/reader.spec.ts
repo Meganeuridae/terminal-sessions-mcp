@@ -2160,3 +2160,44 @@ test("rows a range's projection lost show in a read that ends before they were l
   assert.deepEqual(before.text!.split('\n'), ['top1', 'top2', 'r3', 'r4', 'r5', 'r6']);
   assert.match((await readJournal(src, { since: 0, as: 'raw' }, { resultBytes: 16384 })).text!, /r3\r\nr4/);
 });
+
+test('a page MAX_SCAN stopped under its budget ends before a control sequence still open, so the next page never shows its payload', async () => {
+  const src = source();
+  for (let i = 0; i < 19_999; i++) out(src.journal, 'y');
+  out(src.journal, 'x\x1b]0;tit');
+  out(src.journal, 'le\x07after\n');
+  const pages: ReadResult[] = [];
+  let since = 0;
+  let offset: number | undefined;
+  for (let guard = 0; guard < 10; guard++) {
+    const r = await readJournal(src, { since, ...(offset !== undefined ? { offset } : {}), maxBytes: 1 << 20 }, { resultBytes: 1 << 20 });
+    pages.push(r);
+    if (!r.more) break;
+    assert.ok(r.nextCursor > since || (r.nextOffset ?? 0) > (offset ?? 0), `a page makes progress: ${since}/${offset} → ${r.nextCursor}/${r.nextOffset}`);
+    since = r.nextCursor;
+    offset = r.nextOffset;
+  }
+  const shown = JSON.stringify(pages.map((p) => p.text?.slice(-16)));
+  assert.equal(pages.length, 2, shown);
+  assert.doesNotMatch(pages.map((p) => p.text).join(''), /tit|le/, shown);
+  assert.match(pages[1]!.text!, /after/, shown);
+});
+
+test('a page MAX_SCAN stopped inside one long control sequence still makes progress', async () => {
+  const src = source();
+  out(src.journal, '\x1b]0;');
+  for (let i = 0; i < 20_000; i++) out(src.journal, 't');
+  out(src.journal, '\x07after\n');
+  let since = 0;
+  let offset: number | undefined;
+  let last: ReadResult | undefined;
+  for (let guard = 0; guard < 10; guard++) {
+    last = await readJournal(src, { since, ...(offset !== undefined ? { offset } : {}), maxBytes: 1 << 20 }, { resultBytes: 1 << 20 });
+    if (!last.more) break;
+    assert.ok(last.nextCursor > since || (last.nextOffset ?? 0) > (offset ?? 0), `a page makes progress: ${since}/${offset} → ${last.nextCursor}/${last.nextOffset}`);
+    since = last.nextCursor;
+    offset = last.nextOffset;
+  }
+  assert.equal(last!.more, false);
+  assert.match(last!.text!, /after/);
+});
