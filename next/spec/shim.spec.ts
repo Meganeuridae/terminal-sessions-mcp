@@ -216,7 +216,7 @@ test('the stdio shim explains upgrade refusals without raw protocol text or a se
       [401, /ask.*operator.*TSM_TOKEN/i],
       [403, /ask.*operator.*(origin|proxy|url)/i],
       [421, /--allow-host.*restart/i],
-      [429, /wait.*retry/i],
+      [429, /refused another connection \(429\).*per-principal limit.*names the same principal.*runs without tokens, every client.*End connections you hold.*retry\. Otherwise ask its operator.*proxy in front of termd can answer 429/i],
       [503, /unavailable.*retry/i],
     ] as const) {
       status = code;

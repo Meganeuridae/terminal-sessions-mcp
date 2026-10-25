@@ -562,7 +562,7 @@ test('upgrade refusals give the agent an operator action without protocol text o
       [401, /ask.*operator.*token/i],
       [403, /ask.*operator.*(origin|proxy|url)/i],
       [421, /--allow-host.*restart/i],
-      [429, /per-principal.*close.*connections.*retry/i],
+      [429, /refused another connection \(429\).*per-principal limit.*names the same principal.*runs without tokens, every client.*End connections you hold.*retry\. Otherwise ask its operator.*proxy in front of termd can answer 429/i],
       [503, /unavailable.*retry/i],
     ] as const) {
       status = code;

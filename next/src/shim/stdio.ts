@@ -807,7 +807,7 @@ function explain(message: string): string {
   }
   if (status === '403') return 'the daemon refused this connection (403): ask its operator to check the configured URL, proxy and Origin policy before retrying';
   if (status === '421') return 'the daemon does not serve this Host (421): ask its operator for a served URL; remove a trailing dot if present. For another valid name, configure --allow-host and restart the running daemon';
-  if (status === '429') return 'the daemon refused another connection (429): wait until capacity is available, then retry';
+  if (status === '429') return `the daemon refused another connection (429): termd refuses one when the connections sharing this connection's principal reach its per-principal limit: with a token, every connection whose token names the same principal; without one, every client that sends none; and when termd runs without tokens, every client. End connections you hold to it and no longer need (another tsm run, a shim, a GUI tab), then retry. Otherwise ask its operator, who can free connections other clients hold; a proxy in front of termd can answer 429 too`;
   if (status === '503') return 'the daemon is unavailable or at its connection limit (503): wait until it is available, then retry';
   return message;
 }
