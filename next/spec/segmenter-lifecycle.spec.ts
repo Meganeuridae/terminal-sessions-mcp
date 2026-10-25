@@ -520,7 +520,7 @@ test('a long output cut to its tail keeps a torn line that is most of the budget
   startRun(src, 'lost');
   endRun(src, 'lost');
   await until(() => out.length === 1, 5000, 'the completion');
-  assert.match(out[0]!.body ?? '', /^\[… some rows of this output may have been lost as it was rendered · read session=s1 runId=lost as=raw for all of it\]\nr5\nr6\nX$/);
+  assert.match(out[0]!.body ?? '', /^\[… some rows of this output may have been lost as it was rendered · read session=s1 runId=lost as=events for all of it\]\nr5\nr6\nX$/);
   assert.equal(out[0]!.metadata.truncated, true);
   // Output the journal no longer has is in no read: its own note, apart from the rows a raw read has (the house's
   // review of bc4bc85..5d8ce0e, PR #22, I14, I15). Retention took the start of this one.
@@ -542,7 +542,7 @@ test('a long output cut to its tail keeps a torn line that is most of the budget
   await until(() => out.length === 1, 5000, 'the completion');
   assert.match(
     out[0]!.body ?? '',
-    /^\[… some of this output is gone from the journal, and no read shows it\]\n\[… some rows of this output may have been lost as it was rendered · read session=s1 runId=both as=raw for all of it\]\ntop1\ntop2\n/,
+    /^\[… some of this output is gone from the journal, and no read shows it\]\n\[… some rows of this output may have been lost as it was rendered · read session=s1 runId=both as=events for all of it\]\ntop1\ntop2\n/,
   );
   seg.dispose();
 });
