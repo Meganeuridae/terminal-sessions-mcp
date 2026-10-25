@@ -97,6 +97,13 @@ export interface SegmenterOptions {
   needsInputMs?: number;
 }
 
+/** `body` headed by the notes a Run's text owes its reader: rows the projection lost, and output the journal no longer has. */
+export function withLossNotes(t: Pick<RunText, 'lost' | 'gone'>, session: string, runId: string, body: string): string {
+  if (t.lost) body = `[… some rows of this output may have been lost as it was rendered · read session=${session} runId=${runId} as=events for all of it]\n${body}`;
+  if (t.gone) body = `[… some of this output is gone from the journal, and no read shows it]\n${body}`;
+  return body;
+}
+
 export interface RunText {
   text: string;
   /** Some of the output isn't in `text`: a cut omitted it, or it was lost. */
@@ -380,8 +387,7 @@ class Render {
     // can be one a program's redraw undid (RunText.lost). Output the journal no longer has is in no read at all
     // (RunText.gone). One note for both said "no read shows it" of rows a raw read has (the house's review of
     // bc4bc85..5d8ce0e, PR #22, I14, I15).
-    if (t.lost) body = `[… some rows of this output may have been lost as it was rendered · read session=${this.src.id} runId=${ev.runId} as=events for all of it]\n${body}`;
-    if (t.gone) body = `[… some of this output is gone from the journal, and no read shows it]\n${body}`;
+    body = withLossNotes(t, this.src.id, ev.runId, body);
     if (unreadable !== undefined) body = `[the Run's output could not be read: ${oneLine(unreadable, 160)} · read session=${this.src.id} runId=${ev.runId} to try again]`;
     const status =
       ev.state === 'exited'

@@ -14,7 +14,7 @@ import { err, TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import type { PlumbingOf } from '../core/plumbing.js';
 import { validateServiceSpec, type ServiceSpec } from '../core/probes.js';
-import { journalRunText, promptLine, Segmenter, type SegmenterOptions } from '../core/segmenter.js';
+import { journalRunText, promptLine, Segmenter, withLossNotes, type RunText, type SegmenterOptions } from '../core/segmenter.js';
 import { ServiceManager, type ServiceInfo } from '../core/services.js';
 import { isTerminal, serviceOutcomeKey, type Session, type SessionInfo } from '../core/session.js';
 import { cutTail, safeCut } from '../core/text.js';
@@ -1061,12 +1061,14 @@ export class App {
     let from: Seq;
     let to: Seq;
     let truncated = false;
+    let losses: Pick<RunText, 'lost' | 'gone'>;
     if (session) {
       const t = await session.runTranscript(run.runId);
       text = t.text;
       from = t.seq[0];
       to = t.seq[1];
       truncated = t.truncated;
+      losses = t;
     } else {
       // History is rendered by the one renderer the segmenter uses too: the plumbing a Run left in
       // the journal is cut by the strategy and nonce its run.start recorded, by shape only for a Run
@@ -1078,11 +1080,14 @@ export class App {
       from = t.seq[0];
       to = t.seq[1];
       truncated = t.truncated;
+      losses = t;
     }
     const cut = cutTail(text, this.resultBytes);
     // The read it advises names the session, which read requires: advised without it, the call was refused (an
     // independent read of the fixes for the review of the 40 commits, PR #22).
-    if (cut.cut) text = `[… earlier output omitted · read session=${s.kind === 'live' ? s.session.id : s.id} runId=${run.runId} pages through all of it]\n${cut.text}`;
+    const id = s.kind === 'live' ? s.session.id : s.id;
+    if (cut.cut) text = `[… earlier output omitted · read session=${id} runId=${run.runId} pages through all of it]\n${cut.text}`;
+    text = withLossNotes(losses, id, run.runId, text);
     return { text, truncated: truncated || cut.cut, seq: [from, to], nextCursor: to };
   }
 

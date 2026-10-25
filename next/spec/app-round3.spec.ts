@@ -937,3 +937,19 @@ test('a command line shortened for a result never splits a surrogate pair', asyn
   const r = await tool('run', { session: 'surrogate', command: `${prefix}\u{1F600} tail`, wait: 5000 });
   assert.equal(r.structured?.line, `${prefix}…(${Buffer.byteLength(`${prefix}\u{1F600} tail`)} bytes)`);
 });
+
+test('a Run whose output lost events to a hole says so in its result, as its completion does', async () => {
+  const s = 'holed';
+  await tool('session_open', { session: s });
+  const live = registry.get(s);
+  assert.ok(live?.kind === 'live');
+  const started = await tool('run', { session: s, command: "printf 'AAA\\n'; sleep 0.8; printf 'BBB\\n'", wait: 0 });
+  const runId = started.structured?.runId as string;
+  const j = live.session.journal;
+  await until(() => j.tail(50).some((e) => e.type === 'output' && e.runId === runId && String(e.data).includes('AAA')), 5000, 'the first line');
+  j.append({ type: 'gap', from: j.lastSeq + 1, to: j.lastSeq + 1, reason: 'store-error' });
+  const done = await tool('await', { session: s, runId, wait: 5000 });
+  const text = (done.structured?.output as { text: string } | undefined)?.text ?? '';
+  assert.match(text, /^\[… some of this output is gone from the journal, and no read shows it\]\n/, text);
+  assert.match(text, /BBB/, text);
+});
