@@ -30,7 +30,7 @@
  *   every pipe's open line written to since the read's line began, begun inside it or before it, and a pipe's with the
  *   read's line begun no later than the pipe's last write, and through it with the other pipe's. So stdout's `server
  *   ready` left quiet, then stderr's `FATAL` left quiet, is one line, the FATAL counted once as it is when stderr's LF
- *   ends both, not twice (an independent read of the fixes for PR #22 comment 6357989601). The one shape the two paths
+ *   ends both, not twice (an independent read of the fixes for PR #22 comment 6357989601). One shape the two paths
  *   read apart: two pipes each writing a fail line into one read line, stderr's `FATAL a` then stdout's `FATAL b`, is
  *   one fail when both are left quiet (the group marks stdout's place through the read's `FATAL aFATAL b`) and two when
  *   each ends at its own LF, by the first rule; the status is unhealthy either way, and only `repeats` and the latest
@@ -46,7 +46,7 @@
  * FATAL. The cost is a ready prompt offered again as its line grows, tested for fail only. A line the other pipe ends
  * at a spent line's end is matched on its own (stdout's `ERROR a` matched quiet, then `ERROR b` and a LF on stderr,
  * are two matches). A fail another reading completed at a line's place forbids a ready there, and the line is still
- * tested for fail.
+ * tested for fail. A twin's verdict counts for a quiet line only when it was given since the read's current line began.
  */
 import { compileLinePattern, LineSplitter, type Begun, type SplitLine } from './ansi.js';
 import { headOnlyText, testBounded } from './regex.js';
@@ -114,8 +114,11 @@ const stronger = (a: Verdict, b: Verdict): Verdict => (a === 'fail' || b === 'fa
 interface Twin {
   at: Begun | undefined;
   verdict: Verdict;
+  given: Begun;
   text?: string;
 }
+
+const before = (a: Begun, b: Begun): boolean => a.at < b.at || (a.at === b.at && a.offset < b.offset);
 
 /** Two places in a Run's output are one: the same event, and the same bytes into it. */
 const samePlace = (a: Begun | undefined, b: Begun): boolean => a !== undefined && a.at === b.at && a.offset === b.offset;
@@ -302,7 +305,7 @@ export class ServiceMonitor {
         const verdict = fresh.length > 0 ? this.onLines(fresh) : undefined;
         // A line the other reading holds open from where it began (stderr's `Password: `, the read's ended at stdout's
         // LF) is that reading's prompt's twin, or its completed line's when the text is the same.
-        for (const line of fresh) if (line.begun && this.heldOpen(line.begun)) this.completed.set(placeOf(line.begun, line), { at: line.begun, verdict, text: line.text });
+        for (const line of fresh) if (line.begun && this.heldOpen(line.begun)) this.completed.set(placeOf(line.begun, line), { at: line.begun, verdict, given: line.ended ?? this.now(), text: line.text });
       }
       this.pruneTwins();
     } else if (ev.type === 'run.start' && ev.runId === this.runId) {
@@ -360,16 +363,27 @@ export class ServiceMonitor {
     const at = placeOf(line.begun, line);
     const own = this.judged(at);
     if (own === 'fail') {
-      this.prompted.set(at, { at: line.begun, verdict: own });
+      const was = this.prompted.get(at)?.verdict === 'fail' ? this.prompted.get(at)! : this.completed.get(at)!;
+      this.prompted.set(at, { at: line.begun, verdict: own, given: was.given });
       return true;
     }
     // Its twins' places too: stdout's `READY FA` ended by stderr's LF in the read is the completed line stdout's open
     // `READY FATAL` continues, and the read's `TAL` offered first is that prompt's twin.
-    const twins = this.twins(r, line);
-    const sofar = twins.reduce<Verdict>((v, t) => stronger(v, this.judged(placeOf(t.begun, t))), own);
-    const verdict = this.onLine(r.pipe !== undefined ? [line, ...twins] : [...twins, line], sofar);
-    for (const l of [line, ...twins]) this.prompted.set(placeOf(l.begun, l), { at: l.begun, verdict });
+    const { lines: twins, began } = this.twins(r, line);
+    const counted = twins.filter((t) => !began || !this.older(placeOf(t.begun, t), began));
+    const sofar = counted.reduce<Verdict>((v, t) => stronger(v, this.judged(placeOf(t.begun, t))), own);
+    const verdict = this.onLine(r.pipe !== undefined ? [line, ...counted] : [...counted, line], sofar);
+    const given = this.now();
+    for (const l of [line, ...counted]) this.prompted.set(placeOf(l.begun, l), { at: l.begun, verdict, given });
     return verdict === 'fail';
+  }
+
+  private now(): Begun {
+    return { at: this.lines?.last ?? 0, offset: Number.POSITIVE_INFINITY };
+  }
+
+  private older(at: string, since: Begun): boolean {
+    return [this.prompted.get(at), this.completed.get(at)].some((t) => t?.verdict !== undefined && before(t.given, since));
   }
 
   /** What a place has been judged so far, as a quiet prompt (prompted) or as a line one reading completed (completed). */
@@ -388,15 +402,15 @@ export class ServiceMonitor {
    * comment 6357989601). The whole group at once: stdout's `x` paired with the read's `Passxword: ` alone matched
    * ready, where stderr's `Password: `, the read's other twin, fails.
    */
-  private twins(r: Reading, line: SplitLine): SplitLine[] {
+  private twins(r: Reading, line: SplitLine): { lines: SplitLine[]; began: Begun | undefined } {
     const read = this.lines;
     const began = r.pipe === undefined ? line.begun : read?.splitter.opened();
-    if (!read || !began || (r !== read && (r.last === undefined || r.last < began.at))) return [];
+    if (!read || !began || (r !== read && (r.last === undefined || r.last < began.at))) return { lines: [], began };
     const open = (o: Reading): SplitLine[] => {
       const t = o === r ? undefined : o.splitter.peek();
       return t ? [t] : [];
     };
-    return [...[...this.pipes.values()].filter((p) => p.last !== undefined && p.last >= began.at).flatMap(open), ...open(read)];
+    return { lines: [...[...this.pipes.values()].filter((p) => p.last !== undefined && p.last >= began.at).flatMap(open), ...open(read)], began };
   }
 
   /** A completed line the other reading completed already, begun at the same place with the same text. */

@@ -642,6 +642,35 @@ test('a fail another reading completed at a line\'s place forbids a ready there,
   q.dispose();
 });
 
+test('a quiet line\'s twin counts its verdict only when it was given since the read\'s current line began (I28 in the house\'s review of bc4bc85..5d8ce0e, PR #22; settled in comment 6394922501)', async (t) => {
+  const shape = async (last: string) => {
+    const f = fake('process');
+    const m = f.monitor({ ready: { pattern: 'READY' }, fail: { pattern: 'FATAL' } }, { partialAfterMs: 30 });
+    const offered = offers(t, m);
+    const offeredText = (text: string) => offered.mock.calls.some((c) => (c.arguments[1] as { text: string }).text.trim() === text.trim());
+    f.start();
+    f.out('READY\n', 'stdout');
+    f.out('FATAL x', 'stderr');
+    await until(() => m.status === 'unhealthy', 2000, 'stderr\'s quiet `FATAL x`');
+    f.out('READY\n', 'stdout');
+    assert.equal(m.status, 'ready', 'recovered');
+    f.out(' more', 'stderr');
+    await until(() => offeredText(' more'), 2000, 'the read offered ` more`');
+    f.out(last, 'stdout');
+    await until(() => offeredText(last), 2000, `stdout offered \`${last}\``);
+    return { f, m };
+  };
+  const { f, m } = await shape('FATAL y');
+  assert.equal(m.status, 'unhealthy', 'FATAL y is reported');
+  assert.equal(m.info().evidence, 'FATAL y', 'as stdout wrote it');
+  assert.deepEqual(f.statuses(), ['starting', 'ready', 'unhealthy', 'ready', 'unhealthy']);
+  m.dispose();
+  const { f: g, m: n } = await shape('hello');
+  assert.equal(n.status, 'ready', 'nothing new failed');
+  assert.deepEqual(g.statuses(), ['starting', 'ready', 'unhealthy', 'ready']);
+  n.dispose();
+});
+
 test('a service\'s lines are taken in the order their ends came, the read\'s and a pipe\'s interleaved (our review of the 73 commits through 4860d4c, PR #22)', () => {
   // stdout `FATAL`, stderr `x` and its LF (the read's `FATALx` ends), then stdout's LF, `READY` and LF: stdout's FATAL
   // ends before READY. The read's lines were all taken first, READY before FATAL, and the service ended unhealthy.
