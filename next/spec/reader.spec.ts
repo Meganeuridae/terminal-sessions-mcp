@@ -2201,3 +2201,29 @@ test('a page MAX_SCAN stopped inside one long control sequence still makes progr
   assert.equal(last!.more, false);
   assert.match(last!.text!, /after/);
 });
+
+test("a page that starts with a control sequence takes another Run's sequence left open through the hole that ends it, or through all that was collected", async () => {
+  for (const hole of [false, true]) {
+    const src = source({ cols: 2000 });
+    startRun(src.journal, 'r1');
+    startRun(src.journal, 'r2');
+    out(src.journal, '\x1b[3', 'stdout', 'r1');
+    out(src.journal, 'y\x1b[4', 'stdout', 'r2');
+    out(src.journal, `${'P'.repeat(1500)}\n`);
+    out(src.journal, '1mRED\x1b[0m\n', 'stdout', 'r1');
+    const gap = hole ? src.journal.append({ type: 'gap', from: src.journal.lastSeq + 1, to: src.journal.lastSeq + 1, reason: 'store-error' }).seq : undefined;
+    out(src.journal, `${'Q'.repeat(100)}\n`);
+    const collected = src.journal.lastSeq;
+    const p1 = await readJournal(src, { since: 0, maxBytes: 1024 }, { resultBytes: 1 << 20 });
+    out(src.journal, '2mBLUE\x1b[0m\n', 'stdout', 'r2');
+    const p2 = await readJournal(src, { since: p1.nextCursor, ...(p1.nextOffset !== undefined ? { offset: p1.nextOffset } : {}), maxBytes: 1024 }, { resultBytes: 1 << 20 });
+    const shown = `${hole ? 'hole' : 'no hole'}: ${JSON.stringify([p1.text?.slice(-40), p1.nextCursor, p1.nextOffset, p2.text?.slice(0, 80)])}`;
+    assert.equal(p1.nextCursor, gap ?? collected, shown);
+    assert.equal(p1.nextOffset, undefined, shown);
+    assert.doesNotMatch(`${p1.text}${p2.text}`, /1mRED|\[3/, shown);
+    if (!hole) {
+      assert.doesNotMatch(`${p1.text}${p2.text}`, /2mBLUE|\[4/, shown);
+      assert.match(`${p1.text}${p2.text}`, /RED[^]*BLUE/, shown);
+    }
+  }
+});
