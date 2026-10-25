@@ -464,6 +464,7 @@ const envFilesOf = (out: string): string[] => [...out.matchAll(/^EnvironmentFile
  * that keeps the old file's times (cp -p, rsync -a, a rename of an older file) sets mtime back, which went
  * unseen, while the kernel sets ctime at each change and a copy cannot set it back. A chmod or chown counts
  * as a change too, which errs towards not starting a termd here (the house's review of bc4bc85..5d8ce0e, #22).
+ * A link's own times count beside its target's.
  */
 function unitChanged(pid: number, prop: (k: string) => string, out: string): string {
   if (prop('NeedDaemonReload') === 'yes') return 'systemd says the unit needs a daemon-reload';
@@ -477,8 +478,15 @@ function unitChanged(pid: number, prop: (k: string) => string, out: string): str
   for (const file of files) {
     let changedMs: number;
     try {
-      const st = fs.statSync(file);
-      changedMs = Math.max(st.mtimeMs, st.ctimeMs);
+      const link = fs.lstatSync(file);
+      let st = link;
+      if (link.isSymbolicLink())
+        try {
+          st = fs.statSync(file);
+        } catch {
+          st = link;
+        }
+      changedMs = Math.max(st.mtimeMs, st.ctimeMs, link.mtimeMs, link.ctimeMs);
     } catch {
       continue;
     }

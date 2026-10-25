@@ -1096,6 +1096,9 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   const unedited = path.join(tmp, 'unedited-termd.service');
   fs.writeFileSync(unedited, '[Service]\n');
   fs.utimesSync(unedited, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
+  const olderTarget = path.join(tmp, 'older-target-termd.env');
+  fs.writeFileSync(olderTarget, 'TSM_PORT=3101\n');
+  fs.utimesSync(olderTarget, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
   const toldDir = path.join(tmp, 'sup-data-dir-told-by-the-running-termd');
   const told = linux ? await liveTermd(toldDir) : undefined;
   // A termd that requires a credential: it tells the shim, whose own goes once the socket is shown to be the termd's.
@@ -1150,6 +1153,9 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   fs.utimesSync(keptEnv, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
   // An optional environment file that is there, so that it may set what the unit's termd reads.
   fs.writeFileSync(path.join(tmp, 'termd.env'), '');
+  const repointed = path.join(tmp, 'repointed-termd.env');
+  fs.symlinkSync(olderTarget, repointed);
+  fs.lutimesSync(repointed, new Date(Date.now() + 600_000), new Date(Date.now() + 600_000));
   const absentEnv = path.join(tmp, 'absent-optional-termd.env');
   const closedDir = path.join(tmp, 'closed');
   fs.mkdirSync(closedDir);
@@ -1237,6 +1243,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     { name: 'next-start-awaits-a-daemon-reload', when: told !== undefined, stub: () => unitStub({ port: 3101, dataDir: '/srv/next-start', needReload: true, mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(systemd says the unit needs a daemon-reload\), could not be read \(its file on disk awaits a daemon-reload, [^)]*\), so the port its next start takes is unknown: none is started here/ },
     // An environment file edited in place is read by the next start with no daemon-reload, and says nothing to systemd.
     { name: 'next-start-environment-file-newer', when: told !== undefined, stub: () => unitStub({ port: 'none', dataDir: '/srv/next-start', envFiles: [`${editedEnv} (ignore_errors=no)`], mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+edited-termd\.env was changed after its start\), names no --port and reads EnvironmentFile=\S+edited-termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so the port its next start takes is unknown: none is started here/ },
+    { name: 'next-start-environment-file-link-repointed', when: told !== undefined, stub: () => unitStub({ port: 'none', dataDir: toldDir, envFiles: [`${repointed} (ignore_errors=no)`], mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+repointed-termd\.env was changed after its start\), names no --port and reads EnvironmentFile=\S+repointed-termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so the port its next start takes is unknown: none is started here/ },
     { name: 'next-start-environment-file-replaced-with-its-times-kept', when: told !== undefined, stub: () => unitStub({ port: 'none', dataDir: toldDir, envFiles: [`${keptEnv} (ignore_errors=no)`], mainPid: told!.pid }), expect: 'managed', says: /the systemd user unit termd's text, which may have changed since its running termd started \(\S+kept-times-termd\.env was changed after its start\), names no --port and reads EnvironmentFile=\S+kept-times-termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so the port its next start takes is unknown: none is started here/ },
     // An optional environment file that is gone gives the next start nothing, as systemd skips it. Read as one that may
     // set anything, the next start's port was unknown, nothing was compared, and a file removed since its termd started,
