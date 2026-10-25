@@ -1570,3 +1570,28 @@ test('m2-2: the secret-prompt test on realistic prompts (false positives measure
   assert.deepEqual(missed, [], 'every secret prompt is recognised');
   assert.deepEqual(falsePositives, [], `false positives: ${falsePositives.length}/${ordinary.length}`);
 });
+
+test('m2-2: a prompt drawn on the screen is read by the cells left of the cursor, so a wide character before it pulls in no text from its right', async () => {
+  // A full-screen prompt drawn over a row that held other text, then a status line elsewhere, then the cursor back
+  // after the prompt: the last line printed ends with the status line, so only the screen's read can see the prompt.
+  // '認証' takes two cells a character, so the row's string read to the cursor's column would take two characters
+  // of what the row held before. The first case, one cell a character, is the control.
+  for (const [prompt, cursorCol] of [['Old Password: ', 15], ['認証 Password: ', 16]] as const) {
+    const draw = '\x1b[10;1H' + 'x'.repeat(30) + '\x1b[10;1H' + prompt + '\x1b[30;1Hstatus: waiting' + `\x1b[10;${cursorCol}H`;
+    assert.equal(looksLikeSecretPrompt(draw.replace(/\x1b\[[0-9;]*H/g, '')), false, 'premise: the last line printed is no prompt');
+    const h = await harness({ setup: (s) => s.on(/^unlock/, () => ({ output: draw, hang: true })) });
+    const a = h.session.admit({ target: 'shell', line: 'unlock vault', principal: AGENT });
+    assert.ok(a.admitted);
+    await h.session.screen.settled();
+    const snap = h.session.screen.snapshot();
+    assert.deepEqual(snap.cursor, { x: cursorCol - 1, y: 9 }, 'premise: the cursor sits right after the prompt');
+    assert.ok(snap.lines[9]!.startsWith(prompt) && snap.lines[9]!.endsWith('x'), `premise: the row keeps text right of the prompt: ${snap.lines[9]}`);
+    h.session.releaseControl(AGENT);
+    for (const ch of 'hunter2') h.session.input(ch, { principal: HUMAN });
+    const inputs = ofType(h.journal.since(0).events, 'input').filter((e) => e.principal === HUMAN);
+    assert.ok(inputs.length > 0 && inputs.every((e) => e.data === '[redacted]' && e.sensitive === true), `${prompt}: ${JSON.stringify(inputs.map((e) => e.data))}`);
+    h.shell.finishHung(0, '\r\n');
+    await tick();
+    await h.session.close();
+  }
+});
