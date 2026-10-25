@@ -922,8 +922,6 @@ test('6307351617 5: a declared Run typed but not started carries its nonce, so i
 });
 
 test('a probe answer with a Run’s nonce and an empty pid stays out of the logs, inline with the Run’s token or none, and the marker strategy’s', async () => {
-  // macOS CI on #22 at 1c88566: a Run's history held `^\<<<PROBE:nonce::nonce>>>`, an answer whose pid came out empty after the
-  // cancel's ^\. The logs took a probe's answer by the session's shape, which takes a pid only as digits, so it kept that line.
   const opened = await call('runCommand', { session: 'emptypid', command: 'cat', timeout: -1 });
   await until(() => summary('emptypid')?.runs?.some((x) => x.runId === opened.runId && x.state === 'running') === true, 5000, 'cat in front');
   await call('session_declare_shell', { session: 'emptypid', shell: 'sh' });

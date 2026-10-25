@@ -139,9 +139,7 @@ async function runOutput(ctx: ToolContext, session: string, runId: string, raw: 
  * cutter's own matcher (keptLines). 1.x kept these out of its logs and logged `$ <command>` in their
  * place (the house's read of 1cabc6a, #22). The inline strategy's body, its start mark and its
  * pieces' marks reached the logs while this held a copy of the marker strategy's shapes alone, and
- * that copy had no line for fish's marker strategy (a reviewer's read of the fixes for #22). A probe's
- * answer is the cut's shape (probeAnswerMark), an answer whose pid came out empty included, which the
- * session's own shape (probeMark) passes over (macOS CI on #22 at 1c88566).
+ * that copy had no line for fish's marker strategy (a reviewer's read of the fixes for #22).
  */
 const PLUMBING = new RegExp([sourceLineEcho(), inlineTypedLine(), startMark(), exitMark(), probeAnswerMark(), ackMark(), goneMark()].map((re) => re.source).join('|'), 'g');
 

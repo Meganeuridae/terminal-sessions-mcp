@@ -743,16 +743,12 @@ test('a marker probe names the shell that answered it: an answer from another pi
 });
 
 test('a probe answer with the Run’s nonce and an empty pid is no shell’s: struck and no end, inline with the Run’s token or none, and under the marker strategy', () => {
-  // macOS CI on #22 at 1c88566: the nested-shell spec's history held `^\<<<PROBE:nonce::nonce>>>`, an answer whose pid came out
-  // empty after the cancel's ^\, which the cut did not read as an answer at all, so it stayed in the Run's text. Why the pid came
-  // out empty there is not known.
   const inline = { strategy: 'inline' as const, nonce: N };
   for (const answer of [`<<<PROBE:${N}::${N}>>>`, `<<<PROBE:${N}::>>>`]) {
     const raw = `\r\nA\r\n$ ^C\r\n$ ${inlineProbe(N, false)}\r\n$ ^\\${answer}\r\nB\r\n<<<EXIT:${N}:0>>>`;
     assert.equal(cutPlumbing(raw, inline), 'A\r\n$ ^C\r\nB\r\n', `${answer}, no pid known`);
     assert.equal(cutPlumbing(raw, { ...inline, pid: '1000' }), 'A\r\n$ ^C\r\nB\r\n', `${answer}, the shell's pid known`);
   }
-  // The marker strategy's probe has no fallback for its pid, so a lookup that fails leaves it empty the same way.
   const marker = { strategy: 'marker' as const, nonce: N };
   const start = `${sourceLine('/tmp/tsm-501/abc/tsm-cmd-1', 'posix', N)}\r\n<<<START:${N}:4242>>>\r\nout\r\n`;
   assert.equal(cutPlumbing(`${start}^C${markerProbe(N)}\r\n<<<PROBE:${N}:>>>\r\nmore\r\n<<<EXIT:${N}:0>>>\r\n`, marker), 'out\r\nmore\r\n');
