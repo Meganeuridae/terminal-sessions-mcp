@@ -174,8 +174,12 @@ test('/bin/bash: shell-10: after a bind -x widget at the prompt, the next daemon
   // leaves stale mislabel the daemon's own line (its 633;E comes from BASH_COMMAND).
   const x = await realSession('/bin/bash', { rc: { '.bashrc': `bind -x '"\\C-t": echo widget-ran'\n` }, login: false });
   try {
-    assert.equal((await x.run('echo before')).text, 'before');
-    const shown = () => x.journal.since(0).events.flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
+    const before = await x.run('echo before');
+    assert.equal(before.text, 'before');
+    const events = () => x.journal.since(0).events;
+    const shown = () => events().flatMap((e) => (e.type === 'output' ? [e.data] : [])).join('');
+    const ended = () => events().find((e) => e.type === 'run.end' && e.runId === before.runId)?.seq ?? Number.POSITIVE_INFINITY;
+    await until(() => events().some((e) => e.type === 'prompt' && e.phase === 'end' && e.seq > ended()), 5000, 'the prompt drawn after the Run');
     x.session.input('\x14', { principal: 'agent:a@test' });
     await until(() => shown().includes('widget-ran'), 5000, 'the widget ran');
     // Its output, which its echoed line doesn't hold, and not a Run of its own: on bash 3.2 the widget's command
