@@ -405,9 +405,11 @@ class Projector {
   /**
    * `pending` when the program last saved its cursor (DECSC, SCOSC, mode 1048): the projection saved its cursor that many
    * rows below the terminal's, so restoring both puts it that far ahead again (onCursorRestore). Counted from that save,
-   * whatever moved the cursors since; a settle starts it afresh with the rest of the account.
+   * whatever moved the cursors since; a settle starts it afresh with the rest of the account, but a DECSTBM's keeps it,
+   * and the rows owed between the two saved cursors.
    */
   private savedPending = 0;
+  private savedRow = 0;
   /** The cursor-motion handlers, while a row is pending or a saved cursor carries one (watchCursor). */
   private cursorWatch: Array<{ dispose(): void }> | undefined;
   /**
@@ -504,8 +506,11 @@ class Projector {
     // Its source owns the margins from here on, so the rows a batch of its begins after this are its terminal's.
     this.batchFrom = undefined;
     const now = this.margins();
-    if (top - 1 !== now.top || bottom - 1 !== now.bottom) this.settle();
-    else {
+    if (top - 1 !== now.top || bottom - 1 !== now.bottom) {
+      const gap = [...this.owed].filter((r) => r > this.savedRow - this.savedPending && r <= this.savedRow);
+      this.settle(this.savedPending);
+      for (const r of gap) this.owed.add(r);
+    } else {
       this.pending = 0;
       this.watchCursor();
     }
@@ -520,13 +525,13 @@ class Projector {
    * screen entered over a normal screen the projection rebuilt (onAltEnter), after which such a row never comes back
    * the way the program's own scrolls bring the two screens together again.
    */
-  private settle(): void {
+  private settle(savedPending = 0): void {
     if (this.ahead.includes(true)) this.lost = true;
     this.ahead = [];
     this.owed.clear();
     this.blank.clear();
     this.pending = 0;
-    this.savedPending = 0;
+    this.savedPending = savedPending;
     this.watchCursor();
     this.generation++;
   }
@@ -631,6 +636,7 @@ class Projector {
   private onCursorSave(): boolean {
     if (!this.others && this.term.buffer.active.type === 'normal') {
       this.savedPending = this.pending;
+      this.savedRow = this.term.buffer.active.cursorY;
       this.watchCursor();
     }
     return false;

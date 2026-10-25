@@ -1136,6 +1136,23 @@ test('a cursor the program saves and restores is as far ahead of the terminal’
   assert.deepEqual((await read([short, { hole: true }, erased])).slice(1), [false, undefined], 'saved ahead, then erased');
 });
 
+test('margins changed between a save and a restore leave the restored cursor as far ahead of the terminal’s as when it was saved, and an erase, the alternate screen or a reset in between leaves it not ahead (the house’s review of 5d8ce0e..21fed2f, PR #22, I29)', async () => {
+  const read = async (chunks: ProjectChunk[]) => {
+    const p = await project(chunks, { cols: 20, rows: 10 });
+    return [p.text.split('\n'), p.truncated, p.lost];
+  };
+  const short = '\x1b[3;6r\x1b[1;1Htop1\r\ntop2\r\nr3\r\nr4';
+  for (let n = 1; n <= 5; n++) {
+    const lines = 'ABCDE'.slice(0, n).split('').map((c) => `${c}\r\n`).join('');
+    const unchanged = await read([short, { hole: true }, `\x1b7\x1b8${lines}`]);
+    assert.equal(unchanged[2], n === 2 || n === 3 ? true : undefined, `${n} lines, the margins unchanged`);
+    assert.deepEqual(await read([short, { hole: true }, `\x1b7\x1b[3;7r\x1b[3;6r\x1b8${lines}`]), unchanged, `${n} lines, the margins changed and back`);
+  }
+  for (const [what, between] of [['ED 2', '\x1b[2J'], ['1047', '\x1b[?1047halt\x1b[?1047l'], ['1049', '\x1b[?1049halt\x1b[?1049l'], ['RIS', `\x1bc${short}`]] as const) {
+    assert.equal((await read([short, { hole: true }, `\x1b7${between}\x1b8A\r\nB\r\nC\r\nD\r\nE\r\nF\r\n`]))[2], undefined, `${what} in between: the projection lacks nothing the terminal shows`);
+  }
+});
+
 test('margins the replayed state set have no known owner: no source’s scroll of them is reported, the projection’s own line ends still are', async () => {
   // The house's review of 4860d4c..bc4bc85 (PR #22, comment 6357989601, "Who owns replayed margins"): fed as the first
   // source's output, the margins set before a page were that source's, and the loss of their rows was told the wrong way
