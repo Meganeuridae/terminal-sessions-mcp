@@ -105,9 +105,9 @@ const TAG_ONTOLOGY = {
     { tagsAny: ['terminal:run-finished', 'terminal:run-lost', 'terminal:service-ready', 'terminal:service-running', 'terminal:missed'], behavior: 'immediate' },
     // A person's typed line is held like ordinary output, not a wake: an agent sharing a terminal with someone in a
     // long interactive session would otherwise run inference on every line (Aster's call, 2026-10-24). A host that
-    // wants it as a wake can key on `chat:from-human`, which the same message carries. Like all ambient messages, it
-    // reaches a host only on an open channel (`terminal.channels`, with `terminal:<session>` open), so only a host
-    // following the session that way is woken by it (the house's review of bc4bc85..5d8ce0e, PR #22).
+    // wants it as a wake can key on `chat:from-human`, which the same message carries. Like every message that isn't a
+    // lifecycle one, it reaches a host only on an open channel (`terminal.channels`, with `terminal:<session>` open), so
+    // only a host following the session that way is woken by it (the house's review of bc4bc85..5d8ce0e, PR #22).
     { tagsAny: ['terminal:output', 'terminal:screen', 'terminal:control', 'terminal:note', 'terminal:human-input'], behavior: 'throttle' },
   ],
   open: true,
