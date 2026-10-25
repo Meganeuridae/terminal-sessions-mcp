@@ -15,8 +15,9 @@ stream, as in 1.x; a process Run keeps stdout and stderr apart. It is in [`next/
 guarantees in [`docs/redesign/DESIGN.md`](docs/redesign/DESIGN.md). Its binaries are `termd`,
 `tsm` and `tsm-shim`. Everything below is about the 1.x binaries (`terminal-sessions-mcp`,
 `session-server`, `session-gui`, `session-cli`), which run 1.x. 2.0 changes none of their code; what
-reaches them is the package manifest they share with 2.0: a narrower Node range (`engines`) and `ws`
-pinned at 8.21.3, inside 1.x's `^8.16.0`.
+reaches them is the package manifest they share with 2.0: a narrower Node range (`engines`), `ws`
+pinned at 8.21.3, inside 1.x's `^8.16.0`, and puppeteer 25 (`^25.16.0`, from `^24.29.1`), which 1.x's
+screenshot path loads.
 
 ## Why This Matters
 

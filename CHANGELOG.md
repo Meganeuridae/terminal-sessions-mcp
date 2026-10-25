@@ -7,7 +7,8 @@ beside the 1.x session server, MCP bridge, GUI and CLI. It lives in `next/`; its
 `termd`, `tsm` and `tsm-shim`. Nothing of 1.x is removed or renamed: `terminal-sessions-mcp`,
 `session-server`, `session-gui` and `session-cli` run 1.x, on ports 3100 and 3200. 2.0 changes none
 of their code; what reaches them is the package manifest they share with 2.0: a narrower Node range
-(`engines`) and `ws` pinned at 8.21.3, inside 1.x's `^8.16.0`. `termd` listens on 3101 by default
+(`engines`), `ws` pinned at 8.21.3, inside 1.x's `^8.16.0`, and puppeteer 25
+(`^25.16.0`, from `^24.29.1`), which 1.x's screenshot path loads. `termd` listens on 3101 by default
 (it takes `SESSION_SERVER_PORT` when neither `--port` nor `TSM_PORT` is set, so a shell that exports
 it for the 1.x server points `termd` at that port too: `next/README.md`, "Upgrading from 1.x").
 Making 2.0 the default — the 1.x names pointing at the shim and `termd`, the 1.x code retired — is a

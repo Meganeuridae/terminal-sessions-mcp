@@ -3,8 +3,9 @@
 > 2.0 lives in `next/`, beside the 1.x code this package has shipped so far. Both are in the
 > package: `termd`, `tsm` and `tsm-shim` are 2.0; `terminal-sessions-mcp`, `session-server`,
 > `session-gui` and `session-cli` are 1.x. 2.0 changes none of their code; what reaches them is the
-> package manifest they share with 2.0: a narrower Node range (`engines`) and `ws` pinned at 8.21.3,
-> inside 1.x's `^8.16.0`. The design discussion is
+> package manifest they share with 2.0: a narrower Node range (`engines`), `ws` pinned at 8.21.3,
+> inside 1.x's `^8.16.0`, and puppeteer 25 (`^25.16.0`, from `^24.29.1`), which 1.x's screenshot
+> path loads. The design discussion is
 > [antra-tess/terminal-sessions-mcp#11](https://github.com/antra-tess/terminal-sessions-mcp/pull/11).
 
 Persistent terminal sessions for agents and humans: a daemon that keeps shells alive,
@@ -296,7 +297,8 @@ stderr with exit 1, `--json` or not. `TSM_URL` and `TSM_TOKEN` point it at a dae
 (`termd`, port 3101) and thin clients (`tsm`, `tsm-shim`). The 1.x binaries
 (`terminal-sessions-mcp`, `session-server`, `session-gui`, `session-cli`) run 1.x. 2.0 changes none
 of their code; what reaches them is the package manifest they share with 2.0: a narrower Node range
-(`engines`) and `ws` pinned at 8.21.3, inside 1.x's `^8.16.0`. When 2.0 becomes the default,
+(`engines`), `ws` pinned at 8.21.3, inside 1.x's `^8.16.0`, and puppeteer 25
+(`^25.16.0`, from `^24.29.1`), which 1.x's screenshot path loads. When 2.0 becomes the default,
 `terminal-sessions-mcp` will point at the shim that serves the 1.x tool names (`runCommand`,
 `tailLogs`, `sendInput`, …; the entry `next/src/shim/compat.ts`, the tools
 `next/src/api/compat.ts`), where `runCommand`'s result also says when a command is still running or
