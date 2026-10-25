@@ -24,7 +24,7 @@ import type { Journal } from './journal.js';
 import { firstOutputMayBeGone, journalLost, type RunOutput } from './runindex.js';
 import { cutPlumbing, runEcho, startMark } from './plumbing.js';
 import { looksLikeSecretPrompt } from './session.js';
-import { lineCarry, lineEnds, pastSequence, tailStart, unfinishedSequence, type LineCarry } from './text.js';
+import { lineCarry, lineEnds, pastSequence, safeCut, tailStart, unfinishedSequence, type LineCarry } from './text.js';
 import { headOnlyText } from './regex.js';
 import { minusRanges } from './ranges.js';
 import { project, runChunks } from './transcript.js';
@@ -223,7 +223,7 @@ const fmtDuration = (ms: number) => (ms >= 60_000 ? `${Math.floor(ms / 60_000)}m
 export const fmtBytes = (n: number) => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MiB` : n >= 1024 ? `${(n / 1024).toFixed(1)} KiB` : `${n} B`);
 export const oneLine = (s: string, max = 120) => {
   const t = s.replace(/\s+/g, ' ').trim();
-  return t.length > max ? t.slice(0, max - 1) + '…' : t;
+  return t.length > max ? t.slice(0, safeCut(t, max - 1)) + '…' : t;
 };
 export const isDone = (s: RunInfo['state']) => s === 'exited' || s === 'cancelled' || s === 'lost';
 const describeRun = (run: RunInfo) => oneLine(run.line ?? run.argv?.join(' ') ?? run.runId, 100);

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { Journal } from '../src/core/journal.js';
 import { MemoryStore } from '../src/core/stores.js';
 import { sourceLine } from '../src/core/plumbing.js';
-import { liveSource, renderPicked, scanLifecycle, Segmenter, type Segment, type SegmentSource } from '../src/core/segmenter.js';
+import { liveSource, oneLine, renderPicked, scanLifecycle, Segmenter, type Segment, type SegmentSource } from '../src/core/segmenter.js';
 import type { RunInfo, ScreenSnapshot } from '../src/core/types.js';
 import { sleep, until } from './testhost.js';
 
@@ -327,6 +327,11 @@ test('a count of what is new is a lower bound for a read before a hole in the ou
   assert.equal(empty.seg.unreadBytes('empty', 0)!.atLeast, true, `no output counted: ${JSON.stringify(empty.seg.unreadBytes('empty', 0))}`);
   const gone = await counted('gone', ['one\n', 'FLOOD'], new Journal({ hot: new MemoryStore(4096) }));
   assert.equal(gone.seg.unreadBytes('gone', 0)!.atLeast, true, `all of it taken by retention: ${JSON.stringify(gone.seg.unreadBytes('gone', 0))}`);
+});
+
+test('a line shortened for a descriptor never splits a surrogate pair', () => {
+  const short = oneLine(`${'y'.repeat(118)}\u{1F600}z`, 120);
+  assert.equal(short, `${'y'.repeat(118)}…`);
 });
 
 test('an inline Run’s progress digest shows its partial line: its output begins after its start mark, so nothing waits for one', async (t) => {

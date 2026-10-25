@@ -931,3 +931,9 @@ test('the 33 commits 7: a recovered key stamped old behind a younger one is drop
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a command line shortened for a result never splits a surrogate pair', async () => {
+  const prefix = `: ${'x'.repeat(197)}`;
+  const r = await tool('run', { session: 'surrogate', command: `${prefix}\u{1F600} tail`, wait: 5000 });
+  assert.equal(r.structured?.line, `${prefix}…(${Buffer.byteLength(`${prefix}\u{1F600} tail`)} bytes)`);
+});

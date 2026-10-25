@@ -17,7 +17,7 @@ import { validateServiceSpec, type ServiceSpec } from '../core/probes.js';
 import { journalRunText, promptLine, Segmenter, type SegmenterOptions } from '../core/segmenter.js';
 import { ServiceManager, type ServiceInfo } from '../core/services.js';
 import { isTerminal, serviceOutcomeKey, type Session, type SessionInfo } from '../core/session.js';
-import { cutTail } from '../core/text.js';
+import { cutTail, safeCut } from '../core/text.js';
 import { DEFAULT_GEOMETRY, type Attribution, type EnvBasis, type JournalEvent, type Principal, type RunInfo, type RunTarget, type ScreenSnapshot, type Seq, type ServiceStatus, type Visibility } from '../core/types.js';
 import { SYSTEM } from '../core/types.js';
 import { WatchManager, type WaitResult, type WatchInfo, type WatchSpec } from '../core/watches.js';
@@ -1420,7 +1420,7 @@ const CREATION_OPTIONS = ['cwd', 'shell', 'shellArgs', 'env', 'visibility', 'con
 /** A command line shortened for results and lists: the journal keeps the whole of it (ux-19). */
 function head(line: string, max = 120): string {
   if (line.length <= max) return line;
-  return `${line.slice(0, max)}…(${Buffer.byteLength(line)} bytes)`;
+  return `${line.slice(0, safeCut(line, max))}…(${Buffer.byteLength(line)} bytes)`;
 }
 
 
