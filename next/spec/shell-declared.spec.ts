@@ -932,3 +932,16 @@ test('where the declared shell runs on this terminal, a submitted line’s hold 
     await y.close();
   }
 });
+
+test('the note a declaration leaves shortens the line that opened the shell without splitting a surrogate pair', async () => {
+  const x = await realSession('/bin/bash');
+  try {
+    const head = `sh #${'x'.repeat(55)}`;
+    const enclosing = await open(x.session, `${head}\u{1F600} tail`);
+    declare(x.session, 'sh');
+    const note = notes(x).find((n) => n.startsWith(`declared: ${enclosing}`));
+    assert.equal(note, `declared: ${enclosing} (${head}) is a sh shell; shell Runs go to it until ${enclosing} ends`);
+  } finally {
+    await x.close();
+  }
+});

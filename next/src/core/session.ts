@@ -22,7 +22,7 @@ import { CLEAR_LINE_KEYS, MarksParser, type Mark } from './marks.js';
 import { Screen } from './screen.js';
 import { firstOutputMayBeGone, journalLost, pageOutput, type RunOutput, type RunOutputRange } from './runindex.js';
 import { commandFile, cutPlumbing, exitMark, inlineProbe, markerCommandText, markerProbe, probeMark, shellQuote, sourceLine, startMark, type ShellFlavor } from './plumbing.js';
-import { stripEscapes } from './text.js';
+import { safeCut, stripEscapes } from './text.js';
 import { project, runChunks } from './transcript.js';
 import { type AttachmentRole, type ControlPolicy, type Cursors, DEFAULT_GEOMETRY, type EnvBasis, type EventOf, type IntegrationLevel, type JournalEvent, type Principal, type RunInfo, type RunOrigin, type RunState, type RunTarget, type ScreenSnapshot, type Seq, type ShellState, SYSTEM, type Visibility } from './types.js';
 
@@ -2030,7 +2030,8 @@ export class Session {
       }
       if (old!.shell !== shell) this.note(`the program in front is declared a ${shell} shell now (was ${old!.shell})`);
     } else {
-      const program = within === null ? 'the program that replaced the session’s shell' : `${within} (${(this.runs.get(within)?.line ?? '').slice(0, 60)})`;
+      const opened = within === null ? '' : (this.runs.get(within)?.line ?? '');
+      const program = within === null ? 'the program that replaced the session’s shell' : `${within} (${opened.slice(0, safeCut(opened, 60))})`;
       this.note(`declared: ${program} is a ${shell} shell; shell Runs go to it${within === null ? '' : ` until ${within} ends`}`);
     }
     this.layers.push(layer);
