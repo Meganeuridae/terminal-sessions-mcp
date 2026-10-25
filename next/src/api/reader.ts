@@ -27,13 +27,16 @@
  *   page is never cut away. A page the next one continues keeps its trailing
  *   blank lines and an unfinished line's trailing spaces (§6 rule 3, `open`), so
  *   pages joined read as the whole range does, with the two exceptions rule 3
- *   names: a line a page ends returned over is a line of its own on that page;
- *   and a line longer than the rest of its page is cut mid-line, its rest
- *   beginning the next page at column 0, so a tab, a backspace or cursor motion
- *   at the cut or in that rest lands on a different column than it would
- *   unsplit: a motion forward carried into the page keeps none of its spacing,
- *   and the text after a motion back joins after what it would have written
- *   over.
+ *   names and a third of the reader's own: a line a page ends returned over is
+ *   a line of its own on that page; a line longer than the rest of its page is
+ *   cut mid-line, its rest beginning the next page at column 0, so a tab, a
+ *   backspace or cursor motion at the cut or in that rest lands on a different
+ *   column than it would unsplit: a motion forward carried into the page keeps
+ *   none of its spacing, and the text after a motion back joins after what it
+ *   would have written over; and a page that holds more than one source begins
+ *   with its first source's header line, so after a page whose last line goes
+ *   on, the joined text carries that header at the end of the line
+ *   (`AAAA[run r1]`), where a projection puts every header on a line of its own.
  * - A shell Run's pages and tails (`runId`) show what the Run's own result
  *   shows: the daemon's plumbing in its range (a marker Run's typed line,
  *   marks and the prompt after its end mark, a declared shell's end mark, a
