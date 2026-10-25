@@ -2080,6 +2080,54 @@ test("a page MAX_SCAN stopped on a carriage return, every event it collected tak
   assert.equal(text, 'p9\nZ0');
 });
 
+test("a page that took every event it collected says how its line stands by the event after it: a CR or an erase that text follows, or a hole, ends it, and a LF or text goes on with it (the house's review of bc4bc85..5d8ce0e, PR #22, I72 and I73)", async () => {
+  const after = async (next: string | null, then?: string) => {
+    const src = source();
+    for (let i = 0; i < 20000; i++) out(src.journal, 'a');
+    if (next === null) src.journal.append({ type: 'gap', from: 20001, to: 20001, reason: 'store-error', exact: true });
+    else out(src.journal, next);
+    if (then !== undefined) out(src.journal, then);
+    const { text, pages } = await readAll(src, { since: 0, maxBytes: 1 << 20 });
+    assert.equal(pages.length, 2, 'premise: MAX_SCAN stops the first page');
+    return { splitLine: pages[0]!.splitLine, tail: text.slice(19996, 20010) };
+  };
+  assert.deepEqual(await after('\rafter'), { splitLine: undefined, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\x1b[2Jafter'), { splitLine: undefined, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\x1b[2Kafter'), { splitLine: undefined, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\x1b[1Kafter'), { splitLine: undefined, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\x1b[Kafter'), { splitLine: true, tail: 'aaaaafter' });
+  assert.deepEqual(await after(null, 'after\r\n'), { splitLine: undefined, tail: 'aaaa\n[… 1 jour' });
+  assert.deepEqual(await after('\nafter'), { splitLine: true, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\r\nafter'), { splitLine: true, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\x1b[2K\nafter'), { splitLine: true, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\r', '\nafter'), { splitLine: true, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\r\x07', '\nafter'), { splitLine: true, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\r\x0bafter'), { splitLine: true, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\r\x1bEafter'), { splitLine: true, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\r\x1b[Eafter'), { splitLine: true, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\r\x1b[Bafter'), { splitLine: true, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\r\x1b[\n0mafter'), { splitLine: true, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\r\x1b[5;1Hafter'), { splitLine: true, tail: 'aaaa\n\n\n\nafter' });
+  assert.deepEqual(await after('\r\x1b[1A\x1b[2Kafter'), { splitLine: undefined, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('\r\x1b[1;1Hafter'), { splitLine: undefined, tail: 'aaaa\nafter' });
+  assert.deepEqual(await after('after'), { splitLine: true, tail: 'aaaaafter' });
+});
+
+test("a page the budget ends with an event, before an overwrite it didn't collect, says its line doesn't go on (the house's review of bc4bc85..5d8ce0e, PR #22, I72)", async () => {
+  let atEnd = 0;
+  for (let n = 0; n < 24; n++) {
+    const src = source();
+    for (let i = 0; i < 300; i++) out(src.journal, `\rx${i}${'y'.repeat(n)}\x1b[0m`);
+    const { pages } = await readAll(src, { since: 0, maxBytes: 1024 });
+    for (const p of pages.slice(0, -1)) {
+      if (p.nextOffset !== undefined) continue;
+      atEnd++;
+      assert.equal(p.splitLine, undefined, `n=${n}: ${JSON.stringify(p.text!.slice(-10))}`);
+    }
+  }
+  assert.ok(atEnd > 0, "premise: some page ends at an event's end");
+});
+
 test("a Run's page reads its open sequence's head only within HEAD_EVENTS journal events back, and applies lasting state only within MAX_SCAN (the house's review of bc4bc85..5d8ce0e, PR #22, I49)", async () => {
   // Each look-back is bounded in journal events, other Runs' included, rather than read back through the Run's output.
   const page = async (set: string, rest: string, others: number) => {

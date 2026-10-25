@@ -48,7 +48,10 @@
  *   the next page begins a line of its own: what followed the cut, carried into
  *   the page, ended the line (an erase of the display, a line end a sequence
  *   executed) or took the cursor back to its start (a CR, which the text after
- *   it writes over; the pages show that text as a line of its own). By the
+ *   it writes over; the pages show that text as a line of its own), or, for a
+ *   page that took every event it collected before collecting stopped, the
+ *   first event it didn't collect does (a CR or such an erase at its start,
+ *   text after it), or is a hole. By the
  *   stream, a range of `\rx<i>` and an erase per event is one line, and a page
  *   cut before an erase said its `x352` went on, so pages joined by `splitLine`
  *   read `x352x353` (the house's review of 4860d4c..bc4bc85, PR #22, comment
@@ -556,6 +559,7 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   let examined = 0;
   let lastExamined = start;
   let exhausted = false;
+  let uncollected: JournalEvent | undefined;
   /** Per source, what its pieces left unfinished for the line-end rule (lineEnds). */
   const carries = new Map<string, LineCarry>();
   /** The head of the CSI or escape sequence that `offset` falls inside (headAt), which the page goes on from. */
@@ -580,7 +584,10 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
       break;
     }
     for (const e of batch) {
-      if (full() || examined >= MAX_SCAN) break outer;
+      if (full() || examined >= MAX_SCAN) {
+        uncollected = e;
+        break outer;
+      }
       examined++;
       lastExamined = e.seq;
       if (isGap(e)) {
@@ -690,9 +697,43 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
   // Nothing follows yet only where the page took every event the range holds so far: a scan cut short leaves events
   // after the page, and a page MAX_SCAN stopped, which took all it collected, ended `p9`, then joined the next page's `Z0`
   // (the house's review of bc4bc85..5d8ce0e, PR #22, I40).
-  const goesOn = p.lastLine === 'unfinished' || (p.lastLine === 'returned' && allTaken && exhausted);
+  const goesOn = (p.lastLine === 'unfinished' && !(allTaken && (await endsLastLine(uncollected, pieces))))
+    || (p.lastLine === 'returned' && allTaken && exhausted);
   if (goesOn && (more || open)) r.splitLine = true;
   return withGapInfo(r, metHoles(journal, r.seq[0], r.seq[1], chosen.gaps));
+}
+
+async function endsLastLine(uncollected: JournalEvent | undefined, pieces: Piece[]): Promise<boolean> {
+  if (uncollected === undefined) return false;
+  if (isGap(uncollected)) return true;
+  if (!isOutput(uncollected)) return false;
+  let last: OutPiece | undefined;
+  for (let j = pieces.length - 1; j >= 0 && last === undefined; j--) {
+    const q = pieces[j]!;
+    if (q.kind === 'out') last = q;
+  }
+  if (last === undefined || sourceKey(last.ev) !== sourceKey(uncollected)) return false;
+  const d = uncollected.data;
+  let ended = false;
+  let i = 0;
+  const opts = { cols: 80, rows: 24, keep: 'head', open: true } as const;
+  while (i < d.length) {
+    const c = d.charCodeAt(i);
+    if (c === 0x0d) {
+      ended = true;
+      i++;
+    } else if (isIntroducer(c)) {
+      const e = sequenceEnd(d, i);
+      if (e === undefined) return false;
+      const seq = d.slice(i, e);
+      if (/[JK]$/.test(seq) && (await project([`x${seq}`], opts)).lastLine === undefined) ended = true;
+      i = e;
+    } else if (c <= 0x20 || c === 0x7f || (c >= 0x80 && c < 0xa0)) i++;
+    else break;
+  }
+  if (!ended || i >= d.length) return false;
+  const first = String.fromCodePoint(d.codePointAt(i)!);
+  return !(await project([d.slice(0, i) + first], opts)).text.startsWith('\n');
 }
 
 /**
