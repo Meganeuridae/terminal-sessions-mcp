@@ -5,7 +5,10 @@
  * keeps a log of everything the server sent.
  */
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
 import * as net from 'node:net';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import WebSocket from 'ws';
 
 export type Msg = { jsonrpc: '2.0'; id?: number | string; method?: string; params?: unknown; result?: unknown; error?: { code: number; message: string; data?: unknown } };
@@ -199,6 +202,14 @@ export async function until(pred: () => boolean, ms = 3000, what = 'condition'):
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
     await sleep(20);
   }
+}
+
+export function gate(seconds = 120): { wait: string; open: () => void } {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-gate-')), 'open');
+  return {
+    wait: `i=0; while [ ! -e '${file}' ]; do i=$((i+1)); if [ $i -gt ${seconds * 20} ]; then echo GATE-SHUT; exit 3; fi; sleep 0.05; done`,
+    open: () => fs.writeFileSync(file, ''),
+  };
 }
 
 /**

@@ -26,7 +26,7 @@ import type { Session } from '../src/core/session.js';
 import { Outbound, type Message } from '../src/transport/jsonrpc.js';
 import { CATCHUP_LIMIT, FEATURE_SETS, manifest, McplLane, NODE_NAME, summaryFloor } from '../src/transport/mcpl.js';
 import { TermServer } from '../src/transport/server.js';
-import { FULL_GRANT, TestHost, sleep, until, type Delivery, type Msg } from './testhost.js';
+import { FULL_GRANT, TestHost, gate, sleep, until, type Delivery, type Msg } from './testhost.js';
 
 const A = 'agent:a@test';
 const B = 'agent:b@test';
@@ -844,7 +844,8 @@ test("a digest of a Run already running when the lane began says the output new 
     // more output than its first read of a Run in flight takes (1 MiB), while the Run still runs.
     const m = await d.host('ta', 'late-m', { mcpl: false });
     await m.call('session_open', { session: 'late', visibility: 'shared' });
-    const r = await m.call('run', { session: 'late', command: "head -c 1200000 /dev/zero | tr '\\0' a; echo; sleep 10", target: 'process', wait: 20 });
+    const held = gate();
+    const r = await m.call('run', { session: 'late', command: `head -c 1200000 /dev/zero | tr '\\0' a; echo; ${held.wait}`, target: 'process', wait: 20 });
     const runId = r.structured?.runId;
     assert.ok(typeof runId === 'string', JSON.stringify(r));
     const s = live(d.registry, 'late');
@@ -857,6 +858,7 @@ test("a digest of a Run already running when the lane began says the output new 
     const head = digest.text.split('\n')[0]!;
     assert.match(head, /at least [\d.]+ \S+ so far/, head);
     assert.match(head, / · at least [\d.]+ \S+ new since your last read/, head);
+    held.open();
     await m.close();
     await b.close();
   } finally {
@@ -2858,7 +2860,8 @@ test("a session's exit built while no connection carried it is caught up for a p
     // The seat passes from the owner to this principal for its Run, and back for the exit.
     const releaseSeat = async (from: typeof other, id: string) => void (await f.app.control(from, { session: id, action: 'release' }));
     await releaseSeat(other, 'ex1');
-    const mine = await f.app.run(f.caller, { session: 'ex1', command: 'sleep 5', target: 'process', wait: 0 });
+    const held = gate();
+    const mine = await f.app.run(f.caller, { session: 'ex1', command: held.wait, target: 'process', wait: 0 });
     await until(() => s1.run(mine.runId!).state === 'running', 5000, "this principal's Run to start");
     await releaseSeat(f.caller, 'ex1');
     await f.app.run(other, { session: 'ex1', command: 'exit 7', wait: 0 });
@@ -2874,6 +2877,7 @@ test("a session's exit built while no connection carried it is caught up for a p
     await until(() => exitOf(s1) !== undefined && exitOf(s2) !== undefined, 8000, 'both shells to exit');
     const atExit = s1.run(mine.runId!);
     assert.ok(atExit.seq.admit < exitOf(s1)!.seq && (atExit.seq.end === undefined || atExit.seq.end > exitOf(s1)!.seq), 'its Run was under way at the exit');
+    held.open();
     const exitPushed = (id: string) =>
       f.sent.filter((m) => m.method === 'push/event' && /session-exit/.test(String((m.params as { eventId: string }).eventId)) && (m.params as { origin: Record<string, unknown> }).origin.channelId === `terminal:${id}`);
     assert.equal(exitPushed('ex1').length + exitPushed('ex2').length, 0, 'nothing pushed while push is off');

@@ -19,7 +19,7 @@ import { NodePtyBackend } from '../src/backends/node-pty.js';
 import type { PtyHandle } from '../src/backends/types.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { TermServer, type LogRecord } from '../src/transport/server.js';
-import { until } from './testhost.js';
+import { gate, until } from './testhost.js';
 
 /** The slice of puppeteer this test uses (loaded dynamically so a machine without it skips). */
 interface Page {
@@ -598,7 +598,8 @@ test('2f357bd: a process Run’s output from before the attach shows with stderr
   await a.call('session_open', { session: 'pe', visibility: 'shared' });
   await a.call('session_open', { session: 'pf', visibility: 'shared' });
   // Early output, then a shell line so the early output lies before the snapshot's cursor, then late output after the attach.
-  const spanning = await a.call('run', { session: 'pe', target: 'process', command: `printf 'EARLY-OUT\\n'; printf 'EARLY-ERR\\n' >&2; sleep 2.5; printf 'LATE-OUT\\n'`, wait: 500 });
+  const late = gate();
+  const spanning = await a.call('run', { session: 'pe', target: 'process', command: `printf 'EARLY-OUT\\n'; printf 'EARLY-ERR\\n' >&2; ${late.wait}; printf 'LATE-OUT\\n'`, wait: 500 });
   assert.equal(spanning.state, 'running');
   const big = await a.call('run', { session: 'pe', target: 'process', command: 'seq 1 30000' });
   assert.equal(big.state, 'exited');
@@ -609,6 +610,7 @@ test('2f357bd: a process Run’s output from before the attach shows with stderr
   try {
     await pick(page, 'pe');
     await page.waitForFunction(`${rows}.includes('MARK-2')`, { timeout: 10_000 });
+    late.open();
     await page.waitForFunction(`${panes}.some((d) => d.textContent.includes('LATE-OUT'))`, { timeout: 10_000 });
     await page.evaluate(`${panes}.forEach((d) => { d.open = true; })`);
     await page.waitForFunction(`${panes}.some((d) => d.textContent.includes('EARLY-OUT') && d.textContent.includes('LATE-OUT'))`, { timeout: 8000 });
