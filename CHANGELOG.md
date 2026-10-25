@@ -47,12 +47,20 @@ later release (`next/README.md`, "Upgrading from 1.x").
   came before (and, when the first line is cut at its head, the read that shows it from there),
   and the logs, raw ones included, mark a hole with a `[… N journal events missing …]` line where
   output was lost: a host that parses the logs sees these lines.
-- **Address and credential migration:** The shim selects `TSM_URL` or its default address with `TSM_TOKEN` (or a token in that URL). When `TSM_URL` is unset, a 1.x address from `SESSION_SERVER_URL` or `SESSION_SERVER_HOST` and `SESSION_SERVER_PORT` uses `SESSION_SERVER_TOKEN` (or a token already in `SESSION_SERVER_URL`). It does not substitute a token from the other address family. In contrast, `termd` uses `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT` and `SESSION_SERVER_TOKEN` as individual fallbacks when the matching `TSM_HOST`, `TSM_PORT` and `TSM_TOKEN` settings are unset. It also accepts `--headless` and `--host localhost` from a 1.x `session-server` command line.
+- **Address and credential migration:** The shim selects `TSM_URL` or its default address with `TSM_TOKEN` (or a token in that URL). When `TSM_URL` is unset, a 1.x address from `SESSION_SERVER_URL`, or from `SESSION_SERVER_HOST` or `SESSION_SERVER_PORT` (either alone takes 1.x's default for the other, `localhost` or 3100), uses `SESSION_SERVER_TOKEN` (or a token already in `SESSION_SERVER_URL`). It does not substitute a token from the other address family. In contrast, `termd` uses `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT` and `SESSION_SERVER_TOKEN` as individual fallbacks when the matching `TSM_HOST`, `TSM_PORT` and `TSM_TOKEN` settings are unset. It also accepts `--headless` and `--host localhost` from a 1.x `session-server` command line.
+- **A session's command path:** a session refuses to start when its command directory's path, under
+  `termd`'s data directory, contains an ASCII control (U+0000–U+001F or U+007F), since a Run types that
+  path into the shell's line editor. Use a data directory with printable path components.
+- **`/health` on `termd`** reports `sessionCount` where 1.x's `/health` reports `sessions` as a count;
+  for a caller with a principal, `sessions` lists the sessions it may observe, with their state. It also
+  reports `version`, `pid`, `connections` and `endpointElapsedMs`, the endpoint's life since session
+  recovery on a monotonic clock, not the process's uptime. Where 1.7.3's `status` is always `ok`, termd
+  answers `degraded`, with the reason as `unsupported`, on a host where it can't open sessions (no `bash`,
+  or a `/dev/fd` that doesn't list the process's own descriptors).
 - Shipped host and supervisor configurations in `next/config/`.
 
 ### Changed
 
-- `/health` reports `endpointElapsedMs` instead of `uptimeMs`. The value measures the endpoint's life after recovery, not process uptime.
 - Node 22.12 or later (`engines`: `>=22.12.0 <25.0.0`), and `puppeteer` `^25.16.0` (from `^24.29.1`): Node 20 reached its end of life on 2026-04-30, and Puppeteer 25, which the 1.x screenshot path and 2.0's GUI tests use, asks for 22.12; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
 - `npm run build` compiles both trees; `npm test` runs 1.x's suite and `npm run test:next` 2.0's.
 - The `@xterm` packages and `ws` are pinned at the versions 2.0 uses (`@xterm/xterm` 6.0.0,

@@ -46,7 +46,7 @@
  *    It runs loopback-open, which accepts this shim's token as well.
  *
  * Where it connects: TSM_URL (default ws://127.0.0.1:3101) uses TSM_TOKEN.
- * Without TSM_URL, a 1.x bridge address from SESSION_SERVER_URL or SESSION_SERVER_HOST + SESSION_SERVER_PORT uses SESSION_SERVER_TOKEN when set, or a token in its URL.
+ * Without TSM_URL, a 1.x bridge address from SESSION_SERVER_URL, or from SESSION_SERVER_HOST or SESSION_SERVER_PORT (either alone takes 1.x's default for the other, localhost or 3100), uses SESSION_SERVER_TOKEN when set, or a token in its URL.
  * A TSM_TOKEN with only a 1.x address and no legacy or URL token is not sent. Put the address in TSM_URL, or the token in SESSION_SERVER_TOKEN.
  * A 1.x address is never replaced by a daemon started here: a config naming another machine must not run its commands on this one, and a failure names the setting.
  *
