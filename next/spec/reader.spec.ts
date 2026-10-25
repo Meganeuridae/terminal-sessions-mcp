@@ -2128,6 +2128,57 @@ test("a page the budget ends with an event, before an overwrite it didn't collec
   assert.ok(atEnd > 0, "premise: some page ends at an event's end");
 });
 
+test("a page MAX_SCAN stops reads its last line's end from what the next page's first line shows: a CRLF split there, a row emptied before a line feed and margins set before the page go on with no blank line, and a backspace edit goes on (the house's review of 5d8ce0e..21fed2f, PR #22, I3, I52 and I53)", async () => {
+  const join = async (before: string, last: string, next: string) => {
+    const src = source();
+    if (before) out(src.journal, before);
+    let seq = before ? 1 : 0;
+    while (seq < 19999) seq = out(src.journal, 'a');
+    out(src.journal, last);
+    out(src.journal, next);
+    const { text, pages } = await readAll(src, { since: 0, maxBytes: 1 << 20 });
+    assert.equal(pages.length, 2, 'premise: MAX_SCAN stops the first page');
+    return { splitLine: pages[0]!.splitLine, tail: text.slice(text.lastIndexOf('aaaa')) };
+  };
+  assert.deepEqual(await join('', 'x\r', '\nafter'), { splitLine: true, tail: 'aaaax\nafter' });
+  assert.deepEqual(await join('', 'x\r', 'Z0'), { splitLine: undefined, tail: 'aaaax\nZ0' });
+  assert.deepEqual(await join('', 'a', '\rX\x1b[2K\nafter'), { splitLine: true, tail: 'aaaa\n after' });
+  assert.deepEqual(await join('\x1b[5;24r\x1b[?6h', 'a', '\rafter'), { splitLine: true, tail: 'aaaa\n\n\n\nafter' });
+  assert.deepEqual(await join('', '$ ls -l', '\b \bs'), { splitLine: true, tail: 'aaaa$ ls -ls' });
+});
+
+test("a page MAX_SCAN stops ends its last line before another source's output, which begins a line of its own (DESIGN §6 rule 6), and goes on into its own source's output after another source's line, and through input typed at it (the house's review of 5d8ce0e..21fed2f, PR #22, I44)", async () => {
+  const join = async (build: (src: ReturnType<typeof source>) => void) => {
+    const src = source();
+    build(src);
+    const { text, pages } = await readAll(src, { since: 0, maxBytes: 1 << 20 });
+    assert.equal(pages.length, 2, 'premise: MAX_SCAN stops the first page');
+    return { splitLine: pages[0]!.splitLine, tail: text.slice(text.lastIndexOf('aaaa')) };
+  };
+  const fill = (src: ReturnType<typeof source>, to: number, runId?: string) => {
+    let seq = 0;
+    while (seq < to) seq = runId === undefined ? out(src.journal, 'a') : out(src.journal, 'a', 'stdout', runId);
+  };
+  assert.deepEqual(await join((src) => {
+    startRun(src.journal, 'r1');
+    fill(src, 20000);
+    out(src.journal, 'after\n', 'stdout', 'r1');
+  }), { splitLine: undefined, tail: 'aaaa\nafter' });
+  assert.deepEqual(await join((src) => {
+    startRun(src.journal, 'r1');
+    startRun(src.journal, 'r2');
+    fill(src, 19999, 'r1');
+    out(src.journal, 'b\n', 'stdout', 'r2');
+    out(src.journal, 'tail\n', 'stdout', 'r1');
+  }), { splitLine: true, tail: 'aaaatail' });
+  assert.deepEqual(await join((src) => {
+    fill(src, 19999);
+    out(src.journal, '$ ');
+    src.journal.append({ type: 'input', data: 'cd /tmp\rls\r', principal: 'human:test:1', kind: 'paste' });
+    out(src.journal, 'cd /tmp\r\n$ ls\r\n');
+  }), { splitLine: true, tail: 'aaaa$ cd /tmp\n$ ls' });
+});
+
 test("a Run's page reads its open sequence's head only within HEAD_EVENTS journal events back, and applies lasting state only within MAX_SCAN (the house's review of bc4bc85..5d8ce0e, PR #22, I49)", async () => {
   // Each look-back is bounded in journal events, other Runs' included, rather than read back through the Run's output.
   const page = async (set: string, rest: string, others: number) => {

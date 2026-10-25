@@ -178,6 +178,10 @@ export interface Projection {
    * comment 6357989601: by the stream's line ends, a page whose last line an erase had ended said it went on).
    */
   lastLine?: 'unfinished' | 'returned';
+  /** With `lastLine`, the cursor's column on the last line's row. */
+  lastColumn?: number;
+  /** With `lastLine`, the source whose output the last line is: `pty`, or `p:<runId>` for a process Run's pipes. */
+  lastSource?: string;
 }
 
 export interface TranscriptOptions {
@@ -368,6 +372,7 @@ class Projector {
   lost = false;
   /** How the last line stands for a next range (Projection.lastLine), once `finish` has run with `open`. */
   lastLine: 'unfinished' | 'returned' | undefined;
+  lastColumn: number | undefined;
   private readonly capacity: number;
   /** The source being fed (a segment's key); undefined while the projection writes its own: a boundary's line end, a note, a header. */
   private source: string | undefined;
@@ -816,7 +821,10 @@ class Projector {
       // the last line stands for the next range is kept for the caller (`lastLine`).
       const row = n.baseY + n.cursorY;
       if (rowText(n, n.cursorY) !== '') {
-        if (row >= last) this.lastLine = n.cursorX > 0 ? 'unfinished' : 'returned';
+        if (row >= last) {
+          this.lastLine = n.cursorX > 0 ? 'unfinished' : 'returned';
+          this.lastColumn = n.cursorX;
+        }
         last = Math.max(last, row);
       } else last = Math.max(last, row - 1);
     }
@@ -1375,12 +1383,14 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
     if (state) await pr.feed(state);
     let slice = performance.now();
     let headersFed = 0;
+    let lastSource: string | undefined;
     // Where feeding stopped, when the head's lines were complete before the range's end.
     let stopped: { s: number; pos: number } | undefined;
     outer: for (let s = 0; s < segs.length; s++) {
       const seg = segs[s]!;
       if (seg.header) headersFed++;
       pr.feeding(seg.key.startsWith('n:') ? undefined : seg.key);
+      if (!seg.key.startsWith('n:')) lastSource = seg.key;
       let pos = 0;
       while (pos < seg.data.length) {
         if (keep === 'head' && pr.out.lines.length > maxLines + headersFed) {
@@ -1445,7 +1455,7 @@ export async function project(chunks: Iterable<ProjectChunk>, opts: ProjectOptio
       omittedInputBytes: omitted,
       ...(cut ? { cut: true as const } : {}),
       ...(pr.lost ? { lost: true as const } : {}),
-      ...(pr.lastLine !== undefined ? { lastLine: pr.lastLine } : {}),
+      ...(pr.lastLine !== undefined ? { lastLine: pr.lastLine, lastColumn: pr.lastColumn ?? 0, ...(lastSource !== undefined ? { lastSource } : {}) } : {}),
     };
   } finally {
     pr.dispose();

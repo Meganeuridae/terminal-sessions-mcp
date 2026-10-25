@@ -53,8 +53,13 @@
  *   executed) or took the cursor back to its start (a CR, which the text after
  *   it writes over; the pages show that text as a line of its own), or, for a
  *   page that took every event it collected before collecting stopped, the
- *   first event it didn't collect does (a CR or such an erase at its start,
- *   text after it), or is a hole. By the
+ *   first event it didn't collect does: a hole; another source's output, which
+ *   begins on a fresh line (§6 rule 6); or output of the line's own source
+ *   whose text, on the next page's first line, doesn't land on this line when
+ *   written after it: it writes over the line's start, or lands on a row of its
+ *   own, as projections of NEXT_EVENT_PEEK_UNITS of that event, in the state
+ *   the next page starts in, show. A line a CR ended is judged so too, so a
+ *   CRLF split there goes on. By the
  *   stream, a range of `\rx<i>` and an erase per event is one line, and a page
  *   cut before an erase said its `x352` went on, so pages joined by `splitLine`
  *   read `x352x353` (the house's review of 4860d4c..bc4bc85, PR #22, comment
@@ -117,7 +122,7 @@ import { persistentState } from '../core/screen.js';
 import { minusRanges } from '../core/ranges.js';
 import { lineBytes } from '../core/stores.js';
 import { countLines, cutTail, headAt, headIndex, indexAtByte, isIntroducer, lineCarry, lineEnds, safeCut, sequenceEnd, stripEscapes, unfinishedSequence, utf8Length, type LineCarry } from '../core/text.js';
-import { interleaveCut, namingHeader, project, type ProjectChunk, type SourceInfo } from '../core/transcript.js';
+import { interleaveCut, namingHeader, project, type ProjectChunk, type Projection, type SourceInfo } from '../core/transcript.js';
 import { DEFAULT_GEOMETRY, type EventOf, type GapReason, type Hole, type JournalEvent, type RunInfo, type Seq } from '../core/types.js';
 
 /**
@@ -176,7 +181,7 @@ export interface ReadResult {
   gaps?: GapInfo[];
   /** True when text was cut to fit, or lost to the scratch emulator (tail reads keep the end). */
   truncated: boolean;
-  /** The next page's first line goes on with this page's last one (join them without a line end): the projection's cursor stood on that line past its start when the page ended, and output may follow (the module comment). */
+  /** The next page's first line goes on with this page's last one (join them without a line end): the projection's cursor stood on that line when the page ended, and output may follow (the module comment). */
   splitLine?: boolean;
   oldestSeq?: Seq;
   /**
@@ -694,49 +699,27 @@ async function textPage(src: ReadSource, o: ReadOptions, maxBytes: number, geome
     truncated: p.lost || p.omitted > 0,
   };
   if (nextOffset !== undefined) r.nextOffset = nextOffset;
-  // The next page goes on with this page's last line when the page's own projection ends with the cursor on that line
-  // past its start, and output may follow (the module comment). A line a CR returned the cursor over is written over
-  // by the text that follows, which the pages show as a line of its own; when nothing follows yet, the LF of a CRLF may.
-  // Nothing follows yet only where the page took every event the range holds so far: a scan cut short leaves events
-  // after the page, and a page MAX_SCAN stopped, which took all it collected, ended `p9`, then joined the next page's `Z0`
-  // (the house's review of bc4bc85..5d8ce0e, PR #22, I40).
-  const goesOn = (p.lastLine === 'unfinished' && !(allTaken && (await endsLastLine(uncollected, pieces))))
-    || (p.lastLine === 'returned' && allTaken && exhausted);
+  const goesOn = p.lastLine !== undefined && (allTaken ? !(await endsLastLine(src, o, geometry, p, uncollected)) : p.lastLine === 'unfinished');
   if (goesOn && (more || open)) r.splitLine = true;
   return withGapInfo(r, metHoles(journal, r.seq[0], r.seq[1], chosen.gaps));
 }
 
-async function endsLastLine(uncollected: JournalEvent | undefined, pieces: Piece[]): Promise<boolean> {
-  if (uncollected === undefined) return false;
-  if (isGap(uncollected)) return true;
-  if (!isOutput(uncollected)) return false;
-  let last: OutPiece | undefined;
-  for (let j = pieces.length - 1; j >= 0 && last === undefined; j--) {
-    const q = pieces[j]!;
-    if (q.kind === 'out') last = q;
-  }
-  if (last === undefined || sourceKey(last.ev) !== sourceKey(uncollected)) return false;
-  const d = uncollected.data;
-  let ended = false;
-  let i = 0;
-  const opts = { cols: 80, rows: 24, keep: 'head', open: true } as const;
-  while (i < d.length) {
-    const c = d.charCodeAt(i);
-    if (c === 0x0d) {
-      ended = true;
-      i++;
-    } else if (isIntroducer(c)) {
-      const e = sequenceEnd(d, i);
-      if (e === undefined) return false;
-      const seq = d.slice(i, e);
-      if (/[JK]$/.test(seq) && (await project([`x${seq}`], opts)).lastLine === undefined) ended = true;
-      i = e;
-    } else if (c <= 0x20 || c === 0x7f || (c >= 0x80 && c < 0xa0)) i++;
-    else break;
-  }
-  if (!ended || i >= d.length) return false;
-  const first = String.fromCodePoint(d.codePointAt(i)!);
-  return !(await project([d.slice(0, i) + first], opts)).text.startsWith('\n');
+const NEXT_EVENT_PEEK_UNITS = 4096;
+const LINE_STAND_IN = '\u{E000}';
+
+async function endsLastLine(src: ReadSource, o: ReadOptions, geometry: { cols: number; rows: number }, last: { lastLine: Projection['lastLine']; lastColumn: number | undefined; lastSource: string | undefined }, next: JournalEvent | undefined): Promise<boolean> {
+  if (next === undefined) return false;
+  if (isGap(next)) return true;
+  if (!isOutput(next)) return false;
+  if (sourceKey(next) !== last.lastSource) return true;
+  const line = last.lastLine === 'returned' ? `${LINE_STAND_IN}\r` : LINE_STAND_IN.repeat(last.lastColumn ?? 1);
+  const data = next.data.slice(0, safeCut(next.data, NEXT_EVENT_PEEK_UNITS));
+  const opts = { cols: geometry.cols, rows: geometry.rows, keep: 'head', open: true, state: stateBefore(src, o, next) } as const;
+  const firstLine = async (text: string) => (await project([chunkOf(next, text)], opts)).text.split('\n', 1)[0]!;
+  const own = (await firstLine(data)).trimStart();
+  if (own.trimEnd() === '') return false;
+  const after = await firstLine(line + data);
+  return !(after.startsWith(LINE_STAND_IN) && after.includes(own));
 }
 
 /**
@@ -1159,7 +1142,7 @@ async function projectPage(chosen: Chosen, geometry: { cols: number; rows: numbe
   const p = await project(chunks, opts);
   const textBytes = utf8Length(p.text);
   // `omittedInputBytes` can only come from maxLines here: the text is over budget by then.
-  return { text: p.text, textBytes, over: textBytes > maxBytes, omitted: p.omittedInputBytes, lost: p.lost === true, lastLine: p.lastLine };
+  return { text: p.text, textBytes, over: textBytes > maxBytes, omitted: p.omittedInputBytes, lost: p.lost === true, lastLine: p.lastLine, lastColumn: p.lastColumn, lastSource: p.lastSource };
 }
 
 /** Output bytes looked back over for the lasting state a page starts in. */
