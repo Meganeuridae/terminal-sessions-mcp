@@ -32,7 +32,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const SHIM = path.resolve(here, '../src/shim/stdio.js');
 const COMPAT = path.resolve(here, '../src/shim/compat.js');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-shim-'));
-after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+after(() => {
+  if (fs.existsSync(path.join(tmp, 'closed'))) fs.chmodSync(path.join(tmp, 'closed'), 0o700);
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
 
 type Msg = { jsonrpc: '2.0'; id?: number | string; method?: string; params?: Record<string, unknown>; result?: unknown; error?: { code: number; message: string; data?: unknown } };
 
@@ -855,6 +858,8 @@ interface Unit {
   fragment?: string;
   /** systemd only: the unit's drop-ins, as `DropInPaths` lists them. */
   dropIn?: string;
+  /** systemd only: the unit's ExecStartPre=, as `systemctl show` prints it. */
+  startPre?: string;
 }
 
 /** The two supervisors' answers for a loaded unit: a launchd job's `print` and a systemd unit's `show`, with the same command line and environment. */
@@ -871,6 +876,7 @@ function unitStub(u: Unit): Stub {
     // The argv unquoted.
     `MainPID=${u.mainPid ?? 0}`,
     `ExecStart={ path=${u.prefix?.[0] ?? '/bin/sh'} ; argv[]=${[...(u.prefix ?? []), '/bin/sh', '/pkg/next/config/termd-launch.sh', ...args].join(' ')} ; ignore_errors=no }`,
+    ...(u.startPre ? [`ExecStartPre=${u.startPre}`] : []),
     `Environment=${words(env)}`,
     ...(u.envFiles ?? []).map((f) => `EnvironmentFiles=${f}`),
     `UnsetEnvironment=${(u.unset ?? []).join(' ')}`,
@@ -1144,6 +1150,13 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   fs.utimesSync(keptEnv, new Date(Date.now() - 600_000), new Date(Date.now() - 600_000));
   // An optional environment file that is there, so that it may set what the unit's termd reads.
   fs.writeFileSync(path.join(tmp, 'termd.env'), '');
+  const absentEnv = path.join(tmp, 'absent-optional-termd.env');
+  const closedDir = path.join(tmp, 'closed');
+  fs.mkdirSync(closedDir);
+  fs.writeFileSync(path.join(closedDir, 'termd.env'), 'TSM_PORT=4000\n');
+  fs.chmodSync(closedDir, 0);
+  const optional = (file: string) => [`${file} (ignore_errors=yes)`];
+  const optionalUnit = (envFiles: string[], startPre?: string) => unitStub({ port: 'none', env: { TSM_PORT: '3101' }, dataDir: path.join(tmp, 'unit-data'), envFiles, ...(startPre && { startPre }) });
   const cases: Case[] = [
     { name: 'shared-data-dir-with-spaces-in-argv', when: true, stub: (dataDir) => unitStub({ port: 3101, dataDir }), dataDir: spaced('argv'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup argv with spaces, which a termd for port \d+ started here would use too/ },
     { name: 'shared-data-dir-with-spaces-in-environment', when: true, stub: (dataDir) => unitStub({ port: 3101, env: { TSM_DATA_DIR: dataDir } }), dataDir: spaced('env'), expect: 'shared', says: /serves port 3101 out of the data dir \S+\/sup env with spaces, which a termd/ },
@@ -1181,6 +1194,11 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // f3750e4, #22 comment 6310921374). Options on the command line stay known.
     { name: 'environment-file-and-no-port-flag', when: linux, stub: () => unitStub({ port: 'none', envFiles: ['/etc/termd.env (ignore_errors=no)'] }), expect: 'unknown', says: /the systemd user unit termd \([^)]*\) names no --port and reads EnvironmentFile=\/etc\/termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so its port is unknown/ },
     { name: 'environment-file-and-no-data-dir-flag', when: linux, stub: () => unitStub({ port: 3101, envFiles: [`${tmp}/termd.env (ignore_errors=yes)`] }), expect: 'dangling', says: /serves port 3101, and its unit names no --data-dir and reads EnvironmentFile=\S+\/termd\.env, which may set TSM_DATA_DIR, so the data dir its termd uses is unknown: none is started here/ },
+    { name: 'optional-environment-file-not-there', when: linux, stub: () => optionalUnit(optional(absentEnv)), expect: 'start', says: /serves port 3101 out of \S+unit-data, not \d+: a termd for \d+ is started here/ },
+    { name: 'optional-environment-file-under-a-file', when: linux, stub: () => optionalUnit(optional(path.join(tmp, 'termd.env', 'termd.env'))), expect: 'start', says: /serves port 3101 out of \S+unit-data, not \d+: a termd for \d+ is started here/ },
+    { name: 'optional-environment-file-a-glob', when: linux, stub: () => optionalUnit(optional(path.join(tmp, 'absent-*.env'))), expect: 'unknown', says: /reads EnvironmentFile=\S+absent-\*\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so its port is unknown/ },
+    { name: 'optional-environment-file-not-searchable', when: linux && process.getuid?.() !== 0, stub: () => optionalUnit(optional(path.join(closedDir, 'termd.env'))), expect: 'unknown', says: /reads EnvironmentFile=\S+closed\/termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so its port is unknown/ },
+    { name: 'optional-environment-file-a-pre-start-hook-writes', when: linux, stub: () => optionalUnit(optional(absentEnv), `{ path=/bin/sh ; argv[]=/bin/sh -c "echo TSM_PORT=4000 > ${absentEnv}" ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }`), expect: 'unknown', says: /reads EnvironmentFile=\S+absent-optional-termd\.env, which may set TSM_PORT or SESSION_SERVER_PORT, so its port is unknown/ },
     { name: 'environment-file-and-both-flags', when: linux, stub: () => unitStub({ port: 3101, dataDir: path.join(tmp, 'unit-data'), envFiles: ['/etc/termd.env (ignore_errors=no)'] }), expect: 'start', says: /serves port 3101 out of \S+unit-data, not \d+: a termd for \d+ is started here/ },
     // The user manager's environment reaches the unit's termd: read from Environment= alone, its data dir was $HOME/.tsm.
     { name: 'data-dir-in-the-manager-environment', when: linux, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir } }), expect: 'shared', says: /serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },

@@ -325,7 +325,7 @@ async function checkSupervisor(): Promise<Supervisor> {
     return managed(`the launchd job ${LAUNCH_AGENT}`, unit);
   }
   if (process.platform === 'linux') {
-    const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,MainPID,ExecStart,Environment,EnvironmentFiles,UnsetEnvironment,NeedDaemonReload,FragmentPath,DropInPaths']);
+    const r = await ask('systemctl', ['--user', 'show', 'termd', '--property=LoadState,ActiveState,UnitFileState,MainPID,ExecStart,ExecStartPre,Environment,EnvironmentFiles,UnsetEnvironment,NeedDaemonReload,FragmentPath,DropInPaths']);
     if (r === 'timeout') return { kind: 'unknown', why: `systemctl --user show termd did not answer within ${SUPERVISOR_CHECK_MS} ms` };
     if (r === 'missing') return { kind: 'none' }; // no systemd: nothing of this user's is managed
     // A failure is no answer: under cron or `sudo -u` the user manager runs, with its units, but systemctl
@@ -407,7 +407,8 @@ async function managerUnit(r: { out: string }, prop: (k: string) => string): Pro
   // An optional file that is not there gives the start nothing, as systemd skips it: named, it made every value the
   // unit's environment gives unknown, so a file removed since the unit's termd started, which had set its port, left
   // nothing to compare (the house's review of bc4bc85..5d8ce0e, #22).
-  const files = [...r.out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim()).filter((f) => !absentOptional(f));
+  const startPre = prop('ExecStartPre') !== '';
+  const files = [...r.out.matchAll(/^EnvironmentFiles=(.+)$/gm)].map((f) => f[1]!.trim()).filter((f) => startPre || !absentOptional(f));
   const unit = systemctlUnit(prop('ExecStart'), prop('Environment'), { manager: /^Environment=(.*)$/m.exec(m.out)?.[1]?.trim() ?? '', files, unset: prop('UnsetEnvironment') });
   return unit ? { unit } : { why: unshaped(prop) };
 }
