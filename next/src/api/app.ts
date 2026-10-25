@@ -228,7 +228,7 @@ function idemIdentity(idem: string): { key: string; tool: string; digest: string
 /**
  * Per-principal memory of idempotency keys (G16). An ordinary replay returns the first outcome,
  * success or failure; `run` and `start` re-await while their Runs remain indexed and
- * the key remains in its 15-minute window. A key reused for another tool or other arguments is refused then. Nothing
+ * the key remains in its window (`idempotencyWindowMs`, 15 minutes by default). A key reused for another tool or other arguments is refused then. Nothing
  * is kept for a call that admitted nothing (`busy`), so its retry can run — except the one
  * refusal that exists to be seen (see `remembered`). Bounded: keys are
  * at most 200 characters, a principal holds at most `perPrincipal` keys and the daemon
@@ -800,7 +800,7 @@ export class App {
     return mono ?? Date.now() - run.admittedAt;
   }
 
-  /** A retained-key `run` or `start` replay inside its 15-minute window re-awaits the same Run. */
+  /** A retained-key `run` or `start` replay inside its window re-awaits the same Run. */
   private async replayRun(caller: Caller, prev: RunResult, wait: number | undefined): Promise<RunResult> {
     if (prev.runId === undefined) return { ...prev, replayed: true };
     let again: RunResult;
