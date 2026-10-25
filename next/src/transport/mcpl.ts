@@ -196,7 +196,7 @@ export interface LaneContext {
 
 const HISTORY_MAX = 500;
 /** Messages a catch-up replays at most, newest first across sessions; the rest are summarised per session (ux-25). */
-const CATCHUP_LIMIT = 20;
+export const CATCHUP_LIMIT = 20;
 const BATCH_MS = 50;
 /** How long a completion is held for a synchronous call that may still return it (G28, mcpl-1); checked every HOLD_POLL_MS. */
 const HOLD_MS = 2000;

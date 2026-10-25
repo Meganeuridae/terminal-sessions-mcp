@@ -24,7 +24,7 @@ import type { SegmenterOptions } from '../src/core/segmenter.js';
 import { seqOfMessageId } from '../src/core/segmenter.js';
 import type { Session } from '../src/core/session.js';
 import { Outbound, type Message } from '../src/transport/jsonrpc.js';
-import { FEATURE_SETS, manifest, McplLane, NODE_NAME, summaryFloor } from '../src/transport/mcpl.js';
+import { CATCHUP_LIMIT, FEATURE_SETS, manifest, McplLane, NODE_NAME, summaryFloor } from '../src/transport/mcpl.js';
 import { TermServer } from '../src/transport/server.js';
 import { FULL_GRANT, TestHost, sleep, until, type Delivery, type Msg } from './testhost.js';
 
@@ -2880,6 +2880,34 @@ test("a session's exit built while no connection carried it is caught up for a p
     await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
     await until(() => f.inside.catchingUp === undefined && exitPushed('ex1').length === 1, 5000, 'the exit of the session it had a Run in caught up');
     assert.equal(exitPushed('ex2').length, 0, 'no exit for a session where every Run of its own had ended');
+  } finally {
+    await f.close();
+  }
+});
+
+test("a catch-up's places go to what the principal is owed: an exit that cut short only another principal's Run takes none", { timeout: 60_000 }, async () => {
+  const f = await bareLane('cx-a');
+  try {
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: NO_PUSH }, f.ctx);
+    await f.app.sessionOpen(f.caller, { id: 'cx-own' });
+    const sOwn = live(f.registry, 'cx-own');
+    const own: string[] = [];
+    for (let i = 0; i < CATCHUP_LIMIT; i++) {
+      const r = await f.app.run(f.caller, { session: 'cx-own', command: 'true', target: 'process', wait: 0 });
+      await until(() => sOwn.run(r.runId!).state === 'exited', 5000, `its Run ${i} to end`);
+      own.push(r.runId!);
+    }
+    const other = { principal: B, connectionId: 'cx-b' };
+    await f.app.sessionOpen(other, { id: 'cx-other', visibility: 'shared' });
+    const s = live(f.registry, 'cx-other');
+    const theirs = await f.app.run(other, { session: 'cx-other', command: 'sleep 5', target: 'process', wait: 0 });
+    await until(() => s.run(theirs.runId!).state === 'running', 5000, 'their Run to start');
+    await f.app.run(other, { session: 'cx-other', command: 'exit 9', wait: 0 });
+    await until(() => s.journal.since(0).events.some((e) => e.type === 'session.exit'), 8000, 'their shell to exit');
+    await f.lane.handle('featureSets/update', { effectiveCapabilities: FULL_GRANT }, f.ctx);
+    await until(() => f.inside.catchingUp === undefined && own.every((id) => sentAbout(f.sent, id).length > 0), 8000, 'every completion of its own replayed');
+    const summaries = f.sent.filter((m) => m.method === 'push/event' && /:summary[:~]/.test((m.params as { eventId?: string }).eventId ?? ''));
+    assert.equal(summaries.length, 0, 'and no summary of messages it missed');
   } finally {
     await f.close();
   }
