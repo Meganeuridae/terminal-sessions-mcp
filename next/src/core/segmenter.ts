@@ -794,6 +794,8 @@ interface RunWatch {
   bytesAtLeast: boolean;
   /** With `bytesAtLeast`, the first output the count holds: a read before it has more unread than the count. */
   countedFrom?: Seq;
+  /** With `bytesAtLeast`, the newest seq a hole in the output the count began with reaches: a read before it has more unread than the count. */
+  holesTo?: Seq;
   bytesAtLastDigest: number;
   lastDigestId?: string;
   timer?: NodeJS.Timeout | undefined;
@@ -990,7 +992,8 @@ export class Segmenter {
    * it is not tracked. Exact while the mark for `read` is kept; when it was dropped, the count runs
    * from the last kept mark before it, so it is never short, except as `atLeast` says: a segmenter
    * that came in while the Run ran counted only the newest output it could read, and for a read
-   * before the first of that, the output before it is unread too (the house's review of bc4bc85..5d8ce0e, PR #22, I36).
+   * before the first of that, the output before it is unread too (the house's review of bc4bc85..5d8ce0e, PR #22, I36), as is
+   * what a hole in that output took, for a read before the hole.
    */
   unreadBytes(runId: string, read: Seq): { bytes: number; atLeast: boolean } | undefined {
     const w = this.running.get(runId);
@@ -1000,7 +1003,7 @@ export class Segmenter {
       if (seq > read) break;
       through = bytes;
     }
-    return { bytes: w.bytes - through, atLeast: w.bytesAtLeast && (w.countedFrom === undefined || read < w.countedFrom) };
+    return { bytes: w.bytes - through, atLeast: w.bytesAtLeast && (w.countedFrom === undefined || read < w.countedFrom || (w.holesTo !== undefined && read < w.holesTo)) };
   }
 
   private emit(seg: Segment | undefined): void {
@@ -1157,6 +1160,7 @@ export class Segmenter {
     w.bytesAtLeast = out.truncated;
     const first = out.events.find((e) => e.type === 'output');
     if (first) w.countedFrom = first.seq;
+    if (gaps.length) w.holesTo = Math.max(...gaps.map((g) => g.to));
     if (out.events.length) w.marks.push([out.events[out.events.length - 1]!.seq, w.bytes]);
     if (!w.pipes) w.silenceTimer = setTimeout(() => this.checkNeedsInput(w), this.o.needsInputMs);
   }

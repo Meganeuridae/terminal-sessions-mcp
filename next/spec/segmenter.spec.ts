@@ -5,13 +5,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Journal } from '../src/core/journal.js';
+import { MemoryStore } from '../src/core/stores.js';
 import { sourceLine } from '../src/core/plumbing.js';
 import { liveSource, renderPicked, scanLifecycle, Segmenter, type Segment, type SegmentSource } from '../src/core/segmenter.js';
 import type { RunInfo, ScreenSnapshot } from '../src/core/types.js';
 import { sleep, until } from './testhost.js';
 
-function fakeSource(): SegmentSource & { runs: Map<string, RunInfo>; screen: ScreenSnapshot } {
-  const journal = new Journal();
+function fakeSource(journal = new Journal()): SegmentSource & { runs: Map<string, RunInfo>; screen: ScreenSnapshot } {
   const runs = new Map<string, RunInfo>();
   const screen: ScreenSnapshot = { cols: 80, rows: 5, alt: false, cursor: { x: 0, y: 0 }, lines: ['', '', '', '', ''], title: '', seq: 0 };
   return {
@@ -301,6 +301,32 @@ test('a marker Run in flight when the segmenter begins: its digest drops the ech
   assert.equal(far.atLeast, true, `a read before the count began: ${JSON.stringify(far)}`);
   assert.equal(seg.unreadBytes('far', src.journal.lastSeq - 1)!.atLeast, false, 'a read inside what was counted');
   assert.equal(seg.unreadBytes('near', 0)!.atLeast, false);
+});
+
+test('a count of what is new is a lower bound for a read before a hole in the output it began with, and for every read when that output held none', async (t) => {
+  const counted = async (runId: string, outputs: string[], journal?: Journal) => {
+    const src = fakeSource(journal);
+    src.runs.set(runId, { runId, sessionId: 's1', target: 'process', origin: 'agent', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'exact' });
+    src.journal.append({ type: 'run.start', runId, cwd: '/w' });
+    const seqs: number[] = [];
+    for (const data of outputs) {
+      if (data === 'HOLE') src.journal.append({ type: 'gap', from: src.journal.lastSeq + 1, to: src.journal.lastSeq + 1, reason: 'store-error' });
+      else if (data === 'FLOOD') for (let i = 0; i < 80; i++) src.journal.append({ type: 'output', data: 'z'.repeat(100), stream: 'pty' });
+      else seqs.push(src.journal.append({ type: 'output', data, stream: 'stdout', runId }).seq);
+    }
+    const seg = new Segmenter(src, { runSettleMs: 5, cadenceMs: 40, screenQuietMs: 20 });
+    t.after(() => seg.dispose());
+    await until(() => seg.unreadBytes(runId, 0) !== undefined, 5000, `${runId} counted`);
+    return { seg, seqs };
+  };
+  const holed = await counted('holed', ['one\n', 'HOLE', 'two\n']);
+  const [first, after] = holed.seqs as [number, number];
+  assert.equal(holed.seg.unreadBytes('holed', first)!.atLeast, true, `a read before the hole: ${JSON.stringify(holed.seg.unreadBytes('holed', first))}`);
+  assert.equal(holed.seg.unreadBytes('holed', after)!.atLeast, false, 'a read after the hole');
+  const empty = await counted('empty', ['HOLE']);
+  assert.equal(empty.seg.unreadBytes('empty', 0)!.atLeast, true, `no output counted: ${JSON.stringify(empty.seg.unreadBytes('empty', 0))}`);
+  const gone = await counted('gone', ['one\n', 'FLOOD'], new Journal({ hot: new MemoryStore(4096) }));
+  assert.equal(gone.seg.unreadBytes('gone', 0)!.atLeast, true, `all of it taken by retention: ${JSON.stringify(gone.seg.unreadBytes('gone', 0))}`);
 });
 
 test('an inline Run’s progress digest shows its partial line: its output begins after its start mark, so nothing waits for one', async (t) => {
