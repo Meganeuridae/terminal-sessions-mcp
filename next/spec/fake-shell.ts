@@ -93,6 +93,7 @@ export class FakeShell {
   readonly key: string;
   readonly marks: 'rich' | 'basic' | 'none';
   ignoreSignals = false;
+  drawsPromptEnd = true;
   readonly opts: FakeShellOptions;
 
   constructor(readonly pty: ScriptedPty, opts: FakeShellOptions = {}) {
@@ -135,7 +136,7 @@ export class FakeShell {
     // has none), and nothing else reads it: what the cancel's checks read before typing its empty line.
     this.pty.mode = this.marks === 'none' ? COOKED_MODE : EDITOR_MODE;
     this.pty.reader = false;
-    if (this.marks === 'rich') this.pty.emit(this.mark(`633;P;Cwd=${encodeVscodeValue(this.cwd)}`) + this.mark('133;A') + '$ ' + this.mark('133;B'));
+    if (this.marks === 'rich') this.pty.emit(this.mark(`633;P;Cwd=${encodeVscodeValue(this.cwd)}`) + this.mark('133;A') + '$ ' + (this.drawsPromptEnd ? this.mark('133;B') : ''));
     else this.pty.emit('$ ');
   }
 

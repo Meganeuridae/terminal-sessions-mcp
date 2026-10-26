@@ -62,7 +62,7 @@ export interface SessionOptions {
   seatGraceMs?: number;
   /** A partial line typed at the prompt stops blocking shell Runs after this long without input (default 30 s). */
   editingStaleMs?: number;
-  /** After a cancel's empty line, how long a prompt's start waits for the prompt's end mark before the line is taken as lost (default PROMPT_DRAWN_WAIT_MS). */
+  /** How long a prompt's start waits for the prompt's end mark: after it, queued and waiting shell Runs are typed without it, and a cancel's empty line is taken as lost (default PROMPT_DRAWN_WAIT_MS). */
   promptDrawnWaitMs?: number;
   /** Cursors carried over from an earlier life or a restart (G22): the registry persists them. */
   cursors?: Record<Principal, Cursors>;
@@ -548,6 +548,12 @@ export class Session {
   private sawPromptEnd = false;
   /** This shell's prompts carry an end mark (a B was seen): the empty line's grace then runs from it. */
   private promptsCarryEnd = false;
+  /**
+   * Between a prompt's start mark and its end mark the shell's line editor doesn't yet hold the terminal,
+   * so what is typed meets the tty's own line discipline: its echo, and keys such as ^U, ^W and macOS's ^T.
+   */
+  private promptDrawn = true;
+  private promptEndTimer: NodeJS.Timeout | undefined;
   /** Writes of a principal's input (input()), so the cancel's empty line can tell that someone typed during its settle. */
   private inputsSent = 0;
   /** An `exec` in the Run in flight may replace the shell: its command line is watched (ss-4). */
@@ -961,6 +967,7 @@ export class Session {
         // substitution takes its time): the empty line's grace runs from here (onPromptStart).
         if (this.sawPromptStart) this.promptsCarryEnd = true;
         if (this.promptProbe?.prompted && !this.promptProbe.started) this.armPromptProbeGrace();
+        if (this.sawPromptStart) this.onPromptDrawn();
         return;
       case 'C':
         return this.onPreExec();
@@ -1198,10 +1205,23 @@ export class Session {
       this.armPromptProbeGrace(this.promptsCarryEnd ? (this.opts.promptDrawnWaitMs ?? PROMPT_DRAWN_WAIT_MS) : PROMPT_PROBE_GRACE_MS);
     }
     if (this.shellState !== 'exited') this.shellState = this.currentShellRun || this.pendingShellRun || this.promptProbe ? 'busy' : 'idle';
+    this.promptDrawn = this.ready && !this.promptsCarryEnd;
+    clearTimeout(this.promptEndTimer);
+    this.promptEndTimer = undefined;
+    if (!this.promptDrawn && this.ready) {
+      this.promptEndTimer = setTimeout(() => {
+        this.promptsCarryEnd = false;
+        this.onPromptDrawn();
+      }, this.opts.promptDrawnWaitMs ?? PROMPT_DRAWN_WAIT_MS);
+      this.promptEndTimer.unref();
+    }
     if (!this.ready && !this.readyTimer) {
       // The prompt is being printed; a shell is only truly at its line editor once it
       // is done (the B mark). Do not wait forever for a PS1 that lost our mark.
-      this.readyTimer = setTimeout(() => this.markReady(), 500);
+      this.readyTimer = setTimeout(() => {
+        this.markReady();
+        this.onPromptDrawn();
+      }, 500);
     }
     // Keys typed while the last Run ran may be in the editor now: their echo comes after the
     // prompt's end mark, so a queued Run launched here, with its clear-line keys first, wiped
@@ -1213,6 +1233,15 @@ export class Session {
     // typed text only then, and a PS1 with a command substitution ate a grace that started here
     // (the house's read of f6fe640). Until then the shell is `prompt-pending` (shellAvailable).
     if (this.typeaheadWatch !== undefined) return;
+    this.drainQueue();
+    this.notifyAvailable();
+  }
+
+  private onPromptDrawn(): void {
+    clearTimeout(this.promptEndTimer);
+    this.promptEndTimer = undefined;
+    if (this.promptDrawn) return;
+    this.promptDrawn = true;
     this.drainQueue();
     this.notifyAvailable();
   }
@@ -1505,7 +1534,7 @@ export class Session {
     // nor do the members of their groups that outlived the leader (ss-10).
     this.teardownProcessGroups();
     await Promise.allSettled([...this.teardowns]);
-    for (const t of [this.graceTimer, this.settleTimer, this.readyTimer, this.capTimer, this.editingTimer, this.typeaheadTimer, this.promptProbeTimer, this.seatReserved?.timer]) clearTimeout(t);
+    for (const t of [this.graceTimer, this.settleTimer, this.readyTimer, this.capTimer, this.editingTimer, this.typeaheadTimer, this.promptProbeTimer, this.promptEndTimer, this.seatReserved?.timer]) clearTimeout(t);
     this.seatReserved = undefined;
     this.cleanupTempFiles();
     await this.screen.settled();
@@ -1782,6 +1811,7 @@ export class Session {
     // The last Run ended but the prompt that confirms the shell is back has not arrived — after a cancel
     // whose ^C drew no mark, none at all yet, which may never come by itself (askForPrompt).
     if (this.shellState === 'busy') return { ok: false, reason: this.promptProbe && !this.promptProbe.started && !this.promptProbe.prompted ? 'cancel-unanswered' : 'prompt-pending' };
+    if (!this.promptDrawn) return { ok: false, reason: 'prompt-pending' };
     // The prompt is here, and keys typed during the last Run may be in its editor (see onPromptStart): until
     // the prompt's end mark and the grace after it, nothing says whether the editor shows them.
     if (this.typeaheadWatch !== undefined) return { ok: false, reason: 'prompt-pending' };
