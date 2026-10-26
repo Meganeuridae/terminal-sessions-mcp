@@ -181,6 +181,7 @@ interface RunRecord extends RunInfo {
   /** Inline strategy: the lines still to type, one per acknowledgement; and how many pieces were acknowledged. */
   inlineLines?: string[];
   inlineAck?: number;
+  inlineLinesSubmitted?: number;
   tempFile?: string;
   /** The exact line typed for a daemon-issued shell Run (trimmed): what its 633;E must say. */
   execLine?: string;
@@ -237,7 +238,7 @@ const REPLIES_KEPT = 8;
 /** What a note says when the reinit gate after `exec bash` gives up: the recovery that loads the integration with the session's key. */
 const REINIT_RECOVERY = 'Shell commands are unavailable until it loads: once the shell shows its own prompt, send ` . "$TSM_BASH_RC" reinit typed` with input to load it, or open a new session';
 const publicRun = (r: RunRecord): RunInfo => {
-  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, markerStarted: _ms, startShellPid: _ssp, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, startedMono: _sm, ...info } = r;
+  const { waiters: _w, changeWaiters: _cw, process: _p, markerNonce: _n, inlineLines: _il, inlineAck: _ia, inlineLinesSubmitted: _ils, tempFile: _t, execLine: _x, cancelRequested: _c, markerTail: _m, markerStarted: _ms, startShellPid: _ssp, probed: _pr, endReason: _e, writeOrder: _wo, survivePrompts: _sp, replaced: _rp, lingerNoted: _ln, admittedMono: _am, startedMono: _sm, ...info } = r;
   return { ...info, seq: { ...info.seq } };
 };
 
@@ -556,6 +557,7 @@ export class Session {
   private promptEndTimer: NodeJS.Timeout | undefined;
   /** Writes of a principal's input (input()), so the cancel's empty line can tell that someone typed during its settle. */
   private inputsSent = 0;
+  private linesSubmitted = 0;
   /** An `exec` in the Run in flight may replace the shell: its command line is watched (ss-4). */
   private execWatch: { run: RunRecord; timer: NodeJS.Timeout } | undefined;
   /** Order of everything typed into the terminal: principals' lines and the daemon's (ss-1). */
@@ -2131,6 +2133,7 @@ export class Session {
     // read of 236301b); known active edits block admission above.
     run.state = 'starting';
     this.inFront.set(run.within ?? null, run);
+    run.inlineLinesSubmitted = this.linesSubmitted;
     this.pty.write(`${CLEAR_WHOLE_LINE}${run.inlineLines.shift()!}\n`);
     for (const w of run.changeWaiters?.splice(0) ?? []) w();
   }
@@ -2176,6 +2179,12 @@ export class Session {
     const { run } = hit;
     if (hit.kind === 'ack') {
       run.inlineAck = (run.inlineAck ?? 0) + 1;
+      if (this.linesSubmitted !== run.inlineLinesSubmitted) {
+        run.inlineLines = [];
+        this.submittedAt = clocks.monotonic();
+        this.endRun(run, { state: run.cancelRequested ? 'cancelled' : 'lost', reason: 'line-not-whole' });
+        return;
+      }
       // Cleared like the first line: keys a person typed at the prompt between two pieces would
       // otherwise start the next one (the house's read of a6d0c35, #22); the whole-line check in
       // the piece stands behind that.
@@ -3024,6 +3033,7 @@ export class Session {
     this.append(ev);
     this.inputsSent++;
     if (opts.principal !== SYSTEM) {
+      if (/[\r\n]/.test(data)) this.linesSubmitted++;
       this.lastTyper = opts.principal;
       const layer = this.layers.at(-1);
       const atPrompt = (this.shellState === 'idle' && !this.currentShellRun && !this.pendingShellRun) || (layer !== undefined && !this.inFront.has(layer.within));

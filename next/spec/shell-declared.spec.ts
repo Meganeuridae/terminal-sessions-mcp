@@ -12,6 +12,8 @@ import { looksLikeShellOpener } from '../src/api/hints.js';
 import { renderRun } from '../src/api/tools.js';
 import type { RunResult } from '../src/api/app.js';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import { inlineProbe } from '../src/core/plumbing.js';
 import { inlineLines } from '../src/core/session.js';
 import { journalRunText } from '../src/core/segmenter.js';
@@ -464,6 +466,84 @@ test('a gone marker from the declared shell ends the Run lost: line-not-whole, n
     assert.equal(typed.slice(before).filter((t) => t.includes("__tsm_b='echo one'")).length, 0, 'nothing more typed for the lost Run');
   } finally {
     await h.session.close();
+  }
+});
+
+/** A declared shell in front, and a Run long enough to be typed in pieces, with a Run queued behind it; the first piece is typed. */
+async function piecesUnderway() {
+  const h = await scriptedSession();
+  const typed: string[] = [];
+  h.pty.onWrite((d) => typed.push(d));
+  const front = h.session.admit({ target: 'shell', line: 'sleep 100', principal: AGENT });
+  assert.ok(front.admitted);
+  await until(() => h.session.run(front.run.runId).state === 'running');
+  h.session.declareShell({ principal: AGENT });
+  const long = h.session.admit({ target: 'shell', line: `: ${'x'.repeat(2600)}`, principal: AGENT });
+  const next = h.session.admit({ target: 'shell', line: 'echo next', principal: AGENT, queue: true });
+  assert.ok(long.admitted && next.admitted);
+  await until(() => typed.some((t) => t.includes("__tsm_b='")), 3000, 'the first piece');
+  const nonce = /<<<AC''K:([0-9a-f]+):1>>>/.exec(typed.find((t) => t.includes("__tsm_b='"))!)![1]!;
+  return { h, typed, long: long.run.runId, next: next.run.runId, nonce };
+}
+
+test('a line typed between two pieces of a declared Run stops it: nothing more is typed for it, it ends lost (line-not-whole), and the Run queued behind it waits', async () => {
+  const { h, typed, long, next, nonce } = await piecesUnderway();
+  try {
+    h.session.input('cat > notes\r', { principal: AGENT });
+    const before = typed.length;
+    h.pty.emit(`<<<ACK:${nonce}:1>>>\r\n`);
+    await until(() => h.session.run(long).state === 'lost', 3000, 'the Run ends lost');
+    assert.equal(h.session.run(long).reason, 'line-not-whole');
+    assert.match(renderRun({ ...(h.session.run(long) as unknown as RunResult), session: 's', output: { text: '', truncated: false, seq: [1, 2], nextCursor: 2 } }, 'transcript').text, /a line was submitted between its pieces, so the command never ran/);
+    await new Promise((r) => setTimeout(r, 600));
+    assert.deepEqual(typed.slice(before).filter((t) => t.includes('__tsm_b')), [], 'neither its next piece nor the queued Run was typed into the command that line started');
+    assert.equal(h.session.run(next).state, 'queued');
+  } finally {
+    await h.session.close();
+  }
+});
+
+test('keys typed between two pieces of a declared Run without a newline do not stop it: the next piece is typed', async () => {
+  const { h, typed, long, nonce } = await piecesUnderway();
+  try {
+    h.session.input('cat', { principal: AGENT });
+    const before = typed.length;
+    h.pty.emit(`<<<ACK:${nonce}:1>>>\r\n`);
+    await until(() => typed.slice(before).some((t) => t.includes('__tsm_b=${__tsm_b-}')), 3000, 'the next piece');
+    assert.equal(h.session.run(long).state, 'starting');
+  } finally {
+    await h.session.close();
+  }
+});
+
+test('in a declared bash, a command submitted while a Run is typed in pieces gets none of them: the Run ends lost, and a Run queued behind it waits until that command ends', { skip: !hasShell('/bin/bash') }, async () => {
+  // A short stale period: the queued Run must wait on cat being in front, not on the period.
+  const x = await realSession('/bin/bash', { editingStaleMs: 600 });
+  try {
+    await open(x.session, 'bash --norc --noprofile');
+    declare(x.session, 'bash');
+    // Each piece's assignment first sleeps 0.3 s, so a line can be submitted while a piece runs.
+    assert.equal((await x.run(`trap '[[ $BASH_COMMAND == __tsm_b=* ]] && sleep 0.3' DEBUG`, 10000)).exit, 0);
+    const file = path.join(x.tmp, 'notes');
+    const before = x.journal.lastSeq;
+    const output = () => x.journal.since(before).events.flatMap((e) => (e.type === 'output' ? [(e as { data: string }).data] : [])).join('');
+    const long = x.session.admit({ target: 'shell', line: `: ${'x'.repeat(2600)}; echo RAN-$((40+2))`, principal: AGENT });
+    assert.ok(long.admitted);
+    await until(() => /<<<ACK:[0-9a-f]+:1>>>/.test(output()), 10000, 'the first piece acknowledged');
+    x.session.input(`cat > ${file}\r`, { principal: AGENT });
+    const queued = x.session.admit({ target: 'shell', line: 'echo QUEUED', principal: AGENT, queue: true });
+    assert.ok(queued.admitted);
+    const r = await x.session.awaitRun(long.run.runId, 10000);
+    assert.deepEqual([r.state, r.reason], ['lost', 'line-not-whole']);
+    await new Promise((res) => setTimeout(res, 1500));
+    assert.equal(fs.readFileSync(file, 'utf8'), '', 'cat received none of the Run');
+    assert.equal(x.session.run(queued.run.runId).state, 'queued', 'the queued Run waits while cat holds the terminal');
+    x.session.input('\x03', { principal: AGENT, kind: 'keys' });
+    const q = await x.session.awaitRun(queued.run.runId, 10000);
+    assert.deepEqual([q.state, q.exit, (await x.session.runTranscript(q.runId)).text.trim()], ['exited', 0, 'QUEUED']);
+    assert.doesNotMatch(output(), /RAN-42/);
+  } finally {
+    await x.close();
   }
 });
 
