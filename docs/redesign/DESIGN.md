@@ -1246,9 +1246,6 @@ addition; nothing about them touches the live PTY.
   hosts as MCP carries one: an `isError` result whose text opens with the code
   (`session_not_found: …`) and carries no envelope; a protocol failure is a JSON-RPC error.
   Only the compat pack answers in 1.x's `{success: false}` shape, for its one release.
-  Regex support is capability-checked: Node 20's linear engine refuses lookbehind, and
-  misorders some nullable bounded repetitions. Such patterns receive an explicit error
-  on that engine instead of a wrong match or an automatic switch to backtracking.
 - Structured logs (JSON lines) with `session`, `principal`, `runId`; client strings are
   length-limited and JSON-encoded, tokens never appear. `/health` reports per-session
   state, backend, integration, controller, the current Run, journal stats (bytes, retention,

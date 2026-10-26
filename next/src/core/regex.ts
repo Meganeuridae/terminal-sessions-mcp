@@ -9,7 +9,6 @@
  * whatever the pattern. How a pattern is prepared for it:
  *
  * - That engine has no back-references or lookahead: those patterns are refused.
- *   Lookbehind depends on the engine's capabilities (Node 20's engine refuses it).
  *   A pattern the linear engine rejects is refused, never silently moved to backtracking.
  * - It has no case-insensitive mode: `i` is compiled by rewriting each letter
  *   into the class of what `i` equates it with (`a` → `[Aa]`, see `foldCase`).
@@ -78,21 +77,6 @@ function enableLinearEngine(): boolean {
 /** True when caller patterns run on the linear-time engine. */
 export const LINEAR_REGEX = enableLinearEngine();
 
-/** Whether this Node's linear engine accepts lookbehind; Node 20's does not. */
-export const LINEAR_LOOKBEHIND =
-  LINEAR_REGEX &&
-  (() => {
-    try {
-      new RegExp('(?<=a)b', 'l');
-      return true;
-    } catch {
-      return false;
-    }
-  })();
-
-/** Older linear engines choose an empty optional group before its nonempty match. */
-export const LINEAR_NULLABLE_REPETITION = LINEAR_REGEX && new RegExp('a(?:b*?)?', 'l').exec('ab')?.[0] === 'ab';
-
 const windows = new WeakMap<RegExp, number>();
 
 const REFUSED =
@@ -124,14 +108,11 @@ export function compileUserRegex(pattern: string, flags = ''): RegExp {
     if (final.length > MAX_EXPANDED_LENGTH) throw tooLarge();
     size = parse(final)?.node;
   }
-  if (!LINEAR_NULLABLE_REPETITION && (size === undefined || nullableBoundedRepetition(size))) {
-    throw err('invalid_argument', 'this Node\'s linear-time regex engine misorders nullable bounded repetitions; simplify optional groups or use a newer Node');
-  }
   let re: RegExp;
   try {
     re = new RegExp(final, `${base.replace('i', '')}l`);
   } catch {
-    throw err('invalid_argument', 'pattern is not supported by this Node\'s linear-time regex engine; lookbehind requires an engine that supports it');
+    throw err('invalid_argument', 'pattern is not supported by this Node\'s linear-time regex engine');
   }
   windows.set(re, size === undefined ? MIN_WINDOW : Math.max(MIN_WINDOW, Math.min(MAX_MATCH_INPUT, Math.floor(MATCH_COST / Math.max(1, sizeOf(size))))));
   return re;
@@ -335,16 +316,6 @@ const copies = (q: Extract<Node, { kind: 'quant' }>): number => (q.max !== Infin
 
 /** The copies the engine itself makes of a quantifier's body: `x{m,}` is `x{m}x*` to it, so `x+` is two (Node 20's engine counts so; Node 22's is more lenient). */
 const engineCopies = (q: Extract<Node, { kind: 'quant' }>): number => (q.max !== Infinity ? Math.max(1, q.max) : q.min === 0 ? 1 : q.min + 1);
-
-function nullableBoundedRepetition(n: Node): boolean {
-  switch (n.kind) {
-    case 'atom': return false;
-    case 'seq': return n.items.some(nullableBoundedRepetition);
-    case 'alt': return n.branches.some(nullableBoundedRepetition);
-    case 'group': return nullableBoundedRepetition(n.body);
-    case 'quant': return (n.max !== Infinity && nullable(n.body)) || nullableBoundedRepetition(n.body);
-  }
-}
 
 /** The most copies along one nesting of quantifiers within `n`, as the engine counts them. */
 function nesting(n: Node): number {

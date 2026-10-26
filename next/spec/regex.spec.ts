@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { cpuMs } from './testhost.js';
-import { compileUserRegex, execBounded, foldCase, LINEAR_LOOKBEHIND, LINEAR_NULLABLE_REPETITION, LINEAR_REGEX, MAX_MATCH_INPUT, MIN_WINDOW, matchWindow, testBounded } from '../src/core/regex.js';
+import { compileUserRegex, execBounded, foldCase, LINEAR_REGEX, MAX_MATCH_INPUT, MIN_WINDOW, matchWindow, testBounded } from '../src/core/regex.js';
 
 test('regex: the linear-time engine is in force on this Node', () => {
   assert.equal(LINEAR_REGEX, true);
@@ -57,6 +57,8 @@ test('regex: refusals are invalid_argument with a reason', () => {
   refused('(?:\\w+\\s?){1,300}$', '', /grow past/);
   refused('(?<n>a)\\k<n>', '', /back-references/);
   refused('(', '', /invalid pattern/);
+  // A modifier group: invalid as a group on Node 22; on Node 24 the linear engine can't run it.
+  refused('(?i:a)b');
   refused('a', 'u', /flags/);
   refused('x'.repeat(1001), '', /longer/);
 });
@@ -108,7 +110,7 @@ function patternGen(r: () => number, maxCount: number): () => string {
     for (let n = 1 + Math.floor(r() * 4); n > 0; n--) {
       const k = r();
       if (k < 0.06) out += pick(['^', '$', '\\b', '\\B']);
-      else if (k < 0.09 && depth === 0 && LINEAR_LOOKBEHIND) out += `(?<=${pick([...letters])})`;
+      else if (k < 0.09 && depth === 0) out += `(?<=${pick([...letters])})`;
       else {
         const a = atom(depth);
         out += a + quant(a.startsWith('('));
@@ -139,9 +141,6 @@ function fuzz(seed: number, cases: number, maxCount: number, flags: string[]) {
     try {
       lin = compileUserRegex(p, f);
     } catch (e) {
-      // Node 20's engine has a match-priority bug for a nullable bounded repetition.
-      // Those patterns must be explicitly refused rather than return the wrong match.
-      if (!LINEAR_NULLABLE_REPETITION && /misorders nullable bounded repetitions/.test((e as Error).message)) continue;
       // Only a nesting of large counts may be refused, and only for its size.
       assert.match((e as Error).message, /grow past/, `/${p}/${f}`);
       refusedForSize++;
@@ -227,15 +226,8 @@ test('er-9: groups are compiled non-capturing; the match itself is unchanged', (
   assert.ok(compileUserRegex('[\\1]').test('\x01'));
 });
 
-test('an engine without lookbehind (Node 20) refuses it instead of silently using backtracking', { skip: LINEAR_LOOKBEHIND ? 'this engine takes lookbehind' : false }, () => {
-  for (const pattern of ['(?<=y)b', '(?<=y)(a+)+$', '(?<=y)(a|aa)+$']) {
-    assert.throws(() => compileUserRegex(pattern), /not supported by this Node's linear-time regex engine/);
-  }
-});
-
-test('nullable optional groups either preserve JavaScript match priority or explain the engine limitation', () => {
+test('nullable optional groups keep JavaScript match priority', () => {
   for (const [pattern, text] of [['a(?:b*?)?', 'ab'], ['e(?:c+?|[W-Zb-eA-z]*?)?', 'eY']]) {
-    if (LINEAR_NULLABLE_REPETITION) assert.deepEqual(compileUserRegex(pattern!).exec(text!)?.[0], new RegExp(pattern!).exec(text!)?.[0]);
-    else assert.throws(() => compileUserRegex(pattern!), /misorders nullable bounded repetitions/);
+    assert.deepEqual(compileUserRegex(pattern!).exec(text!)?.[0], new RegExp(pattern!).exec(text!)?.[0]);
   }
 });
