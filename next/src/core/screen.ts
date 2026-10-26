@@ -40,6 +40,7 @@ const { SerializeAddon } = serializeAddon as unknown as {
 
 /** Largest single xterm write, in UTF-16 units: bounds one parse slice (tens of ms at worst). */
 const MAX_BATCH = 256 * 1024;
+const SECRET_PROMPT_MAX_CHARS = 1024;
 
 export interface ScreenOptions {
   cols: number;
@@ -418,10 +419,19 @@ export class Screen {
     return snap;
   }
 
-  /** The text of the cells left of the cursor on its row. */
+  /** Text before the cursor on its logical line, including xterm-marked wrapped rows. */
   textBeforeCursor(): string {
     const buf = this.term.buffer.active;
-    return buf.getLine(buf.baseY + buf.cursorY)?.translateToString(true, 0, buf.cursorX) ?? '';
+    let y = buf.baseY + buf.cursorY;
+    let line = buf.getLine(y);
+    if (!line) return '';
+    let text = line.translateToString(true, 0, buf.cursorX);
+    while (line.isWrapped && y > 0 && text.length < SECRET_PROMPT_MAX_CHARS) {
+      line = buf.getLine(--y);
+      if (!line) break;
+      text = line.translateToString(false).slice(-(SECRET_PROMPT_MAX_CHARS - text.length)) + text;
+    }
+    return text.slice(-SECRET_PROMPT_MAX_CHARS);
   }
 
   /**

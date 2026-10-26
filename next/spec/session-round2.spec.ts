@@ -1530,6 +1530,12 @@ test('m2-2: the secret-prompt test on realistic prompts (false positives measure
     "aster@build-01's password: ",
     "Enter passphrase for key '/Users/aster/.ssh/id_ed25519': ",
     'Passphrase: ',
+    'Enter PEM pass phrase: ',
+    'New passwd: ',
+    'GITHUB_TOKEN: ',
+    'client_secret: ',
+    'AWS_SECRET_ACCESS_KEY: ',
+    'Password? ',
     "Password for 'https://aster@github.com': ",
     'Enter password: ',
     'Password for user postgres: ',
@@ -1593,7 +1599,51 @@ test('m2-2: a prompt drawn on the screen is read by the cells left of the cursor
   }
 });
 
-test('m2-2 and G26: the GUI asks the daemon’s question of the text left of its cursor (I94 in the house’s review of bc4bc85..5d8ce0e, PR #22; settled in comment 6394922501)', () => {
+test('m2-2: common token and pass-phrase prompts redact input in the journal', async () => {
+  for (const prompt of ['GITHUB_TOKEN: ', 'Enter PEM pass phrase: ', 'Password? ']) {
+    const h = await harness({ setup: (s) => s.on(/^ask/, () => ({ output: prompt, hang: true })) });
+    try {
+      const a = h.session.admit({ target: 'shell', line: 'ask for credential', principal: AGENT });
+      assert.ok(a.admitted);
+      await h.session.screen.settled();
+      h.session.releaseControl(AGENT);
+      h.session.input('credential-sentinel', { principal: HUMAN });
+      const input = ofType(h.journal.since(0).events, 'input').filter((e) => e.principal === HUMAN).at(-1);
+      assert.equal(input?.data, '[redacted]', prompt);
+      assert.equal(input?.sensitive, true, prompt);
+    } finally {
+      await h.session.close();
+    }
+  }
+});
+
+test('m2-2: a drawn prompt spanning wrapped rows marks input sensitive, not an unrelated earlier row', async () => {
+  const cases = [
+    { name: 'wrapped', draw: '\x1b[10;113HPassword: \x1b[20;1Hstatus\x1b[11;3H', sensitive: true },
+    { name: 'separate rows', draw: '\x1b[10;1HPassword: \x1b[11;1H: \x1b[20;1Hstatus\x1b[11;3H', sensitive: false },
+  ];
+  for (const c of cases) {
+    const h = await harness({ setup: (s) => s.on(/^unlock/, () => ({ output: c.draw, hang: true })) });
+    try {
+      const a = h.session.admit({ target: 'shell', line: 'unlock vault', principal: AGENT });
+      assert.ok(a.admitted);
+      await h.session.screen.settled();
+      const snap = h.session.screen.snapshot();
+      assert.deepEqual(snap.cursor, { x: 2, y: 10 }, c.name);
+      assert.ok(snap.lines[9]?.includes('Password') && snap.lines[10]?.startsWith(':'), 'the prompt spans the displayed rows');
+      assert.equal(looksLikeSecretPrompt(c.draw.replace(/\x1b\[[0-9;]*H/g, '')), false, 'the last printed line has trailing status');
+      h.session.releaseControl(AGENT);
+      h.session.input('credential-sentinel', { principal: HUMAN });
+      const input = ofType(h.journal.since(0).events, 'input').filter((e) => e.principal === HUMAN).at(-1);
+      assert.equal(input?.data, c.sensitive ? '[redacted]' : 'credential-sentinel', c.name);
+      assert.equal(input?.sensitive === true, c.sensitive, c.name);
+    } finally {
+      await h.session.close();
+    }
+  }
+});
+
+test('m2-2 and G26: GUI and daemon use the same secret-prompt pattern', () => {
   const app = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'gui', 'app.js'), 'utf8');
   const literal = /^\s*const SECRET_PROMPT = \/(.+)\/([a-z]*);$/m.exec(app);
   assert.ok(literal, 'gui/app.js declares SECRET_PROMPT as a regular expression literal');

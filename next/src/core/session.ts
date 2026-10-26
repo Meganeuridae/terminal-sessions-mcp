@@ -506,7 +506,7 @@ function flavorOf(command: string | undefined): ShellFlavor {
  * next; measured against realistic prompts in session-round2.spec.
  */
 export const SECRET_PROMPT =
-  /(?:pass(?:word|phrase|code)|\bpins?\b|\bsecrets?\b|\btokens?\b|\botp\b|one[- ]time (?:password|code)|verification code|auth(?:entication)? code|\bapi[ _-]?key\b|\baccess key\b)[^\n]*:\s*$/i;
+  /(?:pass(?:word|phrase|code|wd)|pass[ _-]phrase|(?:^|[^A-Za-z0-9])(?:pins?|secrets?|tokens?|otp|one[- ]time (?:password|code)|verification code|auth(?:entication)? code|api[ _-]?key|access key)(?![A-Za-z0-9]))[^\n]*[:?]\s*$/i;
 
 export const looksLikeSecretPrompt = (textBeforeCursor: string): boolean => SECRET_PROMPT.test(textBeforeCursor);
 

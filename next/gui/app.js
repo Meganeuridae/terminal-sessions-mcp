@@ -273,19 +273,29 @@
   // ───────────── typing: never queued, secret when asked or when it looks like a password prompt ─────────────
 
   /** A no-echo prompt's usual last line: `Password:`, `[sudo] password for x:`, `Enter passphrase for key …:`, `PIN:`. */
-  const SECRET_PROMPT = /(?:pass(?:word|phrase|code)|\bpins?\b|\bsecrets?\b|\btokens?\b|\botp\b|one[- ]time (?:password|code)|verification code|auth(?:entication)? code|\bapi[ _-]?key\b|\baccess key\b)[^\n]*:\s*$/i;
+  const SECRET_PROMPT = /(?:pass(?:word|phrase|code|wd)|pass[ _-]phrase|(?:^|[^A-Za-z0-9])(?:pins?|secrets?|tokens?|otp|one[- ]time (?:password|code)|verification code|auth(?:entication)? code|api[ _-]?key|access key)(?![A-Za-z0-9]))[^\n]*[:?]\s*$/i;
+  const SECRET_PROMPT_MAX_CHARS = 1024;
   const secret = { manual: false, auto: false };
 
   /**
-   * The text left of the cursor on its row, the place the daemon's m2-2 also reads a prompt on the screen (the second of
-   * `atSecretPrompt`'s two reads): what a row held before the prompt was printed over it can stay to the cursor's right.
+   * The logical text left of the cursor, including xterm-marked wrapped rows, is the daemon's second prompt read.
+   * A row can still hold stale text to the cursor's right from before the prompt overwrote it.
    * Read whole, a row left so by readline's redraw for a resize took `Password: o "len=${#PW}"` for no prompt (a
    * reviewer's read of the fixes for #22).
    */
   function textBeforeCursor() {
     if (!term) return '';
     const b = term.buffer.active;
-    return b.getLine(b.baseY + b.cursorY)?.translateToString(true, 0, b.cursorX) ?? '';
+    let y = b.baseY + b.cursorY;
+    let line = b.getLine(y);
+    if (!line) return '';
+    let text = line.translateToString(true, 0, b.cursorX);
+    while (line.isWrapped && y > 0 && text.length < SECRET_PROMPT_MAX_CHARS) {
+      line = b.getLine(--y);
+      if (!line) break;
+      text = line.translateToString(false).slice(-(SECRET_PROMPT_MAX_CHARS - text.length)) + text;
+    }
+    return text.slice(-SECRET_PROMPT_MAX_CHARS);
   }
 
   function updateSecret() {
@@ -326,7 +336,7 @@
       );
       return;
     }
-    // G26: a password prompt left of the cursor makes this input secret until the line is entered.
+    // G26: a password prompt left of the cursor makes this input secret until Enter or Ctrl-C.
     if (!secret.manual && !secret.auto && SECRET_PROMPT.test(textBeforeCursor())) {
       secret.auto = true;
       updateSecret();
@@ -337,7 +347,7 @@
     typedSecret = sensitive;
     if (!typedAhead) typedFor = state.current;
     typedAhead += data;
-    if (sensitive && secret.auto && /[\r\n]/.test(data)) {
+    if (sensitive && secret.auto && /[\r\n\x03]/.test(data)) {
       secret.auto = false;
       updateSecret();
     }

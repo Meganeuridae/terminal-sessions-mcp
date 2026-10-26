@@ -412,6 +412,131 @@ test('tsg-8 (G26): input at a password prompt is sent as sensitive automatically
   }
 });
 
+test('tsg-8: Ctrl-C ends automatic secret mode before the next ordinary input', async (t) => {
+  if (skip || !browser) return t.skip(skip || 'no browser');
+  const a = await agent();
+  await a.call('session_open', { session: 'cancel-secret', visibility: 'shared' });
+  const problems: string[] = [];
+  const page = await openGui('http://127.0.0.1:' + port + '/?token=tg', problems);
+  try {
+    await pick(page, 'cancel-secret');
+    await takeSeat(page, a, 'cancel-secret');
+    await page.click('#term');
+    await page.keyboard.type('A=Pa; P=word; read -s -p "${A}ss$P: " PW; echo');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(rows + ".includes('Password:')", { timeout: 8000 });
+    const live = registry.get('cancel-secret');
+    assert.ok(live && live.kind === 'live');
+    const pty = (live.session as unknown as { pty: PtyHandle }).pty;
+    await until(() => {
+      const mode = pty.inputMode?.();
+      return mode !== undefined && mode.canonical && !mode.echo;
+    }, 5000, 'the secret reader has echo disabled');
+    await page.keyboard.type('x');
+    await page.waitForFunction("document.getElementById('secret').textContent === 'Secret: auto'", { timeout: 3000 });
+    await until(() => inputsOf('cancel-secret').some((e) => e.sensitive === true), 5000, 'the first secret key journaled');
+    const beforeCancel = inputsOf('cancel-secret').length;
+    const promptsBefore = live.session.journal.since(0).events.filter((e) => e.type === 'prompt' && e.phase === 'end').length;
+    await page.keyboard.down('Control');
+    try {
+      await page.keyboard.press('c');
+    } finally {
+      await page.keyboard.up('Control');
+    }
+    await until(() => inputsOf('cancel-secret').length > beforeCancel, 5000, 'Ctrl-C input was journaled');
+    await until(() => live.session.journal.since(0).events.filter((e) => e.type === 'prompt' && e.phase === 'end').length > promptsBefore, 5000, 'the shell prompt after Ctrl-C');
+    await page.waitForFunction("document.getElementById('secret').textContent === 'Secret: off'", { timeout: 3000 });
+    const before = inputsOf('cancel-secret').length;
+    await page.keyboard.type('echo AFTER-CANCEL');
+    await page.keyboard.press('Enter');
+    await until(() => inputsOf('cancel-secret').slice(before).map((e) => e.data).join('').includes('echo AFTER-CANCEL'), 5000, 'ordinary command journaled after cancellation');
+    assert.ok(inputsOf('cancel-secret').slice(before).every((e) => e.sensitive !== true), 'the next input remains ordinary');
+    assert.deepEqual(problems, []);
+  } finally {
+    await page.close();
+    a.close();
+  }
+});
+
+test('tsg-8: an underscore token prompt marks GUI input sensitive', async (t) => {
+  if (skip || !browser) return t.skip(skip || 'no browser');
+  const a = await agent();
+  await a.call('session_open', { session: 'token-secret', visibility: 'shared' });
+  const problems: string[] = [];
+  const page = await openGui('http://127.0.0.1:' + port + '/?token=tg', problems);
+  try {
+    await pick(page, 'token-secret');
+    await takeSeat(page, a, 'token-secret');
+    await page.click('#term');
+    await page.keyboard.type('A=GITHUB; read -s -p "${A}_TOKEN: " PW; echo');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(rows + ".includes('GITHUB_TOKEN:')", { timeout: 8000 });
+    const live = registry.get('token-secret');
+    assert.ok(live && live.kind === 'live');
+    const pty = (live.session as unknown as { pty: PtyHandle }).pty;
+    await until(() => {
+      const mode = pty.inputMode?.();
+      return mode !== undefined && mode.canonical && !mode.echo;
+    }, 5000, 'the token reader has echo disabled');
+    const before = inputsOf('token-secret').length;
+    await page.keyboard.type('x');
+    await page.waitForFunction("document.getElementById('secret').textContent === 'Secret: auto'", { timeout: 3000 });
+    await until(() => inputsOf('token-secret').length > before, 5000, 'the token input journaled');
+    assert.ok(inputsOf('token-secret').slice(before).every((e) => e.sensitive === true && e.data === '[redacted]'), 'the GUI marks typed token input sensitive');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction("document.getElementById('secret').textContent === 'Secret: off'", { timeout: 3000 });
+    assert.deepEqual(problems, []);
+  } finally {
+    await page.close();
+    a.close();
+  }
+});
+
+test('tsg-8: a wrapped drawn password prompt is auto sensitive in the GUI', async (t) => {
+  if (skip || !browser) return t.skip(skip || 'no browser');
+  const a = await agent();
+  await a.call('session_open', { session: 'wrapped-secret', visibility: 'shared' });
+  const problems: string[] = [];
+  const page = await openGui('http://127.0.0.1:' + port + '/?token=tg', problems);
+  try {
+    await pick(page, 'wrapped-secret');
+    await takeSeat(page, a, 'wrapped-secret');
+    await page.click('#term');
+    const live = registry.get('wrapped-secret');
+    assert.ok(live && live.kind === 'live');
+    const resizesBefore = live.session.journal.since(0).events.filter((e) => e.type === 'resize').length;
+    await page.setViewport({ width: 1100, height: 900 });
+    await until(() => live.session.journal.since(0).events.filter((e) => e.type === 'resize').length > resizesBefore, 5000, 'the controller viewport resized the PTY');
+    const { cols, rows: height } = live.session.snapshot();
+    await page.click('#term');
+    assert.ok(cols > 16 && height > 20, 'the view has room for a wrapped prompt and status');
+    const command = 'A=Pa; P=word; printf "\\033[10;' + (cols - 7) + 'H${A}ss${P}: \\033[20;1Hstatus\\033[11;3H"; read -s PW; echo';
+    await page.keyboard.type(command);
+    await page.keyboard.press('Enter');
+    await until(() => {
+      const snap = live.session.snapshot();
+      return snap.lines[9]?.endsWith('Password') === true && snap.lines[10]?.startsWith(':') === true;
+    }, 8000, 'the daemon screen holds the prompt on wrapped rows');
+    await page.waitForFunction(rows + ".includes('status')", { timeout: 8000 });
+    const pty = (live.session as unknown as { pty: PtyHandle }).pty;
+    await until(() => {
+      const mode = pty.inputMode?.();
+      return mode !== undefined && mode.canonical && !mode.echo;
+    }, 5000, 'the secret reader has echo disabled');
+    const before = inputsOf('wrapped-secret').length;
+    await page.keyboard.type('x');
+    await page.waitForFunction("document.getElementById('secret').textContent === 'Secret: auto'", { timeout: 3000 });
+    await until(() => inputsOf('wrapped-secret').length > before, 5000, 'the wrapped-prompt input journaled');
+    assert.ok(inputsOf('wrapped-secret').slice(before).every((e) => e.sensitive === true && e.data === '[redacted]'), 'the GUI marks typed input sensitive');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction("document.getElementById('secret').textContent === 'Secret: off'", { timeout: 3000 });
+    assert.deepEqual(problems, []);
+  } finally {
+    await page.close();
+    a.close();
+  }
+});
+
 test('tsg-9: after the session is closed the GUI shows its history, and follows it into a new life', async (t) => {
   if (skip || !browser) return t.skip(skip || 'no browser');
   const a = await agent();
