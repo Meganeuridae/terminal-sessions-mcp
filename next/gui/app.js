@@ -278,7 +278,7 @@
   const secret = { manual: false, auto: false };
 
   /**
-   * The logical text left of the cursor, including xterm-marked wrapped rows, is the daemon's second prompt read.
+   * The logical line left of the cursor, capped to its last 1024 characters and joined only over xterm-marked wraps, is the daemon's second prompt read.
    * A row can still hold stale text to the cursor's right from before the prompt overwrote it.
    * Read whole, a row left so by readline's redraw for a resize took `Password: o "len=${#PW}"` for no prompt (a
    * reviewer's read of the fixes for #22).

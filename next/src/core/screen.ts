@@ -419,7 +419,7 @@ export class Screen {
     return snap;
   }
 
-  /** Text before the cursor on its logical line, including xterm-marked wrapped rows. */
+  /** At most the last 1024 characters before the cursor on its logical line, joining xterm-marked wrapped rows. */
   textBeforeCursor(): string {
     const buf = this.term.buffer.active;
     let y = buf.baseY + buf.cursorY;
