@@ -462,7 +462,7 @@ npx ts-node examples/service-management.ts
 ## Requirements
 
 - **Node.js** 22.12 or later within 22.x, or 24.x (`engines`: `>=22.12.0 <25.0.0`; Node 20 reached its end of life on 2026-04-30; `session-cli` requires an ES-module-only dependency, which `require` loads from 22.12 on, and Puppeteer 25 asks for 22.12 too; Node 21 and 22.0 to 22.11 are out; Node 25+ not yet supported due to node-pty compatibility)
-- **Headless Chrome** (via Puppeteer) for screenshots. Puppeteer 25 downloads it as it installs: on Linux it unpacks the archive with `unzip`, or with the `yauzl` package where that is installed, and it reads HTTP(S)_PROXY through the `proxy-agent` package where that is installed, otherwise using Node's own agents (both packages are optional peers of `@puppeteer/browsers`). A download that fails only warns, so `npm install` succeeds without a browser, and screenshots then fail at launch.
+- **Headless Chrome** (via Puppeteer) for screenshots. Puppeteer 25 downloads it as it installs: on Linux it unpacks the archive with `unzip`, or with the `yauzl` package, which this package depends on so that a host without `unzip` still gets its browser. It reads HTTP(S)_PROXY through the `proxy-agent` package where that is installed, otherwise using Node's own agents (`proxy-agent` is an optional peer of `@puppeteer/browsers`, and this package doesn't depend on it). A download that fails only warns, so `npm install` succeeds without a browser, and screenshots then fail at launch.
 - **Modern browser** for web GUI (Chrome, Firefox, Safari, Edge)
 
 ## Configuration

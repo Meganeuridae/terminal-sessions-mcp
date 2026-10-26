@@ -66,7 +66,8 @@ later release (`next/README.md`, "Upgrading from 1.x").
 - The `@xterm` packages and `ws` are pinned at the versions 2.0 uses (`@xterm/xterm` 6.0.0,
   `@xterm/addon-fit` 0.11.0, `@xterm/addon-web-links` 0.12.0, `ws` 8.21.3); the 1.x GUI loads
   xterm from a CDN, and 1.x's `ws` stays within 8.x. New dependencies: `@animalabs/mcpl-core`,
-  `@xterm/headless`, `@xterm/addon-serialize`.
+  `@xterm/headless`, `@xterm/addon-serialize`, and `yauzl` `^3.4.0`, with which Puppeteer unpacks its
+  browser on a Linux host without `unzip`.
 
 ## v1.7.3 - 2026-10-22
 
