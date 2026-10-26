@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { hasShell, realSession, until } from './fake-shell.js';
+import { hasShell, realSession, until, withoutSetpgidWarning } from './fake-shell.js';
 
 const shells = ['/bin/bash', '/bin/zsh'].filter(hasShell);
 
@@ -195,3 +195,11 @@ test('/bin/bash: shell-10: after a bind -x widget at the prompt, the next daemon
   }
 });
 
+test("a Run's text loses bash 3.2's child-setpgid warning line, and nothing else", () => {
+  const warning = 'bash: child setpgid (51915 to 51915): Operation not permitted';
+  assert.equal(withoutSetpgidWarning(`${warning}\nsub`), 'sub');
+  assert.equal(withoutSetpgidWarning(`one\r\n${warning}\r\ntwo`), 'one\r\ntwo');
+  for (const kept of ['sub', `x ${warning}`, `${warning} and more`, 'bash: child setpgid (1 to 2): No such process', '<<<PROBE:ab12::>>>']) {
+    assert.equal(withoutSetpgidWarning(kept), kept);
+  }
+});

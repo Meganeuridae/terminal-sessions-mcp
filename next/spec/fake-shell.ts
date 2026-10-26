@@ -589,7 +589,7 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
       const a = await session.admitWhenAvailable({ target: 'shell', line, principal: AGENT }, 3000);
       if (!a.admitted) throw new Error(`not admitted (${a.reason}): ${line}`);
       const r = await session.awaitRun(a.run.runId, wait);
-      return { ...r, text: (await session.runTranscript(r.runId)).text };
+      return { ...r, text: withoutSetpgidWarning((await session.runTranscript(r.runId)).text) };
     },
     async close() {
       await session.close();
@@ -597,6 +597,13 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
     },
   };
 }
+
+/**
+ * bash 3.2 on macOS now and then writes this line for a child it forks under job control, when the kernel
+ * refuses the child's own setpgid; the child runs on. The line is the shell's, not the command's, so the text
+ * this helper returns drops it, and nothing else.
+ */
+export const withoutSetpgidWarning = (text: string): string => text.replace(/^bash: child setpgid \(\d+ to \d+\): Operation not permitted(?:\r?\n|$)/gm, '');
 
 export const hasShell = (p: string): boolean => fs.existsSync(p);
 
