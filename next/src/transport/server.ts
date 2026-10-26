@@ -21,8 +21,9 @@
  *     accepts an optional credential; without one it uses an anonymous principal
  *     where available, or reports liveness, version, pid, endpoint elapsed time,
  *     counts and any degraded reason without session details. A WebSocket upgrade first
- *     checks the connection limit, then resolves `?token=` or
- *     `Authorization: Bearer` to a principal (§4.5), or returns 401.
+ *     checks the global connection limit (503), then resolves `?token=` or
+ *     `Authorization: Bearer` to a principal (§4.5), or returns 401. It checks
+ *     that principal's connection limit (429) before admitting the socket.
  *     A same-origin browser WebSocket uses the GUI's human principal,
  *     `human:gui:<token principal>` (unchanged for `human:…`).
  *
