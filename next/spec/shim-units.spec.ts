@@ -15,10 +15,17 @@ import { spawn } from 'node:child_process';
 import * as http from 'node:http';
 import * as net from 'node:net';
 import { fileURLToPath } from 'node:url';
+import { until } from './testhost.js';
 import { askDataDir, connectionOf, procAddress, titlePort } from '../src/shim/running.js';
 import { launchctlUnit, nextStart, plistUnit, procEnviron, sameDir, systemctlUnit, TERMD_BOOLEAN_FLAGS, unitArg, unitDataDir, unitPort, type UnitText } from '../src/shim/units.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+
+/** Either credential form that /health accepts; the proof tests care who receives it. */
+const credentialOf = (req: http.IncomingMessage): string | undefined => {
+  const token = new URL(req.url ?? '/', 'http://localhost').searchParams.get('token');
+  return req.headers.authorization ?? (token === null ? undefined : `Bearer ${token}`);
+};
 
 /** ExecStart as systemd 255 prints it: the argv joined by one space each, unquoted; `prefix` goes before the launcher (an `env …`). */
 const execStart = (argv: string[], prefix: string[] = []) => `{ path=${prefix[0] ?? '/bin/sh'} ; argv[]=${[...prefix, '/bin/sh', '/pkg/next/config/termd-launch.sh', ...argv].join(' ')} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }`;
@@ -308,9 +315,10 @@ test("a running termd is asked for its data dir on the port its title names, and
   /** Set, the status and body sent instead of `answer`. */
   let raw: { status: number; body: string } | undefined;
   const seen: Array<string | undefined> = [];
+  let unprovenBefore: number | undefined;
   const server = http.createServer((req, res) => {
-    seen.push(req.headers.authorization);
-    res.writeHead(raw?.status ?? (req.url === '/health' ? 200 : 404), { 'content-type': 'application/json' });
+    seen.push(credentialOf(req));
+    res.writeHead(raw?.status ?? (req.url?.split('?')[0] === '/health' ? 200 : 404), { 'content-type': 'application/json' });
     res.end(raw?.body ?? JSON.stringify(answer));
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
@@ -326,9 +334,6 @@ test("a running termd is asked for its data dir on the port its title names, and
     answer = { status: 'ok', pid: 4242, dataDir: '/srv/running' };
     await askDataDir(port, 4242, { timeoutMs: 1500, token: 'shim-token', ...proven });
     assert.equal(seen.pop(), 'Bearer shim-token');
-    const before = seen.length;
-    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, token: 'shim-token', prove: async () => 'not shown' }), { error: 'not shown' });
-    assert.equal(seen.length, before, 'an unproven listener is sent no request, so no credential');
     // What isn't termd's answer is refused, each for its own reason (the house's read of the 17 commits over our fixes, #22).
     raw = { status: 503, body: JSON.stringify({ status: 'ok', pid: 4242, dataDir: '/srv/running' }) };
     assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, ...proven }), { error: 'its /health answered 503' });
@@ -337,9 +342,12 @@ test("a running termd is asked for its data dir on the port its title names, and
     raw = { status: 200, body: '42' };
     assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, ...proven }), { error: 'its /health answer is not an object' });
     raw = undefined;
+    unprovenBefore = seen.length;
+    assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, token: 'shim-token', prove: async () => 'not shown' }), { error: 'not shown' });
   } finally {
     await new Promise((r) => server.close(r));
   }
+  assert.equal(seen.length, unprovenBefore, 'after the listener drains, an unproven socket received no credential or request');
   assert.deepEqual(await askDataDir(port, 4242, { timeoutMs: 1500, ...proven }), { error: `nothing listens on port ${port}` });
   // Linux shows a process's title in its cmdline, as termd sets it; only a systemd unit's termd is asked, so only Linux's /proc is read.
   if (process.platform === 'linux') {
@@ -444,7 +452,7 @@ test("a listener on 127.0.0.1 not shown to be termd's is passed over for ::1 wit
   // Stopped at the first address whose listener was not shown to be termd's, the ask never reached a termd on ::1.
   const asked: string[] = [];
   const answer = (dataDir: string) => (req: http.IncomingMessage, res: http.ServerResponse) => {
-    asked.push(`${dataDir} ${req.headers.authorization ?? '-'}`);
+    asked.push(`${dataDir} ${credentialOf(req) ?? '-'}`);
     res.end(JSON.stringify({ status: 'ok', pid: 4242, dataDir }));
   };
   const v6 = http.createServer(answer('/v6'));
@@ -471,6 +479,7 @@ test("a listener on 127.0.0.1 not shown to be termd's is passed over for ::1 wit
     v4.closeAllConnections();
     await Promise.all([v6, v4].map((s) => new Promise((r) => s.close(() => r(undefined)))));
   }
+  assert.deepEqual(asked, ['/v6 Bearer shim-token'], 'after both listeners drain, the unproven v4 socket received no request');
 });
 
 test("one deadline covers both addresses: what 127.0.0.1's proof took is gone for ::1 (the house's read of the 14 commits over our fixes, #22)", async (t) => {
@@ -502,6 +511,7 @@ test("one deadline covers both addresses: what 127.0.0.1's proof took is gone fo
     v4.closeAllConnections();
     await Promise.all([v6, v4].map((s) => new Promise((r) => s.close(() => r(undefined)))));
   }
+  assert.deepEqual(asked, [], 'after both listeners drain, neither address received a request');
 });
 
 for (const when of ['as it is made', 'while it is proved'] as const) {
@@ -509,7 +519,7 @@ for (const when of ['as it is made', 'while it is proved'] as const) {
     // Read as termd's own failure, the reset ended the ask, and the termd on ::1 was never asked.
     const asked: string[] = [];
     const v6 = http.createServer((req, res) => {
-      asked.push(req.headers.authorization ?? '-');
+      asked.push(credentialOf(req) ?? '-');
       res.end(JSON.stringify({ status: 'ok', pid: 4242, dataDir: '/v6' }));
     });
     const bound = await new Promise<boolean>((resolve) => {
@@ -744,7 +754,7 @@ test("an answer counts only from the termd's own socket: a listener of another p
     return;
   }
   // termd's pid is public: an impostor on its port, beside a termd on ::1, can claim it.
-  const impostor = spawn(process.execPath, ['-e', `const http = require('node:http'); const s = http.createServer((req, res) => { process.stdout.write('asked ' + (req.headers.authorization || '-') + '\\n'); res.end(JSON.stringify({ status: 'ok', pid: ${process.pid}, dataDir: '/impostor' })); }); s.listen(0, '127.0.0.1', () => process.stdout.write('port ' + s.address().port + '\\n'));`], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const impostor = spawn(process.execPath, ['-e', `const http = require('node:http'); const s = http.createServer((req, res) => { process.stdout.write('asked ' + (req.headers.authorization || '-') + '\\n'); res.end(JSON.stringify({ status: 'ok', pid: ${process.pid}, dataDir: '/impostor' })); }); s.on('connection', (c) => c.once('close', () => process.stdout.write('closed\\n'))); s.listen(0, '127.0.0.1', () => process.stdout.write('port ' + s.address().port + '\\n'));`], { stdio: ['ignore', 'pipe', 'ignore'] });
   let out = '';
   impostor.stdout!.on('data', (b: Buffer) => (out += b.toString()));
   try {
@@ -755,7 +765,8 @@ test("an answer counts only from the termd's own socket: a listener of another p
     const port = Number(/port (\d+)/.exec(out)?.[1]);
     assert.ok(port, `the impostor started (exit ${impostor.exitCode}, said ${JSON.stringify(out)})`);
     assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 3000, token: 'shim-token' }), { error: `the socket that answered on port ${port} is not its` });
-    assert.doesNotMatch(out, /asked/, 'no request reached it, so no credential');
+    await until(() => out.includes('closed'), 3000, 'the unproven listener’s accepted socket to close');
+    assert.doesNotMatch(out, /asked/, 'after its socket closes, no request reached it and no credential was sent');
     // The same ask of a listener this process owns is answered.
     const own = http.createServer((_req, res) => res.end(JSON.stringify({ status: 'ok', pid: process.pid, dataDir: '/own' })));
     await new Promise<void>((r) => own.listen(0, '127.0.0.1', r));
@@ -782,7 +793,7 @@ test("the other end of a connection is found by both its addresses whole, so a c
   // termd on ::1 only (this process), an impostor on 127.0.0.1 at the same port, claiming termd's pid.
   const credentials: Array<string | undefined> = [];
   const termd = http.createServer((req, res) => {
-    credentials.push(req.headers.authorization);
+    credentials.push(credentialOf(req));
     res.end(JSON.stringify({ status: 'ok', pid: process.pid, dataDir: '/real' }));
   });
   const bound = await new Promise<boolean>((resolve) => {
@@ -791,7 +802,7 @@ test("the other end of a connection is found by both its addresses whole, so a c
   });
   if (!bound) return t.skip('no ::1 here');
   const port = (termd.address() as { port: number }).port;
-  const impostor = spawn(process.execPath, ['-e', `const http = require('node:http'); const s = http.createServer((req, res) => { process.stdout.write('asked ' + (req.headers.authorization || '-') + '\\n'); res.end(JSON.stringify({ status: 'ok', pid: ${process.pid}, dataDir: '/impostor' })); }); s.listen(${port}, '127.0.0.1', () => process.stdout.write('listening\\n'));`], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const impostor = spawn(process.execPath, ['-e', `const http = require('node:http'); const s = http.createServer((req, res) => { process.stdout.write('asked ' + (req.headers.authorization || '-') + '\\n'); res.end(JSON.stringify({ status: 'ok', pid: ${process.pid}, dataDir: '/impostor' })); }); s.on('connection', (c) => c.once('close', () => process.stdout.write('closed\\n'))); s.listen(${port}, '127.0.0.1', () => process.stdout.write('listening\\n'));`], { stdio: ['ignore', 'pipe', 'ignore'] });
   let out = '';
   impostor.stdout!.on('data', (b: Buffer) => (out += b.toString()));
   const sockets: net.Socket[] = [];
@@ -815,7 +826,8 @@ test("the other end of a connection is found by both its addresses whole, so a c
     // to termd on ::1, which tells it. Stopped at the impostor, it read the unit's text instead (the house's review of
     // a8b6f28..4860d4c, #22 comment 6341260318, question 5).
     assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 3000, token: 'shim-token' }), { dataDir: '/real' });
-    assert.doesNotMatch(out, /asked/);
+    await until(() => out.includes('closed'), 3000, 'the unproven v4 socket to close');
+    assert.doesNotMatch(out, /asked/, 'the v4 listener’s receipt was drained after socket close');
     assert.deepEqual(credentials, ['Bearer shim-token'], 'the credential went to termd alone');
   } finally {
     for (const c of sockets) c.destroy();
@@ -941,5 +953,37 @@ test('sameDir compares a directory not made yet by where it would be made, throu
     assert.ok(sameDir('relative-not-made', path.resolve('relative-not-made')), 'a relative path, by where it resolves');
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('an unexpected process title is described without its argument values', { skip: process.platform !== 'linux' }, async () => {
+  const child = spawn(process.execPath, ['-e', "process.title = 'worker --token secret-title-value'; console.log('ready'); setTimeout(() => {}, 30000)"], { stdio: ['ignore', 'pipe', 'ignore'] });
+  try {
+    await new Promise<void>((resolve, reject) => { child.stdout!.once('data', () => resolve()); child.once('error', reject); });
+    const answer = titlePort(child.pid!);
+    assert.match(JSON.stringify(answer), /its title is not a termd's with a port/);
+    assert.doesNotMatch(JSON.stringify(answer), /secret-title-value/);
+  } finally {
+    child.kill();
+    await new Promise((resolve) => child.once('close', resolve));
+  }
+});
+
+test('health accepts the same Unicode and control-character tokens as the WebSocket query', async () => {
+  const seen: string[] = [];
+  const server = http.createServer((req, res) => {
+    const token = new URL(req.url!, 'http://localhost').searchParams.get('token');
+    seen.push(token ?? '');
+    res.end(JSON.stringify({ pid: process.pid, dataDir: '/srv/token' }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as net.AddressInfo).port;
+  try {
+    for (const token of ['snowman-☃', 'secret\r\nvalue']) {
+      assert.deepEqual(await askDataDir(port, process.pid, { timeoutMs: 1500, token, prove: async () => undefined }), { dataDir: '/srv/token' });
+      assert.equal(seen.pop(), token);
+    }
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
   }
 });
