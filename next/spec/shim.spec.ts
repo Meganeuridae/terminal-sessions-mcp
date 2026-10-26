@@ -1215,13 +1215,13 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     { name: 'manager-environment-query-fails', when: linux, stub: () => unitStub({ port: 3101, managerFails: true }), expect: 'unknown', says: /systemctl --user show \(the user manager's environment, which the unit's termd inherits\) failed \(Failed to connect to bus: No medium found\), so the unit's port and data dir are unknown/ },
     // The house's review of f3750e4..4f4c067 (#22 comment 6315636412). A running unit's termd has the environment it
     // started with: read from the manager's as it is now, a data dir imported into it since was taken for termd's.
-    { name: 'data-dir-in-the-running-termd-environment', when: linux, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: path.join(tmp, 'imported-since') }, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /the systemd user unit termd \(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"\) serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
+    { name: 'data-dir-in-the-running-termd-environment', when: linux, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: path.join(tmp, 'imported-since') }, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /the systemd user unit termd \(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port\) serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
     // An env prefix that refers to the variable it sets ran once, before termd started: applied again to the
     // environment the running termd has, it was read as another data dir, and a termd was started (the house's
     // read of the 17 commits over our fixes, #22).
-    { name: 'self-referring-env-prefix-in-a-running-unit', when: linux, stub: (dataDir) => unitStub({ port: 3101, prefix: ['/usr/bin/env', 'TSM_DATA_DIR=${TSM_DATA_DIR}/x'], managerEnv: { HOME: tmp, TSM_DATA_DIR: path.dirname(dataDir) }, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /the systemd user unit termd \(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"\) serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
+    { name: 'self-referring-env-prefix-in-a-running-unit', when: linux, stub: (dataDir) => unitStub({ port: 3101, prefix: ['/usr/bin/env', 'TSM_DATA_DIR=${TSM_DATA_DIR}/x'], managerEnv: { HOME: tmp, TSM_DATA_DIR: path.dirname(dataDir) }, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /the systemd user unit termd \(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port\) serves port 3101 out of the data dir \S+, which a termd for port \d+ started here would use too/ },
     // One the shim may not read (another user's, pid 1) leaves the manager's, and the note says so.
-    { name: 'running-termd-environment-unreadable', when: linux && process.getuid?.() !== 0, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir }, mainPid: 1 }), expect: 'shared', says: /the systemd user unit termd \(its environment read from the user manager's, as its running termd's, pid 1, could not be: it is another user's process; its running termd could not be asked: its title is not a termd's with a port: [^)]*\) serves port 3101 out of the data dir/ },
+    { name: 'running-termd-environment-unreadable', when: linux && process.getuid?.() !== 0, stub: (dataDir) => unitStub({ port: 3101, managerEnv: { HOME: tmp, TSM_DATA_DIR: dataDir }, mainPid: 1 }), expect: 'shared', says: /the systemd user unit termd \(its environment read from the user manager's, as its running termd's, pid 1, could not be: it is another user's process; its running termd could not be asked: its title is not a termd's with a port\) serves port 3101 out of the data dir/ },
     // The house's review of 4f4c067..a8b6f28 (#22 comment 6323055715), question 1: a unit's text names what its next
     // start runs, and after an edit and a daemon-reload not what its running termd was started with. The running
     // termd says its port and data dir itself; read from the edited text, they were port 3101 and /srv/edited-since.
@@ -1261,7 +1261,7 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
     // port is passed over for termd on ::1, which tells its data dir; stopped at the impostor, the shim read the text.
     { name: 'data-dir-told-past-an-impostor-on-127-0-0-1', when: impostor, stub: () => unitStub({ port: 3101, dataDir: '/srv/edited-since', mainPid: v6!.pid }), dataDir: v6Dir, expect: 'shared', says: /the systemd user unit termd \(its port and data dir told by its running termd, pid \d+\) serves port \d+ out of the data dir \S+sup-data-dir-told-past-an-impostor-on-127-0-0-1, which a termd for port \d+ started here would use too/ },
     // One that cannot be asked leaves the text, and the note says when the text may have changed since it started.
-    { name: 'running-unit-needs-a-daemon-reload', when: linux, stub: (dataDir) => unitStub({ port: 3101, needReload: true, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /\(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port: "sleep 60"; the unit's text may have changed since that termd started: systemd says the unit needs a daemon-reload\) serves port 3101 out of the data dir/ },
+    { name: 'running-unit-needs-a-daemon-reload', when: linux, stub: (dataDir) => unitStub({ port: 3101, needReload: true, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /\(its environment read from its running termd, pid \d+; its running termd could not be asked: its title is not a termd's with a port; the unit's text may have changed since that termd started: systemd says the unit needs a daemon-reload\) serves port 3101 out of the data dir/ },
     { name: 'running-unit-file-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: edited, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+edited-termd\.service was changed after its start\) serves port 3101 out of the data dir/ },
     { name: 'running-unit-drop-in-newer-than-its-termd', when: linux, stub: (dataDir) => unitStub({ port: 3101, fragment: unedited, dropIn, mainPid: runningTermd({ HOME: tmp, TSM_DATA_DIR: dataDir }) }), expect: 'shared', says: /; the unit's text may have changed since that termd started: \S+termd\.service\.d-edited\.conf was changed after its start\) serves port 3101 out of the data dir/ },
     // This user's live termd whose environment reads EACCES: unknown, not the manager's (which here names the shim's own data dir).
@@ -1688,5 +1688,32 @@ test('invalid daemon addresses omit credential values from shim diagnostics', as
     const said = s.err.join('');
     assert.match(said, /TSM_URL.*(not a URL|must be a ws:)/);
     assert.doesNotMatch(said, /secret-url/);
+  }
+});
+
+test('a second detached start rereads a supervisor that took responsibility since the first start', async () => {
+  const port = await unusedPort();
+  const dataDir = path.join(tmp, 'supervisor-arrived-between-starts');
+  const checkPath = supervisorPath('none', port);
+  const stubDir = checkPath.split(':')[0]!;
+  const s = shim({ TSM_URL: `ws://127.0.0.1:${port}`, TSM_NO_SPAWN: '', TSM_DATA_DIR: dataDir, HOME: tmp, PATH: checkPath, TSM_CONNECT_TIMEOUT_MS: '5500' });
+  try {
+    s.send(init(1));
+    assert.ok((await s.next(byId(1), 15_000)).result, 'the first start reached the shim');
+    const first = (await (await fetch(`http://127.0.0.1:${port}/health`)).json()) as { pid: number };
+    const managed = unitStub({ port, dataDir });
+    for (const [name, body] of [['launchctl', managed.launchctl], ['systemctl', managed.systemctl]] as const) {
+      fs.writeFileSync(path.join(stubDir, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    }
+    process.kill(first.pid, 'SIGTERM');
+    await until(() => commandOf(first.pid) === '', 5000, 'the first daemon to exit');
+    s.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    const next = await s.next(byId(2), 12_000);
+    assert.equal(next.error?.code, -32000, 'a new detached daemon cannot take the newly managed port');
+    assert.equal(s.err.join('').match(/started termd/g)?.length, 1, `only the first start was detached: ${s.err.join('')}`);
+    assert.match(next.error?.message ?? '', /termd on port \d+ is .*to start/);
+  } finally {
+    s.child.kill();
+    await stopSpawned(dataDir);
   }
 });

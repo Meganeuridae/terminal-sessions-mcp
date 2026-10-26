@@ -32,7 +32,7 @@ export function titlePort(pid: number): number | { error: string } {
   }
   const m = /^termd --port (\d+)$/.exec(title.trim());
   const port = m ? Number(m[1]) : NaN;
-  return port > 0 && port <= 65535 ? port : { error: `its title is not a termd's with a port: ${JSON.stringify(title.slice(0, 80))}` };
+  return port > 0 && port <= 65535 ? port : { error: "its title is not a termd's with a port" };
 }
 
 export interface AskOptions {
@@ -118,9 +118,9 @@ function health(host: string, port: number, pid: number, o: AskOptions, ms: numb
         if (why !== undefined) return finish({ error: why, unproven: true });
         proven = true;
         const headers: Record<string, string> = { host: `${host.includes(':') ? `[${host}]` : host}:${port}` };
-        if (o.token) headers.authorization = `Bearer ${o.token}`;
+        const target = o.token ? `/health?${new URLSearchParams({ token: o.token })}` : '/health';
         // No agent: the request goes on this proven connection and no other.
-        const req = http.request({ method: 'GET', path: '/health', headers, createConnection: () => socket }, (res) => {
+        const req = http.request({ method: 'GET', path: target, headers, createConnection: () => socket }, (res) => {
           const parts: Buffer[] = [];
           let bytes = 0;
           res.on('data', (c: Buffer) => {

@@ -225,7 +225,7 @@ const dataDir = path.resolve(setting('TSM_DATA_DIR') ?? path.join(os.homedir(), 
  * Why no termd is started here for this address, or undefined when one may be. A daemon started here
  * serves only a plain ws:// loopback address that 2.0 settings named: never a 1.x one (atc-6), never a
  * wss:// one (termd has no TLS; a plain termd on that port would fail the shim's own handshake), and
- * never one a supervisor manages (asked when a start is due, see `supervisedTermd`).
+ * never one a supervisor manages (asked when a start is due, see `checkSupervisor`).
  */
 function noStartReason(): string | undefined {
   if (setting('TSM_NO_SPAWN') === '1') return 'TSM_NO_SPAWN=1';
@@ -246,8 +246,6 @@ type Supervisor =
   | { kind: 'none' }
   | { kind: 'unknown'; why: string };
 const SUPERVISOR_CHECK_MS = 1500;
-const SUPERVISOR_CACHE_MS = 30_000;
-let supervisorCache: { at: number; result: Supervisor } | undefined;
 /** The launchd job's label; its plist, when installed, is `<label>.plist` in a LaunchAgents directory. */
 const LAUNCH_AGENT = 'com.animalabs.termd';
 
@@ -286,16 +284,8 @@ const managed = (by: string, u: UnitText): Supervisor => {
  * at login — and a check that does not answer, or fails, is not taken as "no" (the house's read of
  * 4e37a11, #22, and of the shim, #22 comment 6269349177), with one exception: on macOS a failed
  * launchctl query with no LaunchAgent plist on disk is "no", since nothing of this user's is
- * installed for launchd to run. Asked at each start that is due, at most once per SUPERVISOR_CACHE_MS.
+ * installed for launchd to run. Asked afresh for each detached start.
  */
-async function supervisedTermd(): Promise<Supervisor> {
-  const now = clocks.monotonic();
-  if (supervisorCache && now - supervisorCache.at < SUPERVISOR_CACHE_MS) return supervisorCache.result;
-  const result = await checkSupervisor();
-  supervisorCache = { at: now, result };
-  return result;
-}
-
 async function checkSupervisor(): Promise<Supervisor> {
   if (process.platform === 'darwin') {
     const r = await ask('launchctl', ['print', `gui/${process.getuid?.() ?? 0}/${LAUNCH_AGENT}`]);
@@ -354,7 +344,7 @@ async function checkSupervisor(): Promise<Supervisor> {
     if (pid > 0) {
       const port = titlePort(pid);
       // The shim's own credential, so a termd that requires one answers too; sent only on a connection shown to be the termd's.
-      const told = typeof port === 'number' ? await askDataDir(port, pid, { timeoutMs: SUPERVISOR_CHECK_MS, token: chosen.token }) : port;
+      const told = typeof port === 'number' ? await askDataDir(port, pid, { timeoutMs: SUPERVISOR_CHECK_MS, token: url.searchParams.get('token') ?? undefined }) : port;
       if ('dataDir' in told) {
         const sup = { kind: 'managed' as const, by: `the systemd user unit termd (its port and data dir told by its running termd, pid ${pid})`, port: String(port), dataDir: told.dataDir };
         // The unit's next start, on a failure or at the next login, takes what its text gives, which an edit
@@ -786,9 +776,9 @@ function unreachableHint(): string {
   if (chosen.from) {
     return `; the address came from ${chosen.from} (a 1.x setting), so no local daemon was started for it — 2.0's termd listens on 3101 by default: set TSM_URL, or start termd on that address`;
   }
+  if (notStarted) return `; ${notStarted}`;
   if (spawned && spawned.exit === undefined) return `; termd (pid ${spawned.pid}) was started here ${seconds(spawned.at)} s ago and has not answered yet`;
   if (spawned) return `; termd (pid ${spawned.pid}) started here exited (${spawned.exit})${spawned.said ? `: ${spawned.said}` : ''}`;
-  if (notStarted) return `; ${notStarted}`;
   const reason = noStartReason();
   if (reason !== undefined && loopback) return `; no termd was started here: ${reason}`;
   return '';
@@ -889,7 +879,7 @@ async function startDaemon(): Promise<void> {
   if (starting) return;
   starting = true;
   try {
-    const sup = await supervisedTermd();
+    const sup = await checkSupervisor();
     if (sup.kind === 'unknown') {
       noteNotStarted(`${sup.why}: no termd is started here while that is unknown (TSM_NO_SPAWN=1 skips the check; a termd started by hand is used)`);
       return;
