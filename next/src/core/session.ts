@@ -1208,7 +1208,8 @@ export class Session {
     this.promptDrawn = this.ready && !this.promptsCarryEnd;
     clearTimeout(this.promptEndTimer);
     this.promptEndTimer = undefined;
-    if (!this.promptDrawn && this.ready) {
+    if (this.promptDrawn) this.armTypeaheadGrace();
+    else if (this.ready) {
       this.promptEndTimer = setTimeout(() => {
         this.promptsCarryEnd = false;
         this.onPromptDrawn();
@@ -1240,6 +1241,7 @@ export class Session {
   private onPromptDrawn(): void {
     clearTimeout(this.promptEndTimer);
     this.promptEndTimer = undefined;
+    this.armTypeaheadGrace();
     if (this.promptDrawn) return;
     this.promptDrawn = true;
     this.drainQueue();

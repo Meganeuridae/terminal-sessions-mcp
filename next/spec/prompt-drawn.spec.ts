@@ -72,6 +72,24 @@ test('a shell whose prompts never carry the end mark is available from its first
   await h.session.close();
 });
 
+for (const carries of ['a prompt whose end mark never comes', 'prompts that never carry the end mark'] as const) {
+  test(`keys a program took during a Run, then ${carries}: a queued Run is typed once the typed-ahead grace has passed`, async () => {
+    const h = await harness({ promptDrawnWaitMs: 300, ...(carries === 'prompts that never carry the end mark' && { setup: (s) => (s.drawsPromptEnd = false) }) });
+    const a = h.session.admit({ target: 'shell', line: 'sleep 30', principal: AGENT });
+    assert.ok(a.admitted, JSON.stringify(a));
+    await until(() => h.session.run(a.run.runId).state === 'running', 2000, 'the first Run running');
+    h.session.input('qq', { principal: AGENT });
+    const b = h.session.admit({ target: 'shell', line: 'echo hello', principal: AGENT, queue: true });
+    assert.ok(b.admitted && b.run.state === 'queued', JSON.stringify(b));
+    h.shell.drawsPromptEnd = false;
+    h.shell.finishHung(0);
+    await until(() => h.session.run(b.run.runId).state !== 'queued', 3000, 'the queued Run typed');
+    const rb = await h.session.awaitRun(b.run.runId, 2000);
+    assert.deepEqual([rb.state, rb.exit], ['exited', 0], JSON.stringify(rb));
+    await h.session.close();
+  });
+}
+
 for (const how of ['queued', 'waiting'] as const) {
   test(`bash with a prompt slow to draw: a ${how} Run's line reaches the line editor, shown once and never echoed by the terminal`, { skip: !hasShell('/bin/bash'), timeout: 30_000 }, async () => {
     const x = await realSession('/bin/bash', { rc: { '.bashrc': `PS1='$(sleep 0.3)'"$PS1"\n` }, login: false, cols: 250 });
