@@ -429,7 +429,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 export function assertTypedCommandDir(dir: string): void {
   if (/[\x00-\x1f\x7f]/.test(dir)) {
     const shown = JSON.stringify(dir).replace(/\x7f/g, '\\u007f');
-    throw err('invalid_argument', `session command directory path has a terminal control character: ${shown}. Choose a path without ASCII control characters`);
+    throw err('invalid_argument', `session command directory path has a terminal control character: ${shown}. Set --data-dir (or TSM_DATA_DIR when no flag is set) to a path without ASCII control characters; direct Session.start callers must supply a safe tempDir`);
   }
 }
 
@@ -3164,6 +3164,7 @@ export class Session {
       // The file already has owner-only mode. POSIX/zsh use >| to override noclobber; fish parses >| as a pipe.
       writeExclusive(out, '');
       const admitted = await this.admitWhenAvailable(() => {
+        if (principal !== SYSTEM && this.control !== 'open') this.requireSeat(principal, 'run', opts);
         // waitAvailable can change the declared shell: choose syntax just before each attempt to admit.
         const front = this.layers.at(-1);
         const flavor = front ? declaredFlavor(front.shell) : this.flavor;

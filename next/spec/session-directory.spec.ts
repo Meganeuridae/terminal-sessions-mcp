@@ -32,6 +32,9 @@ test('only ASCII editor-control characters are refused in a typed command path',
   for (const c of ['\x00', '\x01', '\t', '\n', '\x1f', '\x7f']) {
     assert.throws(() => assertTypedCommandDir(`/data/${c}/shell`), (e: unknown) => {
       assert.equal((e as { code?: string }).code, 'invalid_argument');
+      assert.match((e as Error).message, /--data-dir/);
+      assert.match((e as Error).message, /TSM_DATA_DIR/);
+      assert.match((e as Error).message, /tempDir/);
       assert.ok(!/[\x00-\x1f\x7f]/.test((e as Error).message), 'the diagnostic escapes its own control characters');
       if (c === '\x7f') assert.ok((e as Error).message.includes('\\u007f'), 'DEL is escaped even though JSON.stringify leaves it literal');
       return true;

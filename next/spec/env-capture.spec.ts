@@ -122,3 +122,19 @@ test('fish environment capture uses its supported redirection into an existing f
     await x.close();
   }
 });
+
+test('env capture waiting for startup refuses a caller who lost the controller seat before admission', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-env-seat-'));
+  const h = await scriptedSession({ tempDir: dir, promptAtStart: false, hello: false, integrationGraceMs: 30, startupCapMs: 150 });
+  t.after(async () => { await h.session.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  assert.equal(h.session.state, 'starting');
+  const pending = h.session.captureEnv(AGENT, 1000);
+  h.session.releaseControl(AGENT);
+  h.session.attach('human:other:2', 'other', 'controller');
+  assert.equal(h.session.currentController, 'human:other:2');
+  h.shell.start();
+  await assert.rejects(pending, (e: unknown) => (e as { code?: string }).code === 'not_controller');
+  assert.equal(h.session.listRuns().some((run) => run.line?.startsWith('env -0')), false, 'no capture line was admitted to the new controller’s shell');
+  assert.equal(ofType(h.journal.since(0).events, 'env.snapshot').length, 0);
+  assert.deepEqual(fs.readdirSync(dir).filter((name) => name.startsWith('tsm-env-')), [], 'the failed request cleaned its raw file');
+});
