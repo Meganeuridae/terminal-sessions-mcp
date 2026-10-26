@@ -1120,9 +1120,11 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   if (linux && !v6Bindable) t.diagnostic('data-dir-told-past-an-impostor-on-127-0-0-1 is left out: this host cannot bind ::1');
   const v6 = v6Bindable ? await liveTermd(v6Dir, ['--host', '::1']) : undefined;
   let impostorSaid = '';
+  let impostorChild: ChildProcess | undefined;
   const impostor = v6
     ? await new Promise<boolean>((resolve) => {
-        const child = spawn(process.execPath, ['-e', `const http = require('node:http'); const s = http.createServer((req, res) => { process.stdout.write('asked ' + (req.headers.authorization || '-') + '\\n'); res.end(JSON.stringify({ status: 'ok', pid: ${v6.pid}, dataDir: '/impostor' })); }); s.listen(${v6.port}, '127.0.0.1', () => process.stdout.write('listening\\n'));`], { stdio: ['ignore', 'pipe', 'ignore'] });
+        const child = spawn(process.execPath, ['-e', `const http = require('node:http'); const s = http.createServer((req, res) => { process.stdout.write('asked ' + (req.headers.authorization || '-') + '\\n'); res.end(JSON.stringify({ status: 'ok', pid: ${v6.pid}, dataDir: '/impostor' })); }); s.on('connection', (c) => c.on('data', () => process.stdout.write('bytes\\n'))); process.stdin.once('data', () => s.close(() => process.stdout.write('drained\\n'))); s.listen(${v6.port}, '127.0.0.1', () => process.stdout.write('listening\\n'));`], { stdio: ['pipe', 'pipe', 'ignore'] });
+        impostorChild = child;
         stand.push(child);
         child.stdout!.on('data', (b: Buffer) => {
           impostorSaid += b.toString();
@@ -1299,7 +1301,11 @@ test("tg-19: the supervisor check fails closed and reads a unit as termd does: a
   };
   try {
     await Promise.all(cases.filter((c) => c.when).map(run));
-    assert.doesNotMatch(impostorSaid, /asked/, 'the impostor on 127.0.0.1 was sent no request, so no credential');
+    if (impostorChild) {
+      impostorChild.stdin!.end('drain\n');
+      await until(() => impostorSaid.includes('drained'), 3000, 'the impostor child to close its listener after the shims exit');
+      assert.doesNotMatch(impostorSaid, /asked|bytes/, 'after the child listener drains, the unproven socket received no request bytes');
+    }
   } finally {
     for (const child of stand) child.kill();
   }
