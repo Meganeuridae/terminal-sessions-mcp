@@ -1064,6 +1064,26 @@ test('a cursor the program moves by rows meets the terminal’s where a margin s
   assert.deepEqual(await read([short, { hole: true }, '\x1b[3e\x1b[4AA\r\nB\r\nC\r\n']), [true, true], 'a row pending: past the margin and back');
 });
 
+test('in origin mode VPR and CUD meeting the region bottom agree on whether a gap lost a row', async () => {
+  const prefix = '\x1b[3;6r\x1b[?6h\x1b[1;1Hr3\r\nr4';
+  const read = (move: string, hole: boolean) => project(
+    hole ? [prefix, { hole: true as const }, move + 'A\r\n'] : [prefix + move + 'A\r\n'],
+    { cols: 20, rows: 10 },
+  );
+  const cud = await read('\x1b[2B', true);
+  const vpr = await read('\x1b[2e', true);
+  const directCud = await read('\x1b[2B', false);
+  const directVpr = await read('\x1b[2e', false);
+  assert.equal(directVpr.text, directCud.text, 'xterm draws both cursor moves at the same row under origin mode');
+  assert.equal(cud.truncated, false, 'the cursors meet at the region bottom without losing text');
+  assert.equal(cud.lost, undefined);
+  assert.deepEqual(
+    [vpr.text, vpr.truncated, vpr.lost],
+    [cud.text, cud.truncated, cud.lost],
+    'VPR does not invent loss where the equivalent CUD retains the row',
+  );
+});
+
 test('a row a Run’s line end begins is the projection’s alone at once, and a scroll of the same batch takes it as such (the house’s review of bc4bc85..5d8ce0e, PR #22, I63)', async () => {
   // From an empty row of the region, a Run's first line end begins a row without scrolling; its later line ends scroll
   // the region, and from the fifth line on, the row the first one began is taken in the same batch. Owed only once the

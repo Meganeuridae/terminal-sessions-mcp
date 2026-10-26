@@ -470,7 +470,7 @@ class Projector {
       const p = this.term.parser;
       this.cursorWatch = [
         ...['A', 'B', 'E', 'F'].map((final) => p.registerCsiHandler({ final }, (params) => this.onCursorMove(final === 'A' || final === 'F' ? -(num(params[0]) || 1) : num(params[0]) || 1))),
-        p.registerCsiHandler({ final: 'e' }, (params) => this.onCursorMove(num(params[0]) || 1, 'screen')),
+        p.registerCsiHandler({ final: 'e' }, (params) => this.onCursorMove(num(params[0]) || 1, this.term.modes.originMode ? 'margin' : 'screen')),
         ...['H', 'f', 'd'].map((final) => p.registerCsiHandler({ final }, () => this.onCursorSet())),
         p.registerCsiHandler({ final: 's' }, () => this.onCursorSave()),
         p.registerEscHandler({ final: '7' }, () => this.onCursorSave()),
@@ -609,8 +609,9 @@ class Projector {
   /**
    * CUU, CUD, CNL, CPL, VPR: the program's own cursor moved `dy` rows while its cursor runs ahead of the terminal's
    * (`pending`): both move alike, and meet where a margin or the screen's edge stops one of them (cursorAfter).
-   * VPR passes the bottom margin, where CUD stops at it, and stops at the screen's edge alone (`stop`): by a run of
-   * xterm 6.0.0, `CSI 9 e` from the third row of a region 3–6 lands on the tenth row, `CSI 9 B` on the sixth.
+   * Outside origin mode VPR passes the bottom margin, where CUD stops at it, and stops at the screen's edge alone
+   * (`stop`): in xterm 6.0.0 `CSI 9 e` from the third row of region 3–6 lands on the tenth row, `CSI 9 B` on the sixth.
+   * In DECOM origin mode VPR stops at the margin too.
    * Unwatched, a VPR that met the terminal's cursor at the screen's edge left a row pending, and the program's next
    * scrolls reported a loss where nothing went (the house's review of bc4bc85..5d8ce0e, PR #22, I62).
    */
@@ -664,7 +665,7 @@ class Projector {
 
   /**
    * Where xterm's CUU or CUD takes the cursor from row `y` by `dy`: it stops at the margin on its side when it is within
-   * it, else at the screen's edge. With `stop` 'screen', as VPR, at the screen's edge alone.
+   * it, else at the screen's edge. With `stop` 'screen', as VPR outside origin mode, at the screen's edge alone.
    */
   private cursorAfter(y: number, dy: number, stop: 'margin' | 'screen' = 'margin'): number {
     if (stop === 'screen') return Math.min(Math.max(y + dy, 0), this.rows - 1);
