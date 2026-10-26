@@ -1700,7 +1700,11 @@ test('a second detached start rereads a supervisor that took responsibility sinc
   try {
     s.send(init(1));
     assert.ok((await s.next(byId(1), 15_000)).result, 'the first start reached the shim');
-    const first = (await (await fetch(`http://127.0.0.1:${port}/health`)).json()) as { pid: number };
+    const first = (await (await fetch(`http://127.0.0.1:${port}/health`)).json()) as { pid: number; dataDir?: string };
+    await until(() => /started termd \(pid \d+\) on loopback/.test(s.err.join('')), 3000, 'the shim to name the daemon it started');
+    const started = /started termd \(pid (\d+)\) on loopback/.exec(s.err.join(''))!;
+    assert.equal(first.pid, Number(started[1]), 'the /health answer came from the daemon this shim started');
+    assert.equal(first.dataDir && fs.realpathSync(first.dataDir), fs.realpathSync(dataDir), 'the daemon answered from this test’s own data dir');
     const managed = unitStub({ port, dataDir });
     for (const [name, body] of [['launchctl', managed.launchctl], ['systemctl', managed.systemctl]] as const) {
       fs.writeFileSync(path.join(stubDir, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
