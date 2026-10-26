@@ -563,7 +563,6 @@ export class Session {
   /** Runs from the prompt start until the typeahead's echo arrives or TYPEAHEAD_GRACE_MS pass without it (see onPromptStart). */
   private typeaheadTimer: NodeJS.Timeout | undefined;
   private idleEcho = '';
-  /** A secret prompt is being answered: keystrokes are journaled redacted until Enter (m2-2). */
   private secretInput = false;
   /** The end of the latest terminal output (what a program waiting for input printed last). */
   private outputTail = '';
