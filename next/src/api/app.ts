@@ -557,6 +557,12 @@ export class App {
       .map((s) => this.summary(s));
   }
 
+  /** One session's entry in `sessionList(caller)`, or undefined when there's none: no other session's summary is built. */
+  sessionSummary(caller: Caller, id: string): SessionSummary | undefined {
+    const s = this.registry.get(id);
+    return s !== undefined && this.can(caller.principal, s, 'observe') ? this.summary(s) : undefined;
+  }
+
   async sessionOpen(
     caller: Caller,
     o: Omit<CreateOptions, 'owner'> & { role?: 'observer' | 'controller'; idempotencyKey?: string },

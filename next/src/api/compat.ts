@@ -42,7 +42,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const iso = (ms: number | undefined): string | null => (ms === undefined ? null : new Date(ms).toISOString());
 
 /** The session's summary, when the caller may see it. */
-const summaryOf = (ctx: ToolContext, session: string): SessionSummary | undefined => ctx.app.sessionList(ctx.caller).find((s) => s.id === session);
+const summaryOf = (ctx: ToolContext, session: string): SessionSummary | undefined => ctx.app.sessionSummary(ctx.caller, session);
 
 /** The most output a compat result carries (UTF-8 bytes): 1.x returned all of it; this keeps the tail beyond a bound, visibly. */
 const COMPAT_OUTPUT_BYTES = 1024 * 1024;

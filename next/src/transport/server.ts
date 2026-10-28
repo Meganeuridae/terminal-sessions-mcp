@@ -1171,7 +1171,7 @@ export class TermServer {
 
   /** The session's summary as this connection sees it, for an attach response. */
   private summaryOf(conn: Conn, sid: string): unknown {
-    return this.opts.app.sessionList(conn.caller).find((x) => x.id === sid) ?? null;
+    return this.opts.app.sessionSummary(conn.caller, sid) ?? null;
   }
 
   /** A history-only session attaches with its transcript; undefined when the name changed during the read (the caller starts over). */

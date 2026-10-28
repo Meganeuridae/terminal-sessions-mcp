@@ -11,7 +11,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { App, type Caller } from '../src/api/app.js';
 import { SessionRegistry } from '../src/api/registry.js';
-import { callTool, TOOLS, type ResultText, type ToolResult } from '../src/api/tools.js';
+import { callTool, TOOLS, toolsFor, type ResultText, type ToolResult } from '../src/api/tools.js';
 import { analyze, type UsageRecord } from '../src/api/usage.js';
 import { validate } from '../src/api/validate.js';
 import { NodePtyBackend } from '../src/backends/node-pty.js';
@@ -342,4 +342,50 @@ test('run, await and start results report the session’s duration, and a queued
   assert.equal(replayed.structured?.replayed, true);
   assert.ok((replayed.structured?.durationMs as number) >= 2500, `a service, so far: ${replayed.structured?.durationMs} ms`);
   await app.sessionClose(A, { session: 'dursvc' });
+});
+
+async function summariesBuilt(body: () => Promise<unknown> | unknown): Promise<string[]> {
+  const built: string[] = [];
+  const original = app.summary;
+  app.summary = function (this: App, s) {
+    const out = original.call(this, s);
+    built.push(out.id);
+    return out;
+  };
+  try {
+    await body();
+  } finally {
+    app.summary = original;
+  }
+  return built;
+}
+
+test("compat runCommand finds its session without building any other session's summary", async () => {
+  const compat = toolsFor('compat');
+  for (const id of ['many-1', 'many-2', 'many-3']) await tool('session_open', { session: id });
+  await tool('session_open', { session: 'many-b', visibility: 'shared' }, B);
+  await callTool('runCommand', { session: 'many-1', command: 'echo first' }, { app, caller: A, resultText: 'json' }, compat);
+  const built = await summariesBuilt(() => callTool('runCommand', { session: 'many-1', command: 'echo again' }, { app, caller: A, resultText: 'json' }, compat));
+  assert.ok(built.length > 0, 'runCommand looks its session up');
+  assert.deepEqual([...new Set(built)], ['many-1'], `summaries built: ${JSON.stringify(built)}`);
+  for (const id of ['many-1', 'many-2', 'many-3']) await app.sessionClose(A, { session: id });
+  await app.sessionClose(B, { session: 'many-b' });
+});
+
+test("sessionSummary is sessionList's entry for one id, and none for an id the caller can't see or that doesn't exist", async () => {
+  await tool('session_open', { session: 'one-a' });
+  await tool('session_open', { session: 'one-shared', visibility: 'shared' }, B);
+  await tool('session_open', { session: 'one-private' }, B);
+  for (const id of ['one-a', 'one-shared', 'one-private', 'one-none']) {
+    const listed = app.sessionList(A).find((s) => s.id === id);
+    let one: ReturnType<App['sessionSummary']> = undefined;
+    const built = await summariesBuilt(() => {
+      one = app.sessionSummary(A, id);
+    });
+    assert.deepEqual(one, listed, id);
+    assert.deepEqual(built, listed ? [id] : [], id);
+  }
+  await app.sessionClose(A, { session: 'one-a' });
+  await app.sessionClose(B, { session: 'one-shared' });
+  await app.sessionClose(B, { session: 'one-private' });
 });
