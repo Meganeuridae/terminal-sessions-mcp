@@ -601,10 +601,11 @@ export async function realSession(shell: string, opts: RealOptions = {}): Promis
 
 /**
  * bash 3.2 on macOS now and then writes this line for a child it forks under job control, when the kernel
- * refuses the child's own setpgid; the child runs on. The line is the shell's, not the command's, so the text
- * this helper returns drops it, and nothing else.
+ * refuses the child's own setpgid; the child runs on. An interactive bash names itself by the last part of the
+ * path it was run as: `bash`, or `sh` for `/bin/sh`. The line is the shell's, not the command's, so the text this
+ * helper returns drops it, and nothing else.
  */
-export const withoutSetpgidWarning = (text: string): string => text.replace(/^bash: child setpgid \(\d+ to \d+\): Operation not permitted(?:\r?\n|$)/gm, '');
+export const withoutSetpgidWarning = (text: string): string => text.replace(/^(?:ba)?sh: child setpgid \(\d+ to \d+\): Operation not permitted(?:\r?\n|$)/gm, '');
 
 export const hasShell = (p: string): boolean => fs.existsSync(p);
 

@@ -199,7 +199,9 @@ test("a Run's text loses bash 3.2's child-setpgid warning line, and nothing else
   const warning = 'bash: child setpgid (51915 to 51915): Operation not permitted';
   assert.equal(withoutSetpgidWarning(`${warning}\nsub`), 'sub');
   assert.equal(withoutSetpgidWarning(`one\r\n${warning}\r\ntwo`), 'one\r\ntwo');
-  for (const kept of ['sub', `x ${warning}`, `${warning} and more`, 'bash: child setpgid (1 to 2): No such process', '<<<PROBE:ab12::>>>']) {
+  assert.equal(withoutSetpgidWarning(`sh: child setpgid (71753 to 71753): Operation not permitted\nit's "quoted"`), `it's "quoted"`);
+  for (const kept of ['sub', `x ${warning}`, `${warning} and more`, 'bash: child setpgid (1 to 2): No such process',
+    'ksh: child setpgid (1 to 1): Operation not permitted', '<<<PROBE:ab12::>>>']) {
     assert.equal(withoutSetpgidWarning(kept), kept);
   }
 });
