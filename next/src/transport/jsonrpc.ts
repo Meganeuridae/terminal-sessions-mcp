@@ -92,21 +92,22 @@ export function classify(v: unknown): Frame {
 /** Correlates outbound requests with their responses on one connection. */
 export class Outbound {
   private nextId = 1;
-  private readonly pending = new Map<Id, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
+  private readonly pending = new Map<Id, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout | undefined }>();
 
   constructor(
     private readonly send: (m: Message) => void,
-    private readonly timeoutMs = 30_000,
+    private readonly timeoutMs: number | null = 30_000,
   ) {}
 
   request<T = unknown>(method: string, params?: unknown): Promise<T> {
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const ms = this.timeoutMs;
+      const timer = ms === null ? undefined : setTimeout(() => {
         this.pending.delete(id);
-        reject(new RpcError(INTERNAL, `no response to ${method} within ${this.timeoutMs} ms`));
-      }, this.timeoutMs);
-      timer.unref?.();
+        reject(new RpcError(INTERNAL, `no response to ${method} within ${ms} ms`));
+      }, ms);
+      timer?.unref?.();
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       this.send({ jsonrpc: '2.0', id, method, params });
     });
