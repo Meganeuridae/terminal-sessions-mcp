@@ -112,10 +112,16 @@ test('H2: a daemon whose replacement of a dead socket is itself replaced serves 
     c.on('error', () => {});
     served++;
     c.end('A\n');
-  }, { confirmMs: 300 });
-  // Once the loser has renamed its socket into place, a connection reaches it; then another daemon renames over it.
+  }, { confirmMs: 2000 });
   while ((await probe(socket)) !== 'answers') await new Promise((r) => setTimeout(r, 5));
-  const heldAnswer = ask(socket);
+  const held = net.connect(socket);
+  await new Promise<void>((r) => held.once('connect', () => r()));
+  const heldAnswer = new Promise<string>((resolve) => {
+    let got = '';
+    held.on('data', (b) => (got += b));
+    held.on('error', () => {});
+    held.on('close', () => resolve(got ? got.trim() : 'closed without a word'));
+  });
   const winner = net.createServer(greet('B'));
   await new Promise<void>((r) => winner.listen(path.join(dir, 'winner.sock'), r));
   fs.renameSync(path.join(dir, 'winner.sock'), socket);
@@ -147,6 +153,38 @@ test('H10: closing removes the socket when it is still ours, and leaves one anot
     assert.equal(await ask(socket), 'C');
     await new Promise<void>((r) => other.close(() => r()));
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a close that another daemon\'s rename overtakes leaves that daemon\'s socket', async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  const other = net.createServer(greet('C'));
+  try {
+    const a = listening(await listenAt(socket, greet('A')));
+    await new Promise<void>((r) => other.listen(path.join(dir, 'other.sock'), r));
+    const closing = a.close();
+    fs.renameSync(path.join(dir, 'other.sock'), socket);
+    await closing;
+    assert.equal(await ask(socket), 'C');
+  } finally {
+    await new Promise<void>((r) => other.close(() => r()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a probe that fails after the bind gives up the bound name and rejects', async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  const stale = net.createServer();
+  await new Promise<void>((r) => stale.listen(socket, r));
+  fs.chmodSync(socket, 0o000);
+  try {
+    await assert.rejects(listenAt(socket, greet('A')), /can't reach/);
+    assert.deepEqual(fs.readdirSync(dir), ['daemon.sock'], 'its own bound name is gone');
+  } finally {
+    await new Promise<void>((r) => stale.close(() => r()));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

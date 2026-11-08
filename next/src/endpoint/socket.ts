@@ -38,6 +38,8 @@ function linuxRunUser(uid: number): string | undefined {
   }
 }
 
+export const shellQuote = (s: string): string => (/^[A-Za-z0-9_./=:,+@%^-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+
 /** The process's uid, without the passwd lookup os.userInfo() makes, which throws for a uid with no entry. */
 const uidOf = (): number => process.getuid?.() ?? os.userInfo().uid;
 
@@ -55,7 +57,7 @@ export function ensurePrivateDir(dir: string): void {
   if (!st.isDirectory()) throw new EndpointError(`${dir} isn't a directory${st.isSymbolicLink() ? ' (it is a symbolic link)' : ''}; remove it, or give another with --socket`);
   const uid = uidOf();
   if (st.uid !== uid) throw new EndpointError(`${dir} belongs to uid ${st.uid}, not to this user (${uid}); give another with --socket`);
-  if ((st.mode & 0o077) !== 0) throw new EndpointError(`${dir} can be entered by others (mode ${(st.mode & 0o777).toString(8)}); \`chmod 700 ${dir}\` fixes it`);
+  if ((st.mode & 0o077) !== 0) throw new EndpointError(`${dir} can be entered by others (mode ${(st.mode & 0o777).toString(8)}); \`chmod 700 ${shellQuote(dir)}\` fixes it`);
 }
 
 export type Probe = 'answers' | 'refused' | 'missing';
@@ -142,7 +144,14 @@ export async function listenAt(socket: string, onConnection: (c: net.Socket) => 
       await giveUp();
       throw new EndpointError(`can't place the socket at ${socket}: ${(e as Error).message}`);
     }
-    if ((await probe(socket)) === 'answers') return giveUp();
+    let seen: Probe;
+    try {
+      seen = await probe(socket);
+    } catch (err) {
+      await giveUp();
+      throw err;
+    }
+    if (seen === 'answers') return giveUp();
     fs.renameSync(own, socket);
     await new Promise((resolve) => setTimeout(resolve, opts.confirmMs ?? 500));
     if (!stillOurs()) return giveUp();
@@ -154,9 +163,8 @@ export async function listenAt(socket: string, onConnection: (c: net.Socket) => 
     path: socket,
     stillOurs,
     close: async () => {
-      const ours = stillOurs();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      if (ours) fs.rmSync(socket, { force: true });
+      if (stillOurs()) fs.rmSync(socket, { force: true });
     },
   };
 }

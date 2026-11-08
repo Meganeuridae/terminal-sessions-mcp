@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as net from 'node:net';
 import { PassThrough } from 'node:stream';
 import { parseCli, runCli, type CliOptions } from '../src/endpoint/cli-main.js';
 import { runDaemon, type RunningDaemon } from '../src/endpoint/daemon-main.js';
+import { helloLine } from '../src/endpoint/hello.js';
 import type { OpenOptions } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
 
@@ -60,6 +62,76 @@ test('H9: the CLI calls the daemon in its scope, prints the text, and takes noth
     assert.match(missing.err, /No session named "main" is open in scope "b"/);
   } finally {
     await d.stop('test');
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('several words after the name are each quoted for the shell, one stays a command line, and an empty number is refused', () => {
+  assert.deepEqual(parseCli(['run', 'demo', '--', 'printf', '%s\\n', 'hello world']), { scope: 'default', call: { tool: 'run', args: { name: 'demo', command: "printf '%s\\n' 'hello world'" } } });
+  assert.deepEqual(parseCli(['run', 'demo', 'echo', '; rm -rf target']), { scope: 'default', call: { tool: 'run', args: { name: 'demo', command: "echo '; rm -rf target'" } } });
+  assert.deepEqual(parseCli(['run', 'demo', "it's"]), { scope: 'default', call: { tool: 'run', args: { name: 'demo', command: "it's" } } });
+  assert.deepEqual(parseCli(['run', 'demo', 'make test | tee log']), { scope: 'default', call: { tool: 'run', args: { name: 'demo', command: 'make test | tee log' } } });
+  assert.deepEqual(parseCli(['read', 'demo', '--lines', ':10']), { error: '--lines takes a number, not ""' });
+  assert.deepEqual(parseCli(['run', 'demo', 'x', '--wait', '']), { error: '--wait takes a number, not ""' });
+});
+
+async function standIn(dir: string, hello: object, reply: (id: unknown) => Buffer[]) {
+  const socket = path.join(dir, 'daemon.sock');
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    c.write(helloLine(hello as never));
+    let buf = '';
+    c.on('data', (b) => {
+      buf += b;
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const m = JSON.parse(buf.slice(0, nl)) as { id?: unknown; method?: string };
+        buf = buf.slice(nl + 1);
+        if (m.method === 'initialize') c.write(`${JSON.stringify({ jsonrpc: '2.0', id: m.id, result: {} })}\n`);
+        else if (m.method === 'tools/call') {
+          // Two writes in a row can reach the reader as one chunk.
+          const pieces = reply(m.id);
+          const next = (): void => {
+            const piece = pieces.shift();
+            if (piece) c.write(piece, () => setTimeout(next, 50));
+          };
+          next();
+        }
+      }
+    });
+  });
+  await new Promise<void>((r) => server.listen(socket, r));
+  return { socket, close: () => new Promise<void>((r) => server.close(() => r())) };
+}
+
+test('the CLI decodes a character split across chunks, reports a line that is not JSON, and signals no pid a daemon couldn\'t have', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
+  const run = async (socket: string, ...argv: string[]) => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let out = '';
+    let err = '';
+    stdout.on('data', (b) => (out += b));
+    stderr.on('data', (b) => (err += b));
+    const code = await runCli({ ...(parseCli(argv) as CliOptions), socket, version: '2.0.0', startDaemon: () => assert.fail('a daemon answers'), stdout, stderr, reachMs: 1000 });
+    return { code, out, err };
+  };
+  const daemon = { version: '2.0.0', pid: 1, startedAt: '2026-11-08T19:00:00.000Z' };
+  try {
+    const whole = Buffer.from(`${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { content: [{ type: 'text', text: 'café' }] } })}\n`, 'utf8');
+    const at = whole.indexOf(Buffer.from('é', 'utf8')) + 1;
+    const split = await standIn(dir, daemon, () => [whole.subarray(0, at), whole.subarray(at)]);
+    assert.equal((await run(split.socket, 'list')).out, 'café\n');
+    const stopped = await run(split.socket, 'daemon', 'stop');
+    assert.equal(stopped.code, 1);
+    assert.match(stopped.err, /names pid 1, which can't be its own; nothing was signalled/);
+    await split.close();
+    const bad = await standIn(dir, daemon, () => [Buffer.from('not json\n')]);
+    const r = await run(bad.socket, 'list');
+    assert.equal(r.code, 1);
+    assert.match(r.err, /the daemon sent a line that is not JSON/);
+    await bad.close();
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

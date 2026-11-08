@@ -12,7 +12,7 @@ import { packageVersion } from './endpoint/version.js';
 export interface RelayOptions {
   socket: string;
   hello: ClientHello;
-  startDaemon: () => string;
+  startDaemon: (budgetMs: number) => string;
   stdin: Readable;
   stdout: Writable;
   stderr: Writable;
@@ -30,14 +30,16 @@ export const REACH_MS = 25_000;
 
 export type Reached = { socket: net.Socket; daemon: DaemonHello; rest: Buffer };
 
-function reachOnce(socketPath: string, hello: ClientHello): Promise<Reached | 'nothing'> {
+function reachOnce(socketPath: string, hello: ClientHello, budgetMs: number): Promise<Reached | 'nothing'> {
   return new Promise((resolve, reject) => {
     const socket = net.connect(socketPath);
     let buf = Buffer.alloc(0);
     let done = false;
+    const timer = setTimeout(() => finish(new Error(`something at ${socketPath} accepted the connection but sent no hello within ${budgetMs} ms`)), Math.max(1, budgetMs));
     const finish = (r: Reached | 'nothing' | Error): void => {
       if (done) return;
       done = true;
+      clearTimeout(timer);
       socket.off('data', onData);
       if (r === 'nothing' || r instanceof Error) socket.destroy();
       if (r instanceof Error) reject(r);
@@ -69,12 +71,12 @@ export async function reach(o: Pick<RelayOptions, 'socket' | 'hello' | 'startDae
   const end = Date.now() + (o.reachMs ?? REACH_MS);
   let log: string | undefined;
   for (;;) {
-    const r = await reachOnce(o.socket, o.hello);
+    const r = await reachOnce(o.socket, o.hello, end - Date.now());
     if (r !== 'nothing') return r;
     if (Date.now() >= end) {
       throw new Error(`no terminal-sessions daemon answered at ${o.socket} within ${o.reachMs ?? REACH_MS} ms${log ? `, though one was started; its log is ${log}` : ''}`);
     }
-    log ??= o.startDaemon();
+    log ??= o.startDaemon(end - Date.now());
     await new Promise((r) => setTimeout(r, 50));
   }
 }
@@ -84,7 +86,9 @@ export async function relay(o: RelayOptions): Promise<number> {
   try {
     reached = await reach(o);
   } catch (e) {
-    o.stderr.write(`tsm-relay: ${(e as Error).message}\n`);
+    const reason = `tsm-relay: ${(e as Error).message}`;
+    o.stderr.write(`${reason}\n`);
+    await answerFirstRequest(o.stdin, o.stdout, reason);
     return 1;
   }
   const { socket, daemon, rest } = reached;
@@ -118,21 +122,50 @@ export async function relay(o: RelayOptions): Promise<number> {
  * would end with the resident. A transient user unit of its own escapes that; it takes the
  * settings next/config/termd.service gives the daemon, for the reasons given there.
  */
-export function startDaemon(daemonScript: string, socket: string, log: string): string {
+export function startDaemon(daemonScript: string, socket: string, log: string, budgetMs: number): string {
   const args = [daemonScript, '--socket', socket];
   if (process.platform === 'linux') {
     const unit = `terminal-sessions-${process.pid}-${Date.now()}`;
     const props = ['KillMode=process', 'OOMPolicy=continue'].flatMap((p) => ['-p', p]);
-    const r = spawnSync('systemd-run', ['--user', '--collect', '--quiet', '--unit', unit, ...props, '--', process.execPath, ...args], { stdio: 'ignore', timeout: REACH_MS });
+    const r = spawnSync('systemd-run', ['--user', '--collect', '--quiet', '--unit', unit, ...props, '--', process.execPath, ...args], { stdio: 'ignore', timeout: Math.max(1, budgetMs), killSignal: 'SIGKILL' });
     if (r.status === 0) return `the user journal (journalctl --user -u ${unit})`;
   }
-  const fd = fs.openSync(log, 'a', 0o600);
+  const fd = fs.openSync(log, 'w', 0o600);
   try {
     spawn(process.execPath, args, { detached: true, stdio: ['ignore', fd, fd] }).unref();
   } finally {
     fs.closeSync(fd);
   }
   return log;
+}
+
+function answerFirstRequest(stdin: Readable, stdout: Writable, reason: string): Promise<void> {
+  return new Promise((resolve) => {
+    let buf = '';
+    const done = (): void => {
+      stdin.off('data', onData);
+      stdin.off('end', done);
+      resolve();
+    };
+    const onData = (b: Buffer | string): void => {
+      buf += b.toString();
+      const nl = buf.indexOf('\n');
+      if (nl < 0) return;
+      let m: { id?: unknown; method?: unknown } | undefined;
+      try {
+        m = JSON.parse(buf.slice(0, nl)) as { id?: unknown; method?: unknown };
+      } catch {
+        m = undefined;
+      }
+      if (m && (typeof m.id === 'number' || typeof m.id === 'string') && typeof m.method === 'string') {
+        stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: reason } })}\n`);
+      }
+      done();
+    };
+    stdin.on('data', onData);
+    stdin.once('end', done);
+    stdin.resume();
+  });
 }
 
 function usage(stderr: Writable): number {
@@ -164,7 +197,7 @@ async function main(argv: string[]): Promise<number> {
   return relay({
     socket: paths.socket,
     hello: { version: packageVersion(), scope, client: 'relay' },
-    startDaemon: () => startDaemon(daemonScript, paths.socket, path.join(paths.dir, 'daemon.log')),
+    startDaemon: (budgetMs) => startDaemon(daemonScript, paths.socket, path.join(paths.dir, 'daemon.log'), budgetMs),
     stdin: process.stdin,
     stdout: process.stdout,
     stderr: process.stderr,

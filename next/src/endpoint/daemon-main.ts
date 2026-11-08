@@ -1,3 +1,4 @@
+import * as fs from 'node:fs';
 import type * as net from 'node:net';
 import * as path from 'node:path';
 import type { OpenSession } from '../session/types.js';
@@ -47,8 +48,8 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
       o.log(`stopping: ${why}`);
       clearInterval(checking);
       for (const c of conns) c.destroy();
-      await listening?.close();
-      await host.closeAll();
+      await listening?.close().catch((e: Error) => o.log(`closing the socket failed: ${e.message}`));
+      await host.closeAll().catch((e: Error) => o.log(`closing the sessions failed: ${e.message}`));
       resolveStopped();
     })();
     return stopping;
@@ -72,6 +73,7 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
   );
   if (r === 'running') return 'running';
   listening = r;
+  for (const name of fs.readdirSync(sessionsDir)) fs.rmSync(path.join(sessionsDir, name), { recursive: true, force: true });
   // Checked against this daemon's inode on a timer, not watched for changes: a watch can miss a
   // change made just as it starts (macOS's directory events and fs.watchFile's first stat both start
   // asynchronously), and a missed one would leave this daemon holding shells no client can reach.

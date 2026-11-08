@@ -1,10 +1,14 @@
+import { StringDecoder } from 'node:string_decoder';
 import type { Writable } from 'node:stream';
-import { reach, type Reached } from '../relay.js';
+import { REACH_MS, reach, type Reached } from '../relay.js';
 import { SCOPE_RE } from './hello.js';
+import { probe, shellQuote } from './socket.js';
 
 export const USAGE = `usage: tsm [--scope NAME] [--socket PATH] COMMAND
   open NAME [--cwd DIR] [--cols N] [--rows N]
-  run NAME [--wait S] [--notify-on REGEX] [--] COMMAND...   (quote the command, or put -- before it)
+  run NAME [--wait S] [--notify-on REGEX] [--] COMMAND...
+      one argument is a command line as typed ('make test | tee log'); several are its words,
+      each quoted for the shell; put -- before a command whose words start with --
   send NAME [--text TEXT] [--keys KEY,KEY...] [--wait-for REGEX] [--wait S]
   look NAME [--until end|input] [--match REGEX] [--wait S]
   read NAME [--command N] [--lines FROM:TO] [--match REGEX] [--context N]
@@ -23,16 +27,26 @@ export interface CliOptions {
   call: CliCall;
 }
 
+// Number('') is 0.
+const num = (flag: string, v: string): number => {
+  if (!/^\d+(\.\d+)?$/.test(v)) throw new Error(`${flag} takes a number, not ${JSON.stringify(v)}`);
+  return Number(v);
+};
+
 const FLAGS: Record<string, Record<string, (v: string) => [string, unknown]>> = {
-  open: { '--cwd': (v) => ['cwd', v], '--cols': (v) => ['cols', Number(v)], '--rows': (v) => ['rows', Number(v)] },
-  run: { '--wait': (v) => ['wait', Number(v)], '--notify-on': (v) => ['notify_on', v] },
-  send: { '--text': (v) => ['text', v], '--keys': (v) => ['keys', v.split(',')], '--wait-for': (v) => ['wait_for', v], '--wait': (v) => ['wait', Number(v)] },
-  look: { '--until': (v) => ['until', v], '--match': (v) => ['match', v], '--wait': (v) => ['wait', Number(v)] },
+  open: { '--cwd': (v) => ['cwd', v], '--cols': (v) => ['cols', num('--cols', v)], '--rows': (v) => ['rows', num('--rows', v)] },
+  run: { '--wait': (v) => ['wait', num('--wait', v)], '--notify-on': (v) => ['notify_on', v] },
+  send: { '--text': (v) => ['text', v], '--keys': (v) => ['keys', v.split(',')], '--wait-for': (v) => ['wait_for', v], '--wait': (v) => ['wait', num('--wait', v)] },
+  look: { '--until': (v) => ['until', v], '--match': (v) => ['match', v], '--wait': (v) => ['wait', num('--wait', v)] },
   read: {
-    '--command': (v) => ['command', Number(v)],
-    '--lines': (v) => ['lines', v.split(':').map(Number)],
+    '--command': (v) => ['command', num('--command', v)],
+    '--lines': (v) => {
+      const parts = v.split(':');
+      if (parts.length !== 2) throw new Error(`--lines takes FROM:TO, not ${JSON.stringify(v)}`);
+      return ['lines', parts.map((p) => num('--lines', p))];
+    },
     '--match': (v) => ['match', v],
-    '--context': (v) => ['context', Number(v)],
+    '--context': (v) => ['context', num('--context', v)],
   },
   stop: { '--signal': (v) => ['signal', v.replace(/^SIG/, '')] },
   list: {},
@@ -69,8 +83,12 @@ export function parseCli(argv: readonly string[]): CliOptions | { error: string 
       if (!f) return { error: `${tool} takes no ${a}` };
       const v = argv[++i];
       if (v === undefined) return { error: `${a} needs a value` };
-      const [k, val] = f(v);
-      args[k] = val;
+      try {
+        const [k, val] = f(v);
+        args[k] = val;
+      } catch (e) {
+        return { error: (e as Error).message };
+      }
     } else words.push(a);
   }
   if (tool !== 'list') {
@@ -80,16 +98,18 @@ export function parseCli(argv: readonly string[]): CliOptions | { error: string 
   }
   if (tool === 'run') {
     if (!words.length) return { error: 'run needs a command' };
-    args.command = words.join(' ');
+    args.command = words.length === 1 ? words[0] : words.map(shellQuote).join(' ');
   } else if (words.length) return { error: `${tool} takes no ${JSON.stringify(words[0])}` };
   return { scope, ...(socket ? { socket } : {}), call: { tool, args } };
 }
 
 function rpc(r: Reached, method: string, params: unknown, id: number): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
-    let buf = r.rest.toString('utf8');
+    // A chunk can end inside a UTF-8 character.
+    const decoder = new StringDecoder('utf8');
+    let buf = decoder.write(r.rest);
     const onData = (b: Buffer): void => {
-      buf += b.toString('utf8');
+      buf += decoder.write(b);
       check();
     };
     const check = (): void => {
@@ -97,7 +117,15 @@ function rpc(r: Reached, method: string, params: unknown, id: number): Promise<R
       while ((nl = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
-        const m = JSON.parse(line) as Record<string, unknown>;
+        let m: Record<string, unknown>;
+        try {
+          m = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          r.socket.off('data', onData);
+          r.socket.off('close', onClose);
+          reject(new Error('the daemon sent a line that is not JSON'));
+          return;
+        }
         if (m.id === id && !('method' in m)) {
           r.socket.off('data', onData);
           r.socket.off('close', onClose);
@@ -117,7 +145,7 @@ function rpc(r: Reached, method: string, params: unknown, id: number): Promise<R
   });
 }
 
-export async function runCli(o: CliOptions & { socket: string; version: string; startDaemon: () => string; stdout: Writable; stderr: Writable; reachMs?: number }): Promise<number> {
+export async function runCli(o: CliOptions & { socket: string; version: string; startDaemon: (budgetMs: number) => string; stdout: Writable; stderr: Writable; reachMs?: number }): Promise<number> {
   const daemonStop = 'daemonStop' in o.call;
   let r: Reached;
   try {
@@ -133,8 +161,22 @@ export async function runCli(o: CliOptions & { socket: string; version: string; 
   }
   try {
     if ('daemonStop' in o.call) {
-      process.kill(r.daemon.pid, 'SIGTERM');
-      o.stdout.write(`Asked the daemon (pid ${r.daemon.pid}, running since ${r.daemon.startedAt}) to stop; it hangs up every shell it holds.\n`);
+      const pid = r.daemon.pid;
+      if (!Number.isInteger(pid) || pid <= 1) {
+        o.stderr.write(`tsm: the daemon at ${o.socket} names pid ${pid}, which can't be its own; nothing was signalled\n`);
+        return 1;
+      }
+      process.kill(pid, 'SIGTERM');
+      r.socket.destroy();
+      const end = Date.now() + (o.reachMs ?? REACH_MS);
+      while ((await probe(o.socket).catch(() => 'missing')) === 'answers') {
+        if (Date.now() >= end) {
+          o.stderr.write(`tsm: the daemon (pid ${pid}) still answers at ${o.socket} after ${o.reachMs ?? REACH_MS} ms\n`);
+          return 1;
+        }
+        await new Promise((res) => setTimeout(res, 50));
+      }
+      o.stdout.write(`Stopped the daemon (pid ${pid}, running since ${r.daemon.startedAt}); it hangs up every shell it held.\n`);
       return 0;
     }
     await rpc(r, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'tsm', version: o.version } }, 1);

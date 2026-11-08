@@ -147,10 +147,14 @@ test('H3: nothing answering within the bound ends the relay nonzero, naming wher
   const dir = tmp();
   const socket = path.join(dir, 'daemon.sock');
   const s = io();
+  s.stdin.write('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n');
   try {
     const code = await relay({ socket, hello: HELLO, stdin: s.stdin, stdout: s.stdout, stderr: s.stderr, startDaemon: () => '/somewhere/daemon.log', reachMs: 300 });
     assert.equal(code, 1);
     assert.match(s.err(), /no terminal-sessions daemon answered at .*daemon\.sock within 300 ms, though one was started; its log is \/somewhere\/daemon\.log/);
+    const answer = JSON.parse(s.out().trim()) as { id: number; error: { message: string } };
+    assert.equal(answer.id, 0, "the host's initialize is answered");
+    assert.match(answer.error.message, /^tsm-relay: no terminal-sessions daemon answered at .* its log is \/somewhere\/daemon\.log$/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -166,6 +170,7 @@ test('H3: something at the socket that isn\'t a daemon is said to be so', { time
   });
   await new Promise<void>((r) => other.listen(socket, r));
   const s = io();
+  s.stdin.end();
   try {
     assert.equal(await relay({ socket, hello: HELLO, stdin: s.stdin, stdout: s.stdout, stderr: s.stderr, startDaemon: () => 'x' }), 1);
     assert.match(s.err(), /something other than a terminal-sessions daemon listens at .*: its first line isn't a hello/);
@@ -190,6 +195,27 @@ test('H4: a daemon of another version is named on stderr; one of the same versio
       await fake.close();
     }
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('something that accepts the connection and never greets ends the relay within its bound', { timeout: 10_000 }, async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  const silent = net.createServer((c) => {
+    c.on('error', () => {});
+    c.resume();
+  });
+  await new Promise<void>((r) => silent.listen(socket, r));
+  const s = io();
+  s.stdin.end();
+  try {
+    const t0 = Date.now();
+    assert.equal(await relay({ socket, hello: HELLO, stdin: s.stdin, stdout: s.stdout, stderr: s.stderr, startDaemon: () => assert.fail('something answered'), reachMs: 300 }), 1);
+    assert.ok(Date.now() - t0 < 2000, `${Date.now() - t0} ms`);
+    assert.match(s.err(), /accepted the connection but sent no hello within \d+ ms/);
+  } finally {
+    await new Promise<void>((r) => silent.close(() => r()));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

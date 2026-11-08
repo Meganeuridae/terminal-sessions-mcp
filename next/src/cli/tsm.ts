@@ -29,7 +29,7 @@ async function main(argv: readonly string[]): Promise<number> {
     ...parsed,
     socket: paths.socket,
     version: packageVersion(),
-    startDaemon: () => startDaemon(daemonScript, paths.socket, path.join(paths.dir, 'daemon.log')),
+    startDaemon: (budgetMs) => startDaemon(daemonScript, paths.socket, path.join(paths.dir, 'daemon.log'), budgetMs),
     stdout: process.stdout,
     stderr: process.stderr,
   });

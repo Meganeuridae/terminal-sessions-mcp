@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { runDaemon, type RunningDaemon } from '../src/endpoint/daemon-main.js';
+import { ORPHAN_CHECK_MS, runDaemon, type RunningDaemon } from '../src/endpoint/daemon-main.js';
 import { helloLine } from '../src/endpoint/hello.js';
 import type { OpenOptions } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
@@ -93,8 +93,8 @@ test('H2: a daemon whose socket another took, with no connection left, ends its 
     const c = await openMain(socket);
     await new Promise<void>((r) => other.listen(path.join(dir, 'other.sock'), r));
     fs.renameSync(path.join(dir, 'other.sock'), socket);
-    await new Promise((r) => setTimeout(r, 100));
-    assert.equal(sessions[0]!.closedWith, undefined, 'a connection remains, so it serves on');
+    await new Promise((r) => setTimeout(r, ORPHAN_CHECK_MS + 300));
+    assert.equal(sessions[0]!.closedWith, undefined, 'a connection remains, so it serves on past an orphan check');
     c.destroy();
     await within(d.stopped, 2000, 'the orphaned daemon stopping');
     assert.ok(sessions[0]!.closedWith);
@@ -117,6 +117,21 @@ test('H2: a daemon with no connection whose socket another took stops when the s
   } finally {
     await d.stop('test');
     await new Promise<void>((r) => other.close(() => r()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a daemon starting removes the session directories a daemon that died left behind', async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  fs.mkdirSync(path.join(dir, 'sessions', 'main-123'), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.join(dir, 'sessions'), 0o700);
+  fs.writeFileSync(path.join(dir, 'sessions', 'main-123', 'command'), 'echo secret');
+  const d = running(await runDaemon(options(socket, [])));
+  try {
+    assert.deepEqual(fs.readdirSync(path.join(dir, 'sessions')), []);
+  } finally {
+    await d.stop('test');
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
