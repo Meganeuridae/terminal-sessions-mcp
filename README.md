@@ -2,8 +2,6 @@
 
 **Interactive, persistent terminal sessions for AI assistants via Model Context Protocol**
 
-![Web GUI Demo](docs/screenshots/web-gui-demo.gif)
-
 ## Why This Matters
 
 While many AI tools offer basic command execution, Terminal Sessions MCP provides unique capabilities:
@@ -14,23 +12,20 @@ While many AI tools offer basic command execution, Terminal Sessions MCP provide
 - **True interactivity** - Send input to prompts, handle confirmations, respond to interactive tools
 - **Process control** - Send signals (Ctrl+C, Ctrl+Z) to gracefully manage long-running processes
 - **Stateful environment** - `cd`, `export`, and environment changes persist across commands
-- **Visual debugging** - Take screenshots of terminal output to debug TUI applications
 - **Context search** - Search through command history and output with regex
 
-Your AI assistant can now run servers in the background while working on other tasks, maintain persistent development environments, handle interactive workflows, and even build terminal UI applications with visual feedback.
+Your AI assistant can now run servers in the background while working on other tasks, maintain persistent development environments, and handle interactive workflows.
 
 ## MCP Features
 
 ✅ **Truly Persistent Sessions** - Sessions survive Cursor/IDE restarts, keeping all state  
 ✅ **Interactive Workflows** - Handle password prompts, confirmations, and interactive tools  
-✅ **Build & Debug TUIs** - Develop terminal UI apps with visual feedback via screenshots  
 ✅ **Process Control** - Send signals (SIGINT, SIGTERM, SIGTSTP) to running processes  
 ✅ **Stateful Shell** - `cd`, `export`, and other state changes persist across AI responses  
 ✅ **Log Search** - Search through command history and output with regex and context  
 ✅ **Service Management** - Start services with intelligent readiness detection  
 ✅ **Smart Command Execution** - Detects when commands complete, handles long-running processes  
 ✅ **Multi-Session Management** - Track multiple services/sessions by name  
-✅ **Terminal Screenshots** - Capture visually rich terminal output for debugging  
 ✅ **Real-Time Streaming** - Watch output as it happens, not just final results  
 
 ## Quick Start for AI Assistants
@@ -54,7 +49,7 @@ This is the backend server that actually manages your terminal sessions:
 **If installed globally:**
 ```bash
 session-server
-# Starts session server on port 3100 (with GUI on port 3200)
+# Starts session server on port 3100
 ```
 
 **If installed locally:**
@@ -62,20 +57,15 @@ session-server
 npx session-server
 ```
 
-**Headless mode (no GUI):**
-```bash
-session-server --headless
-```
-
 **Remote access (bind to all interfaces):**
 ```bash
 session-server --host 0.0.0.0 --token your-secret-token
 ```
 
-**Who may connect.** Both ports (the session API and the web GUI) refuse
-browser pages from other sites: a request that carries an `Origin` must come
-from the GUI's own page, or from an origin you list with `--allow-origin`.
-Without a token, they also serve only requests addressed to `localhost`,
+**Who may connect.** The session server refuses browser pages from other
+sites: a request that carries an `Origin` must name the host and port the
+request was sent to, or an origin you list with `--allow-origin`. Without a
+token, it also serves only requests addressed to `localhost`,
 `127.0.0.1`, `[::1]` or the bind address; to reach a token-less server by any
 other name, list it with `--allow-host` (or, better, use `--token`):
 ```bash
@@ -162,36 +152,13 @@ Your AI assistant now has access to these MCP tools:
 - `sendSignal` - Send signals (Ctrl+C, etc.) to processes
 - `listSessions` - See all active sessions
 - `killSession` - Stop a session gracefully or forcefully
-- `takeScreenshot` - Capture terminal visual state
 
-## Web GUI (Optional)
+## TUI Applications
 
-The server includes an optional web-based GUI for human operators to monitor and interact with sessions:
-
-**Features:**
-- 📊 Dashboard showing all active sessions with live status
-- 🖥️ Full xterm.js terminal emulator with 256-color support
-- 🖱️ Complete mouse support in TUI apps (Midnight Commander, htop, etc.)
-- ⌨️ Direct keyboard input with proper key code forwarding
-- 📐 Automatic resize handling for perfect coordinate mapping
-- 🎨 Beautiful GitHub-inspired dark theme
-- 🔄 Real-time output streaming
-- ⚡ Signal controls (Ctrl+C, Ctrl+Z, SIGTERM)
-
-**Access:** Open `http://localhost:3200` when running with GUI enabled (default), or use `--headless` to disable.
-
-## TUI Control Sequences Support
-
-All terminal control sequences work perfectly, enabling rich TUI applications:
-
-[![TUI Controls](docs/screenshots/tui-controls.png)](docs/screenshots/tui-controls.png)
-
-- ✅ **Cursor positioning** - `\033[row;colH`
-- ✅ **Screen clearing** - `\033[2J\033[H`
-- ✅ **Colors & formatting** - All ANSI codes (30-37, 40-47, bold, dim, etc.)
-- ✅ **Progress bars** - Dynamic updates with proper positioning
-- ✅ **Box drawing** - UTF-8 box characters (╔═══╗)
-- ✅ **Live TUIs** - htop, vim, tmux, custom TUI apps
+Each session runs in a pseudo-terminal, so TUI applications (htop, vim, tmux,
+progress bars) run as they would in a terminal. Their output carries its escape
+sequences for colors, cursor positioning and screen clearing: `raw: true`
+returns them as written, and without it they're removed.
 
 ## API Usage
 
@@ -211,24 +178,11 @@ console.log(result.output);
 
 // Search logs
 const matches = await client.searchLogs('my-session', 'error|warning', 5);
-
-// Take a screenshot (includes all colors and formatting!)
-const screenshot = await client.takeScreenshot('my-session', {
-  lines: 50,
-  outputPath: './terminal.png'
-});
 ```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│      Web GUI (http://localhost:3200)            │
-│  - xterm.js terminal rendering                  │
-│  - Live Socket.IO updates                       │
-│  - Session dashboard                            │
-└─────────────────────────────────────────────────┘
-                     ↕ Socket.IO
 ┌─────────────────────────────────────────────────┐
 │    Session Server (ws://localhost:3100)         │
 │  - PTY-based persistent sessions                │
@@ -238,9 +192,8 @@ const screenshot = await client.takeScreenshot('my-session', {
                      ↕ MCP Protocol
 ┌─────────────────────────────────────────────────┐
 │       AI Assistant (Cursor, Claude, etc.)       │
-│  - 10 MCP tools for session management          │
+│  - 9 MCP tools for session management           │
 │  - Start services, run commands                 │
-│  - Take screenshots                             │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -328,7 +281,6 @@ with `sendInput`, which may have started a command.
 ### Log Operations
 - **tailLogs** - Get recent logs from a session
 - **searchLogs** - Search logs with regex patterns and context
-- **takeScreenshot** - Capture terminal screenshot with proper TUI rendering 📸
 
 ## CLI Usage
 
@@ -351,50 +303,6 @@ npx session-cli tail my-session --lines=100
 npx session-cli subscribe my-session --replay=50
 ```
 
-## Web GUI Usage
-
-Start the web GUI to visually manage all your terminal sessions:
-
-```bash
-# Start on default port (3200)
-npx session-gui
-
-# Or custom port
-GUI_PORT=8080 npx session-gui
-```
-
-Then open http://localhost:3200 in your browser to:
-- View all active sessions in a sidebar
-- Click any session to see its xterm.js rendered terminal
-- Type commands directly in the web interface
-- Watch live updates stream in real-time
-- Take screenshots from the rendered terminal
-- Monitor multiple services simultaneously
-
-## Terminal Screenshots 📸
-
-Perfect for debugging visually rich terminal applications:
-
-```typescript
-// Capture a TUI, progress bar, or ANSI art
-const result = await client.takeScreenshot('my-session', {
-  lines: 50,           // How many lines to capture
-  outputPath: './screenshot.png',  // Save to file
-  width: 1200,         // Image width
-  height: 800          // Image height
-});
-
-// Or get base64 (omit outputPath) - displays inline in MCP!
-const { base64 } = await client.takeScreenshot('my-session');
-```
-
-**Use cases:**
-- 📊 Debugging progress bars and spinners
-- 🎨 Capturing ANSI art and colors
-- 🖥️  Visual regression testing of CLI tools
-- 📝 Documenting terminal applications
-- 🔍 Sharing colorized logs with proper formatting
-
 ## Use Cases
 
 ### 1. AI-Assisted Development
@@ -405,17 +313,13 @@ Enable AI assistants to manage development services, run tests, and interact wit
 
 Start and monitor multiple services simultaneously, with intelligent startup detection and log search.
 
-### 3. Visual Terminal Debugging
-
-Capture screenshots of TUIs, progress bars, and ANSI art for debugging or documentation. The web GUI provides real-time visual feedback.
-
-### 4. Interactive Debugging
+### 3. Interactive Debugging
 
 AI assistants can interact with running processes, send input, and observe output in real-time.
 
-### 5. Team Collaboration
+### 4. Team Collaboration
 
-Share terminal sessions between multiple agents or humans. Send a URL to view live terminal output.
+Share terminal sessions between multiple agents or humans.
 
 ## Development
 
@@ -433,22 +337,16 @@ npm run build
 # Start session server
 npm run start-server
 
-# Start web GUI
-npm run start-gui
-
 # Run CLI
 npm run cli -- list
 
 # Run demos
-npx ts-node examples/screenshot-demo.ts
 npx ts-node examples/service-management.ts
 ```
 
 ## Requirements
 
 - **Node.js** 18.x, 20.x, or 22.x LTS (Node 25+ not yet supported due to node-pty compatibility)
-- **Headless Chrome** (via Puppeteer) for screenshots
-- **Modern browser** for web GUI (Chrome, Firefox, Safari, Edge)
 
 ## Configuration
 
@@ -459,8 +357,7 @@ npx ts-node examples/service-management.ts
 - `SESSION_SERVER_HOST` - Host to bind to (default: localhost)
 - `SESSION_SERVER_TOKEN` - Authentication token (optional, required for remote access by other names unless listed with `SESSION_SERVER_ALLOW_HOSTS`)
 - `SESSION_SERVER_ALLOW_HOSTS` - Comma-separated Host names (optionally `name:port`) a token-less server serves besides the loopback names (same as `--allow-host`)
-- `SESSION_SERVER_ALLOW_ORIGINS` - Comma-separated browser origins allowed besides the GUI's own page (same as `--allow-origin`)
-- `GUI_PORT` - Web GUI port (default: 3200)
+- `SESSION_SERVER_ALLOW_ORIGINS` - Comma-separated browser origins allowed besides the server's own (same as `--allow-origin`)
 
 **MCP Client:**
 - `SESSION_SERVER_URL` - Full WebSocket URL (e.g., `ws://192.168.1.100:3100`)
@@ -503,19 +400,6 @@ You can configure multiple MCP servers to connect to different machines simultan
 2. Check that paths in mcp.json are absolute
 3. Restart your AI assistant after configuration changes
 4. Enable debug mode: `MCP_DEBUG=1`
-
-### Web GUI not connecting
-
-1. Ensure session server is running on port 3100
-2. Check browser console for errors
-3. Verify Socket.IO and xterm.js CDN libraries loaded
-4. Try a different port if 3200 is occupied
-
-### Screenshots failing
-
-1. Ensure Puppeteer can launch headless Chrome
-2. Check system resources (memory)
-3. Try with fewer lines: `lines: 20`
 
 ## License
 

@@ -1,14 +1,13 @@
 /**
- * Host and Origin checks for both 1.x ports (the session API and the web GUI),
- * matching the 2.0 transport (next/src/transport/server.ts).
+ * Host and Origin checks for the 1.x session API, matching the 2.0 transport
+ * (next/src/transport/server.ts).
  *
- * Checked on every HTTP request and every WebSocket / socket.io handshake,
- * before the token:
+ * Checked on every HTTP request and every WebSocket handshake, before the
+ * token:
  *
- *  1. Origin, when present, must be same-origin with the request's Host (the
- *     GUI's own page) or listed with --allow-origin; otherwise 403. Requests
- *     without an Origin come from non-browser clients (the MCP shim, the CLI,
- *     the GUI's server-side client).
+ *  1. Origin, when present, must be same-origin with the request's Host or
+ *     listed with --allow-origin; otherwise 403. Requests without an Origin
+ *     come from non-browser clients (the MCP shim, the CLI).
  *
  *  2. Without a token, Host must name this server: `localhost`, `127.0.0.1` or
  *     `[::1]`, the bind address when it is a specific one, or a name given with
@@ -23,7 +22,7 @@ import { timingSafeEqual } from 'crypto';
 export interface AccessOptions {
   /** Host names (optionally `name:port`) served besides the loopback names. */
   allowHosts?: string[];
-  /** Origins (e.g. `https://dash.example`) allowed besides our own GUI page. */
+  /** Origins (e.g. `https://dash.example`) allowed besides the request's own. */
   allowOrigins?: string[];
 }
 
@@ -135,7 +134,7 @@ export class RequestGuard {
    * @param bind the address the server listens on (`--host`)
    * @param port the port it listens on, or a function giving it once bound
    * @param tokenRequired whether a token gates every connection
-   * @param label log prefix (`SessionAPI`, `WebGUI`)
+   * @param label log prefix (`SessionAPI`)
    */
   constructor(
     bind: string,
@@ -179,7 +178,7 @@ export class RequestGuard {
     const hostHeader = req.headers.host;
     const host = typeof hostHeader === 'string' ? parseHost(hostHeader) : undefined;
 
-    // 1. Origin: absent (not a browser), same-origin with Host (our GUI), or explicitly allowed.
+    // 1. Origin: absent (not a browser), same-origin with Host, or explicitly allowed.
     const origin = req.headers.origin;
     if (origin !== undefined) {
       let u: URL | undefined;

@@ -403,12 +403,6 @@ export class PersistentSessionServer extends EventEmitter {
   private readonly defaultCommandTimeout = 30000; // 30 seconds default
   private tempFileCounter = 0;
 
-  /**
-   * Auth token for the web GUI (same token as the session server).
-   * Used by takeScreenshot so its headless browser can authenticate.
-   */
-  guiAuthToken?: string;
-
   constructor() {
     super();
     // When the program exits, remove the sessions' temp files. An 'exit'
@@ -538,8 +532,8 @@ export class PersistentSessionServer extends EventEmitter {
 
       if (data.length > 0) {
         // `chunk` is the terminal stream as the PTY wrote it, plumbing
-        // included, for terminal renderers (the GUI writes it to xterm);
-        // `lines` are its complete lines with the plumbing removed.
+        // included, for terminal renderers; `lines` are its complete lines
+        // with the plumbing removed.
         this.notify('session:output', {
           sessionId: sessionInfo.id,
           chunk: data,
@@ -636,7 +630,7 @@ export class PersistentSessionServer extends EventEmitter {
 
       // Clear the startup output. The line buffer is kept, as on main: it
       // holds the prompt that followed the marker, and getOutput appends it to
-      // the logs, so the GUI's first read of a fresh session shows the prompt.
+      // the logs, so a client's first read of a fresh session shows the prompt.
       session.outputBuffer = '';
       session.logs = [];
     }
@@ -2076,123 +2070,6 @@ export class PersistentSessionServer extends EventEmitter {
   async getCurrentDirectory(sessionId: string): Promise<string> {
     const result = await this.execCommand(sessionId, 'pwd');
     return result.output.trim();
-  }
-
-  /**
-   * Take a screenshot of the terminal session via xterm.js GUI
-   * This properly captures TUIs like htop, vim, etc.
-   */
-  async takeScreenshot(sessionId: string, options?: {
-    lines?: number;
-    outputPath?: string;
-    width?: number;
-    height?: number;
-    guiPort?: number;
-  }): Promise<{ success: boolean; path?: string; base64?: string; error?: string }> {
-    try {
-      const session = this.sessions.get(sessionId);
-      if (!session) {
-        throw new Error(`Session ${sessionId} not found`);
-      }
-
-      const guiPort = options?.guiPort || 3200;
-      const width = options?.width || 1400;
-      const height = options?.height || 900;
-
-      // Use puppeteer to navigate to the xterm.js GUI
-      const puppeteer = require('puppeteer');
-      const browser = await puppeteer.launch({ 
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-      });
-      
-      try {
-        const page = await browser.newPage();
-        
-        // Set viewport size
-        await page.setViewport({
-          width,
-          height
-        });
-        
-        // Navigate to the GUI (with auth token if the GUI requires one)
-        const tokenParam = this.guiAuthToken ? `?token=${encodeURIComponent(this.guiAuthToken)}` : '';
-        const guiUrl = `http://localhost:${guiPort}${tokenParam}`;
-        await page.goto(guiUrl, { waitUntil: 'networkidle0', timeout: 10000 });
-        
-        // Wait for the session list to load
-        await page.waitForSelector('.session-item', { timeout: 5000 });
-        
-        // Find and click the session - use $$eval to avoid DOM type issues
-        const sessionClicked = await page.$$eval(
-          '.session-item',
-          (items: any[], targetId: string) => {
-            for (const item of items) {
-              const nameEl = item.querySelector('.session-name');
-              if (nameEl && nameEl.textContent === targetId) {
-                (item as any).click();
-                return true;
-              }
-            }
-            return false;
-          },
-          sessionId
-        );
-        
-        if (!sessionClicked) {
-          throw new Error(`Session ${sessionId} not found in GUI`);
-        }
-        
-        // Wait for terminal container to be ready
-        await page.waitForSelector('#terminal', { timeout: 5000 });
-        
-        // Give xterm.js plenty of time to process and render all escape sequences
-        // TUIs like htop send many cursor positioning commands that need time to render
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        
-        // Force xterm.js to refresh if it's available
-        await page.evaluate(() => {
-          try {
-            const w = (globalThis as any);
-            if (w.currentTerminal) {
-              w.currentTerminal.refresh(0, w.currentTerminal.rows - 1);
-            }
-          } catch (e) {
-            // Ignore if terminal refresh fails
-          }
-        });
-        
-        // Final wait after refresh
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Screenshot the terminal canvas container which has the rendered output
-        const terminalElement = await page.$('#terminal');
-        if (!terminalElement) {
-          throw new Error('Terminal element not found in GUI');
-        }
-        
-        const screenshotBuffer = await terminalElement.screenshot({
-          type: 'png'
-        });
-        
-        await browser.close();
-
-        // Always return base64 for MCP, optionally save to file too
-        const base64 = screenshotBuffer.toString('base64');
-        
-        if (options?.outputPath) {
-          const fullPath = path.resolve(options.outputPath);
-          await fs.promises.writeFile(fullPath, screenshotBuffer);
-          return { success: true, base64, path: fullPath };
-        } else {
-          return { success: true, base64 };
-        }
-      } finally {
-        await browser.close().catch(() => {});
-      }
-    } catch (error: any) {
-      return { success: false, error: `Failed to screenshot via GUI: ${error.message}` };
-    }
   }
 
   // Helper methods

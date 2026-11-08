@@ -439,30 +439,6 @@ export class ConnectomeTestingMCP {
   }
   
   /**
-   * Take a screenshot of the terminal session
-   * @tool
-   */
-  async takeScreenshot(params: {
-    session: string;
-    lines?: number;
-    outputPath?: string;
-    width?: number;
-    height?: number;
-  }): Promise<{
-    success: boolean;
-    path?: string;
-    base64?: string;
-    error?: string;
-  }> {
-    try {
-      const sessionId = this.serviceMap.get(params.session) || params.session;
-      return await this.getClient().takeScreenshot(sessionId, params);
-    } catch (error: any) {
-      return { success: false, error: error.message };
-    }
-  }
-  
-  /**
    * Wait for a pattern to appear in logs
    * @tool
    */

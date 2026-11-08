@@ -179,8 +179,6 @@ export class RobustSessionClient extends EventEmitter {
       }
       case 'service.start':
         return 20000; // server polls ready/error patterns for up to 15s
-      case 'session.screenshot':
-        return 30000; // puppeteer launch + navigation + render waits
       default:
         return this.requestTimeout;
     }
@@ -298,15 +296,6 @@ export class RobustSessionClient extends EventEmitter {
   
   async killAll(graceful?: boolean) {
     return this.request('session.killAll', { graceful });
-  }
-  
-  async takeScreenshot(sessionId: string, options?: {
-    lines?: number;
-    outputPath?: string;
-    width?: number;
-    height?: number;
-  }) {
-    return this.request('session.screenshot', { sessionId, ...options });
   }
   
   async resizeSession(sessionId: string, cols: number, rows: number) {

@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+
+- **The web GUI, and the `takeScreenshot` tool that rendered through it.**
+  The session server no longer starts a GUI on `GUI_PORT` (3200), the
+  `session-gui` command and `npm run start-gui` are gone, and the stdio MCP
+  server offers nine tools, without `takeScreenshot`. A host whose prompt
+  holds the tool list sees it change once. A call to `takeScreenshot` is
+  answered `Unknown tool: takeScreenshot`, and the session server's
+  WebSocket API answers `session.screenshot` with `Unknown method:
+  session.screenshot`.
+- **For the library, breaking:** `takeScreenshot` on `RobustSessionClient`,
+  `ConnectomeTestingMCP` and `PersistentSessionServer`, and
+  `PersistentSessionServer.guiAuthToken`, are removed. TypeScript consumers
+  need their own `@types/node`, which Socket.IO and Puppeteer used to bring
+  in.
+- **Dependencies:** Puppeteer, Express, Socket.IO, `@xterm/xterm`,
+  `@xterm/addon-fit`, `@xterm/addon-web-links` and `ansi-to-html` are no
+  longer dependencies, and `@types/express` is no longer a dev dependency.
+  Express is still installed, since `@modelcontextprotocol/sdk` depends on
+  it; the others no longer are.
+- **`--headless`, `HEADLESS` and `GUI_PORT` are no longer read.** A session
+  server started with them starts as before, serving no GUI either way.
+
 ## v1.7.3 - 2026-10-22
 
 ### Fixed
