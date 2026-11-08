@@ -73,7 +73,7 @@ class LiveSession implements Session {
   private watchSeq = 0;
   private readonly listeners = new Set<(e: SessionEvent) => void>();
   private poll: NodeJS.Timeout | undefined;
-  private hooksLost = false;
+  private drawnOnce = false;
   private execed = false;
   private opened = false;
   private closed = false;
@@ -113,7 +113,6 @@ class LiveSession implements Session {
 
   async ready(waitMs: number): Promise<void> {
     await this.until(Date.now() + waitMs, () => (this.prompted || this.exitInfo || (this.kind === 'none' && this.front().state === 'prompt') ? true : undefined));
-    if (!this.prompted && this.kind !== 'none') this.hooksLost = true;
     this.opened = true;
   }
 
@@ -153,9 +152,10 @@ class LiveSession implements Session {
       }
     }
     if (kind === 'B' && ok) {
+      this.drawnOnce = true;
       if (this.atPrompt && !this.submitted) this.promptAt = at;
       else if (this.running) this.drawnWithoutEnd(at);
-      else if (!this.runCommand) {
+      else if (!this.runCommand && (this.promptAt === undefined || at.line > this.promptAt.line)) {
         this.atPrompt = true;
         this.submitted = false;
         this.sentPending = undefined;
@@ -189,7 +189,6 @@ class LiveSession implements Session {
 
   private ended(at: Pos, d: { status: number; pipe: number[]; flags: string; cwd: string; flushed: string }): void {
     this.inCommand = false;
-    this.hooksLost = false;
     this.atPrompt = true;
     this.submitted = false;
     this.sentPending = undefined;
@@ -212,7 +211,6 @@ class LiveSession implements Session {
     const c = this.running;
     this.running = undefined;
     this.inCommand = false;
-    this.hooksLost = false;
     this.atPrompt = true;
     this.submitted = false;
     this.sentPending = undefined;
@@ -308,21 +306,21 @@ class LiveSession implements Session {
       }
       const process: Process = { pgid: g?.pgrp ?? this.pid, argv: proc.argv(this.pid) ?? this.shellName, shell: true };
       const reads = proc.readsTerminal(this.pid, this.pts);
-      if ((!this.submitted || this.kind === 'none' || this.hooksLost) && this.withoutHooks(reads)) {
+      if ((!this.submitted || this.plain) && this.withoutHooks(reads)) {
         this.submitted = false;
         const open = this.running ?? this.runCommand;
         if (open) {
           this.running = this.runCommand = undefined;
           this.inCommand = false;
-          if (this.kind !== 'none') this.hooksLost = true;
           this.finish(open, { line: this.t.pos().line, col: 0 }, { at: Date.now(), errexit: false, refusedMarks: this.refused });
           this.refused = 0;
         }
         const pending = this.sentPending;
         return { state: 'prompt', since: this.since('prompt'), ...(pending !== undefined && { pending }) };
       }
-      if (reads && !this.plain && !this.atPrompt) return at({ state: 'waiting', since: this.since(`w:${process.pgid}`), process, echo: proc.modes(this.pts)?.echo ?? true });
-      return at({ state: 'running', since: this.since(`r:${process.pgid}`), process, waitVisible: reads !== undefined && !this.plain });
+      const starting = !this.drawnOnce && !this.plain ? { starting: true as const } : {};
+      if (reads && !this.plain && !this.atPrompt) return at({ state: 'waiting', since: this.since(`w:${process.pgid}`), process, echo: proc.modes(this.pts)?.echo ?? true, ...starting });
+      return at({ state: 'running', since: this.since(`r:${process.pgid}`), process, waitVisible: reads !== undefined && !this.plain, ...starting });
     }
     const members = proc.descendants(this.pid)?.filter((d) => d.pgrp === g.tpgid).map((d) => d.pid) ?? [];
     const process: Process = { pgid: g.tpgid, argv: proc.argv(g.tpgid) ?? (members[0] !== undefined ? proc.argv(members[0]) : undefined) ?? '?', shell: false };
@@ -332,19 +330,18 @@ class LiveSession implements Session {
   }
 
   /**
-   * A shell with no integration, or whose first prompt never came, is at its prompt once output is quiet and
-   * it waits at its line editor, which holds the terminal out of canonical mode, or, with no line
-   * editor (dash), reads the terminal itself. A shell whose process now runs another program (an
-   * exec) is treated as one without integration.
+   * A shell with no integration, or one replaced by exec (its process now runs another program), is
+   * at its prompt once output is quiet and it waits at its line editor, which holds the terminal out
+   * of canonical mode, or, with no line editor (dash), reads the terminal itself.
    */
   private withoutHooks(reads: boolean | undefined): boolean {
     if (this.atPrompt || Date.now() - Math.max(this.lastOutput, this.lastWrite) < HOOKS_QUIET_MS) return false;
     if (this.kind !== 'none' && !this.execed && this.opened) {
       const now = proc.argv(this.pid);
-      if (now !== undefined && now !== this.argvAtOpen) this.execed = this.hooksLost = true;
+      if (now !== undefined && now !== this.argvAtOpen) this.execed = true;
     }
-    if (!this.plain && !this.hooksLost) return false;
-    if (reads) return this.plain;
+    if (!this.plain) return false;
+    if (reads) return true;
     return proc.modes(this.pts)?.canonical === false;
   }
 
@@ -455,7 +452,10 @@ class LiveSession implements Session {
     if (this.exitInfo) return { sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by: 'exited' };
     const deadline = Date.now() + opts.waitMs;
     const quiet = opts.quietMs ?? 300;
-    if (this.atPrompt && !this.submitted && this.promptAt === undefined) await this.until(deadline, () => (this.prompted || this.exitInfo || !this.atPrompt ? true : undefined));
+    if (this.atPrompt && !this.submitted && !this.prompted) {
+      await this.until(deadline, () => (this.prompted || this.exitInfo || !this.atPrompt ? true : undefined));
+      if (!this.exitInfo && this.atPrompt && !this.prompted) return { sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by: 'timeout' };
+    }
     if (this.exitInfo) return { sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by: 'exited' };
     if (this.atPrompt && !this.submitted) {
       if (/[\r\n]/.test(bytes)) this.submitted = true;

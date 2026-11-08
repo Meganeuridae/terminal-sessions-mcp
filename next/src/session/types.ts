@@ -66,6 +66,8 @@ export type Front =
       command?: number;
       /** false when the kernel won't show whether it reads the terminal (no ptrace access, or not Linux), so `waiting` can't be seen. */
       waitVisible: boolean;
+      /** The shell hasn't drawn its first prompt yet: it is still running its startup files. */
+      starting?: true;
     }
   | {
       /** Blocked reading this terminal, on the kernel's evidence. Programs that wait in poll (a REPL, ssh) show as `running`. */
@@ -75,6 +77,8 @@ export type Front =
       command?: number;
       /** false: the terminal doesn't echo, as for a password. */
       echo: boolean;
+      /** The shell hasn't drawn its first prompt yet: a startup file is reading. */
+      starting?: true;
     }
   | { state: 'exited'; since: number; exit: Exit };
 
@@ -136,7 +140,7 @@ export type RunOutcome =
   | { kind: 'running'; command: Command; front: Front };
 
 export interface SendOutcome {
-  /** false when the shell had exited, and nothing was sent. */
+  /** false when nothing was sent: the shell had exited (`by: 'exited'`), or a prompt whose end mark came wasn't drawn within the wait (`by: 'timeout'`). */
   sent: boolean;
   /** From the line the cursor was on when the text went in. */
   lines: Lines;
@@ -210,7 +214,7 @@ export interface Session {
 
   /** Only at a prompt with nothing pending; otherwise refused with nothing typed. */
   run(text: string, opts: { waitMs: number; take?: boolean }): Promise<RunOutcome>;
-  /** Exactly these bytes, nothing appended. At a prompt whose end mark came but which isn't drawn yet, it first waits, within `waitMs`, for the drawn prompt, so the line editor gets the bytes rather than the terminal. Returns when `until` matches from the cursor's line on, or (without `until`) when output is quiet for `quietMs`, default 300. */
+  /** Exactly these bytes, nothing appended. At a prompt whose end mark came but which isn't drawn yet, it first waits, within `waitMs`, for the mark at the prompt's end, so the line editor gets the bytes rather than the terminal or a prompt hook, and sends nothing if the wait runs out. Returns when `until` matches from the cursor's line on, or (without `until`) when output is quiet for `quietMs`, default 300. */
   send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean }): Promise<SendOutcome>;
   /** `match` looks from line `from` on, so lines already there count. */
   wait(until: Until, opts: { waitMs: number; from: number; take?: boolean }): Promise<WaitOutcome>;
