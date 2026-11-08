@@ -1,11 +1,10 @@
-// The package has no web GUI: the session server serves its API alone, and the stdio server offers no screenshot
-// tool, which rendered through the GUI. An operator's `--headless` or `HEADLESS=true` still starts the session server.
 // Runs against the compiled output: `npm test`.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
+const { performance } = require('node:perf_hooks');
 const { join } = require('node:path');
 const { once } = require('node:events');
 const WebSocket = require('ws');
@@ -16,7 +15,6 @@ const sessionServerJs = join(root, 'dist', 'src', 'server', 'start-session-serve
 const ANSWER_WITHIN_MS = 10000;
 const TOOLS = ['launch', 'runCommand', 'listSessions', 'tailLogs', 'sendInput', 'sendSignal', 'killSession', 'killAll', 'searchLogs'];
 
-// Two distinct loopback ports nothing listens on: ones the kernel just handed out together and that have been closed.
 async function closedPorts() {
   const probes = [net.createServer(), net.createServer()];
   for (const probe of probes) {
@@ -28,7 +26,6 @@ async function closedPorts() {
   return ports;
 }
 
-// A session server that answers every method with null.
 async function fakeSessionServer() {
   const wss = new WebSocket.Server({ host: '127.0.0.1', port: 0 });
   await once(wss, 'listening');
@@ -41,8 +38,6 @@ async function fakeSessionServer() {
   };
 }
 
-// The stdio server with a JSON-RPC line client. A request fails, rather than waiting forever, when no answer comes
-// within ANSWER_WITHIN_MS or the server ends first.
 function startStdioServer(url) {
   const child = spawn(process.execPath, [stdioJs], { env: { ...process.env, SESSION_SERVER_URL: url } });
   let buffer = '';
@@ -75,23 +70,27 @@ function startStdioServer(url) {
   return { child, request };
 }
 
-// Starts the built session server on loopback with the API at apiPort and GUI_PORT set to guiPort, and resolves once
-// its /health answers. The caller kills the child.
 async function startSessionServer({ args = [], env = {}, apiPort, guiPort }) {
   const child = spawn(process.execPath, [sessionServerJs, '--host', '127.0.0.1', ...args], {
     env: { ...process.env, SESSION_SERVER_PORT: String(apiPort), GUI_PORT: String(guiPort), ...env },
     stdio: 'ignore',
   });
-  const deadline = Date.now() + ANSWER_WITHIN_MS;
-  for (;;) {
-    if (child.exitCode !== null) throw new Error(`session server exited with code ${child.exitCode} before answering /health`);
-    const status = await new Promise((resolve) => {
-      http.get({ host: '127.0.0.1', port: apiPort, path: '/health' }, (res) => { res.resume(); resolve(res.statusCode); })
-        .on('error', () => resolve(null));
-    });
-    if (status === 200) return child;
-    if (Date.now() > deadline) throw new Error(`no /health answer within ${ANSWER_WITHIN_MS} ms`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+  const deadline = performance.now() + ANSWER_WITHIN_MS;
+  try {
+    for (;;) {
+      if (child.exitCode !== null) throw new Error(`session server exited with code ${child.exitCode} before answering /health`);
+      const status = await new Promise((resolve) => {
+        const req = http.get({ host: '127.0.0.1', port: apiPort, path: '/health' }, (res) => { res.resume(); resolve(res.statusCode); });
+        req.setTimeout(1000, () => req.destroy());
+        req.on('error', () => resolve(null));
+      });
+      if (status === 200) return child;
+      if (performance.now() > deadline) throw new Error(`no /health answer within ${ANSWER_WITHIN_MS} ms`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  } catch (error) {
+    child.kill('SIGKILL');
+    throw error;
   }
 }
 
@@ -129,9 +128,13 @@ test('the session server serves its API and nothing at GUI_PORT', async () => {
 });
 
 for (const [how, options] of [['--headless', { args: ['--headless'] }], ['HEADLESS=true', { env: { HEADLESS: 'true' } }]]) {
-  test(`the session server still starts with ${how}`, async () => {
+  test(`the session server still starts with ${how}, and serves nothing at GUI_PORT`, async () => {
     const [apiPort, guiPort] = await closedPorts();
     const child = await startSessionServer({ ...options, apiPort, guiPort });
-    child.kill('SIGKILL');
+    try {
+      assert.equal(await accepts('127.0.0.1', guiPort), false);
+    } finally {
+      child.kill('SIGKILL');
+    }
   });
 }

@@ -63,9 +63,9 @@ session-server --host 0.0.0.0 --token your-secret-token
 ```
 
 **Who may connect.** The session server refuses browser pages from other
-sites: a request that carries an `Origin` must come from the server's own
-origin, or from an origin you list with `--allow-origin`. Without a token, it
-also serves only requests addressed to `localhost`,
+sites: a request that carries an `Origin` must name the host and port the
+request was sent to, or an origin you list with `--allow-origin`. Without a
+token, it also serves only requests addressed to `localhost`,
 `127.0.0.1`, `[::1]` or the bind address; to reach a token-less server by any
 other name, list it with `--allow-host` (or, better, use `--token`):
 ```bash
@@ -153,16 +153,12 @@ Your AI assistant now has access to these MCP tools:
 - `listSessions` - See all active sessions
 - `killSession` - Stop a session gracefully or forcefully
 
-## TUI Control Sequences Support
+## TUI Applications
 
-All terminal control sequences work perfectly, enabling rich TUI applications:
-
-- ✅ **Cursor positioning** - `\033[row;colH`
-- ✅ **Screen clearing** - `\033[2J\033[H`
-- ✅ **Colors & formatting** - All ANSI codes (30-37, 40-47, bold, dim, etc.)
-- ✅ **Progress bars** - Dynamic updates with proper positioning
-- ✅ **Box drawing** - UTF-8 box characters (╔═══╗)
-- ✅ **Live TUIs** - htop, vim, tmux, custom TUI apps
+Each session runs in a pseudo-terminal, so TUI applications (htop, vim, tmux,
+progress bars) run as they would in a terminal. Their output carries its escape
+sequences for colors, cursor positioning and screen clearing: `raw: true`
+returns them as written, and without it they're removed.
 
 ## API Usage
 
