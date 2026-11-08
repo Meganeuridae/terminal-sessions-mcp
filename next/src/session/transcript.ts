@@ -159,7 +159,7 @@ export class Transcript {
     const b = this.term.buffer.active;
     const rows: string[] = [];
     for (let y = 0; y < this.term.rows; y++) rows.push(this.io.redact(b.getLine(b.baseY + y)?.translateToString(true) ?? ''));
-    return { rows, cursor: { row: b.cursorY, col: b.cursorX }, alt: b.type === 'alternate', title: this.titleText };
+    return { rows, cursor: { row: b.cursorY, col: b.cursorX }, alt: b.type === 'alternate', title: this.io.redact(this.titleText) };
   }
 
   dispose(): void {
@@ -204,15 +204,16 @@ export class Transcript {
     for (let i = from; i <= to; i++) {
       const row = b.getLine(i);
       if (!row) continue;
-      const text = row.translateToString(!b.getLine(i + 1)?.isWrapped);
+      const last = !b.getLine(i + 1)?.isWrapped;
       const starts = [0, ...this.splitsAt(i).map((s) => s.col)];
       starts.forEach((start, k) => {
-        const piece = text.slice(start, starts[k + 1] ?? text.length);
+        const stop = starts[k + 1];
+        const piece = stop === undefined ? row.translateToString(last, start) : row.translateToString(false, start, stop);
         const continues = k === 0 && row.isWrapped && lines.length > 0;
         const before = continues ? lines[lines.length - 1]!.length : 0;
         if (continues) lines[lines.length - 1] += piece;
         else lines.push(piece);
-        if (cursor && cursor.row === i && cursor.x >= start && (k + 1 >= starts.length || cursor.x < starts[k + 1]!)) at = { index: lines.length - 1, col: before + cursor.x - start };
+        if (cursor && cursor.row === i && cursor.x >= start && (stop === undefined || cursor.x < stop)) at = { index: lines.length - 1, col: before + row.translateToString(false, start, cursor.x).length };
       });
     }
     return at ? { lines, cursor: at } : { lines };

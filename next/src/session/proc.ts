@@ -105,6 +105,15 @@ export function modes(pts: string): { canonical: boolean; echo: boolean } | unde
   }
 }
 
+export function groupExists(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 /** Sends `signal` to process group `pgid`; false when nothing received it. */
 export function signalGroup(pgid: number, signal: NodeJS.Signals): boolean {
   if (!(pgid > 1)) return false;

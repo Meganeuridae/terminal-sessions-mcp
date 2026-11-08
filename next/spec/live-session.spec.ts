@@ -8,7 +8,6 @@ import { openSession } from '../src/session/session.js';
 import type { Command, Session, SessionEvent } from '../src/session/types.js';
 
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-session-')));
-after(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
 const which = (name: string): string | undefined => {
   try {
@@ -24,6 +23,7 @@ let homes = 0;
 const sessions: Session[] = [];
 after(async () => {
   for (const s of sessions) await s.close({ force: true });
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5 });
 });
 
 const bashBelow = (shell: string, major: number, minor: number): boolean => {
@@ -34,7 +34,7 @@ const bashBelow = (shell: string, major: number, minor: number): boolean => {
 
 const STARTUP: Record<string, string> = { bash: '.bash_profile', zsh: '.zshrc', fish: '.config/fish/config.fish' };
 
-async function open(shell: string, opts: { rc?: string; cwd?: string; cols?: number; waitMs?: number } = {}): Promise<Session> {
+async function open(shell: string, opts: { rc?: string; files?: Record<string, string>; cwd?: string; cols?: number; waitMs?: number } = {}): Promise<Session> {
   const home = path.join(tmp, `home-${++homes}`);
   fs.mkdirSync(home);
   const name = path.basename(shell);
@@ -43,6 +43,7 @@ async function open(shell: string, opts: { rc?: string; cwd?: string; cols?: num
     fs.mkdirSync(path.dirname(path.join(home, STARTUP[name]!)), { recursive: true });
     fs.writeFileSync(path.join(home, STARTUP[name]!), opts.rc);
   }
+  for (const [file, text] of Object.entries(opts.files ?? {})) fs.writeFileSync(path.join(home, file), text);
   const s = await openSession({
     name: 'main',
     shell,
@@ -79,6 +80,14 @@ for (const sh of shells) {
       assert.equal(c.end?.status, 0);
     });
 
+    test('bash reads what an interactive login bash reads: its profile, and .bashrc only where the profile sources it', { skip: sh.name !== 'bash' ? 'bash only' : false }, async () => {
+      const both = 'echo "$FROM_PROFILE|$FROM_BASHRC"';
+      const alone = await open(shell, { files: { '.bash_profile': 'FROM_PROFILE=profile_ok\n', '.bashrc': 'FROM_BASHRC=rc_ok\n' } });
+      assert.deepEqual(out(alone, await ran(alone, both)), ['profile_ok|']);
+      const sourced = await open(shell, { files: { '.bash_profile': 'FROM_PROFILE=profile_ok\n. "$HOME/.bashrc"\n', '.bashrc': 'FROM_BASHRC=rc_ok\n' } });
+      assert.deepEqual(out(sourced, await ran(sourced, both)), ['profile_ok|rc_ok']);
+    });
+
     test('a startup file that asks a question holds the session until it is answered', { skip: sh.name === 'fish' ? 'fish config has no prompt read here' : false }, async () => {
       const s = await open(shell, { rc: 'read ANSWER\nexport ANSWER\n', waitMs: 1500 });
       const f = s.front();
@@ -105,6 +114,12 @@ for (const sh of shells) {
       assert.deepEqual(out(s, bare), ['abc']);
     });
 
+    test('output is cut at its end by cells, so a wide or combining character before the prompt stays whole', async () => {
+      const s = await open(shell);
+      assert.deepEqual(out(s, await ran(s, "printf '界'")), ['界']);
+      assert.deepEqual(out(s, await ran(s, "printf 'e\u0301'")), ['e\u0301']);
+    });
+
     test('a command typed with send gets an id and a status too', { skip: bashBelow(shell, 4, 4) ? 'bash before 4.4 has no PS0' : false }, async () => {
       const s = await open(shell);
       const r = await s.send('echo typed-here\r', { waitMs: 5000, until: /typed-here$/ });
@@ -123,12 +138,12 @@ for (const sh of shells) {
       if (sh.name !== 'fish') assert.deepEqual(out(s, await ran(s, 'cat <<EOF\nline one\nEOF')), ['line one']);
     });
 
-    test('output that replays marks ends nothing, and is counted', async () => {
+    test('output that replays marks ends nothing, and only marks shaped like the session\'s own are counted', async () => {
       const s = await open(shell);
-      const forged = `printf '\\033]133;D;1.1234;2.5678;0;;;/;\\007\\033]133;C;2.5678;\\007after\\n'; false`;
+      const forged = `printf '\\033]133;D;1.1234;2.5678;0;;;/;\\007\\033]133;C;2.5678;\\007\\033]133;D;0\\007after\\n'; false`;
       const c = await ran(s, forged);
       assert.equal(c.end?.status, 1);
-      assert.ok((c.end?.refusedMarks ?? 0) >= 2);
+      assert.equal(c.end?.refusedMarks, 2);
       assert.deepEqual(out(s, c), ['after']);
       assert.equal(s.front().state, 'prompt');
     });
@@ -139,7 +154,13 @@ for (const sh of shells) {
       assert.deepEqual(out(s, c), ['[[redacted]]']);
     });
 
-    test('a line typed ahead of a program that never read it is discarded at the prompt and reported', { skip: sh.name === 'fish' || bashBelow(shell, 4, 0) ? 'fish and bash before 4 have no timed read to flush with' : false }, async () => {
+    test('the live nonce never shows in the title', { skip: sh.name === 'fish' ? 'fish sets its own title at each prompt' : false }, async () => {
+      const s = await open(shell);
+      await ran(s, `printf '\\033]0;%s\\007' "$__tsm_r"`);
+      assert.equal(s.screen().title, '[redacted]');
+    });
+
+    test('a line typed ahead of a program that never read it is discarded at the prompt and reported', async () => {
       const s = await open(shell);
       const r = await s.run('sleep 1', { waitMs: 200 });
       assert.equal(r.kind, 'running');
@@ -168,6 +189,62 @@ for (const sh of shells) {
       await s.send('\x15', { waitMs: 1000 });
       assert.deepEqual(out(s, await ran(s, 'echo yes')), ['yes']);
       assert.ok(!s.lines(0).lines.some((l) => l === 'SHOULD_NOT_RUN'));
+    });
+
+    test('keys sent before a slow prompt is drawn wait for it, so the line editor gets them rather than the terminal', async () => {
+      const rc = sh.name === 'fish' ? 'function fish_prompt; sleep 0.5; echo -n "> "; end\n' : sh.name === 'zsh' ? '__slow() { sleep 0.5 }\nprecmd_functions+=(__slow)\n' : 'PROMPT_COMMAND="sleep 0.5"\n';
+      const search = sh.name === 'bash' ? /reverse-i-search/ : sh.name === 'zsh' ? /bck-i-search/ : /./;
+      const viaRun = await open(shell, { rc });
+      await ran(viaRun, 'true');
+      await viaRun.send('\x12', { waitMs: 3000 });
+      const a = viaRun.screen().rows.join('\n');
+      assert.ok(!a.includes('^R'), a);
+      assert.match(a, search);
+      const viaSend = await open(shell, { rc });
+      await viaSend.send('true\r', { waitMs: 3000, quietMs: 100 });
+      await viaSend.send('\x12', { waitMs: 3000 });
+      const b = viaSend.screen().rows.join('\n');
+      assert.ok(!b.includes('^R'), b);
+      assert.match(b, search);
+    });
+
+    test('a command reading the terminal without echo stays running until it ends, however quiet', async () => {
+      const s = await open(shell);
+      const read = sh.name === 'zsh' ? 'read -rsk1 a' : sh.name === 'fish' ? 'read -s -n1 a' : 'read -rsn1 a';
+      const r = await s.run(`${read}; printf '\\nREAD_DONE:%s\\n' "$a"`, { waitMs: 1500 });
+      assert.equal(r.kind, 'running');
+      assert.notEqual(r.front.state, 'prompt');
+      assert.notEqual(s.front().state, 'prompt');
+      await s.send('Z', { waitMs: 3000, until: /READ_DONE:Z/ });
+      await s.wait({ kind: 'end' }, { waitMs: 3000, from: 0 });
+      const c = s.command((r as { command: Command }).command.id);
+      assert.equal(c?.end?.status, 0);
+      assert.ok(out(s, c!).includes('READ_DONE:Z'));
+    });
+
+    test('a typed command that removes the prompt hook but not the prompt ends when its prompt is drawn, with no status', { skip: sh.name === 'fish' || bashBelow(shell, 4, 4) ? 'bash 4.4 and later and zsh: a typed command needs a start mark' : false }, async () => {
+      const s = await open(shell);
+      const r = await s.send(sh.name === 'zsh' ? 'precmd_functions=()\r' : 'PROMPT_COMMAND=\r', { waitMs: 3000 });
+      const w = await s.wait({ kind: 'end' }, { waitMs: 3000, from: r.lines.from });
+      const c = [...r.ended, ...w.ended].at(-1);
+      assert.ok(c?.end, 'the typed command ended');
+      assert.equal(c.end.status, undefined);
+      assert.equal(s.front().state, 'prompt');
+      assert.equal((await ran(s, 'false', 5000)).end?.status, 1);
+    });
+
+    test('a command run that replaces the prompt hook and the prompt leaves the hooks in place', { skip: sh.name === 'fish' ? 'fish keeps its hooks as event functions' : false }, async () => {
+      const s = await open(shell);
+      const c = await ran(s, sh.name === 'zsh' ? 'precmd_functions=(); PS1="> "' : 'PROMPT_COMMAND=; PS1="> "', 5000);
+      assert.equal(c.end?.status, 0);
+      assert.equal((await ran(s, 'false', 5000)).end?.status, 1);
+    });
+
+    test('a run line the shell took without starting a command ends at the next end mark, with its status', { skip: sh.name !== 'bash' ? 'bash only: it disables the builtin a run line sources with' : false }, async () => {
+      const s = await open(shell, { rc: "PROMPT_COMMAND='PS0='\nenable -n .\n" });
+      const c = await ran(s, 'echo NOT_RUN', 5000);
+      assert.equal(c.end?.status, 127);
+      assert.ok(!out(s, c).includes('NOT_RUN'));
     });
 
     test('a program blocked reading the terminal shows as waiting, and run returns at once', { skip: process.platform !== 'linux' ? 'only Linux shows reads' : false }, async () => {
@@ -240,6 +317,18 @@ for (const sh of shells) {
       assert.deepEqual(hard.steps.map((x) => x.sent), ['C-c', 'SIGTERM', 'SIGKILL']);
       assert.equal(hard.front.state, 'prompt');
       assert.deepEqual(out(s, await ran(s, 'echo alive')), ['alive']);
+    });
+
+    test('stop counts a step done once its job is gone, though the shell has not drawn its prompt within the grace', { skip: sh.name === 'fish' ? 'the busy prompt hook is bash and zsh syntax' : false }, async () => {
+      const busy = 'SECONDS=0; while (( SECONDS < 3 )); do :; done';
+      const rc = sh.name === 'zsh' ? `__busy() { ${busy} }\nprecmd_functions+=(__busy)\n` : `PROMPT_COMMAND='${busy}'\n`;
+      const s = await open(shell, { rc, waitMs: 15_000 });
+      await s.run('sleep 30', { waitMs: 300 });
+      const r = await s.stop();
+      assert.deepEqual(r.steps.map((x) => x.sent), ['C-c']);
+      assert.equal(r.front.state === 'running' ? r.front.process.shell : r.front.state, true);
+      await s.wait({ kind: 'end' }, { waitMs: 8000, from: 0 });
+      assert.equal(s.front().state, 'prompt');
     });
 
     test('events: endings a call returned are taken; one after the call returned is not; the exit comes last', async () => {

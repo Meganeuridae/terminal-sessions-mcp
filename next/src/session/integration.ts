@@ -51,13 +51,25 @@ __tsm_esc() {
   __tsm_ret=$\{__tsm_ret//$'\\a'/\\\\x07}
   __tsm_ret=$\{__tsm_ret//$'\\033'/\\\\x1b}
 }
+__tsm_drain() {
+  local __tsm_m
+  __tsm_m=$(PATH=/usr/bin:/bin:$PATH stty -g 2>/dev/null) || return 0
+  PATH=/usr/bin:/bin:$PATH stty -icanon min 0 time 0 2>/dev/null
+  PATH=/usr/bin:/bin:$PATH dd bs=65536 count=1 2>/dev/null
+  PATH=/usr/bin:/bin:$PATH stty "$__tsm_m" 2>/dev/null
+}
 __tsm_end() {
-  local __tsm_s=$? __tsm_p="$\{PIPESTATUS[*]}" __tsm_l __tsm_f= __tsm_n __tsm_cwd
+  local __tsm_s=$? __tsm_p="$\{PIPESTATUS[*]}" __tsm_l __tsm_f= __tsm_n __tsm_cwd __tsm_j=$-
   if [ -n "$\{__tsm_ps+x}" ]; then __tsm_p=$__tsm_ps; unset __tsm_ps; fi
   if [ "$\{BASH_VERSINFO[0]}" -ge 4 ]; then
     while builtin read -t 0 2>/dev/null; do
       if IFS= builtin read -r -t 1 __tsm_l; then __tsm_f=$__tsm_f$__tsm_l$'\\n'; else break; fi
     done
+  else
+    set +m
+    __tsm_f=$(__tsm_drain; builtin printf x)
+    case $__tsm_j in *m*) set -m ;; esac
+    __tsm_f=$\{__tsm_f%x}
   fi
   __tsm_esc "$PWD"
   __tsm_cwd=$__tsm_ret
@@ -69,10 +81,13 @@ __tsm_end() {
   return "$__tsm_s"
 }
 __tsm_b='\\[\\033]133;B;$\{__tsm_c}.$\{__tsm_r}\\007\\]'
-__tsm_tail() {
-  local __tsm_s=$? __tsm_pc
+__tsm_hook() {
+  local __tsm_pc
   case $\{PS1-} in *'133;B;'*) ;; *) PS1="$\{PS1-}$__tsm_b" ;; esac
-  if [ "$\{#PROMPT_COMMAND[@]}" -le 1 ]; then
+  if [ "$\{#PROMPT_COMMAND[@]}" -gt 1 ]; then
+    case $\{PROMPT_COMMAND[0]} in __tsm_end$'\\n'*) ;; *) PROMPT_COMMAND[0]=__tsm_end$'\\n'"$\{PROMPT_COMMAND[0]}" ;; esac
+    case $\{PROMPT_COMMAND[$\{#PROMPT_COMMAND[@]}-1]} in __tsm_tail) ;; *) PROMPT_COMMAND+=(__tsm_tail) ;; esac
+  else
     case $\{PROMPT_COMMAND-} in
       __tsm_end$'\\n'*$'\\n'__tsm_tail) ;;
       *)
@@ -83,19 +98,17 @@ __tsm_tail() {
         ;;
     esac
   fi
+}
+__tsm_tail() {
+  local __tsm_s=$?
+  __tsm_hook
   case $- in *e*) return 0 ;; esac
   return "$__tsm_s"
 }
-if [ "$\{#PROMPT_COMMAND[@]}" -gt 1 ]; then
-  PROMPT_COMMAND[0]=__tsm_end$'\\n'"$\{PROMPT_COMMAND[0]}"
-  PROMPT_COMMAND+=(__tsm_tail)
-else
-  PROMPT_COMMAND=__tsm_end$'\\n'"$\{PROMPT_COMMAND-}"$'\\n'__tsm_tail
-fi
+__tsm_hook
 if [ "$\{BASH_VERSINFO[0]}" -gt 4 ] || { [ "$\{BASH_VERSINFO[0]}" -eq 4 ] && [ "$\{BASH_VERSINFO[1]}" -ge 4 ]; }; then
   PS0="$\{PS0-}"'\\033]133;C;$\{__tsm_c}.$\{__tsm_r};\\007'
 fi
-PS1="$\{PS1-}$__tsm_b"
 `;
 
 const ZSH_FORWARD = (file: string, last: boolean): string => `if (( $\{+__tsm_uzd} )); then ZDOTDIR=$__tsm_uzd; else unset ZDOTDIR; fi
@@ -151,8 +164,11 @@ __tsm_tail() {
 __tsm_nohist() {
   [[ $1 != ' . '*'/${COMMAND_FILE}'* ]]
 }
-precmd_functions=(__tsm_end $\{precmd_functions:#__tsm_(end|tail)} __tsm_tail)
-preexec_functions=($\{preexec_functions:#__tsm_start} __tsm_start)
+__tsm_hook() {
+  precmd_functions=(__tsm_end $\{precmd_functions:#__tsm_(end|tail)} __tsm_tail)
+  preexec_functions=($\{preexec_functions:#__tsm_start} __tsm_start)
+}
+__tsm_hook
 zshaddhistory_functions=($\{zshaddhistory_functions:#__tsm_nohist} __tsm_nohist)
 unset __tsm_shim
 `;
@@ -185,14 +201,23 @@ function __tsm_start --on-event fish_preexec
     set -l t (__tsm_esc $argv[1])
     printf '\\e]133;C;%s.%s;%s\\a' $__tsm_c $__tsm_r "$t"
 end
+function __tsm_drain
+    set -l m (PATH=/usr/bin:/bin:$PATH stty -g 2>/dev/null); or return 0
+    PATH=/usr/bin:/bin:$PATH stty -icanon min 0 time 0 2>/dev/null
+    PATH=/usr/bin:/bin:$PATH dd bs=65536 count=1 2>/dev/null
+    PATH=/usr/bin:/bin:$PATH stty $m 2>/dev/null
+end
 function __tsm_d
+    set -l f (begin; __tsm_drain; printf x; end | string collect -N)
     set -l n $__tsm_c.$__tsm_r
     __tsm_next
     set -l p $argv
     set -e p[1]
     set -l pj (string join ' ' -- $p)
     set -l cwd (__tsm_esc $PWD)
-    printf '\\e]133;D;%s;%s;%s;%s;;%s;\\a' $n $__tsm_c.$__tsm_r $argv[1] "$pj" "$cwd"
+    set -l fl (__tsm_esc "$f")
+    set fl (string replace -r -- 'x$' '' "$fl")
+    printf '\\e]133;D;%s;%s;%s;%s;;%s;%s\\a' $n $__tsm_c.$__tsm_r $argv[1] "$pj" "$cwd" "$fl"
 end
 function __tsm_post --on-event fish_postexec
     set -l x $pipestatus $status
@@ -266,11 +291,11 @@ export function commandFile(kind: ShellKind, dir: string, id: number, text: stri
   const file = path.join(dir, `${COMMAND_FILE}${id}`);
   if (kind === 'bash') {
     const start = `case $\{PS0-} in *'133;C;'*) ;; *) builtin printf '\\033]133;C;%s.%s;\\007' "$__tsm_c" "$__tsm_r" ;; esac`;
-    const body = `${start}\nbuiltin history -s -- ${sq(text)}\n${text}\n__tsm_st=$? __tsm_ps="$\{PIPESTATUS[*]}"; return $__tsm_st\n`;
+    const body = `${start}\nbuiltin history -s -- ${sq(text)}\n${text}\n__tsm_st=$? __tsm_ps="$\{PIPESTATUS[*]}"; __tsm_hook 2>/dev/null; return $__tsm_st\n`;
     return { file, body, line: ` . ${sq(file)}\r` };
   }
   if (kind === 'zsh') {
-    const body = `builtin print -s -- ${sq(text)}\n${text}\n__tsm_st=$? __tsm_ps="$\{(j: :)pipestatus}"; return $__tsm_st\n`;
+    const body = `builtin print -s -- ${sq(text)}\n${text}\n__tsm_st=$? __tsm_ps="$\{(j: :)pipestatus}"; __tsm_hook 2>/dev/null; return $__tsm_st\n`;
     return { file, body, line: ` . ${sq(file)}\r` };
   }
   if (kind === 'fish') {
