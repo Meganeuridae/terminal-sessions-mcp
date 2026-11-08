@@ -354,6 +354,18 @@ for (const sh of shells) {
       assert.equal(s.front().state, 'prompt');
     });
 
+    test('the line editor reading before its end mark is parsed is not taken for a program waiting for input', { skip: process.platform !== 'linux' ? 'only Linux shows reads' : false }, async () => {
+      const s = await open(shell);
+      const r = await s.run('sleep 0.3', { waitMs: 50 });
+      assert.equal(r.kind, 'running');
+      const until = Date.now() + 1500;
+      while (Date.now() < until);
+      assert.notEqual(s.front().state, 'waiting');
+      const w = await s.wait({ kind: 'end' }, { waitMs: 3000, from: 0 });
+      assert.equal(w.by, 'end');
+      assert.equal(s.front().state, 'prompt');
+    });
+
     test('a program splicing from the terminal shows as waiting only while it waits for input, not for room in its pipe', { skip: process.platform !== 'linux' || !which('python3') ? 'Linux with python3 only' : false }, async () => {
       const s = await open(shell);
       const events: SessionEvent[] = [];

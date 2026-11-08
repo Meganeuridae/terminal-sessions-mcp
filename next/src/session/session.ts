@@ -15,6 +15,12 @@ const LINUX = process.platform === 'linux';
 const TICK_MS = 50;
 const POLL_MS = 250;
 const HOOKS_QUIET_MS = 500;
+/**
+ * The shell's line editor reads the terminal right after the shell writes its end mark, so the kernel
+ * can show the shell reading before that mark is parsed here. A builtin read in a command outlasts
+ * this: the shell itself counts as waiting once its read has gone this long with no output after it.
+ */
+const SHELL_READ_SETTLE_MS = 100;
 const STEP_GRACE_MS = 1500;
 const CLOSE_GRACE_MS = 2000;
 const RECENT_NONCES = 64;
@@ -319,7 +325,11 @@ class LiveSession implements Session {
         return { state: 'prompt', since: this.since('prompt'), ...(pending !== undefined && { pending }) };
       }
       const starting = !this.drawnOnce && !this.plain ? { starting: true as const } : {};
-      if (reads && !this.plain && !this.atPrompt) return at({ state: 'waiting', since: this.since(`w:${process.pgid}`), process, echo: proc.modes(this.pts)?.echo ?? true, ...starting });
+      if (reads && !this.plain && !this.atPrompt) {
+        const since = this.since(`w:${process.pgid}`);
+        if (Date.now() - Math.max(since, this.lastOutput) >= SHELL_READ_SETTLE_MS) return at({ state: 'waiting', since, process, echo: proc.modes(this.pts)?.echo ?? true, ...starting });
+        return at({ state: 'running', since, process, waitVisible: true, ...starting });
+      }
       return at({ state: 'running', since: this.since(`r:${process.pgid}`), process, waitVisible: reads !== undefined && !this.plain, ...starting });
     }
     const members = proc.descendants(this.pid)?.filter((d) => d.pgrp === g.tpgid).map((d) => d.pid) ?? [];
