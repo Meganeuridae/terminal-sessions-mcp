@@ -16,7 +16,8 @@ interface Split {
 
 const HIGH_WATER = 1024 * 1024;
 const LOW_WATER = 256 * 1024;
-const FREEZE_EVERY = 1000;
+/** Rows scrolled off the screen between two freezes, at most; each freeze takes every row above the screen. */
+const FREEZE_EVERY = 100;
 
 const isAlt = (params: (number | number[])[]): boolean => params.some((p) => p === 1049 || p === 1047 || p === 47);
 
@@ -35,7 +36,9 @@ export class Transcript {
   private splits: Split[] = [];
   private pending = 0;
   private paused = false;
-  private linefeeds = 0;
+  private scrolled = 0;
+  /** The head of a logical line that goes on wrapping, taken from the emulator by a freeze before it ended. */
+  private partial = '';
   private reset = false;
   private titleText = '';
   private written = 0;
@@ -55,11 +58,13 @@ export class Transcript {
     },
     private readonly maxLines = 10_000,
   ) {
-    this.term = new Terminal({ cols, rows, scrollback: 10_000, allowProposedApi: true });
+    // The scrollback holds only what no freeze has taken yet: the rows scrolled since the last freeze, at
+    // most FREEZE_EVERY, and the last frozen row, which anchors the first unfrozen one if its row is deleted.
+    this.term = new Terminal({ cols, rows, scrollback: FREEZE_EVERY + 1, allowProposedApi: true });
     this.term.onData((d) => d && this.io.reply(d));
     this.term.onTitleChange((t) => (this.titleText = t));
-    this.term.onLineFeed(() => {
-      if (++this.linefeeds >= FREEZE_EVERY) this.freezeScrolled();
+    this.term.onScroll(() => {
+      if (++this.scrolled >= FREEZE_EVERY) this.freezeScrolled();
     });
     const p = this.term.parser;
     p.registerOscHandler(133, (data) => {
@@ -143,8 +148,27 @@ export class Transcript {
   pos(): Pos {
     if (!this.normal) return { line: this.end(), col: 0 };
     const b = this.term.buffer.normal;
-    const w = this.walk(this.firstLine(), b.baseY + b.cursorY, { row: b.baseY + b.cursorY, x: b.cursorX });
-    return { line: this.dropped + this.frozen.length + (w.cursor?.index ?? 0), col: w.cursor?.col ?? 0 };
+    const from = this.firstLine();
+    const w = this.walk(from, b.baseY + b.cursorY, { row: b.baseY + b.cursorY, x: b.cursorX });
+    let index = w.cursor?.index ?? 0;
+    let col = w.cursor?.col ?? 0;
+    const head = this.head(from);
+    if (head === 'joins' && index === 0) col += this.partial.length;
+    else if (head === 'apart') index++;
+    return { line: this.dropped + this.frozen.length + index, col };
+  }
+
+  /** How the partial line meets the first unfrozen row: it continues there, or it ended and stands apart. */
+  private head(from: number): 'joins' | 'apart' | undefined {
+    if (!this.partial) return undefined;
+    return this.term.buffer.normal.getLine(from)?.isWrapped ? 'joins' : 'apart';
+  }
+
+  private withPartial(from: number, lines: string[]): string[] {
+    const head = this.head(from);
+    if (head === 'joins' && lines.length) lines[0] = this.partial + lines[0];
+    else if (head) lines.unshift(this.partial);
+    return lines;
   }
 
   /** One past the last line, counting the cursor's. */
@@ -187,6 +211,8 @@ export class Transcript {
       this.at = this.above = undefined;
       this.splits = [];
       this.anchored = false;
+      if (this.partial) this.push(this.io.redact(this.partial));
+      this.partial = '';
     }
     if (this.at && !this.at.isDisposed) return this.at.line;
     if (this.above && !this.above.isDisposed) return this.above.line + 1;
@@ -206,7 +232,8 @@ export class Transcript {
   private live(): string[] {
     if (!this.normal) return [];
     const b = this.term.buffer.normal;
-    return this.walk(this.firstLine(), b.baseY + Math.max(this.lastRow(), b.cursorY)).lines;
+    const from = this.firstLine();
+    return this.withPartial(from, this.walk(from, b.baseY + Math.max(this.lastRow(), b.cursorY)).lines);
   }
 
   private walk(from: number, to: number, cursor?: { row: number; x: number }): { lines: string[]; cursor?: { index: number; col: number } } {
@@ -232,7 +259,9 @@ export class Transcript {
   }
 
   private push(text: string): void {
-    this.frozen.push(text);
+    // V8 keeps a string built by appending, as the emulator builds a row's text, as a rope of its pieces,
+    // about ten times the memory of the flat string. A string decoded from a buffer is flat.
+    this.frozen.push(Buffer.from(text, 'utf16le').toString('utf16le'));
     if (this.frozen.length > this.maxLines + 1000) {
       const n = this.frozen.length - this.maxLines;
       this.frozen.splice(0, n);
@@ -243,16 +272,17 @@ export class Transcript {
   private freezeThrough(upto: number): number {
     const b = this.term.buffer.normal;
     const from = this.firstLine();
-    while (upto >= from && b.getLine(upto + 1)?.isWrapped) upto--;
     if (upto < from) return from;
-    for (const l of this.walk(from, upto).lines) this.push(this.io.redact(l));
+    const lines = this.withPartial(from, this.walk(from, upto).lines);
+    this.partial = b.getLine(upto + 1)?.isWrapped ? (lines.pop() ?? '') : '';
+    for (const l of lines) this.push(this.io.redact(l));
     for (const s of this.splits) if (s.marker.line <= upto) s.marker.dispose();
     this.splits = this.splits.filter((s) => !s.marker.isDisposed);
     return upto + 1;
   }
 
   private freezeScrolled(): void {
-    this.linefeeds = 0;
+    this.scrolled = 0;
     if (!this.normal) return;
     const b = this.term.buffer.normal;
     if (this.firstLine() >= b.baseY) return;
