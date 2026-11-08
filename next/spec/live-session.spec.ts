@@ -39,6 +39,10 @@ async function open(shell: string, opts: { rc?: string; files?: Record<string, s
   fs.mkdirSync(home);
   const name = path.basename(shell);
   if (name === 'zsh') fs.writeFileSync(path.join(home, '.zshenv'), 'skip_global_compinit=1\n');
+  // fish's first interactive start in a home without generated completions launches a disowned
+  // generator that outlives the session and writes into the home while `after` removes it. Their
+  // directory's presence is what fish checks: ~/.local/share in fish 3, ~/.cache in fish 4.
+  if (name === 'fish') for (const dir of ['.local/share/fish', '.cache/fish']) fs.mkdirSync(path.join(home, dir, 'generated_completions'), { recursive: true });
   if (opts.rc !== undefined && STARTUP[name]) {
     fs.mkdirSync(path.dirname(path.join(home, STARTUP[name]!)), { recursive: true });
     fs.writeFileSync(path.join(home, STARTUP[name]!), opts.rc);
