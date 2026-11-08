@@ -74,7 +74,7 @@ export function statusLine(f: StatusFacts): string {
 export const RESULT_MAX_CHARS = 24_000;
 
 /** String lengths count UTF-16 units, so a cut at a unit can split a surrogate pair. */
-const cutAt = (text: string, max: number, fromEnd: boolean): string => {
+export const cutAt = (text: string, max: number, fromEnd: boolean): string => {
   if (text.length <= max) return text;
   if (fromEnd) {
     let i = text.length - max + 1;

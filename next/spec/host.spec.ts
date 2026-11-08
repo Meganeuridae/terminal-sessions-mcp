@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Host, type Caller, type Wake } from '../src/tools/host.js';
-import { RESULT_MAX_CHARS } from '../src/tools/render.js';
+import { cutAt, RESULT_MAX_CHARS } from '../src/tools/render.js';
 import type { OpenOptions } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
 
@@ -662,4 +662,14 @@ test('a match on a line longer than the match window says it was matched on the 
   await settle();
   const wake = wakes.find((w) => w.tag === 'terminal:match')!;
   assert.match(wake.text, /\nMatched at line 7: needle \(the line is longer than the match window: matched on its head only\)$/);
+});
+
+test('a line cut to fit a result is cut between characters, never inside a surrogate pair', () => {
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  for (const pad of ['', 'x'])
+    for (const fromEnd of [false, true]) {
+      const cut = cutAt(`${pad}${'😀'.repeat(100)}${pad}`, 51, fromEnd);
+      assert.ok(cut.length <= 51, `${cut.length}`);
+      assert.doesNotMatch(cut, lone, `pad ${JSON.stringify(pad)}, from the ${fromEnd ? 'end' : 'start'}`);
+    }
 });
