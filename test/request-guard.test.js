@@ -1,5 +1,5 @@
-// Tests for the Host/Origin check that both ports (session API, web GUI) run
-// before the token. Runs against the compiled output: `npm test`.
+// Tests for the Host/Origin check that the session API runs before the token.
+// Runs against the compiled output: `npm test`.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { RequestGuard, tokenMatches, requestUrl, splitList } = require('../dist/src/server/request-guard');
@@ -39,7 +39,7 @@ test('no token: an unlisted Host is refused (421), even with a matching Origin',
   assert.equal(status(g, { host: 'a b' }), 421); // malformed
 });
 
-test('same-origin page (our GUI) is served', () => {
+test('same-origin page is served', () => {
   const g = new RequestGuard('localhost', 3200, false);
   assert.equal(status(g, { host: 'localhost:3200', origin: 'http://localhost:3200' }), 'ok');
   assert.equal(status(g, { host: '127.0.0.1:3200', origin: 'http://127.0.0.1:3200' }), 'ok');

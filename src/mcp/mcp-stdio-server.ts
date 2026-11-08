@@ -182,20 +182,6 @@ const TOOLS = {
       },
       required: ['session', 'pattern']
     }
-  },
-  takeScreenshot: {
-    description: 'Take a screenshot of the terminal session (useful for visually rich TUIs, ANSI art, progress bars)',
-    parameters: {
-      type: 'object',
-      properties: {
-        session: { type: 'string', description: 'Session to screenshot' },
-        lines: { type: 'number', description: 'Number of recent lines to capture (default: 50)' },
-        outputPath: { type: 'string', description: 'Optional file path to save screenshot (returns base64 if omitted)' },
-        width: { type: 'number', description: 'Screenshot width in pixels (default: 1200)' },
-        height: { type: 'number', description: 'Screenshot height in pixels (default: 800)' }
-      },
-      required: ['session']
-    }
   }
 };
 
@@ -302,41 +288,16 @@ rl.on('line', async (line) => {
             case 'searchLogs':
               result = await mcpInstance.searchLogs(args);
               break;
-            case 'takeScreenshot':
-              result = await mcpInstance.takeScreenshot(args);
-              break;
             default:
               throw new Error(`Unknown tool: ${name}`);
           }
           
-          // Special handling for screenshot - return image content
-          if (name === 'takeScreenshot' && 
-              typeof result === 'object' && 
-              result !== null && 
-              'success' in result && 
-              result.success && 
-              'base64' in result) {
-            sendResponse(id, {
-              content: [
-                {
-                  type: 'image',
-                  data: result.base64,
-                  mimeType: 'image/png'
-                },
-                {
-                  type: 'text',
-                  text: 'path' in result && result.path ? `Saved to: ${result.path}` : 'Screenshot captured'
-                }
-              ]
-            });
-          } else {
-            sendResponse(id, {
-              content: [{
-                type: 'text',
-                text: typeof result === 'string' ? result : JSON.stringify(result, null, 2)
-              }]
-            });
-          }
+          sendResponse(id, {
+            content: [{
+              type: 'text',
+              text: typeof result === 'string' ? result : JSON.stringify(result, null, 2)
+            }]
+          });
         } catch (err: any) {
           sendResponse(id, null, {
             code: -32000,
