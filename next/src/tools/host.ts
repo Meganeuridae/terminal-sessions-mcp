@@ -5,7 +5,7 @@ import { TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, OpenSession, Session, SessionEvent } from '../session/types.js';
-import { endingText, exitText, fitted, frontText, linesText, quoted, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
+import { duration, endingText, exitText, fitted, frontText, linesText, quoted, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, type ToolDef } from './table.js';
 
 export interface Caller {
@@ -227,12 +227,18 @@ export class Host {
     if (bytes === '') return refused('Nothing to send: give `text`, `keys`, or both.', { error: 'invalid_argument' });
     const until = a.wait_for !== undefined ? this.regex(a.wait_for as string) : undefined;
     const r = await e.session.send(bytes, { waitMs: this.waitMs(a), take: caller.takes, ...(until ? { until } : {}) });
+    if (!r.sent && r.by === 'timeout' && r.front.state !== 'exited') {
+      return refused(
+        `${this.status(e, r.front)}\nNothing was typed: the shell hasn't finished drawing its prompt after ${duration(this.now() - r.front.since)}, and keys sent before a line editor has the terminal would reach the terminal's own line editing instead. \`send\` again with a longer \`wait\`.`,
+        { error: 'not_at_prompt', front: r.front },
+      );
+    }
     if (!r.sent) return refused(`${this.status(e, r.front)}\nNothing was sent: the shell has exited.`, { error: 'session_exited', front: r.front });
     if (caller.takes) e.cursor = Math.max(e.cursor, r.lines.to - r.lines.live);
     const parts = [this.status(e, r.front)];
     for (const c of r.ended) parts.push(`Command ${c.id} ended: ${endingText(c).join(' · ')}.`);
     if (r.by === 'timeout') parts.push(until ? 'The wait ended before the pattern matched.' : 'Output was still changing when the wait ended.');
-    if (r.matched) parts.push(`Matched at line ${r.matched.line}: ${r.matched.text}`);
+    if (r.matched) parts.push(`Matched at line ${r.matched.line}: ${quoted(r.matched.text)}`);
     const used = parts.join('\n').length + 1;
     parts.push(r.screen ? screenText(r.screen, RESULT_MAX_CHARS - used) : this.output(r.lines, undefined, RESULT_MAX_CHARS - used));
     return ok(parts.join('\n'), { front: r.front, by: r.by, ended: r.ended, ...(r.matched ? { matched: r.matched } : {}), lines: { from: r.lines.from, to: r.lines.to } });
@@ -403,11 +409,11 @@ function refused(text: string, structured: Record<string, unknown>): ToolResult 
 function refusalAdvice(front: Front): string {
   switch (front.state) {
     case 'prompt':
-      return `${JSON.stringify(front.pending ?? '')} is typed at the prompt and not run. \`send\` with \`keys: ["C-u"]\` clears it, or \`keys: ["Enter"]\` runs it.`;
+      return `${JSON.stringify(quoted(front.pending ?? ''))} is typed at the prompt and not run. \`send\` with \`keys: ["C-u"]\` clears it, or \`keys: ["Enter"]\` runs it.`;
     case 'running':
-      return `${front.process.shell ? 'the shell itself is busy' : `${front.process.argv} is running`}. \`look\` with \`until: "end"\` waits for it, \`send\` types into it, \`stop\` stops it.`;
+      return `${front.process.shell ? 'the shell itself is busy' : `${quoted(front.process.argv)} is running`}. \`look\` with \`until: "end"\` waits for it, \`send\` types into it, \`stop\` stops it.`;
     case 'waiting':
-      return `${front.process.argv} is waiting for input. \`send\` answers it, \`stop\` stops it.`;
+      return `${quoted(front.process.argv)} is waiting for input. \`send\` answers it, \`stop\` stops it.`;
     case 'exited':
       return 'the shell has exited. `close` this session and `open` another.';
   }

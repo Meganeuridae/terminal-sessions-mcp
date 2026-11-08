@@ -291,3 +291,15 @@ test('no result passes the cap, even with more endings not yet seen than its sta
   assert.match(listed.text, /\n… \d+ characters left out, past the 24000 a result carries$/);
   assert.match(listed.text, /^main: at the prompt/);
 });
+
+test('a send whose wait ends before the prompt is drawn types nothing, and says so and for how long', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.frontNow = { state: 'running', since: Date.now() - 2_300, process: { pgid: 5, argv: 'bash', shell: true }, waitVisible: true };
+  s.promptUndrawn = true;
+  const r = await host.call(agent(), 'send', { name: 'main', keys: ['C-r'], wait: 1 });
+  assert.equal(r.isError, true);
+  assert.equal(r.structured.error, 'not_at_prompt');
+  assert.match(r.text, /\nNothing was typed: the shell hasn't finished drawing its prompt after 2\.\d s, .* `send` again with a longer `wait`\.$/);
+});

@@ -16,6 +16,7 @@ export class FakeSession implements Session {
   runMode: 'refuse' | 'end' | 'run' = 'end';
   closedWith: Exit | undefined;
   screenNow: Screen | undefined;
+  promptUndrawn = false;
 
   constructor(readonly name: string, readonly opts: OpenOptions) {
     this.dir = opts.cwd;
@@ -97,6 +98,7 @@ export class FakeSession implements Session {
   async send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean }): Promise<SendOutcome> {
     this.calls.push({ method: 'send', args: [bytes, opts] });
     const from = this.out.length;
+    if (this.promptUndrawn) return { sent: false, lines: this.lines(from), front: this.frontNow, ended: [], by: 'timeout' };
     return { sent: this.frontNow.state !== 'exited', lines: this.lines(from), ...(this.screenNow?.alt ? { screen: this.screenNow } : {}), front: this.frontNow, ended: [], by: 'quiet' };
   }
 
