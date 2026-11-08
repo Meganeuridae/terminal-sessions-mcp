@@ -5,7 +5,7 @@ import { TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, OpenSession, Session, SessionEvent } from '../session/types.js';
-import { endingText, exitText, frontText, linesText, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
+import { endingText, exitText, fitted, frontText, linesText, quoted, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, type ToolDef } from './table.js';
 
 export interface Caller {
@@ -248,7 +248,7 @@ export class Host {
       const w = await e.session.wait(until, { waitMs: this.waitMs(a), from: e.cursor, take: caller.takes });
       front = w.front;
       for (const c of w.ended) parts.push(`Command ${c.id} ended: ${endingText(c).join(' · ')}.`);
-      if (w.matched) parts.push(`Matched at line ${w.matched.line}: ${w.matched.text}`);
+      if (w.matched) parts.push(`Matched at line ${w.matched.line}: ${quoted(w.matched.text)}`);
       if (w.by === 'timeout') {
         if (pattern) {
           const current = e.session.current();
@@ -315,7 +315,7 @@ export class Host {
   private async stop(e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
     const r = await e.session.stop(a.signal !== undefined ? (`SIG${a.signal as string}` as NodeJS.Signals) : undefined);
     const now = this.now();
-    const steps = r.steps.map((s) => `Sent ${s.sent}${s.to ? ` to ${s.to.argv}` : ''}: now ${frontText(s.front, now)}.`);
+    const steps = r.steps.map((s) => `Sent ${s.sent}${s.to ? ` to ${quoted(s.to.argv)}` : ''}: now ${frontText(s.front, now)}.`);
     if (!r.steps.length) steps.push(`Nothing was sent: ${frontText(r.front, now)}.`);
     if (r.next === 'close') steps.push('What runs is the shell itself, or a job that outlived KILL: only `close` ends it.');
     return ok([this.status(e, r.front), ...steps].join('\n'), { steps: r.steps, front: r.front, ...(r.next ? { next: r.next } : {}) });
@@ -368,10 +368,11 @@ export class Host {
         const key = e.watches.get(ev.watch);
         if (key === undefined) return;
         e.watches.delete(ev.watch);
-        wake = { scope: e.scope, session: e.name, tag: 'terminal:match', key, text: `${this.status(e, e.session.front())}\nMatched at line ${ev.match.line}: ${ev.match.text}` };
+        wake = { scope: e.scope, session: e.name, tag: 'terminal:match', key, text: `${this.status(e, e.session.front())}\nMatched at line ${ev.match.line}: ${quoted(ev.match.text)}` };
         break;
       }
     }
+    wake.text = fitted(wake.text);
     e.unseen.set(wake.key, { key: wake.key, text: wake.text.split('\n')[0]! });
     void this.deliver(e, wake);
   }
@@ -392,11 +393,11 @@ export class Host {
 }
 
 function ok(text: string, structured: Record<string, unknown>): ToolResult {
-  return { text, structured };
+  return { text: fitted(text), structured };
 }
 
 function refused(text: string, structured: Record<string, unknown>): ToolResult {
-  return { text, structured, isError: true };
+  return { text: fitted(text), structured, isError: true };
 }
 
 function refusalAdvice(front: Front): string {

@@ -239,9 +239,9 @@ test('open holds a terminal to the size whose whole screen fits in a result, nam
   assert.ok(sent.text.length <= RESULT_MAX_CHARS, `${sent.text.length}`);
   assert.match(sent.text, /\n44x+$/, 'the bottom row is there');
   assert.doesNotMatch(sent.text, /rows above not shown/);
-  s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 9, argv: `top ${'-x '.repeat(700)}`, shell: false }, command: 1, waitVisible: true };
+  s.dir = `/${'d'.repeat(2100)}`;
   const long = await host.call(agent(), 'send', { name: 'big', keys: ['Down'] });
-  assert.ok(long.text.length <= RESULT_MAX_CHARS, `with a 2,100-character command line in front: ${long.text.length}`);
+  assert.ok(long.text.length <= RESULT_MAX_CHARS, `in a 2,100-character directory: ${long.text.length}`);
   assert.match(long.text, /\(\d+ rows? above not shown\)/);
   assert.match(long.text, /\n44x+$/, 'the top rows go, not the bottom');
   s.emit({ kind: 'waiting', front: { state: 'waiting', since: Date.now(), process: { pgid: 9, argv: 'top', shell: false }, command: 1, echo: true }, taken: false });
@@ -249,4 +249,45 @@ test('open holds a terminal to the size whose whole screen fits in a result, nam
   assert.equal(wakes.length, 1);
   assert.ok(wakes[0]!.text.length <= RESULT_MAX_CHARS, `${wakes[0]!.text.length}`);
   assert.match(wakes[0]!.text, /\n44x+$/);
+});
+
+test('a command line, a title and a matched line a program sets are quoted up to a quarter of the room, so a screen at the largest size stays whole', async () => {
+  const { host, opened } = setup();
+  const wakes: Wake[] = [];
+  host.subscribe('a', async (w) => (wakes.push(w), false));
+  await host.call(agent(), 'open', { name: 'big', cols: 500, rows: 45 });
+  const s = opened[0]!;
+  s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 9, argv: `prog ${'a'.repeat(100_000)}`, shell: false }, command: 1, waitVisible: true };
+  const listed = await host.call(agent(), 'list', {});
+  assert.match(listed.text, /running prog a+… \(99755 more characters\)/);
+  s.screenNow = { rows: Array.from({ length: 45 }, (_, i) => `${i}`.padEnd(500, 'x')), cursor: { row: 44, col: 499 }, alt: true, title: 'T'.repeat(100_000) };
+  const sent = await host.call(agent(), 'send', { name: 'big', keys: ['Down'] });
+  assert.ok(sent.text.length <= RESULT_MAX_CHARS, `${sent.text.length}`);
+  assert.match(sent.text, /title "T+… \(99750 more characters\)"/);
+  assert.doesNotMatch(sent.text, /rows above not shown/, 'with both clipped, no row of the screen goes');
+  assert.match(sent.text, /\n44x+$/);
+  s.screenNow = undefined;
+  s.frontNow = { state: 'prompt', since: Date.now() };
+  s.runMode = 'run';
+  await host.call(agent(), 'run', { name: 'big', command: 'gen', wait: 0, notify_on: 'needle' });
+  s.print(`needle ${'b'.repeat(100_000)}`);
+  await settle();
+  const match = wakes.find((w) => w.tag === 'terminal:match')!;
+  assert.match(match.text, /Matched at line 1: needle b+… \(99757 more characters\)$/);
+});
+
+test('no result passes the cap, even with more endings not yet seen than its status lines fit', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.runMode = 'run';
+  for (let i = 0; i < 400; i++) {
+    await host.call(agent(), 'run', { name: 'main', command: `job ${i} ${'y'.repeat(200)}`, wait: 0 });
+    s.end(0);
+  }
+  await settle();
+  const listed = await host.call(cli(), 'list', {});
+  assert.ok(listed.text.length <= RESULT_MAX_CHARS, `${listed.text.length}`);
+  assert.match(listed.text, /\n… \d+ characters left out, past the 24000 a result carries$/);
+  assert.match(listed.text, /^main: at the prompt/);
 });

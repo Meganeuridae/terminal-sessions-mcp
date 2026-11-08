@@ -14,13 +14,13 @@ export const exitText = (e: Exit): string => (e.signal ? `was killed by ${e.sign
 export function frontText(front: Front, now: number): string {
   switch (front.state) {
     case 'prompt':
-      return front.pending ? `at the prompt, with ${JSON.stringify(front.pending)} typed and not yet run` : 'at the prompt';
+      return front.pending ? `at the prompt, with ${JSON.stringify(quoted(front.pending))} typed and not yet run` : 'at the prompt';
     case 'running': {
-      const what = front.process.shell ? 'the shell itself is busy' : `running ${front.process.argv}`;
+      const what = front.process.shell ? 'the shell itself is busy' : `running ${quoted(front.process.argv)}`;
       return `${what} for ${duration(now - front.since)}${front.waitVisible ? '' : " (whether it waits for input can't be seen here)"}`;
     }
     case 'waiting':
-      return `waiting for input: ${front.process.argv}${front.echo ? '' : ', not echoed, as for a password'}, for ${duration(now - front.since)}`;
+      return `waiting for input: ${quoted(front.process.argv)}${front.echo ? '' : ', not echoed, as for a password'}, for ${duration(now - front.since)}`;
     case 'exited':
       return `the shell ${exitText(front.exit)}`;
   }
@@ -34,7 +34,7 @@ export function endingText(c: Command): string[] {
   if (end.pipeline && end.pipeline.some((s) => s !== 0)) parts.push(`pipeline ${end.pipeline.join('|')}`);
   parts.push(duration(end.at - c.startedAt));
   if (end.errexit) parts.push('set -e is on: a failing command now ends the shell');
-  if (end.flushed) parts.push(`discarded typed-ahead text ${JSON.stringify(end.flushed)}, which nothing read`);
+  if (end.flushed) parts.push(`discarded typed-ahead text ${JSON.stringify(quoted(end.flushed))}, which nothing read`);
   if (end.refusedMarks) parts.push(`${end.refusedMarks} lookalike end mark${end.refusedMarks === 1 ? '' : 's'} in its output refused`);
   return parts;
 }
@@ -118,13 +118,42 @@ export function linesText(l: Lines, budget: number, readHint: string): string {
  */
 export const SCREEN_ROOM_CHARS = 1_000;
 
+/**
+ * How much a result quotes of a value the host doesn't bound: a command line (up to the kernel's
+ * limit, 2 MiB on Linux), a program's title, text typed and not run, a matched line. The status
+ * line, the screen's own line and a matched line share SCREEN_ROOM_CHARS, so each such value
+ * gets a quarter of it, leaving the rest to the host's own parts with an ordinary directory.
+ */
+export const QUOTED_MAX_CHARS = SCREEN_ROOM_CHARS / 4;
+
+export function quoted(s: string): string {
+  if (s.length <= QUOTED_MAX_CHARS) return s;
+  const n = isHighSurrogate(s.charCodeAt(QUOTED_MAX_CHARS - 1)) ? QUOTED_MAX_CHARS - 1 : QUOTED_MAX_CHARS;
+  return `${s.slice(0, n)}… (${s.length - n} more characters)`;
+}
+
+const isHighSurrogate = (c: number): boolean => c >= 0xd800 && c <= 0xdbff;
+
+/**
+ * Every result and wake ends within RESULT_MAX_CHARS. What can still carry one past it, once
+ * output is cut to its budget and quoted values to theirs, is a count the host doesn't bound,
+ * such as many endings not yet seen; the cut keeps the head, where the status line is.
+ */
+export function fitted(text: string): string {
+  if (text.length <= RESULT_MAX_CHARS) return text;
+  const note = (n: number): string => `\n… ${n} characters left out, past the ${RESULT_MAX_CHARS} a result carries`;
+  let n = RESULT_MAX_CHARS - note(text.length).length;
+  if (isHighSurrogate(text.charCodeAt(n - 1))) n--;
+  return text.slice(0, n) + note(text.length - n);
+}
+
 /** The most characters a screen of `cols` by `rows` can take: each row and its line break. */
 export const screenChars = (cols: number, rows: number): number => (cols + 1) * rows;
 
 export function screenText(s: Screen, budget: number): string {
   const rows = [...s.rows];
   while (rows.length && rows[rows.length - 1]!.trimEnd() === '') rows.pop();
-  const head = `(screen${s.alt ? ', full-screen program' : ''}${s.title ? `, title ${JSON.stringify(s.title)}` : ''}; cursor at row ${s.cursor.row + 1}, column ${s.cursor.col + 1})`;
+  const head = `(screen${s.alt ? ', full-screen program' : ''}${s.title ? `, title ${JSON.stringify(quoted(s.title))}` : ''}; cursor at row ${s.cursor.row + 1}, column ${s.cursor.col + 1})`;
   let text = [head, ...rows].join('\n');
   // Only lines past the room open's bound keeps (a very long command line in front, a long
   // title) can bring a whole screen past the budget; then its top rows go, not the cap.
