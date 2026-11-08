@@ -416,9 +416,10 @@ class LiveSession implements Session {
   }
 
   async run(text: string, opts: { waitMs: number; take?: boolean }): Promise<RunOutcome> {
+    const deadline = Date.now() + opts.waitMs;
+    if (this.atPrompt && !this.submitted && !this.prompted) await this.until(deadline, () => (this.prompted || this.exitInfo || !this.atPrompt ? true : undefined));
     const f = this.front();
     if (f.state !== 'prompt' || f.pending !== undefined) return { kind: 'refused', front: f };
-    const deadline = Date.now() + opts.waitMs;
     const id = this.nextId();
     const c: Command = { id, text, from: this.t.pos().line + 1, startedAt: Date.now() };
     this.store(c);

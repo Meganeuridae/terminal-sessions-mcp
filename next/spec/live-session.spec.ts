@@ -266,6 +266,19 @@ for (const sh of shells) {
       await pendingIs(s, 'zq');
     });
 
+    test('run waits within its wait for a prompt that is slow to draw, and refuses, typing nothing, only when the wait runs out', async () => {
+      const rc = sh.name === 'fish' ? 'function fish_prompt; sleep 2; echo -n "> "; end\n' : sh.name === 'zsh' ? '__slow() { sleep 2 }\nprecmd_functions+=(__slow)\n' : 'PROMPT_COMMAND="sleep 2"\n';
+      const s = await open(shell, { rc, waitMs: 15_000 });
+      await s.send('true\r', { waitMs: 3000, quietMs: 100 });
+      const early = await s.run('echo early', { waitMs: 500 });
+      assert.equal(early.kind, 'refused');
+      assert.equal(early.front.state, 'running');
+      const later = await s.run('echo later', { waitMs: 8000 });
+      assert.equal(later.kind, 'ended');
+      assert.deepEqual(out(s, (later as { command: Command }).command), ['later']);
+      assert.ok(!s.lines(0).lines.includes('early'));
+    });
+
     test('keys sent while a prompt hook reads the terminal raw wait for the drawn prompt, so the hook does not get them', { skip: sh.name === 'fish' ? 'the hooks are bash and zsh syntax' : false }, async () => {
       const hooks = sh.name === 'zsh'
         ? ['__hk() { read -rsk1 -t 2 hookkey }\nprecmd_functions+=(__hk)\n', "__cq() { print -n '\\e[6n'; read -rs -d R pos; sleep 1 }\nprecmd_functions+=(__cq)\n"]

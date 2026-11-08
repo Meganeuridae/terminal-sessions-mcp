@@ -212,7 +212,7 @@ export interface Session {
   /** For keys' `inputBytes`: arrows follow the cursor-key mode the program set. */
   keyOptions(): { appCursor: boolean };
 
-  /** Only at a prompt with nothing pending; otherwise refused with nothing typed. */
+  /** Only at a prompt with nothing pending; otherwise refused with nothing typed. At a prompt whose end mark came but which isn't drawn yet, it first waits, within `waitMs`, for the mark at the prompt's end, as `send` does. */
   run(text: string, opts: { waitMs: number; take?: boolean }): Promise<RunOutcome>;
   /** Exactly these bytes, nothing appended. At a prompt whose end mark came but which isn't drawn yet, it first waits, within `waitMs`, for the mark at the prompt's end, so the line editor gets the bytes rather than the terminal or a prompt hook, and sends nothing if the wait runs out. Returns when `until` matches from the cursor's line on, or (without `until`) when output is quiet for `quietMs`, default 300. */
   send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean }): Promise<SendOutcome>;
