@@ -159,7 +159,7 @@ for (const sh of shells) {
 
     test('a command typed with send gets an id and a status too', { skip: bashBelow(shell, 4, 4) ? 'bash before 4.4 has no PS0' : false }, async () => {
       const s = await open(shell);
-      const r = await s.send('echo typed-here\r', { waitMs: 5000, until: /typed-here$/ });
+      const r = await s.send('echo typed-here\r', { waitMs: 5000, until: /^typed-here$/ });
       const w = await s.wait({ kind: 'end' }, { waitMs: 5000, from: r.lines.from });
       const c = [...r.ended, ...w.ended].at(-1) ?? s.last();
       assert.ok(c?.end, 'the typed command ended');
