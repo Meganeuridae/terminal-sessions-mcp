@@ -17,8 +17,7 @@
   },
   "include": [
     "src/**/*",
-    "cli/**/*",
-    "gui/**/*"
+    "cli/**/*"
   ],
   "exclude": [
     "node_modules",

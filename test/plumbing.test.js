@@ -1470,9 +1470,8 @@ test("a marked command whose line the ^C discarded never answers: its own timeou
 
 test("a lone ^C sent with sendInput, as the C-c key or a terminal's Ctrl+C keystroke, isn't refused while a body goes in: it gives the body up at once, without being written, as sendSignal's SIGINT does", (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
-  // The C-c key writes '\x03' alone, and so does the GUI's terminal for a
-  // Ctrl+C keystroke (its 'input' handler sends the keystroke's data with no
-  // Enter).
+  // The C-c key writes '\x03' alone, and so does a terminal client for a
+  // Ctrl+C keystroke (sendInput with the keystroke's data and no Enter).
   for (const [form, args] of [
     ['the C-c key', ['', false, ['C-c']]],
     ["a terminal's keystroke", ['\x03', false]],
@@ -1593,7 +1592,7 @@ test("a command waiting in the server's queue goes in once the shell has read th
   // (resolveCommand runs processCommandQueue), so the ^C's decision not to be
   // written comes first: the next probe line is then held until the shell has
   // read the body's line already typed. Both are sent while the body goes
-  // in, as the GUI's Ctrl+C keystroke can be.
+  // in, as a terminal client's Ctrl+C keystroke can be.
   for (const [how, send] of [
     ['sendSignal', (server) => server.sendSignal('s', 'SIGINT')],
     ['sendInput', (server) => server.sendInput('s', '', false, ['C-c'])],

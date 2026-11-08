@@ -49,8 +49,6 @@ export class SessionAPI {
     // Host/Origin check at every request and upgrade (see request-guard.ts)
     this.guard = new RequestGuard(host, () => this.httpServer?.address()?.port ?? port, !!authToken, access, 'SessionAPI');
     this.server = new PersistentSessionServer();
-    // Let takeScreenshot authenticate against the (token-protected) web GUI
-    this.server.guiAuthToken = authToken;
     this.registerServerListener('session:created', (payload) => {
       this.pushEvent('session:created', payload, payload.sessionId);
     });
@@ -224,10 +222,6 @@ export class SessionAPI {
         case 'session.killAll':
           await this.server.killAll(params?.graceful);
           result = { success: true };
-          break;
-          
-        case 'session.screenshot':
-          result = await this.server.takeScreenshot(params.sessionId, params);
           break;
           
         case 'session.resize':

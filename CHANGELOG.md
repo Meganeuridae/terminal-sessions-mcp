@@ -3,12 +3,11 @@
 ## Unreleased — 2.0, the rearchitecture, beside 1.x
 
 A new implementation, built to `docs/redesign/DESIGN.md` and its guarantees (G1–G30), ships
-beside the 1.x session server, MCP bridge, GUI and CLI. It lives in `next/`; its binaries are
-`termd`, `tsm` and `tsm-shim`. Nothing of 1.x is removed or renamed: `terminal-sessions-mcp`,
-`session-server`, `session-gui` and `session-cli` run 1.x, on ports 3100 and 3200. 2.0 changes none
-of their code; what reaches them is the package manifest they share with 2.0: a narrower Node range
-(`engines`), `ws` pinned at 8.21.3, inside 1.x's `^8.16.0`, and puppeteer 25
-(`^25.16.0`, from `^24.29.1`), which 1.x's screenshot path loads. `termd` listens on 3101 by default
+beside the 1.x session server, MCP bridge and CLI. It lives in `next/`; its binaries are
+`termd`, `tsm` and `tsm-shim`. 2.0 removes or renames nothing of 1.x: `terminal-sessions-mcp`,
+`session-server` and `session-cli` run 1.x, on port 3100. 2.0 changes none of their code; what
+reaches them is the package manifest they share with 2.0: a narrower Node range (`engines`), and
+`ws` pinned at 8.21.3, inside 1.x's `^8.16.0`. `termd` listens on 3101 by default
 (it takes `SESSION_SERVER_PORT` when neither `--port` nor `TSM_PORT` is set, so a shell that exports
 it for the 1.x server points `termd` at that port too: `next/README.md`, "Upgrading from 1.x").
 Making 2.0 the default — the 1.x names pointing at the shim and `termd`, the 1.x code retired — is a
@@ -61,13 +60,36 @@ later release (`next/README.md`, "Upgrading from 1.x").
 
 ### Changed
 
-- Node 22.12 or later (`engines`: `>=22.12.0 <25.0.0`), and `puppeteer` `^25.16.0` (from `^24.29.1`): Node 20 reached its end of life on 2026-04-30, and Puppeteer 25, which the 1.x screenshot path and 2.0's GUI tests use, asks for 22.12; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
+- Node 22.12 or later (`engines`: `>=22.12.0 <25.0.0`): Node 20 reached its end of life on 2026-04-30, and Puppeteer 25, which 2.0's GUI tests use, asks for 22.12; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
 - `npm run build` compiles both trees; `npm test` runs 1.x's suite and `npm run test:next` 2.0's.
-- The `@xterm` packages and `ws` are pinned at the versions 2.0 uses (`@xterm/xterm` 6.0.0,
-  `@xterm/addon-fit` 0.11.0, `@xterm/addon-web-links` 0.12.0, `ws` 8.21.3); the 1.x GUI loads
-  xterm from a CDN, and 1.x's `ws` stays within 8.x. New dependencies: `@animalabs/mcpl-core`,
-  `@xterm/headless`, `@xterm/addon-serialize`, and `yauzl` `^3.4.0`, with which Puppeteer unpacks its
-  browser on a Linux host without `unzip`.
+- `ws` is pinned at the version 2.0 uses, 8.21.3, and 1.x's `ws` stays within 8.x. New
+  dependencies: `@animalabs/mcpl-core`, `@xterm/headless` 6.0.0, `@xterm/addon-serialize`, the
+  GUI's `@xterm/xterm` 6.0.0 and `@xterm/addon-fit` 0.11.0, `puppeteer` `^25.16.0` for 2.0's GUI
+  tests, and `yauzl` `^3.4.0`, with which Puppeteer unpacks its browser on a Linux host without
+  `unzip`.
+
+### Removed from 1.x
+
+- **The web GUI, and the `takeScreenshot` tool that rendered through it.**
+  The session server no longer starts a GUI on `GUI_PORT` (3200), the
+  `session-gui` command and `npm run start-gui` are gone, and the stdio MCP
+  server offers nine tools, without `takeScreenshot`. A host whose prompt
+  holds the tool list sees it change once. A call to `takeScreenshot` is
+  answered `Unknown tool: takeScreenshot`, and the session server's
+  WebSocket API answers `session.screenshot` with `Unknown method:
+  session.screenshot`.
+- **For the library, breaking:** `takeScreenshot` on `RobustSessionClient`,
+  `ConnectomeTestingMCP` and `PersistentSessionServer`, and
+  `PersistentSessionServer.guiAuthToken`, are removed. TypeScript consumers
+  need their own `@types/node`, which Socket.IO and Puppeteer used to bring
+  in.
+- **Dependencies:** Express, Socket.IO, `@xterm/addon-web-links` and
+  `ansi-to-html` are no longer dependencies, and `@types/express` is no
+  longer a dev dependency. Express is still installed, since
+  `@modelcontextprotocol/sdk` depends on it. Puppeteer, `@xterm/xterm` and
+  `@xterm/addon-fit` stay, for 2.0's GUI and its tests.
+- **`--headless`, `HEADLESS` and `GUI_PORT` are no longer read.** A session
+  server started with them starts as before, serving no GUI either way.
 
 ## v1.7.3 - 2026-10-22
 
