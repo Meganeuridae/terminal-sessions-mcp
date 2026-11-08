@@ -45,6 +45,7 @@ Eight tools. Every result about a session opens with its status line, such as `[
 - **Waiting for input** is the kernel's evidence: on Linux, a program blocked reading this terminal. A program that waits in `poll`, such as Python's REPL or `ssh`, shows as running. macOS shows no such evidence, so there it is always "running", and the status line says it can't tell.
 - **End marks** carry a chained nonce: a mark's counter is spent once used, so output that replays an old mark is refused. A program that reads the shell's own variables can print a mark with the live nonce, deliberately, and is not defended against.
 - **A daemon restart ends every shell.** A host that reconnects is told no session it names is open.
+- **bash isn't started in login mode,** since a login bash ignores the file that installs the session's hooks. It reads the files a login shell reads, in their order (`/etc/profile`, then the first of `~/.bash_profile`, `~/.bash_login` and `~/.profile`), but `shopt login_shell` is off and `~/.bash_logout` doesn't run. zsh and fish start as login shells.
 - **In zsh, a heredoc left without its terminator** in a command given to `run` takes the session's own lines after it as its body: they print, or go into the file the heredoc writes, and the hooks aren't put back after that command.
 - **In bash, while a command given to `run` runs,** its RETURN trap is the session's, which keeps the pipeline's statuses. `trap -p RETURN` shows it there, and the shell's own trap comes back afterwards.
 
