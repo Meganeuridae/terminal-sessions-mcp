@@ -1,5 +1,5 @@
 # systemd user unit: cp to ~/.config/systemd/user/termd.service, replace PACKAGE with the
-# installed package ("$(npm root -g)/term-sessions-mcp"), then
+# installed package ("$(npm root -g)/term-sessions-mcp"; write any % in it as %%), then
 #   systemctl --user daemon-reload && systemctl --user enable --now termd
 # termd-launch.sh finds node (nvm's default version, Volta, /usr/local, ~/.local; or
 # Environment=TSM_NODE_BIN=/path/to/node), puts those directories on PATH and starts in $HOME.

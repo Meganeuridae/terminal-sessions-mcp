@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- launchd: cp to ~/Library/LaunchAgents/, then replace the two paths below:
+<!-- launchd: cp to ~/Library/LaunchAgents/, then replace the two paths below (writing & as &amp;
+     and < as &lt;):
        PACKAGE  the installed package: "$(npm root -g)/term-sessions-mcp", or with Volta
                 ~/.volta/tools/image/packages/term-sessions-mcp/lib/node_modules/term-sessions-mcp
        YOU      your home directory's name (launchd does not expand ~ or $HOME)
