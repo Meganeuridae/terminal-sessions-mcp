@@ -1,5 +1,6 @@
 import xterm from '@xterm/headless';
 import type { IMarker, Terminal as TerminalType } from '@xterm/headless';
+import { MAX_MATCH_INPUT } from '../core/regex.js';
 import type { Lines, Screen } from './types.js';
 
 const { Terminal } = xterm;
@@ -18,6 +19,14 @@ const HIGH_WATER = 1024 * 1024;
 const LOW_WATER = 256 * 1024;
 /** Rows scrolled off the screen between two freezes, at most; each freeze takes every row above the screen. */
 const FREEZE_EVERY = 100;
+/** A logical line longer than this is kept as lines of this length: the most any pattern searches of one line. */
+const MAX_LINE = MAX_MATCH_INPUT;
+/**
+ * Frozen characters kept, besides the line limit: at most 12 MiB as V8 keeps them (2 bytes a character
+ * at worst), under the 13.3 MiB the emulator's own 10,000-row scrollback took at 80 columns. 80-column
+ * text meets the line limit first; only long lines meet this one.
+ */
+const MAX_CHARS = 6 * 1024 * 1024;
 
 const isAlt = (params: (number | number[])[]): boolean => params.some((p) => p === 1049 || p === 1047 || p === 47);
 
@@ -29,6 +38,7 @@ const isAlt = (params: (number | number[])[]): boolean => params.some((p) => p =
 export class Transcript {
   private readonly term: TerminalType;
   private readonly frozen: string[] = [];
+  private frozenChars = 0;
   private dropped = 0;
   private at: IMarker | undefined;
   private above: IMarker | undefined;
@@ -259,14 +269,23 @@ export class Transcript {
   }
 
   private push(text: string): void {
-    // V8 keeps a string built by appending, as the emulator builds a row's text, as a rope of its pieces,
-    // about ten times the memory of the flat string. A string decoded from a buffer is flat.
-    this.frozen.push(Buffer.from(text, 'utf16le').toString('utf16le'));
-    if (this.frozen.length > this.maxLines + 1000) {
-      const n = this.frozen.length - this.maxLines;
-      this.frozen.splice(0, n);
-      this.dropped += n;
+    for (const piece of pieces(text)) {
+      // V8 keeps a string built by appending, as the emulator builds a row's text, as a rope of its pieces,
+      // about ten times the memory of the flat string. A string decoded from a buffer is flat.
+      this.frozen.push(Buffer.from(piece, 'utf16le').toString('utf16le'));
+      this.frozenChars += piece.length;
     }
+    if (this.frozen.length > this.maxLines + 1000) this.drop(this.frozen.length - this.maxLines);
+    if (this.frozenChars > MAX_CHARS + MAX_CHARS / 8) {
+      let n = 0;
+      for (let chars = this.frozenChars; chars > MAX_CHARS; n++) chars -= this.frozen[n]!.length;
+      this.drop(n);
+    }
+  }
+
+  private drop(n: number): void {
+    for (const l of this.frozen.splice(0, n)) this.frozenChars -= l.length;
+    this.dropped += n;
   }
 
   private freezeThrough(upto: number): number {
@@ -276,6 +295,11 @@ export class Transcript {
     const lines = this.withPartial(from, this.walk(from, upto).lines);
     this.partial = b.getLine(upto + 1)?.isWrapped ? (lines.pop() ?? '') : '';
     for (const l of lines) this.push(this.io.redact(l));
+    if (this.partial.length > MAX_LINE) {
+      const ps = pieces(this.partial);
+      this.partial = ps.pop()!;
+      for (const piece of ps) this.push(this.io.redact(piece));
+    }
     for (const s of this.splits) if (s.marker.line <= upto) s.marker.dispose();
     this.splits = this.splits.filter((s) => !s.marker.isDisposed);
     return upto + 1;
@@ -314,4 +338,25 @@ function trimEnd(rows: string[]): string[] {
   let n = rows.length;
   while (n > 0 && !rows[n - 1]) n--;
   return rows.slice(0, n);
+}
+
+/**
+ * `text` cut into lines of at most MAX_LINE, never between the two halves of a surrogate pair, and not
+ * inside a run of digits shorter than half a line, so a nonce (digits) is redacted whole in its piece.
+ */
+function pieces(text: string): string[] {
+  if (text.length <= MAX_LINE) return [text];
+  const digit = (c: string | undefined): boolean => c !== undefined && c >= '0' && c <= '9';
+  const out: string[] = [];
+  for (let i = 0; i < text.length; ) {
+    let end = Math.min(text.length, i + MAX_LINE);
+    const inDigits = (at: number): boolean => at < text.length && digit(text[at - 1]) && digit(text[at]);
+    let back = end;
+    while (inDigits(back) && back > i + MAX_LINE / 2) back--;
+    if (!inDigits(back)) end = back;
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
+    out.push(text.slice(i, end));
+    i = end;
+  }
+  return out;
 }
