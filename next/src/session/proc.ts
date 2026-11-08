@@ -2,7 +2,15 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 
 const LINUX = process.platform === 'linux';
-const READ = process.arch === 'arm64' ? 63 : 0;
+/**
+ * The calls a process blocks in to read a descriptor, by number, each with the field of
+ * /proc/PID/syscall that names the descriptor: read, readv, sendfile (its input) and splice (its
+ * input). uutils' cat, which Ubuntu 26.04 ships, waits in splice.
+ */
+const READS: ReadonlyMap<number, number> =
+  process.arch === 'arm64'
+    ? new Map([[63, 1], [65, 1], [71, 2], [76, 1]])
+    : new Map([[0, 1], [19, 1], [40, 2], [275, 1]]);
 const MAX_DESCENDANTS = 1024;
 
 export interface Groups {
@@ -71,7 +79,7 @@ export function descendants(pid: number): Array<{ pid: number; pgrp: number }> |
 }
 
 /**
- * Linux: is `pid` blocked in read() on the terminal `pts`? undefined where the kernel won't say:
+ * Linux: is `pid` blocked reading the terminal `pts`? undefined where the kernel won't say:
  * not Linux, or no ptrace access to the process (Yama's ptrace_scope, another user's process).
  */
 export function readsTerminal(pid: number, pts: string): boolean | undefined {
@@ -83,9 +91,10 @@ export function readsTerminal(pid: number, pts: string): boolean | undefined {
     return undefined;
   }
   if (sc[0] === 'running') return false;
-  if (Number(sc[0]) !== READ) return false;
+  const field = READS.get(Number(sc[0]));
+  if (field === undefined) return false;
   try {
-    const link = fs.readlinkSync(`/proc/${pid}/fd/${Number.parseInt(sc[1] ?? '', 16)}`);
+    const link = fs.readlinkSync(`/proc/${pid}/fd/${Number.parseInt(sc[field] ?? '', 16)}`);
     return link === pts || link === '/dev/tty';
   } catch {
     return undefined;
