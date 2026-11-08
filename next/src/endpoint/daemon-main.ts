@@ -1,4 +1,3 @@
-import * as fs from 'node:fs';
 import type * as net from 'node:net';
 import * as path from 'node:path';
 import type { OpenSession } from '../session/types.js';
@@ -22,6 +21,12 @@ export interface RunningDaemon {
   stopped: Promise<void>;
 }
 
+/**
+ * How soon a daemon with no connection notices that its socket is no longer its own: each check is
+ * one stat, and the shells it holds run on either way until it stops.
+ */
+export const ORPHAN_CHECK_MS = 5_000;
+
 export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'running'> {
   const dir = path.dirname(o.socket);
   ensurePrivateDir(dir);
@@ -33,14 +38,14 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
   const conns = new Set<net.Socket>();
   let listening: Listening | undefined;
   let stopping: Promise<void> | undefined;
+  let checking: NodeJS.Timeout | undefined;
   let resolveStopped!: () => void;
   const stopped = new Promise<void>((r) => (resolveStopped = r));
-  let watcher: fs.FSWatcher | undefined;
 
   const stop = (why: string): Promise<void> => {
     stopping ??= (async () => {
       o.log(`stopping: ${why}`);
-      watcher?.close();
+      clearInterval(checking);
       for (const c of conns) c.destroy();
       await listening?.close();
       await host.closeAll();
@@ -67,8 +72,11 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
   );
   if (r === 'running') return 'running';
   listening = r;
-  watcher = fs.watch(dir, () => orphaned());
-  watcher.on('error', () => {});
+  // Checked against this daemon's inode on a timer, not watched for changes: a watch can miss a
+  // change made just as it starts (macOS's directory events and fs.watchFile's first stat both start
+  // asynchronously), and a missed one would leave this daemon holding shells no client can reach.
+  checking = setInterval(orphaned, ORPHAN_CHECK_MS);
+  checking.unref();
   o.log(`listening at ${o.socket}, version ${o.version}, pid ${process.pid}`);
   return { stop, stopped };
 }

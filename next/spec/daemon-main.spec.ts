@@ -113,7 +113,7 @@ test('H2: a daemon with no connection whose socket another took stops when the s
   try {
     await new Promise<void>((r) => other.listen(path.join(dir, 'other.sock'), r));
     fs.renameSync(path.join(dir, 'other.sock'), socket);
-    await within(d.stopped, 2000, 'the orphaned daemon stopping');
+    await within(d.stopped, 7000, 'the orphaned daemon stopping, at its next check of its socket');
   } finally {
     await d.stop('test');
     await new Promise<void>((r) => other.close(() => r()));
