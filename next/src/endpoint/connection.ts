@@ -37,6 +37,17 @@ export function manifest(): Record<string, unknown> {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
+/** Hosts deduplicate pushes by eventId (MCPL push/event), so one sequence serves every connection of the daemon. */
+let eventSeq = 0;
+
+/**
+ * The MCP revisions this server speaks, newest first. What it uses (initialize, ping, tools/list,
+ * tools/call with content and isError, and the initialized, cancelled and tools/list_changed
+ * notifications) is the same in each; structuredContent is 2025-06-18's, and an older client
+ * ignores it.
+ */
+const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
+
 export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonInfo): void {
   let hello: ClientHello | undefined;
   let mcpl = false;
@@ -45,7 +56,6 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
   let policyReceived = false;
   let enabled = new Set<string>();
   let unsubscribe: (() => void) | undefined;
-  let eventSeq = 0;
   let closed = false;
 
   const write = (m: Message): void => {
@@ -53,7 +63,8 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
   };
   const out = new Outbound(write, null);
   const has = (path: string): boolean => grant !== null && capabilityGranted(grant.effectiveCapabilities, path);
-  const toolsAllowed = (): boolean => !mcpl || !policyReceived || (enabled.has('terminal.tools') && has('tools'));
+  const disabled = (n: string): boolean => grant?.disabledFeatureSets.includes(n) === true;
+  const toolsAllowed = (): boolean => !mcpl || (policyReceived ? enabled.has('terminal.tools') && has('tools') : !disabled('terminal.tools'));
   const pushes = (): boolean => mcpl && hello?.client === 'relay' && enabled.has('terminal.events') && has('pushEvents');
 
   const sink = async (w: Wake): Promise<boolean> => {
@@ -110,7 +121,7 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
         coalescing = ec === true || (isObj(ec) && ec.pushEvents === true);
         const note = versionNote(hello!.version, { version: daemon.version, pid: daemon.pid, startedAt: new Date(daemon.startedAt).toISOString() });
         return {
-          protocolVersion: typeof p.protocolVersion === 'string' ? p.protocolVersion : '2025-06-18',
+          protocolVersion: typeof p.protocolVersion === 'string' && PROTOCOL_VERSIONS.includes(p.protocolVersion) ? p.protocolVersion : PROTOCOL_VERSIONS[0],
           capabilities: { tools: { listChanged: true }, ...(mcpl ? { experimental: { mcpl: manifest() } } : {}) },
           serverInfo: { name: 'terminal-sessions', version: daemon.version },
           instructions:
@@ -134,12 +145,11 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
       case 'featureSets/update': {
         if (!mcpl) throw new RpcError(METHOD_NOT_FOUND, 'not an MCPL connection');
         const before = toolsAllowed();
-        const receipt = updatePolicy(p as unknown as FeatureSetsUpdateParams, isRequest ? 'request' : 'notification');
         after(() => {
           activate();
           if (toolsAllowed() !== before) write({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
         });
-        return receipt;
+        return updatePolicy(p as unknown as FeatureSetsUpdateParams, isRequest ? 'request' : 'notification');
       }
       case 'mcpl/manifest':
         if (!mcpl) throw new RpcError(METHOD_NOT_FOUND, 'not an MCPL connection');
@@ -179,9 +189,11 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
         for (const fn of afters) fn();
       },
       (e: unknown) => {
-        if (!isRequest) return;
-        const rpc = e instanceof RpcError ? e : new RpcError(INTERNAL, (e as Error).message ?? String(e));
-        write({ jsonrpc: '2.0', id: req.id as Id, error: { code: rpc.code, message: rpc.message, ...(rpc.data !== undefined ? { data: rpc.data } : {}) } });
+        if (isRequest) {
+          const rpc = e instanceof RpcError ? e : new RpcError(INTERNAL, (e as Error).message ?? String(e));
+          write({ jsonrpc: '2.0', id: req.id as Id, error: { code: rpc.code, message: rpc.message, ...(rpc.data !== undefined ? { data: rpc.data } : {}) } });
+        }
+        for (const fn of afters) fn();
       },
     );
   };

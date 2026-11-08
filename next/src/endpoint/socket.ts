@@ -21,7 +21,7 @@ export interface EndpointPaths {
  */
 export function endpointPaths(env: NodeJS.ProcessEnv = process.env, runUser: (uid: number) => string | undefined = linuxRunUser): EndpointPaths {
   const runtime = env.XDG_RUNTIME_DIR;
-  const uid = os.userInfo().uid;
+  const uid = uidOf();
   const base = runtime && path.isAbsolute(runtime) ? runtime : runUser(uid);
   const dir = base ? path.join(base, 'terminal-sessions') : `/tmp/terminal-sessions-${uid}`;
   return { dir, socket: path.join(dir, 'daemon.sock') };
@@ -38,6 +38,9 @@ function linuxRunUser(uid: number): string | undefined {
   }
 }
 
+/** The process's uid, without the passwd lookup os.userInfo() makes, which throws for a uid with no entry. */
+const uidOf = (): number => process.getuid?.() ?? os.userInfo().uid;
+
 export class EndpointError extends Error {
   override name = 'EndpointError';
 }
@@ -50,7 +53,7 @@ export function ensurePrivateDir(dir: string): void {
   }
   const st = fs.lstatSync(dir);
   if (!st.isDirectory()) throw new EndpointError(`${dir} isn't a directory${st.isSymbolicLink() ? ' (it is a symbolic link)' : ''}; remove it, or give another with --socket`);
-  const uid = os.userInfo().uid;
+  const uid = uidOf();
   if (st.uid !== uid) throw new EndpointError(`${dir} belongs to uid ${st.uid}, not to this user (${uid}); give another with --socket`);
   if ((st.mode & 0o077) !== 0) throw new EndpointError(`${dir} can be entered by others (mode ${(st.mode & 0o777).toString(8)}); \`chmod 700 ${dir}\` fixes it`);
 }

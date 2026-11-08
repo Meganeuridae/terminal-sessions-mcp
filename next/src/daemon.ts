@@ -28,7 +28,14 @@ export async function main(argv: readonly string[]): Promise<number> {
       return 2;
     }
   }
-  const shell = process.env.SHELL || os.userInfo().shell || '/bin/sh';
+  // os.userInfo() throws for a uid with no passwd entry, such as a container's arbitrary uid.
+  let entry: string | null | undefined;
+  try {
+    entry = os.userInfo().shell;
+  } catch {
+    entry = undefined;
+  }
+  const shell = entry || process.env.SHELL || '/bin/sh';
   let d;
   try {
     d = await runDaemon({ socket, openSession, shell, env: configuredEnv(process.env, {}), version: packageVersion(), log, oomScoreAdj });

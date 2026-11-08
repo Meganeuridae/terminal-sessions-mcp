@@ -1,6 +1,7 @@
 /**
  * What a session never inherits from the daemon's environment:
- * - every TSM_* variable, the tool's own namespace;
+ * - every TSM_* variable, the tool's own namespace, and 1.x's SESSION_SERVER_TOKEN and
+ *   SESSION_SERVER_URL, the credentials of this package's other server;
  * - the identity of the terminal that launched the daemon. The session's terminal is the
  *   daemon's emulator, not that one: inheriting these makes the user's rc load the launching
  *   terminal's own shell integration (Ghostty, iTerm2, kitty, VS Code …; VTE's vte.sh appends
@@ -20,7 +21,8 @@ const SCRUBBED_NAMES = new Set(
   `TERM_PROGRAM TERM_PROGRAM_VERSION TERM_SESSION_ID TERM_FEATURES TERMINFO TMUX TMUX_PANE STY WINDOWID WT_SESSION WT_PROFILE_ID
    INSIDE_EMACS TERMINAL_EMULATOR LC_TERMINAL LC_TERMINAL_VERSION COLORTERM VTE_VERSION TILIX_ID TERMINATOR_UUID
    INIT_CWD CLAUDECODE CLAUDE_PID CLAUDE_EFFORT CLAUDE_JOB_DIR AI_AGENT CURSOR_TRACE_ID CURSOR_AGENT
-   CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED CODEX_THREAD_ID ATUIN_SESSION ATUIN_HISTORY_ID ATUIN_SHLVL ATUIN_TMUX_POPUP`.split(/\s+/),
+   CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED CODEX_THREAD_ID ATUIN_SESSION ATUIN_HISTORY_ID ATUIN_SHLVL ATUIN_TMUX_POPUP
+   SESSION_SERVER_TOKEN SESSION_SERVER_URL`.split(/\s+/),
 );
 const SCRUBBED_PREFIXES = ['TSM_', 'GHOSTTY_', 'ITERM_', 'KITTY_', 'VSCODE_', 'WEZTERM_', 'ALACRITTY_', 'KONSOLE_', 'ZELLIJ', 'WARP_', '_VOLTA_', 'npm_', 'CLAUDE_CODE_'];
 
@@ -49,7 +51,8 @@ function scrubPath(value: string, env: NodeJS.ProcessEnv): string {
 
 /** The daemon's environment minus its own credentials, the launching terminal's identity and its launcher's state. */
 export function scrubDaemonEnv(daemonEnv: NodeJS.ProcessEnv): Record<string, string> {
-  const out: Record<string, string> = {};
+  // No prototype, so a variable named __proto__ is kept like any other.
+  const out: Record<string, string> = Object.create(null) as Record<string, string>;
   for (const [k, v] of Object.entries(daemonEnv)) {
     if (v === undefined || scrubbed(k, v)) continue;
     out[k] = k === 'PATH' ? scrubPath(v, daemonEnv) : v;

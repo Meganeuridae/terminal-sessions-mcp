@@ -55,6 +55,11 @@ export function classify(v: unknown): Frame {
   if (Array.isArray(v)) return { kind: 'invalid', id: null, code: INVALID_REQUEST, message: 'batches are not supported; send one message per frame' };
   if (!isPlainObject(v)) return { kind: 'invalid', id: null, code: INVALID_REQUEST, message: 'a message must be a JSON object' };
   const hasId = Object.hasOwn(v, 'id') && v.id !== undefined;
+  if (v.jsonrpc !== '2.0') {
+    const isResponseShape = !Object.hasOwn(v, 'method') && (Object.hasOwn(v, 'result') || Object.hasOwn(v, 'error'));
+    const answerable = !isResponseShape && hasId && (v.id === null || isId(v.id));
+    return { kind: 'invalid', id: isResponseShape ? undefined : answerable ? (v.id as Id | null) : null, code: INVALID_REQUEST, message: 'jsonrpc must be "2.0"' };
+  }
   const badId = hasId && v.id !== null && !isId(v.id);
   const isResponse = !Object.hasOwn(v, 'method') && (Object.hasOwn(v, 'result') || Object.hasOwn(v, 'error'));
   // A bad id on a request is answered (with id null, as the spec says); on a response it is one more

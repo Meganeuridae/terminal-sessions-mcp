@@ -80,3 +80,14 @@ test('Outbound: a request settles on its response, is rejected when no response 
   // Nothing left: a late response for a rejected request is a stray.
   out.handleResponse({ jsonrpc: '2.0', id: 4, result: 1 });
 });
+
+test('a frame without "jsonrpc": "2.0" is invalid, answered when it is a request with an id, dropped when it is a response', () => {
+  const req = classify({ id: 3, method: 'ping' });
+  assert.equal(req.kind, 'invalid');
+  assert.equal((req as { id: unknown }).id, 3);
+  const old = classify({ jsonrpc: '1.0', id: 4, method: 'ping' });
+  assert.equal(old.kind, 'invalid');
+  const resp = classify({ id: 5, result: {} });
+  assert.equal(resp.kind, 'invalid');
+  assert.equal((resp as { id: unknown }).id, undefined);
+});

@@ -241,3 +241,55 @@ test('H8: a grant without terminal.events gets no push, and the end stays unseen
     await h.done();
   }
 });
+
+test('no two pushes from one daemon share an eventId, across its connections', async () => {
+  const h = await harness();
+  try {
+    const ids: string[] = [];
+    for (const scope of ['a', 'b']) {
+      const c = await h.connect(relayHello(scope));
+      await c.request('initialize', MCPL_INIT);
+      await c.request('featureSets/update', GRANT);
+      await c.request('tools/call', { name: 'open', arguments: { name: 'main' } });
+      const s = h.sessions.at(-1)!;
+      s.runMode = 'run';
+      await c.request('tools/call', { name: 'run', arguments: { name: 'main', command: 'x', wait: 0 } });
+      s.end(0);
+      const push = await c.next((m) => m.method === 'push/event');
+      ids.push((push.params as { eventId: string }).eventId);
+      c.send({ jsonrpc: '2.0', id: push.id, result: { accepted: true } });
+    }
+    assert.notEqual(ids[0], ids[1]);
+  } finally {
+    await h.done();
+  }
+});
+
+test('initialize answers a revision it speaks; a notification\'s disabled hides tools before any policy; a malformed policy unsubscribes and says the tools changed', async () => {
+  const h = await harness();
+  try {
+    const c = await h.connect(relayHello('a'));
+    const init = await c.request('initialize', { ...MCPL_INIT, protocolVersion: '2099-01-01' });
+    assert.equal((init.result as { protocolVersion: string }).protocolVersion, '2025-06-18');
+    const older = await h.connect(relayHello('a'));
+    assert.equal(((await older.request('initialize', { ...MCPL_INIT, protocolVersion: '2025-03-26' })).result as { protocolVersion: string }).protocolVersion, '2025-03-26');
+    c.send({ jsonrpc: '2.0', method: 'featureSets/update', params: { disabled: ['terminal.tools'] } });
+    assert.deepEqual((await c.request('tools/list')).result, { tools: [] });
+
+    const d = await h.connect(relayHello('a'));
+    await d.request('initialize', MCPL_INIT);
+    await d.request('featureSets/update', GRANT);
+    await d.request('tools/call', { name: 'open', arguments: { name: 'other' } });
+    const bad = await d.request('featureSets/update', { effectiveCapabilities: ['tools'], deniedCapabilities: ['tools'] });
+    assert.ok(bad.error);
+    await d.next((m) => m.method === 'notifications/tools/list_changed');
+    const s = h.sessions.at(-1)!;
+    s.runMode = 'run';
+    await h.host.call({ scope: 'a', takes: true, pushes: false }, 'run', { name: 'other', command: 'x', wait: 0 });
+    s.end(0);
+    await d.request('ping').catch(() => undefined);
+    assert.equal(d.messages.filter((m) => m.method === 'push/event').length, 0, 'unsubscribed');
+  } finally {
+    await h.done();
+  }
+});

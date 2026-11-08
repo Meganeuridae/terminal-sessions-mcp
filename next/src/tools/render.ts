@@ -61,7 +61,7 @@ export function statusLine(f: StatusFacts): string {
   }
   parts.push(frontText(f.front, f.now));
   parts.push(f.command?.end?.cwd ?? f.cwd);
-  if (f.unseen) parts.push(`${f.unseen} ending${f.unseen === 1 ? '' : 's'} not yet seen (list shows them)`);
+  if (f.unseen) parts.push(`${f.unseen} report${f.unseen === 1 ? '' : 's'} not yet seen (list shows them)`);
   return `[${parts.join(' · ')}]`;
 }
 
@@ -73,11 +73,20 @@ export function statusLine(f: StatusFacts): string {
  */
 export const RESULT_MAX_CHARS = 24_000;
 
+/** String lengths count UTF-16 units, so a cut at a unit can split a surrogate pair. */
 const cutAt = (text: string, max: number, fromEnd: boolean): string => {
-  const cps = Array.from(text);
-  if (cps.length <= max) return text;
-  return fromEnd ? `…${cps.slice(cps.length - max + 1).join('')}` : `${cps.slice(0, max - 1).join('')}…`;
+  if (text.length <= max) return text;
+  if (fromEnd) {
+    let i = text.length - max + 1;
+    if (isLowSurrogate(text.charCodeAt(i))) i++;
+    return `…${text.slice(i)}`;
+  }
+  let n = max - 1;
+  if (isHighSurrogate(text.charCodeAt(n - 1))) n--;
+  return `${text.slice(0, n)}…`;
 };
+
+const isLowSurrogate = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
 
 export function linesText(l: Lines, budget: number, readHint: string): string {
   const out: string[] = [];
@@ -118,7 +127,8 @@ export function linesText(l: Lines, budget: number, readHint: string): string {
  * The room a result keeps beside a whole screen, for its status line, the screen's own line and a
  * matched line, which an ordinary command line, directory and title keep well within. `open` holds
  * a terminal to the size whose screen fits in RESULT_MAX_CHARS less this, so an agent sees a
- * full-screen program's screen whole, status bar and prompt included.
+ * full-screen program's screen whole, status bar and prompt included, when each cell is one
+ * UTF-16 unit.
  */
 export const SCREEN_ROOM_CHARS = 1_000;
 
@@ -152,7 +162,7 @@ const isHighSurrogate = (c: number): boolean => c >= 0xd800 && c <= 0xdbff;
 /**
  * Every result and wake ends within RESULT_MAX_CHARS. What can still carry one past it, once
  * output is cut to its budget and quoted values to theirs, is a count the host doesn't bound,
- * such as many endings not yet seen; the cut keeps the head, where the status line is.
+ * such as many reports not yet seen; the cut keeps the head, where the status line is.
  */
 export function fitted(text: string): string {
   if (text.length <= RESULT_MAX_CHARS) return text;
@@ -170,8 +180,9 @@ export function screenText(s: Screen, budget: number): string {
   while (rows.length && rows[rows.length - 1]!.trimEnd() === '') rows.pop();
   const head = `(screen${s.alt ? ', full-screen program' : ''}${s.title ? `, title ${quotedString(s.title)}` : ''}; cursor at row ${s.cursor.row + 1}, column ${s.cursor.col + 1})`;
   let text = [head, ...rows].join('\n');
-  // Only lines past the room open's bound keeps (a very long command line in front, a long
-  // title) can bring a whole screen past the budget; then its top rows go, not the cap.
+  // Lines past the room open's bound keeps (a very long command line in front, a long title),
+  // or cells wider than one UTF-16 unit (emoji, combining marks), can bring a whole screen past
+  // the budget; then its top rows go, not the cap.
   let dropped = 0;
   while (text.length > budget && rows.length > 1) {
     rows.shift();

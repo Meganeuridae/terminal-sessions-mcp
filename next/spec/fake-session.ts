@@ -14,6 +14,7 @@ export class FakeSession implements Session {
   private watches = new Map<number, { pattern: RegExp; from: number }>();
   private nextWatch = 1;
   runMode: 'refuse' | 'end' | 'run' = 'end';
+  runOutput: string[] = [];
   closedWith: Exit | undefined;
   screenNow: Screen | undefined;
   promptUndrawn = false;
@@ -50,6 +51,10 @@ export class FakeSession implements Session {
 
   print(...lines: string[]): void {
     this.out.push(...lines);
+    this.checkWatches();
+  }
+
+  private checkWatches(): void {
     for (const [id, w] of this.watches) {
       const i = this.out.findIndex((l, n) => n >= w.from && w.pattern.test(l));
       if (i >= 0) {
@@ -75,7 +80,9 @@ export class FakeSession implements Session {
   }
 
   emit(e: SessionEvent): void {
-    for (const l of this.listeners) l(e);
+    queueMicrotask(() => {
+      for (const l of this.listeners) l(e);
+    });
   }
 
   async run(text: string, opts: { waitMs: number; take?: boolean }): Promise<RunOutcome> {
@@ -84,7 +91,7 @@ export class FakeSession implements Session {
     const id = this.opts.nextCommandId();
     const c: Command = { id, text, from: this.out.length, startedAt: Date.now() };
     this.commands.set(id, c);
-    this.out.push(`$ ${text}`);
+    this.out.push(`$ ${text}`, ...this.runOutput);
     if (this.runMode === 'end') {
       c.to = this.out.length;
       c.end = { at: Date.now(), status: 0, errexit: false, refusedMarks: 0, cwd: this.dir };
@@ -115,15 +122,26 @@ export class FakeSession implements Session {
   async close(opts?: { force?: boolean }): Promise<Exit> {
     this.calls.push({ method: 'close', args: [opts] });
     this.closedWith = { code: 0 };
+    const c = this.current();
+    if (c) {
+      c.to = this.out.length;
+      c.end = { at: Date.now(), errexit: false, refusedMarks: 0, cwd: this.dir };
+      this.emit({ kind: 'ended', command: c, taken: false });
+    }
+    this.frontNow = { state: 'exited', since: Date.now(), exit: this.closedWith };
+    this.emit({ kind: 'exited', exit: this.closedWith, taken: false });
     return this.closedWith;
   }
 
   watch(pattern: RegExp, from: number): number {
+    this.calls.push({ method: 'watch', args: [pattern, from] });
     const id = this.nextWatch++;
     this.watches.set(id, { pattern, from });
+    queueMicrotask(() => this.checkWatches());
     return id;
   }
   unwatch(id: number): void {
+    this.calls.push({ method: 'unwatch', args: [id] });
     this.watches.delete(id);
   }
   onEvent(listener: (event: SessionEvent) => void): () => void {

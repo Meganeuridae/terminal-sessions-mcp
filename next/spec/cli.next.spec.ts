@@ -53,8 +53,8 @@ test('H9: the CLI calls the daemon in its scope, prints the text, and takes noth
     s.runMode = 'run';
     await cli('--scope', 'a', 'run', 'main', 'sleep', '5', '--wait', '0');
     s.end(0);
-    assert.match((await cli('--scope', 'a', 'list')).out, /1 ending not yet seen/);
-    assert.match((await cli('--scope', 'a', 'list')).out, /1 ending not yet seen/, "the CLI's list left it unseen");
+    assert.match((await cli('--scope', 'a', 'list')).out, /1 report not yet seen/);
+    assert.match((await cli('--scope', 'a', 'list')).out, /1 report not yet seen/, "the CLI's list left it unseen");
     const missing = await cli('--scope', 'b', 'look', 'main');
     assert.equal(missing.code, 1);
     assert.match(missing.err, /No session named "main" is open in scope "b"/);

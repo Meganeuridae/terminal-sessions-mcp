@@ -26,7 +26,7 @@ const wait: Schema = {
 export const SESSION_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
 /**
- * `open` holds a terminal to what one result can show whole: (cols + 1) × rows within
+ * `open` holds a terminal to what one result can show whole when each cell is one UTF-16 unit: (cols + 1) × rows within
  * RESULT_MAX_CHARS less SCREEN_ROOM_CHARS (render.ts), so 23,000 characters. Its cost is the
  * daemon's memory, which grows with the columns because each session's emulator keeps 10,000
  * lines of scrollback: measured with @xterm/headless 6.0.0 on Node 24, a terminal at full
@@ -46,7 +46,7 @@ export const TOOLS: readonly ToolDef[] = [
       properties: {
         name,
         cwd: { type: 'string', description: 'The directory to start in: absolute, or starting with `~`. Your home directory when left out.' },
-        cols: { type: 'integer', minimum: 1, maximum: SIZE_MAX, description: `Terminal width in columns; 120 when left out. Columns plus one, times rows, may be at most ${RESULT_MAX_CHARS - SCREEN_ROOM_CHARS}, so a whole screen fits in one result.` },
+        cols: { type: 'integer', minimum: 1, maximum: SIZE_MAX, description: `Terminal width in columns; 120 when left out. Columns plus one, times rows, may be at most ${RESULT_MAX_CHARS - SCREEN_ROOM_CHARS}, so a whole screen of plain text fits in one result.` },
         rows: { type: 'integer', minimum: 1, maximum: SIZE_MAX, description: 'Terminal height in rows; 40 when left out.' },
       },
       required: ['name'],
@@ -57,15 +57,15 @@ export const TOOLS: readonly ToolDef[] = [
     name: 'run',
     description:
       'Run one command line in a session\'s shell, only when it is at its prompt. Otherwise nothing is typed, and the refusal says what is in front. ' +
-      'Returns its exit status, duration, directory afterwards and output, or that it is still running when the wait ends: it keeps running, and its end is reported to you when it comes. ' +
-      '`notify_on` reports a pattern in its output once, as it appears.',
+      'Returns its exit status, duration, directory afterwards and output, or that it is still running when the wait ends: it keeps running, and on a host that takes wakes its end is reported to you when it comes. ' +
+      '`notify_on` reports a pattern in its output once: in the result if the command has ended, otherwise as it appears, on a host that takes wakes.',
     inputSchema: {
       type: 'object',
       properties: {
         name,
         command: { type: 'string', minLength: 1, description: 'The command line, run as if typed at the prompt; it may span lines.' },
         wait,
-        notify_on: { type: 'string', description: 'A regular expression: report its first match in this command\'s output, once.' },
+        notify_on: { type: 'string', description: 'A regular expression: report its first match in this command\'s output, once, and nothing after the command ends.' },
       },
       required: ['name', 'command'],
       additionalProperties: false,
@@ -95,12 +95,13 @@ export const TOOLS: readonly ToolDef[] = [
     name: 'look',
     description:
       'What a session shows that you haven\'t seen yet, and what is in front now. With `until`, wait first for a command to end (`end`) or a program to wait for input (`input`); ' +
-      'with `match`, for a pattern in new output. If the wait ends first, the match is reported to you when it comes.',
+      '`end` also returns when a program waits for input, since it won\'t end until answered; ' +
+      'with `match`, for a pattern in new output. If the wait ends first, on a host that takes wakes, what it waited for is reported to you when it comes.',
     inputSchema: {
       type: 'object',
       properties: {
         name,
-        until: { type: 'string', enum: ['end', 'input'], description: '`end`: until the shell is back at its prompt; `input`: until a program waits for input.' },
+        until: { type: 'string', enum: ['end', 'input'], description: '`end`: until the shell is back at its prompt, or a program waits for input; `input`: until a program waits for input.' },
         match: { type: 'string', description: 'A regular expression: until it matches in output from here on.' },
         wait,
       },
@@ -111,14 +112,15 @@ export const TOOLS: readonly ToolDef[] = [
   {
     name: 'read',
     description:
-      'Read a session\'s earlier output: one command\'s whole output by its id (each result names its command id), a range of line numbers, or the lines matching a pattern, with context.',
+      'Read a session\'s earlier output: one command\'s output by its id (each result names its command id), a range of line numbers, or the lines matching a pattern, with context. ' +
+      `Like every result it is cut to ${RESULT_MAX_CHARS} characters, keeping its start and end, so a long output is read in ranges; a single line longer than that is cut in its middle, and output older than the lines a session keeps is gone.`,
     inputSchema: {
       type: 'object',
       properties: {
         name,
-        command: { type: 'integer', minimum: 1, description: 'A command id: its whole output.' },
+        command: { type: 'integer', minimum: 1, description: 'A command id: its output.' },
         lines: { type: 'array', items: { type: 'integer', minimum: 0 }, description: 'Two line numbers, [from, to]: from `from` up to, not including, `to`.' },
-        match: { type: 'string', description: 'A regular expression: every line it matches, within `command` or `lines` when given.' },
+        match: { type: 'string', description: 'A regular expression: every line it matches, within `command` or `lines` when given. A line longer than the pattern\'s match window is searched on its head only, and the result says how many were.' },
         context: { type: 'integer', minimum: 0, description: 'With `match`, lines shown before and after each match; 2 when left out.' },
       },
       required: ['name'],
@@ -128,8 +130,8 @@ export const TOOLS: readonly ToolDef[] = [
   {
     name: 'stop',
     description:
-      'Stop what runs in front of a session\'s shell, in steps, each reported: Ctrl-C, then TERM, then KILL to its job, never to the shell. ' +
-      'If the shell itself is what runs, the steps end there, and `close` is what remains. With `signal`, just that one.',
+      'Stop what runs in front of a session\'s shell, in steps, each reported: Ctrl-C typed to the terminal, so it reaches whatever is in front, a shell\'s own loop included; then TERM, then KILL to the job in front, never to the shell. ' +
+      'If the shell itself is what runs and Ctrl-C doesn\'t bring back its prompt, the steps end there, and `close` is what remains. With `signal`, just that one, and never to the shell.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -142,7 +144,7 @@ export const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'list',
-    description: 'Every session you have open: what is in front of each, its directory, and the endings you haven\'t seen.',
+    description: 'Every session you have open: what is in front of each, its directory, and the reports you haven\'t seen.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {

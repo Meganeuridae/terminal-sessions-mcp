@@ -43,3 +43,13 @@ test('ux-8: launcher state never reaches a session — Volta recursion, npm/npx 
   assert.equal(configured.CLAUDECODE, 'mine');
   assert.equal(configured.PATH, '/given');
 });
+
+test('1.x\'s server credentials never reach a session, and a variable named __proto__ is kept like any other', () => {
+  const daemonEnv = JSON.parse('{"HOME":"/home/u","SESSION_SERVER_TOKEN":"t-1","SESSION_SERVER_URL":"ws://localhost:3100","__proto__":"kept"}') as NodeJS.ProcessEnv;
+  const env = configuredEnv(daemonEnv, {});
+  assert.equal(env.SESSION_SERVER_TOKEN, undefined);
+  assert.equal(env.SESSION_SERVER_URL, undefined);
+  assert.equal(env.HOME, '/home/u');
+  assert.ok(Object.hasOwn(env, '__proto__'));
+  assert.equal(Object.getOwnPropertyDescriptor(env, '__proto__')?.value, 'kept');
+});
