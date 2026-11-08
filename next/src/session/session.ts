@@ -15,12 +15,6 @@ const LINUX = process.platform === 'linux';
 const TICK_MS = 50;
 const POLL_MS = 250;
 const HOOKS_QUIET_MS = 500;
-/**
- * The shell's line editor reads the terminal right after the shell writes its end mark, so the kernel
- * can show the shell reading before that mark is parsed here. A builtin read in a command outlasts
- * this: the shell itself counts as waiting once its read has gone this long with no output after it.
- */
-const SHELL_READ_SETTLE_MS = 100;
 const STEP_GRACE_MS = 1500;
 const CLOSE_GRACE_MS = 2000;
 const RECENT_NONCES = 64;
@@ -69,6 +63,8 @@ class LiveSession implements Session {
   private exitInfo: Exit | undefined;
   private exitedAt = 0;
   private lastOutput = 0;
+  private outputs = 0;
+  private shellRead: { key: string; turns: number } | undefined;
   private lastWrite = 0;
   private frontKey = '';
   private frontSince = Date.now();
@@ -108,6 +104,7 @@ class LiveSession implements Session {
     });
     p.onData((d) => {
       this.lastOutput = Date.now();
+      this.outputs++;
       this.t.write(d, () => {
         this.checkWatches();
         this.wake();
@@ -327,7 +324,7 @@ class LiveSession implements Session {
       const starting = !this.drawnOnce && !this.plain ? { starting: true as const } : {};
       if (reads && !this.plain && !this.atPrompt) {
         const since = this.since(`w:${process.pgid}`);
-        if (Date.now() - Math.max(since, this.lastOutput) >= SHELL_READ_SETTLE_MS) return at({ state: 'waiting', since, process, echo: proc.modes(this.pts)?.echo ?? true, ...starting });
+        if (this.shellReadSettled(process.pgid)) return at({ state: 'waiting', since, process, echo: proc.modes(this.pts)?.echo ?? true, ...starting });
         return at({ state: 'running', since, process, waitVisible: true, ...starting });
       }
       return at({ state: 'running', since: this.since(`r:${process.pgid}`), process, waitVisible: reads !== undefined && !this.plain, ...starting });
@@ -337,6 +334,26 @@ class LiveSession implements Session {
     const reads = members.map((m) => proc.readsTerminal(m, this.pts));
     if (reads.includes(true)) return at({ state: 'waiting', since: this.since(`w:${g.tpgid}`), process, echo: proc.modes(this.pts)?.echo ?? true });
     return at({ state: 'running', since: this.since(`r:${g.tpgid}`), process, waitVisible: members.length > 0 && !reads.includes(undefined) });
+  }
+
+  /**
+   * Whether the shell's own read of the terminal is a builtin read in a command. The line editor reads
+   * as soon as the shell has written its end mark and prompt, so when the kernel shows the shell
+   * reading, those bytes may still be unread here or unparsed. They were written before the read began,
+   * so once the event loop has turned twice since the read was first seen, with no output in between
+   * and everything received parsed, any end mark among them has been handled.
+   */
+  private shellReadSettled(pgid: number): boolean {
+    const key = `${pgid}:${this.outputs}`;
+    if (this.shellRead?.key !== key) {
+      const read = { key, turns: 0 };
+      this.shellRead = read;
+      const turn = (): void => {
+        if (++read.turns < 2) setImmediate(turn);
+      };
+      setImmediate(turn);
+    }
+    return this.shellRead.turns >= 2 && this.t.caughtUp;
   }
 
   /**

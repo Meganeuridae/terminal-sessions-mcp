@@ -358,8 +358,13 @@ for (const sh of shells) {
       const s = await open(shell);
       const r = await s.run('sleep 0.3', { waitMs: 50 });
       assert.equal(r.kind, 'running');
-      const until = Date.now() + 1500;
-      while (Date.now() < until);
+      const block = (ms: number): void => {
+        const until = Date.now() + ms;
+        while (Date.now() < until);
+      };
+      block(1500);
+      assert.notEqual(s.front().state, 'waiting');
+      block(300);
       assert.notEqual(s.front().state, 'waiting');
       const w = await s.wait({ kind: 'end' }, { waitMs: 3000, from: 0 });
       assert.equal(w.by, 'end');

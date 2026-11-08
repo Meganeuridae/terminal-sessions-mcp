@@ -121,6 +121,11 @@ export class Transcript {
     });
   }
 
+  /** Whether everything written so far is parsed. */
+  get caughtUp(): boolean {
+    return this.pending === 0;
+  }
+
   /** Resolves once everything written so far is parsed. */
   settled(): Promise<void> {
     if (this.parsed >= this.written) return Promise.resolve();
