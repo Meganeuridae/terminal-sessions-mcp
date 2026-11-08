@@ -40,6 +40,7 @@ export class Transcript {
   private titleText = '';
   private written = 0;
   private parsed = 0;
+  private isDisposed = false;
   private readonly settledWaiters: Array<{ upto: number; resolve: () => void }> = [];
 
   constructor(
@@ -106,8 +107,9 @@ export class Transcript {
     return this.term.modes.applicationCursorKeysMode;
   }
 
-  /** Feeds output; `parsed` runs once the emulator has parsed it. */
+  /** Feeds output; `parsed` runs once the emulator has parsed it. Ignored once disposed. */
   write(data: string, parsed: () => void): void {
+    if (this.isDisposed) return;
     this.pending += data.length;
     this.written += data.length;
     if (!this.paused && this.pending >= HIGH_WATER) this.setPaused(true);
@@ -128,7 +130,7 @@ export class Transcript {
 
   /** Resolves once everything written so far is parsed. */
   settled(): Promise<void> {
-    if (this.parsed >= this.written) return Promise.resolve();
+    if (this.isDisposed || this.parsed >= this.written) return Promise.resolve();
     return new Promise((resolve) => this.settledWaiters.push({ upto: this.written, resolve }));
   }
 
@@ -167,7 +169,12 @@ export class Transcript {
     return { rows, cursor: { row: b.cursorY, col: b.cursorX }, alt: b.type === 'alternate', title: this.io.redact(this.titleText) };
   }
 
+  get disposed(): boolean {
+    return this.isDisposed;
+  }
+
   dispose(): void {
+    this.isDisposed = true;
     this.term.dispose();
     for (const w of this.settledWaiters.splice(0)) w.resolve();
   }

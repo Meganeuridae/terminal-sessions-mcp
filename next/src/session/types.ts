@@ -3,9 +3,10 @@
  * terminal of its own, what is in front of it, and its transcript. A Session knows nothing of
  * connections, scopes, rendering or deadlines' defaults; the host keeps those.
  *
- * Times are milliseconds since the epoch. Line numbers count the session's transcript from 0 and
- * never change once given; the bound on what is kept drops the oldest lines, and every read says
- * how many it dropped.
+ * Times are milliseconds since the epoch. Line numbers count the session's transcript from 0, and a
+ * line given never changes, but for one case: the cursor's line and the screen's lines below it when a
+ * full-screen program starts stay live while it runs, and move to follow its last frame.
+ * The bound on what is kept drops the oldest lines, and every read says how many it dropped.
  */
 
 export type ShellKind = 'bash' | 'zsh' | 'fish' | 'none';
@@ -47,7 +48,7 @@ export interface Process {
   pgid: number;
   /** Its leader's command line as the kernel has it now. */
   argv: string;
-  /** The shell's own group: a loop, a builtin, a function, or its startup files. */
+  /** The shell itself runs it: a loop, a builtin, a function, or its startup files. false for a job, and for a program exec'd in the shell's place. */
   shell: boolean;
 }
 
@@ -131,6 +132,8 @@ export interface Screen {
 export interface Match {
   line: number;
   text: string;
+  /** The line is longer than the pattern's match window, so only its head was matched. */
+  clipped?: true;
 }
 
 export type RunOutcome =
@@ -157,7 +160,7 @@ export interface SendOutcome {
 export type Until = { kind: 'end' } | { kind: 'input' } | { kind: 'match'; pattern: RegExp };
 
 export interface WaitOutcome {
-  /** `end`: the front is at a prompt, at once when it already was; `input`: the front is `waiting`. */
+  /** `end`: the front is at a prompt, at once when it already was; `input`: the front is `waiting`, which ends a wait for `end` too, since a command waiting for input won't end until it's answered. */
   by: 'end' | 'input' | 'match' | 'exited' | 'timeout';
   front: Front;
   ended: Command[];
@@ -175,14 +178,15 @@ export interface StopStep {
 export interface StopOutcome {
   steps: StopStep[];
   front: Front;
-  /** The shell itself runs what's in front, or a job outlived KILL: only `close` ends it. */
+  /** The shell itself runs what's in front, a program exec'd in the shell's place does, or a job outlived KILL: only `close` ends it. */
   next?: 'close';
 }
 
 /**
  * Events, each emitted once. `taken` is true when a call's outcome already gave it (`run`, `send` or
  * `wait` on this session, unless the call passed `take: false`), so the host can skip the wake.
- * `waiting` fires on each entry into that state, noticed within about a quarter second; a `match`
+ * `waiting` fires on each entry into that state, noticed within about a quarter second, and input
+ * sent while something is in front starts a new one; a `match`
  * watch fires once and is gone. A shell that exits mid-command emits that command's `ended`, with no
  * status, before `exited`.
  */
@@ -218,9 +222,9 @@ export interface Session {
   send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean }): Promise<SendOutcome>;
   /** `match` looks from line `from` on, so lines already there count. */
   wait(until: Until, opts: { waitMs: number; from: number; take?: boolean }): Promise<WaitOutcome>;
-  /** Without `signal`, in steps: C-c, then TERM, then KILL, each with a grace. With it, that one step. */
+  /** Without `signal`, in steps: C-c, typed to the terminal, so it reaches whatever is in front, a shell's own loop included; then TERM, then KILL, each with a grace and each only to the job's group while it is still the shell's. With `signal`, that one step. */
   stop(signal?: NodeJS.Signals): Promise<StopOutcome>;
-  /** Hangs up the shell, then KILL after a grace, or at once with `force`. Resolves with the exit, at once if it had exited. */
+  /** Hangs up the shell, again every 500 ms while it is there, then after a grace KILLs the shell alone, so the kernel hangs up the job in front as a closing terminal does, and a job detached on purpose lives on. With `force`, at once KILLs every process group the shell started, then the shell. Resolves with the exit, at once if it had exited. */
   close(opts?: { force?: boolean }): Promise<Exit>;
 
   /** A one-shot pattern watch from line `from` on; its id names the `match` event. */

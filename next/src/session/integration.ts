@@ -289,21 +289,39 @@ export function prepare(shell: string, dir: string, nonce: Nonce, env: Record<st
   return { kind, args: [], env: {} };
 }
 
-/** The file `run` has the shell source, and the line to type that sources it. The command's status stays its own. */
-export function commandFile(kind: ShellKind, dir: string, id: number, text: string): { file: string; body: string; line: string } {
+export const TEXT_FILE = 'tsm-text-';
+
+/**
+ * The files `run` writes, and the line to type that sources the first. The command's status, and its
+ * pipeline's, stay its own. In bash the text has a file of its own, so its syntax ends where that file
+ * does; a RETURN trap set around it keeps the pipeline's statuses, which zsh and fish reset through
+ * every wrapper. In zsh and fish the text stays inline, followed by a blank line, which ends a trailing
+ * backslash's continuation.
+ */
+export function commandFile(kind: ShellKind, dir: string, id: number, text: string): { files: Array<{ path: string; body: string }>; line: string } {
   const file = path.join(dir, `${COMMAND_FILE}${id}`);
   if (kind === 'bash') {
-    const start = `case $\{PS0-} in *'133;C;'*) ;; *) builtin printf '\\033]133;C;%s.%s;\\007' "$__tsm_c" "$__tsm_r" ;; esac`;
-    const body = `${start}\nbuiltin history -s -- ${sq(text)}\n${text}\n__tsm_st=$? __tsm_ps="$\{PIPESTATUS[*]}"; __tsm_hook 2>/dev/null; return $__tsm_st\n`;
-    return { file, body, line: ` . ${sq(file)}\r` };
+    const textFile = path.join(dir, `${TEXT_FILE}${id}`);
+    const body = [
+      `case $\{PS0-} in *'133;C;'*) ;; *) builtin printf '\\033]133;C;%s.%s;\\007' "$__tsm_c" "$__tsm_r" ;; esac`,
+      `builtin history -s -- ${sq(text)}`,
+      '__tsm_rt=$(builtin trap -p RETURN)',
+      `builtin trap '__tsm_ps="$\{PIPESTATUS[*]}"' RETURN`,
+      `builtin . ${sq(textFile)}`,
+      '__tsm_st=$?',
+      'case $(builtin trap -p RETURN) in *__tsm_ps=*) builtin trap - RETURN; builtin eval "$__tsm_rt" ;; esac',
+      '__tsm_hook 2>/dev/null; return $__tsm_st',
+      '',
+    ].join('\n');
+    return { files: [{ path: file, body }, { path: textFile, body: `${text}\n` }], line: ` . ${sq(file)}\r` };
   }
   if (kind === 'zsh') {
-    const body = `builtin print -s -- ${sq(text)}\n${text}\n__tsm_st=$? __tsm_ps="$\{(j: :)pipestatus}"; __tsm_hook 2>/dev/null; return $__tsm_st\n`;
-    return { file, body, line: ` . ${sq(file)}\r` };
+    const body = `builtin print -s -- ${sq(text)}\n${text}\n\n__tsm_st=$? __tsm_ps="$\{(j: :)pipestatus}"; __tsm_hook 2>/dev/null; return $__tsm_st\n`;
+    return { files: [{ path: file, body }], line: ` . ${sq(file)}\r` };
   }
   if (kind === 'fish') {
-    const body = `${text}\nset -g __tsm_fps $pipestatus $status; __tsm_setst $__tsm_fps[-1]\n`;
-    return { file, body, line: ` eval (__tsm_collect ${fishq(file)} $status)\r` };
+    const body = `${text}\n\nset -g __tsm_fps $pipestatus $status; __tsm_setst $__tsm_fps[-1]\n`;
+    return { files: [{ path: file, body }], line: ` eval (__tsm_collect ${fishq(file)} $status)\r` };
   }
-  return { file, body: text, line: `${text}\r` };
+  return { files: [], line: `${text}\r` };
 }

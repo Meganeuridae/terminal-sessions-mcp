@@ -2,16 +2,27 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 
 const LINUX = process.platform === 'linux';
-const ARM64 = process.arch === 'arm64';
-/** read and readv, whose only wait is for their input. */
-const READS: ReadonlySet<number> = new Set(ARM64 ? [63, 65] : [0, 19]);
 /**
- * splice moves its input into a pipe, and waits either for input or for room in the pipe; only the
- * wait channel tells them apart. uutils' cat, which Ubuntu 26.04 ships, waits in splice.
+ * The numbers of read and readv, whose only wait is for their input, and of splice: x86-64's table, and
+ * the generic table arm64, riscv64 and loong64 share. On any other architecture no read is seen.
  */
-const SPLICE = ARM64 ? 76 : 275;
-/** The wait channel of a terminal read with nothing to read: n_tty_read's. */
+const SYSCALLS: Partial<Record<string, { reads: ReadonlySet<number>; splice: number }>> = {
+  x64: { reads: new Set([0, 19]), splice: 275 },
+  arm64: { reads: new Set([63, 65]), splice: 76 },
+  riscv64: { reads: new Set([63, 65]), splice: 76 },
+  loong64: { reads: new Set([63, 65]), splice: 76 },
+};
+const NUMBERS = LINUX ? SYSCALLS[process.arch] : undefined;
+/** Whether the kernel here shows a process blocked reading the terminal. */
+export const READS_VISIBLE = NUMBERS !== undefined;
+/**
+ * The wait channel of a terminal read with nothing to read: n_tty_read's. splice moves its input into
+ * a pipe, and waits either for input or for room in the pipe; only the wait channel tells them apart.
+ * uutils' cat, which Ubuntu 26.04 ships, waits in splice.
+ */
 const TERMINAL_READ_WAIT = 'wait_woken';
+/** A kernel built without CONFIG_PROC_CHILDREN has no children file; descendants then come from every process's parent. */
+const CHILDREN_FILES = LINUX && fs.existsSync(`/proc/self/task/${process.pid}/children`);
 const MAX_DESCENDANTS = 1024;
 
 export interface Groups {
@@ -44,11 +55,13 @@ export function argv(pid: number): string | undefined {
   }
 }
 
+type Proc = { pid: number; pgrp: number };
+
 /** Every descendant of `pid` with its group; undefined when they can't be listed. */
-export function descendants(pid: number): Array<{ pid: number; pgrp: number }> | undefined {
+export function descendants(pid: number): Proc[] | undefined {
   try {
-    if (LINUX) {
-      const out: Array<{ pid: number; pgrp: number }> = [];
+    if (CHILDREN_FILES) {
+      const out: Proc[] = [];
       const todo = [pid];
       while (todo.length) {
         const p = todo.pop()!;
@@ -67,10 +80,21 @@ export function descendants(pid: number): Array<{ pid: number; pgrp: number }> |
       }
       return out;
     }
-    const rows = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: 2000 }).trim().split('\n').map((l) => l.trim().split(/\s+/).map(Number));
-    const kids = new Map<number, Array<{ pid: number; pgrp: number }>>();
-    for (const [p, pp, g] of rows) if (p && pp !== undefined && g) (kids.get(pp) ?? kids.set(pp, []).get(pp)!).push({ pid: p, pgrp: g });
-    const out: Array<{ pid: number; pgrp: number }> = [];
+    const kids = new Map<number, Proc[]>();
+    const add = (p: number, pp: number, g: number): void => {
+      if (p > 0 && g > 0) (kids.get(pp) ?? kids.set(pp, []).get(pp)!).push({ pid: p, pgrp: g });
+    };
+    if (LINUX) {
+      for (const d of fs.readdirSync('/proc')) {
+        if (!/^\d+$/.test(d)) continue;
+        try {
+          const s = fs.readFileSync(`/proc/${d}/stat`, 'utf8');
+          const f = s.slice(s.lastIndexOf(')') + 2).split(' ');
+          add(Number(d), Number(f[1]), Number(f[2]));
+        } catch {}
+      }
+    } else for (const [p, pp, g] of execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: 2000 }).trim().split('\n').map((l) => l.trim().split(/\s+/).map(Number))) add(p!, pp!, g!);
+    const out: Proc[] = [];
     const todo = [pid];
     while (todo.length) for (const k of kids.get(todo.pop()!) ?? []) out.push(k), todo.push(k.pid);
     return out;
@@ -80,11 +104,12 @@ export function descendants(pid: number): Array<{ pid: number; pgrp: number }> |
 }
 
 /**
- * Linux: is `pid` blocked reading the terminal `pts`? undefined where the kernel won't say:
- * not Linux, or no ptrace access to the process (Yama's ptrace_scope, another user's process).
+ * Linux: is `pid` blocked reading the terminal `pts`? undefined where the kernel won't say: not
+ * Linux, an architecture without a known syscall table, or no ptrace access to the process (Yama's
+ * ptrace_scope, another user's process).
  */
 export function readsTerminal(pid: number, pts: string): boolean | undefined {
-  if (!LINUX) return undefined;
+  if (!NUMBERS) return undefined;
   let sc: string[];
   try {
     sc = fs.readFileSync(`/proc/${pid}/syscall`, 'utf8').trim().split(' ');
@@ -93,11 +118,11 @@ export function readsTerminal(pid: number, pts: string): boolean | undefined {
   }
   if (sc[0] === 'running') return false;
   const call = Number(sc[0]);
-  if (!READS.has(call) && call !== SPLICE) return false;
+  if (!NUMBERS.reads.has(call) && call !== NUMBERS.splice) return false;
   try {
     const link = fs.readlinkSync(`/proc/${pid}/fd/${Number.parseInt(sc[1] ?? '', 16)}`);
     if (link !== pts && link !== '/dev/tty') return false;
-    if (call !== SPLICE) return true;
+    if (call !== NUMBERS.splice) return true;
     const wait = fs.readFileSync(`/proc/${pid}/wchan`, 'utf8').trim();
     return wait === '0' || wait === '' ? undefined : wait === TERMINAL_READ_WAIT;
   } catch {
@@ -135,14 +160,5 @@ export function signalGroup(pgid: number, signal: NodeJS.Signals): boolean {
     return true;
   } catch {
     return false;
-  }
-}
-
-export function groupAlive(pgid: number): boolean {
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'EPERM';
   }
 }

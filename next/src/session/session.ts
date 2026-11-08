@@ -5,6 +5,7 @@ import * as pty from 'node-pty';
 import { historyIsolationEnv } from '../core/env.js';
 import { err } from '../core/errors.js';
 import { shellLaunch, viaBash } from '../core/launch.js';
+import { testBounded } from '../core/regex.js';
 import * as integration from './integration.js';
 import type { Nonce } from './integration.js';
 import * as proc from './proc.js';
@@ -17,8 +18,14 @@ const POLL_MS = 250;
 const HOOKS_QUIET_MS = 500;
 const STEP_GRACE_MS = 1500;
 const CLOSE_GRACE_MS = 2000;
+const HANGUP_EVERY_MS = 500;
 const RECENT_NONCES = 64;
 const MAX_COMMANDS = 10_000;
+/** A process exec'd in the shell's place still counts as a shell when its name is one of these. */
+const SHELLS = new Set(['sh', 'ash', 'dash', 'bash', 'zsh', 'fish', 'ksh', 'ksh93', 'mksh', 'pdksh', 'oksh', 'yash', 'posh', 'busybox', 'tcsh', 'csh']);
+const isShell = (argv: string): boolean => SHELLS.has(path.basename(argv.split(' ')[0] ?? '').replace(/^-/, ''));
+/** Deadlines, graces and quiet periods; the times a session reports are wall-clock. */
+const mono = (): number => performance.now();
 
 const randomDigits = (): string => Array.from({ length: 4 }, () => String(randomInt(10000, 100000))).join('');
 
@@ -40,6 +47,12 @@ interface Call {
   own?: number;
 }
 
+/** Where a pattern search has got to: lines before `from` were searched and are frozen, and nothing was parsed since the `parses`th parse. */
+interface Scan {
+  from: number;
+  parses: number;
+}
+
 class LiveSession implements Session {
   readonly name: string;
   readonly pid: number;
@@ -53,6 +66,7 @@ class LiveSession implements Session {
   private inCommand = false;
   private submitted = false;
   private sentPending: string | undefined;
+  private sentOutputs = -1;
   private promptAt: Pos | undefined;
   private readonly commands = new Map<number, Command>();
   private running: Command | undefined;
@@ -61,9 +75,13 @@ class LiveSession implements Session {
   private refused = 0;
   private cwdNow: string;
   private exitInfo: Exit | undefined;
+  private ptyExit: Exit | undefined;
   private exitedAt = 0;
   private lastOutput = 0;
   private outputs = 0;
+  private parses = 0;
+  private echoSeen = { key: '', echo: true };
+  private readonly files = new Map<number, string[]>();
   private shellRead: { key: string; turns: number } | undefined;
   private lastWrite = 0;
   private frontKey = '';
@@ -71,7 +89,7 @@ class LiveSession implements Session {
   private waitingKey = '';
   private readonly calls = new Set<Call>();
   private readonly wakers = new Set<() => void>();
-  private readonly watches = new Map<number, { pattern: RegExp; from: number }>();
+  private readonly watches = new Map<number, { pattern: RegExp; scan: Scan }>();
   private watchSeq = 0;
   private readonly listeners = new Set<(e: SessionEvent) => void>();
   private poll: NodeJS.Timeout | undefined;
@@ -103,19 +121,25 @@ class LiveSession implements Session {
       mark: (payload, at) => this.mark(payload, at),
     });
     p.onData((d) => {
-      this.lastOutput = Date.now();
+      if (this.t.disposed) return;
+      this.lastOutput = mono();
       this.outputs++;
       this.t.write(d, () => {
+        this.parses++;
         this.checkWatches();
         this.wake();
       });
     });
-    p.onExit(({ exitCode, signal }) => void this.exited(signal ? { code: null, signal: `SIG${signalName(signal)}` } : { code: exitCode }));
+    p.onExit(({ exitCode, signal }) => {
+      this.ptyExit = signal ? { code: null, signal: `SIG${signalName(signal)}` } : { code: exitCode };
+      this.exitedAt = Date.now();
+      void this.exited(this.ptyExit);
+    });
     this.schedulePoll();
   }
 
   async ready(waitMs: number): Promise<void> {
-    await this.until(Date.now() + waitMs, () => (this.prompted || this.exitInfo || (this.kind === 'none' && this.front().state === 'prompt') ? true : undefined));
+    await this.until(mono() + waitMs, () => (this.prompted || this.exitInfo || (this.kind === 'none' && this.front().state === 'prompt') ? true : undefined));
     this.opened = true;
   }
 
@@ -232,6 +256,8 @@ class LiveSession implements Session {
     c.to = Math.max(to, c.from);
     c.end = end;
     this.lastEnded = c;
+    for (const f of this.files.get(c.id) ?? []) fs.rmSync(f, { force: true });
+    this.files.delete(c.id);
     let taken = false;
     for (const call of this.calls) {
       if (call.own !== undefined && call.own !== c.id) continue;
@@ -249,7 +275,7 @@ class LiveSession implements Session {
   private async exited(exit: Exit): Promise<void> {
     await this.t.settled();
     this.exitInfo = exit;
-    this.exitedAt = Date.now();
+    if (this.t.disposed) return;
     const c = this.running ?? this.runCommand;
     this.running = this.runCommand = undefined;
     if (c) this.finish(c, undefined, { at: Date.now(), errexit: false, refusedMarks: this.refused });
@@ -272,13 +298,14 @@ class LiveSession implements Session {
   private schedulePoll(): void {
     if (!LINUX || this.exitInfo || this.closed) return;
     this.poll = setTimeout(() => {
-      if (!this.atPrompt) this.observe(this.front());
+      if (!this.atPrompt) this.observe(this.front(), [...this.calls].some((c) => c.take));
       this.schedulePoll();
     }, POLL_MS);
     this.poll.unref();
   }
 
-  private observe(f: Front): void {
+  /** Emits `waiting` on each entry into that state. `taken`: the call returning `f`, or a call still open, gives it. */
+  private observe(f: Front, taken: boolean): void {
     if (f.state !== 'waiting') {
       this.waitingKey = '';
       return;
@@ -286,7 +313,13 @@ class LiveSession implements Session {
     const key = `${f.process.pgid}:${f.since}`;
     if (key === this.waitingKey) return;
     this.waitingKey = key;
-    this.emit({ kind: 'waiting', front: f, taken: [...this.calls].some((c) => c.take) });
+    this.emit({ kind: 'waiting', front: f, taken });
+  }
+
+  /** The terminal's echo, read once for each wait: `key` names the wait. */
+  private echo(key: string): boolean {
+    if (this.echoSeen.key !== key) this.echoSeen = { key, echo: proc.modes(this.pts)?.echo ?? true };
+    return this.echoSeen.echo;
   }
 
   private since(key: string): number {
@@ -298,17 +331,29 @@ class LiveSession implements Session {
   }
 
   front(): Front {
-    if (this.exitInfo) return { state: 'exited', since: this.exitedAt, exit: this.exitInfo };
+    const exit = this.exitInfo ?? this.ptyExit;
+    if (exit) return { state: 'exited', since: this.exitedAt, exit };
     const g = proc.groups(this.pid);
     const command = this.running?.id ?? this.runCommand?.id;
     const at = <T extends object>(o: T): T => (command !== undefined ? { ...o, command } : o);
+    const program = (process: Process, reads: Array<boolean | undefined>): Front => {
+      if (reads.includes(true)) {
+        const since = this.since(`w:${process.pgid}`);
+        return at({ state: 'waiting', since, process, echo: this.echo(`${process.pgid}:${since}`) });
+      }
+      return at({ state: 'running', since: this.since(`r:${process.pgid}`), process, waitVisible: reads.length > 0 && !reads.includes(undefined) });
+    };
     if (!g || g.tpgid === g.pgrp) {
       if (this.prompted) {
         const pending = this.pending();
         return { state: 'prompt', since: this.since('prompt'), ...(pending !== undefined && { pending }) };
       }
-      const process: Process = { pgid: g?.pgrp ?? this.pid, argv: proc.argv(this.pid) ?? this.shellName, shell: true };
+      const pgid = g?.pgrp ?? this.pid;
+      const argv = proc.argv(this.pid);
+      if (this.opened && argv !== undefined && argv !== this.argvAtOpen) this.execed = true;
       const reads = proc.readsTerminal(this.pid, this.pts);
+      if (this.execed && argv !== undefined && !isShell(argv)) return program({ pgid, argv, shell: false }, [reads]);
+      const process: Process = { pgid, argv: argv ?? this.shellName, shell: true };
       if ((!this.submitted || this.plain) && this.withoutHooks(reads)) {
         this.submitted = false;
         const open = this.running ?? this.runCommand;
@@ -322,28 +367,30 @@ class LiveSession implements Session {
         return { state: 'prompt', since: this.since('prompt'), ...(pending !== undefined && { pending }) };
       }
       const starting = !this.drawnOnce && !this.plain ? { starting: true as const } : {};
-      if (reads && !this.plain && !this.atPrompt) {
+      if (reads && !this.plain && (!this.atPrompt || this.submitted)) {
         const since = this.since(`w:${process.pgid}`);
-        if (this.shellReadSettled(process.pgid)) return at({ state: 'waiting', since, process, echo: proc.modes(this.pts)?.echo ?? true, ...starting });
+        if (this.shellReadSettled(process.pgid)) return at({ state: 'waiting', since, process, echo: this.echo(`${process.pgid}:${since}`), ...starting });
         return at({ state: 'running', since, process, waitVisible: true, ...starting });
       }
       return at({ state: 'running', since: this.since(`r:${process.pgid}`), process, waitVisible: reads !== undefined && !this.plain, ...starting });
     }
     const members = proc.descendants(this.pid)?.filter((d) => d.pgrp === g.tpgid).map((d) => d.pid) ?? [];
     const process: Process = { pgid: g.tpgid, argv: proc.argv(g.tpgid) ?? (members[0] !== undefined ? proc.argv(members[0]) : undefined) ?? '?', shell: false };
-    const reads = members.map((m) => proc.readsTerminal(m, this.pts));
-    if (reads.includes(true)) return at({ state: 'waiting', since: this.since(`w:${g.tpgid}`), process, echo: proc.modes(this.pts)?.echo ?? true });
-    return at({ state: 'running', since: this.since(`r:${g.tpgid}`), process, waitVisible: members.length > 0 && !reads.includes(undefined) });
+    return program(process, members.map((m) => proc.readsTerminal(m, this.pts)));
   }
 
   /**
    * Whether the shell's own read of the terminal is a builtin read in a command. The line editor reads
    * as soon as the shell has written its end mark and prompt, so when the kernel shows the shell
    * reading, those bytes may still be unread here or unparsed. They were written before the read began,
-   * so once the event loop has turned twice since the read was first seen, with no output in between
-   * and everything received parsed, any end mark among them has been handled.
+   * so once the event loop has turned twice since the read was seen with everything received parsed,
+   * with no output in between, any end mark among them has been handled.
    */
   private shellReadSettled(pgid: number): boolean {
+    if (!this.t.caughtUp) {
+      this.shellRead = undefined;
+      return false;
+    }
     const key = `${pgid}:${this.outputs}`;
     if (this.shellRead?.key !== key) {
       const read = { key, turns: 0 };
@@ -353,20 +400,16 @@ class LiveSession implements Session {
       };
       setImmediate(turn);
     }
-    return this.shellRead.turns >= 2 && this.t.caughtUp;
+    return this.shellRead.turns >= 2;
   }
 
   /**
-   * A shell with no integration, or one replaced by exec (its process now runs another program), is
-   * at its prompt once output is quiet and it waits at its line editor, which holds the terminal out
-   * of canonical mode, or, with no line editor (dash), reads the terminal itself.
+   * A shell with no integration, or a shell exec'd in the integrated shell's place, is at its prompt
+   * once output is quiet and it waits at its line editor, which holds the terminal out of canonical
+   * mode, or, with no line editor (dash), reads the terminal itself.
    */
   private withoutHooks(reads: boolean | undefined): boolean {
-    if (this.atPrompt || Date.now() - Math.max(this.lastOutput, this.lastWrite) < HOOKS_QUIET_MS) return false;
-    if (this.kind !== 'none' && !this.execed && this.opened) {
-      const now = proc.argv(this.pid);
-      if (now !== undefined && now !== this.argvAtOpen) this.execed = true;
-    }
+    if (this.atPrompt || mono() - Math.max(this.lastOutput, this.lastWrite) < HOOKS_QUIET_MS) return false;
     if (!this.plain) return false;
     if (reads) return true;
     return proc.modes(this.pts)?.canonical === false;
@@ -376,14 +419,23 @@ class LiveSession implements Session {
     return this.kind === 'none' || this.execed;
   }
 
+  /** Whether the kernel can tell a call's loop more than the marks do: a wait for input where reads show, a prompt where there are no marks. Elsewhere (macOS) reading it on every tick only costs spawns. */
+  private get kernelSays(): boolean {
+    return proc.READS_VISIBLE || this.plain;
+  }
+
+  /** The prompt's text after its end mark; until output that came after the last `send` here is parsed, what that sent. */
   private pending(): string | undefined {
     const b = this.promptAt;
     if (!b) return this.sentPending;
     const cur = this.t.pos();
-    if (cur.line < b.line || (cur.line === b.line && cur.col <= b.col)) return undefined;
-    const ls = this.t.lines(b.line, cur.line + 1).lines;
-    const text = ls.length === 1 ? ls[0]!.slice(b.col, cur.col) : [ls[0]!.slice(b.col), ...ls.slice(1, -1), ls.at(-1)!.slice(0, cur.col)].join('\n');
-    return text.trim() ? text : undefined;
+    if (cur.line > b.line || (cur.line === b.line && cur.col > b.col)) {
+      const ls = this.t.lines(b.line, cur.line + 1).lines;
+      const text = ls.length === 1 ? ls[0]!.slice(b.col, cur.col) : [ls[0]!.slice(b.col), ...ls.slice(1, -1), ls.at(-1)!.slice(0, cur.col)].join('\n');
+      if (text.trim()) return text;
+    }
+    const sent = this.sentPending;
+    return sent !== undefined && /[^\x00-\x20\x7f]/.test(sent) && (this.outputs === this.sentOutputs || !this.t.caughtUp) ? sent : undefined;
   }
 
   cwd(): string {
@@ -425,11 +477,11 @@ class LiveSession implements Session {
       const check = () => {
         const v = done();
         if (v !== undefined) return finish(v);
-        if (Date.now() >= deadline) return finish(undefined);
+        if (mono() >= deadline) return finish(undefined);
       };
       const tick = () => {
         check();
-        if (this.wakers.has(check)) timer = setTimeout(tick, Math.min(TICK_MS, Math.max(0, deadline - Date.now())));
+        if (this.wakers.has(check)) timer = setTimeout(tick, Math.min(TICK_MS, Math.max(0, deadline - mono())));
       };
       this.wakers.add(check);
       tick();
@@ -443,62 +495,65 @@ class LiveSession implements Session {
   }
 
   async run(text: string, opts: { waitMs: number; take?: boolean }): Promise<RunOutcome> {
-    const deadline = Date.now() + opts.waitMs;
+    const deadline = mono() + opts.waitMs;
     if (this.atPrompt && !this.submitted && !this.prompted) await this.until(deadline, () => (this.prompted || this.exitInfo || !this.atPrompt ? true : undefined));
     const f = this.front();
     if (f.state !== 'prompt' || f.pending !== undefined) return { kind: 'refused', front: f };
     const id = this.nextId();
     const c: Command = { id, text, from: this.t.pos().line + 1, startedAt: Date.now() };
     this.store(c);
-    const via = this.plain ? 'none' : this.kind;
-    const cf = integration.commandFile(via, this.dir, id, text);
-    if (via !== 'none') fs.writeFileSync(cf.file, cf.body, { mode: 0o600 });
+    const cf = integration.commandFile(this.plain ? 'none' : this.kind, this.dir, id, text);
+    if (cf.files.length) this.files.set(id, cf.files.map((f) => f.path));
+    for (const f of cf.files) fs.writeFileSync(f.path, f.body, { mode: 0o600 });
     this.runCommand = c;
     this.submitted = true;
     const call = this.enter(opts.take ?? true, id);
-    this.lastWrite = Date.now();
+    this.lastWrite = mono();
     this.p.write(cf.line);
     try {
       await this.until(deadline, () => {
         if (this.exitInfo) return true;
-        if (c.end) return this.front().state === 'prompt' ? true : undefined;
-        if (this.kind !== 'none' && Date.now() - Math.max(this.lastOutput, this.lastWrite) < HOOKS_QUIET_MS) return undefined;
+        if (c.end) return this.prompted || (this.plain && this.front().state === 'prompt') ? true : undefined;
+        if (!this.kernelSays || (this.kind !== 'none' && mono() - Math.max(this.lastOutput, this.lastWrite) < HOOKS_QUIET_MS)) return undefined;
         return this.front().state === 'waiting' || c.end ? true : undefined;
       });
       await this.t.settled();
     } finally {
       this.calls.delete(call);
-      if (via !== 'none' && c.end) fs.rmSync(cf.file, { force: true });
     }
     const front = this.front();
-    this.observe(front);
+    this.observe(front, call.take);
     return c.end ? { kind: 'ended', command: c, front } : { kind: 'running', command: c, front };
   }
 
   async send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean }): Promise<SendOutcome> {
     const from = this.t.pos().line;
-    if (this.exitInfo) return { sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by: 'exited' };
-    const deadline = Date.now() + opts.waitMs;
+    const gone = (): Exit | undefined => this.exitInfo ?? this.ptyExit;
+    if (gone()) return { sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by: 'exited' };
+    const deadline = mono() + opts.waitMs;
     const quiet = opts.quietMs ?? 300;
     if (this.atPrompt && !this.submitted && !this.prompted) {
-      await this.until(deadline, () => (this.prompted || this.exitInfo || !this.atPrompt ? true : undefined));
-      if (!this.exitInfo && this.atPrompt && !this.prompted) return { sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by: 'timeout' };
+      await this.until(deadline, () => (this.prompted || gone() || !this.atPrompt ? true : undefined));
+      if (!gone() && this.atPrompt && !this.prompted) return { sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by: 'timeout' };
     }
-    if (this.exitInfo) return { sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by: 'exited' };
+    if (gone()) return { sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by: 'exited' };
+    if (!this.prompted) this.frontKey = '';
     if (this.atPrompt && !this.submitted) {
       if (/[\r\n]/.test(bytes)) this.submitted = true;
       else this.sentPending = (this.sentPending ?? '') + bytes;
     }
     const call = this.enter(opts.take ?? true);
-    const sentAt = (this.lastWrite = Date.now());
+    const sentAt = (this.lastWrite = mono());
     this.p.write(bytes);
+    this.sentOutputs = this.outputs;
+    const scan: Scan = { from, parses: -1 };
     let matched: Match | undefined;
     let by: SendOutcome['by'] = 'timeout';
     try {
       const r = await this.until(deadline, () => {
         if (this.exitInfo) return 'exited' as const;
-        if (opts.until) return (matched = this.search(opts.until, from)) ? ('match' as const) : undefined;
-        return Date.now() - Math.max(this.lastOutput, sentAt) >= quiet ? ('quiet' as const) : undefined;
+        if (opts.until) return (matched = this.scan(opts.until, scan)) ? ('match' as const) : undefined;
+        return mono() - Math.max(this.lastOutput, sentAt) >= quiet ? ('quiet' as const) : undefined;
       });
       if (r) by = r;
       await this.t.settled();
@@ -506,22 +561,23 @@ class LiveSession implements Session {
       this.calls.delete(call);
     }
     const front = this.front();
-    this.observe(front);
+    this.observe(front, call.take);
     const screen = this.t.screen();
     return { sent: true, lines: this.t.lines(from), ...(screen.alt && { screen }), front, ended: call.ended, ...(matched && { matched }), by };
   }
 
   async wait(until: Until, opts: { waitMs: number; from: number; take?: boolean }): Promise<WaitOutcome> {
-    const deadline = Date.now() + opts.waitMs;
+    const deadline = mono() + opts.waitMs;
     const call = this.enter(opts.take ?? true);
+    const scan: Scan = { from: opts.from, parses: -1 };
     let matched: Match | undefined;
     let by: WaitOutcome['by'] = 'timeout';
     try {
       const r = await this.until(deadline, () => {
         if (this.exitInfo) return 'exited' as const;
-        if (until.kind === 'match') return (matched = this.search(until.pattern, opts.from)) ? ('match' as const) : undefined;
+        if (until.kind === 'match') return (matched = this.scan(until.pattern, scan)) ? ('match' as const) : undefined;
         if (this.prompted) return until.kind === 'end' ? ('end' as const) : undefined;
-        if (!LINUX && this.kind !== 'none' && Date.now() - Math.max(this.lastOutput, this.lastWrite) < HOOKS_QUIET_MS) return undefined;
+        if (!this.kernelSays) return undefined;
         const s = this.front().state;
         if (s === 'waiting') return 'input' as const;
         return until.kind === 'end' && s === 'prompt' ? ('end' as const) : undefined;
@@ -532,17 +588,26 @@ class LiveSession implements Session {
       this.calls.delete(call);
     }
     const front = this.front();
-    this.observe(front);
+    this.observe(front, call.take);
     return { by, front, ended: call.ended, ...(matched && { matched }) };
   }
 
-  private search(pattern: RegExp, from: number): Match | undefined {
-    const ls = this.t.lines(from);
+  /** The first line from `s.from` on that matches, each matched on its head within the pattern's window. Rescans only after a parse, and moves `s.from` past frozen lines that didn't match. */
+  private scan(pattern: RegExp, s: Scan): Match | undefined {
+    if (s.parses === this.parses) return undefined;
+    s.parses = this.parses;
+    const ls = this.t.lines(s.from);
     for (let i = 0; i < ls.lines.length; i++) {
-      pattern.lastIndex = 0;
-      if (pattern.test(ls.lines[i]!)) return { line: ls.from + i, text: ls.lines[i]! };
+      const r = testBounded(pattern, ls.lines[i]!);
+      if (r.matched) return { line: ls.from + i, text: ls.lines[i]!, ...(r.clipped && { clipped: true as const }) };
     }
+    s.from = Math.max(s.from, ls.to - ls.live);
     return undefined;
+  }
+
+  /** Whether process group `pgid` still has a member among the shell's descendants, so a signal to it reaches the job it was read as. */
+  private ours(pgid: number): boolean {
+    return proc.descendants(this.pid)?.some((d) => d.pgrp === pgid) ?? proc.groupExists(pgid);
   }
 
   async stop(signal?: NodeJS.Signals): Promise<StopOutcome> {
@@ -550,30 +615,34 @@ class LiveSession implements Session {
     let f = this.front();
     if (f.state === 'prompt' || f.state === 'exited') return { steps, front: f };
     const target = f.process;
+    const own = target.shell || target.pgid === this.pid;
     const settled = (now: Front): boolean => now.state === 'prompt' || now.state === 'exited' || (!now.process.shell && now.process.pgid !== target.pgid);
-    const gone = (now: Front): boolean => now.state === 'prompt' || now.state === 'exited' || (now.process.pgid !== target.pgid && (!now.process.shell || !proc.groupExists(target.pgid)));
+    const gone = (now: Front): boolean => now.state === 'prompt' || now.state === 'exited' || (now.process.pgid !== target.pgid && (!now.process.shell || !this.ours(target.pgid)));
     const cleared = async (): Promise<Front> =>
-      (await this.until(Date.now() + STEP_GRACE_MS, () => {
+      (await this.until(mono() + STEP_GRACE_MS, () => {
         const now = this.front();
         return settled(now) ? now : undefined;
       })) ?? this.front();
     const step = async (sent: StopStep['sent']): Promise<boolean> => {
       if (sent === 'C-c') {
-        this.lastWrite = Date.now();
+        this.lastWrite = mono();
         this.p.write('\x03');
+      } else if (this.ours(target.pgid)) proc.signalGroup(target.pgid, sent);
+      else {
+        f = this.front();
+        return true;
       }
-      else proc.signalGroup(target.pgid, sent);
       f = await cleared();
       steps.push({ sent, ...(sent !== 'C-c' && { to: target }), front: f });
       return gone(f);
     };
     if (signal) {
-      if (target.shell) return { steps, front: f, next: 'close' };
+      if (own) return { steps, front: f, next: 'close' };
       await step(signal);
       return { steps, front: f };
     }
     if (await step('C-c')) return { steps, front: f };
-    if (target.shell) return { steps, front: f, next: 'close' };
+    if (own) return { steps, front: f, next: 'close' };
     for (const s of ['SIGTERM', 'SIGKILL'] as const) if (await step(s)) return { steps, front: f };
     return { steps, front: f, next: 'close' };
   }
@@ -582,21 +651,27 @@ class LiveSession implements Session {
     this.closed = true;
     if (this.poll) clearTimeout(this.poll);
     if (!this.exitInfo) {
-      const kill = () => {
-        for (const d of proc.descendants(this.pid) ?? []) proc.signalGroup(d.pgrp, 'SIGKILL');
+      const killShell = (): void => {
         try {
           this.p.kill('SIGKILL');
         } catch {}
       };
-      if (opts.force) kill();
-      else {
-        try {
-          this.p.kill('SIGHUP');
-        } catch {}
-        await this.until(Date.now() + CLOSE_GRACE_MS, () => this.exitInfo);
-        if (!this.exitInfo) kill();
+      if (opts.force) {
+        for (const d of proc.descendants(this.pid) ?? []) proc.signalGroup(d.pgrp, 'SIGKILL');
+        killShell();
+      } else {
+        // bash can miss a SIGHUP that lands just before its line editor waits for input, and go on waiting.
+        const gone = (): Exit | undefined => this.exitInfo ?? this.ptyExit;
+        const grace = mono() + CLOSE_GRACE_MS;
+        for (let at = mono(); !gone() && at < grace; at += HANGUP_EVERY_MS) {
+          try {
+            this.p.kill('SIGHUP');
+          } catch {}
+          await this.until(Math.min(at + HANGUP_EVERY_MS, grace), gone);
+        }
+        if (!gone()) killShell();
       }
-      await this.until(Date.now() + CLOSE_GRACE_MS, () => this.exitInfo);
+      await this.until(mono() + CLOSE_GRACE_MS, () => this.exitInfo);
     }
     this.t.dispose();
     fs.rmSync(this.dir, { recursive: true, force: true });
@@ -605,7 +680,7 @@ class LiveSession implements Session {
 
   watch(pattern: RegExp, from: number): number {
     const id = ++this.watchSeq;
-    this.watches.set(id, { pattern, from });
+    this.watches.set(id, { pattern, scan: { from, parses: -1 } });
     queueMicrotask(() => this.checkWatches());
     return id;
   }
@@ -616,13 +691,10 @@ class LiveSession implements Session {
 
   private checkWatches(): void {
     for (const [id, w] of this.watches) {
-      const m = this.search(w.pattern, w.from);
+      const m = this.scan(w.pattern, w.scan);
       if (m) {
         this.watches.delete(id);
         this.emit({ kind: 'match', watch: id, match: m });
-      } else {
-        const ls = this.t.lines(w.from);
-        w.from = Math.max(w.from, ls.to - ls.live);
       }
     }
   }
