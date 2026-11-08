@@ -14,7 +14,9 @@
   session.screenshot`.
 - **For the library, breaking:** `takeScreenshot` on `RobustSessionClient`,
   `ConnectomeTestingMCP` and `PersistentSessionServer`, and
-  `PersistentSessionServer.guiAuthToken`, are removed.
+  `PersistentSessionServer.guiAuthToken`, are removed. TypeScript consumers
+  need their own `@types/node`, which Socket.IO and Puppeteer used to bring
+  in.
 - **Dependencies:** Puppeteer, Express, Socket.IO, `@xterm/xterm`,
   `@xterm/addon-fit`, `@xterm/addon-web-links` and `ansi-to-html` are no
   longer dependencies, and `@types/express` is no longer a dev dependency.
