@@ -863,6 +863,50 @@ test('a subscriber is told when its session is closed (terminal/closed), rather 
 
 // ───────────────────────────── HTTP, health, usage, logs ─────────────────────────────
 
+test("a credential naming human:gui:<X> is its own principal, with none of X's sessions, seat or cancel rights", async () => {
+  const h = await start({ resolver: new TokenMapResolver({ tokens: { ...TOKENS, tg: 'human:gui:agent:a@test' } }) });
+  try {
+    const owner = await Client.open(h.port);
+    await owner.call('session_open', { session: 'gx-private' });
+    const shared = await owner.call('session_open', { session: 'gx-shared', visibility: 'shared' });
+    assert.ok(!shared.isError, shared.text);
+    const r = await owner.call('run', { session: 'gx-shared', command: 'sleep 5', wait: 0 });
+    assert.equal(r.structured.state, 'running');
+    assert.equal(liveSession(h, 'gx-shared').currentController, 'agent:a@test');
+    const g = await Client.open(h.port, { token: 'tg', profile: 'full' });
+    const list = await g.call('session_list', {});
+    assert.ok(!list.isError, list.text);
+    assert.ok(list.text.includes('gx-shared'), 'the shared session is listed');
+    assert.ok(!list.text.includes('gx-private'), "X's private session is not listed");
+    assert.match((await g.call('read', { session: 'gx-private' })).text, /^forbidden:/);
+    assert.match((await g.call('control', { session: 'gx-shared', action: 'take' })).text, /^not_controller:/, "X's held seat is not taken over");
+    assert.match((await g.call('cancel', { session: 'gx-shared', runId: r.structured.runId })).text, /^(forbidden|not_controller):/, "X's Run is not cancelled");
+    assert.equal(liveSession(h, 'gx-shared').currentController, 'agent:a@test');
+    owner.close();
+    g.close();
+  } finally {
+    await h.close();
+  }
+});
+
+test('G26: input marked sensitive reaches the journal redacted through the tool', async () => {
+  const h = await start();
+  try {
+    const c = await Client.open(h.port);
+    await c.call('session_open', { session: 'secret' });
+    const r = await c.call('input', { session: 'secret', text: 'hunter2-4821', sensitive: true });
+    assert.ok(!r.isError, r.text);
+    const events = liveSession(h, 'secret').journal.since(0).events;
+    const typed = events.filter((e) => e.type === 'input' && e.principal === 'agent:a@test');
+    assert.equal(typed.length, 1);
+    assert.deepEqual([(typed[0] as { data: string }).data, (typed[0] as { sensitive?: boolean }).sensitive], ['[redacted]', true]);
+    assert.ok(!JSON.stringify(events).includes('hunter2-4821'), 'the text is nowhere in the journal');
+    c.close();
+  } finally {
+    await h.close();
+  }
+});
+
 test('HTTP serves /health and nothing else', async () => {
   const h = await start();
   try {

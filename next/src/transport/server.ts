@@ -1,7 +1,7 @@
 /**
  * The daemon's one endpoint (§12): JSON-RPC 2.0 over WebSocket with two method
  * families — MCP+MCPL (tools, channels, manifest, policy) and `terminal/*` (the
- * native family for the CLI: subscribe, attach, detach) — plus `/health` over
+ * native family: subscribe, attach, detach) — plus `/health` over
  * HTTP. Every WebSocket connection has a
  * server-generated connection ID for its attachments and a principal resolved
  * from its credential. Each session keeps delivery and read cursors per
@@ -13,7 +13,7 @@
  *     port or none, or a name given with `--allow-host` (required for
  *     non-loopback binds). Anything else is 421: a DNS-rebinding page sends its
  *     own name, so it never gets through.
- *  2. Origin, when present, must be same-origin with that allowed Host; any
+ *  2. Origin, when present, must name that allowed Host's host and port; any
  *     other Origin is 403. Browsers supply Origin on WebSocket handshakes:
  *     without this check, another page could drive the user's shells. HTTP
  *     no-cors GETs may omit Origin, so its absence does not authenticate HTTP.
@@ -117,7 +117,7 @@ export interface ServerOptions {
   highWaterBytes?: number;
   /** How long close() waits for clients to finish the closing handshake before terminating them (default 1000 ms). */
   shutdownGraceMs?: number;
-  /** Called for every tools/call (§16 Measure). */
+  /** Called for every tools/call the daemon runs (§16 Measure). */
   usage?: { record(r: UsageRecord): void };
   /** The daemon's data dir, which /health tells a caller that has a principal and a loopback peer address (see health). */
   dataDir?: string;

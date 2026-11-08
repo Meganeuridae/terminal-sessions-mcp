@@ -311,10 +311,10 @@ test('G25: the daemon answers terminal queries itself and journals the reply as 
   h.pty.emit('\x1b[6n');
   await h.session.screen.settled();
   await tick();
-  assert.ok(h.pty.writes.some((w) => /^\x1b\[\d+;\d+R$/.test(w)), 'cursor position report written to the PTY');
-  const reply = h.journal.since(0).events.find((e) => e.type === 'input' && e.kind === 'protocol-reply');
-  assert.ok(reply);
-  assert.equal((reply as Extract<JournalEvent, { type: 'input' }>).principal, 'system');
+  assert.equal(h.pty.writes.filter((w) => /^\x1b\[\d+;\d+R$/.test(w)).length, 1, 'one cursor position report written to the PTY');
+  const replies = h.journal.since(0).events.filter((e) => e.type === 'input' && e.kind === 'protocol-reply');
+  assert.equal(replies.length, 1);
+  assert.equal((replies[0] as Extract<JournalEvent, { type: 'input' }>).principal, 'system');
   await h.session.close();
 });
 

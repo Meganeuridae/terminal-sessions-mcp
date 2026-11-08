@@ -412,7 +412,7 @@ const HELP = `termd — terminal sessions daemon
   --disk-floor-bytes <n> stop writing history to disk while the data dir's filesystem has less than n bytes
                          free (default 209715200, 200 MiB; 0: never): the recent part stays in memory and is
                          written once space returns; what the memory ring had to drop meanwhile reads as a gap
-  --usage-log <file>     usage records, one JSON line per tool call (default <data-dir>/usage.jsonl)
+  --usage-log <file>     usage records, one JSON line per tool call it runs (default <data-dir>/usage.jsonl)
   --no-usage-log         do not record usage
   --log-file <file>      write logs to this file (0600, rotated by size) instead of stderr; a startup
                          failure is said on stderr as well
@@ -644,7 +644,7 @@ async function main(): Promise<void> {
     log('info', c.type === 'closed' ? 'session closed' : 'session removed', { session: c.id });
   });
 
-  // §16 Measure: one JSON line per tools/call, owner-only, rotated by size keeping USAGE_GENERATIONS old files (16 MiB
+  // §16 Measure: one JSON line per tools/call it runs, owner-only, rotated by size keeping USAGE_GENERATIONS old files (16 MiB
   // each) so a week of traces fits. A write error disables it; it never breaks a call.
   let usage: RotatingFile | undefined;
   if (!f['no-usage-log']) {

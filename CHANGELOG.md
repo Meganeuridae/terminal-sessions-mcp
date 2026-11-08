@@ -34,7 +34,7 @@ later release (`next/README.md`, "Upgrading from 1.x").
   mcpl-cc-bridge's real host code (`next/acceptance/`).
 - **Sharing**: several principals per session (per-agent tokens), one controller seat,
   provenance on every input, observers that cannot act, private and shared sessions.
-- **Measure**: every tool call recorded (names and hashes only) to `usage.jsonl`; `tsm usage` reports use, errors and confusion signatures.
+- **Measure**: every tool call the daemon runs recorded (names and hashes only) to `usage.jsonl`; `tsm usage` reports use, errors and confusion signatures.
 - **The 1.x tool names on 2.0**: `tsm-shim --profile compat` (or `TSM_PROFILE=compat`) serves
   `runCommand`, `tailLogs`, `searchLogs`, `sendInput`, `sendSignal`, `listSessions`,
   `killSession`, `killAll`, `launch` and `takeScreenshot` over `termd`, for a 1.x host
