@@ -263,7 +263,7 @@ test('a command line, a title and a matched line a program sets are quoted up to
   s.screenNow = { rows: Array.from({ length: 45 }, (_, i) => `${i}`.padEnd(500, 'x')), cursor: { row: 44, col: 499 }, alt: true, title: 'T'.repeat(100_000) };
   const sent = await host.call(agent(), 'send', { name: 'big', keys: ['Down'] });
   assert.ok(sent.text.length <= RESULT_MAX_CHARS, `${sent.text.length}`);
-  assert.match(sent.text, /title "T+… \(99750 more characters\)"/);
+  assert.match(sent.text, /title "T+"… \(99750 more characters\);/, 'the note after the closing quotation mark');
   assert.doesNotMatch(sent.text, /rows above not shown/, 'with both clipped, no row of the screen goes');
   assert.match(sent.text, /\n44x+$/);
   s.screenNow = undefined;

@@ -14,7 +14,7 @@ export const exitText = (e: Exit): string => (e.signal ? `was killed by ${e.sign
 export function frontText(front: Front, now: number): string {
   switch (front.state) {
     case 'prompt':
-      return front.pending ? `at the prompt, with ${JSON.stringify(quoted(front.pending))} typed and not yet run` : 'at the prompt';
+      return front.pending ? `at the prompt, with ${quotedString(front.pending)} typed and not yet run` : 'at the prompt';
     case 'running': {
       const what = front.process.shell
         ? front.starting
@@ -38,7 +38,7 @@ export function endingText(c: Command): string[] {
   if (end.pipeline && end.pipeline.some((s) => s !== 0)) parts.push(`pipeline ${end.pipeline.join('|')}`);
   parts.push(duration(end.at - c.startedAt));
   if (end.errexit) parts.push('set -e is on: a failing command now ends the shell');
-  if (end.flushed) parts.push(`discarded typed-ahead text ${JSON.stringify(quoted(end.flushed))}, which nothing read`);
+  if (end.flushed) parts.push(`discarded typed-ahead text ${quotedString(end.flushed)}, which nothing read`);
   if (end.refusedMarks) parts.push(`${end.refusedMarks} lookalike end mark${end.refusedMarks === 1 ? '' : 's'} in its output refused`);
   return parts;
 }
@@ -130,10 +130,21 @@ export const SCREEN_ROOM_CHARS = 1_000;
  */
 export const QUOTED_MAX_CHARS = SCREEN_ROOM_CHARS / 4;
 
-export function quoted(s: string): string {
-  if (s.length <= QUOTED_MAX_CHARS) return s;
+function clip(s: string): { text: string; more: number } {
+  if (s.length <= QUOTED_MAX_CHARS) return { text: s, more: 0 };
   const n = isHighSurrogate(s.charCodeAt(QUOTED_MAX_CHARS - 1)) ? QUOTED_MAX_CHARS - 1 : QUOTED_MAX_CHARS;
-  return `${s.slice(0, n)}… (${s.length - n} more characters)`;
+  return { text: s.slice(0, n), more: s.length - n };
+}
+
+export function quoted(s: string): string {
+  const c = clip(s);
+  return c.more ? `${c.text}… (${c.more} more characters)` : s;
+}
+
+/** As `quoted`, in quotation marks, with the note after the closing one, so it can't read as part of the text. */
+export function quotedString(s: string): string {
+  const c = clip(s);
+  return c.more ? `${JSON.stringify(c.text)}… (${c.more} more characters)` : JSON.stringify(s);
 }
 
 const isHighSurrogate = (c: number): boolean => c >= 0xd800 && c <= 0xdbff;
@@ -157,7 +168,7 @@ export const screenChars = (cols: number, rows: number): number => (cols + 1) * 
 export function screenText(s: Screen, budget: number): string {
   const rows = [...s.rows];
   while (rows.length && rows[rows.length - 1]!.trimEnd() === '') rows.pop();
-  const head = `(screen${s.alt ? ', full-screen program' : ''}${s.title ? `, title ${JSON.stringify(quoted(s.title))}` : ''}; cursor at row ${s.cursor.row + 1}, column ${s.cursor.col + 1})`;
+  const head = `(screen${s.alt ? ', full-screen program' : ''}${s.title ? `, title ${quotedString(s.title)}` : ''}; cursor at row ${s.cursor.row + 1}, column ${s.cursor.col + 1})`;
   let text = [head, ...rows].join('\n');
   // Only lines past the room open's bound keeps (a very long command line in front, a long
   // title) can bring a whole screen past the budget; then its top rows go, not the cap.

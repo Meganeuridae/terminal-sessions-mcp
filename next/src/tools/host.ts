@@ -5,7 +5,7 @@ import { TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, OpenSession, Session, SessionEvent } from '../session/types.js';
-import { duration, endingText, exitText, fitted, frontText, linesText, quoted, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
+import { duration, endingText, exitText, fitted, frontText, linesText, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, type ToolDef } from './table.js';
 
 export interface Caller {
@@ -409,7 +409,7 @@ function refused(text: string, structured: Record<string, unknown>): ToolResult 
 function refusalAdvice(front: Front): string {
   switch (front.state) {
     case 'prompt':
-      return `${JSON.stringify(quoted(front.pending ?? ''))} is typed at the prompt and not run. \`send\` with \`keys: ["C-u"]\` clears it, or \`keys: ["Enter"]\` runs it.`;
+      return `${quotedString(front.pending ?? '')} is typed at the prompt and not run. \`send\` with \`keys: ["C-u"]\` clears it, or \`keys: ["Enter"]\` runs it.`;
     case 'running':
       if (front.starting) return `the shell is still running its startup files${front.process.shell ? '' : `, now ${quoted(front.process.argv)}`}, and \`run\` works once it has drawn its first prompt. \`look\` shows what it prints, \`send\` types into it.`;
       if (front.process.shell) return 'the shell itself is busy. `look` with `until: "end"` waits for it, `send` types into it. If a command removed the session\'s prompt hooks, `close` it and `open` it again.';
