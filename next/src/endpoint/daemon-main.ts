@@ -13,6 +13,7 @@ export interface DaemonOptions {
   env: Record<string, string>;
   version: string;
   log: (line: string) => void;
+  oomScoreAdj?: number;
   confirmMs?: number;
 }
 
@@ -27,7 +28,7 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
   const sessionsDir = path.join(dir, 'sessions');
   ensurePrivateDir(sessionsDir);
   const startedAt = Date.now();
-  const host = new Host({ openSession: o.openSession, shell: o.shell, env: o.env, sessionsDir, startedAt });
+  const host = new Host({ openSession: o.openSession, shell: o.shell, env: o.env, sessionsDir, startedAt, ...(o.oomScoreAdj ? { oomScoreAdj: o.oomScoreAdj } : {}) });
   const info = { version: o.version, pid: process.pid, startedAt };
   const conns = new Set<net.Socket>();
   let listening: Listening | undefined;

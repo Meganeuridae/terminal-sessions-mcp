@@ -27,10 +27,10 @@ const listening = (r: Listening | 'running'): Listening => {
   return r as Listening;
 };
 
-test('H1: the socket lives in the runtime directory, else in a directory of the user\'s own under the temporary one', () => {
+test('H1: the socket lives in the runtime directory, else in a directory of the user\'s own under /tmp', () => {
   assert.deepEqual(endpointPaths({ XDG_RUNTIME_DIR: '/run/user/1000' }), { dir: '/run/user/1000/terminal-sessions', socket: '/run/user/1000/terminal-sessions/daemon.sock' });
-  const fallback = endpointPaths({});
-  assert.equal(fallback.dir, path.join(os.tmpdir(), `terminal-sessions-${os.userInfo().uid}`));
+  const fallback = endpointPaths({ TMPDIR: '/var/host-tmp' });
+  assert.equal(fallback.dir, `/tmp/terminal-sessions-${os.userInfo().uid}`, "not $TMPDIR, which a host may set for its children alone");
   assert.equal(fallback.socket, path.join(fallback.dir, 'daemon.sock'));
   assert.equal(endpointPaths({ XDG_RUNTIME_DIR: 'relative/dir' }).dir, fallback.dir);
 });

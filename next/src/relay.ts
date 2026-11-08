@@ -121,7 +121,7 @@ export function startDaemon(daemonScript: string, socket: string, log: string): 
   const args = [daemonScript, '--socket', socket];
   if (process.platform === 'linux') {
     const unit = `terminal-sessions-${process.pid}-${Date.now()}`;
-    const props = ['KillMode=process', 'OOMPolicy=continue', 'LimitNOFILE=65536'].flatMap((p) => ['-p', p]);
+    const props = ['KillMode=process', 'OOMPolicy=continue'].flatMap((p) => ['-p', p]);
     const r = spawnSync('systemd-run', ['--user', '--collect', '--quiet', '--unit', unit, ...props, '--', process.execPath, ...args], { stdio: 'ignore', timeout: REACH_MS });
     if (r.status === 0) return `the user journal (journalctl --user -u ${unit})`;
   }

@@ -202,3 +202,21 @@ test('look shows each line once, but for the lines still live on the screen', as
   assert.match(second.text, /\nprompt\$ \nc$/);
   assert.doesNotMatch(second.text, /\nb\n/);
 });
+
+test('read with a pattern says how many lines were searched on their head only', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  opened[0]!.print('short needle', `${'x'.repeat(70_000)} needle`);
+  const r = await host.call(agent(), 'read', { name: 'main', match: 'needle' });
+  assert.match(r.text, /1 matching line; 1 line longer than the match window, searched on its head only/);
+});
+
+test('the shells start with the daemon\'s oom preference', async () => {
+  const opened: OpenOptions[] = [];
+  const host = new Host({
+    openSession: async (o: OpenOptions) => (opened.push(o), new FakeSession(o.name, o)),
+    shell: '/bin/bash', env: {}, sessionsDir: '/tmp/s', startedAt: STARTED, oomScoreAdj: 200,
+  });
+  await host.call(agent(), 'open', { name: 'main' });
+  assert.equal(opened[0]!.oomScoreAdj, 200);
+});

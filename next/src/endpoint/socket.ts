@@ -12,9 +12,13 @@ export interface EndpointPaths {
   socket: string;
 }
 
+/**
+ * Not os.tmpdir() for the fallback: it follows $TMPDIR, which a host may set for its own
+ * children, so a relay and a person's tsm would find different sockets and different daemons.
+ */
 export function endpointPaths(env: NodeJS.ProcessEnv = process.env): EndpointPaths {
   const runtime = env.XDG_RUNTIME_DIR;
-  const dir = runtime && path.isAbsolute(runtime) ? path.join(runtime, 'terminal-sessions') : path.join(os.tmpdir(), `terminal-sessions-${os.userInfo().uid}`);
+  const dir = runtime && path.isAbsolute(runtime) ? path.join(runtime, 'terminal-sessions') : `/tmp/terminal-sessions-${os.userInfo().uid}`;
   return { dir, socket: path.join(dir, 'daemon.sock') };
 }
 

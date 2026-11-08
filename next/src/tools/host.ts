@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import { validate, ValidationError } from '../api/validate.js';
 import { TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
-import { compileUserRegex, testBounded } from '../core/regex.js';
+import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, OpenSession, Session, SessionEvent } from '../session/types.js';
 import { endingText, exitText, frontText, linesText, RESULT_MAX_CHARS, screenText, statusLine } from './render.js';
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, type ToolDef } from './table.js';
@@ -36,6 +36,7 @@ export interface HostOptions {
   env: Record<string, string>;
   sessionsDir: string;
   startedAt: number;
+  oomScoreAdj?: number;
   now?: () => number;
 }
 
@@ -161,6 +162,7 @@ export class Host {
       parent: this.o.sessionsDir,
       nextCommandId: () => this.nextId++,
       waitMs: this.waitMs(a),
+      ...(this.o.oomScoreAdj ? { oomScoreAdj: this.o.oomScoreAdj } : {}),
     });
     if (this.entries.has(k)) {
       await session.close({ force: true });
@@ -277,8 +279,11 @@ export class Host {
     const re = this.regex(a.match as string);
     const ctx = (a.context as number | undefined) ?? 2;
     const hits: number[] = [];
+    let clipped = 0;
     lines.lines.forEach((line, i) => {
-      if (testBounded(re, line).matched) hits.push(i);
+      const t = testBounded(re, line);
+      if (t.clipped) clipped++;
+      if (t.matched) hits.push(i);
     });
     const shown = new Set<number>();
     for (const h of hits) for (let i = Math.max(0, h - ctx); i <= Math.min(lines.lines.length - 1, h + ctx); i++) shown.add(i);
@@ -290,7 +295,7 @@ export class Host {
       last = i;
     }
     const body = { from: 0, to: out.length, lines: out, dropped: lines.dropped, live: 0 };
-    const counted = `${head}\n${hits.length} matching line${hits.length === 1 ? '' : 's'}`;
+    const counted = `${head}\n${hits.length} matching line${hits.length === 1 ? '' : 's'}${clipped ? `; ${headOnlyText(clipped)}` : ''}`;
     return ok(`${counted}\n${linesText(body, RESULT_MAX_CHARS - counted.length - 1, 'narrow `lines` or the pattern')}`, { matches: hits.map((i) => lines.from + i) });
   }
 
