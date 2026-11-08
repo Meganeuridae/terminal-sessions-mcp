@@ -5,7 +5,7 @@ import { TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, OpenSession, Session, SessionEvent } from '../session/types.js';
-import { endingText, exitText, frontText, linesText, RESULT_MAX_CHARS, screenText, statusLine } from './render.js';
+import { endingText, exitText, frontText, linesText, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, type ToolDef } from './table.js';
 
 export interface Caller {
@@ -149,6 +149,19 @@ export class Host {
     if (!SESSION_NAME_RE.test(name)) return refused(`${JSON.stringify(name)} isn't a session name: 1 to 64 letters, digits, ".", "_" or "-".`, { error: 'invalid_argument' });
     const k = keyOf(caller.scope, name);
     if (this.entries.has(k)) return refused(`A session named ${JSON.stringify(name)} is already open in this scope. Use it, or \`close\` it first.`, { error: 'session_exists', session: name });
+    const cols = (a.cols as number | undefined) ?? 120;
+    const rows = (a.rows as number | undefined) ?? 40;
+    const fits = RESULT_MAX_CHARS - SCREEN_ROOM_CHARS;
+    if (screenChars(cols, rows) > fits) {
+      const maxRows = Math.floor(fits / (cols + 1));
+      const maxCols = Math.floor(fits / rows) - 1;
+      return refused(
+        `A terminal of ${cols} by ${rows} can show a screen of ${screenChars(cols, rows)} characters, more than a result can carry whole ` +
+          `(${RESULT_MAX_CHARS}, less ${SCREEN_ROOM_CHARS} for its other lines), so a full-screen program's status bar and prompt would be cut off. ` +
+          `${maxRows >= 1 ? `At ${cols} columns, up to ${maxRows} rows fit` : `No height fits at ${cols} columns`}; ${maxCols >= 1 ? `at ${rows} rows, up to ${maxCols} columns` : `no width fits at ${rows} rows`}.`,
+        { error: 'invalid_argument', fits: { cols: maxCols, rows: maxRows } },
+      );
+    }
     const raw = (a.cwd as string | undefined) ?? '~';
     const cwd = raw === '~' ? os.homedir() : raw.startsWith('~/') ? path.join(os.homedir(), raw.slice(2)) : raw;
     if (!path.isAbsolute(cwd)) return refused(`The directory ${JSON.stringify(raw)} must be absolute, or start with "~".`, { error: 'invalid_argument' });
@@ -156,8 +169,8 @@ export class Host {
       name,
       shell: this.o.shell,
       cwd,
-      cols: (a.cols as number | undefined) ?? 120,
-      rows: (a.rows as number | undefined) ?? 40,
+      cols,
+      rows,
       env: this.o.env,
       parent: this.o.sessionsDir,
       nextCommandId: () => this.nextId++,
@@ -221,7 +234,7 @@ export class Host {
     if (r.by === 'timeout') parts.push(until ? 'The wait ended before the pattern matched.' : 'Output was still changing when the wait ended.');
     if (r.matched) parts.push(`Matched at line ${r.matched.line}: ${r.matched.text}`);
     const used = parts.join('\n').length + 1;
-    parts.push(r.screen ? screenText(r.screen) : this.output(r.lines, undefined, RESULT_MAX_CHARS - used));
+    parts.push(r.screen ? screenText(r.screen, RESULT_MAX_CHARS - used) : this.output(r.lines, undefined, RESULT_MAX_CHARS - used));
     return ok(parts.join('\n'), { front: r.front, by: r.by, ended: r.ended, ...(r.matched ? { matched: r.matched } : {}), lines: { from: r.lines.from, to: r.lines.to } });
   }
 
@@ -365,7 +378,7 @@ export class Host {
 
   private tailText(e: Entry, status: string, c: Command | undefined = e.session.current() ?? e.session.last()): string {
     const screen = e.session.screen();
-    if (screen.alt) return screenText(screen);
+    if (screen.alt) return screenText(screen, RESULT_MAX_CHARS - status.length - 1);
     const all = e.session.lines(c?.from ?? 0, c?.to);
     const l = { ...all, from: Math.max(all.from, all.to - PUSH_LINES), lines: all.lines.slice(-PUSH_LINES), dropped: 0 };
     return linesText(l, RESULT_MAX_CHARS - status.length - 1, c ? `\`read\` with \`command: ${c.id}\` gives it whole` : '`read` gives the rest');

@@ -221,14 +221,32 @@ test('the shells start with the daemon\'s oom preference', async () => {
   assert.equal(opened[0]!.oomScoreAdj, 200);
 });
 
-test('open refuses a terminal wider or taller than the bound its memory gives, and opens one at it', async () => {
+test('open holds a terminal to the size whose whole screen fits in a result, naming the largest that fits, and a send and a wake at that size stay under the cap', async () => {
   const { host, opened } = setup();
-  for (const size of [{ cols: 501 }, { rows: 501 }]) {
-    const r = await host.call(agent(), 'open', { name: 'big', ...size });
-    assert.equal(r.isError, true);
-    assert.match(r.text, /must be <= 500/);
-  }
+  const wakes: Wake[] = [];
+  host.subscribe('a', async (w) => (wakes.push(w), false));
+  const big = await host.call(agent(), 'open', { name: 'big', cols: 500, rows: 500 });
+  assert.equal(big.isError, true);
+  assert.match(big.text, /A terminal of 500 by 500 can show a screen of 250500 characters, more than a result can carry whole \(24000, less 1000 for its other lines\).* At 500 columns, up to 45 rows fit; at 500 rows, up to 45 columns\./);
+  const tooWide = await host.call(agent(), 'open', { name: 'big', cols: 501 });
+  assert.match(tooWide.text, /must be <= 500/);
   assert.equal(opened.length, 0);
-  assert.equal((await host.call(agent(), 'open', { name: 'big', cols: 500, rows: 500 })).isError, undefined);
-  assert.equal(opened[0]!.opts.cols, 500);
+  assert.equal((await host.call(agent(), 'open', { name: 'big', cols: 500, rows: 45 })).isError, undefined);
+  const s = opened[0]!;
+  s.screenNow = { rows: Array.from({ length: 45 }, (_, i) => `${i}`.padEnd(500, 'x')), cursor: { row: 44, col: 499 }, alt: true, title: 'top' };
+  s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 9, argv: 'top', shell: false }, command: 1, waitVisible: true };
+  const sent = await host.call(agent(), 'send', { name: 'big', keys: ['Down'] });
+  assert.ok(sent.text.length <= RESULT_MAX_CHARS, `${sent.text.length}`);
+  assert.match(sent.text, /\n44x+$/, 'the bottom row is there');
+  assert.doesNotMatch(sent.text, /rows above not shown/);
+  s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 9, argv: `top ${'-x '.repeat(700)}`, shell: false }, command: 1, waitVisible: true };
+  const long = await host.call(agent(), 'send', { name: 'big', keys: ['Down'] });
+  assert.ok(long.text.length <= RESULT_MAX_CHARS, `with a 2,100-character command line in front: ${long.text.length}`);
+  assert.match(long.text, /\(\d+ rows? above not shown\)/);
+  assert.match(long.text, /\n44x+$/, 'the top rows go, not the bottom');
+  s.emit({ kind: 'waiting', front: { state: 'waiting', since: Date.now(), process: { pgid: 9, argv: 'top', shell: false }, command: 1, echo: true }, taken: false });
+  await settle();
+  assert.equal(wakes.length, 1);
+  assert.ok(wakes[0]!.text.length <= RESULT_MAX_CHARS, `${wakes[0]!.text.length}`);
+  assert.match(wakes[0]!.text, /\n44x+$/);
 });

@@ -13,13 +13,29 @@ export interface EndpointPaths {
 }
 
 /**
- * Not os.tmpdir() for the fallback: it follows $TMPDIR, which a host may set for its own
- * children, so a relay and a person's tsm would find different sockets and different daemons.
+ * Where $XDG_RUNTIME_DIR isn't set (a service run with User=, cron, a container), Linux's
+ * /run/user/<uid> is the directory a login, the user's systemd manager and its units are given,
+ * so it's tried next, then /tmp. Not os.tmpdir(): it follows $TMPDIR, which a host may set for its
+ * own children. Either way, a relay and a person's tsm would otherwise find different sockets and
+ * different daemons.
  */
-export function endpointPaths(env: NodeJS.ProcessEnv = process.env): EndpointPaths {
+export function endpointPaths(env: NodeJS.ProcessEnv = process.env, runUser: (uid: number) => string | undefined = linuxRunUser): EndpointPaths {
   const runtime = env.XDG_RUNTIME_DIR;
-  const dir = runtime && path.isAbsolute(runtime) ? path.join(runtime, 'terminal-sessions') : `/tmp/terminal-sessions-${os.userInfo().uid}`;
+  const uid = os.userInfo().uid;
+  const base = runtime && path.isAbsolute(runtime) ? runtime : runUser(uid);
+  const dir = base ? path.join(base, 'terminal-sessions') : `/tmp/terminal-sessions-${uid}`;
   return { dir, socket: path.join(dir, 'daemon.sock') };
+}
+
+function linuxRunUser(uid: number): string | undefined {
+  if (process.platform !== 'linux') return undefined;
+  const dir = `/run/user/${uid}`;
+  try {
+    const st = fs.lstatSync(dir);
+    return st.isDirectory() && st.uid === uid && (st.mode & 0o077) === 0 ? dir : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export class EndpointError extends Error {

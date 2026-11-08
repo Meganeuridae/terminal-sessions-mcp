@@ -1,4 +1,5 @@
 import type { Schema } from '../api/validate.js';
+import { RESULT_MAX_CHARS, SCREEN_ROOM_CHARS } from './render.js';
 
 export interface ToolDef {
   name: string;
@@ -25,11 +26,12 @@ const wait: Schema = {
 export const SESSION_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
 /**
- * The largest terminal `open` makes. Each session's emulator keeps 10,000 lines of scrollback, so
- * its memory grows with the columns: measured with @xterm/headless 6.0.0 on Node 24, a terminal at
- * full scrollback took 20.5 MiB at 80 columns, 24.2 at 200 and 39.1 at 500, about 0.07 MiB a
- * column, all of it in the daemon that holds every session. At 500 by 500 one session stays near
- * 50 MB; at 10,000 columns it would be about 730 MiB.
+ * `open` holds a terminal to what one result can show whole: (cols + 1) × rows within
+ * RESULT_MAX_CHARS less SCREEN_ROOM_CHARS (render.ts), so 23,000 characters. Its cost is the
+ * daemon's memory, which grows with the columns because each session's emulator keeps 10,000
+ * lines of scrollback: measured with @xterm/headless 6.0.0 on Node 24, a terminal at full
+ * scrollback took 20.5 MiB at 80 columns, 24.2 at 200 and 39.1 at 500. This maximum on each side
+ * is a backstop for the schema; the widest terminal that fits, 500 by 45, is near 39 MiB.
  */
 export const SIZE_MAX = 500;
 
@@ -44,8 +46,8 @@ export const TOOLS: readonly ToolDef[] = [
       properties: {
         name,
         cwd: { type: 'string', description: 'The directory to start in: absolute, or starting with `~`. Your home directory when left out.' },
-        cols: { type: 'integer', minimum: 1, maximum: SIZE_MAX, description: `Terminal width in columns, up to ${SIZE_MAX}; 120 when left out. Each column costs the daemon memory across the whole scrollback.` },
-        rows: { type: 'integer', minimum: 1, maximum: SIZE_MAX, description: `Terminal height in rows, up to ${SIZE_MAX}; 40 when left out.` },
+        cols: { type: 'integer', minimum: 1, maximum: SIZE_MAX, description: `Terminal width in columns; 120 when left out. Columns plus one, times rows, may be at most ${RESULT_MAX_CHARS - SCREEN_ROOM_CHARS}, so a whole screen fits in one result.` },
+        rows: { type: 'integer', minimum: 1, maximum: SIZE_MAX, description: 'Terminal height in rows; 40 when left out.' },
       },
       required: ['name'],
       additionalProperties: false,

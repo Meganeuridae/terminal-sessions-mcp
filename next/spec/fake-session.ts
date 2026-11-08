@@ -15,6 +15,7 @@ export class FakeSession implements Session {
   private nextWatch = 1;
   runMode: 'refuse' | 'end' | 'run' = 'end';
   closedWith: Exit | undefined;
+  screenNow: Screen | undefined;
 
   constructor(readonly name: string, readonly opts: OpenOptions) {
     this.dir = opts.cwd;
@@ -40,7 +41,7 @@ export class FakeSession implements Session {
     return { from, to: end, lines: this.out.slice(from, end), dropped: 0, live: to === undefined ? Math.min(this.live, end - from) : 0 };
   }
   screen(): Screen {
-    return { rows: this.out.slice(-5), cursor: { row: 0, col: 0 }, alt: false, title: '' };
+    return this.screenNow ?? { rows: this.out.slice(-5), cursor: { row: 0, col: 0 }, alt: false, title: '' };
   }
   keyOptions(): { appCursor: boolean } {
     return { appCursor: false };
@@ -96,7 +97,7 @@ export class FakeSession implements Session {
   async send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean }): Promise<SendOutcome> {
     this.calls.push({ method: 'send', args: [bytes, opts] });
     const from = this.out.length;
-    return { sent: this.frontNow.state !== 'exited', lines: this.lines(from), front: this.frontNow, ended: [], by: 'quiet' };
+    return { sent: this.frontNow.state !== 'exited', lines: this.lines(from), ...(this.screenNow?.alt ? { screen: this.screenNow } : {}), front: this.frontNow, ended: [], by: 'quiet' };
   }
 
   async wait(until: Until, opts: { waitMs: number; from: number; take?: boolean }): Promise<WaitOutcome> {

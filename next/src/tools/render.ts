@@ -110,8 +110,29 @@ export function linesText(l: Lines, budget: number, readHint: string): string {
   return [...out, ...head, ...(left > 0 ? [marker(left)] : []), ...tail].join('\n');
 }
 
-export function screenText(s: Screen): string {
+/**
+ * The room a result keeps beside a whole screen, for its status line, the screen's own line and a
+ * matched line, which an ordinary command line, directory and title keep well within. `open` holds
+ * a terminal to the size whose screen fits in RESULT_MAX_CHARS less this, so an agent sees a
+ * full-screen program's screen whole, status bar and prompt included.
+ */
+export const SCREEN_ROOM_CHARS = 1_000;
+
+/** The most characters a screen of `cols` by `rows` can take: each row and its line break. */
+export const screenChars = (cols: number, rows: number): number => (cols + 1) * rows;
+
+export function screenText(s: Screen, budget: number): string {
   const rows = [...s.rows];
   while (rows.length && rows[rows.length - 1]!.trimEnd() === '') rows.pop();
-  return [`(screen${s.alt ? ', full-screen program' : ''}${s.title ? `, title ${JSON.stringify(s.title)}` : ''}; cursor at row ${s.cursor.row + 1}, column ${s.cursor.col + 1})`, ...rows].join('\n');
+  const head = `(screen${s.alt ? ', full-screen program' : ''}${s.title ? `, title ${JSON.stringify(s.title)}` : ''}; cursor at row ${s.cursor.row + 1}, column ${s.cursor.col + 1})`;
+  let text = [head, ...rows].join('\n');
+  // Only lines past the room open's bound keeps (a very long command line in front, a long
+  // title) can bring a whole screen past the budget; then its top rows go, not the cap.
+  let dropped = 0;
+  while (text.length > budget && rows.length > 1) {
+    rows.shift();
+    dropped++;
+    text = [head, `(${dropped} row${dropped === 1 ? '' : 's'} above not shown)`, ...rows].join('\n');
+  }
+  return text;
 }

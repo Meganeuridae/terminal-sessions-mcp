@@ -27,12 +27,13 @@ const listening = (r: Listening | 'running'): Listening => {
   return r as Listening;
 };
 
-test('H1: the socket lives in the runtime directory, else in a directory of the user\'s own under /tmp', () => {
+test('H1: the socket lives in the runtime directory, else in /run/user/<uid>, else in a directory of the user\'s own under /tmp', () => {
   assert.deepEqual(endpointPaths({ XDG_RUNTIME_DIR: '/run/user/1000' }), { dir: '/run/user/1000/terminal-sessions', socket: '/run/user/1000/terminal-sessions/daemon.sock' });
-  const fallback = endpointPaths({ TMPDIR: '/var/host-tmp' });
+  const fallback = endpointPaths({ TMPDIR: '/var/host-tmp' }, () => undefined);
   assert.equal(fallback.dir, `/tmp/terminal-sessions-${os.userInfo().uid}`, "not $TMPDIR, which a host may set for its children alone");
+  assert.equal(endpointPaths({}, (uid) => `/run/user/${uid}`).dir, `/run/user/${os.userInfo().uid}/terminal-sessions`, "without $XDG_RUNTIME_DIR, the user's /run/user directory before /tmp");
   assert.equal(fallback.socket, path.join(fallback.dir, 'daemon.sock'));
-  assert.equal(endpointPaths({ XDG_RUNTIME_DIR: 'relative/dir' }).dir, fallback.dir);
+  assert.equal(endpointPaths({ XDG_RUNTIME_DIR: 'relative/dir' }, () => undefined).dir, fallback.dir);
 });
 
 test('H1: the directory is made 0700, and one others can enter, or a symbolic link, is refused', () => {
