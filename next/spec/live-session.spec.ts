@@ -341,6 +341,27 @@ for (const sh of shells) {
       assert.equal(s.front().state, 'prompt');
     });
 
+    test('a program splicing from the terminal shows as waiting only while it waits for input, not for room in its pipe', { skip: process.platform !== 'linux' || !which('python3') ? 'Linux with python3 only' : false }, async () => {
+      const s = await open(shell);
+      const events: SessionEvent[] = [];
+      s.onEvent((e) => events.push(e));
+      const empty = await s.run(`python3 -c 'import os; r, w = os.pipe(); print("TRANSFERRED:%d" % os.splice(0, w, 4096))'`, { waitMs: 4000 });
+      assert.equal(empty.kind, 'running');
+      assert.equal(empty.front.state, 'waiting');
+      const sent = await s.send('X\r', { waitMs: 3000, until: /^TRANSFERRED:2$/ });
+      assert.equal(sent.by, 'match');
+      await s.wait({ kind: 'end' }, { waitMs: 3000, from: 0 });
+      events.length = 0;
+      const full = await s.run(`python3 -c 'import os, fcntl; r, w = os.pipe(); fcntl.fcntl(w, 1031, 4096); os.write(w, b"x" * 4096); print("FULL", flush=True); print("TRANSFERRED:%d" % os.splice(0, w, 4096))'`, { waitMs: 1500 });
+      assert.equal(full.kind, 'running');
+      assert.equal(full.front.state, 'running');
+      await s.send('Y\r', { waitMs: 1000 });
+      assert.equal(s.front().state, 'running');
+      assert.ok(!events.some((e) => e.kind === 'waiting'));
+      await s.stop();
+      assert.equal(s.front().state, 'prompt');
+    });
+
     test('a password read shows as waiting without echo', { skip: process.platform !== 'linux' || sh.name === 'fish' ? 'Linux, bash and zsh only' : false }, async () => {
       const s = await open(shell);
       const r = await s.run(sh.name === 'zsh' ? 'read -s pw' : 'read -s pw', { waitMs: 3000 });

@@ -2,15 +2,16 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 
 const LINUX = process.platform === 'linux';
+const ARM64 = process.arch === 'arm64';
+/** read and readv, whose only wait is for their input. */
+const READS: ReadonlySet<number> = new Set(ARM64 ? [63, 65] : [0, 19]);
 /**
- * The calls a process blocks in to read a descriptor, by number, each with the field of
- * /proc/PID/syscall that names the descriptor: read, readv, sendfile (its input) and splice (its
- * input). uutils' cat, which Ubuntu 26.04 ships, waits in splice.
+ * splice moves its input into a pipe, and waits either for input or for room in the pipe; only the
+ * wait channel tells them apart. uutils' cat, which Ubuntu 26.04 ships, waits in splice.
  */
-const READS: ReadonlyMap<number, number> =
-  process.arch === 'arm64'
-    ? new Map([[63, 1], [65, 1], [71, 2], [76, 1]])
-    : new Map([[0, 1], [19, 1], [40, 2], [275, 1]]);
+const SPLICE = ARM64 ? 76 : 275;
+/** The wait channel of a terminal read with nothing to read: n_tty_read's. */
+const TERMINAL_READ_WAIT = 'wait_woken';
 const MAX_DESCENDANTS = 1024;
 
 export interface Groups {
@@ -91,11 +92,14 @@ export function readsTerminal(pid: number, pts: string): boolean | undefined {
     return undefined;
   }
   if (sc[0] === 'running') return false;
-  const field = READS.get(Number(sc[0]));
-  if (field === undefined) return false;
+  const call = Number(sc[0]);
+  if (!READS.has(call) && call !== SPLICE) return false;
   try {
-    const link = fs.readlinkSync(`/proc/${pid}/fd/${Number.parseInt(sc[field] ?? '', 16)}`);
-    return link === pts || link === '/dev/tty';
+    const link = fs.readlinkSync(`/proc/${pid}/fd/${Number.parseInt(sc[1] ?? '', 16)}`);
+    if (link !== pts && link !== '/dev/tty') return false;
+    if (call !== SPLICE) return true;
+    const wait = fs.readFileSync(`/proc/${pid}/wchan`, 'utf8').trim();
+    return wait === '0' || wait === '' ? undefined : wait === TERMINAL_READ_WAIT;
   } catch {
     return undefined;
   }
