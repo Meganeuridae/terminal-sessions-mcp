@@ -4,12 +4,14 @@
 # termd-launch.sh finds node (nvm's default version, Volta, /usr/local, ~/.local; or
 # Environment=TSM_NODE_BIN=/path/to/node), puts those directories on PATH and starts in $HOME.
 # Logs go to the journal: journalctl --user -u termd. Without this unit, the first tsm-relay or
-# tsm that finds no daemon starts one as a transient unit of its own.
+# tsm that finds no daemon starts one: as a transient unit of its own where systemd-run works,
+# otherwise detached, in the starter's own control group, where stopping the starter's service
+# stops the daemon too.
 [Unit]
 Description=terminal sessions daemon (termd)
 
 [Service]
-ExecStart=/bin/sh PACKAGE/next/config/termd-launch.sh
+ExecStart=/bin/sh "PACKAGE/next/config/termd-launch.sh"
 WorkingDirectory=%h
 # No UMask= here: the sessions' shells inherit this mask, so files a session creates keep the
 # usual permissions; termd makes its own directory and socket owner-only by mode.

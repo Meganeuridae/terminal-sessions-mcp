@@ -1,16 +1,17 @@
 /** Named keys for `input` (G8, §11.1): the vocabulary and the cursor-key mode. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import { decodeKey, inputBytes, NAMED_KEYS } from '../src/core/keys.js';
 
-test('G8: every 1.6 key name still decodes to the same bytes in normal cursor mode', () => {
-  const legacy: Record<string, string> = {
-    Enter: '\r', Tab: '\t', 'Shift-Tab': '\x1b[Z', Esc: '\x1b', Escape: '\x1b', Space: ' ', Backspace: '\x7f',
-    Delete: '\x1b[3~', Up: '\x1b[A', Down: '\x1b[B', Right: '\x1b[C', Left: '\x1b[D', Home: '\x1b[H', End: '\x1b[F',
-    PageUp: '\x1b[5~', PageDown: '\x1b[6~', F1: '\x1bOP', F4: '\x1bOS', F5: '\x1b[15~', F12: '\x1b[24~',
-    'C-c': '\x03', 'C-a': '\x01', 'C-z': '\x1a', 'C-D': '\x04', 'M-x': '\x1bx', 'M-X': '\x1bX', 'M-.': '\x1b.',
-  };
-  for (const [name, bytes] of Object.entries(legacy)) assert.equal(decodeKey(name), bytes, name);
+test('G8: 1.x\'s key names (its table, C-a to C-z and M-<char>) still decode to the same bytes in normal cursor mode', () => {
+  const legacy = createRequire(import.meta.url)('../../../dist/src/server/keys.js') as { NAMED_KEYS: Record<string, string>; decodeKey(name: string): string };
+  const names = [
+    ...Object.keys(legacy.NAMED_KEYS),
+    ...'abcdefghijklmnopqrstuvwxyz'.split('').flatMap((c) => [`C-${c}`, `C-${c.toUpperCase()}`]),
+    ...' !"#$%&\'()*+,-./0123456789:;<=>?@[\\]^_`{|}~abcxyzABCXYZ'.split('').map((c) => `M-${c}`),
+  ];
+  for (const name of names) assert.equal(decodeKey(name), legacy.decodeKey(name), name);
 });
 
 test('emu-16: control chords beyond the letters, Insert, S-Tab and the tmux aliases', () => {

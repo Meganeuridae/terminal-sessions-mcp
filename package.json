@@ -24,7 +24,7 @@
     "prepublishOnly": "npm run build",
     "postinstall": "node -e \"const fs=require('fs'),path=require('path');try{const p=path.join(path.dirname(require.resolve('node-pty/package.json')),'build/Release/spawn-helper');fs.chmodSync(p,0o755);}catch(e){}\"",
     "build:next": "node -e \"require('node:fs').rmSync('next/dist', { recursive: true, force: true })\" && tsc -p next/tsconfig.json",
-    "test:next": "npm run build:next && node --test next/dist/spec/*.spec.js",
+    "test:next": "npm run build && node --test next/dist/spec/*.spec.js",
     "acceptance:af": "npm run build:next && node next/acceptance/agent-framework.mjs",
     "acceptance:bridge": "npm run build:next && bun next/acceptance/bridge.ts"
   },

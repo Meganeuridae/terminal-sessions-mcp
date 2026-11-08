@@ -45,10 +45,12 @@ const deadline = setTimeout(() => {
   process.exit(1);
 }, 180_000);
 
+const CONFIG = path.resolve(import.meta.dirname, '../config');
+const shippedServer = JSON.parse(fs.readFileSync(path.join(CONFIG, 'agent-framework.recipe.json'), 'utf8')).mcplServers[0];
 const GATE = process.env.ACCEPTANCE_GATE;
 let gateOption = {};
 if (GATE) {
-  const shipped = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, '../config/agent-framework.gate.json'), 'utf8'));
+  const shipped = JSON.parse(fs.readFileSync(path.join(CONFIG, 'agent-framework.gate.json'), 'utf8'));
   const configPath = path.join(tmp, 'gate.json');
   fs.writeFileSync(configPath, JSON.stringify({ default: 'defer', policies: GATE === 'shipped' ? shipped.policies : [] }));
   gateOption = { gate: { configPath } };
@@ -65,14 +67,10 @@ const framework = await AgentFramework.create({
   ...gateOption,
   mcplServers: [
     {
-      id: 'terminal',
-      transport: 'stdio',
+      ...shippedServer,
       command: process.execPath,
-      args: [path.join(DIST, 'relay.js'), '--socket', socket, '--scope', 'scout'],
-      toolPrefix: 'terminal',
-      reconnect: true,
+      args: [path.join(DIST, 'relay.js'), '--socket', socket, ...shippedServer.args.map((a) => (a === 'AGENT' ? 'scout' : a))],
       reconnectIntervalMs: 300,
-      enabledFeatureSets: ['terminal.tools', 'terminal.events'],
     },
   ],
 });

@@ -31,9 +31,8 @@
  * more. `execBounded` and `testBounded` match the head of a line within that
  * window and say when they cut (G11: truncation is visible).
  *
- * Where the engine is unavailable, patterns fall back to the backtracking engine
- * behind a refusal of the classic catastrophic shapes; `LINEAR_REGEX` says which
- * is in force.
+ * Where the engine can't be enabled, caller patterns are refused, saying why: no check of a
+ * pattern's shape keeps the backtracking engine bounded. `LINEAR_REGEX` says whether it is on.
  */
 import v8 from 'node:v8';
 import { err } from './errors.js';
@@ -95,7 +94,7 @@ export function compileUserRegex(pattern: string, flags = ''): RegExp {
   } catch (e) {
     throw err('invalid_argument', `invalid pattern: ${(e as Error).message}`);
   }
-  if (!LINEAR_REGEX) return backtracking(pattern, base);
+  if (!LINEAR_REGEX) throw err('invalid_argument', "patterns can't be used here: this Node's linear-time regex engine can't be enabled, and patterns don't run without it");
   const source = base.includes('i') ? foldCase(pattern) : pattern;
   // Syntax the parser does not model is compiled as written, on the smallest window.
   const parsed = parse(source);
@@ -151,14 +150,6 @@ export function testBounded(re: RegExp, text: string): { matched: boolean; clipp
 export function headOnlyText(n?: number): string {
   if (n === undefined) return 'the line is longer than the match window: matched on its head only';
   return `${n} line${n === 1 ? '' : 's'} longer than the match window, searched on ${n === 1 ? 'its' : 'their'} head only`;
-}
-
-/** The fallback: refuse back-references and the classic exponential shapes. */
-function backtracking(pattern: string, flags: string): RegExp {
-  if (/\\[1-9]|\\k</.test(pattern)) throw err('invalid_argument', 'back-references are not supported in patterns');
-  // A quantified group that itself contains a quantifier: `(a+)+`, `(\\w*x)*`.
-  if (/\((?:[^()\\]|\\.)*[+*}](?:[^()\\]|\\.)*\)\s*[+*{]/.test(pattern)) throw err('invalid_argument', 'nested quantifiers (like (a+)+) are refused: they can take exponential time');
-  return new RegExp(pattern, flags);
 }
 
 // ───────────── the pattern's structure: groups and counted repetition ─────────────

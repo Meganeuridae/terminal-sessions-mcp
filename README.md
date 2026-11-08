@@ -4,7 +4,7 @@
 
 ## Terminal sessions 2.0, beside 1.x
 
-This package also ships **2.0**, persistent shells for agents: one daemon (`termd`) per user keeps each session's login shell alive between calls and connections, an agent types into it only through explicit calls and gets each command's exit status, duration and directory with its output, and an MCPL host is woken only when a command ends, a program waits for input, a shell dies or a pattern it asked for appears. It is in [`next/`](next/README.md). Its binaries are `termd`, `tsm` and `tsm-relay`. Everything below is about the 1.x binaries (`terminal-sessions-mcp`, `session-server`, `session-cli`), which run 1.x. 2.0 changes none of their code; what reaches them is the package manifest they share with 2.0: a narrower Node range (`engines`).
+This package also ships **2.0**, persistent shells for agents: one daemon (`termd`) per user keeps each session's login shell alive between calls and connections, an agent types into it only through explicit calls and gets the exit status, duration and directory of each command `run` types in an integrated shell, with its output, and an MCPL host is woken only when a command ends, a program waits for input, a shell dies or a pattern it asked for appears. It is in [`next/`](next/README.md). Its binaries are `termd`, `tsm` and `tsm-relay`. Everything below is about the 1.x binaries (`terminal-sessions-mcp`, `session-server`, `session-cli`), which run 1.x. 2.0 changes none of their code; what reaches them is the package they share with 2.0: a narrower Node range (`engines`), `npm run build` and `npm test` building 2.0 too, and 2.0's dependencies installing with it.
 
 ## Why This Matters
 
@@ -350,7 +350,7 @@ npx ts-node examples/service-management.ts
 
 ## Requirements
 
-- **Node.js** 22.12 or later within 22.x, or 24.x (`engines`: `>=22.12.0 <25.0.0`; Node 20 reached its end of life on 2026-04-30; `session-cli` requires an ES-module-only dependency, which `require` loads from 22.12 on; Node 21 and 22.0 to 22.11 are out; Node 25+ not yet supported due to node-pty compatibility)
+- **Node.js** 22.12 or later, below 25 (`engines`: `>=22.12.0 <25.0.0`; Node 20 reached its end of life on 2026-04-30; `session-cli` requires an ES-module-only dependency, which `require` loads from 22.12 on; Node 21 and 22.0 to 22.11 are out; Node 25+ not yet supported due to node-pty compatibility)
 
 ## Configuration
 

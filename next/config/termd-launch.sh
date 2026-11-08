@@ -43,26 +43,28 @@ nvm_newest() {
 
 # nvm keeps each version under $NVM_DIR/versions/node/vX.Y.Z and names the one `nvm use`
 # picks by default in alias/default: a version, the start of one (24, 24.22), `node`, or
-# another alias (lts/* -> lts/jod -> v22.11.0). Its `current` link exists only when the user
-# asked nvm for it, so the alias is followed as nvm follows it, with the shell's builtins
-# alone (the house's read of 59f660b, #22). An alias nothing installed answers to falls back
-# to the newest installed version.
+# another alias (lts/* -> lts/jod -> v22.11.0), followed here as nvm follows it, with the
+# shell's builtins alone. Its `current` link, made only when the user asks nvm for one, points at
+# the version the last `nvm use` chose.
 nvm_bin() {
   dir=${NVM_DIR:-$HOME/.nvm}
-  if [ -d "$dir/current/bin" ]; then echo "$dir/current/bin"; return 0; fi
   [ -d "$dir/versions/node" ] || return 1
-  want=default hops=0
-  while [ -f "$dir/alias/$want" ] && [ "$hops" -lt 8 ]; do
-    read -r want < "$dir/alias/$want" || :
-    hops=$((hops + 1))
-  done
-  case $want in
-    system) return 1 ;;
-    ''|node|stable|latest) pre= ;;
-    v[0-9]*) pre=$want ;;
-    *) pre=v$want ;;
-  esac
-  nvm_newest "$pre" || nvm_newest ''
+  if [ -f "$dir/alias/default" ]; then
+    want=default hops=0
+    while [ -f "$dir/alias/$want" ] && [ "$hops" -lt 8 ]; do
+      read -r want < "$dir/alias/$want" || :
+      hops=$((hops + 1))
+    done
+    case $want in
+      system) return 1 ;;
+      ''|node|stable|latest) pre= ;;
+      v[0-9]*) pre=$want ;;
+      *) pre=v$want ;;
+    esac
+    if nvm_newest "$pre"; then return 0; fi
+  fi
+  if [ -d "$dir/current/bin" ]; then echo "$dir/current/bin"; return 0; fi
+  nvm_newest ''
 }
 
 # Prepended in reverse, so a version manager the user chose wins, then Homebrew, then /usr/local.
@@ -78,6 +80,7 @@ prepend /opt/homebrew/bin
 prepend "$HOME/.local/bin"
 if nvm=$(nvm_bin); then prepend "$nvm"; fi
 prepend "$HOME/.volta/bin"
+if [ -n "${TSM_NODE_BIN:-}" ]; then prepend "$(dirname "$TSM_NODE_BIN")"; fi
 export PATH
 
 daemon=${TSM_DAEMON:-"$here/../dist/src/daemon.js"}

@@ -49,19 +49,16 @@ const deadline = setTimeout(() => {
   process.exit(1)
 }, 180_000)
 
-const wake = { wake: [['terminal:ended'], ['terminal:waiting'], ['terminal:exited'], ['terminal:match']] }
+const shipped = JSON.parse(fs.readFileSync(path.resolve(import.meta.dir, '../config/mcpl-bridge.json'), 'utf8')).servers.terminal
+const wake = shipped.wake
 const gate = new WakeGate(wake)
 const deliveries: any[] = []
 const hostLog: string[] = []
 const h = new McplServerHandle(
   'terminal',
   {
-    transport: { command: node, args: [path.join(DIST, 'relay.js'), '--socket', socket, '--scope', 'claude'] },
-    grant: ['tools', 'pushEvents'],
-    enableFeatureSets: ['terminal.tools', 'terminal.events'],
-    toolPrefix: 'terminal',
-    wake,
-    reconnect: true,
+    ...shipped,
+    transport: { command: node, args: [path.join(DIST, 'relay.js'), '--socket', socket, ...shipped.transport.args] },
     reconnectIntervalMs: 300,
   } as any,
   { deliver: (m: any) => deliveries.push(m), toolsChanged: () => {}, log: (line: string) => hostLog.push(line) },

@@ -5,8 +5,9 @@
 A new implementation ships beside the 1.x session server, MCP bridge and CLI. It lives in `next/`
 (`next/README.md`); its binaries are `termd`, `tsm` and `tsm-relay`. 2.0 removes or renames nothing
 of 1.x: `terminal-sessions-mcp`, `session-server` and `session-cli` run 1.x, and 2.0 changes none of
-their code. What reaches them is the package manifest they share with 2.0: a narrower Node range
-(`engines`).
+their code. What reaches them is the package they share with 2.0: a narrower Node range
+(`engines`), `npm run build` and `npm test` building 2.0 too, and 2.0's dependencies installing
+with it.
 
 ### Added
 
@@ -16,7 +17,7 @@ their code. What reaches them is the package manifest they share with 2.0: a nar
 - **Sessions are your own login shell** (bash, zsh or fish) with your startup files, persisting
   across calls, connections and host restarts. A daemon restart ends them, and says so.
 - **Eight tools:** `open`, `run`, `send`, `look`, `read`, `stop`, `list` and `close`. Every result
-  opens with a status line: the command's exit status (or "status unknown"), its duration and
+  about a session opens with its status line: the command's exit status (or "status unknown"), its duration and
   directory, and what is in front of the shell now. `run` types only at the prompt; `send` types
   exactly what it is given and returns its effect.
 - **Wakes over MCPL** (feature set `terminal.events`): a command ended that no call was waiting on,
@@ -28,7 +29,7 @@ their code. What reaches them is the package manifest they share with 2.0: a nar
 
 ### Changed
 
-- Node 22.12 or later (`engines`: `>=22.12.0 <25.0.0`): Node 20 reached its end of life on 2026-04-30; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
+- Node 22.12 or later, below 25 (`engines`: `>=22.12.0 <25.0.0`): Node 20 reached its end of life on 2026-04-30; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
 - `npm run build` compiles both trees; `npm test` runs 1.x's suite and `npm run test:next` 2.0's.
 - New dependencies: `@animalabs/mcpl-core` and `@xterm/headless` 6.0.0.
 

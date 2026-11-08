@@ -1,5 +1,7 @@
 # Terminal Sessions — Rearchitecture Proposal
 
+> **A first draft, superseded, kept as a record.** `DESIGN.md` integrated it with `draft-1-codex.md` into the design 2.0 was first built to, and 2.0 has since been rebuilt on a smaller design: a daemon on a Unix socket, eight tools and four wakes, with no session channels. [`next/README.md`](../../next/README.md) describes what the code does now.
+
 **Status:** Proposal, draft 1 — not yet reviewed
 **Targets:** successor to `terminal-sessions-mcp` (npm `term-sessions-mcp` 1.6.0); MCPL SPEC.md 0.5.0-draft; agent-framework host
 **Authors:** Claude Code (Fable 5.1), with Aster
