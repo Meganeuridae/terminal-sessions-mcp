@@ -21,7 +21,6 @@ import { cutTail, safeCut } from '../core/text.js';
 import { DEFAULT_GEOMETRY, type Attribution, type EnvBasis, type JournalEvent, type Principal, type RunInfo, type RunTarget, type ScreenSnapshot, type Seq, type ServiceStatus, type Visibility } from '../core/types.js';
 import { SYSTEM } from '../core/types.js';
 import { WatchManager, type WaitResult, type WatchInfo, type WatchSpec } from '../core/watches.js';
-import { guiActsFor } from './principals.js';
 import { endedMessage, type AnySession, type CreateOptions, type SessionRegistry } from './registry.js';
 import { readJournal, searchJournal, type ReadOptions, type ReadResult, type ReadSource, type SearchOptions, type SearchResult } from './reader.js';
 
@@ -416,8 +415,7 @@ export class App {
     if (principal === SYSTEM) return true;
     const owner = s.kind === 'live' ? s.session.owner : s.owner;
     const visibility = s.kind === 'live' ? s.session.visibility : s.visibility;
-    // The GUI of a token's own principal (`human:gui:<owner>`) acts for that owner (§12).
-    if (principal === owner || guiActsFor(principal, owner)) return true;
+    if (principal === owner) return true;
     if (visibility !== 'shared') return false;
     if (verb === 'observe') return true;
     if (verb === 'destroy') return false;
@@ -444,11 +442,6 @@ export class App {
     // Only the owner starts a new life (G30): an observer is not sent to a tool that refuses them (the house's read of 1cabc6a, #22).
     if (s.kind !== 'live') throw err('session_exited', endedMessage(s, this.can(caller.principal, s, 'run')), { session: id });
     return s.session;
-  }
-
-  /** The owner's own GUI human acts with the owner's seat and cancel rights (§12, tsg-13). */
-  private seat(caller: Caller, session: Session): { asOwner?: boolean } {
-    return guiActsFor(caller.principal, session.owner) ? { asOwner: true } : {};
   }
 
   private ensureAttached(caller: Caller, session: Session): void {
@@ -575,13 +568,13 @@ export class App {
       async () => {
         const { idempotencyKey: _k, role: _r, id, ...create } = o;
         const { session, created } = await this.liveSession(caller, id, 'observe', create);
-        // `role: controller` asks for the seat. attach grants a free seat; the owner (and its GUI, like `run`)
+        // `role: controller` asks for the seat. attach grants a free seat; the owner, like `run`,
         // also takes a held seat over, under owner-priority or from a dropped holder — the same rule `run` uses,
         // which attach alone did not apply (the house's read of 1cabc6a, #22). Anyone else is refused (not_controller).
         const att = session.attach(caller.principal, caller.connectionId, o.role === 'controller' ? 'auto' : (o.role ?? 'auto'));
         let role = att.role;
         if (o.role === 'controller' && role !== 'controller') {
-          session.takeControl(caller.principal, this.seat(caller, session));
+          session.takeControl(caller.principal);
           role = 'controller';
         }
         const res: { created: boolean; info: SessionSummary; role: 'observer' | 'controller'; ignored?: string[] } = { created, info: this.summary(this.entry(session)), role };
@@ -676,7 +669,7 @@ export class App {
 
   /**
    * Who owns a new life of a name whose shell ended (G30): its recorded owner, when the caller is that
-   * owner or its GUI (§12); refused for anyone else, with the reason.
+   * owner; refused for anyone else, with the reason.
    */
   private newLifeOwner(caller: Caller, existing: AnySession | undefined, id: string): Principal {
     if (!existing || caller.principal === SYSTEM) return caller.principal;
@@ -686,7 +679,7 @@ export class App {
     // registry's own re-read first (the house's read of the 36 commits, #22, comment 6269992150).
     const current = existing.kind === 'history' ? this.registry.rereadIfRefused(id) ?? existing : existing;
     const owner = current.kind === 'live' ? current.session.owner : current.owner;
-    if (caller.principal === owner || guiActsFor(caller.principal, owner)) return owner;
+    if (caller.principal === owner) return owner;
     if (!this.can(caller.principal, current, 'observe')) throw err('session_exists', `the name ${id} belongs to another principal; choose another name`, { session: id });
     throw err('forbidden', endedMessage(current, false), { session: id, owner });
   }
@@ -730,7 +723,6 @@ export class App {
         if (o.queue) admitOpts.queue = true;
         if (o.envBasis) admitOpts.envBasis = o.envBasis;
         if (idem !== undefined) admitOpts.idem = idem;
-        Object.assign(admitOpts, this.seat(caller, session));
         const a = await session.admitWhenAvailable(admitOpts);
         if (!a.admitted) return this.busyResult(session, target, a.reason, a.busy, created);
         const result = await this.finishRun(caller, this.entry(session), a.run.runId, o.wait);
@@ -762,7 +754,7 @@ export class App {
         // nothing to declare, and a refusal must not leave a shell it started (the house's read of 1cabc6a, #22).
         const session = this.liveFor(caller, o.session, 'run');
         this.ensureAttached(caller, session);
-        const r = session.declareShell({ principal: caller.principal, ...(o.shell !== undefined && { shell: o.shell }), ...(o.within !== undefined && { within: o.within }), ...this.seat(caller, session) });
+        const r = session.declareShell({ principal: caller.principal, ...(o.shell !== undefined && { shell: o.shell }), ...(o.within !== undefined && { within: o.within }) });
         const res: { session: string; shell: string | null; within: string | null; depth: number; line?: string } = { session: session.id, ...r };
         const line = r.within ? session.run(r.within).line : undefined;
         if (line !== undefined) res.line = head(line, 80);
@@ -1109,7 +1101,7 @@ export class App {
         this.authorize(caller.principal, s, 'signal');
         // A Run of an ended shell (history, or an earlier life of this name): its recorded outcome (jr2-13).
         if (!runner) return { runId: o.runId, state: run.state, contract: run.target, steps: [] as string[] };
-        return runner.cancel(o.runId, caller.principal, this.seat(caller, runner));
+        return runner.cancel(o.runId, caller.principal);
       },
       async (prev) => ({ ...prev, replayed: true }),
     );
@@ -1134,7 +1126,6 @@ export class App {
         const admitOpts: Parameters<Session['admitWhenAvailable']>[0] = { target, line: o.command, principal: caller.principal };
         if (o.envBasis) admitOpts.envBasis = o.envBasis;
         if (idem !== undefined) admitOpts.idem = idem;
-        Object.assign(admitOpts, this.seat(caller, session));
         const a = await session.admitWhenAvailable(admitOpts);
         if (!a.admitted) return this.busyResult(session, target, a.reason, a.busy, created);
         const spec: ServiceSpec = {};
@@ -1276,7 +1267,6 @@ export class App {
         const data = inputBytes(o.text, o.keys, { appCursor: session.screen.applicationCursorKeys });
         const io: Parameters<Session['input']>[1] = { principal: caller.principal, kind: o.keys?.length ? 'keys' : 'text' };
         if (o.sensitive) io.sensitive = true;
-        Object.assign(io, this.seat(caller, session));
         session.input(data, io);
         return { seq: session.journal.lastSeq };
       },
@@ -1292,7 +1282,7 @@ export class App {
       o,
       async () => {
         const session = this.liveFor(caller, o.session, 'signal');
-        session.signal(o.signal ?? 'SIGINT', caller.principal, this.seat(caller, session));
+        session.signal(o.signal ?? 'SIGINT', caller.principal);
         return { ok: true as const };
       },
       async (prev) => ({ ...prev, replayed: true }),
@@ -1307,7 +1297,7 @@ export class App {
       o,
       async () => {
         const session = this.liveFor(caller, o.session, 'resize');
-        session.resize(o.cols, o.rows, caller.principal, this.seat(caller, session));
+        session.resize(o.cols, o.rows, caller.principal);
         return { ok: true as const };
       },
       async (prev) => ({ ...prev, replayed: true }),
@@ -1332,7 +1322,7 @@ export class App {
       const session = this.liveFor(caller, o.session, 'observe');
       if (o.action === 'take') {
         this.ensureAttached(caller, session);
-        session.takeControl(caller.principal, this.seat(caller, session));
+        session.takeControl(caller.principal);
       } else if (o.action === 'release') session.releaseControl(caller.principal);
       return { controller: session.currentController };
     };
@@ -1348,7 +1338,7 @@ export class App {
       o,
       async () => {
         const session = this.liveFor(caller, o.session, 'run');
-        const snap = await session.captureEnv(caller.principal, undefined, this.seat(caller, session));
+        const snap = await session.captureEnv(caller.principal);
         return { seq: snap.seq, count: Object.keys(snap.vars).length };
       },
       async (prev) => ({ ...prev, replayed: true }),

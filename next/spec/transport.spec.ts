@@ -2,8 +2,8 @@
  * The endpoint's guard rails and the native family, against the scripted
  * backend: Host and Origin (DNS rebinding, CSWSH), frames that must never crash
  * the daemon, frame caps, connection identity (api-11), native subscribe paging
- * and backpressure, attach snapshots under concurrent output (G13), static
- * hosting, /health, the usage hook and structured logs.
+ * and backpressure, attach snapshots under concurrent output (G13), what HTTP
+ * serves, /health, the usage hook and structured logs.
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -310,7 +310,7 @@ test('a specific-bind Host policy applies port restrictions to real HTTP request
   }
 });
 
-test('sec-1: cross-site WebSocket hijacking is refused (403); a same-origin browser is the GUI human, human:gui:<name>', async () => {
+test('sec-1: cross-site WebSocket hijacking is refused (403); a same-origin browser keeps its token\'s principal', async () => {
   const h = await start({ allowHosts: ['term.example'] });
   try {
     const p = h.port;
@@ -320,13 +320,12 @@ test('sec-1: cross-site WebSocket hijacking is refused (403); a same-origin brow
     assert.deepEqual(await tryUpgrade(base, { origin: `http://localhost:${p}` }), { status: 403 }, 'same site, other origin');
     assert.equal((await httpGet(p, '/health', { Origin: 'https://evil.example' })).status, 403);
 
-    // Our own page: same origin as the Host it connected to.
+    // Same origin as the Host it connected to: admitted, and an Origin grants no identity of its own.
     const owner = await Client.open(p);
     await owner.call('session_open', { session: 'shared1', visibility: 'shared' });
-    const gui = await Client.open(p, { token: 'ta' }, { origin: `http://127.0.0.1:${p}` });
-    const att = (await gui.request('terminal/attach', { session: 'shared1' })) as { principal: string; role: string };
-    assert.equal(att.principal, 'human:gui:agent:a@test');
-    assert.equal(att.role, 'observer', 'the GUI human is not the owner, so it does not take the seat');
+    const browser = await Client.open(p, { token: 'ta' }, { origin: `http://127.0.0.1:${p}` });
+    const att = (await browser.request('terminal/attach', { session: 'shared1' })) as { principal: string; role: string };
+    assert.equal(att.principal, 'agent:a@test');
     const human = await Client.open(p, { token: 'th' }, { origin: `http://127.0.0.1:${p}` });
     assert.equal(((await human.request('terminal/attach', { session: 'shared1' })) as { principal: string }).principal, 'human:test:9', 'a human principal is kept');
     const proxied = await tryUpgrade(base, { headers: { Host: `term.example:${p}` }, origin: `http://term.example:${p}` });
@@ -335,7 +334,7 @@ test('sec-1: cross-site WebSocket hijacking is refused (403); a same-origin brow
     // Non-browser clients send no Origin and keep their principal.
     const opened = await owner.call('session_open', { session: 'mine' });
     assert.equal((opened.structured.info as { owner: string }).owner, 'agent:a@test');
-    for (const c of [owner, gui, human]) c.close();
+    for (const c of [owner, browser, human]) c.close();
   } finally {
     await h.close();
   }
@@ -862,45 +861,17 @@ test('a subscriber is told when its session is closed (terminal/closed), rather 
   }
 });
 
-// ───────────────────────────── static hosting, health, usage, logs ─────────────────────────────
+// ───────────────────────────── HTTP, health, usage, logs ─────────────────────────────
 
-test('GUI static assets: whitelist only, exact content types, nosniff, and a CSP limited to self and our WebSocket', async () => {
+test('HTTP serves /health and nothing else', async () => {
   const h = await start();
   try {
     const p = h.port;
-    const page = await httpGet(p, '/');
-    assert.equal(page.status, 200);
-    assert.equal(page.headers['content-type'], 'text/html; charset=utf-8');
-    assert.equal(page.headers['x-content-type-options'], 'nosniff');
-    assert.equal(page.headers['x-frame-options'], 'DENY');
-    assert.equal(page.headers['cache-control'], 'no-store');
-    assert.equal(page.headers['referrer-policy'], 'no-referrer');
-    const csp = String(page.headers['content-security-policy']);
-    assert.match(csp, /default-src 'none'/);
-    assert.match(csp, /script-src 'self'(;|$)/);
-    assert.match(csp, new RegExp(`connect-src 'self' ws://127\\.0\\.0\\.1:${p} wss://127\\.0\\.0\\.1:${p}`));
-    assert.match(csp, /frame-ancestors 'none'/);
-    assert.match(page.body, /<script src="\/app.js"><\/script>/);
-    const types: Record<string, string> = {
-      '/app.js': 'text/javascript; charset=utf-8',
-      '/vendor/xterm.js': 'text/javascript; charset=utf-8',
-      '/vendor/addon-fit.js': 'text/javascript; charset=utf-8',
-      '/vendor/xterm.css': 'text/css; charset=utf-8',
-    };
-    for (const [pth, type] of Object.entries(types)) {
-      const r = await httpGet(p, pth);
-      assert.equal(r.status, 200, pth);
-      assert.equal(r.headers['content-type'], type, pth);
-      assert.equal(r.headers['x-content-type-options'], 'nosniff', pth);
-      assert.ok(r.body.length > 100, pth);
-    }
-    for (const pth of ['/package.json', '/../package.json', '/%2e%2e/package.json', '/vendor/xterm.mjs', '/gui/app.js', '/src/daemon.ts', '/vendor/', '/app.js/']) {
+    for (const pth of ['/', '/index.html', '/app.js', '/vendor/xterm.js', '/vendor/addon-fit.js', '/vendor/xterm.css', '/package.json', '/../package.json']) {
       assert.equal((await httpGet(p, pth)).status, 404, pth);
     }
-    assert.equal((await httpGet(p, '/', {}, 'POST')).status, 405);
-    const head = await httpGet(p, '/app.js', {}, 'HEAD');
-    assert.equal(head.status, 200);
-    assert.equal(head.body, '');
+    assert.equal((await httpGet(p, '/', {}, 'HEAD')).status, 404);
+    assert.equal((await httpGet(p, '/health')).status, 200);
   } finally {
     await h.close();
   }
@@ -913,8 +884,8 @@ test('sec-10: /health reports per-session state, backend, controller, integratio
     await a.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
     await a.call('session_open', { session: 'hp' });
     const r = await a.call('run', { session: 'hp', command: 'sleep 5', wait: 0 });
-    const gui = await Client.open(h.port, { token: 'tb' }, { origin: `http://127.0.0.1:${h.port}` });
-    await gui.request('ping');
+    const cli = await Client.open(h.port, { token: 'tb', client: 'cli' });
+    await cli.request('ping');
     type Health = { status: string; pid: number; connections: Record<string, number>; sessionCount: number; sessions?: Array<Record<string, unknown>> };
     // tsg-17: with tokens required, /health without a credential returns public endpoint metadata and counts, not session details.
     const bare = JSON.parse((await httpGet(h.port, '/health')).body) as Health;
@@ -922,7 +893,8 @@ test('sec-10: /health reports per-session state, backend, controller, integratio
     assert.equal(bare.pid, process.pid);
     assert.equal(bare.connections.total, 2);
     assert.equal(bare.connections.mcp, 1);
-    assert.equal(bare.connections.gui, 1);
+    assert.equal(bare.connections.cli, 1);
+    assert.deepEqual(Object.keys(bare.connections).sort(), ['cli', 'mcp', 'mcpl', 'native', 'pending', 'total']);
     assert.equal(bare.sessions, undefined, 'no session list without a credential');
     const full = JSON.parse((await httpGet(h.port, '/health?token=ta')).body) as Health & { sessions: Array<Record<string, unknown>> };
     const hp = full.sessions.find((x) => x.id === 'hp')!;
@@ -938,14 +910,14 @@ test('sec-10: /health reports per-session state, backend, controller, integratio
     const asA = JSON.parse((await httpGet(h.port, '/health', { Authorization: 'Bearer ta' })).body) as Health & { sessions: Array<Record<string, unknown>> };
     assert.equal(asA.sessions.find((x) => x.id === 'hp')?.controller, 'agent:a@test');
     a.close();
-    gui.close();
+    cli.close();
   } finally {
     await h.close();
   }
 });
 
 test('/health on a host that cannot open sessions says so, with the reason session_open refuses with, to every caller', async () => {
-  // termd keeps serving history, the GUI and the lane without bash; /health answered "ok" with nothing
+  // termd keeps serving history and the lane without bash; /health answered "ok" with nothing
   // about it, and the startup warning is one line (the house's answers, #22 comment 6275033749).
   const h = await start();
   try {
@@ -978,11 +950,11 @@ test('§16 Measure: the usage hook sees every tools/call with host, profile, out
     await c.call('run', { session: 'u1' });
     await c.call('input', { session: 'u1', text: 'abc' });
     await c.call('input', { session: 'u1', text: 'abc' });
-    const gui = await Client.open(h.port, {}, { origin: `http://127.0.0.1:${h.port}` });
-    await gui.call('session_list', {}); // the GUI's own bookkeeping: logged at debug, not recorded (tsg-16)
-    await gui.call('control', { session: 'u1', action: 'status' });
-    assert.equal(h.usage.length, 5);
-    const [run, bad, in1, in2, list] = h.usage as [UsageRecord, UsageRecord, UsageRecord, UsageRecord, UsageRecord];
+    const browser = await Client.open(h.port, {}, { origin: `http://127.0.0.1:${h.port}` });
+    await browser.call('session_list', {});
+    await browser.call('control', { session: 'u1', action: 'status' });
+    assert.equal(h.usage.length, 6, 'a read from a same-origin browser is recorded like any other');
+    const [run, bad, in1, in2, list, control] = h.usage as [UsageRecord, UsageRecord, UsageRecord, UsageRecord, UsageRecord, UsageRecord];
     assert.equal(run.tool, 'run');
     assert.equal(run.ok, true);
     assert.equal(run.host, 'mcp');
@@ -1000,13 +972,13 @@ test('§16 Measure: the usage hook sees every tools/call with host, profile, out
     assert.equal(bad.error, 'invalid_argument');
     assert.equal(in1.digest, in2.digest, 'the same input twice has the same digest');
     assert.notEqual(in1.digest, run.digest);
-    assert.equal(list.tool, 'control');
-    assert.equal(list.host, 'native');
-    assert.equal(list.principal, 'human:gui:agent:a@test');
-    assert.ok(h.logs.some((l) => l.msg === 'tool call' && l.tool === 'session_list' && l.level === 'debug'), 'the GUI list call is logged at debug');
+    assert.equal(list.tool, 'session_list');
+    assert.equal(list.host, 'mcp');
+    assert.equal(list.principal, 'agent:a@test');
+    assert.equal(control.tool, 'control');
     assert.ok(!JSON.stringify(h.usage).includes('echo hello'), 'argument values are not recorded');
     c.close();
-    gui.close();
+    browser.close();
   } finally {
     await h.close();
   }
@@ -1302,21 +1274,21 @@ test('jr2-14 (G20, G21): /health reports history sessions as closed or recovered
 test('tsg-16: terminal/sessions lists sessions outside tools/call and pushes registry changes to a watcher', async () => {
   const h = await start();
   try {
-    const gui = await Client.open(h.port, {}, { origin: `http://127.0.0.1:${h.port}` });
-    const r = (await gui.request('terminal/sessions', { watch: true })) as { sessions: unknown[]; watching: boolean };
+    const watcher = await Client.open(h.port, { client: 'cli' });
+    const r = (await watcher.request('terminal/sessions', { watch: true })) as { sessions: unknown[]; watching: boolean };
     assert.deepEqual(r, { sessions: [], watching: true });
     const a = await Client.open(h.port);
     await a.call('session_open', { session: 'pushed' });
-    const note = await gui.next((m) => m.method === 'terminal/sessionsChanged');
+    const note = await watcher.next((m) => m.method === 'terminal/sessionsChanged');
     assert.deepEqual(note.params, { type: 'created', session: 'pushed' });
     // Another principal's private session is announced without its name (G18).
     const b = await Client.open(h.port, { token: 'tb' });
     await b.call('session_open', { session: 'b-private' });
-    const hidden = await gui.next((m) => m.method === 'terminal/sessionsChanged');
+    const hidden = await watcher.next((m) => m.method === 'terminal/sessionsChanged');
     assert.deepEqual(hidden.params, { type: 'created' });
     b.close();
     assert.equal(h.usage.filter((u) => u.host === 'native').length, 0, 'the list is not usage');
-    gui.close();
+    watcher.close();
     a.close();
   } finally {
     await h.close();
@@ -1910,7 +1882,7 @@ test('78c4d6e: isSessionId’s alphabet is checked, not only the length, and the
   }
 });
 
-test('78c4d6e: a subscribed history session that is forgotten drives terminal/closed with reason session-removed (the GUI keys on it)', async () => {
+test('78c4d6e: a subscribed history session that is forgotten drives terminal/closed with reason session-removed', async () => {
   const h = await start({ prepare: (dataDir) => historyDir(dataDir, 'rmhist', 'shared', [1, 2, 3].map((i) => ({ type: 'note', text: `h${i}`, principal: 'agent:a@test' }))) });
   try {
     const c = await Client.open(h.port);

@@ -42,10 +42,6 @@ export function assertPrincipal(p: unknown, what: string): asserts p is Principa
   if (!isValidPrincipal(p)) {
     throw new Error(`${what}: ${JSON.stringify(p)} is not a principal; use agent:<name>@<domain>, human:<provider>:<id>, token:<name> or host:<name> (never "system")`);
   }
-  // `human:gui:…` is derived by the daemon from a token's own principal (guiPrincipal), never issued: a
-  // credential naming one would be the GUI human of the agent it names, and pass guiActsFor for that
-  // agent's sessions (the house's read of 1cabc6a, #22).
-  if (p.startsWith('human:gui:')) throw new Error(`${what}: ${JSON.stringify(p)} is the GUI's own form of a principal, derived from the token's; give the token the agent's or human's principal instead`);
 }
 
 const digest = (token: string): Buffer => createHash('sha256').update(token, 'utf8').digest();
@@ -85,29 +81,6 @@ export class TokenMapResolver implements PrincipalResolver {
     }
     return this.anonymous;
   }
-}
-
-/**
- * The principal of a browser on the daemon's own origin (the GUI): the human at
- * the keyboard of whoever the token names. The whole token principal is the id,
- * so distinct tokens get distinct GUI humans (`agent:alice` and `token:alice`
- * stay apart): `agent:alice@corp` → `human:gui:agent:alice@corp`,
- * `token:local-aster` → `human:gui:token:local-aster`. A `human:` principal is
- * kept as it is — which is why no credential may name a `human:gui:` principal
- * (assertPrincipal): mapped as it is, it would be the GUI human of the agent it
- * names, and the two forms would meet in one id.
- */
-export function guiPrincipal(p: Principal): Principal {
-  return p.startsWith('human:') ? p : `human:gui:${p}`;
-}
-
-/**
- * True when `gui` is the GUI human of `owner` — the person holding `owner`'s
- * token in a browser. For verb checks (G18) that want the GUI to see and act on
- * its own token's sessions; nothing in the transport grants it by itself.
- */
-export function guiActsFor(gui: Principal, owner: Principal): boolean {
-  return gui !== owner && gui.startsWith('human:gui:') && guiPrincipal(owner) === gui;
 }
 
 /**

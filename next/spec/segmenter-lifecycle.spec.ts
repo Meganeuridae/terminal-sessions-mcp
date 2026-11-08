@@ -38,7 +38,7 @@ import { sleep, until } from './testhost.js';
 
 const A = 'agent:a@t';
 const B = 'agent:b@t';
-const H = 'human:gui:aster';
+const H = 'human:local:aster';
 
 type Fake = SegmentSource & { runs: Map<string, RunInfo>; screen: ScreenSnapshot };
 

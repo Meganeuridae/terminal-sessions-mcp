@@ -3,7 +3,7 @@
  * which is why the engines range starts at the Node versions whose require() loads one; the 1.x suite's
  * bins test reads only the shebangs, so nothing ran a bin (the house's read of the 38 commits, #22
  * comment 6274806357). The test lives here, beside 2.0's, because 2.0 makes no change of its own to the
- * 1.x tree (`src/`, `cli/`, `gui/`, `test/`, `tsconfig.json`): those paths are main's as of the last
+ * 1.x tree (`src/`, `cli/`, `test/`, `tsconfig.json`): those paths are main's as of the last
  * merge of main, and the next merge keeps main's side (the house's read of the 33 commits, #22, comment
  * 6307351806: they were 1.7.1's while main had moved to 1.7.2). It needs
  * the 1.x build (`npm test` or `npm run build` makes it; CI runs `npm test` first) and says so when absent.

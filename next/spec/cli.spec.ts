@@ -3,7 +3,7 @@
  * exit code, 128+N for a signal, 124 while running, 75 when busy, 1 on error,
  * including a daemon connection lost before the result (jr-18) — its argument
  * forms (`await <runId>`, durations, `--`, values typed by the tool's schema),
- * its output to a slow reader, `tsm gui` and `tsm usage`.
+ * its output to a slow reader, and `tsm usage`.
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -85,7 +85,7 @@ test('tsm exit codes: the Run exit code, 124 while running, 75 when busy, 1 on e
     const denied = await tsm(['sessions'], { ...env, TSM_TOKEN: 'wrong' });
     assert.equal(denied.code, 1);
     assert.match(denied.stderr, /refused this credential \(401\).*Ask its operator.*TSM_TOKEN/, 'ux-18: a bad token directs the agent to the operator');
-    // The CLI is the native family, with the GUI: `tsm usage` does not read its calls as an agent's.
+    // The CLI is the native family: `tsm usage` does not read its calls as an agent's.
     assert.ok(usage.length >= 6, `usage records: ${usage.length}`);
     assert.deepEqual(new Set(usage.map((u) => u.host)), new Set(['native']), JSON.stringify(usage.map((u) => [u.tool, u.host])));
   } finally {
@@ -205,19 +205,13 @@ test('jr-18: tsm exits 1 with a message when the daemon connection closes before
   }
 });
 
-test('tsm gui prints the GUI URL, with the token when one is configured, as JSON with --json', async () => {
-  const plain = await tsm(['gui'], { TSM_URL: 'ws://127.0.0.1:3101' });
-  assert.equal(plain.code, 0);
-  assert.equal(plain.stdout.trim(), 'http://127.0.0.1:3101/');
-  const withToken = await tsm(['gui'], { TSM_URL: 'wss://term.example:8443', TSM_TOKEN: 'a b&c' });
-  assert.equal(withToken.stdout.trim(), 'https://term.example:8443/?token=a+b%26c');
-  const inUrl = await tsm(['gui'], { TSM_URL: 'ws://localhost:3175/?token=t1', TSM_TOKEN: '' });
-  assert.equal(inUrl.stdout.trim(), 'http://localhost:3175/?token=t1');
-  // An empty TSM_URL is unset: the default address (the house's read, #22 comment 6269721389).
-  const empty = await tsm(['gui'], { TSM_URL: '' });
-  assert.equal(empty.stdout.trim(), 'http://127.0.0.1:3101/');
-  const json = await tsm(['gui', '--json'], { TSM_URL: 'ws://127.0.0.1:3101' });
-  assert.deepEqual(JSON.parse(json.stdout), { url: 'http://127.0.0.1:3101/' });
+test('tsm has no gui command: it is not in the usage, and `tsm gui` prints no URL', async () => {
+  const help = await tsm(['--help'], {});
+  assert.equal(help.code, 0);
+  assert.doesNotMatch(help.stdout, /^\s+gui\b/m);
+  const r = await tsm(['gui'], { TSM_URL: 'ws://127.0.0.1:1' });
+  assert.notEqual(r.code, 0);
+  assert.doesNotMatch(r.stdout, /https?:\/\//);
 });
 
 test('atc-5/tsg-2/atc-25/ux-18: a signal exits 128+N; await <runId>; durations; -- ends option parsing', async () => {

@@ -523,7 +523,7 @@ test('one rule for a Run’s duration across a wall-clock step back: so far, at 
     assert.ok(end.durationMs >= 2500, `${end.durationMs} ms`);
     assert.equal(h.session.run(id).durationMs, end.durationMs, 'the ended Run carries the journaled duration');
     assert.equal(h.session.runDurationMs(id), end.durationMs, 'and the rule answers with it');
-    assert.equal(h.session.listRuns().find((r) => r.runId === id)!.durationMs, end.durationMs, 'a listing carries it (the GUI shows it)');
+    assert.equal(h.session.listRuns().find((r) => r.runId === id)!.durationMs, end.durationMs, 'a listing carries it');
     assert.equal(h.journal.runs.run(id)!.durationMs, end.durationMs, 'history’s Run, from the journal, carries the same one');
   } finally {
     await h.session.close();

@@ -18,7 +18,7 @@ later release (`next/README.md`, "Upgrading from 1.x").
 - **One daemon, `termd`** (port 3101): sessions as persistent login shells with an append-only
   journal per session (memory ring plus files, explicit retention), a headless emulator for the
   current screen, and one WebSocket endpoint speaking MCP, MCPL and a native family. `tsm` (CLI,
-  `--json` everywhere) and `tsm-shim` (stdio MCP) are thin clients; the GUI is served by `termd`.
+  `--json` everywhere) and `tsm-shim` (stdio MCP) are thin clients.
 - **Runs with identity**: every command has a `runId` from admission; shell and process
   targets; exit codes from shell-integration marks (bash, zsh, fish; keyed so nested shells,
   programs and other terminals' integrations cannot spoof them) or from the process itself; a
@@ -34,8 +34,7 @@ later release (`next/README.md`, "Upgrading from 1.x").
   mcpl-cc-bridge's real host code (`next/acceptance/`).
 - **Sharing**: several principals per session (per-agent tokens), one controller seat,
   provenance on every input, observers that cannot act, private and shared sessions.
-- **Measure**: every tool call but the GUI's own successful reads recorded (names and hashes
-  only) to `usage.jsonl`; `tsm usage` reports use, errors and confusion signatures.
+- **Measure**: every tool call recorded (names and hashes only) to `usage.jsonl`; `tsm usage` reports use, errors and confusion signatures.
 - **The 1.x tool names on 2.0**: `tsm-shim --profile compat` (or `TSM_PROFILE=compat`) serves
   `runCommand`, `tailLogs`, `searchLogs`, `sendInput`, `sendSignal`, `listSessions`,
   `killSession`, `killAll`, `launch` and `takeScreenshot` over `termd`, for a 1.x host
@@ -60,13 +59,10 @@ later release (`next/README.md`, "Upgrading from 1.x").
 
 ### Changed
 
-- Node 22.12 or later (`engines`: `>=22.12.0 <25.0.0`): Node 20 reached its end of life on 2026-04-30, and Puppeteer 25, which 2.0's GUI tests use, asks for 22.12; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
+- Node 22.12 or later (`engines`: `>=22.12.0 <25.0.0`): Node 20 reached its end of life on 2026-04-30; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
 - `npm run build` compiles both trees; `npm test` runs 1.x's suite and `npm run test:next` 2.0's.
 - `ws` is pinned at the version 2.0 uses, 8.21.3, and 1.x's `ws` stays within 8.x. New
-  dependencies: `@animalabs/mcpl-core`, `@xterm/headless` 6.0.0, `@xterm/addon-serialize`, the
-  GUI's `@xterm/xterm` 6.0.0 and `@xterm/addon-fit` 0.11.0, `puppeteer` `^25.16.0` for 2.0's GUI
-  tests, and `yauzl` `^3.4.0`, with which Puppeteer unpacks its browser on a Linux host without
-  `unzip`.
+  dependencies: `@animalabs/mcpl-core`, `@xterm/headless` 6.0.0 and `@xterm/addon-serialize`.
 
 ### Removed from 1.x
 
@@ -83,11 +79,11 @@ later release (`next/README.md`, "Upgrading from 1.x").
   `PersistentSessionServer.guiAuthToken`, are removed. TypeScript consumers
   need their own `@types/node`, which Socket.IO and Puppeteer used to bring
   in.
-- **Dependencies:** Express, Socket.IO, `@xterm/addon-web-links` and
-  `ansi-to-html` are no longer dependencies, and `@types/express` is no
-  longer a dev dependency. Express is still installed, since
-  `@modelcontextprotocol/sdk` depends on it. Puppeteer, `@xterm/xterm` and
-  `@xterm/addon-fit` stay, for 2.0's GUI and its tests.
+- **Dependencies:** Puppeteer, Express, Socket.IO, `@xterm/xterm`,
+  `@xterm/addon-fit`, `@xterm/addon-web-links` and `ansi-to-html` are no
+  longer dependencies, and `@types/express` is no longer a dev dependency.
+  Express is still installed, since `@modelcontextprotocol/sdk` depends on
+  it; the others no longer are.
 - **`--headless`, `HEADLESS` and `GUI_PORT` are no longer read.** A session
   server started with them starts as before, serving no GUI either way.
 

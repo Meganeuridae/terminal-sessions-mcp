@@ -56,7 +56,6 @@ const USAGE = `tsm <command> [args] [--key value ...] [--json]
   signal <session> [--signal SIGINT]
   control <session> take|release|status
   env-capture <session>
-  gui                                   print the GUI's URL (with the token, when one is set)
   usage [--file F] [--since ISO]        §16 Measure: per-tool use, errors, confusion signatures
                                         (reads <data-dir>/usage.jsonl locally; TSM_DATA_DIR, default ~/.tsm)
   <tool> --arg value ...                any tool by name
@@ -331,15 +330,6 @@ function exitCode(tool: string, structured: Record<string, unknown>): number {
   return 0;
 }
 
-/** The GUI is served by termd at its own origin (§12); the page reads `?token=` once and forgets it from the address bar. */
-function guiUrl(): string {
-  const ws = new URL(setting('TSM_URL') ?? 'ws://127.0.0.1:3101');
-  const http = new URL(`${ws.protocol === 'wss:' ? 'https:' : 'http:'}//${ws.host}/`);
-  const token = setting('TSM_TOKEN') ?? ws.searchParams.get('token');
-  if (token) http.searchParams.set('token', token);
-  return http.toString();
-}
-
 /** `tsm usage`: the Measure report, read from the daemon's usage log on this machine. */
 function usageReport(argv: string[]): void {
   const opts: Record<string, string> = {};
@@ -380,7 +370,7 @@ function usageReport(argv: string[]): void {
   console.log('\ntool                 calls  errors  p50');
   for (const [t, v] of Object.entries(report.byTool).sort((a, b) => b[1].calls - a[1].calls)) console.log(`${t.padEnd(20)} ${String(v.calls).padStart(5)}  ${String(v.errors).padStart(6)}  ${v.p50ms}ms`);
   if (Object.keys(report.errors).length) console.log(`\nerrors: ${Object.entries(report.errors).map(([k, v]) => `${k} ${v}`).join(', ')}`);
-  console.log(`\nconfusion signatures (${report.agentCalls} agent calls; a human's GUI and the native family are not counted)`);
+  console.log(`\nconfusion signatures (${report.agentCalls} agent calls; humans and the native family are not counted)`);
   for (const [k, v] of Object.entries(report.signatures)) console.log(`${String(v.count).padStart(5)}  ${k}: ${v.description}`);
   const w = report.waits;
   console.log(`\nwaits: ${w.awaitAfterUnfinished} awaits after an unfinished result; ${w.runsAwaited} Runs finished later, extra time p50 ${w.extraMs.p50}ms, p90 ${w.extraMs.p90}ms, max ${w.extraMs.max}ms`);
@@ -417,7 +407,6 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   if (!cmd || cmd === '--help' || cmd === '-h') return end(0, USAGE);
-  if (cmd === 'gui') return end(0, parse(argv, undefined, false).json ? JSON.stringify({ url: guiUrl() }, null, 2) : guiUrl());
   if (cmd === 'usage') return usageReport(argv.slice(1));
   // Before any daemon is asked, the syntax alone is checked, and only what it can tell: a
   // shorthand's extra word is a usage error whether or not termd runs, and `--json` means tsm's own
@@ -444,7 +433,7 @@ async function ask(argv: string[], syntax: Parsed): Promise<void> {
   url.searchParams.set('profile', 'full');
   url.searchParams.set('resultText', syntax.json ? 'json' : 'transcript');
   url.searchParams.set('connection', `tsm-${process.pid}`);
-  // The CLI is the native family, with the GUI: its calls are not an agent's in `tsm usage` (the house's read of 4e37a11, #22).
+  // The CLI is the native family: its calls are not an agent's in `tsm usage` (the house's read of 4e37a11, #22).
   url.searchParams.set('client', 'cli');
   const ws = new WebSocket(url.toString());
   socket = ws;
@@ -529,7 +518,7 @@ function connectError(url: URL, failure: Error): string {
   if (status === '401') return `${at} refused this credential (401). Ask its operator for a valid token for this address; set TSM_TOKEN to that token or use the URL they provide.`;
   if (status === '403') return `${at} refused this connection (403). Ask its operator to check the URL, proxy and Origin policy before retrying.`;
   if (status === '421') return `${at} does not serve Host ${url.host} (421). Ask its operator for a served URL. If the Host ends in a dot, remove that dot; to serve another valid name, have the operator add --allow-host <name> to the running daemon configuration and restart it.`;
-  if (status === '429') return `${at} refused another connection (429). termd refuses one when the connections sharing this connection's principal reach its per-principal limit: with a token, every connection whose token names the same principal; without one, every client that sends none; and when termd runs without tokens, every client. End connections you hold to it and no longer need (another tsm run, a shim, a GUI tab), then retry. Otherwise ask its operator, who can free connections other clients hold; a proxy in front of termd can answer 429 too.`;
+  if (status === '429') return `${at} refused another connection (429). termd refuses one when the connections sharing this connection's principal reach its per-principal limit: with a token, every connection whose token names the same principal; without one, every client that sends none; and when termd runs without tokens, every client. End connections you hold to it and no longer need (another tsm run, a shim), then retry. Otherwise ask its operator, who can free connections other clients hold; a proxy in front of termd can answer 429 too.`;
   if (status === '503') return `${at} is unavailable or at its connection limit (503). Wait until it is available, then retry.`;
   const code = (failure as NodeJS.ErrnoException).code;
   return `cannot reach ${at}. Ask its operator to check the URL and whether the daemon is running before retrying.${typeof code === 'string' ? ` (${code})` : ''}`;

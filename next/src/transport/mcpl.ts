@@ -899,7 +899,7 @@ export class McplLane {
       // Only under a byte cap is a note's size kept: without one nothing is ever evicted and the list
       // only grew, a pair per note for the daemon's life (the house's read of the 38 commits (PR #22, comment 6274370651)).
       if (capped) budget?.record(r.seq, stored);
-      // Delivered means recorded (mcpl-14): the note is in the session's journal, where the GUI, `read`
+      // Delivered means recorded (mcpl-14): the note is in the session's journal, where `read`
       // and other principals' open channels see it. Nobody watching right now is not a failure to report.
       return { delivered: true, messageId: qualify(segmentId(sid, targetOf(s).journal, 'note', r.seq)) };
     } catch (e) {

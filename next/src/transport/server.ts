@@ -1,8 +1,8 @@
 /**
  * The daemon's one endpoint (§12): JSON-RPC 2.0 over WebSocket with two method
  * families — MCP+MCPL (tools, channels, manifest, policy) and `terminal/*` (the
- * native family for the GUI and CLI: subscribe, attach, detach) — plus `/health`
- * and the GUI's static files over HTTP. Every WebSocket connection has a
+ * native family for the CLI: subscribe, attach, detach) — plus `/health` over
+ * HTTP. Every WebSocket connection has a
  * server-generated connection ID for its attachments and a principal resolved
  * from its credential. Each session keeps delivery and read cursors per
  * principal. A client declaring `experimental.mcpl` also has an MCPL lane.
@@ -17,15 +17,13 @@
  *     other Origin is 403. Browsers supply Origin on WebSocket handshakes:
  *     without this check, another page could drive the user's shells. HTTP
  *     no-cors GETs may omit Origin, so its absence does not authenticate HTTP.
- *  3. HTTP routes serve the GUI's static files without a credential. `/health`
- *     accepts an optional credential; without one it uses an anonymous principal
- *     where available, or reports liveness, version, pid, endpoint elapsed time,
- *     counts and any degraded reason without session details. A WebSocket upgrade first
- *     checks the global connection limit (503), then resolves `?token=` or
+ *  3. `/health` is the only HTTP route. It accepts an optional credential;
+ *     without one it uses an anonymous principal where available, or reports
+ *     liveness, version, pid, endpoint elapsed time, counts and any degraded
+ *     reason without session details. A WebSocket upgrade first checks the
+ *     global connection limit (503), then resolves `?token=` or
  *     `Authorization: Bearer` to a principal (§4.5), or returns 401. It checks
  *     that principal's connection limit (429) before admitting the socket.
- *     A same-origin browser WebSocket uses the GUI's human principal,
- *     `human:gui:<token principal>` (unchanged for `human:…`).
  *
  * Loopback names are served on any port while the bind is loopback: a port
  * forward (`ssh -L 13101:127.0.0.1:3101`) changes the port, and pinning it adds
@@ -57,7 +55,7 @@ import type { AddressInfo, Server as NetServer, Socket } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { type App, type Caller } from '../api/app.js';
-import { guiPrincipal, type PrincipalResolver } from '../api/principals.js';
+import { type PrincipalResolver } from '../api/principals.js';
 import type { AnySession, HistorySession, LiveSession } from '../api/registry.js';
 import { callTool, TOOLS, toolsFor, type Profile, type ResultText, type ToolDef, type ToolResult } from '../api/tools.js';
 import { clipField, newUsageKey, usageDigest, type UsageRecord } from '../api/usage.js';
@@ -67,7 +65,6 @@ import type { Principal, Seq } from '../core/types.js';
 import { Follower, type JournalSource } from './follower.js';
 import { classify, INTERNAL, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, OVERLOADED, Outbound, PARSE_ERROR, RpcError, type Id, type Message, type Request } from './jsonrpc.js';
 import { manifest, McplLane } from './mcpl.js';
-import { StaticFiles } from './static.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -120,7 +117,7 @@ export interface ServerOptions {
   highWaterBytes?: number;
   /** How long close() waits for clients to finish the closing handshake before terminating them (default 1000 ms). */
   shutdownGraceMs?: number;
-  /** Called for every tools/call except the GUI's successful read-only calls, which are its own bookkeeping (§16 Measure, tsg-16). */
+  /** Called for every tools/call (§16 Measure). */
   usage?: { record(r: UsageRecord): void };
   /** The daemon's data dir, which /health tells a caller that has a principal and a loopback peer address (see health). */
   dataDir?: string;
@@ -135,13 +132,11 @@ interface AttachWait {
   waiting: number;
 }
 
-type ConnKind = 'pending' | 'mcp' | 'mcpl' | 'native' | 'gui' | 'cli';
+type ConnKind = 'pending' | 'mcp' | 'mcpl' | 'native' | 'cli';
 
 interface Conn {
   /** Server-generated, unique: the identity attachments are keyed by. */
   id: string;
-  /** The principal the credential resolved to (before the GUI mapping): what the per-principal bound counts. */
-  credential: Principal;
   /** The client's `?connection=`, sanitized; for logs and usage only. */
   label: string | undefined;
   ws: WebSocket;
@@ -151,9 +146,7 @@ interface Conn {
   profile: Profile;
   resultText: ResultText;
   initialized: boolean;
-  /** A same-origin browser: the GUI. */
-  gui: boolean;
-  /** What this connection is: pending until initialize, then an MCP or MCPL host, the GUI, the tsm CLI (`?client=cli`), or a native client. The GUI and the CLI are the native family in usage records, not agent surfaces (the house's read of 4e37a11, #22). */
+  /** What this connection is: pending until initialize, then an MCP or MCPL host, the tsm CLI (`?client=cli`), or a native client. The CLI is the native family in usage records, not an agent surface (the house's read of 4e37a11, #22). */
   kind: ConnKind;
   followers: Map<string, Follower>;
   /**
@@ -172,7 +165,7 @@ interface Conn {
   /** Answered the last ping (or sent something since). */
   alive: boolean;
   pendingTimer: NodeJS.Timeout | undefined;
-  /** Asked for registry changes (`terminal/sessions {watch: true}`): the GUI's list, pushed rather than polled (tsg-16). */
+  /** Asked for registry changes (`terminal/sessions {watch: true}`): the session list, pushed rather than polled (tsg-16). */
   watchSessions: boolean;
 }
 
@@ -271,8 +264,6 @@ function sessionParam(p: Record<string, unknown>): string {
 const DIGEST_KEYS = ['command', 'text', 'keys', 'input'] as const;
 /** Every tool name the daemon serves, on any profile or lane: anything else is recorded as `(unknown)`. */
 const TOOL_NAMES: ReadonlySet<string> = new Set(TOOLS.map((t) => t.name));
-/** Tools that change nothing: from the GUI they are its own bookkeeping, not use to measure (§16, tsg-16). */
-const READ_ONLY_TOOLS: ReadonlySet<string> = new Set(['session_list', 'screen', 'read', 'search', 'watches', 'listSessions', 'tailLogs', 'searchLogs']);
 /** Close code for a connection that never sent anything (policy violation). */
 const CLOSE_IDLE = 1008;
 /** A history attach reads this many lines of the end of the journal and carries at most this many. */
@@ -285,7 +276,6 @@ export class TermServer {
   private readonly wss: WebSocketServer;
   private readonly conns = new Set<Conn>();
   private readonly opts: ServerOptions;
-  private readonly statics: StaticFiles;
   /** The monotonic origin for /health's endpointElapsedMs: this endpoint's construction, after registry recovery. Wall-clock steps cannot move it; a host whose monotonic clock pauses during suspend omits that interval. */
   private readonly startedAt = clocks.monotonic();
   private offRegistry: (() => void) | undefined;
@@ -298,8 +288,6 @@ export class TermServer {
 
   constructor(opts: ServerOptions) {
     this.opts = opts;
-    // A GUI file that cannot be read is a broken install: the operator's log says which (the house's read of 2f357bd, #22).
-    this.statics = new StaticFiles({ onError: (pathname, file, error) => this.emit('warn', 'GUI asset unavailable', { path: pathname, file, error }) });
     this.http = createServer((req, res) => this.onHttp(req, res));
     this.http.on('clientError', (_e, socket) => refuse(socket, 400, 'Bad Request'));
     this.wss = new WebSocketServer({ noServer: true, maxPayload: opts.maxPayload ?? 4 * 1024 * 1024 });
@@ -479,8 +467,7 @@ export class TermServer {
    * One usage record (§16) and one log line per tools/call. The record keeps names, ids,
    * states and a keyed digest, each string clipped; a tool the daemon does not serve is
    * `(unknown)` with a clipped copy of the name (atc-18); input marked sensitive gets no
-   * digest (G26, atc-4). The GUI's read-only calls are its own bookkeeping: logged at
-   * debug and not recorded, so an open tab does not swamp the measurement (tsg-16).
+   * digest (G26, atc-4).
    */
   private afterToolCall(conn: Conn, tool: string, args: unknown, r: ToolResult, ms: number): void {
     const a = isObj(args) ? args : {};
@@ -520,15 +507,12 @@ export class TermServer {
       const typed = DIGEST_KEYS.filter((k) => a[k] !== undefined).map((k): [string, unknown] => [k, a[k]]);
       if (typed.length) rec.digest = usageDigest(this.usageKey, typed);
     }
-    const bookkeeping = conn.gui && READ_ONLY_TOOLS.has(tool) && rec.ok;
-    if (!bookkeeping) {
-      try {
-        this.opts.usage?.record(rec);
-      } catch (e) {
-        this.emit('warn', 'usage sink failed', { error: errText(e) });
-      }
+    try {
+      this.opts.usage?.record(rec);
+    } catch (e) {
+      this.emit('warn', 'usage sink failed', { error: errText(e) });
     }
-    this.emit(!rec.ok ? 'warn' : bookkeeping ? 'debug' : 'info', 'tool call', {
+    this.emit(rec.ok ? 'info' : 'warn', 'tool call', {
       ...this.connFields(conn),
       tool: rec.tool,
       requested: rec.requested,
@@ -569,14 +553,13 @@ export class TermServer {
       if (req.method !== 'GET' && req.method !== 'HEAD') return plain(res, 405, 'method not allowed', { allow: 'GET, HEAD' });
       return this.health(req, res, url);
     }
-    if (!this.statics.serve(req, res, url.pathname, host)) plain(res, 404, 'not found');
+    plain(res, 404, 'not found');
   }
 
   /**
    * §15: per-session state, backend, controller, integration, the current Run,
    * retention, and connections by kind. /health scopes sessions by the credential's
-   * principal (G18); a same-origin browser WebSocket instead uses its derived GUI
-   * human, so its private-session view can differ. A presented token must be
+   * principal (G18). A presented token must be
    * valid (else 401); without one, the daemon's anonymous principal is used when
    * configured (including an unconfigured loopback daemon). A daemon that
    * requires a credential tells an unauthenticated caller what names no one's
@@ -599,7 +582,7 @@ export class TermServer {
     } else viewer = this.opts.resolver.resolve(undefined);
     const app = this.opts.app;
     const all = app.registry.list();
-    const byKind: Record<ConnKind, number> = { pending: 0, mcp: 0, mcpl: 0, native: 0, gui: 0, cli: 0 };
+    const byKind: Record<ConnKind, number> = { pending: 0, mcp: 0, mcpl: 0, native: 0, cli: 0 };
     for (const c of this.conns) byKind[c.kind]++;
     const recoveryErrors = app.registry.recoveryErrors;
     const body: Record<string, unknown> = {
@@ -610,7 +593,7 @@ export class TermServer {
       connections: { total: this.conns.size, ...byKind },
       sessionCount: all.length,
     };
-    // A host without bash or a working /dev/fd keeps serving history, the GUI and the lane, but opens
+    // A host without bash or a working /dev/fd keeps serving history and the lane, but opens
     // no session and runs no process Run: said here at any time after startup, with the refusal's own
     // reason, to every caller, since it names no one's sessions (the house's answers, #22 comment
     // 6275033749: /health answered "ok" with nothing about it, and the startup warning is one line).
@@ -699,15 +682,14 @@ export class TermServer {
     // tsg-19: one principal cannot take every slot (in loopback-open mode every local client is one principal).
     const perPrincipal = this.opts.maxConnectionsPerPrincipal ?? Math.max(1, Math.floor((this.opts.maxConnections ?? 512) / 4));
     let mine = 0;
-    for (const c of this.conns) if (c.credential === principal) mine++;
+    for (const c of this.conns) if (c.caller.principal === principal) mine++;
     if (mine >= perPrincipal) {
       this.emit('warn', 'upgrade refused: too many connections for this principal', { status: 429, principal, limit: perPrincipal, remote });
       return refuse(socket, 429, 'Too Many Requests', `too many connections for ${principal} (limit ${perPrincipal})`);
     }
-    const gui = origin === 'same';
     this.wss.handleUpgrade(req, socket, head, (ws) => {
       try {
-        this.onConnection(ws, principal, url, gui, remote);
+        this.onConnection(ws, principal, url, remote);
       } catch (e) {
         this.emit('error', 'connection setup failed', { error: errText(e), remote });
         ws.terminate();
@@ -715,15 +697,13 @@ export class TermServer {
     });
   }
 
-  private onConnection(ws: WebSocket, credential: Principal, url: URL, gui: boolean, remote: string | undefined): void {
+  private onConnection(ws: WebSocket, principal: Principal, url: URL, remote: string | undefined): void {
     const q = url.searchParams;
     const profileQ = q.get('profile');
     const textQ = q.get('resultText');
     const id = `c-${randomBytes(8).toString('hex')}`;
-    const principal = gui ? guiPrincipal(credential) : credential;
     const conn: Conn = {
       id,
-      credential,
       label: sanitizeLabel(q.get('connection')),
       ws,
       // A ws connection can drop before a result is written, so its read cursor advances only on delivery (G22).
@@ -733,8 +713,7 @@ export class TermServer {
       profile: PROFILES.includes(profileQ as Profile) ? (profileQ as Profile) : (this.opts.profile ?? 'core'),
       resultText: textQ === 'json' || textQ === 'transcript' ? textQ : (this.opts.resultText ?? 'json'),
       initialized: false,
-      gui,
-      kind: gui ? 'gui' : q.get('client') === 'cli' ? 'cli' : 'pending',
+      kind: q.get('client') === 'cli' ? 'cli' : 'pending',
       followers: new Map(),
       attaching: new Map(),
       inFlight: 0,
@@ -973,7 +952,7 @@ export class TermServer {
         if (conn.lane) conn.lane.dispose();
         conn.lane = wantsMcpl ? new McplLane(app, conn.caller, conn.out, (line, level = 'info') => this.emit(level, line, this.connFields(conn))) : null;
         conn.initialized = true;
-        conn.kind = conn.lane ? 'mcpl' : conn.kind === 'gui' || conn.kind === 'cli' ? conn.kind : 'mcp';
+        conn.kind = conn.lane ? 'mcpl' : conn.kind === 'cli' ? conn.kind : 'mcp';
         // Where this connection's tools come from (§11): the profile only for a
         // plain MCP host; an MCPL host's grant decides its tools and deliveries.
         if (conn.lane) {
@@ -1023,7 +1002,7 @@ export class TermServer {
         if (r.onSent) onSent(r.onSent);
         return { content: [{ type: 'text', text: r.text }], structuredContent: r.structured, ...(r.isError ? { isError: true } : {}) };
       }
-      // ── native family (GUI, CLI) ──
+      // ── native family ──
       case 'terminal/sessions':
         return this.nativeSessions(conn, p);
       case 'terminal/subscribe':
@@ -1133,7 +1112,7 @@ export class TermServer {
   }
 
   /**
-   * `terminal/attach { session, role? }` for the GUI (G13): a snapshot of the
+   * `terminal/attach { session, role? }` (G13): a snapshot of the
    * screen at cursor N, an Attachment (role `auto` by default: the owner takes a
    * free seat), and then every event after N through a follower — started only
    * once the response is on the wire, so the client has the snapshot before the
@@ -1244,9 +1223,8 @@ export class TermServer {
 
   /**
    * `terminal/sessions { watch? }`: the session list for the native family, outside
-   * tools/call (so the GUI's list is not usage to measure). With `watch: true` the
-   * connection is also told of every registry change (`terminal/sessionsChanged`), so
-   * the GUI refreshes on change instead of polling (tsg-16).
+   * tools/call. With `watch: true` the connection is also told of every registry change
+   * (`terminal/sessionsChanged`), so a client refreshes on change instead of polling (tsg-16).
    */
   private nativeSessions(conn: Conn, p: Record<string, unknown>): unknown {
     if (p.watch !== undefined && typeof p.watch !== 'boolean') throw new RpcError(INVALID_PARAMS, 'watch must be a boolean');

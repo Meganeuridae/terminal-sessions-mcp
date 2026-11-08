@@ -12,14 +12,13 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { clocks } from '../src/core/clock.js';
 import type { ScriptedProcess } from '../src/backends/scripted.js';
 import type { TermError } from '../src/core/errors.js';
 import { Journal } from '../src/core/journal.js';
 import { CLEAR_LINE_KEYS } from '../src/core/marks.js';
 import { narrowOutput, pageOutput, type RunOutputRange } from '../src/core/runindex.js';
-import { looksLikeSecretPrompt, SECRET_PROMPT } from '../src/core/session.js';
+import { looksLikeSecretPrompt } from '../src/core/session.js';
 import type { JournalEvent } from '../src/core/types.js';
 import { AGENT, code, COOKED_MODE, EDITOR_MODE, HUMAN, OSC, ofType, scriptedSession as harness, tick, until } from './fake-shell.js';
 
@@ -1474,33 +1473,6 @@ test('ux-10: a held seat refuses with the holder and the way forward; a seat res
   await h.session.close();
 });
 
-test('tsg-13/atc-12: asOwner gives the owner\'s GUI human exactly the owner\'s seat and cancel rights', async () => {
-  const GUI = `human:gui:${AGENT}`;
-  const h = await harness({ control: 'owner-priority' });
-  const a = h.session.admit({ target: 'shell', line: 'sleep 9', principal: AGENT });
-  assert.ok(a.admitted);
-  h.session.attach(GUI, 'gui');
-  assert.equal(code(() => h.session.signal('SIGINT', GUI)), 'not_controller', 'without asOwner the GUI is an observer');
-  h.session.signal('SIGINT', GUI, { asOwner: true });
-  assert.equal(h.session.currentController, GUI, 'owner-priority: the owner\'s override');
-  await h.session.close();
-
-  const s = await harness({ control: 'seat' });
-  const b = s.session.admit({ target: 'shell', line: 'sleep 9', principal: AGENT });
-  assert.ok(b.admitted);
-  assert.equal(code(() => s.session.takeControl(GUI)), 'not_controller');
-  s.session.takeControl(GUI, { asOwner: true });
-  assert.equal(s.session.currentController, GUI);
-  s.session.input('\x03', { principal: GUI });
-  s.session.resize(100, 30, GUI, { asOwner: true });
-  s.session.releaseControl(GUI);
-  s.session.takeControl(AGENT);
-  const c = await s.session.cancel(b.run.runId, GUI, { graceMs: 20, asOwner: true });
-  assert.ok(['cancelled', 'exited'].includes(c.state), JSON.stringify(c));
-  assert.equal(s.session.currentController, AGENT, 'cancelling with the owner\'s rights takes no seat');
-  await s.session.close();
-});
-
 // ───────────── m2-2: secrets typed at a password prompt ─────────────
 
 test('m2-2: input typed at a prompt asking for a secret is journaled redacted until Enter, and never becomes a Run\'s line', async () => {
@@ -1643,10 +1615,3 @@ test('m2-2: a drawn prompt spanning wrapped rows marks input sensitive, not an u
   }
 });
 
-test('m2-2 and G26: GUI and daemon use the same secret-prompt pattern', () => {
-  const app = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'gui', 'app.js'), 'utf8');
-  const literal = /^\s*const SECRET_PROMPT = \/(.+)\/([a-z]*);$/m.exec(app);
-  assert.ok(literal, 'gui/app.js declares SECRET_PROMPT as a regular expression literal');
-  const page = new RegExp(literal[1]!, literal[2]);
-  assert.deepEqual([page.source, page.flags], [SECRET_PROMPT.source, SECRET_PROMPT.flags], 'the page’s pattern is the daemon’s');
-});

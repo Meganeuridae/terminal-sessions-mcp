@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
  * termd — the terminal sessions daemon (§12). One per machine. Speaks MCP+MCPL
- * and the native family over one WebSocket port, serves the GUI, and keeps
- * journals on disk.
+ * and the native family over one WebSocket port, and keeps journals on disk.
  *
  * Operability (§15): JSON-line logs on stderr (or a size-rotated `--log-file`),
  * a usage log for §16 Measure, and no client and no stray exception ends the
@@ -413,21 +412,19 @@ const HELP = `termd — terminal sessions daemon
   --disk-floor-bytes <n> stop writing history to disk while the data dir's filesystem has less than n bytes
                          free (default 209715200, 200 MiB; 0: never): the recent part stays in memory and is
                          written once space returns; what the memory ring had to drop meanwhile reads as a gap
-  --usage-log <file>     usage records, one JSON line per tool call, except the GUI's successful read-only
-                         ones (default <data-dir>/usage.jsonl)
+  --usage-log <file>     usage records, one JSON line per tool call (default <data-dir>/usage.jsonl)
   --no-usage-log         do not record usage
   --log-file <file>      write logs to this file (0600, rotated by size) instead of stderr; a startup
                          failure is said on stderr as well
   --log-level <level>    debug|info|warn|error (default info)
-  --headless             accepted for a 1.x command line; changes nothing (the GUI is at the daemon's address)
+  --headless             accepted for a 1.x command line; changes nothing
   --session-oom-score-adj <n>  Linux: sessions' processes get this oom_score_adj (default 200), so the kernel
                          takes a build before termd; it counts against every process on the machine, so a
                          shared host may want less, or 0
 Env: TSM_TOKEN (the shared token; removed from the environment once read), TSM_DATA_DIR, TSM_HOST, TSM_PORT,
 TSM_SESSION_OOM_SCORE_ADJ, TSM_DISK_FLOOR_BYTES;
 the 1.x names SESSION_SERVER_HOST, SESSION_SERVER_PORT and SESSION_SERVER_TOKEN are read where those are not set.
-Logs are JSON lines on stderr. Sessions start in $HOME unless given a cwd. The GUI is served at
-http://<host>:<port>/ (add ?token=… when one is required).`;
+Logs are JSON lines on stderr. Sessions start in $HOME unless given a cwd.`;
 
 async function main(): Promise<void> {
   // A reader that goes away (EPIPE) ends the stream, not the daemon, and is never written to again (tsg-5).
@@ -471,7 +468,7 @@ async function main(): Promise<void> {
   // The 1.x names are read where the 2.0 ones are not set, so a daemon command written for 1.x
   // (connectome-host's setup guide: `--host localhost --headless`, SESSION_SERVER_PORT in the
   // unit) starts termd and says what it took from where (the house's review of #11).
-  if (f.headless) log('info', "--headless is a 1.x flag: termd has no separate GUI server (the GUI is served at the daemon's own address), so it changes nothing");
+  if (f.headless) log('info', '--headless is a 1.x flag: termd serves no GUI, so it changes nothing');
   const oneX = (name: string, newName: string) => log('info', `using ${name} (a 1.x setting); ${newName} is the 2.0 name`);
   if (f.host === undefined && setting('TSM_HOST') === undefined && setting('SESSION_SERVER_HOST') !== undefined) oneX('SESSION_SERVER_HOST', 'TSM_HOST');
   if (f.port === undefined && setting('TSM_PORT') === undefined && setting('SESSION_SERVER_PORT') !== undefined) oneX('SESSION_SERVER_PORT', 'TSM_PORT');
@@ -647,8 +644,7 @@ async function main(): Promise<void> {
     log('info', c.type === 'closed' ? 'session closed' : 'session removed', { session: c.id });
   });
 
-  // §16 Measure: one JSON line per tools/call (the GUI's successful read-only calls excepted:
-  // transport/server.ts), owner-only, rotated by size keeping USAGE_GENERATIONS old files (16 MiB
+  // §16 Measure: one JSON line per tools/call, owner-only, rotated by size keeping USAGE_GENERATIONS old files (16 MiB
   // each) so a week of traces fits. A write error disables it; it never breaks a call.
   let usage: RotatingFile | undefined;
   if (!f['no-usage-log']) {
@@ -733,7 +729,6 @@ async function main(): Promise<void> {
   log('info', 'listening', {
     version: version(),
     url: `ws://${urlHost}:${bound.port}`,
-    gui: `http://${urlHost}:${bound.port}/`,
     dataDir,
     auth,
     allowHosts: allowHosts.length ? allowHosts : undefined,

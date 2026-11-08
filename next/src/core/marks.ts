@@ -16,7 +16,7 @@
  * through this parser (atc-3): a keyed mark's bytes are not output — the mark is journaled as what it means
  * (prompt, cwd, run.start, run.end) — and the key's literal text in output (a `set` or
  * `declare -p` in the shell prints the integration's variables) is replaced with
- * `[redacted]`, so `read as: events`, raw renderings, followers, the GUI and the screen
+ * `[redacted]`, so `read as: events`, raw renderings, followers and the screen
  * never carry it, and nobody who can observe a session can forge its marks. Unkeyed
  * sequences stay in the output byte for byte. Sequences split across chunks are
  * reassembled; only a tail that can still become one of ours — an OSC, or the start of

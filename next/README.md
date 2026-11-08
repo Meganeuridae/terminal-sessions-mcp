@@ -1,11 +1,10 @@
 # Terminal Sessions 2.0
 
 > 2.0 lives in `next/`, beside the 1.x code this package has shipped so far. Both are in the
-> package: `termd`, `tsm` and `tsm-shim` are 2.0; `terminal-sessions-mcp`, `session-server`,
-> `session-gui` and `session-cli` are 1.x. 2.0 changes none of their code; what reaches them is the
-> package manifest they share with 2.0: a narrower Node range (`engines`), `ws` pinned at 8.21.3,
-> inside 1.x's `^8.16.0`, and puppeteer 25 (`^25.16.0`, from `^24.29.1`), which 1.x's screenshot
-> path loads. The design discussion is
+> package: `termd`, `tsm` and `tsm-shim` are 2.0; `terminal-sessions-mcp`, `session-server` and
+> `session-cli` are 1.x. 2.0 changes none of their code; what reaches them is the package manifest
+> they share with 2.0: a narrower Node range (`engines`), and `ws` pinned at 8.21.3, inside 1.x's
+> `^8.16.0`. The design discussion is
 > [antra-tess/terminal-sessions-mcp#11](https://github.com/antra-tess/terminal-sessions-mcp/pull/11).
 
 Persistent terminal sessions for agents and humans: a daemon that keeps shells alive,
@@ -24,7 +23,7 @@ presence) to hosts that support it — agent-framework (connectome) and Claude C
 
 ```bash
 npm install -g term-sessions-mcp     # bins: termd, tsm, tsm-shim
-termd                                 # ws://127.0.0.1:3101 · GUI at http://127.0.0.1:3101/
+termd                                 # ws://127.0.0.1:3101
 tsm run demo 'echo hello; pwd'        # exit = the command's code; 124 running, 75 busy, 1 error (tsm --help lists them all)
 ```
 
@@ -33,7 +32,7 @@ shell or a process Run would otherwise inherit — the terminal masters of other
 before the child runs; a process Run's command text itself then runs in `/bin/sh`. Without bash
 (Alpine's base: `apk add bash`), termd says so when it starts and refuses to open a session or run a
 process Run with that message, since a shell that could write into another session's terminal is the
-worse failure. It keeps serving history, the GUI and the lane meanwhile, and `/health` answers
+worse failure. It keeps serving history and the lane meanwhile, and `/health` answers
 `"status":"degraded"` with the same message as `unsupported`. The same holds for a `/dev/fd` that does
 not list the process's own descriptors.
 
@@ -187,13 +186,6 @@ observable, run a `termd` on the remote machine with a forwarded port: it owns t
 process group, and across tunnel interruptions you reconnect and `await` the same Run
 instead of rerunning an uncertain operation with a fresh key.
 
-## Humans
-
-The GUI is served by `termd` itself (`tsm gui` prints the URL, with the token when one is
-configured). It attaches with a snapshot and then streams everything: who holds the seat,
-who ran and typed what, each command's exit code. Take the seat to type; observers never
-resize or type, and the GUI's emulator never answers terminal queries (the daemon's does).
-
 ## Running the daemon
 
 ```
@@ -205,7 +197,7 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
 
 - **Principals.** Loopback without a token runs as `token:local-<user>`. For several
   agents, `--tokens-file` maps tokens to principals (`{"t1": "agent:linn@animalabs.ai"}`,
-  mode 0600). The GUI's browser connection is the human (`human:gui:<name>`).
+  mode 0600).
 - **Which tools a connection gets.** `--profile` applies to plain MCP hosts only (Claude Code,
   Cursor, the stdio shim): `core` (the default: run, await, read, screen, input, cancel,
   declare_shell and the three session tools), `full` (every tier), `compat` (the 1.x names).
@@ -215,7 +207,7 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   presence. The daemon log says which it is for each connection (`initialized: …`), what the
   grant came to (`grant received: … enabled … not enabled …`), and warns when a host has sent
   no grant five seconds after initializing.
-- **From 1.x.** A daemon command written for 1.x starts termd: `--headless` is accepted and changes nothing (the GUI is at the daemon's address), and `--host localhost` binds 127.0.0.1. In termd itself, `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT` and `SESSION_SERVER_TOKEN` are fallback settings when the matching `TSM_HOST`, `TSM_PORT` and `TSM_TOKEN` are unset. In the shim, a 1.x address (`SESSION_SERVER_URL`, or `SESSION_SERVER_HOST` or `SESSION_SERVER_PORT`, either alone taking 1.x's default for the other: `localhost` or 3100) is selected only when `TSM_URL` is unset. For that address, `SESSION_SERVER_TOKEN` supplies the credential when set; otherwise any token in `SESSION_SERVER_URL` stays in the URL. `TSM_TOKEN` belongs to `TSM_URL` or the default 2.0 address. With `SESSION_SERVER_URL` and `TSM_TOKEN` but neither `TSM_URL` nor `SESSION_SERVER_TOKEN`, the shim does not send `TSM_TOKEN`; a token already in `SESSION_SERVER_URL` stays in use. Put the address in `TSM_URL` to pair it with `TSM_TOKEN`, or put that token in `SESSION_SERVER_TOKEN`. See [`next/config/README.md`](config/README.md) for shipped configurations.
+- **From 1.x.** A daemon command written for 1.x starts termd: `--headless` is accepted and changes nothing, and `--host localhost` binds 127.0.0.1. In termd itself, `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT` and `SESSION_SERVER_TOKEN` are fallback settings when the matching `TSM_HOST`, `TSM_PORT` and `TSM_TOKEN` are unset. In the shim, a 1.x address (`SESSION_SERVER_URL`, or `SESSION_SERVER_HOST` or `SESSION_SERVER_PORT`, either alone taking 1.x's default for the other: `localhost` or 3100) is selected only when `TSM_URL` is unset. For that address, `SESSION_SERVER_TOKEN` supplies the credential when set; otherwise any token in `SESSION_SERVER_URL` stays in the URL. `TSM_TOKEN` belongs to `TSM_URL` or the default 2.0 address. With `SESSION_SERVER_URL` and `TSM_TOKEN` but neither `TSM_URL` nor `SESSION_SERVER_TOKEN`, the shim does not send `TSM_TOKEN`; a token already in `SESSION_SERVER_URL` stays in use. Put the address in `TSM_URL` to pair it with `TSM_TOKEN`, or put that token in `SESSION_SERVER_TOKEN`. See [`next/config/README.md`](config/README.md) for shipped configurations.
 - **Permissions.** termd's own files (journals, logs, keys, the usage log) are owner-only by mode whatever the umask. The per-session `shell/` command directory must be a real directory owned by termd with mode `0700`. termd refuses to open a session on a filesystem that cannot preserve that owner and mode. Sessions' shells and process Runs inherit the umask termd was started with, so files a session creates get the usual permissions. Start termd with the mask you want sessions to have (a supervisor's default is 022).
 - **Command path characters.** The command file's path is typed through a terminal line editor. A session refuses a path containing ASCII controls (U+0000–U+001F or U+007F) before starting a shell. A tab invokes completion instead of naming a file. Use a data directory with printable path components.
 - **Safety.** termd accepts Host values naming loopback, its specific bind address, or a name configured with `--allow-host`. It refuses a browser Origin other than its own. A non-loopback bind needs a token. Session shells never inherit the daemon's credentials or the launching terminal's identity variables.
@@ -275,15 +267,14 @@ termd [--host 127.0.0.1] [--port 3101] [--data-dir ~/.tsm]
   user's work, set it lower or to 0. History on disk is kept forever unless
   `--retention-days` or `--retention-bytes` says otherwise; a long-lived deployment should
   set one.
-- **Measure.** Every tool call but the GUI's own successful reads is recorded (names and hashes,
-  never contents) in `~/.tsm/usage.jsonl`; `tsm usage` reports per-tool use, errors and confusion
+- **Measure.** Every tool call is recorded (names and hashes, never contents) in `~/.tsm/usage.jsonl`; `tsm usage` reports per-tool use, errors and confusion
   signatures.
 
 ## CLI
 
 `tsm` is the tool table over the same endpoint, `--json` on every command:
 `tsm run build 'npm test' --wait 20000`, `tsm await r41`, `tsm read build --since 4812`,
-`tsm screen build`, `tsm input build --keys C-c`, `tsm sessions`, `tsm gui`, `tsm usage`.
+`tsm screen build`, `tsm input build --keys C-c`, `tsm sessions`, `tsm usage`.
 After `--`, each word is one argument of the command, quoted for the session's shell, so its own
 flags and odd characters arrive whole: `tsm run build -- git log --oneline -5`. Flag values take
 the type of the tool's parameter; a yes/no flag stands alone (`--queue`, `--force`). Under
@@ -293,22 +284,21 @@ stderr with exit 1, `--json` or not. `TSM_URL` and `TSM_TOKEN` point it at a dae
 
 ## Upgrading from 1.x
 
-2.0 ships beside the 1.x session server, MCP bridge, GUI and CLI in this package: one daemon
+2.0 ships beside the 1.x session server, MCP bridge and CLI in this package: one daemon
 (`termd`, port 3101) and thin clients (`tsm`, `tsm-shim`). The 1.x binaries
-(`terminal-sessions-mcp`, `session-server`, `session-gui`, `session-cli`) run 1.x. 2.0 changes none
-of their code; what reaches them is the package manifest they share with 2.0: a narrower Node range
-(`engines`), `ws` pinned at 8.21.3, inside 1.x's `^8.16.0`, and puppeteer 25
-(`^25.16.0`, from `^24.29.1`), which 1.x's screenshot path loads. When 2.0 becomes the default,
+(`terminal-sessions-mcp`, `session-server`, `session-cli`) run 1.x. 2.0 changes none of their
+code; what reaches them is the package manifest they share with 2.0: a narrower Node range
+(`engines`), and `ws` pinned at 8.21.3, inside 1.x's `^8.16.0`. When 2.0 becomes the default,
 `terminal-sessions-mcp` will point at the shim that serves the 1.x tool names (`runCommand`,
 `tailLogs`, `sendInput`, …; the entry `next/src/shim/compat.ts`, the tools
 `next/src/api/compat.ts`), where `runCommand`'s result also says when a command is still running or
 queued, and `session-server` at `termd`. Until then the shim serves those names with `--profile
-compat` (`TSM_PROFILE=compat`). The GUI is served by `termd` itself. Nothing reads the 1.x data,
+compat` (`TSM_PROFILE=compat`). Nothing reads the 1.x data,
 which lived only in memory.
 
 ## Development
 
-The code is in this directory, `next/`, beside the 1.x sources (`src/`, `cli/`, `gui/`); it
+The code is in this directory, `next/`, beside the 1.x sources (`src/`, `cli/`); it
 moves to the repository root once 1.x is retired. `npm run test:next` builds and runs 2.0's
 suite, `npm test` 1.x's; the design of record and its guarantees are in `docs/redesign/`.
 

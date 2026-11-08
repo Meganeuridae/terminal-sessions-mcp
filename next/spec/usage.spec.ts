@@ -45,9 +45,9 @@ test('atc-17/ux-23: signatures follow runIds, count only agents, and `await` aft
     // busy, then cancel {runId} of the Run that blocked it (no session in the call).
     a('run', { session: 's', state: 'busy', blockedBy: 'r2', ts: T0 + 50_000 }),
     a('cancel', { runId: 'r2', state: 'cancelled', ts: T0 + 51_000 }),
-    // A human typing Up Up in the GUI is not a blind resend; an agent sending the same input twice is.
-    a('input', { principal: 'human:gui:agent:a@x', host: 'native', session: 's', digest: 'd1', ts: T0 + 60_000 }),
-    a('input', { principal: 'human:gui:agent:a@x', host: 'native', session: 's', digest: 'd1', ts: T0 + 60_100 }),
+    // A human typing Up Up is not a blind resend; an agent sending the same input twice is.
+    a('input', { principal: 'human:local:a', host: 'native', session: 's', digest: 'd1', ts: T0 + 60_000 }),
+    a('input', { principal: 'human:local:a', host: 'native', session: 's', digest: 'd1', ts: T0 + 60_100 }),
     a('input', { session: 's', digest: 'd2', ts: T0 + 61_000 }),
     a('input', { session: 's', digest: 'd2', ts: T0 + 61_200 }),
     // Sensitive input has no digest: never matched.

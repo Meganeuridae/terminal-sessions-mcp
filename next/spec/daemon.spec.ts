@@ -434,7 +434,7 @@ const SANDBOX = '/usr/bin/sandbox-exec';
 const canHideBash = process.platform === 'darwin' && fs.existsSync(SANDBOX) && spawnSync(SANDBOX, ['-p', '(version 1)(allow default)', '/usr/bin/true']).status === 0;
 
 test('termd on a host without bash keeps serving, says so once at startup, and /health carries the reason sessions are refused', { skip: canHideBash ? false : 'hiding /bin/bash from one process needs sandbox-exec (macOS); the server side runs everywhere in transport.spec' }, async () => {
-  // The house's answers (#22 comment 6275033749): serving keeps history, the GUI and the lane; /health
+  // The house's answers (#22 comment 6275033749): serving keeps history and the lane; /health
   // answered "ok" with nothing about the missing bash. /bin/bash is hidden from this termd alone, and
   // its PATH holds no bash.
   const empty = path.join(tmp, 'no-bash-path');

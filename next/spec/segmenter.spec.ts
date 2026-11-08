@@ -46,21 +46,21 @@ test('a human typing into a program is a message; a human typing a command that 
   const src = fakeSource();
   const seg = new Segmenter(src, { runSettleMs: 5 });
   const out = collect(seg);
-  src.journal.append({ type: 'input', data: 'y', principal: 'human:gui:aster', kind: 'text' });
+  src.journal.append({ type: 'input', data: 'y', principal: 'human:local:aster', kind: 'text' });
   // The program echoes it (m2-2: only an echoed line is repeated to agents).
   src.screen.lines = ['Continue? [y/N] y', '', '', '', ''];
   src.screen.cursor = { x: 17, y: 0 };
-  src.journal.append({ type: 'input', data: '\r', principal: 'human:gui:aster', kind: 'text' });
+  src.journal.append({ type: 'input', data: '\r', principal: 'human:local:aster', kind: 'text' });
   await sleep(400);
   assert.equal(out.filter((s) => s.kind === 'human-input').length, 1);
-  assert.match(out[0]!.head, /human:gui:aster typed: y$/);
+  assert.match(out[0]!.head, /human:local:aster typed: y$/);
   assert.ok(out[0]!.tags.includes('chat:from-human'));
 
   out.length = 0;
-  src.journal.append({ type: 'input', data: 'ls\r', principal: 'human:gui:aster', kind: 'text' });
-  const admit = src.journal.append({ type: 'run.admit', runId: 'r9', target: 'shell', principal: 'human:gui:aster', origin: 'human', queued: false });
+  src.journal.append({ type: 'input', data: 'ls\r', principal: 'human:local:aster', kind: 'text' });
+  const admit = src.journal.append({ type: 'run.admit', runId: 'r9', target: 'shell', principal: 'human:local:aster', origin: 'human', queued: false });
   const start = src.journal.append({ type: 'run.start', runId: 'r9', cwd: '/w' });
-  src.runs.set('r9', { runId: 'r9', sessionId: 's1', target: 'shell', origin: 'human', principal: 'human:gui:aster', state: 'running', admittedAt: admit.ts, seq: { admit: admit.seq, start: start.seq }, attribution: 'temporal', line: 'ls' });
+  src.runs.set('r9', { runId: 'r9', sessionId: 's1', target: 'shell', origin: 'human', principal: 'human:local:aster', state: 'running', admittedAt: admit.ts, seq: { admit: admit.seq, start: start.seq }, attribution: 'temporal', line: 'ls' });
   await sleep(400);
   assert.equal(out.filter((s) => s.kind === 'human-input').length, 0, 'the command became a Run; its end is the message');
   seg.dispose();
@@ -73,20 +73,20 @@ test('a line recalled from history or completed with Tab, then Enter, is a human
   src.screen.lines = ['>>> ', '', '', '', ''];
   src.screen.cursor = { x: 4, y: 0 };
   // Up recalls a line this reconstruction never saw; Enter submits it from an empty buffer.
-  src.journal.append({ type: 'input', data: '\x1b[A', principal: 'human:gui:aster', kind: 'keys' });
-  src.journal.append({ type: 'input', data: '\r', principal: 'human:gui:aster', kind: 'text' });
+  src.journal.append({ type: 'input', data: '\x1b[A', principal: 'human:local:aster', kind: 'keys' });
+  src.journal.append({ type: 'input', data: '\r', principal: 'human:local:aster', kind: 'text' });
   await sleep(400);
   assert.equal(out.filter((s) => s.kind === 'human-input').length, 1, 'the recalled line is reported');
   assert.match(out[0]!.head, /typed: \[input edited with cursor, history or completion keys — not shown\]$/);
   out.length = 0;
   // Tab alone completes something, then Enter.
-  src.journal.append({ type: 'input', data: '\t', principal: 'human:gui:aster', kind: 'text' });
-  src.journal.append({ type: 'input', data: '\r', principal: 'human:gui:aster', kind: 'text' });
+  src.journal.append({ type: 'input', data: '\t', principal: 'human:local:aster', kind: 'text' });
+  src.journal.append({ type: 'input', data: '\r', principal: 'human:local:aster', kind: 'text' });
   await sleep(400);
   assert.equal(out.filter((s) => s.kind === 'human-input').length, 1, 'the completed line is reported');
   out.length = 0;
   // A bare Enter with nothing recalled is still nothing.
-  src.journal.append({ type: 'input', data: '\r', principal: 'human:gui:aster', kind: 'text' });
+  src.journal.append({ type: 'input', data: '\r', principal: 'human:local:aster', kind: 'text' });
   await sleep(400);
   assert.equal(out.length, 0);
   seg.dispose();
@@ -98,7 +98,7 @@ test('protocol replies and agent input are never messages; sensitive input is a 
   const out = collect(seg);
   src.journal.append({ type: 'input', data: '\x1b[1;1R', principal: 'system', kind: 'protocol-reply' });
   src.journal.append({ type: 'input', data: 'x\r', principal: 'agent:a@t', kind: 'text' });
-  src.journal.append({ type: 'input', data: '[redacted]', principal: 'human:gui:aster', kind: 'text', sensitive: true });
+  src.journal.append({ type: 'input', data: '[redacted]', principal: 'human:local:aster', kind: 'text', sensitive: true });
   await sleep(450);
   assert.equal(out.length, 1);
   assert.match(out[0]!.head, /typed: \[sensitive input\]$/);
@@ -195,17 +195,17 @@ test('G23: no segment claims chat:addressed — a Run’s end, a service, a watc
   const src = fakeSource();
   const seg = new Segmenter(src, { runSettleMs: 5 });
   const out = collect(seg);
-  src.journal.append({ type: 'input', data: 'y', principal: 'human:gui:aster', kind: 'text' });
+  src.journal.append({ type: 'input', data: 'y', principal: 'human:local:aster', kind: 'text' });
   src.screen.lines = ['Continue? [y/N] y', '', '', '', ''];
   src.screen.cursor = { x: 17, y: 0 };
-  src.journal.append({ type: 'input', data: '\r', principal: 'human:gui:aster', kind: 'text' });
+  src.journal.append({ type: 'input', data: '\r', principal: 'human:local:aster', kind: 'text' });
   await sleep(400);
   src.runs.set('r1', { runId: 'r1', sessionId: 's1', target: 'process', origin: 'self', principal: 'agent:a@t', state: 'running', admittedAt: 0, seq: { admit: 1 }, attribution: 'exact', line: 'npm run dev' });
   src.journal.append({ type: 'service', runId: 'r1', status: 'ready', probe: 'pattern /ready/', principal: 'agent:a@t', evidence: 'ready on :3000' });
   src.journal.append({ type: 'watch.fired', watchId: 'w1', label: 'errors', kind: 'pattern', principal: 'agent:b@t', at: 3, match: 'ERROR', line: 'ERROR: boom' });
-  const admit = src.journal.append({ type: 'run.admit', runId: 'r2', target: 'shell', principal: 'human:gui:aster', origin: 'human', queued: false });
+  const admit = src.journal.append({ type: 'run.admit', runId: 'r2', target: 'shell', principal: 'human:local:aster', origin: 'human', queued: false });
   const start = src.journal.append({ type: 'run.start', runId: 'r2', cwd: '/w' });
-  src.runs.set('r2', { runId: 'r2', sessionId: 's1', target: 'shell', origin: 'human', principal: 'human:gui:aster', state: 'exited', exit: 1, admittedAt: admit.ts, startedAt: start.ts, seq: { admit: admit.seq, start: start.seq }, attribution: 'temporal', line: 'make' });
+  src.runs.set('r2', { runId: 'r2', sessionId: 's1', target: 'shell', origin: 'human', principal: 'human:local:aster', state: 'exited', exit: 1, admittedAt: admit.ts, startedAt: start.ts, seq: { admit: admit.seq, start: start.seq }, attribution: 'temporal', line: 'make' });
   src.journal.append({ type: 'run.end', runId: 'r2', state: 'exited', exit: 1, durationMs: 10 });
   await sleep(400);
   const kinds = new Set<string>(out.map((s) => s.kind));

@@ -1,9 +1,6 @@
 /**
  * Measure (§16): the daemon sees every call, so it records them — per tool, per
- * host kind, errors — except the GUI's successful read-only calls (its own
- * bookkeeping: session_list, screen, read and the like; the endpoint's
- * READ_ONLY_TOOLS), which the log keeps at debug level only (the house's read of
- * the 33 commits, #22, comment 6307351372). A report finds confusion
+ * host kind, errors. A report finds confusion
  * signatures: a `read` right
  * after a `run` whose wait was too short, `input` sent twice within a second,
  * `screen` polled in a loop, `cancel` after a `busy`. The endpoint builds the
@@ -59,7 +56,7 @@ export interface Distribution {
 
 export interface UsageReport {
   calls: number;
-  /** Calls by agents (not a human's GUI and not the native family): the ones the signatures read. */
+  /** Calls by agents (not a human and not the native family): the ones the signatures read. */
   agentCalls: number;
   from?: string;
   to?: string;
@@ -91,8 +88,8 @@ const READ_TOOLS: ReadonlySet<string> = new Set(['read', 'tailLogs']);
 const CANCEL_TOOLS: ReadonlySet<string> = new Set(['cancel', 'signal', 'sendSignal']);
 
 /**
- * Signatures describe agents: a human typing in the GUI (principal `human:…`) sends Up
- * Up or Enter Enter on purpose, and the native family (GUI, CLI) is not the model surface
+ * Signatures describe agents: a human (principal `human:…`) sends Up Up or Enter Enter
+ * on purpose, and the native family (the CLI) is not the model surface
  * the traces are meant to tune.
  */
 export const isAgentCall = (r: Pick<UsageRecord, 'principal' | 'host'>): boolean => !String(r.principal).startsWith('human:') && r.host !== 'native';

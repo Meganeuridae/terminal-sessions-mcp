@@ -1,5 +1,5 @@
 /**
- * G13 on a real shell: GUIs attaching while bash floods the terminal each get a
+ * G13 on a real shell: clients attaching while bash floods the terminal each get a
  * snapshot at N and exactly the events after N, and rebuild the daemon's screen.
  */
 import { test, before, after } from 'node:test';

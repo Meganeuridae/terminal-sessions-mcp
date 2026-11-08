@@ -1,6 +1,6 @@
 /**
  * Credentials and argument validation at the boundary: token resolution,
- * tokens-file hygiene, principals a credential may name, the GUI principal, and
+ * tokens-file hygiene, principals a credential may name, and
  * the schema validator's handling of prototype-named keys and typed maps (api-21).
  */
 import { test, after } from 'node:test';
@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { guiActsFor, guiPrincipal, isValidPrincipal, readTokensFile, TokenMapResolver } from '../src/api/principals.js';
+import { isValidPrincipal, readTokensFile, TokenMapResolver } from '../src/api/principals.js';
 import { validate, ValidationError, type Schema } from '../src/api/validate.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-auth-'));
@@ -40,18 +40,6 @@ test('a credential can never name the system principal or a malformed one', () =
   assert.throws(() => new TokenMapResolver({ tokens: { t: 'agent:has space' } }), /not a principal/);
   assert.throws(() => new TokenMapResolver({ tokens: { t: 'agent:a\nforged' } }), /not a principal/);
   for (const ok of ['agent:a@test', 'human:test:9', 'token:default', 'host:claude-code', 'token:local-aster']) assert.ok(isValidPrincipal(ok), ok);
-});
-
-test('the GUI principal is the human at the keyboard of whoever the token names, one-to-one', () => {
-  assert.equal(guiPrincipal('agent:alice@corp'), 'human:gui:agent:alice@corp');
-  assert.equal(guiPrincipal('token:local-aster'), 'human:gui:token:local-aster');
-  assert.notEqual(guiPrincipal('agent:alice'), guiPrincipal('token:alice'), 'different tokens never share a GUI human');
-  assert.equal(guiPrincipal('human:github:42'), 'human:github:42');
-  assert.ok(isValidPrincipal(guiPrincipal('agent:alice@corp')));
-  assert.equal(guiActsFor('human:gui:agent:alice@corp', 'agent:alice@corp'), true);
-  assert.equal(guiActsFor('human:gui:token:alice', 'agent:alice'), false);
-  assert.equal(guiActsFor('human:github:42', 'human:github:42'), false);
-  assert.equal(guiActsFor('agent:alice@corp', 'agent:alice@corp'), false);
 });
 
 test('a tokens file readable by group or others is refused, naming chmod 600; its tokens never appear in errors', () => {
@@ -124,12 +112,8 @@ test('a tokens file the daemon cannot read is a read failure, not bad JSON', { s
   }
 });
 
-test('a credential cannot name a human:gui: principal: that form is derived from the token’s own', () => {
-  assert.throws(() => new TokenMapResolver({ tokens: { t: 'human:gui:agent:alice@corp' } }), /derived from the token/);
-  assert.throws(() => new TokenMapResolver({ anonymous: 'human:gui:token:default' }), /derived from the token/);
-  const f = path.join(tmp, 'gui.json');
-  fs.writeFileSync(f, JSON.stringify({ 'sekrit-token-3': 'human:gui:agent:alice@corp' }));
-  fs.chmodSync(f, 0o600);
-  assert.throws(() => readTokensFile(f), (e: Error) => /derived from the token/.test(e.message) && !e.message.includes('sekrit'));
-  assert.ok(isValidPrincipal(guiPrincipal('agent:alice@corp')), 'the derived form itself stays a valid principal');
+test('a credential may name any human: principal; no form of one is reserved', () => {
+  const r = new TokenMapResolver({ tokens: { t: 'human:gui:agent:alice@corp' }, anonymous: 'human:gui:token:default' });
+  assert.equal(r.resolve('t'), 'human:gui:agent:alice@corp');
+  assert.equal(r.resolve(undefined), 'human:gui:token:default');
 });

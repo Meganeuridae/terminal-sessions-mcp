@@ -78,8 +78,8 @@ authenticated with a per-session key and every daemon line is a sourced command 
 §8.1, G6); cancel reports its steps and reaches the foreground job's group (G29); sessions
 are login shells with their own history; the transcript projection's seven rules are
 stated (§6); the PTY is paused for the daemon's own emulator (§6); names belong to their
-owners (G30) and closed sessions stay readable (G19); the Host/Origin rules and the GUI's
-principal are specified (§12); G16, G22 and G28 describe their mechanisms (idempotent
+owners (G30) and closed sessions stay readable (G19); the Host/Origin rules are specified
+(§12); G16, G22 and G28 describe their mechanisms (idempotent
 replay, the owed set under `delivered`, suppression by in-flight waiters). Implementation
 notes are in §16.
 
@@ -114,7 +114,7 @@ replaces conventions with a model and guarantees:
    process-mode runs get exit status straight from the daemon; a headless emulator gives
    the screen. The old marker mechanism survives only as a fallback.
 4. **One daemon, one endpoint, an event lane.** The daemon speaks MCP+MCPL over WebSocket;
-   the CLI, the GUI and a stdio shim are thin clients. Sessions are channels; a segmenter
+   the CLI and a stdio shim are thin clients. Sessions are channels; a segmenter
    turns the journal into tagged messages; the host's gate decides what wakes the agent; a
    `beforeInference` injection tells the agent what changed since it last looked.
 5. **Persistence is three separate promises,** made and reported separately: outliving a
@@ -139,8 +139,8 @@ notification is missed.
 ## 2. What the current system gets right, and what to keep
 
 Keep: the daemon/client separation and the deployment posture built on it; real PTYs;
-named sessions; interactive input with the named-key vocabulary; human access through an
-xterm.js GUI; the temp-file route for multi-line input; the exec-marker hardening in
+named sessions; interactive input with the named-key vocabulary; the temp-file route for
+multi-line input; the exec-marker hardening in
 PR #7 (as the fallback strategy); the real-PTY test style.
 
 Replace: the single mutable session object; the marker-typed-after-a-delay completion
@@ -188,7 +188,7 @@ Node ─┬─ Session ─┬─ Terminal (the shell's PTY · Screen · Journal)
       │           ├─ Run* (target: shell | process; optional Service)
       │           ├─ Attachment* (principal, role, cursors)
       │           └─ Watch*
-      └─ Principal* (agent | human | host | system; via token | aid1 | gui)
+      └─ Principal* (agent | human | host | system; via token | aid1)
 ```
 
 | Entity | Identity | Meaning |
@@ -419,7 +419,7 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
   the name, which continues the same journal and `seq` numbering, so earlier Runs stay
   reachable by id (the newest 100,000 Runs of a name: the run index is bounded in memory, and
   output of a Run it forgot stays readable by cursor); anyone else is refused, so no principal can take over a name to read
-  another's history. The owner's GUI (`human:gui:<owner>`, §12) acts for the owner here.
+  another's history.
   Names are unique regardless of case, and concurrent opens of one name make one shell;
   a caller that raced another principal's creation is authorized against the session that
   resulted, and a name the caller cannot observe is reported as taken, not as a verb
@@ -476,8 +476,7 @@ to, and what agents may plan around. Numbering is stable; amend by adding, not r
 - **G25.** The daemon writes to a PTY only: the exec line of a shell Run; integration setup
   at session start; resize; input a principal asked for; and the terminal-protocol replies
   a program requested (cursor position report, device attributes, and the like). The
-  daemon's emulator is the **sole** responder to such queries; an attached GUI's emulator
-  never answers, so attaching a second viewer never creates a second responder.
+  daemon's emulator is the **sole** responder to such queries.
 - **G26.** Input marked `sensitive` is journaled as a redacted placeholder, and transport
   credentials are never logged or journaled. No promise is made about what programs print
   — a program may echo a secret — and retention (G21) bounds that exposure. This is the
@@ -744,8 +743,8 @@ core flow — open, run, input — never needs a `control` call; other principal
 seat on request when it is free, per policy. Each Attachment carries the principal's two
 cursors (G22).
 Observers see everything, including who the controller is and what they type (with
-provenance), and may not act (G17). Terminal dimensions belong to the controller; the GUI
-and the snapshot renderer scale or reflow their own view rather than resizing the PTY —
+provenance), and may not act (G17). Terminal dimensions belong to the controller; the snapshot
+renderer scales or reflows its own view rather than resizing the PTY —
 the observer effect Codex found is designed out (G14).
 
 Handoff: `release` (controller gives up the seat), `take` (a waiting principal takes a free
@@ -774,7 +773,7 @@ Each session is a bidirectional channel `terminal:<session>` with `address: {nod
 session}`. This fits what the host already does with channels: host-owned open/close with
 durable desired state, backscroll on open, tune-out routing, and per-channel conversation
 binding. `publish` records what the agent said on the channel as a **note** in the journal —
-visible to humans in the GUI and to other observers — and never types into the terminal:
+visible to observers — and never types into the terminal:
 hosts route an agent's ordinary speech to the channel that woke it, so publish-as-typing
 executes prose (found in review, reproduced against agent-framework: the reply "Build
 finished. A sensible follow-up would be: touch …" ran, and the loop it started did not
@@ -1135,15 +1134,15 @@ release so existing recipes keep working, and is removed in the release after.
 ## 12. Topology and transport
 
 ```
- agent-framework hosts            Cursor / Claude Desktop / Claude Code        humans
-   │ MCPL over wss (?token / aid1)     │ stdio                                 │ https
-   │                                    ▼                                       ▼
-   │                          terminal-sessions-mcp (shim: stdio ↔ ws proxy)  browser GUI
-   ▼                                    │                                       │
+ agent-framework hosts            Cursor / Claude Desktop / Claude Code
+   │ MCPL over wss (?token / aid1)     │ stdio
+   │                                    ▼
+   │                          terminal-sessions-mcp (shim: stdio ↔ ws proxy)
+   ▼                                    │
 ┌──────────────────────────────── termd — one per node ────────────────────────────────┐
 │ transport/  ws server: JSON-RPC 2.0 with two method families —                       │
 │             MCP+MCPL (tools, channels, hooks, manifest) · terminal/* (attach, cursor  │
-│             subscribe, screen diffs, control) · static GUI hosting · /health         │
+│             subscribe, screen diffs, control) · /health                              │
 │ api/        typed application API · schemas · adapters (mcp/mcpl, native, compat)    │
 │ policy/     principals · verbs · control seats · per-principal cursors               │
 │ core/       Session FSM · Run lifecycle · Journal + views · Screen · Marks · Watches  │
@@ -1156,15 +1155,12 @@ release so existing recipes keep working, and is removed in the release after.
   `token` (or an `Authorization: Bearer` header), `profile` (plain MCP only: `core | full |
   compat`), `resultText` (`json | transcript`, §11), `connection` (a label for logs and usage
   records; the daemon generates the identity), and `client=cli`, which the `tsm` CLI sends so
-  usage records count it with the GUI as the native family rather than as an agent surface.
-  Serves the GUI's static files; the GUI is a
-  client of the `terminal/*` family over the same WebSocket. socket.io and express go away.
+  usage records count it as the native family rather than as an agent surface.
+  socket.io and express go away.
   Every HTTP request and upgrade must name an allowed Host (loopback names, the bind
   address, `--allow-host`; non-loopback binds require both a credential and
   `--allow-host`), which stops DNS rebinding; an `Origin` is accepted only when it is
-  same-origin with that Host — the daemon's own GUI — which stops cross-site WebSocket
-  hijacking; and a same-origin browser connection is the GUI's human, principal
-  `human:gui:<token principal>`. Nothing a client sends can take the daemon down: frames
+  same-origin with that Host, which stops cross-site WebSocket hijacking. Nothing a client sends can take the daemon down: frames
   are classified before use and capped (4 MiB), requests in flight per connection and
   connections per daemon are bounded, and connection identities are generated by the
   daemon, so no client can detach another's attachments by reusing a label.
@@ -1175,7 +1171,7 @@ release so existing recipes keep working, and is removed in the release after.
   buffers output during the gap (bounded, so the journal shows a `gap` if it overflows).
   Journals are the daemon's and are file-backed, so a restart under the keeper is
   `recovered: continuous`; without it, `history-only` (G20).
-- **Native methods** exist for the GUI and CLI and are the one non-MCP part of the
+- **Native methods** exist for the CLI and are the one non-MCP part of the
   surface, kept small: attach with a cursor, stream journal events and screen diffs, take
   or release control.
 - **Multi-node**: a recipe lists one terminal server per node; descriptors carry
@@ -1198,10 +1194,9 @@ src/backends/    ExecutionBackend: node-pty; keeper client; scripted (tests)
 src/shell/       integration scripts for bash, zsh, fish (PowerShell later); detection
 src/api/         application API + schemas; adapters: mcp/mcpl (on @animalabs/mcpl-core),
                  native, compat
-src/transport/   ws server, auth, static hosting, /health
+src/transport/   ws server, auth, /health
 src/shim/        stdio ↔ ws
 src/cli/         thin client
-gui/             static app (xterm.js) as a native client
 ```
 
 Seams. A second implementation is required only where one is real on day one; elsewhere a
@@ -1285,8 +1280,8 @@ be made on evidence the first milestone will produce. Each deferral below says w
 **Implementation status (2026-09-24; landing shape 2026-10-19).** Milestones 1 and 2 are
 built in `next/`, and the package ships them beside the 1.x code rather than in its place
 (PR #22): `package.json` points the 1.x names (`terminal-sessions-mcp`, `session-server`,
-`session-gui`, `session-cli`) at the 1.x code, unchanged, and adds `termd`, `tsm` and
-`tsm-shim` for 2.0; the 1.x server keeps ports 3100 and 3200, `termd` listens on 3101.
+`session-cli`) at the 1.x code, unchanged, and adds `termd`, `tsm` and `tsm-shim` for 2.0;
+the 1.x server keeps port 3100, `termd` listens on 3101.
 Making 2.0 the default — `terminal-sessions-mcp` becoming the stdio shim serving the compat
 pack, `session-server` starting `termd`, the 1.x code retired — is a later release, antra's
 call as the maintainer; until then the shim serves the 1.x tool names with
@@ -1296,8 +1291,8 @@ agent-framework's real host code and against mcpl-cc-bridge's host classes
 bash 3.2 / zsh / sh / dash / fish, end to end over the endpoint, a headless browser for the
 GUI, daemon restarts) passes.
 Milestone 2's contents are in: the compat pack, services with pattern/tcp/alive probes,
-watches and `wait_for`, digests with `supersedes`, screens, needs-input, presence, the GUI
-as a native client, socket.io/express/puppeteer gone from the runtime, tiers and profiles,
+watches and `wait_for`, digests with `supersedes`, screens, needs-input, presence,
+socket.io/express/puppeteer gone from the runtime, tiers and profiles,
 Measure (`usage.jsonl`, `tsm usage`) and shipped configurations (`next/config/`). Not done
 here: switching agent-framework recipes to `mcplServers` (their repository) and a week of
 Measure traces from real use, which need deployment. Facts the build taught, folded in
@@ -1353,17 +1348,13 @@ file store. Dogfooded on a second port beside the deployed daemon.
 Deferred from milestone 1, with reasons: services and probes (their own contract; §8.3);
 watches and `wait_for` (a second event source; cheap, but not needed for the sentence);
 in-flight digests and the presence injection (both depend on the `read` cursor semantics
-being right in practice first — evidence); the GUI as a native client (the old GUI still
-works against the 1.x server, which ships beside 2.0 — the compat pack serves the 1.x *tool
-names* to MCP hosts, not the 1.x GUI's own `session.create`/`exec`/`output`/`search`
-WebSocket protocol, which termd does not speak); tiers and profiles (evidence from Measure
+being right in practice first — evidence); tiers and profiles (evidence from Measure
 decides the boundary).
 
 **Milestone 2 — swap-in.** Everything that makes milestone 1 pleasant and lets it replace
 the deployed daemon: the compat pack under the old tool names; services and the three
 first-release probes; watches and `wait_for`; digests with `supersedes`; the presence delta;
-the GUI as a native client whose emulator does not answer queries; puppeteer, express and
-socket.io removed; tiers and profiles; **Measure** instrumentation; shipped recipe and
+puppeteer, express and socket.io removed; tiers and profiles; **Measure** instrumentation; shipped recipe and
 bridge configurations. agent-framework recipes switch the `shell` entry to `mcplServers`.
 
 **Measure, before fixing the defaults.** "Current workflows seem functional" is weak
@@ -1510,7 +1501,7 @@ started the Run. The presence line reads `build: `npm run build` → 0 (3m12s)`.
 `terminal:watch=dev-errors`, which wakes the agent. When the dev server dies, the Service
 reports `exited` from the observed end mark (G9), not `running` because bash is alive.
 
-**A human intervenes.** A human opens the GUI, takes the seat (`control` event journaled),
+**A human intervenes.** A human (a `human:` principal) takes the seat (`control` event journaled),
 types `git stash`. The `C` mark creates Run `r43` with `origin: human`; the host receives a
 `run` message tagged `terminal:origin=human chat:from-human`. Had the agent issued a `run`
 while `r43` was executing, it would have received `busy` with `r43` (G4). The human releases

@@ -89,8 +89,6 @@ export interface AdmitOptions {
   internal?: boolean;
   /** Recorded on the Run and its run.admit event (G16); opaque to the session. */
   idem?: string;
-  /** The caller acts with the owner's seat rights (the owner's own GUI human, §12); the application layer decides. */
-  asOwner?: boolean;
 }
 
 /**
@@ -112,12 +110,6 @@ export interface DeclareOptions {
   /** The Run whose program is the shell. Default: the innermost running Run (the one holding the terminal). */
   within?: string;
   principal: Principal;
-  asOwner?: boolean;
-}
-
-/** Seat-checked operations accept the owner's rights for a principal the application layer vouches for (tsg-13, atc-12). */
-export interface SeatOptions {
-  asOwner?: boolean;
 }
 
 export type BusyReason = 'running' | 'prompt-pending' | 'cancel-unanswered' | 'human-editing' | 'human-submitted' | 'starting' | 'shell-unavailable' | 'exited' | 'declared-shell-ended';
@@ -1966,7 +1958,7 @@ export class Session {
 
   /** Admit a Run (G1, G4). Shell Runs need availability; process Runs never occupy the shell. */
   admit(opts: AdmitOptions): AdmitResult {
-    if (!opts.internal && opts.principal !== SYSTEM && this.control !== 'open') this.requireSeat(opts.principal, 'run', { asOwner: opts.asOwner === true });
+    if (!opts.internal && opts.principal !== SYSTEM && this.control !== 'open') this.requireSeat(opts.principal, 'run');
     const origin = opts.origin ?? (opts.principal === SYSTEM ? 'system' : 'self');
     if (opts.target === 'process') {
       this.assertAlive();
@@ -2035,7 +2027,7 @@ export class Session {
    */
   declareShell(opts: DeclareOptions): { shell: string | null; within: string | null; depth: number } {
     this.assertAlive();
-    if (opts.principal !== SYSTEM && this.control !== 'open') this.requireSeat(opts.principal, 'declare', { asOwner: opts.asOwner === true });
+    if (opts.principal !== SYSTEM && this.control !== 'open') this.requireSeat(opts.principal, 'declare');
     const shell = (opts.shell ?? 'sh').trim();
     if (shell === 'none') {
       const top = this.layers.pop();
@@ -2590,15 +2582,14 @@ export class Session {
 
   /**
    * Cancel under the contract for the Run's target (G29). Allowed to the seat holder,
-   * the Run's own principal, the owner (`asOwner`: whoever the application layer lets act
-   * with the owner's rights), the daemon, anyone under control 'open' — and anyone else
+   * the Run's own principal, the owner, the daemon, anyone under control 'open' — and anyone else
    * who finds the seat free, and takes it (ux-10; the application layer checks verbs).
    * A process Run that ended while members of its group live on is cancelled as a group
    * still (ss-10): the steps are reported, the recorded state stays.
    */
-  async cancel(runId: string, principal: Principal, opts: { graceMs?: number; asOwner?: boolean } = {}): Promise<CancelResult> {
+  async cancel(runId: string, principal: Principal, opts: { graceMs?: number } = {}): Promise<CancelResult> {
     const run = this.getRun(runId);
-    this.requireCancel(run, principal, opts.asOwner === true);
+    this.requireCancel(run, principal);
     const steps: string[] = [];
     const grace = opts.graceMs ?? 500;
     if (run.target === 'process') {
@@ -2832,8 +2823,8 @@ export class Session {
     this.append({ type: 'input', data: reply, principal: SYSTEM, kind: 'protocol-reply' });
   }
 
-  private requireCancel(run: RunRecord, principal: Principal, asOwner: boolean): void {
-    if (principal === SYSTEM || this.control === 'open' || principal === this.controller || principal === run.principal || principal === this.owner || asOwner) return;
+  private requireCancel(run: RunRecord, principal: Principal): void {
+    if (principal === SYSTEM || this.control === 'open' || principal === this.controller || principal === run.principal || principal === this.owner) return;
     // Anyone else acts through the seat: a free one is theirs (ux-10).
     this.requireSeat(principal, 'cancel');
   }
@@ -3020,10 +3011,10 @@ export class Session {
    * at a prompt that asks for a secret (m2-2) is journaled like input marked `sensitive`
    * (G26): redacted, and never promoted into a Run's line — until Enter or ^C.
    */
-  input(data: string, opts: { principal: Principal; kind?: 'text' | 'keys' | 'paste'; sensitive?: boolean; asOwner?: boolean }): void {
+  input(data: string, opts: { principal: Principal; kind?: 'text' | 'keys' | 'paste'; sensitive?: boolean }): void {
     this.assertAlive();
     if (data.length === 0) throw err('invalid_argument', 'input needs text or keys: there is nothing to send');
-    if (opts.principal !== SYSTEM) this.requireSeat(opts.principal, 'input', { asOwner: opts.asOwner === true });
+    if (opts.principal !== SYSTEM) this.requireSeat(opts.principal, 'input');
     const sensitive = opts.sensitive === true || (opts.principal !== SYSTEM && (this.secretInput || this.atSecretPrompt()));
     if (sensitive && opts.principal !== SYSTEM) this.secretInput = !/[\r\n\x03]/.test(data);
     const ev: Parameters<Journal['append']>[0] = { type: 'input', data: sensitive ? '[redacted]' : data, principal: opts.principal, kind: opts.kind ?? 'text' };
@@ -3135,9 +3126,9 @@ export class Session {
    * group when that group is a job; signalling the shell itself is refused — that is
    * `session_close`. Unknown or empty names are invalid.
    */
-  signal(signal: string, principal: Principal, opts: SeatOptions = {}): void {
+  signal(signal: string, principal: Principal): void {
     this.assertAlive();
-    if (principal !== SYSTEM) this.requireSeat(principal, 'signal', opts);
+    if (principal !== SYSTEM) this.requireSeat(principal, 'signal');
     const name = normalizeSignal(signal);
     const current = this.currentShellRun ?? this.pendingShellRun;
     const ev: Parameters<Journal['append']>[0] = { type: 'signal', signal: name, principal };
@@ -3164,9 +3155,9 @@ export class Session {
     }
   }
 
-  resize(cols: number, rows: number, principal: Principal, opts: SeatOptions = {}): void {
+  resize(cols: number, rows: number, principal: Principal): void {
     this.assertAlive();
-    if (principal !== SYSTEM) this.requireSeat(principal, 'resize', opts);
+    if (principal !== SYSTEM) this.requireSeat(principal, 'resize');
     this.pty.resize(cols, rows);
     this.screen.resize(cols, rows);
     this.append({ type: 'resize', cols, rows, principal });
@@ -3184,9 +3175,9 @@ export class Session {
    * snapshot is journaled (G26). It types into the shell like any run, so it needs the
    * seat like any run (api-3).
    */
-  async captureEnv(principal: Principal, waitMs = 10_000, opts: SeatOptions = {}): Promise<EnvSnapshot> {
+  async captureEnv(principal: Principal, waitMs = 10_000): Promise<EnvSnapshot> {
     this.assertAlive();
-    if (principal !== SYSTEM && this.control !== 'open') this.requireSeat(principal, 'run', opts);
+    if (principal !== SYSTEM && this.control !== 'open') this.requireSeat(principal, 'run');
     const out = path.join(this.tempDir, `tsm-env-${process.pid}-${this.safeId}-${++this.tempCounter}.bin`);
     this.extraTempFiles.add(out);
     let capture: RunRecord | undefined;
@@ -3205,7 +3196,7 @@ export class Session {
       // The file already has owner-only mode. POSIX/zsh use >| to override noclobber; fish parses >| as a pipe.
       writeExclusive(out, '');
       const admitted = await this.admitWhenAvailable(() => {
-        if (principal !== SYSTEM && this.control !== 'open') this.requireSeat(principal, 'run', opts);
+        if (principal !== SYSTEM && this.control !== 'open') this.requireSeat(principal, 'run');
         // waitAvailable can change the declared shell: choose syntax just before each attempt to admit.
         const front = this.layers.at(-1);
         const flavor = front ? declaredFlavor(front.shell) : this.flavor;
@@ -3309,14 +3300,12 @@ export class Session {
 
   /**
    * Take the seat (G17): a free seat is anyone's; a held one only the owner's — the owner
-   * override, under every policy, so the owner is never locked out (ux-10). `asOwner`: the
-   * application layer lets this principal act with the owner's rights (the owner's own GUI
-   * human, tsg-13).
+   * override, under every policy, so the owner is never locked out (ux-10).
    */
-  takeControl(principal: Principal, opts: SeatOptions = {}): void {
+  takeControl(principal: Principal): void {
     if (this.controller === principal) return this.clearSeatReservation();
     if (this.controller === null) return this.setController(principal, principal, 'take');
-    if (principal === this.owner || opts.asOwner === true) return this.setController(principal, principal, 'override');
+    if (principal === this.owner) return this.setController(principal, principal, 'override');
     throw err('not_controller', `seat held by ${this.controller}${this.reservedNote()}: ask ${this.controller} to release it, or the owner (${this.owner}) to take it over`, {
       controller: this.controller,
     });
@@ -3345,13 +3334,13 @@ export class Session {
    * and under any policy from a holder whose connection dropped (a reserved seat never locks
    * the owner out). A seat held by someone else refuses, saying who holds it and what to do.
    */
-  private requireSeat(principal: Principal, verb: string, opts: SeatOptions = {}): void {
+  private requireSeat(principal: Principal, verb: string): void {
     if (this.controller === principal) return;
     if (this.controller === null) {
       this.setController(principal, principal, 'auto');
       return;
     }
-    const owner = principal === this.owner || opts.asOwner === true;
+    const owner = principal === this.owner;
     const holderAway = this.seatReserved !== undefined && this.seatReserved.principal === this.controller;
     if (owner && (this.control === 'owner-priority' || holderAway)) {
       this.setController(principal, principal, 'override');
