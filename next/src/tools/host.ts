@@ -411,9 +411,11 @@ function refusalAdvice(front: Front): string {
     case 'prompt':
       return `${JSON.stringify(quoted(front.pending ?? ''))} is typed at the prompt and not run. \`send\` with \`keys: ["C-u"]\` clears it, or \`keys: ["Enter"]\` runs it.`;
     case 'running':
-      return `${front.process.shell ? 'the shell itself is busy' : `${quoted(front.process.argv)} is running`}. \`look\` with \`until: "end"\` waits for it, \`send\` types into it, \`stop\` stops it.`;
+      if (front.starting) return `the shell is still running its startup files${front.process.shell ? '' : `, now ${quoted(front.process.argv)}`}, and \`run\` works once it has drawn its first prompt. \`look\` shows what it prints, \`send\` types into it.`;
+      if (front.process.shell) return 'the shell itself is busy. `look` with `until: "end"` waits for it, `send` types into it. If a command removed the session\'s prompt hooks, `close` it and `open` it again.';
+      return `${quoted(front.process.argv)} is running. \`look\` with \`until: "end"\` waits for it, \`send\` types into it, \`stop\` stops it.`;
     case 'waiting':
-      return `${quoted(front.process.argv)} is waiting for input. \`send\` answers it, \`stop\` stops it.`;
+      return `${quoted(front.process.argv)} is waiting for input${front.starting ? " in the shell's startup files" : ''}. \`send\` answers it${front.process.shell ? '' : ', `stop` stops it'}.`;
     case 'exited':
       return 'the shell has exited. `close` this session and `open` another.';
   }

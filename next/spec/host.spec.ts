@@ -303,3 +303,27 @@ test('a send whose wait ends before the prompt is drawn types nothing, and says 
   assert.equal(r.structured.error, 'not_at_prompt');
   assert.match(r.text, /\nNothing was typed: the shell hasn't finished drawing its prompt after 2\.\d s, .* `send` again with a longer `wait`\.$/);
 });
+
+test('a shell still running its startup files says so, in the status line and in a refused run', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 5, argv: '-bash', shell: true }, waitVisible: true, starting: true };
+  const r = await host.call(agent(), 'run', { name: 'main', command: 'ls' });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /^\[main · the shell is still running its startup files for /);
+  assert.match(r.text, /\nNothing was typed: the shell is still running its startup files, and `run` works once it has drawn its first prompt\./);
+  assert.doesNotMatch(r.text, /prompt hooks/);
+  s.frontNow = { state: 'waiting', since: Date.now(), process: { pgid: 5, argv: '-bash', shell: true }, echo: false, starting: true };
+  const w = await host.call(agent(), 'run', { name: 'main', command: 'ls' });
+  assert.match(w.text, /^\[main · waiting for input in the shell's startup files: -bash, not echoed/);
+  assert.match(w.text, /\nNothing was typed: -bash is waiting for input in the shell's startup files\. `send` answers it\.$/);
+});
+
+test('a refused run with the shell itself in front names the way out if its prompt hooks were removed, without saying they were', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  opened[0]!.frontNow = { state: 'running', since: Date.now(), process: { pgid: 5, argv: '-bash', shell: true }, waitVisible: true };
+  const r = await host.call(agent(), 'run', { name: 'main', command: 'ls' });
+  assert.match(r.text, /\nNothing was typed: the shell itself is busy\. .* If a command removed the session's prompt hooks, `close` it and `open` it again\.$/);
+});

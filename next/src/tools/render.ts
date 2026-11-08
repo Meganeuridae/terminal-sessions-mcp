@@ -16,11 +16,15 @@ export function frontText(front: Front, now: number): string {
     case 'prompt':
       return front.pending ? `at the prompt, with ${JSON.stringify(quoted(front.pending))} typed and not yet run` : 'at the prompt';
     case 'running': {
-      const what = front.process.shell ? 'the shell itself is busy' : `running ${quoted(front.process.argv)}`;
+      const what = front.process.shell
+        ? front.starting
+          ? 'the shell is still running its startup files'
+          : 'the shell itself is busy'
+        : `running ${quoted(front.process.argv)}${front.starting ? " from the shell's startup files" : ''}`;
       return `${what} for ${duration(now - front.since)}${front.waitVisible ? '' : " (whether it waits for input can't be seen here)"}`;
     }
     case 'waiting':
-      return `waiting for input: ${quoted(front.process.argv)}${front.echo ? '' : ', not echoed, as for a password'}, for ${duration(now - front.since)}`;
+      return `waiting for input${front.starting ? " in the shell's startup files" : ''}: ${quoted(front.process.argv)}${front.echo ? '' : ', not echoed, as for a password'}, for ${duration(now - front.since)}`;
     case 'exited':
       return `the shell ${exitText(front.exit)}`;
   }
