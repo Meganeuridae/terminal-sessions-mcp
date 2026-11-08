@@ -130,6 +130,16 @@ export function linesText(l: Lines, budget: number, readHint: string): string {
   return [...out, ...head, marker(left, cut), ...tail].join('\n');
 }
 
+export function outputValue(lines: readonly string[], budget: number): { output: string; outputLeftOut?: { at: number; characters: number } } {
+  const whole = lines.join('\n');
+  if (whole.length <= budget) return { output: whole };
+  let at = Math.floor(Math.max(0, budget) / 3);
+  if (at > 0 && isHighSurrogate(whole.charCodeAt(at - 1))) at--;
+  let end = whole.length - Math.max(0, budget - at);
+  if (isLowSurrogate(whole.charCodeAt(end))) end++;
+  return { output: whole.slice(0, at) + whole.slice(end), outputLeftOut: { at, characters: end - at } };
+}
+
 function omitted(left: number, cut: number): string {
   const parts: string[] = [];
   if (left) parts.push(`${left} line${left === 1 ? '' : 's'} left out`);
@@ -174,10 +184,12 @@ export function quoted(s: string): string {
   return c.more ? `${c.text}… (${c.more} more characters)` : s;
 }
 
+const OWN_BOUND = new Set(['unseen', 'output']);
+
 export function boundedStrings<T>(v: T): T {
   if (typeof v === 'string') return quoted(v) as T;
   if (Array.isArray(v)) return v.map(boundedStrings) as T;
-  if (v !== null && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, k === 'unseen' ? x : boundedStrings(x)])) as T;
+  if (v !== null && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, OWN_BOUND.has(k) ? x : boundedStrings(x)])) as T;
   return v;
 }
 

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Host, type Caller, type Wake } from '../src/tools/host.js';
-import { cutAt, RESULT_MAX_CHARS } from '../src/tools/render.js';
+import { cutAt, outputValue, RESULT_MAX_CHARS } from '../src/tools/render.js';
 import type { OpenOptions } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
 
@@ -836,4 +836,47 @@ test('the status line quotes a long directory, so the rest of a result keeps its
   const { host } = setup();
   const r = await host.call(agent(), 'open', { name: 'main', cwd: `/${'d'.repeat(2000)}` });
   assert.match(r.text.split('\n')[0]!, / · \/d+… \(\d+ more characters\)\]$/);
+});
+
+test("run's structured content gives the command's own output and its exit code, a non-zero one as a result", async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.runOutput = ['a.txt', 'b.txt'];
+  s.runStatus = 1;
+  const r = await host.call(agent(), 'run', { name: 'main', command: 'grep -l x *.txt' });
+  assert.equal(r.isError, undefined);
+  assert.equal(r.structured.exitCode, 1);
+  assert.equal(r.structured.output, 'a.txt\nb.txt', 'the lines alone, without the typed command');
+  assert.equal(r.structured.outputLeftOut, undefined);
+  s.runStatus = undefined;
+  const unknown = await host.call(agent(), 'run', { name: 'main', command: 'true' });
+  assert.deepEqual([unknown.structured.exitCode, unknown.structured.running], [null, false]);
+  s.runOutput = ['started'];
+  running(s);
+  const still = await host.call(agent(), 'run', { name: 'main', command: 'serve', wait: 0 });
+  assert.deepEqual([still.structured.exitCode, still.structured.running, still.structured.output], [null, true, 'started']);
+});
+
+test("run's output past its budget keeps its start and end, and says where the gap is and how long, never splitting a surrogate pair", async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const lines = Array.from({ length: 3000 }, (_, i) => `${i} 😀 ${'x'.repeat(i % 7)}`);
+  s.runOutput = lines;
+  const r = await host.call(agent(), 'run', { name: 'main', command: 'gen' });
+  const output = r.structured.output as string;
+  const gap = r.structured.outputLeftOut as { at: number; characters: number };
+  const whole = lines.join('\n');
+  assert.ok(output.length < RESULT_MAX_CHARS, `${output.length}`);
+  assert.equal(output.slice(0, gap.at) + whole.slice(gap.at, gap.at + gap.characters) + output.slice(gap.at), whole);
+  const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  assert.doesNotMatch(output, lone);
+  for (const pad of ['', 'x'])
+    for (const budget of [60, 61]) {
+      const text = `${pad}${'😀'.repeat(100)}`;
+      const v = outputValue([text], budget);
+      assert.doesNotMatch(v.output, lone, `pad ${JSON.stringify(pad)}, budget ${budget}`);
+      assert.equal(v.output.slice(0, v.outputLeftOut!.at) + text.slice(v.outputLeftOut!.at, v.outputLeftOut!.at + v.outputLeftOut!.characters) + v.output.slice(v.outputLeftOut!.at), text);
+    }
 });

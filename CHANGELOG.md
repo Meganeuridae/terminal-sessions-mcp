@@ -21,7 +21,8 @@ with it.
   `open`, `run`, `send`, `look`, `read` and `stop` open with the session's status line: the
   command's exit status (or "status unknown", or the shell's exit for a command that ends the
   shell), its duration and directory, and what is in front of the shell now. `list` gives a line
-  for each session, `close` says how the shell ended, and a refused call says why. `run` types only at the prompt; `send` types
+  for each session, `close` says how the shell ended, and a refused call says why. `run`'s
+  `structuredContent` gives the command's `exitCode` and its own `output` as values. `run` types only at the prompt; `send` types
   exactly what it is given and returns its effect.
 - **Wakes over MCPL** (feature set `terminal.events`): a command ended that no call was waiting on,
   a program waiting for input (on the kernel's evidence, on Linux), a shell exited, a pattern asked

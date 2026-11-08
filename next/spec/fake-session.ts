@@ -16,6 +16,7 @@ export class FakeSession implements Session {
   private nextWatch = 1;
   runMode: 'refuse' | 'end' | 'run' = 'end';
   runOutput: string[] = [];
+  runStatus: number | undefined = 0;
   closedWith: Exit | undefined;
   screenNow: Screen | undefined;
   promptUndrawn = false;
@@ -98,12 +99,13 @@ export class FakeSession implements Session {
     this.calls.push({ method: 'run', args: [text, opts] });
     if (this.runMode === 'refuse' || this.frontNow.state !== 'prompt') return { kind: 'refused', front: this.frontNow };
     const id = this.opts.nextCommandId();
+    this.out.push(`$ ${text}`);
     const c: Command = { id, text, from: this.out.length, startedAt: Date.now() };
     this.commands.set(id, c);
-    this.out.push(`$ ${text}`, ...this.runOutput);
+    this.out.push(...this.runOutput);
     if (this.runMode === 'end') {
       c.to = this.out.length;
-      c.end = { at: Date.now(), ms: Date.now() - c.startedAt, status: 0, errexit: false, refusedMarks: 0, cwd: this.dir };
+      c.end = { at: Date.now(), ms: Date.now() - c.startedAt, ...(this.runStatus === undefined ? {} : { status: this.runStatus }), errexit: false, refusedMarks: 0, cwd: this.dir };
       this.emit({ kind: 'ended', command: c, taken: opts.take !== false });
       return { kind: 'ended', command: c, front: this.frontNow };
     }

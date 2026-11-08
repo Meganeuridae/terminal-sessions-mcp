@@ -5,7 +5,7 @@ import { TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, Match, OpenSession, Session, SessionEvent } from '../session/types.js';
-import { boundedStrings, duration, endingText, exitText, fitted, fittedLength, frontText, linesText, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
+import { boundedStrings, duration, endingText, exitText, fitted, fittedLength, frontText, linesText, outputValue, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, WAIT_MAX_S, type ToolDef } from './table.js';
 
 export interface Caller {
@@ -283,8 +283,15 @@ export class Host {
     const tail = r.kind === 'running'
       ? `\nIt keeps running. ${caller.pushes ? 'Its end will be reported to you, or ' : ''}\`look\` with \`until: "end"\` waits for it; \`stop\` stops it.`
       : '';
-    const body = this.output(out, c, RESULT_MAX_CHARS - head.length - tail.length - 1);
-    return ok(`${head}\n${body}${tail}`, { command: c, front: r.front, running: r.kind === 'running' });
+    const budget = RESULT_MAX_CHARS - head.length - tail.length - 1;
+    return ok(`${head}\n${this.output(out, c, budget)}${tail}`, {
+      command: c,
+      front: r.front,
+      running: r.kind === 'running',
+      exitCode: c.end?.status ?? null,
+      ...outputValue(out.lines, budget),
+      ...(out.dropped ? { outputDropped: out.dropped } : {}),
+    });
   }
 
   private async send(caller: Caller, e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
