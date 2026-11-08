@@ -59,18 +59,12 @@ __tsm_drain() {
   PATH=/usr/bin:/bin:$PATH stty "$__tsm_m" 2>/dev/null
 }
 __tsm_end() {
-  local __tsm_s=$? __tsm_p="$\{PIPESTATUS[*]}" __tsm_l __tsm_f= __tsm_n __tsm_cwd __tsm_j=$-
+  local __tsm_s=$? __tsm_p="$\{PIPESTATUS[*]}" __tsm_f __tsm_n __tsm_cwd __tsm_j=$-
   if [ -n "$\{__tsm_ps+x}" ]; then __tsm_p=$__tsm_ps; unset __tsm_ps; fi
-  if [ "$\{BASH_VERSINFO[0]}" -ge 4 ]; then
-    while builtin read -t 0 2>/dev/null; do
-      if IFS= builtin read -r -t 1 __tsm_l; then __tsm_f=$__tsm_f$__tsm_l$'\\n'; else break; fi
-    done
-  else
-    set +m
-    __tsm_f=$(__tsm_drain; builtin printf x)
-    case $__tsm_j in *m*) set -m ;; esac
-    __tsm_f=$\{__tsm_f%x}
-  fi
+  set +m
+  __tsm_f=$(__tsm_drain; builtin printf x)
+  case $__tsm_j in *m*) set -m ;; esac
+  __tsm_f=$\{__tsm_f%x}
   __tsm_esc "$PWD"
   __tsm_cwd=$__tsm_ret
   __tsm_esc "$__tsm_f"
@@ -140,10 +134,18 @@ __tsm_esc() {
   __tsm_ret=$\{__tsm_ret//$'\\a'/\\\\x07}
   __tsm_ret=$\{__tsm_ret//$'\\e'/\\\\x1b}
 }
+__tsm_drain() {
+  local __tsm_m
+  __tsm_m=$(PATH=/usr/bin:/bin:$PATH stty -g 2>/dev/null) || return 0
+  PATH=/usr/bin:/bin:$PATH stty -icanon min 0 time 0 2>/dev/null
+  PATH=/usr/bin:/bin:$PATH dd bs=65536 count=1 2>/dev/null
+  PATH=/usr/bin:/bin:$PATH stty "$__tsm_m" 2>/dev/null
+}
 __tsm_end() {
-  local __tsm_s=$? __tsm_p="$\{(j: :)pipestatus}" __tsm_l __tsm_f= __tsm_n __tsm_cwd
+  local __tsm_s=$? __tsm_p="$\{(j: :)pipestatus}" __tsm_f __tsm_n __tsm_cwd
   if (( $\{+__tsm_ps} )); then __tsm_p=$__tsm_ps; unset __tsm_ps; fi
-  while builtin read -t 0 -r __tsm_l; do __tsm_f=$__tsm_f$__tsm_l$'\\n'; done
+  __tsm_f=$(__tsm_drain; builtin print -rn -- x)
+  __tsm_f=$\{__tsm_f%x}
   __tsm_esc "$PWD"
   __tsm_cwd=$__tsm_ret
   __tsm_esc "$__tsm_f"
@@ -181,14 +183,15 @@ function __tsm_next
     set -g __tsm_r (random 10000 99999)(random 10000 99999)(random 10000 99999)(random 10000 99999)
 end
 function __tsm_esc
-    set -l v (string replace -a -- '\\\\' '\\\\\\\\' $argv[1] | string collect)
+    # The x keeps a trailing newline from string collect, which trims them.
+    set -l v (string replace -a -- '\\\\' '\\\\\\\\' "$argv[1]x" | string collect)
     set v (string replace -a -- ';' '\\\\x3b' $v | string collect)
     set v (string replace -a -- \\n '\\\\x0a' $v | string collect)
     set v (string replace -a -- \\r '\\\\x0d' $v | string collect)
     set v (string replace -a -- \\t '\\\\x09' $v | string collect)
     set v (string replace -a -- \\a '\\\\x07' $v | string collect)
     set v (string replace -a -- \\e '\\\\x1b' $v | string collect)
-    printf '%s' $v
+    printf '%s' (string replace -r -- 'x$' '' $v | string collect)
 end
 function __tsm_collect
     string collect < $argv[1]
