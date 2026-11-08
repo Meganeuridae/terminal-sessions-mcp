@@ -4,7 +4,7 @@ import { SCOPE_RE } from './hello.js';
 
 export const USAGE = `usage: tsm [--scope NAME] [--socket PATH] COMMAND
   open NAME [--cwd DIR] [--cols N] [--rows N]
-  run NAME COMMAND... [--wait S] [--notify-on REGEX]
+  run NAME [--wait S] [--notify-on REGEX] [--] COMMAND...   (quote the command, or put -- before it)
   send NAME [--text TEXT] [--keys KEY,KEY...] [--wait-for REGEX] [--wait S]
   look NAME [--until end|input] [--match REGEX] [--wait S]
   read NAME [--command N] [--lines FROM:TO] [--match REGEX] [--context N]
@@ -59,6 +59,10 @@ export function parseCli(argv: readonly string[]): CliOptions | { error: string 
   const words: string[] = [];
   for (; i < argv.length; i++) {
     const a = argv[i]!;
+    if (a === '--' && tool === 'run') {
+      words.push(...argv.slice(i + 1));
+      break;
+    }
     if (a === '--force' && tool === 'close') args.force = true;
     else if (a.startsWith('--')) {
       const f = flags[a];

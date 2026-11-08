@@ -16,6 +16,7 @@ test('H9: the CLI maps its words to the eight tools\' arguments', () => {
   assert.deepEqual(parseCli(['close', 'main', '--force']), { scope: 'default', call: { tool: 'close', args: { name: 'main', force: true } } });
   assert.deepEqual(parseCli(['list']), { scope: 'default', call: { tool: 'list', args: {} } });
   assert.deepEqual(parseCli(['daemon', 'stop']), { scope: 'default', call: { daemonStop: true } });
+  assert.deepEqual(parseCli(['run', 'main', '--wait', '5', '--', 'grep', '--color', 'x']), { scope: 'default', call: { tool: 'run', args: { name: 'main', wait: 5, command: 'grep --color x' } } });
   assert.deepEqual(parseCli(['run', 'main']), { error: 'run needs a command' });
   assert.deepEqual(parseCli(['look', 'main', '--bogus', 'x']), { error: 'look takes no --bogus' });
 });

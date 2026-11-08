@@ -220,3 +220,15 @@ test('the shells start with the daemon\'s oom preference', async () => {
   await host.call(agent(), 'open', { name: 'main' });
   assert.equal(opened[0]!.oomScoreAdj, 200);
 });
+
+test('open refuses a terminal wider or taller than the bound its memory gives, and opens one at it', async () => {
+  const { host, opened } = setup();
+  for (const size of [{ cols: 501 }, { rows: 501 }]) {
+    const r = await host.call(agent(), 'open', { name: 'big', ...size });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /must be <= 500/);
+  }
+  assert.equal(opened.length, 0);
+  assert.equal((await host.call(agent(), 'open', { name: 'big', cols: 500, rows: 500 })).isError, undefined);
+  assert.equal(opened[0]!.opts.cols, 500);
+});

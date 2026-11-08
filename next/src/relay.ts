@@ -21,11 +21,12 @@ export interface RelayOptions {
 
 /**
  * How long the relay keeps trying to reach a daemon, starting one. A host sends `initialize` as
- * soon as it has launched the relay, and agent-framework gives up on a request after 60 s
- * (DEFAULT_REQUEST_TIMEOUT_MS in src/mcpl/server-connection.ts at aa134e75fc), so the daemon must
- * be reached in time to answer it; 5 s of it are left for the answer, as for a call's wait.
+ * soon as it has launched the relay, and agent-framework gives up on that handshake after 30 s
+ * (INITIALIZE_TIMEOUT_MS in src/mcpl/server-connection.ts at aa134e75fc) and kills the child, so
+ * the relay must reach a daemon, or say why it couldn't, within it; 5 s of it are left for the
+ * answer, as for a call's wait.
  */
-export const REACH_MS = 55_000;
+export const REACH_MS = 25_000;
 
 export type Reached = { socket: net.Socket; daemon: DaemonHello; rest: Buffer };
 
