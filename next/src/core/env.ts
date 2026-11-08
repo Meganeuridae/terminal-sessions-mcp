@@ -1,27 +1,6 @@
-/** Environment basis for shells and process Runs (§8.2, G7) and its hygiene (G26). */
-
-export interface EnvSnapshot {
-  vars: Record<string, string>;
-  seq: number;
-  capturedAt: number;
-}
-
-/** Parse `env -0` output. */
-export function parseEnvNul(text: string): Record<string, string> {
-  const vars: Record<string, string> = {};
-  for (const entry of text.split('\0')) {
-    if (!entry) continue;
-    const eq = entry.indexOf('=');
-    if (eq <= 0) continue;
-    vars[entry.slice(0, eq)] = entry.slice(eq + 1);
-  }
-  return vars;
-}
-
 /**
- * What a session never inherits from the daemon's environment (G7, G26, ux-8):
- * - the daemon's own configuration and credentials: TSM_TOKEN, TSM_TOKENS_FILE, TSM_URL and
- *   every other TSM_* the daemon, the shim or the CLI reads;
+ * What a session never inherits from the daemon's environment:
+ * - every TSM_* variable, the tool's own namespace;
  * - the identity of the terminal that launched the daemon. The session's terminal is the
  *   daemon's emulator, not that one: inheriting these makes the user's rc load the launching
  *   terminal's own shell integration (Ghostty, iTerm2, kitty, VS Code …; VTE's vte.sh appends
@@ -32,8 +11,8 @@ export function parseEnvNul(text: string): Record<string, string> {
  *   per-project node pinning stops working; npm/npx lifecycle, config and working directory
  *   (`npm_*`, `INIT_CWD`); the launching agent host's session identity (Claude Code's
  *   `CLAUDECODE`, `CLAUDE_CODE_*` — which include a messaging token — `CLAUDE_PID`,
- *   `AI_AGENT`, Cursor's and Codex's equivalents), which every principal of every session
- *   would otherwise see; the launching shell's atuin state, with which a session's atuin
+ *   `AI_AGENT`, Cursor's and Codex's equivalents), which every session's shell would
+ *   otherwise see; the launching shell's atuin state, with which a session's atuin
  *   would end the launching shell's history entries.
  * User configuration (VOLTA_HOME, ATUIN_CONFIG_DIR, NODE_OPTIONS …) is kept.
  */
@@ -79,13 +58,11 @@ export function scrubDaemonEnv(daemonEnv: NodeJS.ProcessEnv): Record<string, str
 }
 
 /**
- * G6: a session's history is its own, never the user's — for history tools the user's rc
+ * A session's history is its own, never the user's, for history tools the user's rc
  * loads as well as for HISTFILE. atuin keeps one global database and records every line
  * typed at a prompt into it; these point its database, record store, key and sync
  * session at the session's own directory and turn its daemon and sync off (environment
- * settings override atuin's config file). Its key bindings are handed back to the
- * shell's own history by the integration (shell/*.ts). Given for the shell only; a
- * creation-time env that names any of them wins.
+ * settings override atuin's config file).
  */
 export function historyIsolationEnv(dir: string): Record<string, string> {
   return {
@@ -100,42 +77,6 @@ export function historyIsolationEnv(dir: string): Record<string, string> {
   };
 }
 
-/**
- * The configured basis (G7): the daemon's environment, scrubbed, with the session
- * terminal's identity (the daemon's headless xterm), under the session's creation-time env
- * (which still wins — a session may deliberately be given a TSM_URL or a TERM).
- */
 export function configuredEnv(daemonEnv: NodeJS.ProcessEnv, sessionEnv: Record<string, string>): Record<string, string> {
   return { ...scrubDaemonEnv(daemonEnv), TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'tsm', ...sessionEnv };
-}
-
-/**
- * Drop credentials in the tool's namespace from a captured environment before it is
- * journaled (G26): the transport token (TSM_TOKEN, and any TSM_*_TOKEN/KEY/SECRET/PASSWORD)
- * and the session's mark key. The user's rc may export them in the shell (for the CLI).
- */
-export function redactSnapshot(vars: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(vars)) if (!/^TSM_(?:.*_)?(?:TOKEN|KEY|SECRET|PASSWORD)$/.test(k)) out[k] = v;
-  return out;
-}
-
-/**
- * A setting read from the daemon's own environment: set to something, or absent. An empty
- * variable is unset, not a value (the house's read of 59f660b, #22): `TSM_DATA_DIR=""` must not
- * become a data directory named "", in termd, in the shim that starts it, or in the CLI.
- */
-export const setting = (name: string, env: NodeJS.ProcessEnv = process.env): string | undefined => env[name] || undefined;
-
-/**
- * A duration as a setting or a flag spells it, in milliseconds: `500ms`, `20s`, `1.5s`, `2m`, `1h`,
- * or a plain number of milliseconds; undefined when it is none of these. One grammar for tsm's
- * flags and the shim's settings.
- */
-export function parseDuration(v: string): number | undefined {
-  const m = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(v.trim());
-  if (!m) return undefined;
-  const n = Number(m[1]);
-  const unit = m[2] ?? 'ms';
-  return Math.round(n * (unit === 'h' ? 3_600_000 : unit === 'm' ? 60_000 : unit === 's' ? 1000 : 1));
 }

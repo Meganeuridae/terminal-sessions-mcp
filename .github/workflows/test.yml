@@ -47,10 +47,6 @@ jobs:
         if: runner.os == 'macOS'
         run: brew list fish >/dev/null 2>&1 || brew install fish
       - run: npm ci
-      # Fail early with the shell's startup output instead of leaving later
-      # interactive-shell tests waiting behind an unread startup prompt.
-      - name: Check shell startup
-        run: npm run build:next && node --test --test-name-pattern='G5 rich integration is observed' next/dist/spec/pty.spec.js
       # 1.x's suite (src/, cli/, test/) and 2.0's (next/): both ship in this package.
       - run: npm test
       - run: npm run test:next
@@ -68,12 +64,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: anima-research/agent-framework
-          ref: 0d19f7c8996433ffd1d7adbd45842559dad1c8bd
+          ref: aa134e75fc19bc8cb3b73cb1ec53465dd9cf5c91
           path: .hosts/agent-framework
       - uses: actions/checkout@v4
         with:
           repository: anima-research/mcpl-cc-bridge
-          ref: b4d566fa1771f4547873054c83b9bccde4e02ff4
+          ref: f49fd8f7478eaf95c871fd15d29fa43a16140208
           path: .hosts/mcpl-cc-bridge
       - uses: actions/setup-node@v4
         with:
@@ -83,7 +79,7 @@ jobs:
         # Pinned like the hosts: the bridge check runs under this bun, and a bun release must not
         # change its result either. Move it with the bridge pin.
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       - run: npm ci
       - name: Build agent-framework
         working-directory: .hosts/agent-framework

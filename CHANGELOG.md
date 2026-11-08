@@ -1,68 +1,36 @@
 # Changelog
 
-## Unreleased — 2.0, the rearchitecture, beside 1.x
+## Unreleased — 2.0, persistent shells for agents, beside 1.x
 
-A new implementation, built to `docs/redesign/DESIGN.md` and its guarantees (G1–G30), ships
-beside the 1.x session server, MCP bridge and CLI. It lives in `next/`; its binaries are
-`termd`, `tsm` and `tsm-shim`. 2.0 removes or renames nothing of 1.x: `terminal-sessions-mcp`,
-`session-server` and `session-cli` run 1.x, on port 3100. 2.0 changes none of their code; what
-reaches them is the package manifest they share with 2.0: a narrower Node range (`engines`), and
-`ws` pinned at 8.21.3, inside 1.x's `^8.16.0`. `termd` listens on 3101 by default
-(it takes `SESSION_SERVER_PORT` when neither `--port` nor `TSM_PORT` is set, so a shell that exports
-it for the 1.x server points `termd` at that port too: `next/README.md`, "Upgrading from 1.x").
-Making 2.0 the default — the 1.x names pointing at the shim and `termd`, the 1.x code retired — is a
-later release (`next/README.md`, "Upgrading from 1.x").
+A new implementation ships beside the 1.x session server, MCP bridge and CLI. It lives in `next/`
+(`next/README.md`); its binaries are `termd`, `tsm` and `tsm-relay`. 2.0 removes or renames nothing
+of 1.x: `terminal-sessions-mcp`, `session-server` and `session-cli` run 1.x, and 2.0 changes none of
+their code. What reaches them is the package manifest they share with 2.0: a narrower Node range
+(`engines`).
 
 ### Added
 
-- **One daemon, `termd`** (port 3101): sessions as persistent login shells with an append-only
-  journal per session (memory ring plus files, explicit retention), a headless emulator for the
-  current screen, and one WebSocket endpoint speaking MCP, MCPL and a native family. `tsm` (CLI,
-  `--json` everywhere) and `tsm-shim` (stdio MCP) are thin clients.
-- **Runs with identity**: every command has a `runId` from admission; shell and process
-  targets; exit codes from shell-integration marks (bash, zsh, fish; keyed so nested shells,
-  programs and other terminals' integrations cannot spoof them) or from the process itself; a
-  command still running when `wait` ends keeps running and can be awaited; nothing invents an
-  exit status (`lost` with a reason instead).
-- **Tools**: ten core tools (`run`, `await`, `read`, `screen`, `input`, `cancel`,
-  `session_list`, `session_open`, `session_close`, `session_declare_shell`) with transcript text plus a structured
-  envelope; opt-in tiers for control, services with readiness and health probes, watches and
-  `wait_for`, and `search`. Idempotency keys on every mutating tool.
-- **MCPL**: sessions as channels with dual delivery, completions and service/watch events as
-  push events to the principals they concern, catch-up after reconnect, a per-turn presence
-  line, a tag ontology with suggested treatment. Verified against agent-framework's and
-  mcpl-cc-bridge's real host code (`next/acceptance/`).
-- **Sharing**: several principals per session (per-agent tokens), one controller seat,
-  provenance on every input, observers that cannot act, private and shared sessions.
-- **Measure**: every tool call the daemon runs recorded (names and hashes only) to `usage.jsonl`; `tsm usage` reports use, errors and confusion signatures.
-- **The 1.x tool names on 2.0**: `tsm-shim --profile compat` (or `TSM_PROFILE=compat`) serves
-  `runCommand`, `tailLogs`, `searchLogs`, `sendInput`, `sendSignal`, `listSessions`,
-  `killSession`, `killAll`, `launch` and `takeScreenshot` over `termd`, for a 1.x host
-  configuration pointed at the shim; `runCommand`'s result also says when a command is still
-  running or queued, and `listSessions` returns 1.x's fields (`id`, `name`, `isAlive`,
-  `createdAt`, `lastActivity`, `logSize`, `state`). Unlike 1.x, `tailLogs`' and `launch`'s logs
-  can begin with an `[earlier output not shown (…)]` line, which names the `read` that shows what
-  came before (and, when the first line is cut at its head, the read that shows it from there),
-  and the logs, raw ones included, mark a hole with a `[… N journal events missing …]` line where
-  output was lost: a host that parses the logs sees these lines.
-- **Address and credential migration:** The shim selects `TSM_URL` or its default address with `TSM_TOKEN` (or a token in that URL). When `TSM_URL` is unset, a 1.x address from `SESSION_SERVER_URL`, or from `SESSION_SERVER_HOST` or `SESSION_SERVER_PORT` (either alone takes 1.x's default for the other, `localhost` or 3100), uses `SESSION_SERVER_TOKEN` (or a token already in `SESSION_SERVER_URL`). It does not substitute a token from the other address family. In contrast, `termd` uses `SESSION_SERVER_HOST`, `SESSION_SERVER_PORT` and `SESSION_SERVER_TOKEN` as individual fallbacks when the matching `TSM_HOST`, `TSM_PORT` and `TSM_TOKEN` settings are unset. It also accepts `--headless` and `--host localhost` from a 1.x `session-server` command line.
-- **A session's command path:** a session refuses to start when its command directory's path, under
-  `termd`'s data directory, contains an ASCII control (U+0000–U+001F or U+007F), since a Run types that
-  path into the shell's line editor. Use a data directory with printable path components.
-- **`/health` on `termd`** reports `sessionCount` where 1.x's `/health` reports `sessions` as a count;
-  for a caller with a principal, `sessions` lists the sessions it may observe, with their state. It also
-  reports `version`, `pid`, `connections` and `endpointElapsedMs`, the endpoint's life since session
-  recovery on a monotonic clock, not the process's uptime. Where 1.7.3's `status` is always `ok`, termd
-  answers `degraded`, with the reason as `unsupported`, on a host where it can't open sessions (no `bash`,
-  or a `/dev/fd` that doesn't list the process's own descriptors).
-- Shipped host and supervisor configurations in `next/config/`.
+- **One daemon per user, `termd`,** holding every session's shell, on a Unix socket only the user
+  can open. Hosts launch `tsm-relay` over stdio; the first relay or `tsm` that finds no daemon
+  starts one. `--scope` on the relay keeps two hosts' sessions apart.
+- **Sessions are your own login shell** (bash, zsh or fish) with your startup files, persisting
+  across calls, connections and host restarts. A daemon restart ends them, and says so.
+- **Eight tools:** `open`, `run`, `send`, `look`, `read`, `stop`, `list` and `close`. Every result
+  opens with a status line: the command's exit status (or "status unknown"), its duration and
+  directory, and what is in front of the shell now. `run` types only at the prompt; `send` types
+  exactly what it is given and returns its effect.
+- **Wakes over MCPL** (feature set `terminal.events`): a command ended that no call was waiting on,
+  a program waiting for input (on the kernel's evidence, on Linux), a shell exited, a pattern asked
+  for appeared. Nothing else wakes.
+- **The CLI, `tsm`,** calls the same tools; nothing it is shown counts as seen.
+- Shipped host and supervisor configurations in `next/config/`, and checks against
+  agent-framework's and mcpl-cc-bridge's real host code in `next/acceptance/`.
 
 ### Changed
 
 - Node 22.12 or later (`engines`: `>=22.12.0 <25.0.0`): Node 20 reached its end of life on 2026-04-30; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
 - `npm run build` compiles both trees; `npm test` runs 1.x's suite and `npm run test:next` 2.0's.
-- `ws` is pinned at the version 2.0 uses, 8.21.3, and 1.x's `ws` stays within 8.x. New
-  dependencies: `@animalabs/mcpl-core`, `@xterm/headless` 6.0.0 and `@xterm/addon-serialize`.
+- New dependencies: `@animalabs/mcpl-core` and `@xterm/headless` 6.0.0.
 
 ### Removed from 1.x
 

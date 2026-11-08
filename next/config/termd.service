@@ -2,48 +2,31 @@
 # installed package ("$(npm root -g)/term-sessions-mcp"), then
 #   systemctl --user daemon-reload && systemctl --user enable --now termd
 # termd-launch.sh finds node (nvm's default version, Volta, /usr/local, ~/.local; or
-# Environment=TSM_NODE_BIN=/path/to/node), puts those directories on PATH for process Runs and
-# starts in $HOME. Logs go to the journal: journalctl --user -u termd. (TSM_NODE is something
-# else: the daemon's node name in MCPL message ids and channel addresses.)
+# Environment=TSM_NODE_BIN=/path/to/node), puts those directories on PATH and starts in $HOME.
+# Logs go to the journal: journalctl --user -u termd. Without this unit, the first tsm-relay or
+# tsm that finds no daemon starts one as a transient unit of its own.
 [Unit]
 Description=terminal sessions daemon (termd)
 
 [Service]
-ExecStart=/bin/sh PACKAGE/next/config/termd-launch.sh --port 3101
+ExecStart=/bin/sh PACKAGE/next/config/termd-launch.sh
 WorkingDirectory=%h
-# No UMask= here: termd creates its own files owner-only by mode, and the sessions' shells
-# inherit this mask, so files a session creates keep the usual permissions (0644).
+# No UMask= here: the sessions' shells inherit this mask, so files a session creates keep the
+# usual permissions; termd makes its own directory and socket owner-only by mode.
 Restart=on-failure
-# Each session costs about five file descriptors (pty, journal, key file); the default
-# soft limit of 1024 would end new sessions near 200.
-LimitNOFILE=65536
-# The sessions' shells and everything they run (builds, test suites) are in this service's
-# cgroup. When the kernel kills one of them for memory, systemd's default (OOMPolicy=stop)
-# stops the whole service: every live session is lost for one build's peak. With continue,
-# termd keeps serving and that one Run reports its process killed. The shells and process
-# Runs start with a raised oom_score_adj (--session-oom-score-adj, default 200), so the kernel
-# takes one of them before termd; on a shared host, where that preference counts against other
-# users' work too, pass a lower value or 0.
+# The sessions' shells and everything they run are in this service's cgroup. When the kernel
+# kills one of them for memory, systemd's default (OOMPolicy=stop) stops the whole service and
+# every shell with it, for one build's peak. With continue, termd keeps serving. The shells start
+# with a raised oom_score_adj (--session-oom-score-adj, default 200), so the kernel takes one of
+# them before termd; on a shared host, where that preference counts against other users' work
+# too, pass a lower value or 0.
 OOMPolicy=continue
-# History on disk is kept forever by default. For a long-lived deployment, cap it:
-#   ExecStart=... --retention-days 30          (or --retention-bytes 200000000 per session)
-# Whatever the caps, termd stops writing history to disk while the data dir's filesystem has
-# less than 200 MiB free (--disk-floor-bytes; 0 turns it off) and resumes when space returns.
-# On stop, systemd signals termd alone (KillMode=process), not the whole cgroup. termd drains its
-# sessions (Runs end with reason daemon-shutdown) and hangs up each shell as a closing terminal
-# does: a foreground job ends with it, while a job a session detached on purpose (setsid, nohup,
-# disown) lives on, matching the header of daemon.ts. KillMode=mixed would SIGTERM termd and then,
-# on every stop, SIGKILL whatever is left in the cgroup once termd has exited, not only when the
-# stop times out: systemd.kill(5) says that if processes still remain after the main process of a
-# unit has exited (which applies to KillMode=mixed), the termination request is repeated with
-# SIGKILL. A run on systemd 255 agreed: a setsid'd child and a background child were killed in a
-# stop that took half a second (the house's read, #22 comments 6264958172, 6269721389 and
-# 6274806357). What process costs: if
-# termd itself does not exit within TimeoutStopSec, systemd SIGKILLs termd alone, the sessions'
-# surviving jobs are left as they are, and the process Runs termd had not yet ended keep running
-# until the next start's recovery, which ends the groups it can tie to their Runs, leaves the rest,
-# and ends none when no process listing answers (daemon.ts says so in its header; the registry's
-# recovery does it).
+# On stop, systemd signals termd alone (KillMode=process), not the whole cgroup. termd hangs up
+# each shell as a closing terminal does: a foreground job ends with it, and a job a session
+# detached on purpose (setsid, nohup, disown) lives on. KillMode=mixed would SIGKILL whatever
+# is left in the cgroup once termd has exited, on every stop: systemd.kill(5) says the
+# termination request is repeated with SIGKILL if processes remain after the main process of a
+# unit has exited.
 KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=20

@@ -1,6 +1,6 @@
 /**
- * Caller-supplied regular expressions (search, watches, readiness and fail
- * patterns, compat searchLogs). JavaScript regexes backtrack and run on the
+ * Caller-supplied regular expressions (`read`'s match, `notify_on`, `wait_for` and `look`'s
+ * match). JavaScript regexes backtrack and run on the
  * daemon's one thread, so one pattern with exponential behaviour, like `(a+)+$`,
  * would freeze every session (G19).
  *
@@ -29,8 +29,7 @@
  * The window never falls under MIN_WINDOW, so the largest patterns accepted
  * (a size of a few thousand) cost up to a few times MATCH_COST; nothing costs
  * more. `execBounded` and `testBounded` match the head of a line within that
- * window and say when they cut (G11: truncation is visible); watches match
- * through them too (StreamMatcher in ansi.ts).
+ * window and say when they cut (G11: truncation is visible).
  *
  * Where the engine is unavailable, patterns fall back to the backtracking engine
  * behind a refusal of the classic catastrophic shapes; `LINEAR_REGEX` says which

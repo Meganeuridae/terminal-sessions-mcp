@@ -1,34 +1,12 @@
 {
   "servers": {
     "terminal": {
-      "transport": { "url": "ws://127.0.0.1:3101/?resultText=transcript", "tokenEnv": "TSM_TOKEN" },
-      "grant": [
-        "tools",
-        "pushEvents",
-        "channels.register",
-        "channels.lifecycle",
-        "channels.incoming",
-        "channels.publish",
-        "contextHooks.beforeInference.inject.beforeUser"
-      ],
-      "enableFeatureSets": ["terminal.core", "terminal.live", "terminal.presence", "terminal.channels", "terminal.annotate"],
+      "transport": { "command": "tsm-relay", "args": ["--scope", "claude"] },
+      "grant": ["tools", "pushEvents"],
+      "enableFeatureSets": ["terminal.tools", "terminal.events"],
       "toolPrefix": "terminal",
       "wake": {
-        "wake": [
-          ["terminal:run-finished"],
-          ["terminal:run-lost"],
-          ["terminal:needs-input"],
-          ["terminal:watch"],
-          ["terminal:session-exited"],
-          ["terminal:service-unhealthy"],
-          ["terminal:service-exited"],
-          ["terminal:service-lost"],
-          ["terminal:service-ready"],
-          ["terminal:service-running"],
-          ["terminal:recovered"],
-          ["terminal:missed"]
-        ],
-        "hold": [["terminal:output"], ["terminal:screen"], ["terminal:control"], ["terminal:note"], ["terminal:human-input"]]
+        "wake": [["terminal:ended"], ["terminal:waiting"], ["terminal:exited"], ["terminal:match"]]
       },
       "reconnect": true,
       "reconnectIntervalMs": 1000

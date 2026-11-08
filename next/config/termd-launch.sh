@@ -2,40 +2,19 @@
 # termd for a supervisor (launchd, systemd), whose PATH has no node: launchd's is
 # /usr/bin:/bin:/usr/sbin:/sbin, and Homebrew, Volta and nvm all install elsewhere.
 #
-#   /bin/sh <package>/next/config/termd-launch.sh [termd flags…]     e.g. --port 3101
+#   /bin/sh <package>/next/config/termd-launch.sh [termd flags…]
 #
-# It puts the usual toolchain directories on PATH — process Runs inherit the daemon's
-# environment (G7), so `npm test` must resolve there too — finds node on it (or
-# TSM_NODE_BIN=/path/to/node), runs this package's daemon (or TSM_DAEMON=/path/to/daemon.js),
-# starts in $HOME (sessions opened without a cwd start there as well), and on macOS logs to
-# ~/Library/Logs/termd/termd.log (0600, rotated by termd) unless --log-file is given. Under
-# systemd the log stays on stderr, for the journal. The umask is left as the supervisor set
-# it: termd creates its own files owner-only by mode, and the sessions' shells and process
-# Runs inherit the mask, so files a session creates get the usual permissions. TSM_NODE is
-# not the launcher's: it names this daemon's node in MCPL message ids and channel addresses,
-# and passes through untouched (the house's read of 59f660b, #22).
+# It puts the usual toolchain directories on PATH (the sessions' shells inherit the daemon's
+# environment before their startup files run), finds node on it (or TSM_NODE_BIN=/path/to/node),
+# runs this package's daemon (or TSM_DAEMON=/path/to/daemon.js) and starts in $HOME. termd logs to
+# stderr, which the supervisor keeps. The umask is left as the supervisor set it: the sessions'
+# shells inherit it, so files a session creates get the usual permissions.
 set -eu
 : "${HOME:?HOME is not set}"
 # Resolved before leaving the caller's directory, so a relative path to this script works as
 # an absolute one does (the house's read of 59f660b, #22).
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$HOME"
-
-# A session costs about five open files (pty, journal, key file). A supervisor that didn't
-# raise the soft limit (launchd's default is 256, many systems' 1024) would end new sessions
-# early; raise it to the hard limit, up to 65536, where that is allowed, and say so when the
-# hard limit holds it lower (the house's read of 59f660b, #22).
-soft=$(ulimit -Sn 2>/dev/null || echo 0)
-hard=$(ulimit -Hn 2>/dev/null || echo 0)
-if [ "$soft" != unlimited ] && [ "${soft:-0}" -lt 65536 ] 2>/dev/null; then
-  want=65536
-  if [ "$hard" != unlimited ] && [ "${hard:-0}" -lt 65536 ] 2>/dev/null; then want=$hard; fi
-  ulimit -Sn "$want" 2>/dev/null || true
-  soft=$(ulimit -Sn 2>/dev/null || echo "$soft")
-  if [ "$soft" != unlimited ] && [ "${soft:-0}" -lt 65536 ] 2>/dev/null; then
-    echo "termd-launch: the open-file limit is $soft (the hard limit is $hard): at about five per session, new sessions would fail near $((soft / 5)); raise the hard limit in the supervisor" >&2
-  fi
-fi
 
 # Version $1 is newer than $2 (vX.Y.Z, compared number by number: v24.22 is newer than v24.9).
 newer() {
@@ -115,8 +94,4 @@ fi
 # the daemon's environment.
 unset TSM_NODE_BIN TSM_DAEMON
 
-case " $* " in
-  *" --log-file "* | *" --log-file="*) ;;
-  *) if [ "$(uname -s)" = Darwin ]; then set -- "$@" --log-file "$HOME/Library/Logs/termd/termd.log"; fi ;;
-esac
 exec "$node" "$daemon" "$@"

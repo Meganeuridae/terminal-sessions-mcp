@@ -1,5 +1,7 @@
 # Terminal Sessions — Rearchitecture Design
 
+> **This is the design 2.0 was first built to, kept as its record.** 2.0's session machinery has since been rebuilt on a smaller design: a session is the user's own login shell reached through eight tools and four wakes, with no journal, channels, sharing or network endpoint. [`next/README.md`](../../next/README.md) describes what the code does now; where the two differ, the code and that README are current. Sections 4 to 16 and the three appendices describe the machinery as first built (its entities, guarantees, journal, integration, targets, control, host lane, tools, transport, internal seams, rendering, quality bar and plan), and none of them describes the code now; sections 1 to 3, 17 and 18 keep the design's reasoning.
+
 **Status:** Design, draft 4 — milestones 1 and 2 built to it, reviewed twice and reconciled with what the build taught; not yet reviewed by antra
 **Targets:** successor to `terminal-sessions-mcp` (npm `term-sessions-mcp` 1.6.0); MCPL SPEC.md 0.5.0-draft; agent-framework host
 **Authors:** Claude Code (Fable 5.1) and a Codex agent, with Aster

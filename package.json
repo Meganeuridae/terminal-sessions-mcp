@@ -10,7 +10,7 @@
     "session-cli": "./dist/cli/session-cli.js",
     "termd": "./next/dist/src/daemon.js",
     "tsm": "./next/dist/src/cli/tsm.js",
-    "tsm-shim": "./next/dist/src/shim/stdio.js"
+    "tsm-relay": "./next/dist/src/relay.js"
   },
   "scripts": {
     "build": "tsc && npm run build:next",
@@ -47,11 +47,10 @@
   "dependencies": {
     "@animalabs/mcpl-core": "0.3.0",
     "@modelcontextprotocol/sdk": "^1.11.2",
-    "@xterm/addon-serialize": "0.14.0",
     "@xterm/headless": "6.0.0",
     "node-pty": "^1.0.0",
     "strip-ansi": "^7.1.0",
-    "ws": "8.21.3"
+    "ws": "^8.16.0"
   },
   "devDependencies": {
     "@types/node": "^22.12.0",

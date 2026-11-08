@@ -2,5 +2,5 @@
   "name": "term-sessions-next",
   "private": true,
   "type": "module",
-  "description": "Milestone 1 of the terminal-sessions rearchitecture (docs/redesign/DESIGN.md). Lives beside the deployed code until swap-in; becomes src/ at milestone 2."
+  "description": "terminal-sessions 2.0 (next/README.md), beside 1.x in this package."
 }

@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { cpuMs } from './testhost.js';
 import { compileUserRegex, execBounded, foldCase, LINEAR_REGEX, MAX_MATCH_INPUT, MIN_WINDOW, matchWindow, testBounded } from '../src/core/regex.js';
+
+const cpuMs = <T>(f: () => T): { value: T; ms: number } => {
+  const start = process.cpuUsage();
+  const value = f();
+  const { user, system } = process.cpuUsage(start);
+  return { value, ms: (user + system) / 1000 };
+};
 
 test('regex: the linear-time engine is in force on this Node', () => {
   assert.equal(LINEAR_REGEX, true);

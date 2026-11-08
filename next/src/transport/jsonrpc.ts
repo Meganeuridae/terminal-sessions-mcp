@@ -1,4 +1,4 @@
-/** JSON-RPC 2.0 shapes and helpers for the WebSocket transport. */
+/** JSON-RPC 2.0 shapes and helpers. */
 
 export type Id = string | number;
 
@@ -27,10 +27,6 @@ export const INVALID_PARAMS = -32602;
 export const INTERNAL = -32603;
 /** MCPL: capability denied (SPEC §14.6). */
 export const CAPABILITY_DENIED = -32002;
-export const CHANNEL_NOT_PERMITTED = -32017;
-export const UNKNOWN_CHANNEL = -32023;
-/** Too many requests in flight on one connection (implementation-defined, outside MCPL's allocations). */
-export const OVERLOADED = -32050;
 
 export class RpcError extends Error {
   constructor(

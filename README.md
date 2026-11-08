@@ -4,17 +4,7 @@
 
 ## Terminal sessions 2.0, beside 1.x
 
-This package also ships **2.0**, a rearchitecture built for agents: one daemon (`termd`) that
-keeps shells alive, gives every command a run id and the exit status it observed (when a command's
-end could not be seen, the result is `lost` with the reason, never a guess), keeps a journal on
-disk of everything that happened, so history outlives the daemon, and tells an MCPL host when a
-command finishes instead of being polled. Commands run in the session's shell as one terminal
-stream, as in 1.x; a process Run keeps stdout and stderr apart. It is in [`next/`](next/README.md), with its design and
-guarantees in [`docs/redesign/DESIGN.md`](docs/redesign/DESIGN.md). Its binaries are `termd`,
-`tsm` and `tsm-shim`. Everything below is about the 1.x binaries (`terminal-sessions-mcp`,
-`session-server`, `session-cli`), which run 1.x. 2.0 changes none of their code; what reaches them
-is the package manifest they share with 2.0: a narrower Node range (`engines`), and `ws` pinned at
-8.21.3, inside 1.x's `^8.16.0`.
+This package also ships **2.0**, persistent shells for agents: one daemon (`termd`) per user keeps each session's login shell alive between calls and connections, an agent types into it only through explicit calls and gets each command's exit status, duration and directory with its output, and an MCPL host is woken only when a command ends, a program waits for input, a shell dies or a pattern it asked for appears. It is in [`next/`](next/README.md). Its binaries are `termd`, `tsm` and `tsm-relay`. Everything below is about the 1.x binaries (`terminal-sessions-mcp`, `session-server`, `session-cli`), which run 1.x. 2.0 changes none of their code; what reaches them is the package manifest they share with 2.0: a narrower Node range (`engines`).
 
 ## Why This Matters
 
