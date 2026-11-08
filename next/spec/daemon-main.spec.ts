@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { spawn } from 'node:child_process';
 import { ORPHAN_CHECK_MS, runDaemon, type RunningDaemon } from '../src/endpoint/daemon-main.js';
 import { helloLine } from '../src/endpoint/hello.js';
 import type { OpenOptions } from '../src/session/types.js';
@@ -121,16 +122,29 @@ test('H2: a daemon with no connection whose socket another took stops when the s
   }
 });
 
-test('a daemon starting removes the session directories a daemon that died left behind', async () => {
+test('a daemon starting removes the session directories of daemons that died, and leaves a live one\'s and its own', async () => {
   const dir = tmp();
   const socket = path.join(dir, 'daemon.sock');
-  fs.mkdirSync(path.join(dir, 'sessions', 'main-123'), { recursive: true, mode: 0o700 });
-  fs.chmodSync(path.join(dir, 'sessions'), 0o700);
-  fs.writeFileSync(path.join(dir, 'sessions', 'main-123', 'command'), 'echo secret');
-  const d = running(await runDaemon(options(socket, [])));
+  const sessions = path.join(dir, 'sessions');
+  const live = spawn('sleep', ['30'], { stdio: 'ignore' });
+  const gone = spawn('true', { stdio: 'ignore' });
+  await new Promise((r) => gone.once('exit', r));
+  for (const name of [`${gone.pid}-1`, `${live.pid}-2`]) {
+    fs.mkdirSync(path.join(sessions, name, 'main-x'), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(sessions, name, 'main-x', 'command'), 'echo secret');
+  }
+  fs.chmodSync(sessions, 0o700);
+  const opened: FakeSession[] = [];
+  const d = running(await runDaemon(options(socket, opened)));
   try {
-    assert.deepEqual(fs.readdirSync(path.join(dir, 'sessions')), []);
+    const left = fs.readdirSync(sessions).sort();
+    const own = left.find((n) => n.startsWith(`${process.pid}-`));
+    assert.deepEqual(left, [`${live.pid}-2`, own].sort(), 'the dead daemon\'s directory went, the live one\'s stayed');
+    const c = await openMain(socket);
+    c.destroy();
+    assert.equal(opened[0]!.opts.parent, path.join(sessions, own!), 'sessions open under this daemon\'s own directory');
   } finally {
+    live.kill();
     await d.stop('test');
     fs.rmSync(dir, { recursive: true, force: true });
   }

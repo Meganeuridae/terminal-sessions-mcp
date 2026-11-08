@@ -22,6 +22,13 @@ const ask = (socket: string): Promise<string> =>
     c.on('error', (e: NodeJS.ErrnoException) => resolve(`error ${e.code}`));
   });
 
+async function deadSocket(dir: string, socket: string): Promise<void> {
+  const dead = net.createServer();
+  await new Promise<void>((r) => dead.listen(path.join(dir, 'dead.sock'), r));
+  fs.linkSync(path.join(dir, 'dead.sock'), socket);
+  await new Promise<void>((r) => dead.close(() => r()));
+}
+
 const listening = (r: Listening | 'running'): Listening => {
   assert.notEqual(r, 'running');
   return r as Listening;
@@ -106,14 +113,18 @@ test('H2: a dead daemon\'s socket file is replaced', async () => {
 test('H2: a daemon whose replacement of a dead socket is itself replaced serves no request, and its held connections close unanswered', async () => {
   const dir = tmp();
   const socket = path.join(dir, 'daemon.sock');
-  fs.writeFileSync(socket, '');
+  await deadSocket(dir, socket);
   let served = 0;
   const loser = listenAt(socket, (c) => {
     c.on('error', () => {});
     served++;
     c.end('A\n');
   }, { confirmMs: 2000 });
-  while ((await probe(socket)) !== 'answers') await new Promise((r) => setTimeout(r, 5));
+  const placed = Date.now() + 5_000;
+  while ((await probe(socket)) !== 'answers') {
+    if (Date.now() > placed) assert.fail('the first daemon never placed its socket');
+    await new Promise((r) => setTimeout(r, 5));
+  }
   const held = net.connect(socket);
   await new Promise<void>((r) => held.once('connect', () => r()));
   const heldAnswer = new Promise<string>((resolve) => {
@@ -174,7 +185,7 @@ test('a close that another daemon\'s rename overtakes leaves that daemon\'s sock
   }
 });
 
-test('a probe that fails after the bind gives up the bound name and rejects', async () => {
+test('a probe that fails after the bind gives up the bound name and rejects', { skip: process.getuid?.() === 0 ? 'root connects through a socket of mode 000' : false }, async () => {
   const dir = tmp();
   const socket = path.join(dir, 'daemon.sock');
   const stale = net.createServer();
@@ -185,6 +196,19 @@ test('a probe that fails after the bind gives up the bound name and rejects', as
     assert.deepEqual(fs.readdirSync(dir), ['daemon.sock'], 'its own bound name is gone');
   } finally {
     await new Promise<void>((r) => stale.close(() => r()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('something at the socket path that is not a socket is left as it is, and the daemon says what it is', async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  fs.writeFileSync(socket, 'notes');
+  try {
+    await assert.rejects(listenAt(socket, greet('A'), { confirmMs: 50 }), /daemon\.sock is a regular file, not a socket, so the daemon leaves it alone/);
+    assert.equal(fs.readFileSync(socket, 'utf8'), 'notes');
+    assert.deepEqual(fs.readdirSync(dir), ['daemon.sock'], 'its own bound name is gone');
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

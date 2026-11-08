@@ -1,7 +1,7 @@
 import { StringDecoder } from 'node:string_decoder';
 import type { Writable } from 'node:stream';
 import { REACH_MS, reach, type Reached } from '../relay.js';
-import { SCOPE_RE } from './hello.js';
+import { SCOPE_RE, STOP } from './hello.js';
 import { probe, shellQuote } from './socket.js';
 
 export const USAGE = `usage: tsm [--scope NAME] [--socket PATH] COMMAND
@@ -103,6 +103,12 @@ export function parseCli(argv: readonly string[]): CliOptions | { error: string 
   return { scope, ...(socket ? { socket } : {}), call: { tool, args } };
 }
 
+class ConnectionClosed extends Error {
+  constructor() {
+    super('the daemon closed the connection');
+  }
+}
+
 function rpc(r: Reached, method: string, params: unknown, id: number): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     // A chunk can end inside a UTF-8 character.
@@ -136,12 +142,28 @@ function rpc(r: Reached, method: string, params: unknown, id: number): Promise<R
         }
       }
     };
-    const onClose = (): void => reject(new Error('the daemon closed the connection'));
+    const onClose = (): void => reject(new ConnectionClosed());
     r.socket.on('data', onData);
     r.socket.once('close', onClose);
     r.socket.resume();
     r.socket.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
     check();
+  });
+}
+
+function within<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => resolve(undefined), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e: unknown) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
   });
 }
 
@@ -161,17 +183,26 @@ export async function runCli(o: CliOptions & { socket: string; version: string; 
   }
   try {
     if ('daemonStop' in o.call) {
+      const bound = o.reachMs ?? REACH_MS;
+      const end = performance.now() + bound;
       const pid = r.daemon.pid;
-      if (!Number.isInteger(pid) || pid <= 1) {
-        o.stderr.write(`tsm: the daemon at ${o.socket} names pid ${pid}, which can't be its own; nothing was signalled\n`);
+      const wedged = `the daemon (pid ${pid}, as it named itself) didn't stop within ${bound} ms; if it is stuck, \`kill ${pid}\` ends it and every shell it holds`;
+      const answer = await within(rpc(r, STOP, {}, 1).catch((e: unknown): Record<string, unknown> => {
+        if (e instanceof ConnectionClosed) return {};
+        throw e;
+      }), bound);
+      if (answer === undefined) {
+        o.stderr.write(`tsm: ${wedged}\n`);
         return 1;
       }
-      process.kill(pid, 'SIGTERM');
+      if (answer.error) {
+        o.stderr.write(`tsm: the daemon refused to stop: ${(answer.error as { message: string }).message}\n`);
+        return 1;
+      }
       r.socket.destroy();
-      const end = Date.now() + (o.reachMs ?? REACH_MS);
       while ((await probe(o.socket).catch(() => 'missing')) === 'answers') {
-        if (Date.now() >= end) {
-          o.stderr.write(`tsm: the daemon (pid ${pid}) still answers at ${o.socket} after ${o.reachMs ?? REACH_MS} ms\n`);
+        if (performance.now() >= end) {
+          o.stderr.write(`tsm: ${wedged}\n`);
           return 1;
         }
         await new Promise((res) => setTimeout(res, 50));

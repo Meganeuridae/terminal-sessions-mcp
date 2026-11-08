@@ -35,7 +35,7 @@ function reachOnce(socketPath: string, hello: ClientHello, budgetMs: number): Pr
     const socket = net.connect(socketPath);
     let buf = Buffer.alloc(0);
     let done = false;
-    const timer = setTimeout(() => finish(new Error(`something at ${socketPath} accepted the connection but sent no hello within ${budgetMs} ms`)), Math.max(1, budgetMs));
+    const timer = setTimeout(() => finish(new Error(`something at ${socketPath} accepted the connection but sent no hello within ${budgetMs} ms`)), budgetMs);
     const finish = (r: Reached | 'nothing' | Error): void => {
       if (done) return;
       done = true;
@@ -68,15 +68,17 @@ function reachOnce(socketPath: string, hello: ClientHello, budgetMs: number): Pr
 }
 
 export async function reach(o: Pick<RelayOptions, 'socket' | 'hello' | 'startDaemon' | 'reachMs'>): Promise<Reached> {
-  const end = Date.now() + (o.reachMs ?? REACH_MS);
+  const bound = o.reachMs ?? REACH_MS;
+  const end = performance.now() + bound;
   let log: string | undefined;
+  const none = (): Error => new Error(`no terminal-sessions daemon answered at ${o.socket} within ${bound} ms${log ? `, though one was started; its log is ${log}` : ''}`);
   for (;;) {
-    const r = await reachOnce(o.socket, o.hello, end - Date.now());
+    const left = end - performance.now();
+    if (left <= 0) throw none();
+    const r = await reachOnce(o.socket, o.hello, Math.ceil(left));
     if (r !== 'nothing') return r;
-    if (Date.now() >= end) {
-      throw new Error(`no terminal-sessions daemon answered at ${o.socket} within ${o.reachMs ?? REACH_MS} ms${log ? `, though one was started; its log is ${log}` : ''}`);
-    }
-    log ??= o.startDaemon(end - Date.now());
+    if (performance.now() >= end) throw none();
+    log ??= o.startDaemon(Math.ceil(end - performance.now()));
     await new Promise((r) => setTimeout(r, 50));
   }
 }
@@ -127,10 +129,14 @@ export function startDaemon(daemonScript: string, socket: string, log: string, b
   if (process.platform === 'linux') {
     const unit = `terminal-sessions-${process.pid}-${Date.now()}`;
     const props = ['KillMode=process', 'OOMPolicy=continue'].flatMap((p) => ['-p', p]);
-    const r = spawnSync('systemd-run', ['--user', '--collect', '--quiet', '--unit', unit, ...props, '--', process.execPath, ...args], { stdio: 'ignore', timeout: Math.max(1, budgetMs), killSignal: 'SIGKILL' });
+    const r = spawnSync('systemd-run', ['--user', '--collect', '--quiet', '--unit', unit, ...props, '--', process.execPath, ...args], { stdio: 'ignore', timeout: budgetMs, killSignal: 'SIGKILL' });
     if (r.status === 0) return `the user journal (journalctl --user -u ${unit})`;
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT') {
+      throw new Error(`systemd-run --user didn't finish within the ${budgetMs} ms left to reach a daemon, so whether it started one is unknown, and no other was started`);
+    }
   }
-  const fd = fs.openSync(log, 'w', 0o600);
+  const { O_WRONLY, O_CREAT, O_TRUNC, O_APPEND } = fs.constants;
+  const fd = fs.openSync(log, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0o600);
   try {
     spawn(process.execPath, args, { detached: true, stdio: ['ignore', fd, fd] }).unref();
   } finally {
@@ -190,7 +196,9 @@ async function main(argv: string[]): Promise<number> {
   try {
     ensurePrivateDir(paths.dir);
   } catch (e) {
-    process.stderr.write(`tsm-relay: ${(e as Error).message}\n`);
+    const reason = `tsm-relay: ${(e as Error).message}`;
+    process.stderr.write(`${reason}\n`);
+    await answerFirstRequest(process.stdin, process.stdout, reason);
     return 1;
   }
   const daemonScript = fileURLToPath(new URL('./daemon.js', import.meta.url));

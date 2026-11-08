@@ -38,7 +38,7 @@ function linuxRunUser(uid: number): string | undefined {
   }
 }
 
-export const shellQuote = (s: string): string => (/^[A-Za-z0-9_./=:,+@%^-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+export const shellQuote = (s: string): string => (/^[A-Za-z0-9_./:,+@%-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
 
 /** The process's uid, without the passwd lookup os.userInfo() makes, which throws for a uid with no entry. */
 const uidOf = (): number => process.getuid?.() ?? os.userInfo().uid;
@@ -77,6 +77,20 @@ export function probe(socket: string): Promise<Probe> {
       else reject(new EndpointError(`can't reach ${socket}: ${e.message}`));
     });
   });
+}
+
+function nonSocketAt(p: string): string | undefined {
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(p);
+  } catch {
+    return undefined;
+  }
+  if (st.isSocket()) return undefined;
+  if (st.isFile()) return 'a regular file';
+  if (st.isDirectory()) return 'a directory';
+  if (st.isSymbolicLink()) return 'a symbolic link';
+  return 'a special file';
 }
 
 export interface Listening {
@@ -152,7 +166,17 @@ export async function listenAt(socket: string, onConnection: (c: net.Socket) => 
       throw err;
     }
     if (seen === 'answers') return giveUp();
-    fs.renameSync(own, socket);
+    const kind = nonSocketAt(socket);
+    if (kind) {
+      await giveUp();
+      throw new EndpointError(`${socket} is ${kind}, not a socket, so the daemon leaves it alone; remove it, or give another with --socket`);
+    }
+    try {
+      fs.renameSync(own, socket);
+    } catch (err) {
+      await giveUp();
+      throw new EndpointError(`can't place the socket at ${socket}: ${(err as Error).message}`);
+    }
     await new Promise((resolve) => setTimeout(resolve, opts.confirmMs ?? 500));
     if (!stillOurs()) return giveUp();
   }

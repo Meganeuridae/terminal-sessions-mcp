@@ -1,5 +1,7 @@
 export const HELLO = 'terminal-sessions/hello';
 
+export const STOP = 'terminal-sessions/stop';
+
 export const SCOPE_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
 export interface ClientHello {
@@ -46,6 +48,6 @@ export function versionNote(relay: string, daemon: DaemonHello): string | undefi
   if (relay === daemon.version) return undefined;
   return (
     `The terminal-sessions daemon is version ${daemon.version}, running since ${daemon.startedAt}, and the relay that reached it is ${relay}. ` +
-    `The daemon keeps its version until it restarts, and restarting it (\`tsm daemon stop\`, then any call) ends every shell it holds.`
+    `The daemon keeps its version until it restarts, which ends every shell it holds, so restarting it is for whoever runs it to choose: \`tsm daemon stop\`, then any call.`
   );
 }

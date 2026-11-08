@@ -2,7 +2,7 @@ import type * as net from 'node:net';
 import { capabilityGranted, deriveFeatureSets, grantFromUpdate, withRevision, type CapabilityGrantState, type FeatureSetDeclaration, type FeatureSetsUpdateParams } from '@animalabs/mcpl-core';
 import { CAPABILITY_DENIED, classify, INTERNAL, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, Outbound, PARSE_ERROR, RpcError, type Id, type Message } from '../transport/jsonrpc.js';
 import type { Caller, Host, Wake } from '../tools/host.js';
-import { helloLine, parseClientHello, versionNote, type ClientHello } from './hello.js';
+import { helloLine, parseClientHello, STOP, versionNote, type ClientHello } from './hello.js';
 
 export interface DaemonInfo {
   version: string;
@@ -48,8 +48,9 @@ let eventSeq = 0;
  */
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 
-export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonInfo): void {
+export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonInfo, stopDaemon: (why: string) => void): void {
   let hello: ClientHello | undefined;
+  let initialized = false;
   let mcpl = false;
   let coalescing = false;
   let grant: CapabilityGrantState | null = null;
@@ -114,6 +115,8 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
   const dispatch = async (method: string, p: Record<string, unknown>, isRequest: boolean, after: (fn: () => void) => void): Promise<unknown> => {
     switch (method) {
       case 'initialize': {
+        if (initialized) throw new RpcError(INVALID_REQUEST, 'this connection is already initialized');
+        initialized = true;
         const caps = isObj(p.capabilities) ? p.capabilities : {};
         const exp = isObj(caps.experimental) ? caps.experimental : {};
         mcpl = exp.mcpl !== undefined;
@@ -154,6 +157,10 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
       case 'mcpl/manifest':
         if (!mcpl) throw new RpcError(METHOD_NOT_FOUND, 'not an MCPL connection');
         return manifest();
+      case STOP:
+        if (hello!.client !== 'cli') throw new RpcError(METHOD_NOT_FOUND, `${STOP} is for tsm`);
+        after(() => stopDaemon('tsm daemon stop asked it to'));
+        return {};
       default:
         throw new RpcError(METHOD_NOT_FOUND, `method not found: ${method.slice(0, 64)}`);
     }
@@ -189,11 +196,11 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
         for (const fn of afters) fn();
       },
       (e: unknown) => {
+        for (const fn of afters) fn();
         if (isRequest) {
           const rpc = e instanceof RpcError ? e : new RpcError(INTERNAL, (e as Error).message ?? String(e));
           write({ jsonrpc: '2.0', id: req.id as Id, error: { code: rpc.code, message: rpc.message, ...(rpc.data !== undefined ? { data: rpc.data } : {}) } });
         }
-        for (const fn of afters) fn();
       },
     );
   };

@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { configuredEnv } from './core/env.js';
+import { loginShell } from './core/launch.js';
 import { runDaemon } from './endpoint/daemon-main.js';
 import { endpointPaths } from './endpoint/socket.js';
 import { packageVersion } from './endpoint/version.js';
@@ -35,7 +36,7 @@ export async function main(argv: readonly string[]): Promise<number> {
   } catch {
     entry = undefined;
   }
-  const shell = entry || process.env.SHELL || '/bin/sh';
+  const shell = loginShell([entry, process.env.SHELL, '/bin/sh']);
   let d;
   try {
     d = await runDaemon({ socket, openSession, shell, env: configuredEnv(process.env, {}), version: packageVersion(), log, oomScoreAdj });

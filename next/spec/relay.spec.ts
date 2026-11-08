@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { helloLine, parseClientHello, type ClientHello } from '../src/endpoint/hello.js';
 import { relay } from '../src/relay.js';
@@ -210,12 +211,76 @@ test('something that accepts the connection and never greets ends the relay with
   const s = io();
   s.stdin.end();
   try {
-    const t0 = Date.now();
     assert.equal(await relay({ socket, hello: HELLO, stdin: s.stdin, stdout: s.stdout, stderr: s.stderr, startDaemon: () => assert.fail('something answered'), reachMs: 300 }), 1);
-    assert.ok(Date.now() - t0 < 2000, `${Date.now() - t0} ms`);
-    assert.match(s.err(), /accepted the connection but sent no hello within \d+ ms/);
+    assert.match(s.err(), /accepted the connection but sent no hello within ([1-9]\d*) ms/);
+    assert.ok(Number(/within (\d+) ms/.exec(s.err())![1]) <= 300);
   } finally {
     await new Promise<void>((r) => silent.close(() => r()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the relay keeps to its bound by the monotonic clock while the wall clock steps back', { timeout: 10_000 }, async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  const s = io();
+  s.stdin.end();
+  const wall = Date.now;
+  let t = wall();
+  Date.now = () => (t -= 1_000);
+  try {
+    const ended = relay({ socket, hello: HELLO, stdin: s.stdin, stdout: s.stdout, stderr: s.stderr, startDaemon: () => '/somewhere/daemon.log', reachMs: 300 });
+    const first = await Promise.race([ended, new Promise((r) => setTimeout(() => r('still trying after 3 s'), 3_000))]);
+    Date.now = wall;
+    assert.equal(first, 1);
+    assert.match(s.err(), /within 300 ms, though one was started/);
+  } finally {
+    Date.now = wall;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a start that uses the whole bound ends the reach with the bound named, not a wait of no time', { timeout: 10_000 }, async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  const silent = net.createServer((c) => {
+    c.on('error', () => {});
+    c.resume();
+  });
+  await new Promise<void>((r) => silent.listen(path.join(dir, 'silent.sock'), r));
+  const s = io();
+  s.stdin.end();
+  try {
+    const code = await relay({
+      socket, hello: HELLO, stdin: s.stdin, stdout: s.stdout, stderr: s.stderr, reachMs: 300,
+      startDaemon: () => {
+        fs.renameSync(path.join(dir, 'silent.sock'), socket);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+        return '/somewhere/daemon.log';
+      },
+    });
+    assert.equal(code, 1);
+    assert.match(s.err(), /no terminal-sessions daemon answered at .* within 300 ms, though one was started; its log is \/somewhere\/daemon\.log/);
+  } finally {
+    await new Promise<void>((r) => silent.close(() => r()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a directory others can enter is refused, and the host's first request is answered with why", { timeout: 10_000 }, async () => {
+  const dir = tmp();
+  fs.chmodSync(dir, 0o755);
+  try {
+    const child = spawn(process.execPath, [path.resolve(import.meta.dirname, '../src/relay.js'), '--socket', path.join(dir, 'daemon.sock')], { stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', (b) => (out += b));
+    child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n');
+    const code = await new Promise<number | null>((r) => child.once('exit', r));
+    assert.equal(code, 1);
+    const answer = JSON.parse(out.trim()) as { id: number; error: { message: string } };
+    assert.equal(answer.id, 1);
+    assert.match(answer.error.message, /^tsm-relay: .* can be entered by others \(mode 755\)/);
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

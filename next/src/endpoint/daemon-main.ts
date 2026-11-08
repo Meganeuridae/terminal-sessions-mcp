@@ -31,10 +31,13 @@ export const ORPHAN_CHECK_MS = 5_000;
 export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'running'> {
   const dir = path.dirname(o.socket);
   ensurePrivateDir(dir);
-  const sessionsDir = path.join(dir, 'sessions');
-  ensurePrivateDir(sessionsDir);
+  const sessionsRoot = path.join(dir, 'sessions');
+  ensurePrivateDir(sessionsRoot);
   const startedAt = Date.now();
-  const host = new Host({ openSession: o.openSession, shell: o.shell, env: o.env, sessionsDir, startedAt, ...(o.oomScoreAdj ? { oomScoreAdj: o.oomScoreAdj } : {}) });
+  const ownName = `${process.pid}-${startedAt}`;
+  const sessionsDir = path.join(sessionsRoot, ownName);
+  fs.mkdirSync(sessionsDir, { mode: 0o700 });
+  const host = new Host({ openSession: o.openSession, shell: o.shell, env: o.env, sessionsDir, startedAt, log: o.log, ...(o.oomScoreAdj ? { oomScoreAdj: o.oomScoreAdj } : {}) });
   const info = { version: o.version, pid: process.pid, startedAt };
   const conns = new Set<net.Socket>();
   let listening: Listening | undefined;
@@ -59,21 +62,30 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
     if (conns.size === 0 && lostSocket()) void stop(`${o.socket} is no longer this daemon's socket, and no connection remains, so no client can reach its shells`);
   };
 
-  const r = await listenAt(
-    o.socket,
-    (c) => {
-      conns.add(c);
-      c.once('close', () => {
-        conns.delete(c);
-        orphaned();
-      });
-      serveConnection(c, host, info);
-    },
-    o.confirmMs === undefined ? {} : { confirmMs: o.confirmMs },
-  );
-  if (r === 'running') return 'running';
+  let r: Listening | 'running';
+  try {
+    r = await listenAt(
+      o.socket,
+      (c) => {
+        conns.add(c);
+        c.once('close', () => {
+          conns.delete(c);
+          orphaned();
+        });
+        serveConnection(c, host, info, (why) => void stop(why));
+      },
+      o.confirmMs === undefined ? {} : { confirmMs: o.confirmMs },
+    );
+  } catch (e) {
+    fs.rmSync(sessionsDir, { recursive: true, force: true });
+    throw e;
+  }
+  if (r === 'running') {
+    fs.rmSync(sessionsDir, { recursive: true, force: true });
+    return 'running';
+  }
   listening = r;
-  for (const name of fs.readdirSync(sessionsDir)) fs.rmSync(path.join(sessionsDir, name), { recursive: true, force: true });
+  removeDeadDaemonsDirs(sessionsRoot, ownName, o.log);
   // Checked against this daemon's inode on a timer, not watched for changes: a watch can miss a
   // change made just as it starts (macOS's directory events and fs.watchFile's first stat both start
   // asynchronously), and a missed one would leave this daemon holding shells no client can reach.
@@ -81,4 +93,33 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
   checking.unref();
   o.log(`listening at ${o.socket}, version ${o.version}, pid ${process.pid}`);
   return { stop, stopped };
+}
+
+function removeDeadDaemonsDirs(root: string, own: string, log: (line: string) => void): void {
+  let names: string[];
+  try {
+    names = fs.readdirSync(root);
+  } catch (e) {
+    log(`can't list ${root} for what a daemon that died left there: ${(e as Error).message}`);
+    return;
+  }
+  for (const name of names) {
+    const m = /^(\d+)-\d+$/.exec(name);
+    if (!m || name === own || alive(Number(m[1]))) continue;
+    try {
+      fs.rmSync(path.join(root, name), { recursive: true, force: true });
+    } catch (e) {
+      log(`can't remove ${path.join(root, name)}, which a daemon that died left: ${(e as Error).message}`);
+    }
+  }
+}
+
+function alive(pid: number): boolean {
+  if (pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
 }

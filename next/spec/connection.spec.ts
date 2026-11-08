@@ -17,6 +17,7 @@ interface Client {
   next(pred: (m: Record<string, unknown>) => boolean): Promise<Record<string, unknown>>;
   request(method: string, params?: unknown): Promise<Record<string, unknown>>;
   messages: Array<Record<string, unknown>>;
+  order: Array<Record<string, unknown>>;
   daemonHello: string;
   close(): void;
 }
@@ -33,7 +34,8 @@ async function harness() {
     },
     shell: '/bin/bash', env: {}, sessionsDir: dir, startedAt: DAEMON.startedAt,
   });
-  const server = net.createServer((c) => serveConnection(c, host, DAEMON));
+  const stops: string[] = [];
+  const server = net.createServer((c) => serveConnection(c, host, DAEMON, (why) => stops.push(why)));
   await new Promise<void>((r) => server.listen(socket, r));
   const clients: net.Socket[] = [];
   const connect = (hello: ClientHello | string): Promise<Client> =>
@@ -44,10 +46,12 @@ async function harness() {
       let buf = '';
       let first: string | undefined;
       const messages: Array<Record<string, unknown>> = [];
+      const order: Array<Record<string, unknown>> = [];
       const waiters: Array<{ pred: (m: Record<string, unknown>) => boolean; resolve: (m: Record<string, unknown>) => void; from: number }> = [];
       let nextId = 1;
       const client: Client = {
         messages,
+        order,
         get daemonHello() {
           return first ?? '';
         },
@@ -85,6 +89,7 @@ async function harness() {
             continue;
           }
           const m = JSON.parse(line) as Record<string, unknown>;
+          order.push(m);
           const w = waiters.find((x) => x.pred(m));
           if (w) {
             waiters.splice(waiters.indexOf(w), 1);
@@ -95,7 +100,7 @@ async function harness() {
       c.on('connect', () => c.write(typeof hello === 'string' ? hello : helloLine(hello)));
     });
   return {
-    host, sessions, connect,
+    host, sessions, connect, stops,
     done: async () => {
       for (const c of clients) c.destroy();
       await new Promise<void>((r) => server.close(() => r()));
@@ -126,6 +131,7 @@ test('H4: a client of another version is told so in initialize\'s instructions',
     const old = await h.connect(relayHello('a', '1.9.0'));
     const r = await old.request('initialize', MCPL_INIT);
     assert.match(String((r.result as { instructions: string }).instructions), /daemon is version 2\.0\.0, running since 2026-11-08T13:00:00\.000Z, and the relay that reached it is 1\.9\.0/);
+    assert.match(String((r.result as { instructions: string }).instructions), /restarting it is for whoever runs it to choose/);
     const same = await h.connect(relayHello('a', '2.0.0'));
     const r2 = await same.request('initialize', MCPL_INIT);
     assert.doesNotMatch(String((r2.result as { instructions: string }).instructions), /relay that reached it/);
@@ -283,12 +289,43 @@ test('initialize answers a revision it speaks; a notification\'s disabled hides 
     const bad = await d.request('featureSets/update', { effectiveCapabilities: ['tools'], deniedCapabilities: ['tools'] });
     assert.ok(bad.error);
     await d.next((m) => m.method === 'notifications/tools/list_changed');
+    const order = d.order.filter((m) => m.method === 'notifications/tools/list_changed' || m.id === bad.id);
+    assert.deepEqual(order.map((m) => ('method' in m ? 'list_changed' : 'error')), ['list_changed', 'error'], 'its side effects come before its error');
     const s = h.sessions.at(-1)!;
     s.runMode = 'run';
     await h.host.call({ scope: 'a', takes: true, pushes: false }, 'run', { name: 'other', command: 'x', wait: 0 });
     s.end(0);
-    await d.request('ping').catch(() => undefined);
+    assert.deepEqual((await d.request('ping')).result, {}, 'the connection stays open');
     assert.equal(d.messages.filter((m) => m.method === 'push/event').length, 0, 'unsubscribed');
+  } finally {
+    await h.done();
+  }
+});
+
+test('a second initialize is refused, and the policy from the first stays', async () => {
+  const h = await harness();
+  try {
+    const c = await h.connect(relayHello('a'));
+    await c.request('initialize', MCPL_INIT);
+    await c.request('featureSets/update', { effectiveCapabilities: ['pushEvents'], enabled: ['terminal.events'] });
+    const again = await c.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    assert.match(String((again.error as { message: string }).message), /already initialized/);
+    assert.deepEqual((await c.request('tools/list')).result, { tools: [] });
+    assert.ok((await c.request('tools/call', { name: 'list', arguments: {} })).error, 'calls stay refused');
+  } finally {
+    await h.done();
+  }
+});
+
+test('terminal-sessions/stop stops the daemon for tsm, and is no method for a relay', async () => {
+  const h = await harness();
+  try {
+    const relay = await h.connect(relayHello('a'));
+    assert.ok((await relay.request('terminal-sessions/stop')).error);
+    assert.deepEqual(h.stops, []);
+    const cli = await h.connect({ version: '2.0.0', scope: 'a', client: 'cli' });
+    assert.deepEqual((await cli.request('terminal-sessions/stop')).result, {});
+    assert.deepEqual(h.stops, ['tsm daemon stop asked it to']);
   } finally {
     await h.done();
   }

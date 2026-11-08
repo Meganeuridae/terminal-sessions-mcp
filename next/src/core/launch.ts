@@ -1,3 +1,6 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
 /**
  * The line that closes every descriptor above the ones in `keep` (a `case` pattern such as
  * `0|1|2`) before a child runs. node-pty opens each session's terminal master without
@@ -33,6 +36,24 @@ export function oomLine(oomScoreAdj: number): string[] {
  */
 export function shellLaunch(oomScoreAdj: number): string {
   return [closeFdsLine('0|1|2'), ...oomLine(oomScoreAdj), 'exec "$@"'].join('\n');
+}
+
+export function loginShell(candidates: ReadonlyArray<string | null | undefined>): string {
+  for (const c of candidates) {
+    if (c && path.isAbsolute(c) && !REFUSING.has(path.basename(c)) && executableFile(c)) return c;
+  }
+  return '/bin/sh';
+}
+
+const REFUSING = new Set(['nologin', 'false']);
+
+function executableFile(p: string): boolean {
+  try {
+    fs.accessSync(p, fs.constants.X_OK);
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
 }
 
 /** The argv that runs `text` under bash with no startup files and in privileged mode, named `name`, with `args` as its positional parameters. */

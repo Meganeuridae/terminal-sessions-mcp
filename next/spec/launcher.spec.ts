@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { loginShell } from '../src/core/launch.js';
 
 const LAUNCHER = path.resolve(import.meta.dirname, '../../config/termd-launch.sh');
 
@@ -37,7 +38,7 @@ test("the launcher takes nvm's default version, not the one `current` was last p
   }
 });
 
-test("TSM_NODE_BIN's directory comes first on the sessions' PATH", () => {
+test("TSM_NODE_BIN's directory comes first on the daemon's PATH, moved there when PATH already holds it", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-launch-'));
   try {
     const node = path.join(home, 'custom/bin/node');
@@ -47,7 +48,30 @@ test("TSM_NODE_BIN's directory comes first on the sessions' PATH", () => {
     const r = launch({ HOME: home, TSM_DAEMON: daemon, TSM_NODE_BIN: node });
     assert.equal(r.node, node);
     assert.equal(r.path.split(':')[0], path.join(home, 'custom/bin'));
+    const later = launch({ HOME: home, TSM_DAEMON: daemon, TSM_NODE_BIN: node, PATH: `/usr/bin:/bin:${path.join(home, 'custom/bin')}` });
+    assert.deepEqual(later.path.split(':').filter((d) => d === path.join(home, 'custom/bin') || d === '/usr/bin'), [path.join(home, 'custom/bin'), '/usr/bin'], 'moved ahead of /usr/bin, and only once');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the daemon takes the first shell that can run: the passwd entry\'s, then $SHELL, then /bin/sh', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-shell-'));
+  try {
+    const usable = path.join(dir, 'zsh');
+    fs.writeFileSync(usable, '#!/bin/sh\n', { mode: 0o755 });
+    const plain = path.join(dir, 'fish');
+    fs.writeFileSync(plain, '', { mode: 0o644 });
+    const nologin = path.join(dir, 'nologin');
+    fs.writeFileSync(nologin, '#!/bin/sh\n', { mode: 0o755 });
+    assert.equal(loginShell([usable, '/bin/sh']), usable);
+    assert.equal(loginShell([path.join(dir, 'missing'), usable]), usable, 'missing');
+    assert.equal(loginShell([plain, usable]), usable, 'not executable');
+    assert.equal(loginShell([nologin, usable]), usable, 'nologin');
+    assert.equal(loginShell([dir, usable]), usable, 'a directory');
+    assert.equal(loginShell([undefined, '', 'zsh', usable]), usable, 'unset, empty or relative');
+    assert.equal(loginShell([nologin, path.join(dir, 'missing')]), '/bin/sh');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
