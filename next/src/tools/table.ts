@@ -96,7 +96,7 @@ export const TOOLS: readonly ToolDef[] = [
     description:
       'What a session shows that you haven\'t seen yet, and what is in front now. With `until`, wait first for a command to end (`end`) or a program to wait for input (`input`); ' +
       '`end` also returns when a program waits for input, since it won\'t end until answered; ' +
-      'with `match`, for a pattern in new output. If the wait ends first, on a host that takes wakes, what it waited for is reported to you when it comes.',
+      'with `match`, for a pattern in new output. If the wait ends first, the result says whether what it waited for will be reported to you when it comes.',
     inputSchema: {
       type: 'object',
       properties: {

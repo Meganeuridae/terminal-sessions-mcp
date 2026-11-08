@@ -1,5 +1,5 @@
 /**
- * Named keys for `input` (tmux send-keys style), carried over from 1.6 and
+ * Named keys for `send`'s `keys` (tmux send-keys style), carried over from 1.6 and
  * extended (G8: input is sent exactly as given; §11.1).
  *
  * Grammar, case-insensitive except for the character after `M-`:
@@ -132,8 +132,9 @@ function closeMatches(prefix: string, base: string): string[] {
   const b = base.toLowerCase().replace(/[\s_-]/g, '');
   if (b.length < 2) return [];
   const limit = Math.max(1, Math.floor(b.length / 3));
-  const aliasesOf = (n: string) => Object.entries(KEY_ALIASES).filter(([, v]) => v === n.toLowerCase()).map(([a]) => distance(b, a));
-  const scored = SUGGESTABLE.map((n) => ({ n, d: Math.min(distance(b, n.toLowerCase().replace('-', '')), ...aliasesOf(n)) }));
+  const within = (x: string): number => (Math.abs(x.length - b.length) <= limit ? distance(b, x) : Infinity);
+  const aliasesOf = (n: string) => Object.entries(KEY_ALIASES).filter(([, v]) => v === n.toLowerCase()).map(([a]) => within(a));
+  const scored = SUGGESTABLE.map((n) => ({ n, d: Math.min(within(n.toLowerCase().replace('-', '')), ...aliasesOf(n)) }));
   return scored
     .filter((x) => x.d <= limit)
     .sort((x, y) => x.d - y.d)

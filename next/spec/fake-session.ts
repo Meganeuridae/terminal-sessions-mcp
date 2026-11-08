@@ -1,4 +1,5 @@
-import type { Command, Exit, Front, Lines, OpenOptions, Screen, Session, SessionEvent, StopOutcome, Until, WaitOutcome, RunOutcome, SendOutcome } from '../src/session/types.js';
+import { testBounded } from '../src/core/regex.js';
+import type { Command, Exit, Front, Lines, Match, OpenOptions, Screen, Session, SessionEvent, StopOutcome, Until, WaitOutcome, RunOutcome, SendOutcome } from '../src/session/types.js';
 
 export class FakeSession implements Session {
   readonly pid = 4242;
@@ -56,12 +57,20 @@ export class FakeSession implements Session {
 
   private checkWatches(): void {
     for (const [id, w] of this.watches) {
-      const i = this.out.findIndex((l, n) => n >= w.from && w.pattern.test(l));
-      if (i >= 0) {
+      const match = this.firstMatch(w.pattern, w.from);
+      if (match) {
         this.watches.delete(id);
-        this.emit({ kind: 'match', watch: id, match: { line: i, text: this.out[i]! } });
+        this.emit({ kind: 'match', watch: id, match });
       }
     }
+  }
+
+  private firstMatch(pattern: RegExp, from: number): Match | undefined {
+    for (let i = from; i < this.out.length; i++) {
+      const t = testBounded(pattern, this.out[i]!);
+      if (t.matched) return { line: i, text: this.out[i]!, ...(t.clipped ? { clipped: true as const } : {}) };
+    }
+    return undefined;
   }
 
   end(status: number | undefined, taken = false): Command {
@@ -111,7 +120,8 @@ export class FakeSession implements Session {
 
   async wait(until: Until, opts: { waitMs: number; from: number; take?: boolean }): Promise<WaitOutcome> {
     this.calls.push({ method: 'wait', args: [until, opts] });
-    return { by: 'timeout', front: this.frontNow, ended: [] };
+    const matched = until.kind === 'match' ? this.firstMatch(until.pattern, opts.from) : undefined;
+    return matched ? { by: 'match', front: this.frontNow, ended: [], matched } : { by: 'timeout', front: this.frontNow, ended: [] };
   }
 
   async stop(signal?: NodeJS.Signals): Promise<StopOutcome> {

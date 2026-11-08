@@ -1,4 +1,4 @@
-/** Named keys for `input` (G8, §11.1): the vocabulary and the cursor-key mode. */
+/** Named keys for `send`'s `keys` (G8, §11.1): the vocabulary and the cursor-key mode. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -102,4 +102,10 @@ test('ux-22: an unknown key is invalid_argument (never internal), naming close m
   refused('S-x', /type 'X' as text/);
   refused('ls -la', /Literal characters go in `text`/);
   refused('Hyper');
+});
+
+test('a key name far longer than any key is refused at once, not compared with each', () => {
+  const t0 = performance.now();
+  assert.throws(() => inputBytes(undefined, ['x'.repeat(2_000_000)], { appCursor: false }));
+  assert.ok(performance.now() - t0 < 1_000, `${Math.round(performance.now() - t0)} ms`);
 });

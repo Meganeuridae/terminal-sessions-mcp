@@ -60,7 +60,7 @@ export function statusLine(f: StatusFacts): string {
     else parts.push('still running');
   }
   parts.push(frontText(f.front, f.now));
-  parts.push(f.command?.end?.cwd ?? f.cwd);
+  parts.push(quoted(f.command?.end?.cwd ?? f.cwd));
   if (f.unseen) parts.push(`${f.unseen} report${f.unseen === 1 ? '' : 's'} not yet seen (list shows them)`);
   return `[${parts.join(' · ')}]`;
 }
@@ -93,34 +93,57 @@ export function linesText(l: Lines, budget: number, readHint: string): string {
   if (l.dropped) out.push(`… ${l.dropped} earlier line${l.dropped === 1 ? '' : 's'} no longer kept`);
   const whole = l.lines.join('\n');
   if (whole.length <= budget) return [...out, whole].join('\n');
-  const marker = (n: number): string => `… ${n} line${n === 1 ? '' : 's'} left out (${readHint})`;
-  const room = Math.max(0, budget - marker(l.lines.length).length - 2);
+  if (l.lines.length === 1) return [...out, ...middleCut(l.lines[0]!, budget)].join('\n');
+  const marker = (left: number, cut: number): string => `… ${omitted(left, cut)} (${readHint})`;
+  const room = Math.max(0, budget - marker(l.lines.length, 2).length - 2);
   const headRoom = Math.floor(room / 3);
-  let tailRoom = room - headRoom;
   const head: string[] = [];
+  let cut = 0;
   let used = 0;
   for (const line of l.lines) {
     if (used + line.length + 1 > headRoom) {
-      if (head.length === 0) head.push(cutAt(line, Math.max(1, headRoom), false));
+      if (head.length === 0) {
+        head.push(cutAt(line, Math.max(1, headRoom), false));
+        cut++;
+      }
       break;
     }
     head.push(line);
     used += line.length + 1;
   }
-  tailRoom += headRoom - head.reduce((n, x) => n + x.length + 1, 0);
+  const tailRoom = room - head.reduce((n, x) => n + x.length + 1, 0);
   const tail: string[] = [];
   used = 0;
   for (let i = l.lines.length - 1; i >= head.length; i--) {
     const line = l.lines[i]!;
     if (used + line.length + 1 > tailRoom) {
-      if (tail.length === 0) tail.unshift(cutAt(line, Math.max(1, tailRoom), true));
+      if (tail.length === 0) {
+        tail.unshift(cutAt(line, Math.max(1, tailRoom), true));
+        cut++;
+      }
       break;
     }
     tail.unshift(line);
     used += line.length + 1;
   }
   const left = l.lines.length - head.length - tail.length;
-  return [...out, ...head, ...(left > 0 ? [marker(left)] : []), ...tail].join('\n');
+  return [...out, ...head, marker(left, cut), ...tail].join('\n');
+}
+
+function omitted(left: number, cut: number): string {
+  const parts: string[] = [];
+  if (left) parts.push(`${left} line${left === 1 ? '' : 's'} left out`);
+  if (cut) parts.push(`${cut} line${cut === 1 ? '' : 's'} cut short`);
+  return parts.join(', ');
+}
+
+function middleCut(line: string, budget: number): string[] {
+  const note = (n: number): string => `… ${n} characters of this line left out`;
+  const room = Math.max(2, budget - note(line.length).length - 2);
+  const headRoom = Math.max(1, Math.floor(room / 3));
+  const start = cutAt(line, headRoom, false);
+  const end = cutAt(line, Math.max(1, room - headRoom), true);
+  return [start, note(line.length - (start.length - 1) - (end.length - 1)), end];
 }
 
 /**
@@ -149,6 +172,13 @@ function clip(s: string): { text: string; more: number } {
 export function quoted(s: string): string {
   const c = clip(s);
   return c.more ? `${c.text}… (${c.more} more characters)` : s;
+}
+
+export function boundedStrings<T>(v: T): T {
+  if (typeof v === 'string') return quoted(v) as T;
+  if (Array.isArray(v)) return v.map(boundedStrings) as T;
+  if (v !== null && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, k === 'unseen' ? x : boundedStrings(x)])) as T;
+  return v;
 }
 
 /** As `quoted`, in quotation marks, with the note after the closing one, so it can't read as part of the text. */

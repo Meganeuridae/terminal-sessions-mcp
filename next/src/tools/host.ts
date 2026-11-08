@@ -5,8 +5,8 @@ import { TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, Match, OpenSession, Session, SessionEvent } from '../session/types.js';
-import { duration, endingText, exitText, fitted, fittedLength, frontText, linesText, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
-import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, type ToolDef } from './table.js';
+import { boundedStrings, duration, endingText, exitText, fitted, fittedLength, frontText, linesText, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
+import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, WAIT_MAX_S, type ToolDef } from './table.js';
 
 export interface Caller {
   scope: string;
@@ -38,6 +38,7 @@ export interface HostOptions {
   startedAt: number;
   oomScoreAdj?: number;
   now?: () => number;
+  log?: (line: string) => void;
 }
 
 interface Unseen {
@@ -60,7 +61,7 @@ interface Entry {
   session: Session;
   cursor: number;
   unseen: Map<string, Unseen>;
-  watches: Map<number, string>;
+  watches: Map<number, { key: string; command: number | undefined }>;
   dying: number | undefined;
   closing: boolean;
   off: () => void;
@@ -74,6 +75,7 @@ export class Host {
   private readonly entries = new Map<string, Entry>();
   private readonly subscribers = new Map<string, Set<Subscriber>>();
   private readonly opening = new Set<string>();
+  private readonly starting = new Set<Promise<void>>();
   private stopping = false;
   private wakeSeq = 0;
   private nextId = 1;
@@ -95,6 +97,7 @@ export class Host {
     return () => {
       sub.gone = true;
       set.delete(sub);
+      if (set.size === 0 && this.subscribers.get(scope) === set) this.subscribers.delete(scope);
     };
   }
 
@@ -129,7 +132,7 @@ export class Host {
         case 'look':
           return await this.look(caller, entry, a);
         case 'read':
-          return this.read(entry, a);
+          return await this.read(entry, a);
         case 'stop':
           return await this.stop(entry, a);
         case 'close':
@@ -137,17 +140,27 @@ export class Host {
       }
       return refused(`\`${tool}\` isn't handled here.`, { error: 'unknown_tool' });
     } catch (e) {
-      if (e instanceof TermError) return refused(e.message, { error: e.code });
-      return refused(
-        `\`${tool}\` failed: ${(e as Error)?.message ?? String(e)}. Whether anything was typed or run is unknown; \`look\` shows the session as it is.`,
-        { error: 'backend_failure' },
-      );
+      if (e instanceof TermError) {
+        const text = e.code === 'backend_failure' ? `${capitalized(e.message)}. Calling again won't help: whoever runs the daemon can fix it.` : e.message;
+        return refused(text, { error: e.code });
+      }
+      return refused(`\`${tool}\` failed: ${(e as Error)?.message ?? String(e)}. ${UNKNOWN_AFTER_FAILURE[tool] ?? 'Nothing was typed or sent.'}`, { error: 'backend_failure' });
     }
   }
 
   async closeAll(): Promise<void> {
     this.stopping = true;
-    await Promise.all([...this.entries.values()].map((e) => ((e.closing = true), e.session.close().catch(() => undefined))));
+    await Promise.all(this.starting);
+    await Promise.all(
+      [...this.entries.values()].map(async (e) => {
+        e.closing = true;
+        try {
+          await e.session.close();
+        } catch (err) {
+          this.o.log?.(`closing session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)} failed: ${(err as Error)?.message ?? String(err)}`);
+        }
+      }),
+    );
   }
 
   private noSession(caller: Caller, name: string): ToolResult {
@@ -196,9 +209,20 @@ export class Host {
     const cwd = raw === '~' ? os.homedir() : raw.startsWith('~/') ? path.join(os.homedir(), raw.slice(2)) : raw;
     if (!path.isAbsolute(cwd)) return refused(`The directory ${JSON.stringify(raw)} must be absolute, or start with "~".`, { error: 'invalid_argument' });
     this.opening.add(k);
-    let session: Session;
+    let started!: () => void;
+    const start = new Promise<void>((r) => (started = r));
+    this.starting.add(start);
     try {
-      session = await this.o.openSession({
+      return await this.opened(caller, name, k, cwd, cols, rows, a);
+    } finally {
+      this.opening.delete(k);
+      this.starting.delete(start);
+      started();
+    }
+  }
+
+  private async opened(caller: Caller, name: string, k: string, cwd: string, cols: number, rows: number, a: Record<string, unknown>): Promise<ToolResult> {
+    const session = await this.o.openSession({
       name,
       shell: this.o.shell,
       cwd,
@@ -209,10 +233,7 @@ export class Host {
       nextCommandId: () => this.nextId++,
       waitMs: this.waitMs(a),
       ...(this.o.oomScoreAdj ? { oomScoreAdj: this.o.oomScoreAdj } : {}),
-      });
-    } finally {
-      this.opening.delete(k);
-    }
+    });
     if (this.stopping) {
       await session.close({ force: true });
       return refused('The daemon stopped while this session started, so its shell is closed.', { error: 'backend_failure' });
@@ -232,7 +253,7 @@ export class Host {
     const now = this.now();
     const rows = mine.map((e) => {
       const front = e.session.front();
-      return { e, front, line: `${e.name}: ${frontText(front, now)} · ${e.session.cwd()}${e.unseen.size ? ` · ${reportsText(e.unseen.size)}` : ''}` };
+      return { e, front, line: `${e.name}: ${frontText(front, now)} · ${quoted(e.session.cwd())}${e.unseen.size ? ` · ${reportsText(e.unseen.size)}` : ''}` };
     });
     const pending = rows.flatMap((r) => [...r.e.unseen.values()].map((u) => ({ e: r.e, u }))).sort((a, b) => a.u.seq - b.u.seq);
     let joined = rows.map((r) => r.line).join('\n');
@@ -251,12 +272,13 @@ export class Host {
   private async run(caller: Caller, e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
     const notify = a.notify_on !== undefined ? this.regex(a.notify_on as string, 'notify_on', 'nothing was typed') : undefined;
     const r = await e.session.run(a.command as string, { waitMs: this.waitMs(a), take: caller.takes });
+    if (e.closing) return closedMeanwhile(e);
     if (r.kind === 'refused') return refused(`${this.status(e, r.front)}\nNothing was typed: ${refusalAdvice(r.front)}`, { error: 'not_at_prompt', front: r.front });
     const c = r.command;
-    if (r.kind === 'running' && notify) e.watches.set(e.session.watch(notify, c.from), this.pushKey(e, c.id));
+    if (r.kind === 'running' && notify) e.watches.set(e.session.watch(notify, c.from), { key: this.pushKey(e, c.id), command: c.id });
     const out = e.session.lines(c.from, c.to);
     if (caller.takes && out.from <= e.cursor) e.cursor = Math.max(e.cursor, out.to - (r.kind === 'ended' ? 0 : out.live));
-    const found = r.kind === 'ended' && notify ? firstMatch(notify, out) : undefined;
+    const found = r.kind === 'ended' && notify ? await firstMatch(notify, out) : undefined;
     const head = [this.status(e, r.front, c), ...(found ? [matchedText(found)] : [])].join('\n');
     const tail = r.kind === 'running'
       ? `\nIt keeps running. ${caller.pushes ? 'Its end will be reported to you, or ' : ''}\`look\` with \`until: "end"\` waits for it; \`stop\` stops it.`
@@ -276,9 +298,10 @@ export class Host {
     if (bytes === '') return refused('Nothing to send: give `text`, `keys`, or both.', { error: 'invalid_argument' });
     const until = a.wait_for !== undefined ? this.regex(a.wait_for as string, 'wait_for', 'nothing was typed') : undefined;
     const r = await e.session.send(bytes, { waitMs: this.waitMs(a), take: caller.takes, ...(until ? { until } : {}) });
+    if (e.closing) return closedMeanwhile(e);
     if (!r.sent && r.by === 'timeout' && r.front.state !== 'exited') {
       return refused(
-        `${this.status(e, r.front)}\nNothing was typed: the shell hasn't finished drawing its prompt after ${duration(this.now() - r.front.since)}, and keys sent before a line editor has the terminal would reach the terminal's own line editing instead. \`send\` again with a longer \`wait\`.`,
+        `${this.status(e, r.front)}\nNothing was typed: the shell hasn't finished drawing its prompt after ${duration(this.now() - r.front.since)}, and keys sent before a line editor has the terminal would reach the terminal's own line editing instead. ${this.waitMs(a) >= WAIT_MAX_S * 1000 ? '`look` shows what is in front.' : '`send` again with a longer `wait`.'}`,
         { error: 'not_at_prompt', front: r.front },
       );
     }
@@ -300,7 +323,9 @@ export class Host {
     if (a.until !== undefined || a.match !== undefined) {
       const pattern = a.match !== undefined ? this.regex(a.match as string, 'match', 'nothing was waited for') : undefined;
       const until = pattern ? { kind: 'match' as const, pattern } : { kind: a.until as 'end' | 'input' };
-      const w = await e.session.wait(until, { waitMs: this.waitMs(a), from: e.cursor, take: caller.takes });
+      const from = e.cursor;
+      const w = await e.session.wait(until, { waitMs: this.waitMs(a), from, take: caller.takes });
+      if (e.closing) return closedMeanwhile(e);
       front = w.front;
       for (const c of w.ended) parts.push(`Command ${c.id} ended: ${endingText(c).join(' · ')}.`);
       if (w.matched) parts.push(matchedText(w.matched));
@@ -308,8 +333,8 @@ export class Host {
         if (pattern) {
           if (caller.pushes) {
             const key = `${e.scope}/${e.name}/look`;
-            for (const [id, k] of e.watches) if (k === key) (e.session.unwatch(id), e.watches.delete(id));
-            e.watches.set(e.session.watch(pattern, e.cursor), key);
+            for (const [id, watch] of e.watches) if (watch.key === key) (e.session.unwatch(id), e.watches.delete(id));
+            e.watches.set(e.session.watch(pattern, from), { key, command: undefined });
           }
           parts.push(`The wait ended first.${caller.pushes ? ' The match will be reported to you when it comes.' : ' `look` again waits for it.'}`);
         } else parts.push(`The wait ended first. ${laterText(a.until as 'end' | 'input', caller.pushes, e.session.current() !== undefined, front)}`);
@@ -331,7 +356,7 @@ export class Host {
     return ok(text, { front, unseen: shown.map((u) => u.lines.join('\n')), lines: { from: lines.from, to: lines.to } });
   }
 
-  private read(e: Entry, a: Record<string, unknown>): ToolResult {
+  private async read(e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
     let from = 0;
     let to: number | undefined;
     let what = 'the session\'s output';
@@ -356,11 +381,12 @@ export class Host {
     const ctx = (a.context as number | undefined) ?? 2;
     const hits: number[] = [];
     let clipped = 0;
-    lines.lines.forEach((line, i) => {
-      const t = testBounded(re, line);
+    for (let i = 0; i < lines.lines.length; i++) {
+      const t = testBounded(re, lines.lines[i]!);
       if (t.clipped) clipped++;
       if (t.matched) hits.push(i);
-    });
+      await turn();
+    }
     const shown = new Set<number>();
     for (const h of hits) for (let i = Math.max(0, h - ctx); i <= Math.min(lines.lines.length - 1, h + ctx); i++) shown.add(i);
     const out: string[] = [];
@@ -412,7 +438,7 @@ export class Host {
     e.dying = ev.kind === 'ended' && ev.command.end?.status === undefined ? ev.command.id : undefined;
     if (ev.kind === 'ended') {
       const key = this.pushKey(e, ev.command.id);
-      for (const [id, k] of e.watches) if (k === key) (e.session.unwatch(id), e.watches.delete(id));
+      for (const [id, w] of e.watches) if (w.key === key) (e.session.unwatch(id), e.watches.delete(id));
     }
     let wake: Wake;
     let command: number | undefined;
@@ -439,10 +465,11 @@ export class Host {
         break;
       }
       case 'match': {
-        const key = e.watches.get(ev.watch);
-        if (key === undefined) return;
+        const w = e.watches.get(ev.watch);
+        if (w === undefined) return;
         e.watches.delete(ev.watch);
-        wake = { scope: e.scope, session: e.name, tag: 'terminal:match', key, text: `${this.status(e, e.session.front())}\n${matchedText(ev.match)}` };
+        command = w.command;
+        wake = { scope: e.scope, session: e.name, tag: 'terminal:match', key: w.key, text: `${this.status(e, e.session.front())}\n${matchedText(ev.match)}` };
         break;
       }
     }
@@ -493,15 +520,28 @@ export class Host {
   }
 }
 
-function firstMatch(re: RegExp, l: Lines): Match | undefined {
+async function firstMatch(re: RegExp, l: Lines): Promise<Match | undefined> {
   for (let i = 0; i < l.lines.length; i++) {
     const t = testBounded(re, l.lines[i]!);
     if (t.matched) return { line: l.from + i, text: l.lines[i]!, ...(t.clipped ? { clipped: true as const } : {}) };
+    await turn();
   }
   return undefined;
 }
 
+const turn = (): Promise<void> => new Promise((r) => setImmediate(r));
+
 const matchedText = (m: Match): string => `Matched at line ${m.line}: ${quoted(m.text)}${m.clipped ? ` (${headOnlyText()})` : ''}`;
+
+const UNKNOWN_AFTER_FAILURE: Record<string, string> = {
+  open: 'Whether the session opened is unknown; `list` shows the sessions open.',
+  close: 'Whether the shell ended is unknown; `list` shows whether the session is still open.',
+  run: 'Whether anything was typed or run is unknown; `look` shows the session as it is.',
+  send: 'Whether anything was typed is unknown; `look` shows the session as it is.',
+  stop: 'Whether a signal was sent is unknown; `look` shows what is in front.',
+};
+
+const capitalized = (s: string): string => `${s[0]?.toUpperCase() ?? ''}${s.slice(1)}`;
 
 const reportsText = (n: number): string => `${n} report${n === 1 ? '' : 's'} not yet seen`;
 
@@ -515,12 +555,15 @@ function laterText(until: 'end' | 'input', pushes: boolean, commandRunning: bool
 }
 
 function ok(text: string, structured: Record<string, unknown>): ToolResult {
-  return { text: fitted(text), structured };
+  return { text: fitted(text), structured: boundedStrings(structured) };
 }
 
 function refused(text: string, structured: Record<string, unknown>): ToolResult {
-  return { text: fitted(text), structured, isError: true };
+  return { text: fitted(text), structured: boundedStrings(structured), isError: true };
 }
+
+const closedMeanwhile = (e: Entry): ToolResult =>
+  refused(`Session ${JSON.stringify(e.name)} was closed while this call waited. \`list\` shows the sessions still open.`, { error: 'session_exited', session: e.name });
 
 function refusalAdvice(front: Front): string {
   switch (front.state) {
