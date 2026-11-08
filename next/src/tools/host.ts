@@ -4,7 +4,7 @@ import { validate, ValidationError } from '../api/validate.js';
 import { TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
-import type { Command, Front, Lines, OpenSession, Session, SessionEvent } from '../session/types.js';
+import type { Command, Front, Lines, Match, OpenSession, Session, SessionEvent } from '../session/types.js';
 import { duration, endingText, exitText, fitted, fittedLength, frontText, linesText, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, type ToolDef } from './table.js';
 
@@ -257,7 +257,7 @@ export class Host {
     const out = e.session.lines(c.from, c.to);
     if (caller.takes && out.from <= e.cursor) e.cursor = Math.max(e.cursor, out.to - (r.kind === 'ended' ? 0 : out.live));
     const found = r.kind === 'ended' && notify ? firstMatch(notify, out) : undefined;
-    const head = [this.status(e, r.front, c), ...(found ? [`Matched at line ${found.line}: ${quoted(found.text)}`] : [])].join('\n');
+    const head = [this.status(e, r.front, c), ...(found ? [matchedText(found)] : [])].join('\n');
     const tail = r.kind === 'running'
       ? `\nIt keeps running. ${caller.pushes ? 'Its end will be reported to you, or ' : ''}\`look\` with \`until: "end"\` waits for it; \`stop\` stops it.`
       : '';
@@ -287,7 +287,7 @@ export class Host {
     const parts = [this.status(e, r.front)];
     for (const c of r.ended) parts.push(`Command ${c.id} ended: ${endingText(c).join(' · ')}.`);
     if (r.by === 'timeout') parts.push(until ? 'The wait ended before the pattern matched.' : 'Output was still changing when the wait ended.');
-    if (r.matched) parts.push(`Matched at line ${r.matched.line}: ${quoted(r.matched.text)}`);
+    if (r.matched) parts.push(matchedText(r.matched));
     const used = parts.join('\n').length + 1;
     parts.push(r.screen ? screenText(r.screen, RESULT_MAX_CHARS - used) : this.output(r.lines, undefined, RESULT_MAX_CHARS - used));
     return ok(parts.join('\n'), { front: r.front, by: r.by, ended: r.ended, ...(r.matched ? { matched: r.matched } : {}), lines: { from: r.lines.from, to: r.lines.to } });
@@ -303,7 +303,7 @@ export class Host {
       const w = await e.session.wait(until, { waitMs: this.waitMs(a), from: e.cursor, take: caller.takes });
       front = w.front;
       for (const c of w.ended) parts.push(`Command ${c.id} ended: ${endingText(c).join(' · ')}.`);
-      if (w.matched) parts.push(`Matched at line ${w.matched.line}: ${quoted(w.matched.text)}`);
+      if (w.matched) parts.push(matchedText(w.matched));
       if (w.by === 'timeout') {
         if (pattern) {
           if (caller.pushes) {
@@ -442,7 +442,7 @@ export class Host {
         const key = e.watches.get(ev.watch);
         if (key === undefined) return;
         e.watches.delete(ev.watch);
-        wake = { scope: e.scope, session: e.name, tag: 'terminal:match', key, text: `${this.status(e, e.session.front())}\nMatched at line ${ev.match.line}: ${quoted(ev.match.text)}` };
+        wake = { scope: e.scope, session: e.name, tag: 'terminal:match', key, text: `${this.status(e, e.session.front())}\n${matchedText(ev.match)}` };
         break;
       }
     }
@@ -493,10 +493,15 @@ export class Host {
   }
 }
 
-function firstMatch(re: RegExp, l: Lines): { line: number; text: string } | undefined {
-  const i = l.lines.findIndex((line) => testBounded(re, line).matched);
-  return i < 0 ? undefined : { line: l.from + i, text: l.lines[i]! };
+function firstMatch(re: RegExp, l: Lines): Match | undefined {
+  for (let i = 0; i < l.lines.length; i++) {
+    const t = testBounded(re, l.lines[i]!);
+    if (t.matched) return { line: l.from + i, text: l.lines[i]!, ...(t.clipped ? { clipped: true as const } : {}) };
+  }
+  return undefined;
 }
+
+const matchedText = (m: Match): string => `Matched at line ${m.line}: ${quoted(m.text)}${m.clipped ? ` (${headOnlyText()})` : ''}`;
 
 const reportsText = (n: number): string => `${n} report${n === 1 ? '' : 's'} not yet seen`;
 

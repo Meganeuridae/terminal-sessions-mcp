@@ -644,3 +644,22 @@ test('look clears only the reports its result keeps, and shows the rest next tim
   assert.equal(second[0], String(Number(firstIds.at(-1)) + 1), 'the next report after the last one shown');
   assert.deepEqual(second.filter((id) => firstIds.includes(id)), []);
 });
+
+test('a match on a line longer than the match window says it was matched on the head only, in a result and in a wake', async () => {
+  const { host, opened } = setup();
+  const wakes: Wake[] = [];
+  host.subscribe('a', async (w) => (wakes.push(w), true));
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.runOutput = [`${'x'.repeat(70_000)} tail`];
+  const ended = await host.call(agent(), 'run', { name: 'main', command: 'long', notify_on: 'x' });
+  assert.match(ended.text, /\nMatched at line \d+: .* \(the line is longer than the match window: matched on its head only\)/);
+  s.runOutput = [];
+  running(s);
+  await host.call(agent(), 'run', { name: 'main', command: 'gen', wait: 0, notify_on: 'needle' });
+  const id = [...s.watches.keys()].at(-1)!;
+  s.emit({ kind: 'match', watch: id, match: { line: 7, text: 'needle', clipped: true } });
+  await settle();
+  const wake = wakes.find((w) => w.tag === 'terminal:match')!;
+  assert.match(wake.text, /\nMatched at line 7: needle \(the line is longer than the match window: matched on its head only\)$/);
+});

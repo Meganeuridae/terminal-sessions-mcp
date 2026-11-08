@@ -11,7 +11,7 @@ export class FakeSession implements Session {
   live = 1;
   commands = new Map<number, Command>();
   private listeners = new Set<(e: SessionEvent) => void>();
-  private watches = new Map<number, { pattern: RegExp; from: number }>();
+  watches = new Map<number, { pattern: RegExp; from: number }>();
   private nextWatch = 1;
   runMode: 'refuse' | 'end' | 'run' = 'end';
   runOutput: string[] = [];
