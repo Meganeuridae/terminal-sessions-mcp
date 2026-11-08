@@ -95,6 +95,15 @@ jobs:
         env:
           ACCEPTANCE_REQUIRED: '1'
           AGENT_FRAMEWORK: ${{ github.workspace }}/.hosts/agent-framework
+      # A resident whose gate defers what no rule names: woken with the shipped rules merged in,
+      # and, without them, not woken, which shows the gate is in force.
+      - name: Acceptance against agent-framework, gated
+        run: |
+          ACCEPTANCE_GATE=shipped node next/acceptance/agent-framework.mjs
+          ACCEPTANCE_GATE=defer-only node next/acceptance/agent-framework.mjs
+        env:
+          ACCEPTANCE_REQUIRED: '1'
+          AGENT_FRAMEWORK: ${{ github.workspace }}/.hosts/agent-framework
       - name: Acceptance against mcpl-cc-bridge
         run: npm run acceptance:bridge
         env:

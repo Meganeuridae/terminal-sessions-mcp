@@ -8,6 +8,11 @@
 // outlives its call reported as a wake the host takes, once, with no inference loop; and, when the
 // daemon goes away, the host's own reconnect reaching a new daemon that runs nothing behind the
 // agent's back.
+//
+// ACCEPTANCE_GATE=shipped runs it under a gate whose default is defer, with next/config/
+// agent-framework.gate.json's rules merged in, as a resident whose gate defers unnamed events has
+// it; ACCEPTANCE_GATE=defer-only runs the same gate without those rules, where the end must enter
+// the context and wake no one, which shows the gate is in force.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
@@ -40,12 +45,24 @@ const deadline = setTimeout(() => {
   process.exit(1);
 }, 180_000);
 
+const GATE = process.env.ACCEPTANCE_GATE;
+let gateOption = {};
+if (GATE) {
+  const shipped = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, '../config/agent-framework.gate.json'), 'utf8'));
+  const configPath = path.join(tmp, 'gate.json');
+  fs.writeFileSync(configPath, JSON.stringify({ default: 'defer', policies: GATE === 'shipped' ? shipped.policies : [] }));
+  gateOption = { gate: { configPath } };
+}
+const wakes = GATE !== 'defer-only';
+log(`gate: ${GATE ?? 'none'}`);
+
 const membrane = new MockMembrane();
 const framework = await AgentFramework.create({
   storePath: path.join(tmp, 'af.chronicle'),
   membrane: membrane.asMembrane(),
   agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'test' }],
   modules: [],
+  ...gateOption,
   mcplServers: [
     {
       id: 'terminal',
@@ -91,7 +108,7 @@ try {
 
   const released = path.join(tmp, 'released');
   membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Noted.' }]));
-  await check('a command that outlives its call wakes the agent once, with its output, and no inference loop', async () => {
+  await check(wakes ? 'a command that outlives its call wakes the agent once, with its output, and no inference loop' : 'under a gate that defers what no rule names, the end enters the context and wakes no one', async () => {
     const opened = await call('open', { name: 'main', cwd: tmp });
     assert.equal(opened.isError, false, opened.text);
     const r = await call('run', { name: 'main', command: `until [ -e ${released} ]; do sleep 0.1; done; echo acceptance-out""put`, wait: 0 });
@@ -101,6 +118,12 @@ try {
     for (const until = now() + 15_000; !woke().length && now() < until; ) await sleep(100);
     assert.equal(woke().length, 1, `the end's messages in the agent's context: ${woke().length}`);
     assert.match(text(woke()[0]), /\[main · command \d+ · exit 0 · /);
+    if (!wakes) {
+      await framework.runUntilIdle();
+      await sleep(2000);
+      assert.equal(membrane.calls.length, 0, `inference calls under defer: ${membrane.calls.length}`);
+      return;
+    }
     for (const until = now() + 15_000; !membrane.calls.length && now() < until; ) await sleep(50);
     assert.ok(membrane.calls.length >= 1, 'an inference call followed the wake');
     assert.ok(JSON.stringify(membrane.calls[0].messages).includes('acceptance-output'), 'the inference call carries the end');
