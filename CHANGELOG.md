@@ -17,7 +17,9 @@
   `PersistentSessionServer.guiAuthToken`, are removed.
 - **Dependencies:** Puppeteer, Express, Socket.IO, `@xterm/xterm`,
   `@xterm/addon-fit`, `@xterm/addon-web-links` and `ansi-to-html` are no
-  longer installed, and `@types/express` is no longer a dev dependency.
+  longer dependencies, and `@types/express` is no longer a dev dependency.
+  Express is still installed, since `@modelcontextprotocol/sdk` depends on
+  it; the others no longer are.
 - **`--headless`, `HEADLESS` and `GUI_PORT` are no longer read.** A session
   server started with them starts as before, serving no GUI either way.
 
