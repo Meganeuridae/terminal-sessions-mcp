@@ -624,3 +624,23 @@ test('notify_on reports a match the command printed before run returned', async 
   assert.ok(match, 'a match wake');
   assert.match(match.text, /Matched at line \d+: ready at once/);
 });
+
+test('look clears only the reports its result keeps, and shows the rest next time', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  for (let i = 0; i < 400; i++) {
+    running(s);
+    await host.call(agent(), 'run', { name: 'main', command: `job ${i}`, wait: 0 });
+    s.end(0);
+  }
+  await settle();
+  const idsOf = (r: { structured: Record<string, unknown> }) => (r.structured.unseen as string[]).map((l) => /command (\d+)/.exec(l)![1]);
+  const first = await host.call(agent(), 'look', { name: 'main' });
+  const firstIds = idsOf(first);
+  assert.ok(firstIds.length > 0 && firstIds.length < 400, `${firstIds.length} shown of 400`);
+  for (const id of firstIds) assert.match(first.text, new RegExp(`command ${id} ·`));
+  const second = idsOf(await host.call(agent(), 'look', { name: 'main' }));
+  assert.equal(second[0], String(Number(firstIds.at(-1)) + 1), 'the next report after the last one shown');
+  assert.deepEqual(second.filter((id) => firstIds.includes(id)), []);
+});

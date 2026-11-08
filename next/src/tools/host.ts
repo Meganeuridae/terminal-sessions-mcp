@@ -5,7 +5,7 @@ import { TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, OpenSession, Session, SessionEvent } from '../session/types.js';
-import { duration, endingText, exitText, fitted, frontText, linesText, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
+import { duration, endingText, exitText, fitted, fittedLength, frontText, linesText, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, type ToolDef } from './table.js';
 
 export interface Caller {
@@ -235,8 +235,12 @@ export class Host {
       return { e, front, line: `${e.name}: ${frontText(front, now)} · ${e.session.cwd()}${e.unseen.size ? ` · ${reportsText(e.unseen.size)}` : ''}` };
     });
     const pending = rows.flatMap((r) => [...r.e.unseen.values()].map((u) => ({ e: r.e, u }))).sort((a, b) => a.u.seq - b.u.seq);
-    const text = fitted([...rows.map((r) => r.line), ...(pending.length ? ['', 'Not yet seen:', ...pending.flatMap((p) => p.u.lines)] : [])].join('\n'));
-    const shown = pending.filter((p) => p.u.lines.every((l) => text.includes(l)));
+    let joined = rows.map((r) => r.line).join('\n');
+    if (pending.length) joined += '\n\nNot yet seen:';
+    const ends = pending.map((p) => (joined += `\n${p.u.lines.join('\n')}`).length);
+    const text = fitted(joined);
+    const kept = fittedLength(joined);
+    const shown = pending.filter((_, i) => ends[i]! <= kept);
     if (caller.takes) for (const p of shown) this.forget(p.e, p.u);
     return ok(text, {
       sessions: rows.map((r) => ({ name: r.e.name, front: r.front, cwd: r.e.session.cwd() })),
@@ -313,9 +317,13 @@ export class Host {
     }
     const lines = e.session.lines(e.cursor);
     const pending = [...e.unseen.values()].sort((x, y) => x.seq - y.seq);
-    const before = [this.status(e, front), ...pending.flatMap((u) => u.lines), ...parts].join('\n');
-    const text = fitted(`${before}\n${lines.lines.length ? this.output(lines, undefined, RESULT_MAX_CHARS - before.length - 1) : '(no new output)'}`);
-    const shown = pending.filter((u) => u.lines.every((l) => text.includes(l)));
+    let reports = this.status(e, front);
+    const ends = pending.map((u) => (reports += `\n${u.lines.join('\n')}`).length);
+    const before = [reports, ...parts].join('\n');
+    const full = `${before}\n${lines.lines.length ? this.output(lines, undefined, RESULT_MAX_CHARS - before.length - 1) : '(no new output)'}`;
+    const text = fitted(full);
+    const kept = fittedLength(full);
+    const shown = pending.filter((_, i) => ends[i]! <= kept);
     if (caller.takes) {
       e.cursor = Math.max(e.cursor, lines.to - lines.live);
       for (const u of shown) this.forget(e, u);

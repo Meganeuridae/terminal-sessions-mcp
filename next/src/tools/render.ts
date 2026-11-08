@@ -164,12 +164,17 @@ const isHighSurrogate = (c: number): boolean => c >= 0xd800 && c <= 0xdbff;
  * output is cut to its budget and quoted values to theirs, is a count the host doesn't bound,
  * such as many reports not yet seen; the cut keeps the head, where the status line is.
  */
+const fitNote = (n: number): string => `\n… ${n} characters left out, past the ${RESULT_MAX_CHARS} a result carries`;
+
+export function fittedLength(text: string): number {
+  if (text.length <= RESULT_MAX_CHARS) return text.length;
+  const n = RESULT_MAX_CHARS - fitNote(text.length).length;
+  return isHighSurrogate(text.charCodeAt(n - 1)) ? n - 1 : n;
+}
+
 export function fitted(text: string): string {
-  if (text.length <= RESULT_MAX_CHARS) return text;
-  const note = (n: number): string => `\n… ${n} characters left out, past the ${RESULT_MAX_CHARS} a result carries`;
-  let n = RESULT_MAX_CHARS - note(text.length).length;
-  if (isHighSurrogate(text.charCodeAt(n - 1))) n--;
-  return text.slice(0, n) + note(text.length - n);
+  const n = fittedLength(text);
+  return n === text.length ? text : text.slice(0, n) + fitNote(text.length - n);
 }
 
 /** The most characters a screen of `cols` by `rows` can take: each row and its line break. */
