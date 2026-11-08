@@ -280,7 +280,7 @@ for (const sh of shells) {
 
     test('a typed command that removes the prompt hooks and the prompt mark leaves the session running, refusing run', { skip: sh.name === 'fish' ? 'bash and zsh: the hooks are removed by assignment' : false }, async () => {
       const s = await open(shell);
-      await s.send(sh.name === 'zsh' ? 'precmd_functions=(); PS1="> "\r' : 'PROMPT_COMMAND=; PS1="> "\r', { waitMs: 3000 });
+      await s.send(sh.name === 'zsh' ? 'precmd_functions=(); PS1="> "\r' : 'unset PROMPT_COMMAND; PS1="> "\r', { waitMs: 3000 });
       const w = await s.wait({ kind: 'end' }, { waitMs: 1500, from: 0 });
       assert.notEqual(w.by, 'end');
       const r = await s.run('echo no', { waitMs: 1000 });
