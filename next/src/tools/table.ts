@@ -152,10 +152,10 @@ export const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'close',
-    description: 'End a session: hang up its shell, and kill it if it hasn\'t ended after a grace, or at once with `force`.',
+    description: 'End a session. Its shell and every process on its terminal are hung up, and the shell is killed if it hasn\'t ended after a grace. A process started with `setsid` or `nohup` outlives it.',
     inputSchema: {
       type: 'object',
-      properties: { name, force: { type: 'boolean', description: 'Kill the shell at once.' } },
+      properties: { name, force: { type: 'boolean', description: 'KILL at once the shell, every process on its terminal and every process the shell started. Only a process that left the terminal and is no longer the shell\'s descendant outlives it.' } },
       required: ['name'],
       additionalProperties: false,
     },

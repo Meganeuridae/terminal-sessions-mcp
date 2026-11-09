@@ -22,7 +22,9 @@ with 2.0: a narrower Node range (`engines`), `npm run build` and `npm test` buil
   `open`, `run`, `send`, `look`, `read` and `stop` open with the session's status line: the
   command's exit status (or "status unknown", or the shell's exit for a command that ends the
   shell), its duration and directory, and what is in front of the shell now. `list` gives a line
-  for each session, `close` says how the shell ended, and a refused call says why. `run`'s
+  for each session, `close` says how the shell ended, and a refused call says why. `close` hangs up
+  the shell and every process on its terminal; a process started with `setsid` or `nohup` outlives
+  it, and `force` KILLs at once. `run`'s
   `structuredContent` gives the command's `exitCode` and its own `output` as values. `run` types only at the prompt; `send` types
   exactly what it is given and returns its effect.
 - **Wakes over MCPL** (feature set `terminal.events`): a command ended that no call was waiting on,

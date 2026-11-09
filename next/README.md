@@ -29,10 +29,11 @@ Eight tools. The results of `open`, `run`, `send`, `look`, `read` and `stop` ope
 | `read(name, command?, lines?, match?, context?)` | Earlier output: a command's output by id or a range of lines, not both, or matching lines with context, cut like every result, so long output is read in ranges. |
 | `stop(name, signal?)` | Ctrl-C typed to the terminal, so it reaches whatever is in front, a shell's own loop included; then TERM, then KILL to the job in front, each step reported. TERM and KILL never go to the shell. |
 | `list()` | Each session, what is in front of it, its directory, and reports you haven't seen. With many sessions, rows give way so the oldest report still shows. |
-| `close(name, force?)` | Hangs up the shell. Returns the session's reports you haven't seen, since nothing shows them after. |
+| `close(name, force?)` | Hangs up the shell and every process on its terminal. A process started with `setsid` or `nohup` outlives it. `force` KILLs at once, and reaches the shell's descendants too. Returns the session's reports you haven't seen, since nothing shows them after. |
 
 - **Waits** default to 15 s and stop at 55 s, under agent-framework's 60 s deadline for a call. A `read` search, and `run`'s `notify_on` search of output already there, stop at 55 s too, and say which lines they left. No call holds longer.
-- **A cancelled call** answers nobody. What it took is reported as though no call had, unless another call's result showed it or a later report about its command came. A wait for input that is over isn't reported. A call that fails after taking something reports it the same way. A cancelled `run`'s command keeps running, and its `notify_on` still reports.
+- **Starting a server** is one `run` with a short wait and a `notify_on` for what it prints when it's ready or when it fails: `run(name: "web", command: "npm run dev", wait: 5, notify_on: "listening|EADDRINUSE")`. If the server fails within the wait, the result gives its exit status and the matching line. If it's still running, the result says so. The first match then comes as a wake, even one printed during the wait, since the search starts at the command's first line. A host that takes no wakes, such as `tsm`, gets no report of that match: `look` with `match` waits for it instead.
+- **A cancelled call** answers nobody. What it took is reported as though no call had taken it. It isn't reported if another call's result showed it. Nor is it once a later report about its command has come. A wait for input that is over isn't reported. A call that fails after taking something reports it the same way. A cancelled `run`'s command keeps running, and its `notify_on` still reports.
 - **Long output** keeps its start and its end within 24,000 characters, agent-framework's inline limit for a tool result, and says how to read more: `read` gives a command's output or a range of lines, cut the same way. A single line longer than that is cut in its middle, and no call returns the middle.
 - **`run`'s `structuredContent`,** for a script, holds `command`, `front` and `running`, and:
   - `exitCode`: the command's status. It is `null` with `running: true` while the command runs, and `null` with `running: false` when no status is known: a shell without the integration, a removed hook, or the shell exiting mid-command. A non-zero status is a result, not `isError`.
@@ -54,6 +55,25 @@ Eight tools. The results of `open`, `run`, `send`, `look`, `read` and `stop` ope
 - **fish 3 keeps a command given to `run` out of its history.** fish 4 adds it, as typing it would.
 - **In zsh, a heredoc left without its terminator** in a command given to `run` takes the session's own lines after it as its body: they print, or go into the file the heredoc writes, and the hooks aren't put back after that command.
 - **In bash, while a command given to `run` runs,** its RETURN trap is the session's, which keeps the pipeline's statuses. `trap -p RETURN` shows it there, and the shell's own trap comes back afterwards.
+
+## Coming from 1.x
+
+1.x's nine tools, and what 1.x offered scripts, map to 2.0 like this.
+
+| 1.x | 2.0 |
+|---|---|
+| `launch` | `run` with a short `wait` and a `notify_on` for the program's ready and error lines, as in "Starting a server" above. |
+| `runCommand` | `open`, then `run`. No tool opens a session for you, so after a daemon restart a command isn't run in a fresh shell. |
+| `listSessions` | `list`. |
+| `tailLogs` | `read`, for a command's output or a range of lines, or `look`, for what you haven't seen and what is in front. |
+| `searchLogs` | `read` with `match` and `context`. |
+| `sendInput` | `send`, with `text` and `keys`. |
+| `sendSignal` | `stop`. It reaches the job in front, never the shell. 1.x sent every signal but SIGINT to the shell itself. |
+| `killSession` | `close`. A graceful close ends the same processes as 1.x's graceful kill. With `force`, 2.0 also KILLs every process on the terminal and the shell's descendants. 1.x's forced kill KILLs the shell alone. |
+| `killAll` | Not carried. `list`, then `close` each. One call ending every session in a scope could end another agent's sessions where two share a scope. |
+| `raw: true` | Not carried. `look` gives a full-screen program's screen, and the escape codes would be noise. |
+| The WebSocket API and `SessionClient` | Not carried. A script uses `tsm --json` or the MCP tools. |
+| The network server and its `--token` | Not carried: 2.0 opens no port. For another machine, the host starts the relay there over ssh: `ssh HOST tsm-relay --scope NAME`. |
 
 ## Running the daemon
 
