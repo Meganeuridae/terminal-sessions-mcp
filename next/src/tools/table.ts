@@ -27,11 +27,12 @@ export const SESSION_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
 /**
  * `open` holds a terminal to what one result can show whole when each cell is one UTF-16 unit: (cols + 1) × rows within
- * RESULT_MAX_CHARS less SCREEN_ROOM_CHARS (render.ts), so 23,000 characters. Its cost is the
- * daemon's memory, which grows with the columns because each session's emulator keeps 10,000
- * lines of scrollback: measured with @xterm/headless 6.0.0 on Node 24, a terminal at full
- * scrollback took 20.5 MiB at 80 columns, 24.2 at 200 and 39.1 at 500. This maximum on each side
- * is a backstop for the schema; the widest terminal that fits, 500 by 45, is near 39 MiB.
+ * RESULT_MAX_CHARS less SCREEN_ROOM_CHARS (render.ts), so 23,000 characters. This maximum on each side is a backstop for the
+ * schema; the widest terminal that fits is 500 by 45. Width no longer sets a session's memory: its emulator keeps only the
+ * rows no freeze has taken yet, and the frozen lines are bounded by count and by characters (transcript.ts). Measured with
+ * @xterm/headless 6.0.0 on Node 24.22.2, a session's transcript after 12,000 full-width lines held 2.3 MiB at 80 columns,
+ * 3.7 at 200 and 7.4 at 500 by 45, or 3.1, 5.8 and 12.6 when each character takes two bytes; lines of 60,000 two-byte
+ * characters, which meet the bound on characters, held 16 MiB at 80 columns and at 500.
  */
 export const SIZE_MAX = 500;
 
