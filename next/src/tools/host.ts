@@ -209,7 +209,7 @@ export class Host {
     try {
       return compileUserRegex(pattern);
     } catch (err) {
-      if (err instanceof TermError) throw new TermError(err.code, `\`${arg}\`: ${err.message}. ${notDone[0]!.toUpperCase()}${notDone.slice(1)}.`);
+      if (err instanceof TermError) throw new TermError(err.code, `\`${arg}\`: ${clause(err.message)}. ${notDone[0]!.toUpperCase()}${notDone.slice(1)}.`);
       throw err;
     }
   }

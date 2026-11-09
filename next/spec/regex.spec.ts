@@ -33,6 +33,25 @@ console.log(JSON.stringify({ LINEAR_REGEX, refused }));`;
   assert.match(out.refused?.message ?? '', /Calling again won't help: whoever runs the daemon can run it on a Node that enables the engine\. `read` without `match` still gives the lines\.$/);
 });
 
+test("a tool's refusal of a pattern, where the linear engine can't be enabled, ends the engine's reason with one period", () => {
+  const host = new URL('../src/tools/host.js', import.meta.url).href;
+  const fake = new URL('./fake-session.js', import.meta.url).href;
+  const script = `import v8 from 'node:v8';
+v8.setFlagsFromString = () => {};
+const { Host } = await import(${JSON.stringify(host)});
+const { FakeSession } = await import(${JSON.stringify(fake)});
+const host = new Host({ openSession: async (o) => new FakeSession(o.name, o), shell: '/bin/bash', env: { HOME: '/home/u' }, sessionsDir: '/tmp/sessions', startedAt: Date.now() });
+const caller = { scope: 'a', takes: true, pushes: false };
+await host.call(caller, 'open', { name: 'main' });
+const r = await host.call(caller, 'run', { name: 'main', command: 'make', notify_on: 'ready' });
+console.log(JSON.stringify(r.text));
+process.exit(0);`;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+  assert.equal(child.status, 0, child.stderr);
+  const text = JSON.parse(child.stdout) as string;
+  assert.match(text, /`read` without `match` still gives the lines\. Nothing was typed\.$/);
+});
+
 test('regex: catastrophic patterns match in time linear in the input', () => {
   const cases: Array<[string, string, string]> = [['(a+)+$', '', 'a'], ['(a|a)+$', '', 'a'], ['(\\w+\\s?)+$', '', 'a'], ['(.*a){16}', '', 'a'], ['^(([a-z])+.)+[A-Z]([a-z])+$', '', 'a'], ['(a+)+$', 'i', 'A']];
   for (const [p, flags, ch] of cases) {
