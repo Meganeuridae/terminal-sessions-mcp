@@ -71,11 +71,11 @@ Nine tools. The results of `open`, `run`, `send`, `look`, `read`, `stop` and `in
 | `tailLogs` | `read`, for a command's output or a range of lines, or `look`, for what you haven't seen and what is in front. |
 | `searchLogs` | `read` with `match` and `context`. |
 | `sendInput` | `send`, with `text` and `keys`. |
-| `sendSignal` | `stop`. It reaches the job in front, never the shell. 1.x sent every signal but SIGINT to the shell itself. |
+| `sendSignal` | `stop`. Its TERM and KILL go to the job in front, never to the shell. Its Ctrl-C reaches whatever reads the terminal, a loop in the shell included. 1.x sent every signal but SIGINT to the shell itself. |
 | `killSession` | `close`. A graceful close ends the same processes as 1.x's graceful kill. With `force`, 2.0 also KILLs every process on the terminal and the shell's descendants. 1.x's forced kill KILLs the shell alone. |
 | `killAll` | Not carried. `list`, then `close` each. One call ending every session in a scope could end another agent's sessions where two share a scope. |
 | `raw: true` | Not carried. `look` gives a full-screen program's screen, and the escape codes would be noise. |
-| The WebSocket API and `SessionClient` | Not carried. A script uses `tsm --json` or the MCP tools. |
+| The WebSocket API and `SessionClient` | Not carried. A script uses the MCP tools, or `tsm --json`, which prints a result's `structuredContent` alone. Some results carry their content only in their text: `read`'s lines, the new lines `look`, `send` and `integrate` return, and a full-screen program's screen. For those, a script reads the text, which `tsm` prints without `--json`. |
 | Resizing a session, through the WebSocket API's `session.resize` | Not carried. `open` a session with the `cols` and `rows` it needs. A resize reflows the lines the session keeps, so line numbers and positions already returned would point at other text. |
 | Windows, where 1.x's sessions ran `wsl.exe` | The relay and daemon run inside a WSL2 distro, as in "Windows, through WSL2" below. |
 | The network server and its `--token` | Not carried: 2.0 opens no port. For another machine, the host starts the relay there over ssh, as in "Another machine, over ssh" below. |

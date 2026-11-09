@@ -24,9 +24,10 @@ Restart=on-failure
 # them before termd; on a shared host, where that preference counts against other users' work
 # too, pass a lower value or 0.
 OOMPolicy=continue
-# On stop, systemd signals termd alone (KillMode=process), not the whole cgroup. termd hangs up
-# each shell as a closing terminal does: a foreground job ends with it, and a job a session
-# detached on purpose (setsid, nohup, disown) lives on. KillMode=mixed would SIGKILL whatever
+# On stop, systemd signals termd alone (KillMode=process), not the whole cgroup. termd closes
+# each session as `close` does: it hangs up the shell and every process still on its terminal,
+# a disowned job included. A process started with setsid, which leaves the terminal, or with
+# nohup, which ignores the hangup, lives on. KillMode=mixed would SIGKILL whatever
 # is left in the cgroup once termd has exited, on every stop: systemd.kill(5) says the
 # termination request is repeated with SIGKILL if processes remain after the main process of a
 # unit has exited.
