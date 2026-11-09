@@ -734,6 +734,75 @@ for (const sh of shells) {
       assert.equal(w.clipped, 1);
     });
 
+    /** `n` lines of 2,000 characters of words, `TARGET` at the end of lines n-5 and n-2, and a pattern whose search costs each line its whole length. */
+    const backlog = (n = 40): string => `awk 'BEGIN{for(i=1;i<=${n};i++){printf "%d", i; for(j=0;j<666;j++) printf " ab"; if (i==${n - 5}||i==${n - 2}) printf " TARGET"; print ""}}'`;
+    const costly = (): RegExp => compileUserRegex('(\\w+\\s?){1,80}TARGET');
+    const same = { skip: sh.name !== 'bash' ? 'a search is the same in every shell' : false };
+
+    test('a pattern wait across a long backlog lets the event loop turn while it searches, and finds the first line that matches', same, async () => {
+      const s = await open(shell, { cols: 200 });
+      const from = s.lines(0).to;
+      await ran(s, backlog(), 30_000);
+      let last = performance.now();
+      let longest = 0;
+      let done = false;
+      const turn = (): void => {
+        const now = performance.now();
+        longest = Math.max(longest, now - last);
+        last = now;
+        if (!done) setImmediate(turn);
+      };
+      setImmediate(turn);
+      const t0 = (last = performance.now());
+      const w = await s.wait({ kind: 'match', pattern: costly() }, { waitMs: 300_000, from });
+      const total = performance.now() - t0;
+      done = true;
+      longest = Math.max(longest, performance.now() - last);
+      assert.equal(w.by, 'match');
+      assert.match(w.matched!.text, /^35 /);
+      assert.ok(longest * 3 < total, `the longest turn took ${longest.toFixed(0)} ms of the search's ${total.toFixed(0)} ms`);
+    });
+
+    test('a watch on lines already printed goes on searching though nothing more is printed, and reports the first line that matches', same, async () => {
+      const s = await open(shell, { cols: 200 });
+      const from = s.lines(0).to;
+      await ran(s, backlog(), 30_000);
+      const events: SessionEvent[] = [];
+      s.onEvent((e) => events.push(e));
+      const id = s.watch(costly(), from);
+      await eventually('the watch', () => events.some((e) => e.kind === 'match' && e.watch === id), 300_000);
+      const m = events.find((e) => e.kind === 'match' && e.watch === id);
+      assert.match(m?.kind === 'match' ? m.match.text : '', /^35 /);
+    });
+
+    test('a search that has spent the turn\'s slice still lets another session\'s watch search a line in that turn', same, async () => {
+      const a = await open(shell, { cols: 200 });
+      const from = a.lines(0).to;
+      await ran(a, backlog(80), 30_000);
+      const b = await open(shell);
+      const bFrom = b.lines(0).to;
+      await ran(b, 'echo NEEDLE-$((6 * 7))');
+      const needle = bFrom + b.lines(bFrom).lines.indexOf('NEEDLE-42');
+      assert.ok(needle >= bFrom);
+      const events: SessionEvent[] = [];
+      b.onEvent((e) => events.push(e));
+      const w = a.wait({ kind: 'match', pattern: costly() }, { waitMs: 300_000, from });
+      const id = b.watch(/^NEEDLE-42$/, needle);
+      for (let i = 0; i < 20; i++) await null;
+      assert.ok(events.some((e) => e.kind === 'match' && e.watch === id), 'the watch searched nothing in the turn the other search spent');
+      assert.equal((await w).by, 'match');
+    });
+
+    test('a pattern wait that ends before its search reaches the end says how many lines it had not searched', same, async () => {
+      const s = await open(shell, { cols: 200 });
+      const from = s.lines(0).to;
+      await ran(s, backlog(), 30_000);
+      const w = await s.wait({ kind: 'match', pattern: costly() }, { waitMs: 100, from });
+      assert.equal(w.by, 'timeout');
+      assert.equal(w.matched, undefined);
+      assert.ok(w.unsearched !== undefined && w.unsearched > 0 && w.unsearched <= s.lines(from).lines.length, String(w.unsearched));
+    });
+
     test('a watch that matches a command\'s output is reported before the command\'s end, though both arrive in one read', async () => {
       const s = await open(shell);
       const events: SessionEvent[] = [];

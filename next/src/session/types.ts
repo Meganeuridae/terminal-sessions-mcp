@@ -170,6 +170,8 @@ export interface SendOutcome {
   by: 'match' | 'quiet' | 'exited' | 'timeout' | 'cancelled' | 'closed';
   /** With `until`, lines longer than the pattern's match window that were searched on their head only. */
   clipped?: number;
+  /** With `until` and no match, the lines and alternate-screen rows the search hadn't reached when the call returned. */
+  unsearched?: number;
 }
 
 export type Until = { kind: 'end' } | { kind: 'input' } | { kind: 'match'; pattern: RegExp };
@@ -182,6 +184,8 @@ export interface WaitOutcome {
   matched?: Match;
   /** For a match, lines longer than the pattern's match window that were searched on their head only. */
   clipped?: number;
+  /** For a match that wasn't found, the lines and alternate-screen rows the search hadn't reached when the call returned. */
+  unsearched?: number;
 }
 
 export interface StopStep {

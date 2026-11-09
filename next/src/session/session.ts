@@ -32,6 +32,26 @@ const isShell = (argv: string): boolean => {
 /** Deadlines, graces and quiet periods; the times a session reports are wall-clock. */
 const mono = (): number => performance.now();
 
+/** Pattern searches in one turn of the event loop, in every session, stop once they've spent this long, each after at least one line or row in that turn, and go on in a later turn. */
+const SLICE_MS = TICK_MS;
+/** A pattern search fetches the lines it searches this many at a time. */
+const SCAN_CHUNK = 16;
+let sliceEnd: number | undefined;
+/** Counts the turns in which a search started a slice; a search notes the one it last searched in. */
+let turn = 0;
+/** Whether this turn's pattern searches have spent their slice; the first search in a turn starts it. */
+function spent(): boolean {
+  if (sliceEnd === undefined) {
+    sliceEnd = mono() + SLICE_MS;
+    setImmediate(() => {
+      sliceEnd = undefined;
+      turn++;
+    });
+    return false;
+  }
+  return mono() >= sliceEnd;
+}
+
 const randomDigits = (): string => Array.from({ length: 4 }, () => String(randomInt(10000, 100000))).join('');
 
 function findBash(): string | undefined {
@@ -52,15 +72,25 @@ interface Call {
   own?: number;
 }
 
-/** Where a pattern search has got to: lines before `from` were searched and are frozen, and nothing was parsed since the `parses`th parse. `clipped`: frozen lines searched on their head only; `clippedLive`: live ones, at the last look. */
+/**
+ * Where a pattern search has got to. Lines before `from` were searched, didn't match, and are frozen.
+ * A pass searches the lines from `from` on, then the alternate screen's rows. `parses`: the parse the pass
+ * began after; `next` and `row`: where it goes on, `next` undefined once it's done; `turn`: the turn it last
+ * searched in. `clipped`: frozen lines searched on their head only; `clippedLive`: live ones, in the last
+ * whole pass; `live`: in this pass so far.
+ */
 interface Scan {
   from: number;
   parses: number;
+  next: number | undefined;
+  row: number;
+  turn: number;
   clipped: number;
   clippedLive: number;
+  live: number;
 }
 
-const newScan = (from: number): Scan => ({ from, parses: -1, clipped: 0, clippedLive: 0 });
+const newScan = (from: number): Scan => ({ from, parses: -1, next: undefined, row: 0, turn: -1, clipped: 0, clippedLive: 0, live: 0 });
 /** On macOS a look at the kernel spawns `ps`, so a call's loop looks at most this often. */
 const MAC_LOOK_EVERY_MS = 250;
 /** How long the shell's own read must have been seen before it counts as a builtin read: a bound on the kernel's delivery of output the shell wrote before it began reading, not a proof. */
@@ -108,6 +138,7 @@ class LiveSession implements Session {
   private readonly wakers = new Set<() => void>();
   private readonly watches = new Map<number, { pattern: RegExp; scan: Scan }>();
   private watchSeq = 0;
+  private resuming = false;
   private readonly listeners = new Set<(e: SessionEvent) => void>();
   private poll: NodeJS.Timeout | undefined;
   private drawnOnce = false;
@@ -618,8 +649,7 @@ class LiveSession implements Session {
     const front = this.front();
     this.observe(front, call.take);
     const screen = this.t.screen();
-    const clipped = opts.until && !matched ? scan.clipped + scan.clippedLive : 0;
-    return { sent: true, lines: this.t.lines(from), ...(screen.alt && { screen }), front, ended: call.ended, ...(matched && { matched }), by, ...(clipped > 0 && { clipped }) };
+    return { sent: true, lines: this.t.lines(from), ...(screen.alt && { screen }), front, ended: call.ended, ...(matched && { matched }), by, ...(opts.until && !matched && this.searched(scan)) };
   }
 
   async wait(until: Until, opts: { waitMs: number; from: number; take?: boolean; signal?: AbortSignal }): Promise<WaitOutcome> {
@@ -646,37 +676,72 @@ class LiveSession implements Session {
     }
     const front = this.front();
     this.observe(front, call.take);
-    const clipped = until.kind === 'match' && !matched ? scan.clipped + scan.clippedLive : 0;
-    return { by, front, ended: call.ended, ...(matched && { matched }), ...(clipped > 0 && { clipped }) };
+    return { by, front, ended: call.ended, ...(matched && { matched }), ...(until.kind === 'match' && !matched && this.searched(scan)) };
   }
 
   /**
    * The first line from `s.from` on that matches, each matched on its head within the pattern's window;
-   * then, while the alternate screen is active, its first row that matches. Rescans only after a parse,
+   * then, while the alternate screen is active, its first row that matches. A pass begins after each parse,
    * moves `s.from` past frozen lines that didn't match, and counts the lines it searched on their head only.
+   * It searches at least one line or row in each turn, and once this turn's searches have spent their slice,
+   * the pass stops and goes on in a later turn; `now` begins a pass though nothing was parsed since the last, and
+   * searches to its end.
    */
   private scan(pattern: RegExp, s: Scan, now = false): Match | undefined {
-    if (!now && s.parses === this.parses) return undefined;
-    s.parses = this.parses;
-    const ls = this.t.lines(s.from);
-    const frozen = ls.lines.length - ls.live;
-    let live = 0;
-    for (let i = 0; i < ls.lines.length; i++) {
-      const r = testBounded(pattern, ls.lines[i]!);
-      if (r.matched) return { line: ls.from + i, text: ls.lines[i]!, ...(r.clipped && { clipped: true as const }) };
-      if (!r.clipped) continue;
-      if (i < frozen) s.clipped++;
-      else live++;
+    if (now || s.parses !== this.parses) Object.assign(s, { parses: this.parses, next: s.from, row: 0, live: 0 });
+    else if (s.next === undefined) return undefined;
+    let n = s.next!;
+    for (;;) {
+      const ls = this.t.lines(n, n + SCAN_CHUNK);
+      if (ls.lines.length === 0) break;
+      const frozen = ls.lines.length - ls.live;
+      for (let i = 0; i < ls.lines.length; i++) {
+        if (!now && spent() && s.turn === turn) return this.later(s, ls.from + i, 0);
+        s.turn = turn;
+        const r = testBounded(pattern, ls.lines[i]!);
+        if (r.matched) return { line: ls.from + i, text: ls.lines[i]!, ...(r.clipped && { clipped: true as const }) };
+        if (i < frozen) {
+          if (r.clipped) s.clipped++;
+          s.from = ls.from + i + 1;
+        } else if (r.clipped) s.live++;
+      }
+      n = ls.to;
     }
-    s.clippedLive = live;
-    s.from = Math.max(s.from, ls.to - ls.live);
     const screen = this.t.screen();
     if (screen.alt)
-      for (let row = 0; row < screen.rows.length; row++) {
+      for (let row = s.row; row < screen.rows.length; row++) {
+        if (!now && spent() && s.turn === turn) return this.later(s, n, row);
+        s.turn = turn;
         const r = testBounded(pattern, screen.rows[row]!);
         if (r.matched) return { line: this.t.end(), text: screen.rows[row]!, row, ...(r.clipped && { clipped: true as const }) };
       }
+    s.clippedLive = s.live;
+    s.next = undefined;
     return undefined;
+  }
+
+  /** Leaves `s`'s pass to go on from line `next` and row `row`, and has the session look again in a later turn. */
+  private later(s: Scan, next: number, row: number): undefined {
+    s.next = next;
+    s.row = row;
+    if (!this.resuming) {
+      this.resuming = true;
+      setTimeout(() => {
+        this.resuming = false;
+        if (this.t.disposed) return;
+        this.checkWatches();
+        this.wake();
+      }, 0);
+    }
+    return undefined;
+  }
+
+  /** For a search that ended without a match: the lines it searched on their head only, and the lines and rows its pass hadn't reached. */
+  private searched(s: Scan): { clipped?: number; unsearched?: number } {
+    const clipped = s.clipped + (s.next === undefined ? s.clippedLive : s.live);
+    const screen = s.next === undefined ? undefined : this.t.screen();
+    const unsearched = screen ? Math.max(0, this.t.end() - s.next!) + (screen.alt ? Math.max(0, screen.rows.length - s.row) : 0) : 0;
+    return { ...(clipped > 0 && { clipped }), ...(unsearched > 0 && { unsearched }) };
   }
 
   /** Whether process group `pgid` still has a member among the shell's descendants, so a signal to it reaches the job it was read as. No, when they can't be listed. */
