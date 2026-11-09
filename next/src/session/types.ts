@@ -137,6 +137,11 @@ export interface Ending {
    */
   stopped?: true;
   /**
+   * A signal `stop` sent may have stopped the job, but whether it did couldn't be read. `status` is the shell's report then, which
+   * for a stopped job isn't the job's exit status.
+   */
+  stoppedUnknown?: true;
+  /**
    * The session stopped following it, and whether it ended isn't known. `by` names the program the shell it ran in was reached
    * through. `ended`: that program has no process left, or the session's shell exited. `left`: it left the terminal, as when
    * it's suspended. `back`: it ran in a far shell, and that far shell is at its prompt again, which shows nothing about how it

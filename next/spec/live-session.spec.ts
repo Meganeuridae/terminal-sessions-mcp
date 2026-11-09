@@ -2015,6 +2015,30 @@ test('a second close waits for the first, which hangs up what it listed once the
   }
 });
 
+test("a suspend signal whose stopped check can't be read leaves whether the job stopped unknown, not an exit status", darwinOnly, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const flag = path.join(tmp, `fails-${++gates}`);
+  // Only the reading of each process's state fails, so stop still finds the job's group and signals it.
+  const fake = fakePs(`*stat=*) [ -e '${flag}' ] && { echo 'ps: state reading failed' >&2; exit 1; };;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const r = await s.run('sleep 30', { waitMs: 200 });
+    assert.equal(r.kind, 'running', JSON.stringify(r));
+    await inFront(s, /sleep 30/);
+    fs.writeFileSync(flag, '');
+    const o = await s.stop('SIGTSTP');
+    assert.equal(o.steps[0]?.sent, 'SIGTSTP', JSON.stringify(o));
+    const c = s.command(r.kind === 'running' ? r.command.id : -1);
+    await eventually('the command ended', () => c?.end);
+    assert.deepEqual([c?.end?.stopped, c?.end?.stoppedUnknown], [undefined, true], JSON.stringify(c?.end));
+  } finally {
+    process.env.PATH = keep;
+    fs.rmSync(flag, { force: true });
+    await s.close({ force: true, deadline: by() });
+  }
+});
+
 /** A job of its own group that ignores the hangup, as nohup's do, with its pid. */
 const hupProof = async (s: Session): Promise<number> => pidOf(s, await ran(s, `sh -c 'trap "" HUP; while :; do sleep 1; done' & echo "JOB:$!"`), 'JOB');
 

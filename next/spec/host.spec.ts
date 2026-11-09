@@ -1095,6 +1095,20 @@ test('a report keeps its status line whole when a directory holds a line break, 
   assert.match(lines[1]!, /^Matched at line \d+: a needle here$/);
 });
 
+test("a run whose stop signal's stopped check couldn't be read has no exit code, and says whether it stopped isn't known", async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.run = async (text) => {
+    const c = { id: 4, text, from: 0, to: 1, startedAt: Date.now(), end: { at: Date.now(), ms: 1200, status: 146, errexit: false, refusedMarks: 0, stoppedUnknown: true as const } };
+    s.commands.set(4, c);
+    return { kind: 'ended', command: c, front: s.frontNow, took: [] };
+  };
+  const r = await host.call(agent(), 'run', { name: 'main', command: 'sleep 30' });
+  assert.deepEqual([r.structured.exitCode, r.structured.stoppedUnknown], [null, true], JSON.stringify(r.structured));
+  assert.match(r.text, /^\[main · command 4 · whether the stop signal stopped it isn't known \(the shell reported exit 146\) · 1\.2 s · /);
+});
+
 /** A command `s` no longer follows, ended as the session reports one. */
 const unfollowedEnd = (s: FakeSession, id: number, text: string): Command => {
   const c = { id, text, from: 0, to: 1, startedAt: Date.now(), end: { at: Date.now(), ms: 1200, errexit: false, refusedMarks: 0, unfollowed: { by: 'ssh box', how: 'left' as const } } };

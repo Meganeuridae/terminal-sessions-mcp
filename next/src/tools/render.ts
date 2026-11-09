@@ -49,7 +49,9 @@ export function endingText(c: Command): string[] {
     const seen = how === 'back' ? `the shell that ran ${quoted(by)} is at its prompt again` : `${quoted(by)} ${how === 'left' ? 'left the terminal' : 'ended'}`;
     parts.push(`no longer followed: ${seen}, so whether the command ended isn't known`);
   }
-  else parts.push(end.stopped ? `stopped${end.status === undefined ? '' : ` (the shell reported ${status})`}` : status);
+  else if (end.stopped) parts.push(`stopped${end.status === undefined ? '' : ` (the shell reported ${status})`}`);
+  else if (end.stoppedUnknown) parts.push(`whether the stop signal stopped it isn't known${end.status === undefined ? '' : ` (the shell reported ${status})`}`);
+  else parts.push(status);
   if (end.pipeline && end.pipeline.some((s) => s !== 0)) parts.push(`pipeline ${end.pipeline.join('|')}`);
   parts.push(duration(end.ms));
   if (end.errexit) parts.push('set -e is on: a failing command now ends the shell');

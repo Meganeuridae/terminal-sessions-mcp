@@ -508,6 +508,7 @@ class LiveSession implements Session {
       sig.checked = true;
       sig.stopped = this.groupStopped(sig.pgid);
       if (sig.stopped) c.end.stopped = true;
+      else if (sig.stopped === undefined) c.end.stoppedUnknown = true;
     }
     this.lastEnded = c;
     if (c.end.flushed && this.commands.get(c.id) === c) {
