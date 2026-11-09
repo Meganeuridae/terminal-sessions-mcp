@@ -51,6 +51,61 @@ async function goneAfterGracefulKill(id, command) {
   }
 }
 
+// On Linux the listings read /proc and spawn no ps, so only on macOS can this test fail.
+test('a graceful kill whose deadline has passed runs no ps, and still ends the shell', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-ps-'));
+  const mark = path.join(dir, 'called');
+  fs.writeFileSync(path.join(dir, 'ps'), `#!/bin/sh\necho "$*" >> '${mark}'\nexec /bin/ps "$@"\n`, { mode: 0o755 });
+  await server.createSession('t-kill-deadline', { shell: '/bin/bash' });
+  const r = await server.execCommand('t-kill-deadline', 'echo SHELLPID=$$', 5000);
+  const shellPid = Number((String(r.output).match(/SHELLPID=(\d+)/) || [])[1]);
+  assert.ok(shellPid > 0, `the shell's pid: ${JSON.stringify(r.output)}`);
+  const PATH = process.env.PATH;
+  process.env.PATH = `${dir}:${PATH}`;
+  try {
+    await server.killSession('t-kill-deadline', true, performance.now() - 1);
+  } finally {
+    process.env.PATH = PATH;
+  }
+  const ended = Date.now() + 3000;
+  while (exists(shellPid) && Date.now() < ended) await pause(50);
+  assert.strictEqual(exists(shellPid), false, `the shell (pid ${shellPid}) outlived the kill`);
+  assert.strictEqual(fs.existsSync(mark) ? fs.readFileSync(mark, 'utf8') : '', '', 'no ps ran');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a session opened while killAll waits on a kill is still listed, and alive, after it', async () => {
+  await server.createSession('t-killall-held');
+  let release;
+  const held = new Promise((r) => (release = r));
+  const kill = server.killSession;
+  let pid = 0;
+  server.killSession = async function (id, ...rest) {
+    await kill.call(this, id, ...rest);
+    if (id === 't-killall-held') await held;
+  };
+  try {
+    const all = server.killAll(false);
+    await server.createSession('t-killall-new', { shell: '/bin/bash' });
+    const r = await server.execCommand('t-killall-new', 'echo SHELLPID=$$', 5000);
+    pid = Number((String(r.output).match(/SHELLPID=(\d+)/) || [])[1]);
+    assert.ok(pid > 0, `the new shell's pid: ${JSON.stringify(r.output)}`);
+    release();
+    await all;
+    assert.ok(server.listSessions().some((s) => s.id === 't-killall-new'), 'the session opened during killAll is listed');
+    assert.strictEqual(exists(pid), true, `the new shell (pid ${pid}) is alive`);
+  } finally {
+    release();
+    delete server.killSession;
+    await server.killSession('t-killall-new', false);
+    // A shell whose entry was lost can't be killed through the server, and would keep this run open.
+    if (pid > 0) try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
+});
+
 test('a graceful kill ends the jobs the session started in the background', async () => {
   const { pid, gone } = await goneAfterGracefulKill('t-kill-job', 'sleep 60 & echo BGPID=$!');
   assert.strictEqual(gone, true, `the background job (pid ${pid}) outlived the graceful kill`);

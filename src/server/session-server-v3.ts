@@ -403,11 +403,19 @@ interface Listed {
 }
 
 const LINUX = process.platform === 'linux';
-const PS_TIMEOUT_MS = 3000;
+/** How long a kill may take: RobustSessionClient's default request timeout, through which every kill reaches killSession. */
+const KILL_BUDGET_MS = 10_000;
+const SHELL_WAIT_MS = 3000;
+const SETTLE_MS = 50;
 
-function ps(args: string[]): Promise<{ status: number; stdout: string } | undefined> {
+function ps(args: string[], until: number): Promise<{ status: number; stdout: string } | undefined> {
+  const timeout = Math.floor(until - performance.now());
+  if (timeout <= 0) return Promise.resolve(undefined);
   return new Promise((resolve) => {
-    execFile('ps', args, { encoding: 'utf8', timeout: PS_TIMEOUT_MS, killSignal: 'SIGKILL' }, (error, stdout) => {
+    // After its timeout, execFile's callback waits for the child to exit, which SIGKILL can't hasten for a process in uninterruptible sleep.
+    const timer = setTimeout(() => resolve(undefined), timeout);
+    execFile('ps', args, { encoding: 'utf8', timeout, killSignal: 'SIGKILL' }, (error, stdout) => {
+      clearTimeout(timer);
       if (!error) resolve({ status: 0, stdout });
       else resolve(typeof error.code === 'number' && !error.killed ? { status: error.code, stdout } : undefined);
     });
@@ -424,7 +432,7 @@ function linuxStat(pid: number): { pgid: number; tty: number } | undefined {
   }
 }
 
-async function onTerminal(shellPid: number): Promise<Listed[] | undefined> {
+async function onTerminal(shellPid: number, until: number): Promise<Listed[] | undefined> {
   if (LINUX) {
     const tty = linuxStat(shellPid)?.tty;
     if (!(tty !== undefined && tty > 0)) return undefined;
@@ -442,7 +450,7 @@ async function onTerminal(shellPid: number): Promise<Listed[] | undefined> {
     }
     return listed;
   }
-  const all = await ps(['-A', '-o', 'pid=,pgid=,tty=']);
+  const all = await ps(['-A', '-o', 'pid=,pgid=,tty='], until);
   if (all?.status !== 0) return undefined;
   const rows = all.stdout.trim().split('\n').map((line) => line.trim().split(/\s+/));
   const tty = rows.find((r) => Number(r[0]) === shellPid)?.[2];
@@ -454,7 +462,7 @@ async function onTerminal(shellPid: number): Promise<Listed[] | undefined> {
 // gets SIGCONT once its SIGHUP is delivered. Any process in the session may
 // continue a process, whoever owns it. kill(-0) would signal our own group,
 // and kill(-1) every process we may signal.
-async function hangUp(listed: Listed[], shellPid: number): Promise<void> {
+async function hangUp(listed: Listed[], shellPid: number, until: number): Promise<void> {
   const members = listed.filter((p) => p.pid !== shellPid && p.pgid > 1);
   if (!members.length) return;
   const now = new Map<number, number>();
@@ -464,7 +472,7 @@ async function hangUp(listed: Listed[], shellPid: number): Promise<void> {
       if (s) now.set(p.pid, s.pgid);
     }
   } else {
-    const still = await ps(['-o', 'pid=,pgid=', '-p', members.map((p) => p.pid).join(',')]);
+    const still = await ps(['-o', 'pid=,pgid=', '-p', members.map((p) => p.pid).join(',')], until);
     for (const line of (still?.stdout ?? '').trim().split('\n')) {
       const [pid, pgid] = line.trim().split(/\s+/).map(Number);
       if (pid! > 0) now.set(pid!, pgid!);
@@ -2075,7 +2083,7 @@ export class PersistentSessionServer extends EventEmitter {
   /**
    * Kill a session with optional graceful shutdown
    */
-  async killSession(sessionId: string, graceful: boolean = true): Promise<void> {
+  async killSession(sessionId: string, graceful: boolean = true, deadline: number = performance.now() + KILL_BUDGET_MS): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
@@ -2087,7 +2095,7 @@ export class PersistentSessionServer extends EventEmitter {
         // shell is gone or KILLed, the processes that were on its terminal are
         // hung up here. The kernel clears their controlling terminal when the
         // shell exits, so they're listed before the first SIGHUP.
-        if (process.platform !== 'win32') listed = await onTerminal(session.shell.pid);
+        if (process.platform !== 'win32') listed = await onTerminal(session.shell.pid, deadline - SHELL_WAIT_MS - SETTLE_MS);
 
         // SIGHUP is the "terminal went away" signal: an interactive shell
         // exits on it and resends it to its jobs. (SIGINT, used previously, is
@@ -2101,13 +2109,12 @@ export class PersistentSessionServer extends EventEmitter {
         if (session.isAlive) session.shell.kill('SIGHUP');
 
         // Wait up to 3 seconds for the process to exit gracefully
-        const timeout = 3000;
-        const startTime = Date.now();
-        let nextHangup = startTime + 500;
+        const until = Math.min(performance.now() + SHELL_WAIT_MS, deadline - SETTLE_MS);
+        let nextHangup = performance.now() + 500;
 
-        while (session.isAlive && Date.now() - startTime < timeout) {
+        while (session.isAlive && performance.now() < until) {
           await this.sleep(50);
-          if (session.isAlive && Date.now() >= nextHangup) {
+          if (session.isAlive && performance.now() >= nextHangup) {
             session.shell.kill('SIGHUP');
             nextHangup += 500;
           }
@@ -2125,8 +2132,8 @@ export class PersistentSessionServer extends EventEmitter {
     }
 
     // Brief settle so the exit handler (log flush, event) runs before removal
-    await this.sleep(50);
-    if (listed) await hangUp(listed, session.shell.pid);
+    await this.sleep(SETTLE_MS);
+    if (listed) await hangUp(listed, session.shell.pid, deadline);
     this.cleanupTempFiles(session);
     this.sessions.delete(sessionId);
   }
@@ -2135,11 +2142,11 @@ export class PersistentSessionServer extends EventEmitter {
    * Kill all sessions with optional graceful shutdown
    */
   async killAll(graceful: boolean = true): Promise<void> {
+    const deadline = performance.now() + KILL_BUDGET_MS;
     const killPromises = Array.from(this.sessions.keys()).map(id => 
-      this.killSession(id, graceful)
+      this.killSession(id, graceful, deadline)
     );
     await Promise.all(killPromises);
-    this.sessions.clear();
   }
 
   /**
