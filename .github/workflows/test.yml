@@ -51,6 +51,40 @@ jobs:
       - run: npm test
       - run: npm run test:next
 
+  # `npm ci` installs the node-pty the lockfile pins; `npm install` of the published package
+  # resolves node-pty's range afresh and runs its own install, as a user's does.
+  install-from-tarball:
+    name: a shell opens after npm install of the packed package (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci && npm run build
+      - name: Pack, install into an empty directory, and open a shell through 1.x and through 2.0
+        run: |
+          tgz="$PWD/$(npm pack --silent | tail -1)"
+          dir=$(mktemp -d)
+          cd "$dir"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "$tgz"
+          node -p "'node-pty ' + require('node-pty/package.json').version"
+          node -e "
+            const { PersistentSessionServer } = require('term-sessions-mcp/dist/src/server/session-server-v3.js');
+            const s = new PersistentSessionServer();
+            s.createSession('main', { shell: '/bin/bash' })
+              .then(() => s.execCommand('main', 'echo tarball-ok', 5000))
+              .then(async (r) => { await s.killAll(false); if (!String(r.output).includes('tarball-ok')) throw new Error('1.x ran no echo: ' + JSON.stringify(r.output)); console.log('1.x: a shell opened and ran echo'); process.exit(0); })
+              .catch((e) => { console.error('1.x:', e && e.message); process.exit(1); });
+          "
+          tsm="$dir/node_modules/.bin/tsm"
+          "$tsm" --socket "$dir/d.sock" open main
+          "$tsm" --socket "$dir/d.sock" run main 'echo tarball-ok' | grep -x tarball-ok
+          "$tsm" --socket "$dir/d.sock" daemon stop
+
   # The two checks against real MCPL hosts (next/acceptance), which `npm test` does not run: the
   # agent-framework host with a mock model, and mcpl-cc-bridge's own host classes under bun. Each
   # host is checked out at a pinned commit of its main and built as its README says; a host that
