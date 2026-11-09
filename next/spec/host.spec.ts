@@ -1303,6 +1303,28 @@ test('a session that a caller taking no reports closes, after one taking them us
   assert.equal(((await host.call(plain(), 'list', {})).structured.unseen as string[]).length, 0, 'a taking list forgets them');
 });
 
+test('a close whose call is cancelled before its result is made counts nothing as shown, and leaves the reports and its close for list', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(plain(), 'run', { name: 'main', command: 'make', wait: 0 });
+  s.end(2);
+  await settle();
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  const close = s.close.bind(s);
+  s.close = async (o) => (await held, close(o));
+  const ac = new AbortController();
+  const closing = host.call(plain(), 'close', { name: 'main' }, ac.signal);
+  await settle();
+  ac.abort();
+  release();
+  await closing;
+  const r = await host.call(plain(), 'list', {});
+  assert.match(r.text, /\n\nNot yet seen:\n\[main · command 1 · exit 2 [^\n]*\n\[main · closed by a call that was cancelled or lost its connection; the shell /);
+});
+
 test('a host whose wakes start after reports were kept is offered each one still unseen in its scope, oldest first', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });

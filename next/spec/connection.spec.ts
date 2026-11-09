@@ -428,3 +428,45 @@ test('an end a closed connection was waiting for is pushed to another connection
     await h.done();
   }
 });
+
+test("a close whose connection is lost before its result is made leaves the session's reports and its close for the scope", async () => {
+  const h = await harness();
+  try {
+    const a = await h.connect(relayHello('a'));
+    await a.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    await a.request('tools/call', { name: 'open', arguments: { name: 'main' } });
+    const s = h.sessions[0]!;
+    s.runMode = 'run';
+    await a.request('tools/call', { name: 'run', arguments: { name: 'main', command: 'make', wait: 0 } });
+    s.end(2);
+    let entered!: () => void;
+    const closing = new Promise<void>((r) => (entered = r));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const close = s.close.bind(s);
+    s.close = async (o) => (entered(), await held, close(o));
+    let lost!: Promise<void>;
+    let closed!: Promise<unknown>;
+    const call = h.host.call.bind(h.host);
+    h.host.call = (caller, tool, args, signal) => {
+      const r = call(caller, tool, args, signal);
+      if (tool === 'close') {
+        lost = new Promise<void>((res) => signal?.addEventListener('abort', () => res(), { once: true }));
+        closed = r;
+      }
+      return r;
+    };
+    a.send({ jsonrpc: '2.0', id: 'c', method: 'tools/call', params: { name: 'close', arguments: { name: 'main' } } });
+    await closing;
+    a.close();
+    await lost;
+    release();
+    await closed;
+    const b = await h.connect(relayHello('a'));
+    await b.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    const listed = (await b.request('tools/call', { name: 'list', arguments: {} })).result as { content: Array<{ text: string }> };
+    assert.match(listed.content[0]!.text, /\n\nNot yet seen:\n\[main · command 1 · exit 2 [^\n]*\n\[main · closed by a call that was cancelled or lost its connection; the shell /);
+  } finally {
+    await h.done();
+  }
+});

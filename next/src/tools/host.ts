@@ -164,7 +164,7 @@ export class Host {
         case 'integrate':
           return await this.integrate(caller, entry, a, signal);
         case 'close':
-          return await this.close(caller, entry, a);
+          return await this.close(caller, entry, a, signal);
       }
       return refused(`\`${tool}\` isn't handled here.`, { error: 'unknown_tool' });
     } catch (e) {
@@ -581,7 +581,7 @@ export class Host {
     }
   }
 
-  private async close(caller: Caller, e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
+  private async close(caller: Caller, e: Entry, a: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
     e.closing = true;
     const [exit] = await Promise.all([e.session.close({ force: a.force === true, deadline: mono() + WAIT_MAX_S * 1000 }), Promise.all(e.settling)]);
     if (exit.underway) return ok(`[${e.name} · still closing]\nThe shell ${underwayText(exit, "this call's wait")}.`, { session: e.name, exit });
@@ -598,9 +598,12 @@ export class Host {
     if (pending.length) full += '\n\nNot yet seen:';
     const ends = pending.map((u) => (full += `\n${u.lines.join('\n')}`).length);
     const kept = fittedLength(full);
-    const shown = pending.filter((_, i) => ends[i]! <= kept);
+    const lost = signal?.aborted === true;
+    const shown = lost ? [] : pending.filter((_, i) => ends[i]! <= kept);
     if (caller.takes) for (const u of shown) e.unseen.delete(u.wake.key);
-    if (caller.takes ? e.unseen.size > 0 : e.takerUsed) this.leave(e, caller.takes ? undefined : how);
+    const closer = caller.takes ? (lost ? 'a call that was cancelled or lost its connection' : undefined) : e.takerUsed ? 'a caller that takes no reports' : undefined;
+    if (closer) this.leave(e, `closed by ${closer}; the shell ${how}`);
+    else if (caller.takes && e.unseen.size > 0) this.leave(e, undefined);
     const unseen = shown.map((u) => u.lines.join('\n'));
     return ok(fitted(full), { session: e.name, exit, ...(unseen.length ? { unseen } : {}) });
   }
@@ -770,10 +773,10 @@ export class Host {
     return best;
   }
 
-  private leave(e: Entry, how: string | undefined): void {
+  private leave(e: Entry, closed: string | undefined): void {
     const left = [...(this.left.get(e.scope) ?? []), ...e.unseen.values()];
-    if (how !== undefined) {
-      const text = fitted(`[${e.name} · closed by a caller that takes no reports; the shell ${how}]`);
+    if (closed !== undefined) {
+      const text = fitted(`[${e.name} · ${closed}]`);
       const seq = ++this.wakeSeq;
       left.push({ seq, at: seq, wake: { scope: e.scope, session: e.name, tag: 'terminal:exited', key: this.pushKey(e, undefined), text }, lines: [text], command: undefined });
     }
