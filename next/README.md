@@ -73,13 +73,36 @@ Eight tools. The results of `open`, `run`, `send`, `look`, `read` and `stop` ope
 | `killAll` | Not carried. `list`, then `close` each. One call ending every session in a scope could end another agent's sessions where two share a scope. |
 | `raw: true` | Not carried. `look` gives a full-screen program's screen, and the escape codes would be noise. |
 | The WebSocket API and `SessionClient` | Not carried. A script uses `tsm --json` or the MCP tools. |
-| The network server and its `--token` | Not carried: 2.0 opens no port. For another machine, the host starts the relay there over ssh: `ssh HOST tsm-relay --scope NAME`. |
+| Windows, where 1.x's sessions ran `wsl.exe` | The relay and daemon run inside a WSL2 distro, as in "Windows, through WSL2" below. |
+| The network server and its `--token` | Not carried: 2.0 opens no port. For another machine, the host starts the relay there over ssh, as in "Another machine, over ssh" below. |
 
 ## Running the daemon
 
 One daemon per user holds every shell, on a Unix socket in a directory only you can enter: `$XDG_RUNTIME_DIR/terminal-sessions/daemon.sock`; where that variable isn't set, `/run/user/<uid>/terminal-sessions/daemon.sock` on Linux when that directory is yours alone; otherwise `/tmp/terminal-sessions-<uid>/daemon.sock`. A relay that finds none starts one: on Linux, as a transient systemd user unit where one can be started, so the daemon outlives a host whose service stops; elsewhere, or where `systemd-run` fails, detached, in the starter's control group, with its output in `daemon.log` beside the socket. To have it started again after a crash, install `next/config/termd.service` (systemd) or `next/config/com.animalabs.termd.plist` (launchd). Either keeps the daemon across logins only where the user's service manager outlives a logout, which on Linux takes lingering (`loginctl enable-linger`); on macOS a launch agent stops at logout. Start the systemd unit (`systemctl --user enable --now termd`) before any relay starts a daemon, or after `tsm daemon stop`. Its daemon exits when it finds another already answering, and `Restart=on-failure` doesn't start it again. The launch agent's `KeepAlive` starts it again every 10 seconds, so it takes over once the other daemon ends.
 
 `tsm daemon stop` asks it over its socket to stop, ending every shell, and returns once the socket no longer answers; it sends no signal, and names the daemon's pid if it doesn't stop. Under the shipped launch agent, launchd starts it again (`KeepAlive`); `launchctl bootout gui/$(id -u)/com.animalabs.termd` stops it for good. `termd --session-oom-score-adj N` sets how strongly the kernel prefers a session's processes over the daemon when memory runs out (default 200; 0 leaves it alone).
+
+### Another machine, over ssh
+
+A host reaches another machine's daemon by launching the relay there over ssh: `"command": "ssh", "args": ["-T", "-o", "BatchMode=yes", "box", "tsm-relay", "--scope", "AGENT"]`.
+
+- **The relay's stdout is the protocol.** A startup file on the far machine that prints for a command run over ssh, such as a `.bashrc` that echoes, breaks it.
+- **`PATH`:** a command run over ssh gets no login shell, so a `tsm-relay` that nvm or Volta installed isn't found. Give node's absolute path then, and the relay's after it: `/path/to/node /path/to/term-sessions-mcp/next/dist/src/relay.js --scope AGENT`.
+- **`BatchMode=yes`** turns a password or host-key prompt into a failure the host sees, rather than a wait.
+- **The far daemon lives as long as the far user's service manager.** On Linux, the relay starts it as a transient systemd user unit. Without lingering (`loginctl enable-linger`), the manager stops when the user's last login session ends. The daemon and every shell go with it.
+- **A dropped connection** ends the relay and any call in flight; the relay never reconnects. The far daemon and its sessions live on, and a relay the host starts again finds them.
+- **A far macOS machine** has no systemd. Its daemon should come from the launch agent ([`config/README.md`](config/README.md)). The ssh route to macOS is untested.
+- Tested on Ubuntu 26.04 with Node 22, over ssh to the same machine: a command's status and output, a result cut to the 24,000-character limit, a command's end pushed through ssh, and a session kept across a dropped connection.
+
+### Windows, through WSL2
+
+On Windows, a host launches the relay inside a WSL2 distro: `"command": "wsl.exe", "args": ["-d", "Ubuntu-24.04", "-u", "me", "-e", "/path/to/node", "/path/to/term-sessions-mcp/next/dist/src/relay.js", "--scope", "AGENT"]`.
+
+- **`-e` runs the relay with no shell between,** so nothing a startup file prints reaches the protocol. With no login shell, `PATH` has no node that nvm or a tarball put elsewhere, so give node's absolute path and the relay's.
+- **`-u`** names the user the relay, the daemon and every shell run as.
+- **WSL stops an idle distro, and every session's shell with it.** Microsoft documents the default as 15 seconds (`instanceIdleTimeout`). In our run, the distro stopped 10 to 20 seconds after the last `wsl.exe` client left, though systemd ran and the user was lingering. `instanceIdleTimeout=-1` under `[general]` in `%UserProfile%\.wslconfig` kept it running through a 60-second gap, and the session with it. That file applies to every distro. `wsl --shutdown`, the quick way to apply it, stops every running distro. Another `wsl.exe` client kept attached, such as `wsl.exe -d Ubuntu-24.04 -e sleep infinity`, also kept it running, and changes nothing else.
+- **Paths** in `open`'s `cwd` are the distro's. Windows' drives are under `/mnt/c` and so on.
+- Tested on GitHub's windows-2025 runner, with WSL 3.0.3, Ubuntu 24.04 and Node 22: a command's status and UTF-8 output, a result cut to the 24,000-character limit, a command's end pushed through `wsl.exe`, and the idle stop with and without what keeps it up.
 
 ## CLI
 
