@@ -19,9 +19,9 @@ what reaches them is the package they share with 2.0: a narrower Node range (`en
   shell starts with no arguments and runs without it. A daemon restart ends them. A call naming one
   is then refused, and says why.
 - **Nine tools:** `open`, `run`, `send`, `look`, `read`, `stop`, `integrate`, `list` and `close`. The results
-  of `open`, `run`, `send`, `look`, `read`, `stop` and `integrate` open with the session's status line: the
-  command's exit status (or "status unknown", or the shell's exit for a command that ends the
-  shell), its duration and directory, and what is in front of the shell now. `list` gives a line
+  of `open`, `run`, `send`, `look`, `read`, `stop` and `integrate` open with the session's status line:
+  what is in front of the shell now and its directory, and, in `run`'s and a report's, the command's
+  exit status (or "status unknown", or the shell's exit for a command that ends the shell) and duration. `list` gives a line
   for each session, `close` says how the shell ended, and a refused call says why. `close` hangs up
   the shell and every process on its terminal; a process started with `setsid` or `nohup` outlives
   it, and `force` KILLs at once. `run`'s
@@ -30,7 +30,7 @@ what reaches them is the package they share with 2.0: a narrower Node range (`en
   bracketed paste and the keys after it, for a program such as Claude Code that takes long typed
   text as a paste. `look` gives a full-screen program's screen while it is up. `integrate` gives a shell reached through a typed
   `ssh`, `su` or `docker exec` the session's integration, so `run` works there with statuses.
-- **Wakes over MCPL** (feature set `terminal.events`): a command ended that no call was waiting on,
+- **Wakes over MCPL** (feature set `terminal.events`): a command ended that no call showed,
   a program waiting for input (on the kernel's evidence, on Linux), a shell exited, a pattern asked
   for appeared. Nothing else wakes.
 - **The CLI, `tsm`,** calls the same tools; nothing it is shown counts as seen. `tsm --json` prints
@@ -49,7 +49,8 @@ what reaches them is the package they share with 2.0: a narrower Node range (`en
   kill still KILLs the shell alone, and on Windows the kill is as before. Listing the terminal's
   processes, the 3 s wait for the shell and the hangup share one deadline, 10 s from the kill's
   start: the time `RobustSessionClient` gives a request. A kill that uses all 10 s can still answer
-  after the client has given up.
+  after the client has given up. The session server's shutdown runs a graceful `killAll`, so a
+  supervisor stopping it should allow it those 10 s.
 
 ### Fixed in 1.x
 

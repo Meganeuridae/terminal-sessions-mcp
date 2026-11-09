@@ -531,7 +531,7 @@ test('the refusal at a typed line advises clearing the whole line, and run moves
   s.runMode = 'refuse';
   const r = await host.call(agent(), 'run', { name: 'main', command: 'ls' });
   s.runMode = 'end';
-  assert.match(r.text, /`send` with `keys: \["C-e", "C-u"\]` clears the line/);
+  assert.match(r.text, /With a line editor's default keys, `send` with `keys: \["C-e", "C-u"\]` clears the line/);
   s.frontNow = { state: 'prompt', since: Date.now() };
   s.out.push('unseen 1', 'unseen 2');
   await host.call(agent(), 'run', { name: 'main', command: 'echo hi' });

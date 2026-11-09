@@ -1350,7 +1350,7 @@ export const openSession: OpenSession = async (o) => {
     const cause = `the shell could not start: ${clause((e as Error).message)}`;
     const pdir = ptyDir();
     const helper = pdir && unrunnableHelper(pdir);
-    if (helper) throw err('backend_failure', `${cause}. node-pty starts every shell through ${helper}, which isn't executable. Run chmod +x ${shellQuote(helper)}, then open the session again`);
+    if (helper) throw err('backend_failure', `${cause}. node-pty starts every shell through ${helper}, which isn't executable. Whoever runs this host can run chmod +x ${shellQuote(helper)}, and then the session can be opened again`);
     throw err('backend_failure', `${cause}. If that error passes, such as a limit on processes, opening again may work`);
   }
   const s = new LiveSession(o, p, dir, launch.kind, nonce, o.nextCommandId, [o.shell, ...launch.args].join(' '));
