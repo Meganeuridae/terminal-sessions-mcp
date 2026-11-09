@@ -84,6 +84,7 @@ prepend() {
 }
 # Prepended in reverse, so a version manager the user chose wins, then Homebrew, then /usr/local.
 prepend /usr/local/bin
+prepend /home/linuxbrew/.linuxbrew/bin
 prepend /opt/homebrew/sbin
 prepend /opt/homebrew/bin
 prepend "$HOME/.local/bin"
@@ -96,6 +97,15 @@ daemon=${TSM_DAEMON:-"$here/../dist/src/daemon.js"}
 node=${TSM_NODE_BIN:-$(command -v node || true)}
 if [ -z "$node" ]; then
   echo "termd-launch: no node on PATH ($PATH); set TSM_NODE_BIN=/path/to/node" >&2
+  exit 127
+fi
+version=$("$node" --version 2>/dev/null || true)
+v=${version#v} major=${version#v} minor=0
+major=${major%%.*}
+case $v in *.*) minor=${v#*.} minor=${minor%%.*} ;; esac
+case $major$minor in *[!0-9]*|'') major=0 ;; esac
+if ! { [ "$major" -eq 22 ] && [ "$minor" -ge 12 ]; } && ! { [ "$major" -ge 23 ] && [ "$major" -le 24 ]; }; then
+  echo "termd-launch: $node is Node ${version:-of an unknown version}, and termd runs on Node >=22.12.0 <25.0.0; set TSM_NODE_BIN=/path/to/node" >&2
   exit 127
 fi
 if [ ! -f "$daemon" ]; then

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
 import * as os from 'node:os';
@@ -9,10 +9,10 @@ import { loginShell, unrunnableHelper } from '../src/core/launch.js';
 
 const LAUNCHER = path.resolve(import.meta.dirname, '../../config/termd-launch.sh');
 
-/** A stand-in node that prints which one it is and the PATH it was given. */
-function fakeNode(file: string): void {
+/** A stand-in node that prints which one it is and the PATH it was given, and answers --version. */
+function fakeNode(file: string, version = 'v24.22.2'): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, '#!/bin/sh\necho "node=$0"\necho "PATH=$PATH"\n', { mode: 0o755 });
+  fs.writeFileSync(file, `#!/bin/sh\nif [ "$1" = --version ]; then echo ${version}; exit 0; fi\necho "node=$0"\necho "PATH=$PATH"\n`, { mode: 0o755 });
 }
 
 function launch(env: Record<string, string>): { node: string; path: string } {
@@ -51,6 +51,27 @@ test("TSM_NODE_BIN's directory comes first on the daemon's PATH, moved there whe
     assert.equal(r.path.split(':')[0], path.join(home, 'custom/bin'));
     const later = launch({ HOME: home, TSM_DAEMON: daemon, TSM_NODE_BIN: node, PATH: `/usr/bin:/bin:${path.join(home, 'custom/bin')}` });
     assert.deepEqual(later.path.split(':').filter((d) => d === path.join(home, 'custom/bin') || d === '/usr/bin'), [path.join(home, 'custom/bin'), '/usr/bin'], 'moved ahead of /usr/bin, and only once');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("the launcher refuses a node outside the package's engines range, naming it and the range", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-launch-'));
+  try {
+    const daemon = path.join(home, 'daemon.js');
+    fs.writeFileSync(daemon, '');
+    const engines = (JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, '../../../package.json'), 'utf8')) as { engines: { node: string } }).engines.node;
+    for (const [version, runs] of [['v12.22.12', false], ['v22.11.0', false], ['v22.12.0', true], ['v24.22.2', true], ['v25.0.0', false]] as const) {
+      const node = path.join(home, version, 'bin/node');
+      fakeNode(node, version);
+      const r = spawnSync('/bin/sh', [LAUNCHER], { env: { PATH: '/usr/bin:/bin', HOME: home, TSM_DAEMON: daemon, TSM_NODE_BIN: node }, encoding: 'utf8' });
+      if (runs) assert.equal(r.status, 0, `${version}: ${r.stderr}`);
+      else {
+        assert.equal(r.status, 127, version);
+        assert.ok(r.stderr.includes(`${node} is Node ${version}, and termd runs on Node ${engines};`), `${version}: ${r.stderr}`);
+      }
+    }
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
