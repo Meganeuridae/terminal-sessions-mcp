@@ -2215,7 +2215,7 @@ test('integrate: the result names the shell given the integration, and the statu
   };
   const r = await host.call(agent(), 'integrate', { name: 'main', wait: 5 });
   assert.equal(r.isError, undefined, r.text);
-  assert.equal(r.text, "[main · at the prompt of the shell within ssh box · /srv/far]\nThe shell in front, zsh 5.9, now has the session's integration. `run` types there, with statuses, until that shell exits. Then `run` goes back to the shell it was typed from.");
+  assert.equal(r.text, "[main · at the prompt of the shell within ssh box · /srv/far]\nThe shell in front, zsh 5.9, now has the session's integration. `run` types there, with statuses, until that shell exits, or until the local program it was reached through ends or leaves the terminal. Then `run` goes back to the shell it was typed from.");
   assert.deepEqual(r.structured, { integrated: { shell: 'zsh', version: '5.9' }, front: s.frontNow });
   assert.deepEqual(s.calls.find((c) => c.method === 'integrate')?.args, [5000]);
   assert.match((await host.call(agent(), 'list', {})).text, /^main: at the prompt of the shell within ssh box · \/srv\/far/);

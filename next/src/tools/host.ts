@@ -541,7 +541,7 @@ export class Host {
     switch (r.kind) {
       case 'integrated': {
         const printed = r.printed?.length ? `\nWhile taking the hooks, the shell printed:\n${r.printed.join('\n')}` : '';
-        const said = `\nThe shell in front, ${r.shell} ${r.version}, now has the session's integration. \`run\` types there, with statuses, until that shell exits. Then \`run\` goes back to the shell it was typed from.${printed}`;
+        const said = `\nThe shell in front, ${r.shell} ${r.version}, now has the session's integration. \`run\` types there, with statuses, until that shell exits, or until the local program it was reached through ends or leaves the terminal. Then \`run\` goes back to the shell it was typed from.${printed}`;
         const shown = before?.lines.length ? `\n${this.output(before, Math.max(0, RESULT_MAX_CHARS - head.length - said.length - 1))}` : '';
         if (before) e.cursor = Math.max(e.cursor, e.session.lines(e.cursor).to - 1);
         return ok(

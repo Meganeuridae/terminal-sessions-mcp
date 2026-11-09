@@ -163,7 +163,7 @@ export const TOOLS: readonly ToolDef[] = [
       'It types a probe line, then the hooks, and they answer whatever reads the terminal. Refused at the prompt of a shell that already has the integration: the session\'s own, or one given it before. ' +
       'Refused while this terminal reads whole lines, as at the password or yes/no questions ssh, su and sudo ask on this machine. A program that holds the terminal raw, such as a connected ssh, hides its far side: a question there can\'t be seen, and the probe line would answer it. Call it once `look` shows the far prompt. ' +
       'bash, zsh and fish only; another shell is refused, and the refusal names it. If the wait runs out, nothing more is typed, and the result names the step it reached; once the hooks are all typed, a prompt drawn later still completes it. ' +
-      'The integration lasts until that shell exits. Then `run` goes back to the shell it was typed from. ' +
+      'The integration lasts until that shell exits, or until the local program it was reached through ends or leaves the terminal, as when ssh exits or is suspended. Then `run` goes back to the shell it was typed from. ' +
       'In a shell that writes its history as it goes, the probe line reaches its history file, and in zsh so does the line that turns saving off. Nothing typed after them does.',
     inputSchema: {
       type: 'object',
