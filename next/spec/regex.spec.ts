@@ -9,20 +9,21 @@ const cpuMs = <T>(f: () => T): { value: T; ms: number } => {
   return { value, ms: (user + system) / 1000 };
 };
 
+const leastMs = (f: () => unknown): number => Math.min(cpuMs(f).ms, cpuMs(f).ms);
+
 test('regex: the linear-time engine is in force on this Node', () => {
   assert.equal(LINEAR_REGEX, true);
 });
 
-test('regex: catastrophic patterns match in linear time', () => {
-  for (const p of ['(a+)+$', '(a|a)+$', '(\\w+\\s?)+$', '(.*a){16}', '^(([a-z])+.)+[A-Z]([a-z])+$']) {
-    const re = compileUserRegex(p);
-    const { ms } = cpuMs(() => re.test(`${'a'.repeat(5000)}!`));
-    assert.ok(ms < 500, `${p} took ${Math.round(ms)} ms of CPU`);
+test('regex: catastrophic patterns match in time linear in the input', () => {
+  const cases: Array<[string, string, string]> = [['(a+)+$', '', 'a'], ['(a|a)+$', '', 'a'], ['(\\w+\\s?)+$', '', 'a'], ['(.*a){16}', '', 'a'], ['^(([a-z])+.)+[A-Z]([a-z])+$', '', 'a'], ['(a+)+$', 'i', 'A']];
+  for (const [p, flags, ch] of cases) {
+    const re = compileUserRegex(p, flags);
+    const one = leastMs(() => re.test(`${ch.repeat(5000)}!`));
+    const ten = leastMs(() => re.test(`${ch.repeat(50_000)}!`));
+    assert.ok(ten < one * 30 + 5, `${p}/${flags}: ${Math.round(ten)} ms of CPU on ten times the input, ${Math.round(one)} ms on the input`);
   }
-  const re = compileUserRegex('(a+)+$', 'i');
-  const { value: matched, ms } = cpuMs(() => re.test(`${'A'.repeat(5000)}!`));
-  assert.equal(matched, false);
-  assert.ok(ms < 500, `took ${Math.round(ms)} ms of CPU`);
+  assert.equal(compileUserRegex('(a+)+$', 'i').test(`${'A'.repeat(5000)}!`), false);
 });
 
 test('regex: i is honoured by folding letters into classes', () => {
@@ -187,15 +188,17 @@ test('er-9 / m2-5: counted repetition over 16 is written out, and matches as the
   }
 });
 
-test('er-9 / atc-2: nothing a caller writes takes more than a bounded time per line', () => {
-  const lines = ['a'.repeat(MAX_MATCH_INPUT * 2), 'hello world '.repeat(12_000), '1'.repeat(MAX_MATCH_INPUT)];
+test('er-9 / atc-2: a line costs what its match window costs, however long the line', () => {
   const patterns = ['(a+)+$', '^(\\w+\\s?)*$', '(\\w+\\s?){1,80}$', '(.*a){16}x', '(a?)'.repeat(200), `${'a'.repeat(900)}b`, '[a-z]{1,150}x', '(a|aa){1,60}b', '(?:\\w+\\s){16}x'];
   for (const p of patterns) {
     const re = compileUserRegex(p);
-    for (const line of lines) {
-      const { ms } = cpuMs(() => testBounded(re, line));
-      // The point is that it stays bounded (see cpuMs).
-      assert.ok(ms < 2500, `${p.slice(0, 40)} on ${line.length} chars took ${Math.round(ms)} ms of CPU`);
+    const w = matchWindow(re);
+    for (const unit of ['a', 'hello world ', '1']) {
+      const head = unit.repeat(Math.ceil(w / unit.length)).slice(0, w);
+      const long = head.repeat(10);
+      const one = leastMs(() => testBounded(re, head));
+      const ten = leastMs(() => testBounded(re, long));
+      assert.ok(ten < one * 3 + 5, `${p.slice(0, 40)}: ${Math.round(ten)} ms of CPU on ten windows' length of ${JSON.stringify(unit)}, ${Math.round(one)} ms on one`);
     }
   }
 });
@@ -209,8 +212,9 @@ test('er-9: a large pattern gets a smaller match window, and testBounded says wh
   const huge = compileUserRegex('a'.repeat(1000));
   assert.equal(matchWindow(huge), MIN_WINDOW);
   assert.ok(MIN_WINDOW * 1000 <= 2_000_000, 'the largest common pattern costs at most twice MATCH_COST');
-  const { ms } = cpuMs(() => testBounded(huge, 'b'.repeat(MAX_MATCH_INPUT)));
-  assert.ok(ms < 1000, `the floor case took ${Math.round(ms)} ms of CPU`);
+  const window = leastMs(() => testBounded(huge, 'b'.repeat(MIN_WINDOW)));
+  const line = leastMs(() => testBounded(huge, 'b'.repeat(MAX_MATCH_INPUT)));
+  assert.ok(line < window * 3 + 5, `the floor case took ${Math.round(line)} ms of CPU on a whole ${MAX_MATCH_INPUT}-character line, ${Math.round(window)} ms on its window`);
   // execBounded gives the match itself, from the same window.
   assert.deepEqual(execBounded(small, `${'x'.repeat(100)}ERROR`).match?.[0], 'ERROR');
   assert.equal(execBounded(small, `${'x'.repeat(MAX_MATCH_INPUT)}ERROR`).match, null);

@@ -25,7 +25,10 @@
  * matched against a 64 KiB line takes seconds. So each compiled pattern gets a
  * match window, `matchWindow(re)`: MAX_MATCH_INPUT characters for an ordinary
  * pattern, fewer for a large one, sized so that one match costs about the same
- * (MATCH_COST units of engine work, tens of milliseconds) whatever the pattern.
+ * (MATCH_COST units of engine work) whatever the pattern. That is tens of milliseconds on
+ * Node 24, and up to about a second on Node 22, whose linear engine runs such a pattern about
+ * ten times slower: one large pattern's match on one line can hold the daemon, and every
+ * session with it, that long.
  * The window never falls under MIN_WINDOW, so the largest patterns accepted
  * (a size of a few thousand) cost up to a few times MATCH_COST; nothing costs
  * more. `execBounded` and `testBounded` match the head of a line within that
@@ -56,7 +59,11 @@ export const MAX_MATCH_INPUT = 64 * 1024;
  */
 export const MIN_WINDOW = 1024;
 
-/** Engine work allowed per match: pattern size (atoms × copies) × input characters; about 20–170 ns each. */
+/**
+ * Engine work allowed per match: pattern size (atoms × copies) × input characters. Measured with
+ * `(\w+\s?){1,80}$`, whose window holds it to this, on macos-26-arm64: 26 to 47 ns each on
+ * Node 24.22.2, and 132 to 976 ns on Node 22.12.0 and 22.23.4.
+ */
 const MATCH_COST = 1_000_000;
 
 /** Flags a caller may pass. `g`, `y` and `d` are accepted and dropped (matching is stateless). */
