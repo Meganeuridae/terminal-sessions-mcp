@@ -27,6 +27,24 @@ const CHILDREN_FILES = LINUX && fs.existsSync(`/proc/self/task/${process.pid}/ch
 const MAX_DESCENDANTS = 1024;
 /** How long a spawned `ps` or `stty` may take: a hung one stalls the daemon's loop this long. */
 const SPAWN_TIMEOUT_MS = 500;
+/**
+ * How long a spawned `ps` may take while `close` lists. In 120 forced closes beside two runs of the live tests on GitHub's macos-26
+ * runner, the check of which groups still hold a process took 124 ms at the median and 377 ms at most; this is about five times that.
+ */
+export const CLOSE_SPAWN_TIMEOUT_MS = 2000;
+
+/** How long a listing's spawned `ps` may take, and what to call with the reason when the listing can't be made. */
+export interface Listing {
+  timeoutMs?: number;
+  failed?: (why: string) => void;
+}
+
+const spawnFailure = (e: unknown, timeoutMs: number): string => {
+  const x = e as { code?: string; status?: number | null; message?: string };
+  if (x.code === 'ETIMEDOUT') return `ps took longer than ${timeoutMs} ms`;
+  if (typeof x.status === 'number') return `ps exited with status ${x.status}`;
+  return (x.message ?? String(e)).split('\n')[0]!;
+};
 
 export interface Groups {
   pgrp: number;
@@ -92,11 +110,13 @@ type Proc = { pid: number; pgrp: number };
  * `setsid`. Undefined when they can't be listed. Read it while the shell lives: once a session's leader
  * exits, the kernel takes the terminal from every process in the session.
  */
-export function onTerminal(shell: number, pts: string): Proc[] | undefined {
+export function onTerminal(shell: number, pts: string, o: Listing = {}): Proc[] | undefined {
+  const timeoutMs = o.timeoutMs ?? SPAWN_TIMEOUT_MS;
+  const fail = (why: string): undefined => void o.failed?.(`the processes on the terminal: ${why}`);
   try {
     if (LINUX) {
       const tty = statOf(shell)?.[4];
-      if (tty === undefined || tty === '0') return undefined;
+      if (tty === undefined || tty === '0') return fail("the shell's terminal couldn't be read");
       const out: Proc[] = [];
       for (const d of fs.readdirSync('/proc')) {
         if (!/^\d+$/.test(d)) continue;
@@ -105,20 +125,21 @@ export function onTerminal(shell: number, pts: string): Proc[] | undefined {
       }
       return out;
     }
-    const text = execFileSync('ps', ['-t', pts.slice(pts.lastIndexOf('/') + 1), '-o', 'pid=,pgid='], { encoding: 'utf8', timeout: SPAWN_TIMEOUT_MS });
+    const text = execFileSync('ps', ['-t', pts.slice(pts.lastIndexOf('/') + 1), '-o', 'pid=,pgid='], { encoding: 'utf8', timeout: timeoutMs });
     const out: Proc[] = [];
     for (const line of text.trim().split('\n')) {
       const [p, g] = line.trim().split(/\s+/).map(Number);
       if (p! > 0 && g! > 0) out.push({ pid: p!, pgrp: g! });
     }
-    return out.some((d) => d.pid === shell) ? out : undefined;
-  } catch {
-    return undefined;
+    return out.some((d) => d.pid === shell) ? out : fail("the shell itself wasn't among them");
+  } catch (e) {
+    return fail(spawnFailure(e, timeoutMs));
   }
 }
 
 /** Each of `listed` still in the group it was listed in, with its state; undefined when that can't be read. */
-function states(listed: Proc[]): Array<{ pgrp: number; state: string }> | undefined {
+function states(listed: Proc[], o: Listing = {}): Array<{ pgrp: number; state: string }> | undefined {
+  const timeoutMs = o.timeoutMs ?? SPAWN_TIMEOUT_MS;
   const out: Array<{ pgrp: number; state: string }> = [];
   if (!listed.length) return out;
   try {
@@ -131,11 +152,14 @@ function states(listed: Proc[]): Array<{ pgrp: number; state: string }> | undefi
     }
     let text: string;
     try {
-      text = execFileSync('ps', ['-o', 'pid=,pgid=,stat=', '-p', listed.map((d) => d.pid).join(',')], { encoding: 'utf8', timeout: SPAWN_TIMEOUT_MS });
+      text = execFileSync('ps', ['-o', 'pid=,pgid=,stat=', '-p', listed.map((d) => d.pid).join(',')], { encoding: 'utf8', timeout: timeoutMs });
     } catch (e) {
       // ps exits 1 when a pid it was given is gone, and still lists the others.
       const x = e as { status?: number; stdout?: string };
-      if (x.status !== 1 || typeof x.stdout !== 'string') return undefined;
+      if (x.status !== 1 || typeof x.stdout !== 'string') {
+        o.failed?.(`which listed groups still hold a process: ${spawnFailure(e, timeoutMs)}`);
+        return undefined;
+      }
       text = x.stdout;
     }
     const group = new Map(listed.map((d) => [d.pid, d.pgrp]));
@@ -144,7 +168,8 @@ function states(listed: Proc[]): Array<{ pgrp: number; state: string }> | undefi
       if (state && group.get(Number(p)) === Number(g)) out.push({ pgrp: Number(g), state });
     }
     return out;
-  } catch {
+  } catch (e) {
+    o.failed?.(`which listed groups still hold a process: ${spawnFailure(e, timeoutMs)}`);
     return undefined;
   }
 }
@@ -154,8 +179,8 @@ function states(listed: Proc[]): Array<{ pgrp: number; state: string }> | undefi
  * undefined when that can't be read. An exited process its parent hasn't reaped counts as gone: macOS
  * refuses a signal to a group of only those with EPERM.
  */
-export function held(listed: Proc[]): Set<number> | undefined {
-  const s = states(listed);
+export function held(listed: Proc[], o: Listing = {}): Set<number> | undefined {
+  const s = states(listed, o);
   return s && new Set(s.filter((x) => !x.state.startsWith('Z')).map((x) => x.pgrp));
 }
 
@@ -169,7 +194,9 @@ export function stopped(listed: Proc[]): boolean | undefined {
  * undefined when they can't be listed, or, unless `all`, past 1024 of them. A descendant or thread
  * gone while they're listed is left out; any other failure to read one leaves the list unknown.
  */
-export function descendants(pid: number, all = false): Proc[] | undefined {
+export function descendants(pid: number, all = false, o: Listing = {}): Proc[] | undefined {
+  const timeoutMs = o.timeoutMs ?? SPAWN_TIMEOUT_MS;
+  const fail = (why: string): undefined => void o.failed?.(`the shell's descendants: ${why}`);
   const exited = (e: unknown): boolean => ['ENOENT', 'ESRCH'].includes((e as NodeJS.ErrnoException).code ?? '');
   try {
     if (CHILDREN_FILES) {
@@ -182,7 +209,7 @@ export function descendants(pid: number, all = false): Proc[] | undefined {
           tasks = fs.readdirSync(`/proc/${p}/task`);
         } catch (e) {
           if (p !== pid && exited(e)) continue;
-          return undefined;
+          return fail(`/proc/${p}/task couldn't be read: ${(e as NodeJS.ErrnoException).code}`);
         }
         for (const t of tasks) {
           let kids: number[];
@@ -190,13 +217,13 @@ export function descendants(pid: number, all = false): Proc[] | undefined {
             kids = fs.readFileSync(`/proc/${p}/task/${t}/children`, 'utf8').split(' ').filter((x) => x.trim()).map(Number);
           } catch (e) {
             if ((p !== pid || t !== String(pid)) && exited(e)) continue;
-            return undefined;
+            return fail(`/proc/${p}/task/${t}/children couldn't be read: ${(e as NodeJS.ErrnoException).code}`);
           }
           for (const k of kids) {
             const g = pgrpOf(k);
             if (g) out.push({ pid: k, pgrp: g });
             todo.push(k);
-            if (!all && out.length > MAX_DESCENDANTS) return undefined;
+            if (!all && out.length > MAX_DESCENDANTS) return fail(`more than ${MAX_DESCENDANTS}`);
           }
         }
       }
@@ -217,19 +244,19 @@ export function descendants(pid: number, all = false): Proc[] | undefined {
           add(Number(d), Number(f[1]), Number(f[2]));
         } catch {}
       }
-    } else for (const [p, pp, g] of execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: SPAWN_TIMEOUT_MS }).trim().split('\n').map((l) => l.trim().split(/\s+/).map(Number))) add(p!, pp!, g!);
-    if (!listed) return undefined;
+    } else for (const [p, pp, g] of execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: timeoutMs }).trim().split('\n').map((l) => l.trim().split(/\s+/).map(Number))) add(p!, pp!, g!);
+    if (!listed) return fail("the shell itself wasn't listed");
     const out: Proc[] = [];
     const todo = [pid];
     while (todo.length)
       for (const k of kids.get(todo.pop()!) ?? []) {
         out.push(k);
         todo.push(k.pid);
-        if (!all && out.length > MAX_DESCENDANTS) return undefined;
+        if (!all && out.length > MAX_DESCENDANTS) return fail(`more than ${MAX_DESCENDANTS}`);
       }
     return out;
-  } catch {
-    return undefined;
+  } catch (e) {
+    return fail(spawnFailure(e, timeoutMs));
   }
 }
 

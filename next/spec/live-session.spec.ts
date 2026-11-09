@@ -996,14 +996,15 @@ for (const sh of shells) {
     });
 
     test('close with force ends a descendant that left the terminal with setsid', async () => {
-      const s = await open(shell);
+      const logs: string[] = [];
+      const s = await open(shell, { log: (l) => logs.push(l) });
       const file = path.join(tmp, `pid-${++gates}`);
       await ran(s, `sh -c 'python3 -c "import os, sys, time; os.setsid(); open(sys.argv[1], \\"w\\").write(str(os.getpid())); time.sleep(300)" "$0"; :' '${file}' & ${holdJob(file).replace('[ -e', '[ ! -s')}`);
       const pid = Number(fs.readFileSync(file, 'utf8'));
       assert.ok(pid > 0);
       try {
         const exit = await s.close({ force: true });
-        assert.equal(exit.unlisted, undefined);
+        assert.equal(exit.unlisted, undefined, logs.join('\n'));
         await eventually('the setsid descendant is gone', () => gone(pid));
       } finally {
         try {
@@ -1013,20 +1014,22 @@ for (const sh of shells) {
     });
 
     test('close hangs up a disowned job, which the shell no longer counts as its own', async () => {
-      const s = await open(shell);
+      const logs: string[] = [];
+      const s = await open(shell, { log: (l) => logs.push(l) });
       const c = await ran(s, sh.name === 'fish' ? 'sleep 300 & echo "JOB:$last_pid"; disown' : 'sleep 300 & echo "JOB:$!"; disown');
       const job = pidOf(s, c, 'JOB');
       try {
         const exit = await s.close();
-        assert.equal(exit.unlisted, undefined);
+        assert.equal(exit.unlisted, undefined, logs.join('\n'));
         await eventually('the disowned job is gone', () => gone(job));
       } finally {
         killPid(job);
       }
     });
 
-    test('when close can\'t check which listed groups still hold their processes, it signals none, and says what was started may live on', { skip: process.platform !== 'darwin' ? 'the check fails only where it spawns ps' : false }, async () => {
-      const s = await open(shell);
+    test('when close can\'t check which listed groups still hold their processes, it signals none, says what was started may live on, and logs why', { skip: process.platform !== 'darwin' ? 'the check fails only where it spawns ps' : false }, async () => {
+      const logs: string[] = [];
+      const s = await open(shell, { log: (l) => logs.push(l) });
       const c = await ran(s, sh.name === 'fish' ? 'sleep 300 & echo "JOB:$last_pid"; disown' : 'sleep 300 & echo "JOB:$!"; disown');
       const job = pidOf(s, c, 'JOB');
       const keep = process.env.PATH;
@@ -1037,6 +1040,7 @@ for (const sh of shells) {
         const exit = await closing;
         process.env.PATH = keep;
         assert.equal(exit.unlisted, true, JSON.stringify(exit));
+        assert.match(logs.join('\n'), /close couldn't list which listed groups still hold a process: /);
         assert.equal(gone(job), false, 'the disowned job was left alone');
       } finally {
         process.env.PATH = keep;
@@ -1682,6 +1686,27 @@ test('a probe line typed into a program a shell without integration started, whi
   await readingRaw(s);
   const r = await s.integrate({ waitMs: 10_000 });
   assert.deepEqual(r.kind === 'incomplete' && [r.step, r.by], ['probe', 'exited'], JSON.stringify(r));
+});
+
+test('close with force waits out a slow ps while it lists, within its own bound', { skip: process.platform !== 'darwin' ? 'only macOS spawns ps to list' : false }, async () => {
+  const logs: string[] = [];
+  const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
+  const job = pidOf(s, await ran(s, 'sleep 300 & echo "JOB:$!"'), 'JOB');
+  const slow = path.join(tmp, `slow-ps-${++gates}`);
+  fs.mkdirSync(slow);
+  fs.writeFileSync(path.join(slow, 'ps'), '#!/bin/sh\nsleep 1\nexec /bin/ps "$@"\n', { mode: 0o755 });
+  const keep = process.env.PATH;
+  try {
+    // Each listing's ps now takes a second: longer than the bound for other spawns, within close's own.
+    process.env.PATH = `${slow}:${keep}`;
+    const exit = await s.close({ force: true });
+    process.env.PATH = keep;
+    assert.equal(exit.unlisted, undefined, logs.join('\n'));
+    await eventually('the job is gone', () => gone(job));
+  } finally {
+    process.env.PATH = keep;
+    killPid(job);
+  }
 });
 
 test('integrate names a shell it has no hooks for, and types nothing more', { skip: which('dash') && which('bash') ? false : 'dash and bash are both needed' }, async () => {

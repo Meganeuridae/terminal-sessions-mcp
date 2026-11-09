@@ -1069,8 +1069,9 @@ class LiveSession implements Session {
         } catch {}
       };
       // Listed before the first signal: once the shell exits, nothing in its session has a terminal.
-      const onTerminal = proc.onTerminal(this.pid, this.pts)?.filter((d) => d.pid !== this.pid);
-      const ds = opts.force ? proc.descendants(this.pid, true) : [];
+      const listing: proc.Listing = { timeoutMs: proc.CLOSE_SPAWN_TIMEOUT_MS, failed: (why) => this.log?.(`session ${JSON.stringify(this.name)}: close couldn't list ${why}`) };
+      const onTerminal = proc.onTerminal(this.pid, this.pts, listing)?.filter((d) => d.pid !== this.pid);
+      const ds = opts.force ? proc.descendants(this.pid, true, listing) : [];
       unlisted = onTerminal === undefined || ds === undefined;
       const listed = [...(onTerminal ?? []), ...(ds ?? [])];
       /**
@@ -1079,7 +1080,7 @@ class LiveSession implements Session {
        * result says what was started may live on.
        */
       const reach = (signal: 'SIGHUP' | 'SIGKILL'): void => {
-        const held = proc.held(listed);
+        const held = proc.held(listed, listing);
         if (!held) {
           if (listed.length) unlisted = true;
           return;
@@ -1089,7 +1090,7 @@ class LiveSession implements Session {
           // On Linux, a stopped process holds the hangup until it's continued. So CONT follows a hangup that was delivered, as bash
           // sends it.
           if (signal === 'SIGHUP' && !error) proc.signalGroup(pgid, 'SIGCONT');
-          if (error && error !== 'ESRCH' && proc.held(listed.filter((d) => d.pgrp === pgid))?.has(pgid) !== false) unreached.push({ pgid, signal, error });
+          if (error && error !== 'ESRCH' && proc.held(listed.filter((d) => d.pgrp === pgid), listing)?.has(pgid) !== false) unreached.push({ pgid, signal, error });
         }
       };
       if (opts.force) {
