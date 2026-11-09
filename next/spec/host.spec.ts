@@ -2126,6 +2126,11 @@ test('integrate whose wait ran out names the step it reached, and says what a la
   assert.match(hooks.text, /\nThe hooks were typed in part or whole, and no prompt with them was drawn within the wait\. Nothing more is typed\. If their last part was typed, a prompt drawn later still gives that shell the integration, and the status line then names what it runs within\.$/);
   s.integrate = async () => ({ kind: 'incomplete', step: 'hooks', by: 'exited', front: s.frontNow });
   assert.match((await host.call(agent(), 'integrate', { name: 'main' })).text, /\nWhat the hooks were typed into ended before it drew a prompt with them, and the shell below is back at its prompt\. Nothing more was typed\.$/);
+
+  s.integrate = async () => ({ kind: 'incomplete', step: 'hooks', by: 'exited', ended: 'ssh h', front: s.frontNow });
+  const carrier = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.match(carrier.text, /\nThe program the shell is reached through, ssh h, ended before the hooks were all typed and a prompt with them was drawn\. Nothing more was typed\.$/);
+  assert.equal(carrier.structured.ended, 'ssh h');
 });
 
 test('a run refused with ssh, or a shell that isn\'t the session\'s own, in front names integrate; one with another program in front doesn\'t', async () => {

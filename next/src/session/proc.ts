@@ -171,7 +171,8 @@ function pgrpOf(pid: number): number | undefined {
   return g > 0 ? g : undefined;
 }
 
-type Proc = { pid: number; pgrp: number };
+/** A process, its group, and, from a listing of descendants, its parent. */
+type Proc = { pid: number; pgrp: number; ppid?: number };
 
 /**
  * Every process whose controlling terminal is `pts`, which the session leader `shell` holds, with its group:
@@ -305,7 +306,7 @@ function descendantsHere(pid: number, all: boolean, fail: (why: string) => undef
       }
       for (const k of kids) {
         const g = pgrpOf(k);
-        if (g) out.push({ pid: k, pgrp: g });
+        if (g) out.push({ pid: k, pgrp: g, ppid: p });
         todo.push(k);
         if (!all && out.length > MAX_DESCENDANTS) return fail(`more than ${MAX_DESCENDANTS}`);
       }
@@ -320,7 +321,7 @@ function descendantsFrom(pid: number, all: boolean, rows: number[][], fail: (why
   let listed = false;
   for (const [p, pp, g] of rows) {
     if (p === pid) listed = true;
-    if (p! > 0 && g! > 0) (kids.get(pp!) ?? kids.set(pp!, []).get(pp!)!).push({ pid: p!, pgrp: g! });
+    if (p! > 0 && g! > 0) (kids.get(pp!) ?? kids.set(pp!, []).get(pp!)!).push({ pid: p!, pgrp: g!, ppid: pp! });
   }
   if (!listed) return fail("the shell itself wasn't listed");
   const out: Proc[] = [];
@@ -377,6 +378,16 @@ export function family(pid: number): { all: Proc[]; from: (w: number) => Proc[] 
     return all && { all, from: (w) => descendantsFrom(w, true, rows, fail) };
   } catch {
     return undefined;
+  }
+}
+
+/** Whether process `pid` is there. Only ESRCH says it isn't: EPERM, for another user's process, says it is. */
+export function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 }
 

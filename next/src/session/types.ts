@@ -284,9 +284,10 @@ export type IntegrateOutcome =
    * shell without a line editor. The line editors of bash, zsh and fish hold it out of that mode at their prompts. A program that holds
    * this terminal raw, such as a connected ssh, hides its far side: a question there can't be seen, and the probe line would answer
    * it. `unread`: this terminal's modes couldn't be read, so whether what is in front reads whole lines itself isn't known.
+   * `unlisted`: what holds this terminal, or its processes, couldn't be read, so the program the shell would be reached through isn't known.
    * `integrating`: another `integrate` call on this session is still typing.
    */
-  | { kind: 'refused'; sent?: true; canonical?: true; unread?: true; integrating?: true; front: Front }
+  | { kind: 'refused'; sent?: true; canonical?: true; unread?: true; unlisted?: true; integrating?: true; front: Front }
   /** A shell answered the probe that has no hooks here (sh, dash, ash, and others). Nothing more was typed. `shell` is its `$0`, when it gave one. */
   | { kind: 'unsupported'; shell?: string; front: Front }
   /**
@@ -294,9 +295,10 @@ export type IntegrateOutcome =
    * shell answered. `hooks`: the hooks go in pieces, each typed once the one before has run, and they weren't all typed, or the
    * last was and no prompt with them was drawn yet. Only the last puts them to use: if it was typed and a prompt is drawn later,
    * the shell has the integration from then on. `exited`: the session's shell exited, or what the probe or the hooks were typed into
-   * ended, and a shell below it came back to its prompt.
+   * ended, and a shell below it came back to its prompt; or, with `ended`, a process of the program the shell is reached through
+   * ended, by that process's command line, while the line that ran it may go on.
    */
-  | { kind: 'incomplete'; step: 'probe' | 'hooks'; by: 'timeout' | 'cancelled' | 'exited' | 'closed'; front: Front };
+  | { kind: 'incomplete'; step: 'probe' | 'hooks'; by: 'timeout' | 'cancelled' | 'exited' | 'closed'; ended?: string; front: Front };
 
 /**
  * Events, each emitted once. `taken` is true when a call's outcome already gave it (`run`, `send` or

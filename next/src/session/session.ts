@@ -108,6 +108,12 @@ const MAC_LOOK_EVERY_MS = 250;
 /** How long the shell's own read must have been seen before it counts as a builtin read: a bound on the kernel's delivery of output the shell wrote before it began reading, not a proof. */
 const SHELL_READ_FLOOR_MS = 50;
 
+/** A process of a far shell's carrier group with no child in that group, such as the ssh of `sh -c 'ssh h; cat'`, and its command line. */
+interface Leaf {
+  pid: number;
+  argv: string;
+}
+
 /** Where one shell's chain of marks stands: what it has drawn, what was typed or sent at its prompt, and the command it runs. */
 interface Chain {
   expected: Nonce;
@@ -124,7 +130,7 @@ interface Chain {
   refused: number;
   cwd: string;
   /** A shell given the integration with `integrate`: its kind, the local program it runs under, and what its drain sent since the last end mark, as hex. */
-  far?: { kind: integration.FarKind; within: Process; drained: string[] };
+  far?: { kind: integration.FarKind; within: Process; drained: string[]; leaves: Leaf[] };
 }
 
 /** The job a `stop` with a signal sent it to, and the command running then; once that command ends, whether its group holds a stopped process. */
@@ -371,8 +377,17 @@ class LiveSession implements Session {
     const list = (): ReturnType<typeof proc.family> => (family === null ? (family = proc.family(this.pid)) : family);
     let w: number | undefined;
     for (let i = 1; i < this.chains.length; i++) {
-      const by = this.chains[i]!.far?.within;
-      if (!by || by.pgid === this.pid || by.pgid === w) continue;
+      const far = this.chains[i]!.far;
+      const by = far?.within;
+      if (!far || !by) continue;
+      // A group can go on with another program, as `sh -c 'ssh h; exec cat'` does, so each chain's own processes are checked, even
+      // where its group is the session shell's or an earlier chain's verdict stands for it.
+      const left = far.leaves.find((l) => !proc.alive(l.pid));
+      if (left) {
+        this.drop(i - 1, { by: left.argv, how: 'ended' });
+        return undefined;
+      }
+      if (by.pgid === this.pid || by.pgid === w) continue;
       w = by.pgid;
       const h = this.holds(w, shell, list);
       if (h === undefined) return 'unread';
@@ -1101,14 +1116,31 @@ class LiveSession implements Session {
       // A far chain's front names the program it was reached through. What holds the terminal now may be one that chain's shell
       // started here, as ssh from a local shell, and that is what this shell is reached through.
       const g = proc.info(this.pid)?.tpgid;
-      if (g === undefined) return { kind: 'refused', unread: true, front: f };
+      if (g === undefined) return { kind: 'refused', unlisted: true, front: f };
       within = { pgid: g, argv: proc.argv(g) ?? '?', shell: false };
     } else within = f.process;
+    // The carrier is known by its processes too: those of its group with no child in it. Their end ends it, though the group goes on.
+    // At the session shell's own prompt, that's the shell itself.
+    const all = proc.family(this.pid)?.all;
+    const members = all && [{ pid: this.pid, pgrp: this.pid }, ...all].filter((d) => d.pgrp === within.pgid);
+    if (!members?.length) return { kind: 'refused', unlisted: true, front: f };
+    const leaves: Leaf[] = members.filter((m) => !members.some((c) => c.ppid === m.pid)).map((m) => ({ pid: m.pid, argv: proc.argv(m.pid) ?? within.argv }));
     const below = this.top;
     const plainBelow = this.plain && within.pgid !== this.pid;
-    const ended = (): boolean => !this.chains.includes(below) || below.atPrompt || (plainBelow && this.lookDue() && this.front().state === 'prompt');
+    // A program the shell is reached through can end while the line that ran it goes on with another in the same group, so its
+    // captured processes guard the handshake too.
+    let gone: Leaf | undefined;
+    const leafGone = (): boolean => (gone ??= leaves.find((l) => !proc.alive(l.pid))) !== undefined;
+    const ended = (): boolean => !this.chains.includes(below) || below.atPrompt || (plainBelow && this.lookDue() && this.front().state === 'prompt') || leafGone();
     let stopped: 'exited' | 'closed' | 'cancelled' | undefined;
     const stop = (): typeof stopped => (stopped ??= by() ?? (ended() ? 'exited' : undefined));
+    const incomplete = (step: 'probe' | 'hooks', why: NonNullable<typeof stopped> | 'timeout'): IntegrateOutcome => ({
+      kind: 'incomplete',
+      step,
+      by: why,
+      ...(why === 'exited' && gone && { ended: gone.argv }),
+      front: this.front(),
+    });
     const call = String(randomInt(100000, 1000000));
     const answered = async (): Promise<ProbeAnswer | undefined> => {
       delete this.probe!.answer;
@@ -1116,33 +1148,40 @@ class LiveSession implements Session {
     };
     try {
       this.probe = { call };
+      // Each write is checked first: what it would go to may have ended since the last look.
+      if (stop()) return incomplete('probe', stop()!);
       this.lastWrite = mono();
       this.p.write(integration.PROBE_LINE);
       const answer = await answered();
-      if (!answer) return { kind: 'incomplete', step: 'probe', by: stop() ?? 'timeout', front: this.front() };
+      if (!answer) return incomplete('probe', stop() ?? 'timeout');
       const kind = answer.fish ? 'fish' : answer.zsh ? 'zsh' : answer.bash ? 'bash' : undefined;
       if (!kind) {
+        if (stop()) return incomplete('probe', stop()!);
         this.p.write(integration.PROBE_ZERO_LINE);
-        const name = (await answered())?.zero?.replace(/^-/, '');
+        const zero = await answered();
+        if (!zero && stop()) return incomplete('probe', stop()!);
+        const name = zero?.zero?.replace(/^-/, '');
         return { kind: 'unsupported', ...(name && { shell: path.basename(name) }), front: this.front() };
       }
       const nonce = { counter: 1, random: randomDigits() };
       this.remember(nonce);
       const lines = integration.farHooks(kind, nonce, call);
       for (const [i, line] of lines.slice(0, -1).entries()) {
+        if (stop()) return incomplete('hooks', stop()!);
         this.lastWrite = mono();
         this.p.write(line);
-        if (!(await this.until(deadline, () => (stop() ? false : (this.probe?.acked ?? -1) >= i ? true : undefined), opts.signal)))
-          return { kind: 'incomplete', step: 'hooks', by: stop() ?? 'timeout', front: this.front() };
+        if (!(await this.until(deadline, () => (stop() ? false : (this.probe?.acked ?? -1) >= i ? true : undefined), opts.signal))) return incomplete('hooks', stop() ?? 'timeout');
       }
+      if (stop()) return incomplete('hooks', stop()!);
       const chain = newChain(nonce, '');
-      chain.far = { kind, within, drained: [] };
+      chain.far = { kind, within, drained: [], leaves };
       this.chains.push(chain);
       this.probe!.chain = chain;
       this.lastWrite = mono();
       this.p.write(lines.at(-1)!);
-      const drawn = await this.until(deadline, () => (!this.chains.includes(chain) || by() ? false : this.top === chain && this.prompted ? true : undefined), opts.signal);
-      if (!drawn) return { kind: 'incomplete', step: 'hooks', by: by() ?? (this.chains.includes(chain) ? 'timeout' : 'exited'), front: this.front() };
+      // Once the chain is on top, a prompt it draws is what's awaited, so only the call's own stops and the captured processes count.
+      const drawn = await this.until(deadline, () => (!this.chains.includes(chain) || by() || leafGone() ? false : this.top === chain && this.prompted ? true : undefined), opts.signal);
+      if (!drawn) return incomplete('hooks', by() ?? (leafGone() || !this.chains.includes(chain) ? 'exited' : 'timeout'));
       const p = this.probe!;
       const from = p.acked === lines.length - 1 ? p.ackedAt : undefined;
       const to = p.endAt ?? (chain.promptAt && { line: chain.promptAt.line, col: 0 });
