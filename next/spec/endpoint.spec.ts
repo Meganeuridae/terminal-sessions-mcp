@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { versionNote } from '../src/endpoint/hello.js';
 import { endpointPaths, ensurePrivateDir, listenAt, probe, type Listening } from '../src/endpoint/socket.js';
 
 const tmp = (): string => fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-ep-'));
@@ -211,4 +212,9 @@ test('something at the socket path that is not a socket is left as it is, and th
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("the version note's restart command quotes a socket path the shell would split", () => {
+  const note = versionNote('2.0.1', { version: '2.0.0', pid: 1, startedAt: '2026-11-09T00:00:00.000Z' }, '/tmp/my sockets/daemon.sock');
+  assert.match(note ?? '', /`tsm --socket '\/tmp\/my sockets\/daemon\.sock' daemon stop`/);
 });
