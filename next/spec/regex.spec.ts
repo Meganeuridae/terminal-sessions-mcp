@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { compileUserRegex, execBounded, foldCase, LINEAR_REGEX, MAX_MATCH_INPUT, MIN_WINDOW, matchWindow, testBounded } from '../src/core/regex.js';
 
@@ -13,6 +14,22 @@ const leastMs = (f: () => unknown): number => Math.min(cpuMs(f).ms, cpuMs(f).ms)
 
 test('regex: the linear-time engine is in force on this Node', () => {
   assert.equal(LINEAR_REGEX, true);
+});
+
+test('where the linear engine can\'t be enabled, every caller pattern is refused, saying why', () => {
+  const regex = new URL('../src/core/regex.js', import.meta.url).href;
+  const script = `import v8 from 'node:v8';
+v8.setFlagsFromString = () => {};
+const { LINEAR_REGEX, compileUserRegex } = await import(${JSON.stringify(regex)});
+let refused;
+try { compileUserRegex('a'); } catch (e) { refused = { code: e.code, message: e.message }; }
+console.log(JSON.stringify({ LINEAR_REGEX, refused }));`;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+  assert.equal(child.status, 0, child.stderr);
+  const out = JSON.parse(child.stdout) as { LINEAR_REGEX: boolean; refused?: { code: string; message: string } };
+  assert.equal(out.LINEAR_REGEX, false);
+  assert.equal(out.refused?.code, 'invalid_argument');
+  assert.match(out.refused?.message ?? '', /linear-time regex engine can't be enabled/);
 });
 
 test('regex: catastrophic patterns match in time linear in the input', () => {
