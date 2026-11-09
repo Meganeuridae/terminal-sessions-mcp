@@ -107,11 +107,11 @@ const exitSeen = (s: Session): unknown => {
 };
 
 async function eventually<T>(what: string, get: () => T | undefined | false, ms = 10_000): Promise<T> {
-  const until = Date.now() + ms;
+  const until = performance.now() + ms;
   for (;;) {
     const v = get();
     if (v !== undefined && v !== false) return v;
-    if (Date.now() > until) assert.fail(`${what} did not happen within ${ms} ms`);
+    if (performance.now() > until) assert.fail(`${what} did not happen within ${ms} ms`);
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
@@ -142,10 +142,15 @@ const flagHook = (shell: string, arm: string, flag: string): string =>
     : shell === 'zsh'
       ? `__flag() { if [[ -e '${arm}' ]]; then rm '${arm}'; : > '${flag}'; fi }\nprecmd_functions+=(__flag)\n`
       : `PROMPT_COMMAND='if [ -e "${arm}" ]; then rm "${arm}"; : > "${flag}"; fi'\n`;
+/** Which of the 1,400 `echo LEAKED_i` lines a test typed ahead are missing from `flushed`. */
+const missingLeaked = (flushed: string | undefined): number[] => {
+  const seen = new Set([...(flushed ?? '').matchAll(/LEAKED_(\d+)/g)].map((m) => Number(m[1])));
+  return Array.from({ length: 1400 }, (_, i) => i).filter((i) => !seen.has(i));
+};
 /** Holds the event loop until `file` exists, so whatever was written before it is read in one go. */
 function holdUntil(file: string, ms = 10_000): void {
-  const until = Date.now() + ms;
-  while (!fs.existsSync(file)) if (Date.now() > until) assert.fail(`${file} did not appear within ${ms} ms`);
+  const until = performance.now() + ms;
+  while (!fs.existsSync(file)) if (performance.now() > until) assert.fail(`${file} did not appear within ${ms} ms`);
 }
 /** Each event with the event loop's turn it came in. */
 function eventsByTurn(s: Session): { events: Array<{ e: SessionEvent; turn: number }>; stop: () => void } {
@@ -171,21 +176,21 @@ async function heldAfter(s: Session, gate: string, text: string, via: 'run' | 's
 }
 
 async function inFront(s: Session, pattern: RegExp, ms = 8000): Promise<void> {
-  const until = Date.now() + ms;
+  const until = performance.now() + ms;
   for (;;) {
     const f = s.front();
     if ((f.state === 'running' || f.state === 'waiting') && pattern.test(f.process.argv)) return;
-    if (Date.now() > until) assert.fail(`nothing matching ${pattern} came in front: ${JSON.stringify(f)}`);
+    if (performance.now() > until) assert.fail(`nothing matching ${pattern} came in front: ${JSON.stringify(f)}`);
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
 
 async function pendingIs(s: Session, text: string, ms = 5000): Promise<void> {
-  const until = Date.now() + ms;
+  const until = performance.now() + ms;
   for (;;) {
     const f = s.front();
     if (f.state === 'prompt' && f.pending === text) return;
-    if (Date.now() > until) assert.fail(`the prompt never showed ${JSON.stringify(text)} pending: ${JSON.stringify(f)}`);
+    if (performance.now() > until) assert.fail(`the prompt never showed ${JSON.stringify(text)} pending: ${JSON.stringify(f)}`);
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
@@ -850,7 +855,7 @@ for (const sh of shells) {
       await s.send(typed, { waitMs: 300, quietMs: 100 });
       fs.rmSync(gate);
       assert.equal((await s.wait({ kind: 'end' }, { waitMs: 20_000, from: 0 })).by, 'end');
-      assert.ok(r.kind === 'running' && r.command.end?.flushed?.includes('LEAKED_1399'), JSON.stringify(r.kind === 'running' && r.command.end?.flushed?.length));
+      assert.deepEqual(missingLeaked(r.kind === 'running' ? r.command.end?.flushed : undefined), [], 'every line typed ahead came back');
       assert.deepEqual(out(s, await ran(s, 'echo AFTER')), ['AFTER']);
       assert.ok(!s.lines(0).lines.some((l) => /^LEAKED_\d+$/.test(l)));
     });
@@ -1345,7 +1350,7 @@ for (const sh of shells) {
       });
       try {
         const pgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim());
-        if (pgid !== pid) return t.skip('this sudo runs its command in its own group');
+        if (pgid !== pid) return t.skip("this sudo doesn't run its command in a group of its own");
         const exit = await s.close({ force: true, deadline: by() });
         assert.ok(exit.unreached?.some((u) => u.pgid === pgid && u.signal === 'SIGKILL' && u.error === 'EPERM'), JSON.stringify(exit));
       } finally {
@@ -1435,7 +1440,7 @@ for (const sh of shells) {
       assert.deepEqual(out(s, await ran(s, 'echo home')), ['home']);
     });
 
-    test('nothing from the session after the probe line reaches a history file the far shell saves as it goes', async (t) => {
+    test('of what the session types, only the probe line, and in zsh the line that turns saving off, reach a history file the far shell saves as it goes', async (t) => {
       const s = await open(shell);
       const home = lastHome();
       const file = sh.name === 'fish' ? path.join(home, 'far-data', 'fish', 'fish_history') : path.join(home, 'far-history');
@@ -1519,7 +1524,7 @@ for (const sh of shells) {
       fs.rmSync(gate);
       assert.equal((await s.wait({ kind: 'end' }, { waitMs: 20_000, from: 0 })).by, 'end');
       const c = s.command(r.kind === 'running' ? r.command.id : -1);
-      assert.ok(c?.end?.flushed?.includes('LEAKED_1399'), JSON.stringify({ end: { ...c?.end, flushed: c?.end?.flushed?.length }, front: s.front(), tail: s.lines(Math.max(0, s.lines(0).to - 12)).lines.map((l) => l.slice(0, 100)) }));
+      assert.deepEqual(missingLeaked(c?.end?.flushed), [], JSON.stringify({ end: { ...c?.end, flushed: c?.end?.flushed?.length }, front: s.front() }));
       assert.deepEqual(out(s, await ran(s, 'echo AFTER')), ['AFTER']);
       assert.ok(!s.lines(0).lines.some((l) => /^LEAKED_\d+$/.test(l)));
     });
@@ -1643,7 +1648,9 @@ for (const sh of shells) {
       const from = s.lines(0).to - 1;
       const w = await s.wait({ kind: 'match', pattern: /^far> ?$/ }, { waitMs: 10_000, from });
       assert.equal(w.by, 'match', 'the probe line ran');
-      await s.wait({ kind: 'match', pattern: /eval/ }, { waitMs: 500, from });
+      // The call has returned, so nothing more is typed for it. A line typed now comes after anything the session typed before.
+      const marker = await s.send('echo AFTER-PROBE\r', { waitMs: 5000, until: /^AFTER-PROBE$/ });
+      assert.equal(marker.by, 'match');
       assert.ok(!s.lines(from).lines.some((l) => l.includes('eval')), 'no hooks were typed');
       assert.equal(s.front().state, 'running');
       assert.equal((await s.integrate({ waitMs: 10_000 })).kind, 'integrated');
@@ -1783,12 +1790,14 @@ test('close that runs out of time while ps lists logs how long ps had', darwinOn
   const logs: string[] = [];
   const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
   const job = pidOf(s, await ran(s, 'sleep 300 & echo "JOB:$!"'), 'JOB');
-  const fake = fakePs('*"-t "*) exec sleep 300;;');
+  const reached = path.join(tmp, `reached-${++gates}`);
+  const fake = fakePs(`*"-t "*) : > '${reached}'; exec sleep 300;;`);
   const keep = process.env.PATH;
   try {
     process.env.PATH = `${fake}:${keep}`;
     const exit = await s.close({ force: true, deadline: by(3000) });
     process.env.PATH = keep;
+    assert.ok(fs.existsSync(reached), 'the ps that never answers was reached');
     assert.equal(exit.unlisted, true, JSON.stringify(exit));
     assert.match(logs.join('\n'), /close couldn't list the processes on the terminal: ps took longer than \d+ ms/);
   } finally {
@@ -1810,6 +1819,7 @@ test('close returns at its deadline though the ps it waits on outlives the signa
     const ended = await Promise.race([closing.then(() => 'closed'), new Promise<string>((resolve) => setTimeout(() => resolve('still waiting'), 20_000))]);
     process.env.PATH = keep;
     assert.equal(ended, 'closed');
+    assert.ok(fs.existsSync(held), 'the ps that outlives TERM was reached and started its child');
     const exit = await closing;
     assert.equal(exit.unlisted, true, JSON.stringify(exit));
     assert.match(logs.join('\n'), /close couldn't list the processes on the terminal: ps took longer than \d+ ms/);

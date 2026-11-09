@@ -197,7 +197,7 @@ export type RunOutcome =
   | { kind: 'running'; command: Command; front: Front; took: Took };
 
 export interface SendOutcome {
-  /** false when nothing was sent: the shell had exited (`by: 'exited'`), a prompt whose end mark came wasn't drawn within the wait (`by: 'timeout'`), the call's signal aborted it (`by: 'cancelled'`), or `close` began while it waited (`by: 'closed'`). */
+  /** false when nothing was sent: the shell had exited (`by: 'exited'`), a prompt whose end mark came wasn't drawn within the wait (`by: 'timeout'`), the call's signal aborted it (`by: 'cancelled'`), `close` began while it waited (`by: 'closed'`), or `paste` was asked for while the program in front hadn't turned bracketed paste on (`by: 'paste_off'`). */
   sent: boolean;
   /** From the line the cursor was on when the text went in. */
   lines: Lines;

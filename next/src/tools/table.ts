@@ -63,7 +63,7 @@ export const TOOLS: readonly ToolDef[] = [
       '`notify_on` reports a pattern in its output once: in the result if the command has ended, otherwise as it appears, on a host that takes wakes. ' +
       'For a script, `structuredContent` has `exitCode` (null with `running` true while it runs, null with `running` false when no status is known, null with `stopped` true when a `stop` signal stopped the job, and null with `unfollowed` true when the session stopped following the shell it ran in) and `output`, the command\'s own lines without the typed command or any note, ' +
       'cut past the result\'s budget to its start and end, with `outputLeftOut` giving `at` and `characters` in UTF-16 code units. ' +
-      `In a shell given the integration with \`integrate\`, the command line is typed as one line of at most ${FAR_MAX_TYPED.toLocaleString('en-US')} characters, with each \`'\`, \`\\\`, \`!\`, control or non-ASCII byte counting five; a longer one is refused, and says how long it was.`,
+      `In a shell given the integration with \`integrate\`, the command line goes inside a wrapper of under 200 characters that keeps its statuses, and the whole is typed as one line of at most ${FAR_MAX_TYPED.toLocaleString('en-US')} characters, with each \`'\`, \`\\\`, \`!\`, control or non-ASCII byte of the command counting five; a longer one is refused, and says how long it was.`,
     inputSchema: {
       type: 'object',
       properties: {
