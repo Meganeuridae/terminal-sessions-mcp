@@ -104,7 +104,7 @@ test('ux-22: an unknown key is invalid_argument (never internal), naming close m
   refused('Hyper');
 });
 
-test('a key name far longer than any key costs no more than reading it a few times, not a comparison with each key', () => {
+test('a key name far longer than any key costs no more than reading it a few hundred times, not a comparison with each key', () => {
   const ms = (f: () => void): number => {
     const start = process.cpuUsage();
     f();
@@ -112,9 +112,12 @@ test('a key name far longer than any key costs no more than reading it a few tim
     return (user + system) / 1000;
   };
   const least = (f: () => void): number => Math.min(...[0, 1, 2].map(() => ms(f)));
+  const READS = 60;
   for (const name of ['x'.repeat(2_000_000), `${'x'.repeat(2_000_000)}-a`]) {
-    const read = least(() => name.toLowerCase().replace(/[\s_-]/g, ''));
+    const reads = least(() => {
+      for (let i = 0; i < READS; i++) name.toLowerCase().replace(/[\s_-]/g, '');
+    });
     const refused = least(() => assert.throws(() => inputBytes(undefined, [name], { appCursor: false })));
-    assert.ok(refused < read * 60 + 5, `${name.length} characters: refused in ${Math.round(refused)} ms, read once in ${Math.round(read)} ms`);
+    assert.ok(refused < (reads / READS) * 292, `${name.length} characters: refused in ${refused.toFixed(2)} ms, ${READS} reads in ${reads.toFixed(2)} ms`);
   }
 });
