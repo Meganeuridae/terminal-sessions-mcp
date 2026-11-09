@@ -100,6 +100,7 @@ test('ux-22: an unknown key is invalid_argument (never internal), naming close m
   refused('C-Enter', /no encoding for C-Enter; send 'Enter' alone/);
   refused('Ctrl-Shift-C', /use 'C-c'/);
   refused('S-x', /type 'X' as text/);
+  refused('M-S-x', /use 'M-X'/);
   refused('ls -la', /Literal characters go in `text`/);
   refused('Hyper');
 });

@@ -146,6 +146,11 @@ export class Transcript {
     });
   }
 
+  /** What leaving the alternate screen would have pushed, for a shell that exits with it still up, so its last screen isn't lost. */
+  keepScreen(): void {
+    if (!this.normal) for (const r of trimEnd(this.screen().rows)) this.push(r);
+  }
+
   /** Whether everything written so far is parsed. */
   get caughtUp(): boolean {
     return this.pending === 0;

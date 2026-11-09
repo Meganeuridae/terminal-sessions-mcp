@@ -492,6 +492,7 @@ export class Host {
     if (name !== undefined && !(name in os.constants.signals)) return refused(`${JSON.stringify(a.signal)} isn't a signal this system has. Nothing was sent.`, { error: 'invalid_argument' });
     const r = await e.session.stop(name as NodeJS.Signals | undefined, signal ? { abort: signal } : {});
     if (r.cancelled || signal?.aborted) return CANCELLED;
+    if (e.closing) return closedMeanwhile(e, r.steps.length ? `Sent before it closed: ${r.steps.map((s) => s.sent).join(', ')}.` : 'Nothing was sent.');
     const now = this.now();
     const steps = r.steps.map((s) =>
       s.refused

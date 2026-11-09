@@ -1,6 +1,7 @@
 import { after, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -1827,6 +1828,230 @@ test('close returns at its deadline though the ps it waits on outlives the signa
     process.env.PATH = keep;
     if (fs.existsSync(held)) killPid(Number(fs.readFileSync(held, 'utf8')));
     killPid(job);
+  }
+});
+
+test("a /proc read that fails for a reason other than the process being gone fails close's listing, rather than leaving that process out", { skip: process.platform !== 'linux' ? 'only Linux lists from /proc' : false }, async () => {
+  const logs: string[] = [];
+  const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
+  const job = pidOf(s, await ran(s, 'sleep 300 & echo "JOB:$!"; disown'), 'JOB');
+  const hidden = `/proc/${job}/stat`;
+  const real = fs.readFileSync;
+  const patched = ((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+    if (p === hidden) throw Object.assign(new Error(`EACCES: permission denied, open '${hidden}'`), { code: 'EACCES' });
+    return (real as (...a: unknown[]) => unknown)(p, ...rest);
+  }) as typeof fs.readFileSync;
+  const fsModule = (await import('node:fs')).default;
+  fsModule.readFileSync = patched;
+  syncBuiltinESMExports();
+  try {
+    const exit = await s.close({ deadline: by() });
+    fsModule.readFileSync = real;
+    syncBuiltinESMExports();
+    assert.equal(exit.unlisted, true, JSON.stringify(exit));
+    assert.match(logs.join('\n'), new RegExp(`/proc/${job}/stat couldn't be read: EACCES`));
+  } finally {
+    fsModule.readFileSync = real;
+    syncBuiltinESMExports();
+    killPid(job);
+  }
+});
+
+test('a write to the terminal that throws leaves no call open behind it', async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const pty = (s as unknown as { p: { write: (d: string) => void } }).p;
+  const write = pty.write;
+  pty.write = () => {
+    throw new Error('EIO');
+  };
+  try {
+    await assert.rejects(s.run('echo x', { waitMs: 1000 }), /EIO/);
+    await assert.rejects(s.send('x', { waitMs: 1000 }), /EIO/);
+  } finally {
+    pty.write = write;
+  }
+  assert.equal((s as unknown as { calls: Set<unknown> }).calls.size, 0);
+  await s.close({ force: true, deadline: by() });
+});
+
+test('a line break inside a paste at a prompt is held for editing, so the shell is still at its prompt', async (t) => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const r = await s.send('echo one\necho two', { waitMs: 3000, paste: true });
+  if (!r.sent && r.by === 'paste_off') {
+    await s.close({ force: true, deadline: by() });
+    return t.skip("this bash's line editor doesn't turn bracketed paste on");
+  }
+  assert.equal(r.sent, true, JSON.stringify(r));
+  const f = s.front();
+  assert.equal(f.state, 'prompt', JSON.stringify(f));
+  assert.equal((await s.run('echo x', { waitMs: 1000 })).kind, 'refused', 'the pasted text is pending at the prompt');
+  await s.close({ force: true, deadline: by() });
+});
+
+test("a shell that exits with the alternate screen up keeps that screen in its last command's output", async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  // The command line holds "ALT SHOWN"; only the screen it draws holds "ALT-SHOWN".
+  const r = await s.run(`printf '\\033[?1049h\\033[H%s-%s\\n' ALT SHOWN; exit 3`, { waitMs: 10_000 });
+  await eventually('the shell exited', () => s.front().state === 'exited');
+  const c = s.command(r.kind === 'refused' ? -1 : r.command.id);
+  assert.ok(c?.end, JSON.stringify(r));
+  assert.ok(s.lines(c.from, c.to).lines.some((l) => l.includes('ALT-SHOWN')), JSON.stringify(s.lines(0).lines));
+  await s.close({ force: true, deadline: by() });
+});
+
+test('a ps that exits 1 with a message is a failed check, not a listing of nothing, so close signals none and says so', darwinOnly, async () => {
+  const logs: string[] = [];
+  const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
+  const job = pidOf(s, await ran(s, 'sleep 300 & echo "JOB:$!"; disown'), 'JOB');
+  const fake = fakePs(`*stat=*) echo 'ps: cannot read the process table' >&2; exit 1;;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const exit = await s.close({ deadline: by() });
+    process.env.PATH = keep;
+    assert.equal(exit.unlisted, true, JSON.stringify(exit));
+    assert.match(logs.join('\n'), /ps exited with status 1: ps: cannot read the process table/);
+    assert.equal(gone(job), false, 'the disowned job was left alone');
+  } finally {
+    process.env.PATH = keep;
+    killPid(job);
+  }
+});
+
+test('a synchronous ps that ignores TERM is killed at its timeout, so front returns without waiting for it', darwinOnly, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const finished = path.join(tmp, `finished-${++gates}`);
+  // Twenty seconds of a loop that ignores TERM, then a mark that it ran to its end. KILL ends it before the mark.
+  const fake = fakePs(`*tpgid=*) trap '' TERM; i=0; while [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done; : > '${finished}'; exit 1;;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const f = s.front();
+    process.env.PATH = keep;
+    assert.equal(f.state, 'prompt');
+    assert.equal(fs.existsSync(finished), false, 'front returned before the ps that ignores TERM ran to its end');
+  } finally {
+    process.env.PATH = keep;
+    await s.close({ force: true, deadline: by() });
+  }
+});
+
+test('stop sends nothing more once a close has begun', darwinOnly, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const r = await s.run(`sh -c "trap '' INT; sleep 300"`, { waitMs: 300 });
+  assert.equal(r.kind, 'running', JSON.stringify(r));
+  await eventually('the job in front', () => {
+    const now = s.front();
+    return now.state === 'running' && !now.process.shell && now;
+  });
+  const gate = path.join(tmp, `gate-${++gates}`);
+  const fake = fakePs(`*"-t "*) while [ ! -e '${gate}' ]; do sleep 0.05; done;;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    // stop types C-c before its first wait, which the job ignores; close then holds at its listing, with the shell still up.
+    const stopping = s.stop();
+    const closing = s.close({ deadline: by() });
+    const stopped = await stopping;
+    assert.deepEqual(stopped.steps.map((x) => x.sent), ['C-c']);
+    fs.writeFileSync(gate, '');
+    await closing;
+  } finally {
+    process.env.PATH = keep;
+    fs.writeFileSync(gate, '');
+  }
+});
+
+test('a second close waits for the first, which hangs up what it listed once the shell is gone', darwinOnly, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const job = pidOf(s, await ran(s, 'sleep 300 & echo "JOB:$!"; disown'), 'JOB');
+  const gate = path.join(tmp, `gate-${++gates}`);
+  const held = path.join(tmp, `held-${++gates}`);
+  const fake = fakePs(`*stat=*) : > '${held}'; while [ ! -e '${gate}' ]; do sleep 0.05; done;;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const first = s.close({ deadline: by() });
+    await eventually('the check before the hangup is held, after the shell has gone', () => fs.existsSync(held));
+    let released = false;
+    const second = s.close({ deadline: by() }).then(() => released);
+    // Long enough for a close that doesn't wait to have returned; the green doesn't rest on it, since the gate holds the first.
+    await Promise.race([second, new Promise((resolve) => setTimeout(resolve, 1000))]);
+    released = true;
+    fs.writeFileSync(gate, '');
+    assert.equal(await second, true, 'the second close returned only once the first was let go');
+    await first;
+    process.env.PATH = keep;
+    await eventually('the disowned job is gone', () => gone(job));
+  } finally {
+    process.env.PATH = keep;
+    fs.writeFileSync(gate, '');
+    killPid(job);
+  }
+});
+
+/** A job of its own group that ignores the hangup, as nohup's do, with its pid. */
+const hupProof = async (s: Session): Promise<number> => pidOf(s, await ran(s, `sh -c 'trap "" HUP; while :; do sleep 1; done' & echo "JOB:$!"`), 'JOB');
+
+test('a close with force that joins a gentle close held at its listing makes it forced, so a job that ignores the hangup is KILLed', darwinOnly, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const job = await hupProof(s);
+  const gate = path.join(tmp, `gate-${++gates}`);
+  const held = path.join(tmp, `held-${++gates}`);
+  const fake = fakePs(`*"-t "*) : > '${held}'; while [ ! -e '${gate}' ]; do sleep 0.05; done;;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const first = s.close({ deadline: by() });
+    await eventually('the gentle close is held at its listing', () => fs.existsSync(held));
+    const second = s.close({ force: true, deadline: by() });
+    fs.writeFileSync(gate, '');
+    const [a] = await Promise.all([first, second]);
+    process.env.PATH = keep;
+    assert.equal(a.signal, 'SIGKILL', JSON.stringify(a));
+    await eventually('the job that ignores the hangup is gone', () => gone(job));
+  } finally {
+    process.env.PATH = keep;
+    fs.writeFileSync(gate, '');
+    killPid(job);
+  }
+});
+
+test('a close with force that joins a gentle close after its hangup went out still KILLs what it listed', darwinOnly, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const job = await hupProof(s);
+  // The shell ignores the hangup too, so the gentle close goes on resending it through its grace.
+  await ran(s, "trap '' HUP");
+  try {
+    const first = s.close({ deadline: by() });
+    await eventually('the hangup went out', () => (s as unknown as { sentShell?: string }).sentShell === 'SIGHUP');
+    const second = s.close({ force: true, deadline: by() });
+    await Promise.all([first, second]);
+    await eventually('the job that ignores the hangup is gone', () => gone(job));
+  } finally {
+    killPid(job);
+  }
+});
+
+test("a close that joins one under way and whose own deadline comes first says it's under way, and names no signal before one was sent", darwinOnly, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const gate = path.join(tmp, `gate-${++gates}`);
+  const held = path.join(tmp, `held-${++gates}`);
+  const fake = fakePs(`*"-t "*) : > '${held}'; while [ ! -e '${gate}' ]; do sleep 0.05; done;;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const first = s.close({ deadline: by() });
+    await eventually('the first close is held at its listing', () => fs.existsSync(held));
+    const second = await s.close({ deadline: by(300) });
+    assert.deepEqual([second.underway, second.signal, second.unconfirmed], [true, undefined, undefined], JSON.stringify(second));
+    fs.writeFileSync(gate, '');
+    const a = await first;
+    process.env.PATH = keep;
+    assert.equal(a.underway, undefined, JSON.stringify(a));
+  } finally {
+    process.env.PATH = keep;
+    fs.writeFileSync(gate, '');
   }
 });
 

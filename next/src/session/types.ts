@@ -53,6 +53,11 @@ export type Closed = Exit & {
   unlisted?: true;
   /** The shell's exit wasn't seen within a grace after its KILL, or by the deadline, as for a process in uninterruptible sleep. */
   unconfirmed?: true;
+  /**
+   * This close joined one already under way, and its own deadline came first. `signal` is the strongest signal that close had sent
+   * the shell by then, and absent when it had sent none.
+   */
+  underway?: true;
   /** The groups whose hangup, or KILL with `force`, wasn't delivered, each with the error's code, such as `EPERM`; their processes may live on. */
   unreached?: Array<{ pgid: number; signal: 'SIGHUP' | 'SIGKILL'; error: string }>;
 };
