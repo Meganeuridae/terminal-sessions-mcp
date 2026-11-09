@@ -12,12 +12,13 @@ import { helloLine } from '../src/endpoint/hello.js';
 import type { OpenOptions } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
 
-test('H9: the CLI maps its words to the eight tools\' arguments', () => {
+test('H9: the CLI maps its words to the nine tools\' arguments', () => {
   assert.deepEqual(parseCli(['--scope', 'agent-a', 'run', 'main', 'make', '-j8', 'test', '--wait', '30']), { scope: 'agent-a', call: { tool: 'run', args: { name: 'main', command: 'make -j8 test', wait: 30 } } });
   assert.deepEqual(parseCli(['send', 'main', '--text', 'y', '--keys', 'Enter']), { scope: 'default', call: { tool: 'send', args: { name: 'main', text: 'y', keys: ['Enter'] } } });
   assert.deepEqual(parseCli(['read', 'main', '--lines', '10:20']), { scope: 'default', call: { tool: 'read', args: { name: 'main', lines: [10, 20] } } });
   assert.deepEqual(parseCli(['close', 'main', '--force']), { scope: 'default', call: { tool: 'close', args: { name: 'main', force: true } } });
   assert.deepEqual(parseCli(['list']), { scope: 'default', call: { tool: 'list', args: {} } });
+  assert.deepEqual(parseCli(['integrate', 'main', '--wait', '20']), { scope: 'default', call: { tool: 'integrate', args: { name: 'main', wait: 20 } } });
   assert.deepEqual(parseCli(['daemon', 'stop']), { scope: 'default', call: { daemonStop: true } });
   assert.deepEqual(parseCli(['run', 'main', '--wait', '5', '--', 'grep', '--color', 'x']), { scope: 'default', call: { tool: 'run', args: { name: 'main', wait: 5, command: 'grep --color x' } } });
   assert.deepEqual(parseCli(['run', 'main']), { error: 'run needs a command' });

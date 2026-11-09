@@ -101,7 +101,7 @@ try {
   await check('the host reaches the daemon through the relay, with a grant and the tools', async () => {
     await ready('the first connection and grant');
     const tools = framework.getAllTools().map((t) => t.name).filter((n) => n.startsWith('terminal'));
-    for (const t of ['open', 'run', 'send', 'look', 'read', 'stop', 'list', 'close']) assert.ok(tools.some((n) => n.endsWith(t)), `${t} in ${tools.join(', ')}`);
+    for (const t of ['open', 'run', 'send', 'look', 'read', 'stop', 'integrate', 'list', 'close']) assert.ok(tools.some((n) => n.endsWith(t)), `${t} in ${tools.join(', ')}`);
   });
 
   const released = path.join(tmp, 'released');

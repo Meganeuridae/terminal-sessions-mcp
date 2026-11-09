@@ -1,4 +1,5 @@
 import type { Schema } from '../api/validate.js';
+import { FAR_MAX_TYPED } from '../session/integration.js';
 import { RESULT_MAX_CHARS, SCREEN_ROOM_CHARS } from './render.js';
 
 export interface ToolDef {
@@ -61,7 +62,8 @@ export const TOOLS: readonly ToolDef[] = [
       'Returns its exit status, duration, directory afterwards and output, or that it is still running when the wait ends: it keeps running, and on a host that takes wakes its end is reported to you when it comes. ' +
       '`notify_on` reports a pattern in its output once: in the result if the command has ended, otherwise as it appears, on a host that takes wakes. ' +
       'For a script, `structuredContent` has `exitCode` (null with `running` true while it runs, null with `running` false when no status is known) and `output`, the command\'s own lines without the typed command or any note, ' +
-      'cut past the result\'s budget to its start and end, with `outputLeftOut` giving `at` and `characters` in UTF-16 code units.',
+      'cut past the result\'s budget to its start and end, with `outputLeftOut` giving `at` and `characters` in UTF-16 code units. ' +
+      `In a shell given the integration with \`integrate\`, the command line is typed as one line of at most ${FAR_MAX_TYPED.toLocaleString('en-US')} characters, with each \`'\`, \`\\\`, \`!\`, control or non-ASCII byte counting five; a longer one is refused, and says how long it was.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -134,13 +136,29 @@ export const TOOLS: readonly ToolDef[] = [
     name: 'stop',
     description:
       'Stop what runs in front of a session\'s shell, in steps, each reported: Ctrl-C typed to the terminal, so it reaches whatever is in front, a shell\'s own loop included; then TERM, then KILL to the job in front, never to the shell. ' +
-      'If the shell itself is what runs and Ctrl-C doesn\'t bring back its prompt, the steps end there, and `close` is what remains. With `signal`, just that one, and never to the shell.',
+      'If the shell itself is what runs and Ctrl-C doesn\'t bring back its prompt, the steps end there, and `close` is what remains. With `signal`, just that one, and never to the shell. ' +
+      'With a shell given the integration in front, only Ctrl-C is typed, and a `signal` isn\'t sent: it would reach the local program, such as `ssh`.',
     inputSchema: {
       type: 'object',
       properties: {
         name,
         signal: { type: 'string', enum: ['INT', 'TERM', 'KILL', 'HUP', 'QUIT'], description: 'Send only this signal to the job in front.' },
       },
+      required: ['name'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'integrate',
+    description:
+      'Give the shell now in front the session\'s integration, so `run` works in it with statuses: a shell reached through a typed `ssh`, `su` or `docker exec`. ' +
+      'Call it at that shell\'s prompt, never at a password or host-key question: it types a probe line, then the hooks, and they answer whatever is in front. Refused at the prompt of a shell that already has the integration: the session\'s own, or one given it before. ' +
+      'Refused while the terminal reads whole lines, as at a password or yes/no question; a question asked further on, through a shell already given the integration, can\'t be seen. bash, zsh and fish only; another shell is refused, and the refusal names it. If the wait runs out, nothing more is typed, and the result names the step it reached; once the hooks are all typed, a prompt drawn later still completes it. ' +
+      'The integration lasts until that shell exits. Then `run` goes back to the shell it was typed from. ' +
+      'In a shell that writes its history as it goes, the probe line reaches its history file, and in zsh so does the line that turns saving off. Nothing typed after them does.',
+    inputSchema: {
+      type: 'object',
+      properties: { name, wait },
       required: ['name'],
       additionalProperties: false,
     },

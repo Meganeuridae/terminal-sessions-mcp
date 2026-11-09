@@ -140,13 +140,13 @@ test('H4: a client of another version is told so in initialize\'s instructions',
   }
 });
 
-test('H6: a plain MCP client lists the eight tools and calls them in its scope', async () => {
+test('H6: a plain MCP client lists the nine tools and calls them in its scope', async () => {
   const h = await harness();
   try {
     const c = await h.connect(relayHello('mine'));
     await c.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
     const list = await c.request('tools/list');
-    assert.deepEqual((list.result as { tools: Array<{ name: string }> }).tools.map((t) => t.name), ['open', 'run', 'send', 'look', 'read', 'stop', 'list', 'close']);
+    assert.deepEqual((list.result as { tools: Array<{ name: string }> }).tools.map((t) => t.name), ['open', 'run', 'send', 'look', 'read', 'stop', 'integrate', 'list', 'close']);
     const r = await c.request('tools/call', { name: 'open', arguments: { name: 'main', cwd: '/srv' } });
     assert.match(String(((r.result as { content: Array<{ text: string }> }).content[0]!).text), /^\[main · at the prompt · \/srv\]/);
     const listed = await h.host.call({ scope: 'mine', takes: false, pushes: false }, 'list', {});

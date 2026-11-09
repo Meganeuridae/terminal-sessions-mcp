@@ -13,6 +13,7 @@ export const USAGE = `usage: tsm [--scope NAME] [--socket PATH] [--json] COMMAND
   look NAME [--until end|input] [--match REGEX] [--wait S]
   read NAME [--command N] [--lines FROM:TO] [--match REGEX] [--context N]
   stop NAME [--signal INT|TERM|KILL|HUP|QUIT]
+  integrate NAME [--wait S]
   list
   close NAME [--force]
   daemon stop        stops the daemon, which ends every shell it holds
@@ -51,6 +52,7 @@ const FLAGS: Record<string, Record<string, (v: string) => [string, unknown]>> = 
     '--context': (v) => ['context', num('--context', v)],
   },
   stop: { '--signal': (v) => ['signal', v.replace(/^SIG/, '')] },
+  integrate: { '--wait': (v) => ['wait', num('--wait', v)] },
   list: {},
   close: {},
 };

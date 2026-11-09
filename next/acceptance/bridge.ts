@@ -84,7 +84,7 @@ try {
   await check('the bridge reaches the daemon through the relay, with the tools', async () => {
     await waitFor(() => h.status === 'ready', 30_000, 'the handle ready')
     const names = h.tools.map((t: any) => t.name)
-    for (const t of ['open', 'run', 'send', 'look', 'read', 'stop', 'list', 'close']) if (!names.some((n: string) => n.endsWith(t))) fail(`${t} in ${names.join(', ')}`)
+    for (const t of ['open', 'run', 'send', 'look', 'read', 'stop', 'integrate', 'list', 'close']) if (!names.some((n: string) => n.endsWith(t))) fail(`${t} in ${names.join(', ')}`)
   })
 
   const released = path.join(tmp, 'released')

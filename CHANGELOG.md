@@ -18,15 +18,16 @@ with 2.0: a narrower Node range (`engines`), `npm run build` and `npm test` buil
   bash, zsh and fish start with your startup files and get the session's integration; any other
   shell starts with no arguments and runs without it. A daemon restart ends them. A call naming one
   is then refused, and says why.
-- **Eight tools:** `open`, `run`, `send`, `look`, `read`, `stop`, `list` and `close`. The results of
-  `open`, `run`, `send`, `look`, `read` and `stop` open with the session's status line: the
+- **Nine tools:** `open`, `run`, `send`, `look`, `read`, `stop`, `integrate`, `list` and `close`. The results
+  of `open`, `run`, `send`, `look`, `read`, `stop` and `integrate` open with the session's status line: the
   command's exit status (or "status unknown", or the shell's exit for a command that ends the
   shell), its duration and directory, and what is in front of the shell now. `list` gives a line
   for each session, `close` says how the shell ended, and a refused call says why. `close` hangs up
   the shell and every process on its terminal; a process started with `setsid` or `nohup` outlives
   it, and `force` KILLs at once. `run`'s
   `structuredContent` gives the command's `exitCode` and its own `output` as values. `run` types only at the prompt; `send` types
-  exactly what it is given and returns its effect.
+  exactly what it is given and returns its effect. `integrate` gives a shell reached through a typed
+  `ssh`, `su` or `docker exec` the session's integration, so `run` works there with statuses.
 - **Wakes over MCPL** (feature set `terminal.events`): a command ended that no call was waiting on,
   a program waiting for input (on the kernel's evidence, on Linux), a shell exited, a pattern asked
   for appeared. Nothing else wakes.

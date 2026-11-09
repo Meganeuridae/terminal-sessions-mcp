@@ -13,15 +13,19 @@ export const exitText = (e: Exit): string => (e.signal ? `was killed by ${e.sign
 
 export function frontText(front: Front, now: number): string {
   switch (front.state) {
-    case 'prompt':
-      return front.pending ? `at the prompt, with ${quotedString(front.pending)} typed and not yet run` : 'at the prompt';
+    case 'prompt': {
+      const where = front.within ? `at the prompt of the shell within ${quoted(front.within.argv)}` : 'at the prompt';
+      return front.pending ? `${where}, with ${quotedString(front.pending)} typed and not yet run` : where;
+    }
     case 'running': {
+      const seen = front.waitVisible ? '' : " (whether it waits for input can't be seen here)";
+      if (front.within) return `the shell within ${quoted(front.within.argv)} is running a command for ${duration(now - front.since)}${seen}`;
       const what = front.process.shell
         ? front.starting
           ? 'the shell is still running its startup files'
           : 'the shell itself is busy'
         : `running ${quoted(front.process.argv)}${front.starting ? " from the shell's startup files" : ''}`;
-      return `${what} for ${duration(now - front.since)}${front.waitVisible ? '' : " (whether it waits for input can't be seen here)"}`;
+      return `${what} for ${duration(now - front.since)}${seen}`;
     }
     case 'waiting':
       return `waiting for input${front.starting ? " in the shell's startup files" : ''}: ${quoted(front.process.argv)}${front.echo === false ? ', not echoed, as for a password' : front.echo === undefined ? ', echo unknown' : ''}, for ${duration(now - front.since)}`;
@@ -29,6 +33,9 @@ export function frontText(front: Front, now: number): string {
       return `the shell ${exitText(front.exit)}`;
   }
 }
+
+/** A shell given the integration has no directory until its first end mark. */
+export const dirText = (cwd: string): string => (cwd ? quoted(cwd) : 'directory not yet known');
 
 export function endingText(c: Command): string[] {
   const end = c.end;
@@ -60,7 +67,7 @@ export function statusLine(f: StatusFacts): string {
     else parts.push('still running');
   }
   parts.push(frontText(f.front, f.now));
-  parts.push(quoted(f.command?.end?.cwd ?? f.cwd));
+  parts.push(dirText(f.command?.end?.cwd ?? f.cwd));
   if (f.unseen) parts.push(`${f.unseen} report${f.unseen === 1 ? '' : 's'} not yet seen (list shows them)`);
   return `[${parts.join(' · ')}]`;
 }

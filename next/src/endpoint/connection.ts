@@ -24,7 +24,7 @@ const TAG_ONTOLOGY = {
 };
 
 export const FEATURE_SETS: Record<string, FeatureSetDeclaration> = {
-  'terminal.tools': { description: 'The eight tools: open, run, send, look, read, stop, list, close', uses: ['tools'] },
+  'terminal.tools': { description: 'The nine tools: open, run, send, look, read, stop, integrate, list, close', uses: ['tools'] },
   'terminal.events': {
     description: 'Wakes for what needs you: a command ended that no call waited on, a program waits for input, a shell exited, a pattern you asked for appeared',
     uses: ['pushEvents'],

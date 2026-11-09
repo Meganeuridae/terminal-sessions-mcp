@@ -1,5 +1,5 @@
 import { testBounded } from '../src/core/regex.js';
-import type { Command, Exit, Front, Lines, Match, OpenOptions, Screen, Session, SessionEvent, StopOutcome, Until, WaitOutcome, RunOutcome, SendOutcome } from '../src/session/types.js';
+import type { Command, Exit, Front, IntegrateOutcome, Lines, Match, OpenOptions, Screen, Session, SessionEvent, StopOutcome, Until, WaitOutcome, RunOutcome, SendOutcome } from '../src/session/types.js';
 
 export class FakeSession implements Session {
   readonly pid = 4242;
@@ -131,6 +131,11 @@ export class FakeSession implements Session {
   async stop(signal?: NodeJS.Signals, _opts?: { abort?: AbortSignal }): Promise<StopOutcome> {
     this.calls.push({ method: 'stop', args: [signal] });
     return { steps: [{ sent: signal ?? 'C-c', front: this.frontNow }], front: this.frontNow };
+  }
+
+  async integrate(opts: { waitMs: number; signal?: AbortSignal }): Promise<IntegrateOutcome> {
+    this.calls.push({ method: 'integrate', args: [opts.waitMs] });
+    return { kind: 'refused', front: this.frontNow };
   }
 
   async close(opts?: { force?: boolean }): Promise<Exit> {

@@ -5,7 +5,7 @@ import { TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, Match, OpenSession, Session, SessionEvent, Took } from '../session/types.js';
-import { boundedStrings, duration, endingText, exitText, fitted, fittedLength, frontText, linesText, outputValue, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
+import { boundedStrings, dirText, duration, endingText, exitText, fitted, fittedLength, frontText, linesText, outputValue, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, WAIT_MAX_S, type ToolDef } from './table.js';
 
 const mono = (): number => performance.now();
@@ -133,7 +133,7 @@ export class Host {
       const name = a.name as string;
       const entry = this.entries.get(keyOf(caller.scope, name));
       if (!entry) return this.noSession(caller, name);
-      if (entry.closing && (tool === 'run' || tool === 'send' || tool === 'stop')) {
+      if (entry.closing && (tool === 'run' || tool === 'send' || tool === 'stop' || tool === 'integrate')) {
         return refused(`Session ${JSON.stringify(name)} is closing, so nothing was ${tool === 'stop' ? 'sent' : 'typed'}. \`close\` with \`force\` ends it at once.`, { error: 'session_exited', session: name });
       }
       switch (tool) {
@@ -147,6 +147,8 @@ export class Host {
           return await this.read(entry, a, signal);
         case 'stop':
           return await this.stop(entry, a, signal);
+        case 'integrate':
+          return await this.integrate(caller, entry, a, signal);
         case 'close':
           return await this.close(caller, entry, a);
       }
@@ -266,7 +268,7 @@ export class Host {
     const now = this.now();
     const rows = mine.map((e) => {
       const front = e.session.front();
-      return { e, front, line: `${e.name}: ${frontText(front, now)} · ${quoted(e.session.cwd())}${e.unseen.size ? ` · ${reportsText(e.unseen.size)}` : ''}` };
+      return { e, front, line: `${e.name}: ${frontText(front, now)} · ${dirText(e.session.cwd())}${e.unseen.size ? ` · ${reportsText(e.unseen.size)}` : ''}` };
     });
     const pending = rows.flatMap((r) => [...r.e.unseen.values()].map((u) => ({ e: r.e, u }))).sort((a, b) => a.u.at - b.u.at);
     const build = (n: number): { joined: string; ends: number[] } => {
@@ -298,6 +300,13 @@ export class Host {
     if (r.kind === 'running' && notify && !e.closing) e.watches.set(e.session.watch(notify, r.command.from, r.command.id), { key: this.pushKey(e, r.command.id, 'match'), command: r.command.id });
     if (signal?.aborted) return this.cancelled(held);
     if (e.closing) return this.closed(e, held, r.kind === 'refused' ? 'Nothing was typed.' : typedText(r.command), r.kind === 'refused' ? [] : endOf(r.command));
+    if (r.kind === 'refused' && r.tooLong) {
+      const where = r.front.state === 'prompt' && r.front.within ? `in the shell within ${quoted(r.front.within.argv)}` : 'in a shell given the integration';
+      return refused(
+        `${this.status(e, r.front)}\nNothing was typed: ${where}, \`run\` types the text as one line, and this one would type as ${r.tooLong.typed} characters, over the ${r.tooLong.max} it takes. Split it into shorter runs, or copy a script over and run that.`,
+        { error: 'invalid_argument', tooLong: r.tooLong, front: r.front },
+      );
+    }
     if (r.kind === 'refused') return refused(`${this.status(e, r.front)}\nNothing was typed: ${refusalAdvice(r.front)}`, { error: 'not_at_prompt', front: r.front });
     const c = r.command;
     const out = e.session.lines(c.from, c.to);
@@ -463,12 +472,56 @@ export class Host {
           ? `${s.sent} wasn't sent${s.to ? ` to ${quoted(s.to.argv)}` : ''}: the shell's processes couldn't be listed, so its group couldn't be confirmed as still the shell's, and no further step was taken: now ${frontText(s.front, now)}.`
           : `Sent ${s.sent}${s.to ? ` to ${quoted(s.to.argv)}` : ''}: now ${frontText(s.front, now)}.`,
     );
-    if (!r.steps.length) steps.push(`Nothing was sent: ${frontText(r.front, now)}.`);
+    const farSignal = r.within === true && a.signal !== undefined;
+    if (farSignal) {
+      const local = r.front.state !== 'exited' && r.front.state !== 'waiting' && r.front.within ? quoted(r.front.within.argv) : 'the local program';
+      steps.push(`Nothing was sent: a signal would reach ${local}, not the job in the shell within it. \`stop\` without \`signal\` types Ctrl-C there.`);
+    } else if (!r.steps.length) steps.push(`Nothing was sent: ${frontText(r.front, now)}.`);
     if (r.next === 'close') steps.push('What runs is the shell itself, or a job that outlived KILL: only `close` ends it.');
-    const structured = { steps: r.steps, front: r.front, ...(r.next ? { next: r.next } : {}) };
-    const notSent = r.steps.some((s) => s.refused || s.withheld) || (a.signal !== undefined && r.next === 'close' && r.steps.length === 0);
+    const structured = { steps: r.steps, front: r.front, ...(r.next ? { next: r.next } : {}), ...(r.within ? { within: true } : {}) };
+    const notSent = farSignal || r.steps.some((s) => s.refused || s.withheld) || (a.signal !== undefined && r.next === 'close' && r.steps.length === 0);
     const text = [this.status(e, r.front), ...steps].join('\n');
     return notSent ? refused(text, { error: 'not_sent', ...structured }) : ok(text, structured);
+  }
+
+  private async integrate(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined): Promise<ToolResult> {
+    const r = await e.session.integrate({ waitMs: this.waitMs(a), ...(signal ? { signal } : {}) });
+    if (signal?.aborted) return CANCELLED;
+    if (e.closing || (r.kind === 'incomplete' && r.by === 'closed')) return closedMeanwhile(e);
+    const head = this.status(e, r.front);
+    switch (r.kind) {
+      case 'integrated': {
+        if (caller.takes) e.cursor = Math.max(e.cursor, e.session.lines(e.cursor).to - 1);
+        const printed = r.printed?.length ? `\nWhile taking the hooks, the shell printed:\n${r.printed.join('\n')}` : '';
+        return ok(
+          `${head}\nThe shell in front, ${r.shell} ${r.version}, now has the session's integration. \`run\` types there, with statuses, until that shell exits. Then \`run\` goes back to the shell it was typed from.${printed}`,
+          { integrated: { shell: r.shell, version: r.version, ...(r.printed?.length ? { printed: r.printed } : {}) }, front: r.front },
+        );
+      }
+      case 'refused':
+        if (r.sent) return refused(`${head}\nNothing was typed: a line sent at this prompt hasn't started yet, and what is in front may be a question, such as a password, that anything typed would answer. \`look\` until the shell it reaches shows its prompt, then call \`integrate\` again.`, { error: 'not_at_prompt', sent: true, front: r.front });
+        if (r.canonical) return refused(`${head}\nNothing was typed: what's in front reads a whole line itself, such as a password or a yes/no question, or a shell without a line editor. \`look\` until a shell prompt shows, then call \`integrate\` again.`, { error: 'not_at_prompt', canonical: true, front: r.front });
+        if (r.front.state === 'exited') return refused(`${head}\nNothing was typed: ${refusalAdvice(r.front)}`, { error: 'session_exited', front: r.front });
+        return refused(`${head}\nNothing was typed: the shell in front has the session's integration already, so \`run\` works there.`, { error: 'already_integrated', front: r.front });
+      case 'unsupported':
+        return refused(
+          `${head}\nThe shell in front${r.shell ? `, ${r.shell},` : ''} gets no integration: only bash, zsh and fish do. It answered the probe, and nothing more was typed. \`send\` types into it.`,
+          { error: 'unsupported_shell', ...(r.shell ? { shell: r.shell } : {}), front: r.front },
+        );
+      case 'incomplete': {
+        const what =
+          r.by === 'exited'
+            ? r.front.state === 'exited'
+              ? 'The session\'s shell exited before the integration was complete.'
+              : r.step === 'probe'
+                ? 'What the probe line was typed into ended before a shell answered it, and the shell below is back at its prompt. Nothing more was typed.'
+                : 'What the hooks were typed into ended before it drew a prompt with them, and the shell below is back at its prompt. Nothing more was typed.'
+            : r.step === 'probe'
+              ? 'The probe line was typed, and no shell answered it within the wait, so nothing more was typed. The shell in front has no integration.'
+              : 'The hooks were typed in part or whole, and no prompt with them was drawn within the wait. Nothing more is typed. If their last part was typed, a prompt drawn later still gives that shell the integration, and the status line then names what it runs within.';
+        return refused(`${head}\n${what}`, { error: 'incomplete', step: r.step, by: r.by, front: r.front });
+      }
+    }
   }
 
   private async close(caller: Caller, e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
@@ -683,6 +736,7 @@ const UNKNOWN_AFTER_FAILURE: Record<string, string> = {
   run: 'Whether anything was typed or run is unknown; `look` shows the session as it is.',
   send: 'Whether anything was typed is unknown; `look` shows the session as it is.',
   stop: 'Whether a signal was sent is unknown; `look` shows what is in front.',
+  integrate: 'Whether anything was typed is unknown; `look` shows the session as it is.',
 };
 
 const capitalized = (s: string): string => `${s[0]?.toUpperCase() ?? ''}${s.slice(1)}`;
@@ -721,14 +775,22 @@ function refused(text: string, structured: Record<string, unknown>): ToolResult 
 const closedMeanwhile = (e: Entry, happened = '', ended: Command[] = []): ToolResult =>
   refused(`Session ${JSON.stringify(e.name)} was closed while this call waited.${happened ? ` ${happened}` : ''} \`list\` shows the sessions still open.`, { error: 'session_exited', session: e.name, ...(ended.length ? { ended } : {}) });
 
+function integrateHint(argv: string): string {
+  const program = path.basename(argv.trim().split(/\s+/)[0] ?? '').replace(/^-/, '');
+  if (program === 'ssh') return ' At the prompt of the shell it reached, `integrate` gives that shell statuses.';
+  if (program === 'bash' || program === 'zsh' || program === 'fish') return ' At its prompt, `integrate` gives it statuses.';
+  return '';
+}
+
 function refusalAdvice(front: Front): string {
   switch (front.state) {
     case 'prompt':
       return `${quotedString(front.pending ?? '')} is typed at the prompt and not run. \`send\` with \`keys: ["C-e", "C-u"]\` clears the line, or \`keys: ["Enter"]\` runs it.`;
     case 'running':
+      if (front.within) return `the shell within ${quoted(front.within.argv)} is running a command. \`look\` with \`until: "end"\` waits for it, \`send\` types into it, \`stop\` types Ctrl-C to it.`;
       if (front.starting) return `the shell is still running its startup files${front.process.shell ? '' : `, now ${quoted(front.process.argv)}`}, and \`run\` works once it has drawn its first prompt. \`look\` shows what it prints, \`send\` types into it.`;
       if (front.process.shell) return 'the shell itself is busy. `look` with `until: "end"` waits for it, `send` types into it. If a command removed the session\'s prompt hooks, `close` it and `open` it again.';
-      return `${quoted(front.process.argv)} is running. \`look\` with \`until: "end"\` waits for it, \`send\` types into it, \`stop\` stops it.`;
+      return `${quoted(front.process.argv)} is running. \`look\` with \`until: "end"\` waits for it, \`send\` types into it, \`stop\` stops it.${integrateHint(front.process.argv)}`;
     case 'waiting':
       return `${quoted(front.process.argv)} is waiting for input${front.starting ? " in the shell's startup files" : ''}. \`send\` answers it${front.process.shell ? '' : ', `stop` stops it'}.`;
     case 'exited':

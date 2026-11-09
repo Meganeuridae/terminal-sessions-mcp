@@ -2,7 +2,7 @@ import { mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Host, type Caller, type Wake } from '../src/tools/host.js';
 import { cutAt, outputValue, RESULT_MAX_CHARS } from '../src/tools/render.js';
-import type { Command, OpenOptions } from '../src/session/types.js';
+import type { Command, OpenOptions, Process } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
 
 const STARTED = Date.parse('2026-11-08T13:00:00.000Z');
@@ -620,7 +620,7 @@ test('a timed-out look sets no watch for a caller that gets no pushes, and one p
   assert.equal(watches(), 1);
 });
 
-test('a session that is closing refuses run, send and stop, and a forced close still goes through', async () => {
+test('a session that is closing refuses run, send, stop and integrate, and a forced close still goes through', async () => {
   const { host, opened } = setup();
   await host.call(agent(), 'open', { name: 'main' });
   const s = opened[0]!;
@@ -632,7 +632,7 @@ test('a session that is closing refuses run, send and stop, and a forced close s
   };
   const graceful = host.call(agent(), 'close', { name: 'main' });
   await settle();
-  for (const [tool, extra] of [['run', { command: 'ls' }], ['send', { text: 'x' }], ['stop', {}]] as const) {
+  for (const [tool, extra] of [['run', { command: 'ls' }], ['send', { text: 'x' }], ['stop', {}], ['integrate', {}]] as const) {
     const r = await host.call(agent(), tool, { name: 'main', ...extra });
     assert.equal(r.isError, true, tool);
     assert.match(r.text, /^Session "main" is closing, so nothing was (typed|sent)\./, tool);
@@ -1608,4 +1608,155 @@ test('a wait for input a call cancelled during a close had taken is not in the c
   await looking;
   release();
   assert.doesNotMatch((await closing).text, /Not yet seen/);
+});
+
+const SSH: Process = { pgid: 31, argv: 'ssh box', shell: false };
+
+test('integrate: the result names the shell given the integration, and the status line, list and structuredContent then name what it runs within', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  s.integrate = async (o) => {
+    s.calls.push({ method: 'integrate', args: [o.waitMs] });
+    s.frontNow = { state: 'prompt', since: Date.now(), within: SSH };
+    s.dir = '/srv/far';
+    return { kind: 'integrated', shell: 'zsh', version: '5.9', front: s.frontNow };
+  };
+  const r = await host.call(agent(), 'integrate', { name: 'main', wait: 5 });
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(r.text, "[main · at the prompt of the shell within ssh box · /srv/far]\nThe shell in front, zsh 5.9, now has the session's integration. `run` types there, with statuses, until that shell exits. Then `run` goes back to the shell it was typed from.");
+  assert.deepEqual(r.structured, { integrated: { shell: 'zsh', version: '5.9' }, front: s.frontNow });
+  assert.deepEqual(s.calls.find((c) => c.method === 'integrate')?.args, [5000]);
+  assert.match((await host.call(agent(), 'list', {})).text, /^main: at the prompt of the shell within ssh box · \/srv\/far/);
+  s.frontNow = { state: 'running', since: Date.now(), process: SSH, command: 4, waitVisible: false, within: SSH };
+  assert.match((await host.call(agent(), 'look', { name: 'main' })).text, /^\[main · the shell within ssh box is running a command for [\d.]+ s \(whether it waits for input can't be seen here\) · \/srv\/far\]/);
+  s.frontNow = { state: 'prompt', since: Date.now(), within: SSH };
+  s.dir = '';
+  assert.match((await host.call(agent(), 'look', { name: 'main' })).text, /^\[main · at the prompt of the shell within ssh box · directory not yet known\]/);
+});
+
+test('integrate is refused at the prompt of a shell that has the integration, and names a shell that gets none', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  s.integrate = async () => ({ kind: 'refused', front: s.frontNow });
+  const own = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.equal(own.isError, true);
+  assert.equal(own.text, "[main · at the prompt · /home/u]\nNothing was typed: the shell in front has the session's integration already, so `run` works there.");
+  assert.equal(own.structured.error, 'already_integrated');
+  s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 4242, argv: 'bash', shell: true }, waitVisible: true };
+  s.integrate = async () => ({ kind: 'refused', sent: true, front: s.frontNow });
+  const sent = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.equal(sent.isError, true);
+  assert.match(sent.text, /\nNothing was typed: a line sent at this prompt hasn't started yet, and what is in front may be a question, such as a password, that anything typed would answer\. `look` until the shell it reaches shows its prompt, then call `integrate` again\.$/);
+  assert.deepEqual([sent.structured.error, sent.structured.sent], ['not_at_prompt', true]);
+  s.integrate = async () => ({ kind: 'refused', canonical: true, front: s.frontNow });
+  const canonical = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.equal(canonical.isError, true);
+  assert.match(canonical.text, /\nNothing was typed: what's in front reads a whole line itself, such as a password or a yes\/no question, or a shell without a line editor\. `look` until a shell prompt shows, then call `integrate` again\.$/);
+  assert.deepEqual([canonical.structured.error, canonical.structured.canonical], ['not_at_prompt', true]);
+  s.frontNow = { state: 'running', since: Date.now(), process: SSH, waitVisible: true };
+  s.integrate = async () => ({ kind: 'unsupported', shell: 'dash', front: s.frontNow });
+  const dash = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.equal(dash.isError, true);
+  assert.match(dash.text, /\nThe shell in front, dash, gets no integration: only bash, zsh and fish do\. It answered the probe, and nothing more was typed\. `send` types into it\.$/);
+  assert.deepEqual([dash.structured.error, dash.structured.shell], ['unsupported_shell', 'dash']);
+});
+
+test('integrate whose wait ran out names the step it reached, and says what a later prompt does', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  s.frontNow = { state: 'running', since: Date.now(), process: SSH, waitVisible: true };
+  s.integrate = async () => ({ kind: 'incomplete', step: 'probe', by: 'timeout', front: s.frontNow });
+  const probe = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.equal(probe.isError, true);
+  assert.match(probe.text, /\nThe probe line was typed, and no shell answered it within the wait, so nothing more was typed\. The shell in front has no integration\.$/);
+  assert.deepEqual([probe.structured.error, probe.structured.step, probe.structured.by], ['incomplete', 'probe', 'timeout']);
+  s.integrate = async () => ({ kind: 'incomplete', step: 'hooks', by: 'timeout', front: s.frontNow });
+  const hooks = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.match(hooks.text, /\nThe hooks were typed in part or whole, and no prompt with them was drawn within the wait\. Nothing more is typed\. If their last part was typed, a prompt drawn later still gives that shell the integration, and the status line then names what it runs within\.$/);
+  s.integrate = async () => ({ kind: 'incomplete', step: 'hooks', by: 'exited', front: s.frontNow });
+  assert.match((await host.call(agent(), 'integrate', { name: 'main' })).text, /\nWhat the hooks were typed into ended before it drew a prompt with them, and the shell below is back at its prompt\. Nothing more was typed\.$/);
+});
+
+test('a run refused with ssh, or a shell that isn\'t the session\'s own, in front names integrate; one with another program in front doesn\'t', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  const refusal = async (argv: string): Promise<string> => {
+    s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 40, argv, shell: false }, waitVisible: true };
+    return (await host.call(agent(), 'run', { name: 'main', command: 'ls' })).text;
+  };
+  assert.match(await refusal('ssh -p 2222 box'), /`stop` stops it\. At the prompt of the shell it reached, `integrate` gives that shell statuses\.$/);
+  assert.match(await refusal('/usr/bin/zsh'), /`stop` stops it\. At its prompt, `integrate` gives it statuses\.$/);
+  assert.match(await refusal('-bash'), /At its prompt, `integrate` gives it statuses\.$/);
+  assert.doesNotMatch(await refusal('npm run dev'), /integrate/);
+  s.frontNow = { state: 'running', since: Date.now(), process: SSH, command: 4, waitVisible: false, within: SSH };
+  const far = (await host.call(agent(), 'run', { name: 'main', command: 'ls' })).text;
+  assert.match(far, /\nNothing was typed: the shell within ssh box is running a command\. `look` with `until: "end"` waits for it, `send` types into it, `stop` types Ctrl-C to it\.$/);
+});
+
+test('a run whose text is too long for the line a shell given the integration takes is refused, saying how long it was', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  s.frontNow = { state: 'prompt', since: Date.now(), within: SSH };
+  s.run = async () => ({ kind: 'refused', front: s.frontNow, took: [], tooLong: { typed: 9000, max: 8192 } });
+  const r = await host.call(agent(), 'run', { name: 'main', command: 'x' });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /\nNothing was typed: in the shell within ssh box, `run` types the text as one line, and this one would type as 9000 characters, over the 8192 it takes\. Split it into shorter runs, or copy a script over and run that\.$/);
+  assert.deepEqual([r.structured.error, r.structured.tooLong], ['invalid_argument', { typed: 9000, max: 8192 }]);
+});
+
+test('stop with a shell given the integration in front types only Ctrl-C, and refuses a signal, which would reach the local program', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  s.frontNow = { state: 'running', since: Date.now(), process: SSH, command: 4, waitVisible: false, within: SSH };
+  s.stop = async (signal) => ({ steps: signal ? [] : [{ sent: 'C-c', front: s.frontNow }], front: s.frontNow, within: true });
+  const ctrlC = await host.call(agent(), 'stop', { name: 'main' });
+  assert.equal(ctrlC.isError, undefined, ctrlC.text);
+  assert.match(ctrlC.text, /\nSent C-c: now the shell within ssh box is running a command/);
+  const term = await host.call(agent(), 'stop', { name: 'main', signal: 'TERM' });
+  assert.equal(term.isError, true);
+  assert.match(term.text, /\nNothing was sent: a signal would reach ssh box, not the job in the shell within it\. `stop` without `signal` types Ctrl-C there\.$/);
+  assert.deepEqual([term.structured.error, term.structured.within], ['not_sent', true]);
+});
+
+test('after integrated, look starts at the far prompt: the hooks\' echo is skipped', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  s.print('$ ssh box', 'box$ ');
+  await host.call(agent(), 'look', { name: 'main' });
+  s.integrate = async () => {
+    s.print('box$  unset HISTFILE; hook piece 0', 'box$  __tsm_h=hook piece 1', 'far> ');
+    s.frontNow = { state: 'prompt', since: Date.now(), within: SSH };
+    return { kind: 'integrated', shell: 'bash', version: '5.2.37', front: s.frontNow };
+  };
+  await host.call(agent(), 'integrate', { name: 'main' });
+  const seen = await host.call(agent(), 'look', { name: 'main' });
+  assert.doesNotMatch(seen.text, /hook piece/, seen.text);
+  assert.match(seen.text, /\nfar> $/, seen.text);
+});
+
+test('integrated carries what the far shell printed while taking the hooks, once, and nothing when it printed nothing', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  const integrated = (printed?: string[]) => async () => {
+    s.frontNow = { state: 'prompt', since: Date.now(), within: SSH };
+    return { kind: 'integrated' as const, shell: 'bash' as const, version: '5.2.37', ...(printed ? { printed } : {}), front: s.frontNow };
+  };
+  s.integrate = integrated(['bash: alias: ll: not found']);
+  const r = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.equal(r.isError, undefined);
+  assert.match(r.text, /Then `run` goes back to the shell it was typed from\.\nWhile taking the hooks, the shell printed:\nbash: alias: ll: not found$/);
+  assert.deepEqual((r.structured.integrated as { printed?: string[] }).printed, ['bash: alias: ll: not found']);
+  s.frontNow = { state: 'prompt', since: Date.now() };
+  s.integrate = integrated();
+  const quiet = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.doesNotMatch(quiet.text, /printed/);
+  assert.equal('printed' in (quiet.structured.integrated as object), false);
 });
