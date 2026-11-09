@@ -22,7 +22,7 @@
     "mcp-server": "ts-node src/mcp/mcp-stdio-server.ts",
     "cli": "ts-node cli/session-cli.ts",
     "prepublishOnly": "npm run build",
-    "postinstall": "node -e \"const fs=require('fs'),path=require('path');try{const p=path.join(path.dirname(require.resolve('node-pty/package.json')),'build/Release/spawn-helper');fs.chmodSync(p,0o755);}catch(e){}\"",
+    "postinstall": "node scripts/pty-permissions.js",
     "build:next": "node -e \"require('node:fs').rmSync('next/dist', { recursive: true, force: true })\" && tsc -p next/tsconfig.json",
     "test:next": "npm run build && node --test next/dist/spec/*.spec.js",
     "acceptance:af": "npm run build:next && node next/acceptance/agent-framework.mjs",
