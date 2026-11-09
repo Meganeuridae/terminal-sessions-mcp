@@ -1210,6 +1210,27 @@ test('a session no caller taking reports used leaves nothing behind when one tak
   assert.equal((r.structured.unseen as string[] | undefined)?.length ?? 0, 0);
 });
 
+test("close returns the reports that fit its result, and keeps the rest for list", async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.dir = `/home/u/${'d'.repeat(1_000)}`;
+  const n = 120;
+  for (let i = 0; i < n; i++) {
+    running(s);
+    await host.call(plain(), 'run', { name: 'main', command: `c${i}`, wait: 0 });
+    s.end(1);
+    await settle();
+  }
+  const closed = await host.call(plain(), 'close', { name: 'main' });
+  const shown = (closed.structured.unseen as string[]).length;
+  assert.ok(shown > 0 && shown < n, `close showed ${shown} of ${n}`);
+  assert.ok(closed.text.length <= RESULT_MAX_CHARS);
+  const listed = await host.call(plain(), 'list', {});
+  assert.equal((listed.structured.unseen as string[]).length, n - shown, 'list gives the rest');
+  assert.match(listed.text, new RegExp(`\\n\\nNot yet seen:\\n\\[main · command ${shown + 1} · exit 1 `));
+});
+
 test('look gives the ends its own wait took before the reports not yet seen, so a cut leaves them', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });

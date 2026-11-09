@@ -563,15 +563,21 @@ export class Host {
     e.closing = true;
     const [exit] = await Promise.all([e.session.close({ force: a.force === true, deadline: mono() + WAIT_MAX_S * 1000 }), Promise.all(e.settling)]);
     e.off();
-    const unseen = [...e.unseen.values()].sort((x, y) => x.at - y.at).map((u) => u.lines.join('\n'));
-    if (caller.takes) e.unseen.clear();
     const k = keyOf(e.scope, e.name);
     if (this.entries.get(k) === e) this.entries.delete(k);
     const how = exit.unconfirmed ? `was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it` : exitText(exit);
-    if (!caller.takes && e.takerUsed) this.leave(e, how);
     const unlisted = exit.unlisted ? " The session couldn't list every process it started, so jobs it started may live on." : '';
     const unreached = exit.unreached?.length ? ` These signals weren't delivered: ${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')}. Their processes may live on.` : '';
-    return ok(`[${e.name} · closed]\nThe shell ${how}.${unlisted}${unreached}${unseen.length ? `\n\nNot yet seen:\n${unseen.join('\n')}` : ''}`, { session: e.name, exit, ...(unseen.length ? { unseen } : {}) });
+    const pending = [...e.unseen.values()].sort((x, y) => x.at - y.at);
+    let full = `[${e.name} · closed]\nThe shell ${how}.${unlisted}${unreached}`;
+    if (pending.length) full += '\n\nNot yet seen:';
+    const ends = pending.map((u) => (full += `\n${u.lines.join('\n')}`).length);
+    const kept = fittedLength(full);
+    const shown = pending.filter((_, i) => ends[i]! <= kept);
+    if (caller.takes) for (const u of shown) e.unseen.delete(u.wake.key);
+    if (caller.takes ? e.unseen.size > 0 : e.takerUsed) this.leave(e, caller.takes ? undefined : how);
+    const unseen = shown.map((u) => u.lines.join('\n'));
+    return ok(fitted(full), { session: e.name, exit, ...(unseen.length ? { unseen } : {}) });
   }
 
   private async taking(e: Entry, call: (held: Held) => Promise<ToolResult>): Promise<ToolResult> {
@@ -736,11 +742,14 @@ export class Host {
     return best;
   }
 
-  private leave(e: Entry, how: string): void {
-    const text = fitted(`[${e.name} · closed by a caller that takes no reports; the shell ${how}]`);
-    const seq = ++this.wakeSeq;
-    const exited: Unseen = { seq, at: seq, wake: { scope: e.scope, session: e.name, tag: 'terminal:exited', key: this.pushKey(e, undefined), text }, lines: [text], command: undefined };
-    this.left.set(e.scope, [...(this.left.get(e.scope) ?? []), ...e.unseen.values(), exited]);
+  private leave(e: Entry, how: string | undefined): void {
+    const left = [...(this.left.get(e.scope) ?? []), ...e.unseen.values()];
+    if (how !== undefined) {
+      const text = fitted(`[${e.name} · closed by a caller that takes no reports; the shell ${how}]`);
+      const seq = ++this.wakeSeq;
+      left.push({ seq, at: seq, wake: { scope: e.scope, session: e.name, tag: 'terminal:exited', key: this.pushKey(e, undefined), text }, lines: [text], command: undefined });
+    }
+    this.left.set(e.scope, left);
     e.unseen.clear();
     this.pump(e.scope);
   }
