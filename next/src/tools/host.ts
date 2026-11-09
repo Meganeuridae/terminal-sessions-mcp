@@ -101,7 +101,7 @@ export class Host {
     };
   }
 
-  async call(caller: Caller, tool: string, args: unknown): Promise<ToolResult> {
+  async call(caller: Caller, tool: string, args: unknown, signal?: AbortSignal): Promise<ToolResult> {
     const def = TOOLS.find((t) => t.name === tool);
     if (!def) return refused(`There is no tool \`${tool}\`. The tools are ${TOOLS.map((t) => t.name).join(', ')}.`, { error: 'unknown_tool' });
     try {
@@ -126,11 +126,11 @@ export class Host {
       }
       switch (tool) {
         case 'run':
-          return await this.run(caller, entry, a);
+          return await this.run(caller, entry, a, signal);
         case 'send':
-          return await this.send(caller, entry, a);
+          return await this.send(caller, entry, a, signal);
         case 'look':
-          return await this.look(caller, entry, a);
+          return await this.look(caller, entry, a, signal);
         case 'read':
           return await this.read(entry, a);
         case 'stop':
@@ -269,9 +269,10 @@ export class Host {
     });
   }
 
-  private async run(caller: Caller, e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
+  private async run(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined): Promise<ToolResult> {
     const notify = a.notify_on !== undefined ? this.regex(a.notify_on as string, 'notify_on', 'nothing was typed') : undefined;
-    const r = await e.session.run(a.command as string, { waitMs: this.waitMs(a), take: caller.takes });
+    const r = await e.session.run(a.command as string, { waitMs: this.waitMs(a), take: caller.takes, ...(signal ? { signal } : {}) });
+    if (signal?.aborted) return CANCELLED;
     if (e.closing) return closedMeanwhile(e);
     if (r.kind === 'refused') return refused(`${this.status(e, r.front)}\nNothing was typed: ${refusalAdvice(r.front)}`, { error: 'not_at_prompt', front: r.front });
     const c = r.command;
@@ -294,7 +295,7 @@ export class Host {
     });
   }
 
-  private async send(caller: Caller, e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
+  private async send(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined): Promise<ToolResult> {
     let bytes: string;
     try {
       bytes = inputBytes(a.text as string | undefined, a.keys as string[] | undefined, e.session.keyOptions());
@@ -304,8 +305,9 @@ export class Host {
     }
     if (bytes === '') return refused('Nothing to send: give `text`, `keys`, or both.', { error: 'invalid_argument' });
     const until = a.wait_for !== undefined ? this.regex(a.wait_for as string, 'wait_for', 'nothing was typed') : undefined;
-    const r = await e.session.send(bytes, { waitMs: this.waitMs(a), take: caller.takes, ...(until ? { until } : {}) });
-    if (e.closing) return closedMeanwhile(e);
+    const r = await e.session.send(bytes, { waitMs: this.waitMs(a), take: caller.takes, ...(until ? { until } : {}), ...(signal ? { signal } : {}) });
+    if (signal?.aborted) return CANCELLED;
+    if (e.closing || r.by === 'closed') return closedMeanwhile(e);
     if (!r.sent && r.by === 'timeout' && r.front.state !== 'exited') {
       return refused(
         `${this.status(e, r.front)}\nNothing was typed: the shell hasn't finished drawing its prompt after ${duration(this.now() - r.front.since)}, and keys sent before a line editor has the terminal would reach the terminal's own line editing instead. ${this.waitMs(a) >= WAIT_MAX_S * 1000 ? '`look` shows what is in front.' : '`send` again with a longer `wait`.'}`,
@@ -316,14 +318,14 @@ export class Host {
     if (caller.takes && r.lines.from <= e.cursor) e.cursor = Math.max(e.cursor, r.lines.to - r.lines.live);
     const parts = [this.status(e, r.front)];
     for (const c of r.ended) parts.push(`Command ${c.id} ended: ${endingText(c).join(' · ')}.`);
-    if (r.by === 'timeout') parts.push(until ? 'The wait ended before the pattern matched.' : 'Output was still changing when the wait ended.');
+    if (r.by === 'timeout') parts.push(until ? `The wait ended before the pattern matched${r.clipped ? `; ${headOnlyText(r.clipped)}` : ''}.` : 'Output was still changing when the wait ended.');
     if (r.matched) parts.push(matchedText(r.matched));
     const used = parts.join('\n').length + 1;
     parts.push(r.screen ? screenText(r.screen, RESULT_MAX_CHARS - used) : this.output(r.lines, undefined, RESULT_MAX_CHARS - used));
     return ok(parts.join('\n'), { front: r.front, by: r.by, ended: r.ended, ...(r.matched ? { matched: r.matched } : {}), lines: { from: r.lines.from, to: r.lines.to } });
   }
 
-  private async look(caller: Caller, e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
+  private async look(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined): Promise<ToolResult> {
     if (a.until !== undefined && a.match !== undefined) return refused('Give `until` or `match`, not both.', { error: 'invalid_argument' });
     const parts: string[] = [];
     let front: Front = e.session.front();
@@ -331,7 +333,8 @@ export class Host {
       const pattern = a.match !== undefined ? this.regex(a.match as string, 'match', 'nothing was waited for') : undefined;
       const until = pattern ? { kind: 'match' as const, pattern } : { kind: a.until as 'end' | 'input' };
       const from = e.cursor;
-      const w = await e.session.wait(until, { waitMs: this.waitMs(a), from, take: caller.takes });
+      const w = await e.session.wait(until, { waitMs: this.waitMs(a), from, take: caller.takes, ...(signal ? { signal } : {}) });
+      if (signal?.aborted) return CANCELLED;
       if (e.closing) return closedMeanwhile(e);
       front = w.front;
       for (const c of w.ended) parts.push(`Command ${c.id} ended: ${endingText(c).join(' · ')}.`);
@@ -343,7 +346,7 @@ export class Host {
             for (const [id, watch] of e.watches) if (watch.key === key) (e.session.unwatch(id), e.watches.delete(id));
             e.watches.set(e.session.watch(pattern, from), { key, command: undefined });
           }
-          parts.push(`The wait ended first.${caller.pushes ? ' The match will be reported to you when it comes.' : ' `look` again waits for it.'}`);
+          parts.push(`The wait ended first${w.clipped ? `; ${headOnlyText(w.clipped)}` : ''}.${caller.pushes ? ' The match will be reported to you when it comes.' : ' `look` again waits for it.'}`);
         } else parts.push(`The wait ended first. ${laterText(a.until as 'end' | 'input', caller.pushes, e.session.current() !== undefined, front)}`);
       }
     }
@@ -411,7 +414,11 @@ export class Host {
   private async stop(e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
     const r = await e.session.stop(a.signal !== undefined ? (`SIG${a.signal as string}` as NodeJS.Signals) : undefined);
     const now = this.now();
-    const steps = r.steps.map((s) => `Sent ${s.sent}${s.to ? ` to ${quoted(s.to.argv)}` : ''}: now ${frontText(s.front, now)}.`);
+    const steps = r.steps.map((s) =>
+      s.refused
+        ? `${s.sent} wasn't delivered${s.to ? ` to ${quoted(s.to.argv)}` : ''} (${s.refused}), so no further step was taken: now ${frontText(s.front, now)}.`
+        : `Sent ${s.sent}${s.to ? ` to ${quoted(s.to.argv)}` : ''}: now ${frontText(s.front, now)}.`,
+    );
     if (!r.steps.length) steps.push(`Nothing was sent: ${frontText(r.front, now)}.`);
     if (r.next === 'close') steps.push('What runs is the shell itself, or a job that outlived KILL: only `close` ends it.');
     return ok([this.status(e, r.front), ...steps].join('\n'), { steps: r.steps, front: r.front, ...(r.next ? { next: r.next } : {}) });
@@ -423,7 +430,9 @@ export class Host {
     e.off();
     const k = keyOf(e.scope, e.name);
     if (this.entries.get(k) === e) this.entries.delete(k);
-    return ok(`[${e.name} · closed]\nThe shell ${exitText(exit)}.`, { session: e.name, exit });
+    const how = exit.unconfirmed ? `was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it` : exitText(exit);
+    const unlisted = exit.unlisted ? " Its descendants couldn't be listed, so only the shell was killed, and jobs it started may live on." : '';
+    return ok(`[${e.name} · closed]\nThe shell ${how}.${unlisted}`, { session: e.name, exit });
   }
 
   private status(e: Entry, front: Front, command?: Command): string {
@@ -538,7 +547,9 @@ async function firstMatch(re: RegExp, l: Lines): Promise<Match | undefined> {
 
 const turn = (): Promise<void> => new Promise((r) => setImmediate(r));
 
-const matchedText = (m: Match): string => `Matched at line ${m.line}: ${quoted(m.text)}${m.clipped ? ` (${headOnlyText()})` : ''}`;
+const matchedText = (m: Match): string => `Matched ${m.row === undefined ? `at line ${m.line}` : `on the screen, row ${m.row + 1}`}: ${quoted(m.text)}${m.clipped ? ` (${headOnlyText()})` : ''}`;
+
+const CANCELLED: ToolResult = { text: 'The call was cancelled.', structured: { error: 'cancelled' }, isError: true };
 
 const UNKNOWN_AFTER_FAILURE: Record<string, string> = {
   open: 'Whether the session opened is unknown; `list` shows the sessions open.',

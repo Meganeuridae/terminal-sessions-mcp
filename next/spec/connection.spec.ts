@@ -330,3 +330,29 @@ test('terminal-sessions/stop stops the daemon for tsm, and is no method for a re
     await h.done();
   }
 });
+
+test('a cancelled call stops its wait, and is answered to nobody', async () => {
+  const h = await harness();
+  try {
+    const c = await h.connect(relayHello('a'));
+    await c.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    await c.request('tools/call', { name: 'open', arguments: { name: 'main' } });
+    const s = h.sessions.at(-1)!;
+    let aborted = false;
+    s.wait = (_until, opts) =>
+      new Promise((resolve) => {
+        opts.signal?.addEventListener('abort', () => {
+          aborted = true;
+          resolve({ by: 'cancelled', front: s.frontNow, ended: [] });
+        });
+      });
+    c.send({ jsonrpc: '2.0', id: 'w', method: 'tools/call', params: { name: 'look', arguments: { name: 'main', until: 'end', wait: 30 } } });
+    await new Promise((r) => setTimeout(r, 100));
+    c.send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'w' } });
+    assert.deepEqual((await c.request('ping')).result, {});
+    assert.equal(aborted, true, 'the session saw the abort');
+    assert.equal(c.order.filter((m) => m.id === 'w').length, 0, 'no answer to the cancelled call');
+  } finally {
+    await h.done();
+  }
+});

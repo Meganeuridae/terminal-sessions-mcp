@@ -880,3 +880,29 @@ test("run's output past its budget keeps its start and end, and says where the g
       assert.equal(v.output.slice(0, v.outputLeftOut!.at) + text.slice(v.outputLeftOut!.at, v.outputLeftOut!.at + v.outputLeftOut!.characters) + v.output.slice(v.outputLeftOut!.at), text);
     }
 });
+
+test("the host says what the session reports of a match on the screen, an undelivered signal, an unlisted or unseen close, a timed-out search's long lines, unknown echo and a command's duration", async () => {
+  const { host, opened } = setup();
+  const wakes: Wake[] = [];
+  host.subscribe('a', async (w) => (wakes.push(w), true));
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(agent(), 'run', { name: 'main', command: 'top', wait: 0, notify_on: 'READY' });
+  const id = [...s.watches.keys()].at(-1)!;
+  s.emit({ kind: 'match', watch: id, match: { line: 5, text: 'ALT-READY', row: 2 } });
+  await settle();
+  assert.match(wakes.find((w) => w.tag === 'terminal:match')!.text, /\nMatched on the screen, row 3: ALT-READY$/);
+  s.stop = async () => ({ steps: [{ sent: 'SIGTERM', to: { pgid: 9, argv: 'sudo -n sleep 9', shell: false }, refused: 'EPERM', front: s.frontNow }], front: s.frontNow });
+  assert.match((await host.call(agent(), 'stop', { name: 'main' })).text, /\nSIGTERM wasn't delivered to sudo -n sleep 9 \(EPERM\), so no further step was taken: now /);
+  s.send = async () => ({ sent: true, lines: s.lines(s.out.length), front: s.frontNow, ended: [], by: 'timeout', clipped: 2 });
+  assert.match((await host.call(agent(), 'send', { name: 'main', text: 'x', wait_for: 'never', wait: 1 })).text, /\nThe wait ended before the pattern matched; 2 lines longer than the match window, searched on their head only\./);
+  s.frontNow = { state: 'waiting', since: Date.now(), process: { pgid: 9, argv: 'read', shell: false } };
+  assert.match((await host.call(agent(), 'list', {})).text, /waiting for input: read, echo unknown, for /);
+  const made = s.end(0);
+  made.end!.ms = 1_200;
+  await settle();
+  assert.ok(wakes.some((w) => w.tag === 'terminal:ended' && / · exit 0 · 1\.2 s · /.test(w.text)), "the duration is the ending's own");
+  s.close = async () => ({ code: null, signal: 'SIGKILL', unconfirmed: true, unlisted: true });
+  assert.equal((await host.call(agent(), 'close', { name: 'main', force: true })).text, "[main · closed]\nThe shell was sent SIGKILL, and its exit wasn't seen within the grace after it. Its descendants couldn't be listed, so only the shell was killed, and jobs it started may live on.");
+});

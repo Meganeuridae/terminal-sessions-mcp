@@ -24,7 +24,7 @@ export function frontText(front: Front, now: number): string {
       return `${what} for ${duration(now - front.since)}${front.waitVisible ? '' : " (whether it waits for input can't be seen here)"}`;
     }
     case 'waiting':
-      return `waiting for input${front.starting ? " in the shell's startup files" : ''}: ${quoted(front.process.argv)}${front.echo ? '' : ', not echoed, as for a password'}, for ${duration(now - front.since)}`;
+      return `waiting for input${front.starting ? " in the shell's startup files" : ''}: ${quoted(front.process.argv)}${front.echo === false ? ', not echoed, as for a password' : front.echo === undefined ? ', echo unknown' : ''}, for ${duration(now - front.since)}`;
     case 'exited':
       return `the shell ${exitText(front.exit)}`;
   }
@@ -36,7 +36,7 @@ export function endingText(c: Command): string[] {
   const parts: string[] = [];
   parts.push(end.status === undefined ? 'status unknown' : `exit ${end.status}`);
   if (end.pipeline && end.pipeline.some((s) => s !== 0)) parts.push(`pipeline ${end.pipeline.join('|')}`);
-  parts.push(duration(end.at - c.startedAt));
+  parts.push(duration(end.ms));
   if (end.errexit) parts.push('set -e is on: a failing command now ends the shell');
   if (end.flushed) parts.push(`discarded typed-ahead text ${quotedString(end.flushed)}, which nothing read`);
   if (end.refusedMarks) parts.push(`${end.refusedMarks} lookalike end mark${end.refusedMarks === 1 ? '' : 's'} in its output refused`);

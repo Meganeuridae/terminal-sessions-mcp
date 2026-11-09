@@ -58,6 +58,8 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
   let enabled = new Set<string>();
   let unsubscribe: (() => void) | undefined;
   let closed = false;
+  const calls = new Map<Id, AbortController>();
+  const cancelled = new Set<Id>();
 
   const write = (m: Message): void => {
     if (!closed) socket.write(`${JSON.stringify(m)}\n`);
@@ -112,7 +114,8 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
     return { accepted: true, unavailableFeatures: unavailable, notes, ...(unavailable.length ? { mode: 'degraded' } : {}) };
   };
 
-  const dispatch = async (method: string, p: Record<string, unknown>, isRequest: boolean, after: (fn: () => void) => void): Promise<unknown> => {
+  const dispatch = async (method: string, p: Record<string, unknown>, id: Id | undefined, after: (fn: () => void) => void): Promise<unknown> => {
+    const isRequest = id !== undefined;
     switch (method) {
       case 'initialize': {
         if (initialized) throw new RpcError(INVALID_REQUEST, 'this connection is already initialized');
@@ -134,16 +137,29 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
         };
       }
       case 'notifications/initialized':
-      case 'notifications/cancelled':
         return undefined;
+      case 'notifications/cancelled': {
+        const target = p.requestId;
+        if ((typeof target === 'string' || typeof target === 'number') && calls.has(target)) {
+          cancelled.add(target);
+          calls.get(target)!.abort();
+        }
+        return undefined;
+      }
       case 'ping':
         return {};
       case 'tools/list':
         return { tools: toolsAllowed() ? host.tools().map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) : [] };
       case 'tools/call': {
         if (!toolsAllowed()) throw new RpcError(CAPABILITY_DENIED, 'tools are not granted on this connection', { capability: 'tools' });
-        const r = await host.call(caller(), typeof p.name === 'string' ? p.name : '', p.arguments ?? {});
-        return { content: [{ type: 'text', text: r.text }], structuredContent: r.structured, ...(r.isError ? { isError: true } : {}) };
+        const ac = new AbortController();
+        if (id !== undefined) calls.set(id, ac);
+        try {
+          const r = await host.call(caller(), typeof p.name === 'string' ? p.name : '', p.arguments ?? {}, ac.signal);
+          return { content: [{ type: 'text', text: r.text }], structuredContent: r.structured, ...(r.isError ? { isError: true } : {}) };
+        } finally {
+          if (id !== undefined) calls.delete(id);
+        }
       }
       case 'featureSets/update': {
         if (!mcpl) throw new RpcError(METHOD_NOT_FOUND, 'not an MCPL connection');
@@ -188,18 +204,19 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
     }
     if (f.kind === 'response') return out.handleResponse(f.msg);
     const req = f.msg;
-    const isRequest = req.id !== undefined && req.id !== null;
+    const id = req.id !== undefined && req.id !== null ? (req.id as Id) : undefined;
+    const isRequest = id !== undefined;
     const afters: Array<() => void> = [];
-    void dispatch(req.method, (req.params ?? {}) as Record<string, unknown>, isRequest, (fn) => afters.push(fn)).then(
+    void dispatch(req.method, (req.params ?? {}) as Record<string, unknown>, id, (fn) => afters.push(fn)).then(
       (result) => {
-        if (isRequest) write({ jsonrpc: '2.0', id: req.id as Id, result: result ?? {} });
+        if (isRequest && !cancelled.delete(id)) write({ jsonrpc: '2.0', id, result: result ?? {} });
         for (const fn of afters) fn();
       },
       (e: unknown) => {
         for (const fn of afters) fn();
-        if (isRequest) {
+        if (isRequest && !cancelled.delete(id)) {
           const rpc = e instanceof RpcError ? e : new RpcError(INTERNAL, (e as Error).message ?? String(e));
-          write({ jsonrpc: '2.0', id: req.id as Id, error: { code: rpc.code, message: rpc.message, ...(rpc.data !== undefined ? { data: rpc.data } : {}) } });
+          write({ jsonrpc: '2.0', id, error: { code: rpc.code, message: rpc.message, ...(rpc.data !== undefined ? { data: rpc.data } : {}) } });
         }
       },
     );

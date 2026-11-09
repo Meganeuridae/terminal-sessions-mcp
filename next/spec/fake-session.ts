@@ -95,7 +95,7 @@ export class FakeSession implements Session {
     });
   }
 
-  async run(text: string, opts: { waitMs: number; take?: boolean }): Promise<RunOutcome> {
+  async run(text: string, opts: { waitMs: number; take?: boolean; signal?: AbortSignal }): Promise<RunOutcome> {
     this.calls.push({ method: 'run', args: [text, opts] });
     if (this.runMode === 'refuse' || this.frontNow.state !== 'prompt') return { kind: 'refused', front: this.frontNow };
     const id = this.opts.nextCommandId();
@@ -113,14 +113,14 @@ export class FakeSession implements Session {
     return { kind: 'running', command: c, front: this.frontNow };
   }
 
-  async send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean }): Promise<SendOutcome> {
+  async send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean; signal?: AbortSignal }): Promise<SendOutcome> {
     this.calls.push({ method: 'send', args: [bytes, opts] });
     const from = this.out.length;
     if (this.promptUndrawn) return { sent: false, lines: this.lines(from), front: this.frontNow, ended: [], by: 'timeout' };
     return { sent: this.frontNow.state !== 'exited', lines: this.lines(from), ...(this.screenNow?.alt ? { screen: this.screenNow } : {}), front: this.frontNow, ended: [], by: 'quiet' };
   }
 
-  async wait(until: Until, opts: { waitMs: number; from: number; take?: boolean }): Promise<WaitOutcome> {
+  async wait(until: Until, opts: { waitMs: number; from: number; take?: boolean; signal?: AbortSignal }): Promise<WaitOutcome> {
     this.calls.push({ method: 'wait', args: [until, opts] });
     const matched = until.kind === 'match' ? this.firstMatch(until.pattern, opts.from) : undefined;
     return matched ? { by: 'match', front: this.frontNow, ended: [], matched } : { by: 'timeout', front: this.frontNow, ended: [] };
