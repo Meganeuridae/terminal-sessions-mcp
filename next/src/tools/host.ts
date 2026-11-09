@@ -94,7 +94,7 @@ export class Host {
   private readonly entries = new Map<string, Entry>();
   private readonly left = new Map<string, Unseen[]>();
   private readonly subscribers = new Map<string, Set<Subscriber>>();
-  private readonly opening = new Set<string>();
+  private readonly opening = new Map<string, boolean>();
   private readonly starting = new Set<Promise<void>>();
   private readonly stopper = new AbortController();
   private stopping: number | undefined;
@@ -198,7 +198,9 @@ export class Host {
   }
 
   private noSession(caller: Caller, name: string): ToolResult {
-    const names = [...this.entries.values()].filter((e) => e.scope === caller.scope).map((e) => e.name);
+    const here = [...this.entries.values()].filter((e) => e.scope === caller.scope);
+    if (caller.takes) for (const e of here) e.takerUsed = true;
+    const names = here.map((e) => e.name);
     return refused(
       `No session named ${JSON.stringify(name)} is open in scope ${JSON.stringify(caller.scope)}, and none is opened for you. ` +
         `${names.length ? `Open here: ${names.join(', ')}.` : 'None is open here.'} ` +
@@ -224,7 +226,10 @@ export class Host {
     const name = a.name as string;
     if (!SESSION_NAME_RE.test(name)) return refused(`${JSON.stringify(name)} isn't a session name: 1 to 64 letters, digits, ".", "_" or "-".`, { error: 'invalid_argument' });
     const k = keyOf(caller.scope, name);
-    if (this.entries.has(k) || this.opening.has(k)) return refused(`A session named ${JSON.stringify(name)} is already open in this scope, or opening. Use it, or \`close\` it first.`, { error: 'session_exists', session: name });
+    const existing = this.entries.get(k);
+    if (existing && caller.takes) existing.takerUsed = true;
+    if (!existing && caller.takes && this.opening.has(k)) this.opening.set(k, true);
+    if (existing || this.opening.has(k)) return refused(`A session named ${JSON.stringify(name)} is already open in this scope, or opening. Use it, or \`close\` it first.`, { error: 'session_exists', session: name });
     if (this.stopping !== undefined) return refused('The daemon is stopping, so no session opens.', { error: 'backend_failure' });
     const cols = (a.cols as number | undefined) ?? 120;
     const rows = (a.rows as number | undefined) ?? 40;
@@ -242,7 +247,7 @@ export class Host {
     const raw = (a.cwd as string | undefined) ?? '~';
     const cwd = raw === '~' ? os.homedir() : raw.startsWith('~/') ? path.join(os.homedir(), raw.slice(2)) : raw;
     if (!path.isAbsolute(cwd)) return refused(`The directory ${JSON.stringify(raw)} must be absolute, or start with "~".`, { error: 'invalid_argument' });
-    this.opening.add(k);
+    this.opening.set(k, false);
     let started!: () => void;
     const start = new Promise<void>((r) => (started = r));
     this.starting.add(start);
@@ -274,7 +279,7 @@ export class Host {
       await session.close({ force: true, deadline: this.stopping });
       return refused('The daemon stopped while this session started, so its shell is closed.', { error: 'backend_failure' });
     }
-    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes, exited: false };
+    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes || this.opening.get(k) === true, exited: false };
     entry.off = session.onEvent((ev) => this.onEvent(entry, ev));
     this.entries.set(k, entry);
     const front = session.front();
@@ -285,6 +290,7 @@ export class Host {
 
   private list(caller: Caller): ToolResult {
     const mine = [...this.entries.values()].filter((e) => e.scope === caller.scope);
+    if (caller.takes) for (const e of mine) e.takerUsed = true;
     const left = this.left.get(caller.scope) ?? [];
     const none = `No session is open in scope ${JSON.stringify(caller.scope)}.`;
     if (!mine.length && !left.length) return ok(none, { sessions: [] });
@@ -733,6 +739,7 @@ export class Host {
       if (!next) continue;
       sub.offered = next.u.seq;
       sub.busy = true;
+      if (next.e) next.e.takerUsed = true;
       void sub
         .sink(next.u.wake)
         .catch(() => false)

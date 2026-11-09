@@ -1210,6 +1210,92 @@ test('a host that takes reports is woken when a caller taking none closes a sess
   assert.equal(((await host.call(plain(), 'list', {})).structured.unseen as string[] | undefined)?.length ?? 0, 0);
 });
 
+test('a session a caller taking none opened, then a taking list showed, leaves its close for list when that caller closes it', async () => {
+  const { host } = setup();
+  await host.call(cli(), 'open', { name: 'main' });
+  await host.call(plain(), 'list', {});
+  await host.call(cli(), 'close', { name: 'main' });
+  const r = await host.call(plain(), 'list', {});
+  assert.match(r.text, /\n\nNot yet seen:\n\[main · closed by a caller that takes no reports; the shell /);
+});
+
+test('a host that accepted a wake about a session a caller taking none opened is woken when that caller closes it', async () => {
+  const { host, opened } = setup();
+  const wakes: Wake[] = [];
+  await host.call(cli(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(cli(), 'run', { name: 'main', command: 'make', wait: 0 });
+  host.subscribe('a', async (w) => (wakes.push(w), true));
+  s.end(2);
+  await settle();
+  assert.equal(wakes.length, 1);
+  await host.call(cli(), 'close', { name: 'main' });
+  await settle();
+  assert.equal(wakes.length, 2, wakes.map((w) => w.text).join('\n'));
+  assert.match(wakes[1]!.text, /^\[main · closed by a caller that takes no reports; the shell /);
+});
+
+test("a taking caller refused with a session's name, as not found or already open, counts as shown it", async () => {
+  const { host } = setup();
+  await host.call(cli(), 'open', { name: 'main' });
+  await host.call(cli(), 'open', { name: 'work' });
+  assert.equal((await host.call(plain(), 'look', { name: 'nope' })).structured.error, 'session_not_found');
+  await host.call(cli(), 'close', { name: 'main' });
+  await host.call(cli(), 'open', { name: 'other' });
+  assert.equal((await host.call(plain(), 'open', { name: 'other' })).structured.error, 'session_exists');
+  await host.call(cli(), 'close', { name: 'other' });
+  const r = await host.call(plain(), 'list', {});
+  assert.match(r.text, /\[main · closed by a caller that takes no reports; /);
+  assert.match(r.text, /\[other · closed by a caller that takes no reports; /);
+});
+
+test("a taking caller refused because the session is still opening counts as shown it once it opens", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  const host = new Host({
+    openSession: async (o: OpenOptions) => {
+      await held;
+      return new FakeSession(o.name, o);
+    },
+    shell: '/bin/bash',
+    env: { HOME: '/home/u' },
+    sessionsDir: '/tmp/sessions',
+    startedAt: STARTED,
+  });
+  const opening = host.call(cli(), 'open', { name: 'main' });
+  await settle();
+  assert.equal((await host.call(plain(), 'open', { name: 'main' })).structured.error, 'session_exists');
+  release();
+  await opening;
+  await host.call(cli(), 'close', { name: 'main' });
+  const r = await host.call(plain(), 'list', {});
+  assert.match(r.text, /\n\nNot yet seen:\n\[main · closed by a caller that takes no reports; the shell /);
+});
+
+test('a session a caller taking none opened counts as shown once a wake about it is offered, before the host answers', async () => {
+  const { host, opened } = setup();
+  const wakes: Wake[] = [];
+  let accept!: (v: boolean) => void;
+  host.subscribe('a', (w) => {
+    wakes.push(w);
+    return wakes.length === 1 ? new Promise<boolean>((r) => (accept = r)) : Promise.resolve(true);
+  });
+  await host.call(cli(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(cli(), 'run', { name: 'main', command: 'make', wait: 0 });
+  s.end(2);
+  await settle();
+  assert.equal(wakes.length, 1);
+  await host.call(cli(), 'close', { name: 'main' });
+  accept(true);
+  await settle();
+  await settle();
+  assert.equal(wakes.length, 2, wakes.map((w) => w.text).join('\n'));
+  assert.match(wakes[1]!.text, /^\[main · closed by a caller that takes no reports; the shell /);
+});
+
 test('a session no caller taking reports used leaves nothing behind when one taking none closes it', async () => {
   const { host, opened } = setup();
   await host.call(cli(), 'open', { name: 'main' });
