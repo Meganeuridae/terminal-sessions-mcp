@@ -363,6 +363,7 @@ export class Host {
     if (text === '' && keys.length === 0) return refused('Nothing to send: give `text`, `keys`, or both.', { error: 'invalid_argument' });
     if (paste && text === '') return refused('Nothing was typed: `paste` sends `text` as a paste, so it needs `text`.', { error: 'invalid_argument' });
     if (paste && text.includes(PASTE_END)) return refused('Nothing was typed: `text` holds the bracketed-paste end marker, ESC [ 2 0 1 ~, which would end the paste early.', { error: 'invalid_argument' });
+    if (paste && /[\x03\x1a\x1c]/.test(text)) return refused('Nothing was typed: `text` holds Ctrl-C, Ctrl-Z or Ctrl-\\, which the terminal can act on itself, as a signal, rather than pass inside the paste. `keys` sends them.', { error: 'invalid_argument' });
     const until = a.wait_for !== undefined ? this.regex(a.wait_for as string, 'wait_for', 'nothing was typed') : undefined;
     const r = await e.session.send(text, { waitMs: this.waitMs(a), keys, ...(paste ? { paste } : {}), take: caller.takes, ...(until ? { until } : {}), ...(signal ? { signal } : {}) });
     held.took = r.took;

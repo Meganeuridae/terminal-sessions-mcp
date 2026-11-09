@@ -1254,6 +1254,19 @@ test('stopping the daemon logs each session whose close may have left processes 
   assert.match(lines[0]!, /^session "main" of scope "a" closed, but not every process it started could be listed; SIGHUP to group 77 \(EPERM\) weren't delivered: processes it started may live on$/);
 });
 
+test('a paste refuses text holding Ctrl-C, Ctrl-Z or Ctrl-\\, and types nothing', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  for (const ch of ['\x03', '\x1a', '\x1c']) {
+    const r = await host.call(plain(), 'send', { name: 'main', text: `a${ch}b`, paste: true });
+    assert.equal(r.isError, true, JSON.stringify(ch));
+    assert.equal(r.structured.error, 'invalid_argument');
+    assert.match(r.text, /^Nothing was typed: `text` holds Ctrl-C, Ctrl-Z or Ctrl-\\, /);
+  }
+  assert.equal(s.calls.filter((c) => c.method === 'send').length, 0);
+});
+
 test('look gives the ends its own wait took before the reports not yet seen, so a cut leaves them', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });
