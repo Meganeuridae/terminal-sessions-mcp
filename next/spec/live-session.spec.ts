@@ -1432,6 +1432,8 @@ for (const sh of shells) {
       // This fish starts with an empty configuration directory, rather than --no-config, as a user's starts with theirs.
       const env: Record<string, string> = sh.name === 'fish' ? { XDG_DATA_HOME: path.join(home, 'far-data'), XDG_CONFIG_HOME: path.join(home, 'far-config') } : sh.name === 'bash' ? { HISTFILE: file, PROMPT_COMMAND: 'history -w' } : { HISTFILE: file, SAVEHIST: '1000', HISTSIZE: '1000' };
       fs.mkdirSync(path.dirname(file), { recursive: true });
+      // As in `open`: fish 3 looks for this directory under its data directory.
+      if (sh.name === 'fish') fs.mkdirSync(path.join(home, 'far-data', 'fish', 'generated_completions'));
       fs.writeFileSync(file, '');
       await reachFar(s, shell, env, sh.name === 'zsh' ? ['-o', 'incappendhistory'] : []);
       const typed = await s.send('echo before-integrate\r', { waitMs: 5000, until: /^before-integrate$/ });
