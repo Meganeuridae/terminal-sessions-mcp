@@ -151,8 +151,11 @@ export interface Match {
   row?: number;
 }
 
-/** The events a call took, each emitted `taken` because this call was to give it: handed back untaken by a host that doesn't deliver the call's result, so it becomes a report and a wake. */
-export type Took = Array<Extract<SessionEvent, { kind: 'ended' | 'waiting' | 'exited' }>>;
+/**
+ * The events a call took, each emitted `taken` because this call was to give it: handed back untaken by a host that doesn't deliver the call's result, so it becomes a report and a wake.
+ * Every call that took one occurrence holds the same object, and `takers` counts those calls, so a host can hand an occurrence back only when none of them delivered it.
+ */
+export type Took = Array<Extract<SessionEvent, { kind: 'ended' | 'waiting' | 'exited' }> & { takers: number }>;
 
 export type RunOutcome =
   /** Not at a prompt, text pending at it, or the shell exited: `front` says which. Nothing was typed. */

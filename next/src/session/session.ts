@@ -348,7 +348,8 @@ class LiveSession implements Session {
       if (call.take) takers.push(call);
     }
     this.checkWatches(c);
-    for (const call of takers) call.took.push({ kind: 'ended', command: c, taken: true });
+    const took = { kind: 'ended' as const, command: c, taken: true, takers: takers.length };
+    for (const call of takers) call.took.push(took);
     this.emit({ kind: 'ended', command: c, taken: takers.length > 0 });
   }
 
@@ -377,7 +378,8 @@ class LiveSession implements Session {
     this.atPrompt = false;
     if (this.poll) clearTimeout(this.poll);
     const takers = [...this.calls].filter((c) => c.take);
-    for (const call of takers) call.took.push({ kind: 'exited', exit, taken: true });
+    const took = { kind: 'exited' as const, exit, taken: true, takers: takers.length };
+    for (const call of takers) call.took.push(took);
     this.emit({ kind: 'exited', exit, taken: takers.length > 0 });
     this.wake();
   }
@@ -410,7 +412,8 @@ class LiveSession implements Session {
     const key = `${f.process.pgid}:${f.since}`;
     if (key === this.waitingKey) return;
     this.waitingKey = key;
-    for (const call of takers) call.took.push({ kind: 'waiting', front: f, taken: true });
+    const took = { kind: 'waiting' as const, front: f, taken: true, takers: takers.length };
+    for (const call of takers) call.took.push(took);
     this.emit({ kind: 'waiting', front: f, taken: takers.length > 0 });
   }
 

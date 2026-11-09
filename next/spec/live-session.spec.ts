@@ -1046,6 +1046,24 @@ for (const sh of shells) {
       assert.equal(all[all.length - 1], screen.rows[screen.cursor.row]);
     });
 
+    test('two waits that take one command\'s end hold the same object, which counts them both', async () => {
+      const s = await open(shell);
+      const gate = newGate();
+      fs.writeFileSync(gate, '');
+      const r = await s.run(holdJob(gate), { waitMs: 200 });
+      assert.equal(r.kind, 'running');
+      const c = (r as { command: Command }).command;
+      const a = s.wait({ kind: 'end' }, { waitMs: 30_000, from: s.lines(0).to });
+      const b = s.wait({ kind: 'end' }, { waitMs: 30_000, from: s.lines(0).to });
+      fs.rmSync(gate);
+      const [ea, eb] = await Promise.all([a, b]);
+      assert.deepEqual([ea.by, eb.by], ['end', 'end']);
+      const ta = ea.took.find((e) => e.kind === 'ended' && e.command === c);
+      assert.ok(ta, JSON.stringify(ea.took));
+      assert.equal(eb.took.find((e) => e.kind === 'ended' && e.command === c), ta);
+      assert.equal(ta.takers, 2);
+    });
+
     test('a wait cancelled after a command ended returns that end among what it took', async () => {
       const s = await open(shell);
       const gate = newGate();
