@@ -4,10 +4,10 @@
 
 A new implementation ships beside the 1.x session server, MCP bridge and CLI. It lives in `next/`
 (`next/README.md`); its binaries are `termd`, `tsm` and `tsm-relay`. 2.0 removes or renames nothing
-of 1.x: `terminal-sessions-mcp`, `session-server` and `session-cli` run 1.x, and 2.0 changes one
-thing they do, their graceful kill (below). Otherwise, what reaches them is the package they share
-with 2.0: a narrower Node range (`engines`), `npm run build` and `npm test` building 2.0 too, and
-2.0's dependencies installing with it. The lockfile also moves `@types/node` from 20 to 22, and `express-rate-limit`, `hono` and `ip-address` up a patch release each.
+of 1.x: `terminal-sessions-mcp`, `session-server` and `session-cli` run 1.x, and 2.0 changes what's
+listed below: their graceful kill, under "Changed", and three fixes, under "Fixed in 1.x". Otherwise,
+what reaches them is the package they share with 2.0: a narrower Node range (`engines`),
+`npm run build` and `npm test` building 2.0 too, and 2.0's dependencies installing with it. The lockfile also moves `@types/node` from 20 to 22, and `express-rate-limit`, `hono` and `ip-address` up a patch release each.
 
 ### Added
 
@@ -46,7 +46,20 @@ with 2.0: a narrower Node range (`engines`), `npm run build` and `npm test` buil
 - **1.x's graceful `killSession` and `killAll` hang up every process on the session's terminal**
   once the shell is gone, as 2.0's `close` does. A disowned job, or one started from a subshell, no
   longer outlives a graceful kill. A process started with `setsid` or `nohup` still does. A forced
-  kill still KILLs the shell alone, and on Windows the kill is as before.
+  kill still KILLs the shell alone, and on Windows the kill is as before. Listing the terminal's
+  processes, the 3 s wait for the shell and the hangup share one deadline, 10 s from the kill's
+  start: the time `RobustSessionClient` gives a request. A kill that uses all 10 s can still answer
+  after the client has given up.
+
+### Fixed in 1.x
+
+- **On macOS, a shell can start after an `npm install`.** node-pty 1.1.0 ships its prebuilt
+  `spawn-helper` without its execute bit, and `postinstall` made only `build/Release`'s executable.
+  It now makes executable every `spawn-helper` node-pty can load.
+- **When a shell can't start because that helper isn't executable,** as after an install that skips
+  lifecycle scripts, the error names the helper and gives the `chmod` that fixes it.
+- **`killAll` no longer forgets a session opened while it runs.** It cleared every entry once its
+  kills were done, so that session's shell lived on with nothing to reach it.
 
 ### Removed from 1.x
 
