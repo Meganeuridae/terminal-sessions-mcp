@@ -1122,6 +1122,49 @@ test('closing a session returns the reports about it that no one has seen, since
   assert.equal((r.structured.unseen as string[]).length, 1);
 });
 
+test('a session that a caller taking no reports closes, after one taking them used it, leaves its unseen reports and its close for list, and frees its name', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(plain(), 'run', { name: 'main', command: 'make', wait: 0 });
+  s.end(2);
+  await settle();
+  const closed = await host.call(cli(), 'close', { name: 'main' });
+  assert.match(closed.text, /\n\nNot yet seen:\n\[main · command 1 · exit 2 /);
+  assert.equal((await host.call(cli(), 'open', { name: 'main' })).isError, undefined, 'the name is free at once');
+  const first = await host.call(plain(), 'list', {});
+  assert.match(first.text, /\n\nNot yet seen:\n\[main · command 1 · exit 2 [^\n]*\n\[main · closed by a caller that takes no reports; the shell /);
+  assert.equal(((await host.call(plain(), 'list', {})).structured.unseen as string[]).length, 0, 'a taking list forgets them');
+});
+
+test('a host that takes reports is woken when a caller taking none closes a session it used', async () => {
+  const { host, opened } = setup();
+  const wakes: Wake[] = [];
+  host.subscribe('a', async (w) => (wakes.push(w), true));
+  await host.call(agent(), 'open', { name: 'main' });
+  await host.call(cli(), 'close', { name: 'main' });
+  await settle();
+  assert.equal(opened.length, 1);
+  assert.deepEqual(wakes.map((w) => w.tag), ['terminal:exited']);
+  assert.match(wakes[0]!.text, /^\[main · closed by a caller that takes no reports; the shell /);
+  assert.equal(((await host.call(plain(), 'list', {})).structured.unseen as string[] | undefined)?.length ?? 0, 0);
+});
+
+test('a session no caller taking reports used leaves nothing behind when one taking none closes it', async () => {
+  const { host, opened } = setup();
+  await host.call(cli(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(cli(), 'run', { name: 'main', command: 'make', wait: 0 });
+  s.end(2);
+  await settle();
+  await host.call(cli(), 'close', { name: 'main' });
+  const r = await host.call(plain(), 'list', {});
+  assert.match(r.text, /^No session is open in scope "a"\.$/);
+  assert.equal((r.structured.unseen as string[] | undefined)?.length ?? 0, 0);
+});
+
 test('look gives the ends its own wait took before the reports not yet seen, so a cut leaves them', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });

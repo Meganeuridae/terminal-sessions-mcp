@@ -77,6 +77,7 @@ interface Entry {
   settling: Set<Promise<void>>;
   latest: Map<string, { at: number; command: number | undefined }>;
   off: () => void;
+  takerUsed: boolean;
 }
 
 interface Held {
@@ -90,6 +91,7 @@ const keyOf = (scope: string, name: string): string => `${scope}\u0000${name}`;
 
 export class Host {
   private readonly entries = new Map<string, Entry>();
+  private readonly left = new Map<string, Unseen[]>();
   private readonly subscribers = new Map<string, Set<Subscriber>>();
   private readonly opening = new Set<string>();
   private readonly starting = new Set<Promise<void>>();
@@ -141,6 +143,7 @@ export class Host {
       const name = a.name as string;
       const entry = this.entries.get(keyOf(caller.scope, name));
       if (!entry) return this.noSession(caller, name);
+      if (caller.takes) entry.takerUsed = true;
       if (entry.closing && (tool === 'run' || tool === 'send' || tool === 'stop' || tool === 'integrate')) {
         return refused(`Session ${JSON.stringify(name)} is closing, so nothing was ${tool === 'stop' ? 'sent' : 'typed'}. \`close\` with \`force\` ends it at once.`, { error: 'session_exited', session: name });
       }
@@ -263,7 +266,7 @@ export class Host {
       await session.close({ force: true, deadline: this.stopping });
       return refused('The daemon stopped while this session started, so its shell is closed.', { error: 'backend_failure' });
     }
-    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {} };
+    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes };
     entry.off = session.onEvent((ev) => this.onEvent(entry, ev));
     this.entries.set(k, entry);
     const front = session.front();
@@ -274,15 +277,17 @@ export class Host {
 
   private list(caller: Caller): ToolResult {
     const mine = [...this.entries.values()].filter((e) => e.scope === caller.scope);
-    if (!mine.length) return ok(`No session is open in scope ${JSON.stringify(caller.scope)}.`, { sessions: [] });
+    const left = this.left.get(caller.scope) ?? [];
+    const none = `No session is open in scope ${JSON.stringify(caller.scope)}.`;
+    if (!mine.length && !left.length) return ok(none, { sessions: [] });
     const now = this.now();
     const rows = mine.map((e) => {
       const front = e.session.front();
       return { e, front, line: `${e.name}: ${frontText(front, now)} · ${dirText(e.session.cwd())}${e.unseen.size ? ` · ${reportsText(e.unseen.size)}` : ''}` };
     });
-    const pending = rows.flatMap((r) => [...r.e.unseen.values()].map((u) => ({ e: r.e, u }))).sort((a, b) => a.u.at - b.u.at);
+    const pending = [...rows.flatMap((r) => [...r.e.unseen.values()].map((u) => ({ e: r.e as Entry | undefined, u }))), ...left.map((u) => ({ e: undefined, u }))].sort((a, b) => a.u.at - b.u.at);
     const build = (n: number): { joined: string; ends: number[] } => {
-      let joined = rows.slice(0, n).map((r) => r.line).join('\n');
+      let joined = rows.length ? rows.slice(0, n).map((r) => r.line).join('\n') : none;
       if (n < rows.length) joined += `\n… ${rows.length - n} more session${rows.length - n === 1 ? '' : 's'}, listed in structuredContent`;
       if (pending.length) joined += '\n\nNot yet seen:';
       const ends = pending.map((p) => (joined += `\n${p.u.lines.join('\n')}`).length);
@@ -560,6 +565,7 @@ export class Host {
     const k = keyOf(e.scope, e.name);
     if (this.entries.get(k) === e) this.entries.delete(k);
     const how = exit.unconfirmed ? `was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it` : exitText(exit);
+    if (!caller.takes && e.takerUsed) this.leave(e, how);
     const unlisted = exit.unlisted ? " The session couldn't list every process it started, so jobs it started may live on." : '';
     const unreached = exit.unreached?.length ? ` These signals weren't delivered: ${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')}. Their processes may live on.` : '';
     return ok(`[${e.name} · closed]\nThe shell ${how}.${unlisted}${unreached}${unseen.length ? `\n\nNot yet seen:\n${unseen.join('\n')}` : ''}`, { session: e.name, exit, ...(unseen.length ? { unseen } : {}) });
@@ -717,17 +723,33 @@ export class Host {
     }
   }
 
-  private nextUnseen(scope: string, after: number): { e: Entry; u: Unseen } | undefined {
-    let best: { e: Entry; u: Unseen } | undefined;
+  private nextUnseen(scope: string, after: number): { e: Entry | undefined; u: Unseen } | undefined {
+    let best: { e: Entry | undefined; u: Unseen } | undefined;
     for (const e of this.entries.values()) {
       if (e.scope !== scope) continue;
       for (const u of e.unseen.values()) if (u.seq > after && (!best || u.seq < best.u.seq)) best = { e, u };
     }
+    for (const u of this.left.get(scope) ?? []) if (u.seq > after && (!best || u.seq < best.u.seq)) best = { e: undefined, u };
     return best;
   }
 
-  private forget(e: Entry, u: Unseen): void {
-    if (e.unseen.get(u.wake.key) === u) e.unseen.delete(u.wake.key);
+  private leave(e: Entry, how: string): void {
+    const text = fitted(`[${e.name} · closed by a caller that takes no reports; the shell ${how}]`);
+    const seq = ++this.wakeSeq;
+    const exited: Unseen = { seq, at: seq, wake: { scope: e.scope, session: e.name, tag: 'terminal:exited', key: this.pushKey(e, undefined), text }, lines: [text], command: undefined };
+    this.left.set(e.scope, [...(this.left.get(e.scope) ?? []), ...e.unseen.values(), exited]);
+    e.unseen.clear();
+    this.pump(e.scope);
+  }
+
+  private forget(e: Entry | undefined, u: Unseen): void {
+    if (e) {
+      if (e.unseen.get(u.wake.key) === u) e.unseen.delete(u.wake.key);
+      return;
+    }
+    const rest = (this.left.get(u.wake.scope) ?? []).filter((x) => x !== u);
+    if (rest.length) this.left.set(u.wake.scope, rest);
+    else this.left.delete(u.wake.scope);
   }
 }
 
