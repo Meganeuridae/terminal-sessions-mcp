@@ -18,6 +18,7 @@ test('H9: the CLI maps its words to the nine tools\' arguments', () => {
   assert.deepEqual(parseCli(['read', 'main', '--lines', '10:20']), { scope: 'default', call: { tool: 'read', args: { name: 'main', lines: [10, 20] } } });
   assert.deepEqual(parseCli(['close', 'main', '--force']), { scope: 'default', call: { tool: 'close', args: { name: 'main', force: true } } });
   assert.deepEqual(parseCli(['list']), { scope: 'default', call: { tool: 'list', args: {} } });
+  assert.deepEqual(parseCli(['stop', 'main', '--signal', 'SIGUSR1']), { scope: 'default', call: { tool: 'stop', args: { name: 'main', signal: 'USR1' } } });
   assert.deepEqual(parseCli(['integrate', 'main', '--wait', '20']), { scope: 'default', call: { tool: 'integrate', args: { name: 'main', wait: 20 } } });
   assert.deepEqual(parseCli(['daemon', 'stop']), { scope: 'default', call: { daemonStop: true } });
   assert.deepEqual(parseCli(['run', 'main', '--wait', '5', '--', 'grep', '--color', 'x']), { scope: 'default', call: { tool: 'run', args: { name: 'main', wait: 5, command: 'grep --color x' } } });

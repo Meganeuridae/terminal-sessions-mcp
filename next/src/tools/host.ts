@@ -325,7 +325,8 @@ export class Host {
       command: c,
       front: r.front,
       running: r.kind === 'running',
-      exitCode: c.end?.status ?? null,
+      exitCode: c.end?.stopped ? null : (c.end?.status ?? null),
+      ...(c.end?.stopped ? { stopped: true } : {}),
       ...outputValue(out.lines, budget),
       ...(out.dropped ? { outputDropped: out.dropped } : {}),
     });
@@ -462,7 +463,9 @@ export class Host {
   }
 
   private async stop(e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined): Promise<ToolResult> {
-    const r = await e.session.stop(a.signal !== undefined ? (`SIG${a.signal as string}` as NodeJS.Signals) : undefined, signal ? { abort: signal } : {});
+    const name = a.signal === undefined ? undefined : `SIG${(a.signal as string).toUpperCase().replace(/^SIG/, '')}`;
+    if (name !== undefined && !(name in os.constants.signals)) return refused(`${JSON.stringify(a.signal)} isn't a signal this system has. Nothing was sent.`, { error: 'invalid_argument' });
+    const r = await e.session.stop(name as NodeJS.Signals | undefined, signal ? { abort: signal } : {});
     if (r.cancelled || signal?.aborted) return CANCELLED;
     const now = this.now();
     const steps = r.steps.map((s) =>
@@ -470,7 +473,7 @@ export class Host {
         ? `${s.sent} wasn't delivered${s.to ? ` to ${quoted(s.to.argv)}` : ''} (${s.refused}), so no further step was taken: now ${frontText(s.front, now)}.`
         : s.withheld
           ? `${s.sent} wasn't sent${s.to ? ` to ${quoted(s.to.argv)}` : ''}: the shell's processes couldn't be listed, so its group couldn't be confirmed as still the shell's, and no further step was taken: now ${frontText(s.front, now)}.`
-          : `Sent ${s.sent}${s.to ? ` to ${quoted(s.to.argv)}` : ''}: now ${frontText(s.front, now)}.`,
+          : `Sent ${s.sent}${s.to ? ` to ${quoted(s.to.argv)}` : ''}: now ${frontText(s.front, now)}.${s.stopped ? ' The job is stopped: `jobs` lists it, and `run fg` or `run bg` continues it.' : ''}`,
     );
     const farSignal = r.within === true && a.signal !== undefined;
     if (farSignal) {

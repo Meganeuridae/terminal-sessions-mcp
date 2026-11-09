@@ -1760,3 +1760,52 @@ test('integrated carries what the far shell printed while taking the hooks, once
   assert.doesNotMatch(quiet.text, /printed/);
   assert.equal('printed' in (quiet.structured.integrated as object), false);
 });
+
+test('stop takes any signal this system has, by name, with or without SIG, and refuses one it doesn\'t have', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  for (const [given, sent] of [['USR1', 'SIGUSR1'], ['SIGWINCH', 'SIGWINCH'], ['tstp', 'SIGTSTP']] as const) {
+    await host.call(plain(), 'stop', { name: 'main', signal: given });
+    assert.deepEqual(s.calls.at(-1), { method: 'stop', args: [sent] }, given);
+  }
+  const before = s.calls.length;
+  const bad = await host.call(plain(), 'stop', { name: 'main', signal: 'NOPE' });
+  assert.equal(bad.isError, true);
+  assert.equal(bad.text, '"NOPE" isn\'t a signal this system has. Nothing was sent.');
+  assert.equal(bad.structured.error, 'invalid_argument');
+  assert.equal(s.calls.length, before);
+});
+
+test("a command a stop signal stopped reads as stopped, not exited: exitCode is null, with stopped beside it, and the status line keeps what the shell reported", async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const run = s.run.bind(s);
+  s.run = async (text, opts) => {
+    const r = await run(text, opts);
+    if (r.kind === 'ended') Object.assign(r.command.end!, { stopped: true });
+    return r;
+  };
+  for (const status of [0, 148]) {
+    s.runStatus = status;
+    const r = await host.call(agent(), 'run', { name: 'main', command: 'vim notes' });
+    assert.equal(r.isError, undefined, r.text);
+    assert.match(r.text.split('\n')[0]!, new RegExp(` · stopped \\(the shell reported exit ${status}\\) · `), r.text);
+    assert.equal(r.structured.exitCode, null);
+    assert.equal(r.structured.stopped, true);
+  }
+});
+
+test('a stop step that stopped the job says so, and how to continue it', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const front = { state: 'prompt' as const, since: Date.now() };
+  s.stop = async () => ({ steps: [{ sent: 'SIGTSTP', to: { pgid: 9, argv: 'vim notes', shell: false }, front, stopped: true }], front });
+  const r = await host.call(plain(), 'stop', { name: 'main', signal: 'TSTP' });
+  assert.equal(r.isError, undefined, r.text);
+  assert.match(r.text, /\nSent SIGTSTP to [^\n]*vim notes[^\n]*: now at the prompt\. The job is stopped: `jobs` lists it, and `run fg` or `run bg` continues it\.$/);
+  s.stop = async () => ({ steps: [{ sent: 'SIGUSR1', to: { pgid: 9, argv: 'dd', shell: false }, front }], front });
+  assert.doesNotMatch((await host.call(plain(), 'stop', { name: 'main', signal: 'USR1' })).text, /stopped/);
+});
