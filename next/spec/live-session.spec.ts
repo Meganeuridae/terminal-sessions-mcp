@@ -1,4 +1,4 @@
-import { after, describe, test } from 'node:test';
+import { after, afterEach, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
@@ -26,6 +26,15 @@ let homes = 0;
 const sessions: Session[] = [];
 /** A deadline for `close`, on `performance.now()`'s clock. */
 const by = (ms = 30_000): number => performance.now() + ms;
+// Each test's sessions close as it ends. With every session held to the suite's end, the last tests' shells failed to start
+// on macOS.
+let openedBefore = 0;
+beforeEach(() => {
+  openedBefore = sessions.length;
+});
+afterEach(async () => {
+  for (const s of sessions.slice(openedBefore)) await s.close({ force: true, deadline: by() });
+});
 after(async () => {
   for (const s of sessions) await s.close({ force: true, deadline: by() });
   fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5 });
