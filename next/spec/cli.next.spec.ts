@@ -140,7 +140,7 @@ test('the CLI decodes a character split across chunks, reports a line that is no
     assert.equal((await run(split.socket, 'list')).out, 'café\n');
     const stopped = await run(split.socket, 'daemon', 'stop');
     assert.equal(stopped.code, 1);
-    assert.match(stopped.err, /^tsm: the daemon \(pid 4242, as it named itself\) didn't stop within 300 ms; if it is stuck, `kill 4242` ends it and every shell it holds\n$/);
+    assert.match(stopped.err, /^tsm: the daemon \(pid 4242, as it named itself\) didn't stop within 300 ms; if it is stuck, `kill -KILL 4242` ends it, and each shell gets the hangup a closing terminal sends: the shell ends, with the jobs it hangs up, and a job it disowned or started with nohup lives on\n$/);
     await split.close();
     const bad = await standIn(dir, daemon, () => [Buffer.from('not json\n')]);
     const r = await run(bad.socket, 'list');

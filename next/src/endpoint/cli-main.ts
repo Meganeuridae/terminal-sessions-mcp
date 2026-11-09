@@ -203,7 +203,7 @@ export async function runCli(o: CliOptions & { socket: string; version: string; 
       const bound = o.reachMs ?? REACH_MS;
       const end = performance.now() + bound;
       const pid = r.daemon.pid;
-      const wedged = `the daemon (pid ${pid}, as it named itself) didn't stop within ${bound} ms; if it is stuck, \`kill ${pid}\` ends it and every shell it holds`;
+      const wedged = `the daemon (pid ${pid}, as it named itself) didn't stop within ${bound} ms; if it is stuck, \`kill -KILL ${pid}\` ends it, and each shell gets the hangup a closing terminal sends: the shell ends, with the jobs it hangs up, and a job it disowned or started with nohup lives on`;
       const answer = await within(rpc(r, STOP, {}, 1).catch((e: unknown): Record<string, unknown> => {
         if (e instanceof ConnectionClosed) return {};
         throw e;
