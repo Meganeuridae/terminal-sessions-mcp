@@ -342,6 +342,7 @@ export class Host {
       running: r.kind === 'running',
       exitCode: c.end?.stopped ? null : (c.end?.status ?? null),
       ...(c.end?.stopped ? { stopped: true } : {}),
+      ...(c.end?.unfollowed ? { unfollowed: true } : {}),
       ...outputValue(out.lines, budget),
       ...(out.dropped ? { outputDropped: out.dropped } : {}),
     });
@@ -612,7 +613,7 @@ export class Host {
       const front = ev.kind === 'waiting' ? e.session.front() : undefined;
       const over = ev.kind === 'waiting' && (e.closing || front?.state !== 'waiting' || front.process.pgid !== ev.front.process.pgid || front.since !== ev.front.since);
       if (s.count === ev.takers && !s.shown && !over) this.onEvent(e, { ...ev, taken: false }, { dying, at: this.happened.get(occurrenceOf(ev)) ?? ++this.wakeSeq });
-      dying = ev.kind === 'ended' && ev.command.end?.status === undefined ? ev.command.id : undefined;
+      dying = ev.kind === 'ended' && ev.command.end?.status === undefined && !ev.command.end?.unfollowed ? ev.command.id : undefined;
     }
   }
 
@@ -637,7 +638,7 @@ export class Host {
   private onEvent(e: Entry, ev: SessionEvent, restored?: { dying: number | undefined; at: number }): void {
     if (e.closing && !restored) return;
     const dying = restored ? restored.dying : e.dying;
-    if (!restored) e.dying = ev.kind === 'ended' && ev.command.end?.status === undefined ? ev.command.id : undefined;
+    if (!restored) e.dying = ev.kind === 'ended' && ev.command.end?.status === undefined && !ev.command.end?.unfollowed ? ev.command.id : undefined;
     if (ev.kind === 'ended') for (const [id, w] of e.watches) if (w.command === ev.command.id) (e.session.unwatch(id), e.watches.delete(id));
     this.retire(e);
     let at: number | undefined;
@@ -766,13 +767,13 @@ async function firstMatch(re: RegExp, l: Lines, deadline: number, stopped: () =>
 
 const RAN_OUT = `before the ${WAIT_MAX_S} s a call may hold ran out`;
 
-const endedLine = (c: Command): string => `Command ${c.id} ended: ${endingText(c).join(' · ')}.`;
+const endedLine = (c: Command): string => `Command ${c.id}${c.end?.unfollowed ? '' : ' ended'}: ${endingText(c).join(' · ')}.`;
 
 const endOf = (c: Command): Command[] => (c.end ? [c] : []);
 
 const occurrenceOf = (ev: Exclude<SessionEvent, { kind: 'match' }>): object => (ev.kind === 'ended' ? ev.command : ev.kind === 'waiting' ? ev.front : ev.exit);
 
-const typedText = (c: Command): string => `Command ${c.id} was typed${c.end ? `, and ended: ${endingText(c).join(' · ')}` : ', and the close ended its shell before it ended'}.`;
+const typedText = (c: Command): string => `Command ${c.id} was typed${c.end ? `${c.end.unfollowed ? ':' : ', and ended:'} ${endingText(c).join(' · ')}` : ', and the close ended its shell before it ended'}.`;
 
 const turn = (): Promise<void> => new Promise((r) => setImmediate(r));
 

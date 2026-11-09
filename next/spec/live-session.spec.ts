@@ -1426,6 +1426,7 @@ for (const sh of shells) {
       assert.equal(e.kind, 'ended', JSON.stringify(e));
       // fish runs its postexec handlers for exit, so its end mark comes; bash and zsh exit first, and the command ends with no status.
       assert.equal(e.kind === 'ended' ? e.command.end?.status : 'x', sh.name === 'fish' ? 0 : undefined);
+      if (sh.name !== 'fish') assert.equal(e.kind === 'ended' ? e.command.end?.unfollowed?.how : 'x', 'ended', JSON.stringify(e));
       await s.wait({ kind: 'end' }, { waitMs: 10_000, from: 0 });
       const f = s.front();
       assert.equal(f.state, 'prompt');
@@ -1856,6 +1857,211 @@ test('integrate names a shell it has no hooks for, and types nothing more', { sk
   assert.equal(r.kind === 'unsupported' && r.shell, 'dash');
   assert.equal(s.front().state, 'running');
   assert.equal((await s.run('echo x', { waitMs: 500 })).kind, 'refused');
+});
+
+test("a shell given the integration through a program that ends is no longer followed, and what's typed next is the local shell's", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open('/bin/sh');
+  await far(s, which('bash')!);
+  const integrated = s.front();
+  assert.notEqual(integrated.state === 'prompt' ? integrated.within : undefined, undefined);
+  const e = await s.run('exit', { waitMs: 10_000 });
+  assert.equal(e.kind, 'ended', JSON.stringify(e));
+  const end = e.kind === 'ended' ? e.command.end : undefined;
+  assert.equal(end?.status, undefined);
+  // The far shell's own end wasn't seen, only its carrier's.
+  assert.match(end?.unfollowed?.by ?? '', /script/, JSON.stringify(end));
+  const f = await eventually('the local shell is in front', () => {
+    const now = s.front();
+    return now.state === 'prompt' && now;
+  });
+  assert.equal(f.state === 'prompt' ? f.within : 'x', undefined);
+  assert.deepEqual(out(s, await ran(s, 'echo local')), ['local']);
+  const job = await s.run('sleep 30', { waitMs: 300 });
+  assert.equal(job.kind, 'running', JSON.stringify(job));
+  const stopped = await s.stop();
+  assert.equal(stopped.within, undefined);
+  assert.equal(stopped.steps[0]?.sent, 'C-c');
+  await s.close({ force: true, deadline: by() });
+});
+
+/** `reachFar` through `script`, with `then` run after the carrier on the same line, and `integrate`; returns the carrier's group. */
+async function farThen(s: Session, then: string): Promise<number> {
+  const from = s.lines(0).to - 1;
+  const r = await s.run(`${relayed(which('bash')!)}; ${then}`, { waitMs: 200 });
+  assert.equal(r.kind, 'running', JSON.stringify(r));
+  assert.equal((await s.wait({ kind: 'match', pattern: /^far> ?$/ }, { waitMs: 10_000, from })).by, 'match');
+  assert.equal((await s.integrate({ waitMs: 10_000 })).kind, 'integrated');
+  const f = s.front();
+  assert.ok(f.state === 'prompt' && f.within, JSON.stringify(f));
+  return f.state === 'prompt' ? f.within!.pgid : 0;
+}
+
+test('once the carrier ends and the same line starts another program in front, the far shell is no longer followed, and run types nothing into that program', { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open('/bin/sh');
+  const capture = path.join(tmp, `capture-${++gates}`);
+  const w = await farThen(s, `cat > '${capture}'`);
+  // Ended from outside while the far shell is idle, as a dropped connection ends ssh: nothing typed there gives a mark.
+  process.kill(-w, 'SIGTERM');
+  await eventually('cat holds the terminal', () => {
+    const shell = proc.info(s.pid);
+    return shell?.tpgid !== undefined && shell.tpgid !== shell.pgrp && shell.tpgid !== w && proc.groupAlive(w) === false;
+  });
+  const f = s.front();
+  // Waiting where the kernel shows cat reading its terminal, running where it can't.
+  assert.ok(f.state === 'waiting' ? /cat/.test(f.process.argv) : f.state === 'running' && /cat/.test(f.process.argv) && f.within === undefined, JSON.stringify(f));
+  assert.equal((await s.run('echo MUST_NOT_REACH_CAT', { waitMs: 300 })).kind, 'refused');
+  await s.close({ force: true, deadline: by() });
+  assert.doesNotMatch(fs.existsSync(capture) ? fs.readFileSync(capture, 'utf8') : '', /MUST_NOT_REACH_CAT|__tsm/);
+});
+
+test("a shell reached through a program that a local shell with the integration started is followed only while that program holds the terminal, and the local shell stays followed", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open('/bin/sh');
+  const local = await localFar(s);
+  const capture = path.join(tmp, `capture-${++gates}`);
+  await farThen(s, `cat > '${capture}'`);
+  const integrated = s.front();
+  // The program now in front, as the kernel shows it: script, a job of the local bash.
+  const w = proc.info(s.pid)?.tpgid ?? 0;
+  assert.ok(w > 0 && w !== local, JSON.stringify({ w, local }));
+  // Ended from outside while the far shell is idle, as a dropped connection ends ssh.
+  process.kill(-w, 'SIGTERM');
+  await eventually('cat holds the terminal', () => {
+    const shell = proc.info(s.pid);
+    return shell?.tpgid !== undefined && shell.tpgid !== shell.pgrp && shell.tpgid !== w && shell.tpgid !== local && proc.groupAlive(w) === false;
+  });
+  const f = s.front();
+  // cat is a job of the local bash, whose chain stays: its line is still running.
+  assert.ok(f.state === 'running' && f.within?.pgid === local, JSON.stringify(f));
+  assert.equal((await s.run('echo MUST_NOT_REACH_CAT', { waitMs: 300 })).kind, 'refused');
+  await s.close({ force: true, deadline: by() });
+  assert.doesNotMatch(fs.existsSync(capture) ? fs.readFileSync(capture, 'utf8') : '', /MUST_NOT_REACH_CAT|__tsm/);
+  assert.deepEqual(integrated.state === 'prompt' ? integrated.within?.pgid : 'x', w, 'the far shell was reached through script, not through the local bash');
+});
+
+test("a command in a far shell reached from another far shell, which ends there, is no longer followed with the shell below at its prompt again, not as left", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open('/bin/sh');
+  await far(s, which('bash')!);
+  // The second script runs inside the first far shell, on its terminal, so this terminal's foreground group is still the first.
+  await far(s, which('bash')!);
+  const f = s.front();
+  assert.ok(f.state === 'prompt' && f.within, JSON.stringify(f));
+  const e = await s.run('exit', { waitMs: 10_000 });
+  assert.equal(e.kind, 'ended', JSON.stringify(e));
+  const end = e.kind === 'ended' ? e.command.end : undefined;
+  assert.deepEqual([end?.status, end?.unfollowed?.how], [undefined, 'back'], JSON.stringify(end));
+  assert.match(end?.unfollowed?.by ?? '', /script/);
+  const below = s.front();
+  assert.ok(below.state === 'prompt' && below.within, JSON.stringify(below));
+  await s.close({ force: true, deadline: by() });
+});
+
+test("a far command whose carrier is suspended is no longer followed, and its end says the carrier left the terminal, not that it ended", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open('/bin/sh');
+  const w = await farThen(s, 'true');
+  const r = await s.run('sleep 300', { waitMs: 300 });
+  assert.equal(r.kind, 'running', JSON.stringify(r));
+  // What Ctrl-Z does to a local ssh: its group stops, and the shell takes the terminal back.
+  process.kill(-w, 'SIGSTOP');
+  try {
+    // Each try looks, as an agent's look does: on macOS nothing else reads the terminal while a command runs.
+    const end = await eventually('the far command is no longer followed', () => (s.front(), r.kind === 'running' ? r.command.end : undefined));
+    assert.deepEqual([end.status, end.unfollowed?.how], [undefined, 'left'], JSON.stringify(end));
+    assert.match(end.unfollowed?.by ?? '', /script/);
+    const f = s.front();
+    assert.equal(f.state === 'prompt' || f.state === 'running' ? f.within : 'x', undefined);
+  } finally {
+    process.kill(-w, 'SIGKILL');
+    await s.close({ force: true, deadline: by() });
+  }
+});
+
+test("at the end mark of a shell with the integration, a far command whose carrier stopped is no longer followed, and its end says the carrier left the terminal", { ...darwinOnly, skip: darwinOnly.skip || (which('bash') ? false : 'bash is needed') }, async () => {
+  const s = await open(which('bash')!);
+  await reachFar(s, which('bash')!);
+  assert.equal((await s.integrate({ waitMs: 10_000 })).kind, 'integrated');
+  const f = s.front();
+  const w = f.state === 'prompt' && f.within ? f.within.pgid : 0;
+  assert.ok(w > 0, JSON.stringify(f));
+  const r = await s.run('sleep 300', { waitMs: 300 });
+  assert.equal(r.kind, 'running', JSON.stringify(r));
+  try {
+    // With ps failing, nothing can read who holds the terminal, so only the session shell's end mark can drop the far chain.
+    await failing('ps', '/bin/ps', async (ps) => {
+      ps.on();
+      // What Ctrl-Z does to a local ssh: its group stops, and the session's shell gives its end mark.
+      process.kill(-w, 'SIGSTOP');
+      const end = await eventually('the far command is no longer followed', () => (s.front(), r.kind === 'running' ? r.command.end : undefined));
+      ps.off();
+      assert.deepEqual([end.status, end.unfollowed?.how], [undefined, 'left'], JSON.stringify(end));
+    });
+  } finally {
+    process.kill(-w, 'SIGKILL');
+    await s.close({ force: true, deadline: by() });
+  }
+});
+
+test("a local shell given the integration stays followed while a job it started holds the terminal", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open('/bin/sh');
+  // A local bash, as su or sudo -i would start: its jobs take the terminal in groups of their own.
+  await localFar(s);
+  const job = await s.run('sleep 2', { waitMs: 500 });
+  assert.equal(job.kind, 'running', JSON.stringify(job));
+  const f = s.front();
+  assert.ok(f.state === 'running' && f.within, JSON.stringify(f));
+  const ended = await s.wait({ kind: 'end' }, { waitMs: 10_000, from: 0 });
+  assert.equal(ended.by, 'end');
+  const end = job.kind === 'running' ? job.command.end : undefined;
+  assert.deepEqual([end?.status, end?.unfollowed], [0, undefined], JSON.stringify(end));
+  await s.close({ force: true, deadline: by() });
+});
+
+/** A local bash given the integration in `s`, at its prompt; returns its group. */
+async function localFar(s: Session): Promise<number> {
+  const from = s.lines(0).to - 1;
+  const r = await s.run(`env -i HOME='${lastHome()}' PATH='${process.env.PATH ?? '/usr/bin:/bin'}' TERM=xterm-256color PS1='far> ' '${which('bash')!}' --norc --noprofile -i`, { waitMs: 200 });
+  assert.equal(r.kind, 'running', JSON.stringify(r));
+  assert.equal((await s.wait({ kind: 'match', pattern: /^far> ?$/ }, { waitMs: 10_000, from })).by, 'match');
+  assert.equal((await s.integrate({ waitMs: 10_000 })).kind, 'integrated');
+  const f = s.front();
+  return f.state === 'prompt' && f.within ? f.within.pgid : 0;
+}
+
+for (const [unseen, filter] of [
+  ['the group in front', (w: number) => `awk '$2 != ${w}'`],
+  ["the carrier's own processes", (w: number) => `awk '$1 != ${w}'`],
+] as const) {
+  test(`a listing that doesn't show ${unseen} leaves the far shell followed and the front unknown, rather than dropping it`, darwinOnly, async () => {
+    const s = await open('/bin/sh');
+    const w = await localFar(s);
+    const fake = fakePs(`*"-A "*) /bin/ps "$@" | ${filter(w)}; exit 0;;`);
+    const keep = process.env.PATH;
+    try {
+      process.env.PATH = `${fake}:${keep}`;
+      const job = await s.run('sleep 3', { waitMs: 300 });
+      assert.equal(job.kind, 'running', JSON.stringify(job));
+      assert.equal(s.front().state, 'unknown');
+      process.env.PATH = keep;
+      const f = s.front();
+      assert.ok(f.state === 'running' && f.within, JSON.stringify(f));
+      assert.equal(job.kind === 'running' ? job.command.end?.unfollowed : 'x', undefined);
+    } finally {
+      process.env.PATH = keep;
+      await s.close({ force: true, deadline: by() });
+    }
+  });
+}
+
+test("with ps failing at a far shell's prompt, the front is unknown: the far marks don't say who holds this terminal", { ...darwinOnly, skip: darwinOnly.skip || (which('bash') ? false : 'bash is needed') }, async () => {
+  const s = await open('/bin/sh');
+  await far(s, which('bash')!);
+  await failing('ps', '/bin/ps', async (ps) => {
+    ps.on();
+    assert.equal(s.front().state, 'unknown');
+    ps.off();
+  });
+  const f = s.front();
+  assert.ok(f.state === 'prompt' && f.within, JSON.stringify(f));
+  await s.close({ force: true, deadline: by() });
 });
 
 /** Runs `body` with a `name` first on PATH that fails after `on()` and runs `real` otherwise. */

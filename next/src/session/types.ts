@@ -131,6 +131,13 @@ export interface Ending {
    * an end (128 and the signal's number in bash and zsh, 0 in fish). `jobs` lists it, and `run fg` or `run bg` continues it.
    */
   stopped?: true;
+  /**
+   * The session stopped following it, and whether it ended isn't known. `by` names the program the shell it ran in was reached
+   * through. `ended`: that program has no process left, or the session's shell exited. `left`: it left the terminal, as when
+   * it's suspended. `back`: it ran in a far shell, and that far shell is at its prompt again, which shows nothing about how it
+   * went. A far command can run on after its carrier is gone.
+   */
+  unfollowed?: { by: string; how: 'ended' | 'left' | 'back' };
 }
 
 export interface Command {

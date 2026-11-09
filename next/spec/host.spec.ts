@@ -1095,6 +1095,39 @@ test('a report keeps its status line whole when a directory holds a line break, 
   assert.match(lines[1]!, /^Matched at line \d+: a needle here$/);
 });
 
+/** A command `s` no longer follows, ended as the session reports one. */
+const unfollowedEnd = (s: FakeSession, id: number, text: string): Command => {
+  const c = { id, text, from: 0, to: 1, startedAt: Date.now(), end: { at: Date.now(), ms: 1200, errexit: false, refusedMarks: 0, unfollowed: { by: 'ssh box', how: 'left' as const } } };
+  s.commands.set(id, c);
+  return c;
+};
+
+test("a run on a session closed while it waited doesn't call a command the session stopped following ended", async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  let closing: Promise<unknown> = Promise.resolve();
+  s.run = async (text) => {
+    const c = unfollowedEnd(s, 7, text);
+    closing = host.call(cli(), 'close', { name: 'main' });
+    return { kind: 'ended', command: c, front: s.frontNow, took: [] };
+  };
+  const r = await host.call(plain(), 'run', { name: 'main', command: 'make' });
+  await closing;
+  assert.match(r.text, /^Session "main" was closed while this call waited\. Command 7 was typed: no longer followed: ssh box left the terminal, so whether the command ended isn't known · 1\.2 s\. /);
+});
+
+test("a wait's ends don't call a command the session stopped following ended", async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const c = unfollowedEnd(s, 8, 'make');
+  s.wait = async () => ({ by: 'end', front: s.frontNow, ended: [c], took: [] });
+  const w = await host.call(plain(), 'look', { name: 'main', until: 'end' });
+  assert.match(w.text, /Command 8: no longer followed: ssh box left the terminal, so whether the command ended isn't known · 1\.2 s\./);
+  assert.doesNotMatch(w.text, /Command 8 ended/);
+});
+
 test('a run or send on a session closed while it waited says what it typed and what ended', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });
