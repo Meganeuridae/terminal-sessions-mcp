@@ -259,6 +259,8 @@ export const DRAINED = 'drained';
  * the terminal's modes and change them. The first read waits for nothing; once it found text, each
  * later read waits up to 0.1 s for more, until one finds none or 1 MiB is read, so text that the
  * terminal's input queue (4 KiB on Linux) couldn't hold at once, still on its way, is drained too.
+ * The later reads give dd `conv=notrunc`: uutils dd (Ubuntu 26.04's coreutils) empties a regular file
+ * it was given as standard output, even one opened to append, when it copies nothing.
  */
 const DRAIN = `trap '' INT
 PATH=/usr/bin:/bin:$PATH
@@ -270,7 +272,7 @@ if [ -s "$f" ]; then
   stty min 0 time 1 2>/dev/null
   while :; do
     n=$(wc -c < "$f")
-    dd bs=65536 count=1 2>/dev/null >> "$f"
+    dd bs=65536 count=1 conv=notrunc 2>/dev/null >> "$f"
     [ $(($(wc -c < "$f"))) -gt $((n)) ] && [ $((n)) -lt 1048576 ] || break
   done
 fi
