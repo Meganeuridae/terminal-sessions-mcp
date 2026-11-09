@@ -466,7 +466,6 @@ export function farHooks(kind: FarKind, nonce: Nonce, call: string): string[] {
   const pieces: string[] = [];
   for (let i = 0; i < e.length; ) {
     let j = Math.min(i + PIECE, e.length);
-    // An escape is five characters, so a piece never ends inside one.
     const k = e.lastIndexOf('\\', j - 1);
     if (j < e.length && k > j - 5) j = k;
     pieces.push(e.slice(i, j));

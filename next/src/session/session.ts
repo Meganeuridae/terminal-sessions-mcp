@@ -303,7 +303,6 @@ class LiveSession implements Session {
       return false;
     }
     if (kind === 'D' && !this.exitInfo) {
-      // A lower chain's end mark, accepted as the top chain's would be, means the shells above it have exited.
       const next = /^(\d+)\.\w+$/.exec(rest[0] ?? '');
       const below = this.chains.findIndex((c, i) => i < this.chains.length - 1 && integration.nonceText(c.expected) === nonce && Number(next?.[1]) === c.expected.counter + 1);
       if (below >= 0) this.drop(below);
@@ -990,18 +989,14 @@ class LiveSession implements Session {
     const by = (): 'exited' | 'closed' | 'cancelled' | undefined => (this.exitInfo || this.ptyExit ? 'exited' : this.closed ? 'closed' : opts.signal?.aborted ? 'cancelled' : undefined);
     const f = this.front();
     if (f.state === 'exited' || this.prompted || by()) return { kind: 'refused', front: f };
-    // One handshake at a time: two typing into one terminal can't both succeed.
     if (this.probe) return { kind: 'refused', integrating: true, front: f };
-    // A shell with marks is at its prompt from its end mark on, drawn or not; a line sent there that hasn't started may reach a question.
     if (this.top.atPrompt && !this.plain) return { kind: 'refused', front: f, ...(this.top.submitted && { sent: true as const }) };
     // At its prompt a line editor holds the terminal out of canonical mode; ssh, su and sudo ask for a password or a yes/no in it.
     if (proc.modes(this.pts)?.canonical === true) return { kind: 'refused', canonical: true, front: f };
     const within: Process = f.state === 'prompt' ? { pgid: this.pid, argv: proc.info(this.pid)?.argv ?? this.shellName, shell: true } : f.process;
     const below = this.top;
     const plainBelow = this.plain && within.pgid !== this.pid;
-    // Until the hooks' chain is pushed, the shell below drawing its prompt means what the lines were typed into has ended.
     const ended = (): boolean => !this.chains.includes(below) || below.atPrompt || (plainBelow && this.lookDue() && this.front().state === 'prompt');
-    // Kept once found: a look at a plain shell is throttled, and the shell below may start what was typed after it.
     let stopped: 'exited' | 'closed' | 'cancelled' | undefined;
     const stop = (): typeof stopped => (stopped ??= by() ?? (ended() ? 'exited' : undefined));
     const call = String(randomInt(100000, 1000000));
@@ -1022,13 +1017,11 @@ class LiveSession implements Session {
         return { kind: 'unsupported', ...(name && { shell: path.basename(name) }), front: this.front() };
       }
       const nonce = { counter: 1, random: randomDigits() };
-      // The pieces carry the nonce, and their echo shows it, so it's redacted from the first.
       this.remember(nonce);
       const lines = integration.farHooks(kind, nonce, call);
       for (const [i, line] of lines.slice(0, -1).entries()) {
         this.lastWrite = mono();
         this.p.write(line);
-        // A line that ran in the shell below, after its end mark, acknowledges nothing.
         if (!(await this.until(deadline, () => (stop() ? false : (this.probe?.acked ?? -1) >= i ? true : undefined), opts.signal)))
           return { kind: 'incomplete', step: 'hooks', by: stop() ?? 'timeout', front: this.front() };
       }
@@ -1077,7 +1070,6 @@ class LiveSession implements Session {
       };
       // Listed before the first signal: once the shell exits, nothing in its session has a terminal.
       const onTerminal = proc.onTerminal(this.pid, this.pts)?.filter((d) => d.pid !== this.pid);
-      // Force also ends what the shell started that left the terminal with setsid.
       const ds = opts.force ? proc.descendants(this.pid, true) : [];
       unlisted = onTerminal === undefined || ds === undefined;
       const listed = [...(onTerminal ?? []), ...(ds ?? [])];
@@ -1095,7 +1087,7 @@ class LiveSession implements Session {
         for (const pgid of held) {
           const error = proc.signalGroup(pgid, signal);
           // On Linux, a stopped process holds the hangup until it's continued. So CONT follows a hangup that was delivered, as bash
-          // sends it. One that wasn't leaves the group as it was: a CONT then could only resume what close doesn't end.
+          // sends it.
           if (signal === 'SIGHUP' && !error) proc.signalGroup(pgid, 'SIGCONT');
           if (error && error !== 'ESRCH' && proc.held(listed.filter((d) => d.pgrp === pgid))?.has(pgid) !== false) unreached.push({ pgid, signal, error });
         }
@@ -1122,7 +1114,6 @@ class LiveSession implements Session {
     const exit = this.exitInfo ?? this.ptyExit;
     this.t.dispose();
     // A process just hung up can still be writing here as it exits, so a removal that meets a file written meanwhile tries again.
-    // The shell is gone by then, and what's left harms nothing in its private parent, so a removal that still fails doesn't fail close.
     await fs.promises
       .rm(this.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
       .catch((e: Error) => this.log?.(`session ${JSON.stringify(this.name)} closed, but its directory ${this.dir} wasn't removed: ${e.message}`));
