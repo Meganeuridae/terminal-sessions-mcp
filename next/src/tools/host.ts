@@ -268,7 +268,7 @@ export class Host {
     this.entries.set(k, entry);
     const front = session.front();
     const kind = session.kind === 'none' ? `${path.basename(this.o.shell)}, with no integration: its commands' statuses can't be known` : session.kind;
-    const text = `${this.status(entry, front)}\nOpened ${JSON.stringify(name)}: ${kind}, pid ${session.pid}.${front.state === 'prompt' ? '' : ` It isn't at its prompt yet: ${frontText(front, this.now())}.`}`;
+    const text = `${this.status(entry, front)}\nOpened ${JSON.stringify(name)}: ${kind}, pid ${session.pid}.${front.state === 'prompt' || front.state === 'unknown' ? '' : ` It isn't at its prompt yet: ${frontText(front, this.now())}.`}`;
     return ok(text, { session: name, pid: session.pid, shell: session.kind, front });
   }
 
@@ -317,7 +317,7 @@ export class Host {
         { error: 'invalid_argument', tooLong: r.tooLong, front: r.front },
       );
     }
-    if (r.kind === 'refused') return refused(`${this.status(e, r.front)}\nNothing was typed: ${refusalAdvice(r.front)}`, { error: 'not_at_prompt', front: r.front });
+    if (r.kind === 'refused') return refused(`${this.status(e, r.front)}\nNothing was typed: ${refusalAdvice(r.front, 'run')}`, { error: r.front.state === 'unknown' ? 'front_unknown' : 'not_at_prompt', front: r.front });
     const c = r.command;
     const out = e.session.lines(c.from, c.to);
     const search = r.kind === 'ended' && notify ? await firstMatch(notify, out, deadline, () => signal?.aborted === true || e.closing) : undefined;
@@ -496,12 +496,12 @@ export class Host {
     );
     const farSignal = r.within === true && a.signal !== undefined;
     if (farSignal) {
-      const local = r.front.state !== 'exited' && r.front.state !== 'waiting' && r.front.within ? quoted(r.front.within.argv) : 'the local program';
+      const local = (r.front.state === 'prompt' || r.front.state === 'running') && r.front.within ? quoted(r.front.within.argv) : 'the local program';
       steps.push(`Nothing was sent: a signal would reach ${local}, not the job in the shell within it. \`stop\` without \`signal\` types Ctrl-C there.`);
-    } else if (!r.steps.length) steps.push(`Nothing was sent: ${frontText(r.front, now)}.`);
+    } else if (!r.steps.length) steps.push(`Nothing was sent: ${r.front.state === 'unknown' ? refusalAdvice(r.front, 'stop') : `${frontText(r.front, now)}.`}`);
     if (r.next === 'close') steps.push('What runs is the shell itself, or a job that outlived KILL: only `close` ends it.');
     const structured = { steps: r.steps, front: r.front, ...(r.next ? { next: r.next } : {}), ...(r.within ? { within: true } : {}) };
-    const notSent = farSignal || r.steps.some((s) => s.refused || s.withheld) || (a.signal !== undefined && r.next === 'close' && r.steps.length === 0);
+    const notSent = farSignal || r.steps.some((s) => s.refused || s.withheld) || (a.signal !== undefined && r.next === 'close' && r.steps.length === 0) || (r.front.state === 'unknown' && r.steps.length === 0);
     const text = [this.status(e, r.front), ...steps].join('\n');
     return notSent ? refused(text, { error: 'not_sent', ...structured }) : ok(text, structured);
   }
@@ -527,7 +527,8 @@ export class Host {
         if (r.integrating) return refused(`${head}\nNothing was typed: another \`integrate\` is running in this session. Its result says how it went.`, { error: 'not_sent', integrating: true, front: r.front });
         if (r.sent) return refused(`${head}\nNothing was typed: a line sent at this prompt hasn't started yet, and what is in front may be a question, such as a password, that anything typed would answer. \`look\` until the shell it reaches shows its prompt, then call \`integrate\` again.`, { error: 'not_at_prompt', sent: true, front: r.front });
         if (r.canonical) return refused(`${head}\nNothing was typed: what's in front reads a whole line itself, such as a password or a yes/no question, or a shell without a line editor. \`look\` until a shell prompt shows, then call \`integrate\` again.`, { error: 'not_at_prompt', canonical: true, front: r.front });
-        if (r.front.state === 'exited') return refused(`${head}\nNothing was typed: ${refusalAdvice(r.front)}`, { error: 'session_exited', front: r.front });
+        if (r.front.state === 'exited') return refused(`${head}\nNothing was typed: ${refusalAdvice(r.front, 'integrate')}`, { error: 'session_exited', front: r.front });
+        if (r.front.state === 'unknown') return refused(`${head}\nNothing was typed: ${refusalAdvice(r.front, 'integrate')}`, { error: 'front_unknown', front: r.front });
         return refused(`${head}\nNothing was typed: the shell in front has the session's integration already, so \`run\` works there.`, { error: 'already_integrated', front: r.front });
       case 'unsupported':
         return refused(
@@ -786,6 +787,7 @@ function laterText(until: 'end' | 'input', pushes: boolean, commandRunning: bool
     if (!commandRunning) return 'No command is running, so no end will be reported; the status line says what is in front.';
     return pushes ? 'The end will be reported to you when it comes.' : '`look` with `until: "end"` again waits for it.';
   }
+  if (front.state === 'unknown') return 'Reading the terminal failed, so whether a program waits for input couldn\'t be seen. `look` with `until: "input"` reads it again.';
   if (front.state === 'running' && !front.waitVisible) return "This system can't show a program waiting for input, so none will be reported; `look` again shows what is in front.";
   return pushes ? 'A wait for input will be reported to you when it comes.' : '`look` with `until: "input"` again waits for it.';
 }
@@ -808,7 +810,7 @@ function integrateHint(argv: string): string {
   return '';
 }
 
-function refusalAdvice(front: Front): string {
+function refusalAdvice(front: Front, tool: 'run' | 'integrate' | 'stop'): string {
   switch (front.state) {
     case 'prompt':
       return `${quotedString(front.pending ?? '')} is typed at the prompt and not run. \`send\` with \`keys: ["C-e", "C-u"]\` clears the line, or \`keys: ["Enter"]\` runs it.`;
@@ -817,6 +819,8 @@ function refusalAdvice(front: Front): string {
       if (front.starting) return `the shell is still running its startup files${front.process.shell ? '' : `, now ${quoted(front.process.argv)}`}, and \`run\` works once it has drawn its first prompt. \`look\` shows what it prints, \`send\` types into it.`;
       if (front.process.shell) return 'the shell itself is busy. `look` with `until: "end"` waits for it, `send` types into it. If a command removed the session\'s prompt hooks, `close` it and `open` it again.';
       return `${quoted(front.process.argv)} is running. \`look\` with \`until: "end"\` waits for it, \`send\` types into it, \`stop\` stops it.${integrateHint(front.process.argv)}`;
+    case 'unknown':
+      return `whether the shell is at its prompt couldn't be seen: reading its terminal failed. \`${tool}\` again, or \`look\`.`;
     case 'waiting': {
       const waits = `${quoted(front.process.argv)} is waiting for input${front.starting ? " in the shell's startup files" : ''}. \`send\` answers it`;
       return front.process.shell ? `${waits}.` : `${waits}, \`stop\` stops it.${integrateHint(front.process.argv)}`;

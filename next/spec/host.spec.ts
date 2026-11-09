@@ -2,17 +2,18 @@ import { mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Host, type Caller, type Wake } from '../src/tools/host.js';
 import { cutAt, outputValue, RESULT_MAX_CHARS } from '../src/tools/render.js';
-import type { Command, OpenOptions, Process } from '../src/session/types.js';
+import type { Command, Front, OpenOptions, Process } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
 
 const STARTED = Date.parse('2026-11-08T13:00:00.000Z');
 
-function setup(now?: () => number) {
+function setup(now?: () => number, front?: Front) {
   const opened: FakeSession[] = [];
   const host = new Host({
     ...(now ? { now } : {}),
     openSession: async (o: OpenOptions) => {
       const s = new FakeSession(o.name, o);
+      if (front) s.frontNow = front;
       opened.push(s);
       return s;
     },
@@ -61,6 +62,52 @@ test('H6: a run refused away from the prompt says what is in front and what woul
   const r = await host.call(agent(), 'run', { name: 'main', command: 'ls' });
   assert.equal(r.isError, true);
   assert.match(r.text, /^\[main · waiting for input: python3 -c input\(\), not echoed, as for a password, for [\d.]+ s · \/home\/u\]\nNothing was typed: python3 -c input\(\) is waiting for input\. `send` answers it, `stop` stops it\.$/);
+});
+
+test("H6: when the terminal couldn't be read, the status line says so, and a refused run sends the agent to run again or look, not to wait", async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  opened[0]!.frontNow = { state: 'unknown', since: Date.now() };
+  const r = await host.call(agent(), 'run', { name: 'main', command: 'ls' });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /^\[main · whether the shell is at its prompt can't be seen now: reading its terminal failed · \/home\/u\]\nNothing was typed: whether the shell is at its prompt couldn't be seen: reading its terminal failed\. `run` again, or `look`\.$/);
+  assert.equal((r.structured.front as { state: string }).state, 'unknown');
+  assert.equal(r.structured.error, 'front_unknown');
+});
+
+const unreadOpen = async () => {
+  const { host } = setup(undefined, { state: 'unknown', since: Date.now() });
+  const open = await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  return { host, open };
+};
+
+test("H6: open with the terminal unread says the reading failed, and not that the shell isn't at its prompt", async () => {
+  const { open } = await unreadOpen();
+  assert.doesNotMatch(open.text, /isn't at its prompt/);
+  assert.match(open.text, /whether the shell is at its prompt can't be seen now: reading its terminal failed/);
+});
+
+test('H6: integrate with the terminal unread is refused as unknown, not as integrated already', async () => {
+  const { host } = await unreadOpen();
+  const integrate = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.equal(integrate.structured.error, 'front_unknown');
+  assert.equal(integrate.isError, true);
+  assert.match(integrate.text, /\nNothing was typed: whether the shell is at its prompt couldn't be seen: reading its terminal failed\. `integrate` again, or `look`\.$/);
+});
+
+test('H6: stop with the terminal unread sends nothing and is refused, saying to stop again or look', async () => {
+  const { host } = await unreadOpen();
+  const stop = await host.call(agent(), 'stop', { name: 'main' });
+  assert.equal(stop.isError, true);
+  assert.equal(stop.structured.error, 'not_sent');
+  assert.match(stop.text, /\nNothing was sent: whether the shell is at its prompt couldn't be seen: reading its terminal failed\. `stop` again, or `look`\.$/);
+});
+
+test('H6: a look for input with the terminal unread says the reading failed and promises no report', async () => {
+  const { host } = await unreadOpen();
+  const input = await host.call(agent(), 'look', { name: 'main', until: 'input', wait: 0 });
+  assert.doesNotMatch(input.text, /will be reported/);
+  assert.match(input.text, /Reading the terminal failed, so whether a program waits for input couldn't be seen\. `look` with `until: "input"` reads it again\./);
 });
 
 test('H6: every result but close\'s opens with the status line: a command\'s status, duration, directory and what is in front', async () => {

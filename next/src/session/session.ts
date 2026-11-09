@@ -571,7 +571,9 @@ class LiveSession implements Session {
       const reads = proc.readsTerminal(this.pid, this.pts);
       if (this.execed && argv !== undefined && !isShell(argv)) return program({ pgid, argv, shell: false }, [reads]);
       const process: Process = { pgid, argv: argv ?? this.shellName, shell: true };
-      if ((!this.top.submitted || this.plain) && this.withoutHooks(reads)) {
+      const idle = !this.top.submitted || this.plain ? this.withoutHooks(reads) : false;
+      if (idle === undefined) return at({ state: 'unknown', since: this.since('unknown') });
+      if (idle) {
         if (this.top.submitted || !this.top.promptAt || this.lastWrite === this.top.promptAtWrite) {
           this.top.promptAt = this.t.pos();
           this.top.promptAtWrite = this.lastWrite;
@@ -627,13 +629,16 @@ class LiveSession implements Session {
   /**
    * A shell with no integration, or a shell exec'd in the integrated shell's place, is at its prompt
    * once output is quiet and it waits at its line editor, which holds the terminal out of canonical
-   * mode, or, with no line editor (dash), reads the terminal itself.
+   * mode, or, with no line editor (dash), reads the terminal itself. Undefined when neither the kernel
+   * nor the terminal's modes could be read.
    */
-  private withoutHooks(reads: boolean | undefined): boolean {
+  private withoutHooks(reads: boolean | undefined): boolean | undefined {
     if (this.top.atPrompt || mono() - Math.max(this.lastOutput, this.lastWrite) < HOOKS_QUIET_MS) return false;
     if (!this.plain) return false;
     if (reads) return true;
-    return proc.modes(this.pts)?.canonical === false;
+    const canonical = proc.modes(this.pts)?.canonical;
+    if (canonical === undefined) return reads === false ? false : undefined;
+    return !canonical;
   }
 
   /** The shell in front has no marks: the session's own without the integration, or a program exec'd in its place. */
@@ -934,11 +939,11 @@ class LiveSession implements Session {
     let f = this.front();
     const aborted = (): boolean => opts.abort?.aborted === true;
     if (aborted()) return { steps, front: f, cancelled: true };
-    if (f.state === 'prompt' || f.state === 'exited') return { steps, front: f };
+    if (f.state === 'prompt' || f.state === 'exited' || f.state === 'unknown') return { steps, front: f };
     const target = f.process;
     const own = target.shell || target.pgid === this.pid;
-    const settled = (now: Front): boolean => now.state === 'prompt' || now.state === 'exited' || (!now.process.shell && now.process.pgid !== target.pgid);
-    const gone = (now: Front): boolean => now.state === 'prompt' || now.state === 'exited' || (now.process.pgid !== target.pgid && (!now.process.shell || this.ours(target.pgid) !== true));
+    const settled = (now: Front): boolean => now.state === 'prompt' || now.state === 'exited' || (now.state !== 'unknown' && !now.process.shell && now.process.pgid !== target.pgid);
+    const gone = (now: Front): boolean => now.state === 'prompt' || now.state === 'exited' || (now.state !== 'unknown' && now.process.pgid !== target.pgid && (!now.process.shell || this.ours(target.pgid) !== true));
     const cleared = async (): Promise<Front> =>
       (await this.until(mono() + STEP_GRACE_MS, () => {
         const now = this.front();
@@ -992,7 +997,7 @@ class LiveSession implements Session {
     const deadline = mono() + opts.waitMs;
     const by = (): 'exited' | 'closed' | 'cancelled' | undefined => (this.exitInfo || this.ptyExit ? 'exited' : this.closed ? 'closed' : opts.signal?.aborted ? 'cancelled' : undefined);
     const f = this.front();
-    if (f.state === 'exited' || this.prompted || by()) return { kind: 'refused', front: f };
+    if (f.state === 'exited' || f.state === 'unknown' || this.prompted || by()) return { kind: 'refused', front: f };
     if (this.probe) return { kind: 'refused', integrating: true, front: f };
     if (this.top.atPrompt && !this.plain) return { kind: 'refused', front: f, ...(this.top.submitted && { sent: true as const }) };
     // At its prompt a line editor holds the terminal out of canonical mode; ssh, su and sudo ask for a password or a yes/no in it.

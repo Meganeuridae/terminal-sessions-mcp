@@ -127,6 +127,7 @@ export class FakeSession implements Session {
 
   async stop(signal?: NodeJS.Signals, _opts?: { abort?: AbortSignal }): Promise<StopOutcome> {
     this.calls.push({ method: 'stop', args: [signal] });
+    if (this.frontNow.state === 'unknown') return { steps: [], front: this.frontNow };
     return { steps: [{ sent: signal ?? 'C-c', front: this.frontNow }], front: this.frontNow };
   }
 

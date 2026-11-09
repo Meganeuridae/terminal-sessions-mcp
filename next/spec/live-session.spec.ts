@@ -589,7 +589,7 @@ for (const sh of shells) {
       events.length = 0;
       const full = await s.run(`python3 -c 'import os, fcntl; r, w = os.pipe(); fcntl.fcntl(w, 1031, 4096); os.write(w, b"x" * 4096); print("FULL", flush=True); print("TRANSFERRED:%d" % os.splice(0, w, 4096))'`, { waitMs: 1500 });
       assert.equal(full.kind, 'running');
-      const python = await eventually('python in front', () => { const f = s.front(); return f.state !== 'prompt' && f.state !== 'exited' && /python3/.test(f.process.argv) && f.process.pgid; });
+      const python = await eventually('python in front', () => { const f = s.front(); return (f.state === 'running' || f.state === 'waiting') && /python3/.test(f.process.argv) && f.process.pgid; });
       await eventually('python blocked in splice for room in its pipe', () => fs.readFileSync(`/proc/${python}/syscall`, 'utf8').startsWith(process.arch === 'x64' ? '275 ' : '76 ') && fs.readFileSync(`/proc/${python}/wchan`, 'utf8').trim() === 'pipe_wait_writable');
       assert.equal(s.front().state, 'running');
       await s.send('Y\r', { waitMs: 1000 });
@@ -776,7 +776,7 @@ for (const sh of shells) {
       assert.equal(r.kind, 'running');
       const f = await eventually('cat in front', () => {
         const now = s.front();
-        return now.state !== 'prompt' && now.state !== 'exited' && /cat/.test(now.process.argv) && now;
+        return (now.state === 'running' || now.state === 'waiting') && /cat/.test(now.process.argv) && now;
       });
       assert.equal(f.process.shell, false);
       if (process.platform === 'linux') assert.equal(f.state, 'waiting');
@@ -1878,6 +1878,33 @@ test('text sent to a shell without integration at its prompt is pending there, s
     return f.state === 'prompt' && f.pending === undefined;
   });
   assert.equal((await s.run('echo plain', { waitMs: 5000 })).kind, 'ended');
+});
+
+test("a shell without integration whose terminal can't be read is in front as unknown, not running, and run types nothing", { skip: process.platform !== 'darwin' ? "here the kernel shows the shell reading its terminal, so the terminal's modes aren't asked" : false }, async () => {
+  const bin = path.join(tmp, 'stty-bin');
+  const fails = path.join(tmp, 'stty-fails');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'stty'), `#!/bin/sh\n[ -e '${fails}' ] && exit 1\nexec /bin/stty "$@"\n`, { mode: 0o755 });
+  const PATH = process.env.PATH;
+  process.env.PATH = `${bin}:${PATH ?? '/usr/bin:/bin'}`;
+  try {
+    const s = await open('/bin/sh');
+    for (let i = 0; i < 100 && s.front().state !== 'prompt'; i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(s.front().state, 'prompt');
+    fs.writeFileSync(fails, '');
+    assert.equal(s.front().state, 'unknown');
+    const r = await s.run('echo SHOULD_NOT_RUN', { waitMs: 1000 });
+    assert.equal(r.kind, 'refused');
+    assert.equal(r.front.state, 'unknown');
+    fs.rmSync(fails);
+    assert.equal(s.front().state, 'prompt');
+    const after = await s.run('echo plain', { waitMs: 5000 });
+    assert.equal(after.kind, 'ended');
+    assert.ok(!s.lines(0).lines.some((l) => l.includes('SHOULD_NOT_RUN')));
+  } finally {
+    process.env.PATH = PATH;
+    fs.rmSync(fails, { force: true });
+  }
 });
 
 test('a shell without integration opens and runs, with no status', async () => {

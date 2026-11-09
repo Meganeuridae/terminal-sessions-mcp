@@ -29,6 +29,8 @@ export function frontText(front: Front, now: number): string {
     }
     case 'waiting':
       return `waiting for input${front.starting ? " in the shell's startup files" : ''}: ${quoted(front.process.argv)}${front.echo === false ? ', not echoed, as for a password' : front.echo === undefined ? ', echo unknown' : ''}, for ${duration(now - front.since)}`;
+    case 'unknown':
+      return "whether the shell is at its prompt can't be seen now: reading its terminal failed";
     case 'exited':
       return `the shell ${exitText(front.exit)}`;
   }

@@ -102,6 +102,12 @@ export type Front =
       /** The shell hasn't drawn its first prompt yet: a startup file is reading. */
       starting?: true;
     }
+  | {
+      /** A shell without marks whose terminal couldn't be read, so whether it's at its prompt isn't known. */
+      state: 'unknown';
+      since: number;
+      command?: number;
+    }
   | { state: 'exited'; since: number; exit: Exit };
 
 export interface Ending {
