@@ -52,25 +52,19 @@ __tsm_esc() {
   __tsm_ret=$\{__tsm_ret//$'\\033'/\\\\x1b}
 }
 __tsm_drain() {
-  local __tsm_m
-  __tsm_m=$(PATH=/usr/bin:/bin:$PATH stty -g 2>/dev/null) || return 0
-  PATH=/usr/bin:/bin:$PATH stty -icanon min 0 time 0 2>/dev/null
-  PATH=/usr/bin:/bin:$PATH dd bs=65536 count=1 2>/dev/null
-  PATH=/usr/bin:/bin:$PATH stty "$__tsm_m" 2>/dev/null
+  /bin/sh @DRAIN@ @DRAINED@."$__tsm_c" 2>/dev/null
 }
 __tsm_end() {
   local __tsm_s=$? __tsm_p="$\{PIPESTATUS[*]}" __tsm_f __tsm_n __tsm_cwd __tsm_j=$-
   if [ -n "$\{__tsm_ps+x}" ]; then __tsm_p=$__tsm_ps; unset __tsm_ps; fi
   set +m
-  __tsm_f=$(__tsm_drain; builtin printf x)
+  __tsm_f=$(__tsm_drain)
   case $__tsm_j in *m*) set -m ;; esac
-  __tsm_f=$\{__tsm_f%x}
   __tsm_esc "$PWD"
   __tsm_cwd=$__tsm_ret
-  __tsm_esc "$__tsm_f"
   __tsm_n=$__tsm_c.$__tsm_r
   __tsm_next
-  builtin printf '\\033]133;D;%s;%s;%s;%s;%s;%s;%s\\007' "$__tsm_n" "$__tsm_c.$__tsm_r" "$__tsm_s" "$__tsm_p" "$-" "$__tsm_cwd" "$__tsm_ret"
+  builtin printf '\\033]133;D;%s;%s;%s;%s;%s;%s\\007' "$__tsm_n" "$__tsm_c.$__tsm_r" "$__tsm_s" "$__tsm_p" "$-" "$__tsm_cwd"
   case $- in *e*) return 0 ;; esac
   return "$__tsm_s"
 }
@@ -135,23 +129,17 @@ __tsm_esc() {
   __tsm_ret=$\{__tsm_ret//$'\\e'/\\\\x1b}
 }
 __tsm_drain() {
-  local __tsm_m
-  __tsm_m=$(PATH=/usr/bin:/bin:$PATH stty -g 2>/dev/null) || return 0
-  PATH=/usr/bin:/bin:$PATH stty -icanon min 0 time 0 2>/dev/null
-  PATH=/usr/bin:/bin:$PATH dd bs=65536 count=1 2>/dev/null
-  PATH=/usr/bin:/bin:$PATH stty "$__tsm_m" 2>/dev/null
+  /bin/sh @DRAIN@ @DRAINED@."$__tsm_c" 2>/dev/null
 }
 __tsm_end() {
   local __tsm_s=$? __tsm_p="$\{(j: :)pipestatus}" __tsm_f __tsm_n __tsm_cwd
   if (( $\{+__tsm_ps} )); then __tsm_p=$__tsm_ps; unset __tsm_ps; fi
-  __tsm_f=$(__tsm_drain; builtin print -rn -- x)
-  __tsm_f=$\{__tsm_f%x}
+  __tsm_f=$(__tsm_drain)
   __tsm_esc "$PWD"
   __tsm_cwd=$__tsm_ret
-  __tsm_esc "$__tsm_f"
   __tsm_n=$__tsm_c.$__tsm_r
   __tsm_next
-  builtin printf '\\033]133;D;%s;%s;%s;%s;%s;%s;%s\\007' "$__tsm_n" "$__tsm_c.$__tsm_r" "$__tsm_s" "$__tsm_p" "$-" "$__tsm_cwd" "$__tsm_ret"
+  builtin printf '\\033]133;D;%s;%s;%s;%s;%s;%s\\007' "$__tsm_n" "$__tsm_c.$__tsm_r" "$__tsm_s" "$__tsm_p" "$-" "$__tsm_cwd"
   return $__tsm_s
 }
 __tsm_start() {
@@ -205,22 +193,17 @@ function __tsm_start --on-event fish_preexec
     printf '\\e]133;C;%s.%s;%s\\a' $__tsm_c $__tsm_r "$t"
 end
 function __tsm_drain
-    set -l m (PATH=/usr/bin:/bin:$PATH stty -g 2>/dev/null); or return 0
-    PATH=/usr/bin:/bin:$PATH stty -icanon min 0 time 0 2>/dev/null
-    PATH=/usr/bin:/bin:$PATH dd bs=65536 count=1 2>/dev/null
-    PATH=/usr/bin:/bin:$PATH stty $m 2>/dev/null
+    /bin/sh @DRAIN@ @DRAINED@.$__tsm_c 2>/dev/null
 end
 function __tsm_d
-    set -l f (begin; __tsm_drain; printf x; end | string collect -N)
+    begin; __tsm_drain; end | string collect -N >/dev/null
     set -l n $__tsm_c.$__tsm_r
     __tsm_next
     set -l p $argv
     set -e p[1]
     set -l pj (string join ' ' -- $p)
     set -l cwd (__tsm_esc $PWD)
-    set -l fl (__tsm_esc "$f")
-    set fl (string replace -r -- 'x$' '' "$fl")
-    printf '\\e]133;D;%s;%s;%s;%s;;%s;%s\\a' $n $__tsm_c.$__tsm_r $argv[1] "$pj" "$cwd" "$fl"
+    printf '\\e]133;D;%s;%s;%s;%s;;%s\\a' $n $__tsm_c.$__tsm_r $argv[1] "$pj" "$cwd"
 end
 function __tsm_post --on-event fish_postexec
     set -l x $pipestatus $status
@@ -258,12 +241,48 @@ __tsm_wrap
 `;
 
 const fill = (text: string, o: { nonce: Nonce; dir: string }, quote: (s: string) => string): string =>
-  text.replaceAll('@COUNTER@', String(o.nonce.counter)).replaceAll('@RANDOM@', o.nonce.random).replaceAll('@HISTFILE@', quote(path.join(o.dir, 'history')));
+  text
+    .replaceAll('@COUNTER@', String(o.nonce.counter))
+    .replaceAll('@RANDOM@', o.nonce.random)
+    .replaceAll('@HISTFILE@', quote(path.join(o.dir, 'history')))
+    .replaceAll('@DRAIN@', quote(path.join(o.dir, 'drain.sh')))
+    .replaceAll('@DRAINED@', quote(path.join(o.dir, DRAINED)));
+
+/** The drain writes what it read to this file in the session's directory, `.` and the counter of the nonce its end mark closes. */
+export const DRAINED = 'drained';
+
+/**
+ * The typeahead drain every shell's prompt hook runs, as one sh script: it writes the text typed ahead
+ * that nothing read into the file it's given, and leaves it unread by anything else. The session reads
+ * the file when it parses the end mark, so text of any size costs the hook no escaping. INT is ignored, and its stty and dd inherit
+ * that, so a C-c can't leave the terminal out of canonical mode. It reads nothing unless it could save
+ * the terminal's modes and change them. The first read waits for nothing; once it found text, each
+ * later read waits up to 0.1 s for more, until one finds none or 1 MiB is read, so text that the
+ * terminal's input queue (4 KiB on Linux) couldn't hold at once, still on its way, is drained too.
+ */
+const DRAIN = `trap '' INT
+PATH=/usr/bin:/bin:$PATH
+f=$1
+m=$(stty -g 2>/dev/null) || exit 0
+stty -icanon min 0 time 0 2>/dev/null || { stty "$m" 2>/dev/null; exit 0; }
+dd bs=65536 count=1 2>/dev/null > "$f"
+if [ -s "$f" ]; then
+  stty min 0 time 1 2>/dev/null
+  while :; do
+    n=$(wc -c < "$f")
+    dd bs=65536 count=1 2>/dev/null >> "$f"
+    [ $(($(wc -c < "$f"))) -gt $((n)) ] && [ $((n)) -lt 1048576 ] || break
+  done
+fi
+stty "$m" 2>/dev/null
+if [ ! -s "$f" ]; then rm -f "$f"; fi
+`;
 
 /** Writes the integration's files for `shell` into `dir` and returns how to start it: the user's own startup files run first, the hooks last. */
 export function prepare(shell: string, dir: string, nonce: Nonce, env: Record<string, string>): Launch {
   const kind = shellKind(shell);
   const o = { nonce, dir };
+  if (kind !== 'none') fs.writeFileSync(path.join(dir, 'drain.sh'), DRAIN, { mode: 0o600 });
   if (kind === 'bash') {
     const rc = path.join(dir, 'rc.bash');
     fs.writeFileSync(rc, fill(BASH_RC, o, sq), { mode: 0o600 });

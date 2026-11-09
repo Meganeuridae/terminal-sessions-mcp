@@ -68,7 +68,7 @@ export class FakeSession implements Session {
     const c = this.current();
     if (!c) throw new Error('nothing runs');
     c.to = this.out.length;
-    c.end = { at: Date.now(), errexit: false, refusedMarks: 0, ...(status === undefined ? {} : { status }), cwd: this.dir };
+    c.end = { at: Date.now(), ms: Date.now() - c.startedAt, errexit: false, refusedMarks: 0, ...(status === undefined ? {} : { status }), cwd: this.dir };
     this.frontNow = { state: 'prompt', since: Date.now() };
     this.emit({ kind: 'ended', command: c, taken });
     return c;
@@ -94,7 +94,7 @@ export class FakeSession implements Session {
     this.out.push(`$ ${text}`, ...this.runOutput);
     if (this.runMode === 'end') {
       c.to = this.out.length;
-      c.end = { at: Date.now(), status: 0, errexit: false, refusedMarks: 0, cwd: this.dir };
+      c.end = { at: Date.now(), ms: Date.now() - c.startedAt, status: 0, errexit: false, refusedMarks: 0, cwd: this.dir };
       this.emit({ kind: 'ended', command: c, taken: opts.take !== false });
       return { kind: 'ended', command: c, front: this.frontNow };
     }
@@ -125,7 +125,7 @@ export class FakeSession implements Session {
     const c = this.current();
     if (c) {
       c.to = this.out.length;
-      c.end = { at: Date.now(), errexit: false, refusedMarks: 0, cwd: this.dir };
+      c.end = { at: Date.now(), ms: Date.now() - c.startedAt, errexit: false, refusedMarks: 0, cwd: this.dir };
       this.emit({ kind: 'ended', command: c, taken: false });
     }
     this.frontNow = { state: 'exited', since: Date.now(), exit: this.closedWith };
