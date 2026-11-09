@@ -176,7 +176,7 @@ test('tsm daemon stop asks the daemon over its connection, and it stops and hang
     await call('open', 'main');
     const r = await call('daemon', 'stop');
     assert.equal(r.code, 0);
-    assert.match(r.out, new RegExp(`^Stopped the daemon \\(pid ${process.pid}, `));
+    assert.match(r.out, new RegExp(`^Stopped the daemon \\(pid ${process.pid}, running since [^)]*\\)\\. It hung up each shell it held, and its log names any session whose processes may live on\\.\n$`));
     await d.stopped;
     assert.ok(sessions[0]!.closedWith, 'its shell was hung up');
   } finally {

@@ -180,7 +180,9 @@ export class Host {
       ...[...this.entries.values()].map(async (e) => {
         e.closing = true;
         try {
-          await e.session.close({ deadline });
+          const exit = await e.session.close({ deadline });
+          const left = [exit.unconfirmed && 'its exit wasn\'t seen', exit.unlisted && 'not every process it started could be listed', exit.unreached?.length && `${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')} weren't delivered`].filter(Boolean);
+          if (left.length) this.o.log?.(`session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)} closed, but ${left.join('; ')}: processes it started may live on`);
         } catch (err) {
           this.o.log?.(`closing session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)} failed: ${(err as Error)?.message ?? String(err)}`);
         }

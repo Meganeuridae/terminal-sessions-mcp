@@ -232,7 +232,7 @@ export async function runCli(o: CliOptions & { socket: string; version: string; 
         }
         await new Promise((res) => setTimeout(res, 50));
       }
-      o.stdout.write(`Stopped the daemon (pid ${pid}, running since ${r.daemon.startedAt}); it hangs up every shell it held.\n`);
+      o.stdout.write(`Stopped the daemon (pid ${pid}, running since ${r.daemon.startedAt}). It hung up each shell it held, and its log names any session whose processes may live on.\n`);
       return 0;
     }
     await rpc(r, 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'tsm', version: o.version } }, 1);

@@ -1231,6 +1231,29 @@ test("close returns the reports that fit its result, and keeps the rest for list
   assert.match(listed.text, new RegExp(`\\n\\nNot yet seen:\\n\\[main · command ${shown + 1} · exit 1 `));
 });
 
+test('stopping the daemon logs each session whose close may have left processes behind', async () => {
+  const lines: string[] = [];
+  const opened: FakeSession[] = [];
+  const host = new Host({
+    openSession: async (o: OpenOptions) => {
+      const s = new FakeSession(o.name, o);
+      opened.push(s);
+      return s;
+    },
+    shell: '/bin/bash',
+    env: { HOME: '/home/u' },
+    sessionsDir: '/tmp/sessions',
+    startedAt: STARTED,
+    log: (line) => lines.push(line),
+  });
+  await host.call(plain(), 'open', { name: 'main' });
+  await host.call(plain(), 'open', { name: 'clean' });
+  opened[0]!.close = async () => ({ code: null, signal: 'SIGHUP', unlisted: true, unreached: [{ pgid: 77, signal: 'SIGHUP', error: 'EPERM' }] });
+  await host.closeAll();
+  assert.equal(lines.length, 1, lines.join('\n'));
+  assert.match(lines[0]!, /^session "main" of scope "a" closed, but not every process it started could be listed; SIGHUP to group 77 \(EPERM\) weren't delivered: processes it started may live on$/);
+});
+
 test('look gives the ends its own wait took before the reports not yet seen, so a cut leaves them', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });
