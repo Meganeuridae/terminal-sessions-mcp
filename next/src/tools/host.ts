@@ -93,6 +93,7 @@ export class Host {
   private readonly subscribers = new Map<string, Set<Subscriber>>();
   private readonly opening = new Set<string>();
   private readonly starting = new Set<Promise<void>>();
+  private readonly stopper = new AbortController();
   private stopping: number | undefined;
   private wakeSeq = 0;
   private readonly happened = new WeakMap<object, number>();
@@ -171,9 +172,9 @@ export class Host {
 
   async closeAll(): Promise<void> {
     const deadline = (this.stopping = mono() + STOP_BUDGET_MS);
-    await Promise.all(this.starting);
-    await Promise.all(
-      [...this.entries.values()].map(async (e) => {
+    this.stopper.abort();
+    await Promise.all([
+      ...[...this.entries.values()].map(async (e) => {
         e.closing = true;
         try {
           await e.session.close({ deadline });
@@ -181,7 +182,8 @@ export class Host {
           this.o.log?.(`closing session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)} failed: ${(err as Error)?.message ?? String(err)}`);
         }
       }),
-    );
+      ...this.starting,
+    ]);
   }
 
   private noSession(caller: Caller, name: string): ToolResult {
@@ -253,6 +255,7 @@ export class Host {
       parent: this.o.sessionsDir,
       nextCommandId: () => this.nextId++,
       waitMs: this.waitMs(a),
+      signal: this.stopper.signal,
       ...(this.o.oomScoreAdj ? { oomScoreAdj: this.o.oomScoreAdj } : {}),
       ...(this.o.log ? { log: this.o.log } : {}),
     });

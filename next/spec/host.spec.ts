@@ -1900,3 +1900,33 @@ test('a stop gives every session, and one that finishes opening during it, until
     ['late', [{ force: true, deadline: 2_020_000 }]],
   ]);
 });
+
+test('a stop closes the known sessions at once, without waiting behind an open still starting, and ends that open\'s wait', async () => {
+  let release!: () => void;
+  let hold = false;
+  const given: Array<AbortSignal | undefined> = [];
+  const opened: FakeSession[] = [];
+  const host = new Host({
+    openSession: async (o: OpenOptions) => {
+      given.push(o.signal);
+      if (hold) await new Promise<void>((r) => (release = r));
+      const s = new FakeSession(o.name, o);
+      opened.push(s);
+      return s;
+    },
+    shell: '/bin/bash', env: {}, sessionsDir: '/tmp/sessions', startedAt: STARTED,
+  });
+  await host.call(agent(), 'open', { name: 'known' });
+  hold = true;
+  const pending = host.call(agent(), 'open', { name: 'late' });
+  await settle();
+  assert.equal(given[1]?.aborted, false, 'the starting open was given a signal');
+  const stopping = host.closeAll();
+  await settle();
+  assert.ok(opened[0]!.closedWith, 'the known session closed while the open still started');
+  assert.equal(given[1]?.aborted, true, 'the stop ended the starting open\'s wait');
+  release();
+  await stopping;
+  assert.ok(opened[1]!.closedWith, 'the late session closed too');
+  assert.equal((await pending).isError, true);
+});

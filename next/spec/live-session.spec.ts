@@ -38,7 +38,7 @@ const bashBelow = (shell: string, major: number, minor: number): boolean => {
 
 const STARTUP: Record<string, string> = { bash: '.bash_profile', zsh: '.zshrc', fish: '.config/fish/config.fish' };
 
-async function open(shell: string, opts: { rc?: string; files?: Record<string, string>; cwd?: string; cols?: number; waitMs?: number; log?: (line: string) => void } = {}): Promise<Session> {
+async function open(shell: string, opts: { rc?: string; files?: Record<string, string>; cwd?: string; cols?: number; waitMs?: number; log?: (line: string) => void; signal?: AbortSignal } = {}): Promise<Session> {
   const home = path.join(tmp, `home-${++homes}`);
   fs.mkdirSync(home);
   const name = path.basename(shell);
@@ -63,6 +63,7 @@ async function open(shell: string, opts: { rc?: string; files?: Record<string, s
     nextCommandId: () => ++ids,
     waitMs: opts.waitMs ?? 10_000,
     ...(opts.log ? { log: opts.log } : {}),
+    ...(opts.signal ? { signal: opts.signal } : {}),
   });
   sessions.push(s);
   return s;
@@ -1696,6 +1697,23 @@ test('a probe line typed into a program a shell without integration started, whi
   await readingRaw(s);
   const r = await s.integrate({ waitMs: 10_000 });
   assert.deepEqual(r.kind === 'incomplete' && [r.step, r.by], ['probe', 'exited'], JSON.stringify(r));
+});
+
+test('a signal that aborts while opening waits for the first prompt ends that wait', async () => {
+  const started = path.join(tmp, `started-${++gates}`);
+  const gate = path.join(tmp, `gate-${++gates}`);
+  const stop = new AbortController();
+  const opening = open(which('bash') ?? '/bin/bash', { rc: `: > '${started}'\nwhile [ ! -e '${gate}' ]; do sleep 0.05; done\n`, waitMs: 300_000, signal: stop.signal });
+  try {
+    await eventually('the startup file is running', () => fs.existsSync(started));
+    stop.abort();
+    const ended = await Promise.race([opening.then(() => 'opened'), new Promise<string>((resolve) => setTimeout(() => resolve('still waiting'), 20_000))]);
+    assert.equal(ended, 'opened');
+    assert.notEqual((await opening).front().state, 'prompt');
+  } finally {
+    fs.writeFileSync(gate, '');
+    await opening;
+  }
 });
 
 const darwinOnly = { skip: process.platform !== 'darwin' ? 'only macOS spawns ps to list' : false };

@@ -27,6 +27,8 @@ export interface OpenOptions {
   nextCommandId: () => number;
   /** How long opening waits for the first prompt. */
   waitMs: number;
+  /** Once it aborts, opening waits no longer for the first prompt, as when `waitMs` runs out. */
+  signal?: AbortSignal;
   /** Linux: the shell's oom_score_adj; 0 leaves it alone. */
   oomScoreAdj?: number;
   /** Where the session writes what no caller is told, such as a directory `close` couldn't remove. */

@@ -253,8 +253,8 @@ class LiveSession implements Session {
     this.schedulePoll();
   }
 
-  async ready(waitMs: number): Promise<void> {
-    await this.until(mono() + waitMs, () => (this.prompted || this.ptyExit || (this.kind === 'none' && this.front().state === 'prompt') ? true : undefined));
+  async ready(waitMs: number, signal?: AbortSignal): Promise<void> {
+    await this.until(mono() + waitMs, () => (this.prompted || this.ptyExit || signal?.aborted || (this.kind === 'none' && this.front().state === 'prompt') ? true : undefined), signal);
     if (this.exitDone) await this.exitDone;
     this.opened = true;
   }
@@ -1193,7 +1193,7 @@ export const openSession: OpenSession = async (o) => {
     throw err('backend_failure', `the shell could not start: ${(e as Error).message}. If that error passes, such as a limit on processes, opening again may work`);
   }
   const s = new LiveSession(o, p, dir, launch.kind, nonce, o.nextCommandId, [o.shell, ...launch.args].join(' '));
-  await s.ready(o.waitMs);
+  await s.ready(o.waitMs, o.signal);
   if (s.exit) {
     const said = s.startupText();
     await s.close({ deadline });
