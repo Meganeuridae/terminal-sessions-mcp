@@ -1320,6 +1320,47 @@ test('a session a caller taking none opened counts as shown once a wake about it
   assert.match(wakes[1]!.text, /^\[main · closed by a caller that takes no reports; the shell /);
 });
 
+test('a close that joined one under way and whose wait ended first says the session is still closing, and leaves it to that close', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const close = s.close.bind(s);
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  let calls = 0;
+  s.close = async (opts) => {
+    if (++calls > 1) return { code: null, underway: true };
+    await held;
+    return close(opts);
+  };
+  const first = host.call(cli(), 'close', { name: 'main' });
+  await settle();
+  const joined = await host.call(cli(), 'close', { name: 'main' });
+  assert.equal(joined.text, "[main · still closing]\nThe shell was still being closed by a close begun earlier when this call's wait ended, and nothing had been sent to it yet.");
+  assert.match((await host.call(plain(), 'list', {})).text, /^main: /);
+  release();
+  assert.match((await first).text, /^\[main · closed\]/);
+  const r = await host.call(plain(), 'list', {});
+  assert.equal((r.text.match(/closed by a caller that takes no reports/g) ?? []).length, 1, r.text);
+});
+
+test('two closes that end with the same exit finish the session once', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const close = s.close.bind(s);
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  let shared: ReturnType<typeof close> | undefined;
+  s.close = (opts) => (shared ??= held.then(() => close(opts)));
+  const both = Promise.all([host.call(cli(), 'close', { name: 'main' }), host.call(cli(), 'close', { name: 'main' })]);
+  await settle();
+  release();
+  for (const r of await both) assert.match(r.text, /^\[main · closed\]\nThe shell /);
+  const r = await host.call(plain(), 'list', {});
+  assert.equal((r.text.match(/closed by a caller that takes no reports/g) ?? []).length, 1, r.text);
+});
+
 test('a session no caller taking reports used leaves nothing behind when one taking none closes it', async () => {
   const { host, opened } = setup();
   await host.call(cli(), 'open', { name: 'main' });
@@ -1375,11 +1416,14 @@ test("a close whose wait ends while an earlier close is still under way says so,
   opened[0]!.close = async () => ({ code: null, underway: true });
   assert.equal(
     (await host.call(plain(), 'close', { name: 'main' })).text,
-    '[main · closed]\nThe shell was still being closed by a close begun earlier when this call\'s wait ended, and nothing had been sent to it yet.',
+    '[main · still closing]\nThe shell was still being closed by a close begun earlier when this call\'s wait ended, and nothing had been sent to it yet.',
   );
   opened[1]!.close = async () => ({ code: null, signal: 'SIGHUP', underway: true });
   await host.closeAll();
-  assert.deepEqual(lines, ['session "other" of scope "a": the shell was still being closed by a close begun earlier when the stop\'s wait ended, and had been sent SIGHUP, so processes it started may live on']);
+  assert.deepEqual(lines.sort(), [
+    'session "main" of scope "a": the shell was still being closed by a close begun earlier when the stop\'s wait ended, and nothing had been sent to it yet, so processes it started may live on',
+    'session "other" of scope "a": the shell was still being closed by a close begun earlier when the stop\'s wait ended, and had been sent SIGHUP, so processes it started may live on',
+  ]);
 });
 
 test('stopping the daemon logs each session whose close may have left processes behind', async () => {

@@ -79,6 +79,7 @@ interface Entry {
   off: () => void;
   takerUsed: boolean;
   exited: boolean;
+  finished: boolean;
 }
 
 interface Held {
@@ -279,7 +280,7 @@ export class Host {
       await session.close({ force: true, deadline: this.stopping });
       return refused('The daemon stopped while this session started, so its shell is closed.', { error: 'backend_failure' });
     }
-    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes || this.opening.get(k) === true, exited: false };
+    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes || this.opening.get(k) === true, exited: false, finished: false };
     entry.off = session.onEvent((ev) => this.onEvent(entry, ev));
     this.entries.set(k, entry);
     const front = session.front();
@@ -579,14 +580,17 @@ export class Host {
   private async close(caller: Caller, e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
     e.closing = true;
     const [exit] = await Promise.all([e.session.close({ force: a.force === true, deadline: mono() + WAIT_MAX_S * 1000 }), Promise.all(e.settling)]);
+    if (exit.underway) return ok(`[${e.name} · still closing]\nThe shell ${underwayText(exit, "this call's wait")}.`, { session: e.name, exit });
+    const how = exit.unconfirmed ? `was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it` : exitText(exit);
+    const unlisted = exit.unlisted ? " The session couldn't list every process it started, so jobs it started may live on." : '';
+    const unreached = exit.unreached?.length ? ` These signals weren't delivered: ${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')}. Their processes may live on.` : '';
+    let full = `[${e.name} · closed]\nThe shell ${how}.${unlisted}${unreached}`;
+    if (e.finished) return ok(fitted(full), { session: e.name, exit });
+    e.finished = true;
     e.off();
     const k = keyOf(e.scope, e.name);
     if (this.entries.get(k) === e) this.entries.delete(k);
-    const how = exit.underway ? underwayText(exit, "this call's wait") : exit.unconfirmed ? `was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it` : exitText(exit);
-    const unlisted = exit.unlisted ? " The session couldn't list every process it started, so jobs it started may live on." : '';
-    const unreached = exit.unreached?.length ? ` These signals weren't delivered: ${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')}. Their processes may live on.` : '';
     const pending = [...e.unseen.values()].sort((x, y) => x.at - y.at);
-    let full = `[${e.name} · closed]\nThe shell ${how}.${unlisted}${unreached}`;
     if (pending.length) full += '\n\nNot yet seen:';
     const ends = pending.map((u) => (full += `\n${u.lines.join('\n')}`).length);
     const kept = fittedLength(full);
