@@ -1655,6 +1655,11 @@ test('integrate is refused at the prompt of a shell that has the integration, an
   assert.equal(canonical.isError, true);
   assert.match(canonical.text, /\nNothing was typed: what's in front reads a whole line itself, such as a password or a yes\/no question, or a shell without a line editor\. `look` until a shell prompt shows, then call `integrate` again\.$/);
   assert.deepEqual([canonical.structured.error, canonical.structured.canonical], ['not_at_prompt', true]);
+  s.integrate = async () => ({ kind: 'refused', integrating: true, front: s.frontNow });
+  const busy = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.equal(busy.isError, true);
+  assert.match(busy.text, /\nNothing was typed: another `integrate` is running in this session\. Its result says how it went\.$/);
+  assert.deepEqual([busy.structured.error, busy.structured.integrating], ['not_sent', true]);
   s.frontNow = { state: 'running', since: Date.now(), process: SSH, waitVisible: true };
   s.integrate = async () => ({ kind: 'unsupported', shell: 'dash', front: s.frontNow });
   const dash = await host.call(agent(), 'integrate', { name: 'main' });
@@ -1808,4 +1813,42 @@ test('a stop step that stopped the job says so, and how to continue it', async (
   assert.match(r.text, /\nSent SIGTSTP to [^\n]*vim notes[^\n]*: now at the prompt\. The job is stopped: `jobs` lists it, and `run fg` or `run bg` continues it\.$/);
   s.stop = async () => ({ steps: [{ sent: 'SIGUSR1', to: { pgid: 9, argv: 'dd', shell: false }, front }], front });
   assert.doesNotMatch((await host.call(plain(), 'stop', { name: 'main', signal: 'USR1' })).text, /stopped/);
+});
+
+test('a run refused with a shell other than the session\'s own waiting at its prompt names integrate too', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  const refusal = async (argv: string): Promise<string> => {
+    s.frontNow = { state: 'waiting', since: Date.now(), process: { pgid: 40, argv, shell: false } };
+    return (await host.call(agent(), 'run', { name: 'main', command: 'ls' })).text;
+  };
+  assert.match(await refusal('bash'), /\nNothing was typed: "?bash"? is waiting for input\. `send` answers it, `stop` stops it\. At its prompt, `integrate` gives it statuses\.$/);
+  assert.match(await refusal('ssh box'), /`stop` stops it\. At the prompt of the shell it reached, `integrate` gives that shell statuses\.$/);
+  assert.doesNotMatch(await refusal('python3'), /integrate/);
+});
+
+test('integrated shows the lines not yet shown before the call, frozen or live, once, and the next look starts at the far prompt', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  s.integrate = async () => {
+    s.print('box$  unset HISTFILE; hook piece 0', 'far> ');
+    s.frontNow = { state: 'prompt', since: Date.now(), within: SSH };
+    return { kind: 'integrated', shell: 'bash', version: '5.2.37', front: s.frontNow };
+  };
+  s.print('$ ssh box');
+  await host.call(agent(), 'look', { name: 'main' });
+  s.print('Welcome to box', 'box$ ');
+  const frozen = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.match(frozen.text, /^\[[^\n]*\]\n\$ ssh box\nWelcome to box\nbox\$ \nThe shell in front, bash 5\.2\.37, now has the session's integration\./, frozen.text);
+  assert.doesNotMatch(frozen.text, /hook piece/);
+  const after = await host.call(agent(), 'look', { name: 'main' });
+  assert.doesNotMatch(after.text, /Welcome to box|hook piece/, after.text);
+  assert.match(after.text, /\nfar> $/, after.text);
+  s.print('$ ssh box2');
+  await host.call(agent(), 'look', { name: 'main' });
+  s.out[s.out.length - 1] = '$ ssh box2 Last login: today, with no newline before box2$ ';
+  const live = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.match(live.text, /\n\$ ssh box2 Last login: today, with no newline before box2\$ \nThe shell in front/, live.text);
 });

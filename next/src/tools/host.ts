@@ -488,20 +488,24 @@ export class Host {
   }
 
   private async integrate(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined): Promise<ToolResult> {
+    const before = caller.takes ? e.session.lines(e.cursor) : undefined;
     const r = await e.session.integrate({ waitMs: this.waitMs(a), ...(signal ? { signal } : {}) });
     if (signal?.aborted) return CANCELLED;
     if (e.closing || (r.kind === 'incomplete' && r.by === 'closed')) return closedMeanwhile(e);
     const head = this.status(e, r.front);
     switch (r.kind) {
       case 'integrated': {
-        if (caller.takes) e.cursor = Math.max(e.cursor, e.session.lines(e.cursor).to - 1);
         const printed = r.printed?.length ? `\nWhile taking the hooks, the shell printed:\n${r.printed.join('\n')}` : '';
+        const said = `\nThe shell in front, ${r.shell} ${r.version}, now has the session's integration. \`run\` types there, with statuses, until that shell exits. Then \`run\` goes back to the shell it was typed from.${printed}`;
+        const shown = before?.lines.length ? `\n${this.output(before, Math.max(0, RESULT_MAX_CHARS - head.length - said.length - 1))}` : '';
+        if (before) e.cursor = Math.max(e.cursor, e.session.lines(e.cursor).to - 1);
         return ok(
-          `${head}\nThe shell in front, ${r.shell} ${r.version}, now has the session's integration. \`run\` types there, with statuses, until that shell exits. Then \`run\` goes back to the shell it was typed from.${printed}`,
+          `${head}${shown}${said}`,
           { integrated: { shell: r.shell, version: r.version, ...(r.printed?.length ? { printed: r.printed } : {}) }, front: r.front },
         );
       }
       case 'refused':
+        if (r.integrating) return refused(`${head}\nNothing was typed: another \`integrate\` is running in this session. Its result says how it went.`, { error: 'not_sent', integrating: true, front: r.front });
         if (r.sent) return refused(`${head}\nNothing was typed: a line sent at this prompt hasn't started yet, and what is in front may be a question, such as a password, that anything typed would answer. \`look\` until the shell it reaches shows its prompt, then call \`integrate\` again.`, { error: 'not_at_prompt', sent: true, front: r.front });
         if (r.canonical) return refused(`${head}\nNothing was typed: what's in front reads a whole line itself, such as a password or a yes/no question, or a shell without a line editor. \`look\` until a shell prompt shows, then call \`integrate\` again.`, { error: 'not_at_prompt', canonical: true, front: r.front });
         if (r.front.state === 'exited') return refused(`${head}\nNothing was typed: ${refusalAdvice(r.front)}`, { error: 'session_exited', front: r.front });
@@ -794,8 +798,10 @@ function refusalAdvice(front: Front): string {
       if (front.starting) return `the shell is still running its startup files${front.process.shell ? '' : `, now ${quoted(front.process.argv)}`}, and \`run\` works once it has drawn its first prompt. \`look\` shows what it prints, \`send\` types into it.`;
       if (front.process.shell) return 'the shell itself is busy. `look` with `until: "end"` waits for it, `send` types into it. If a command removed the session\'s prompt hooks, `close` it and `open` it again.';
       return `${quoted(front.process.argv)} is running. \`look\` with \`until: "end"\` waits for it, \`send\` types into it, \`stop\` stops it.${integrateHint(front.process.argv)}`;
-    case 'waiting':
-      return `${quoted(front.process.argv)} is waiting for input${front.starting ? " in the shell's startup files" : ''}. \`send\` answers it${front.process.shell ? '' : ', `stop` stops it'}.`;
+    case 'waiting': {
+      const waits = `${quoted(front.process.argv)} is waiting for input${front.starting ? " in the shell's startup files" : ''}. \`send\` answers it`;
+      return front.process.shell ? `${waits}.` : `${waits}, \`stop\` stops it.${integrateHint(front.process.argv)}`;
+    }
     case 'exited':
       return 'the shell has exited. `close` this session and `open` another.';
   }
