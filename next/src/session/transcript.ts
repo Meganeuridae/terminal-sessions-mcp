@@ -33,7 +33,9 @@ const isAlt = (params: (number | number[])[]): boolean => params.some((p) => p =
 /**
  * A session's terminal output through a headless emulator. Lines that scroll off the normal screen
  * are frozen into a numbered, append-only list; the screen stays live. A line is a logical line:
- * wrapped rows are joined, and an accepted mark that falls mid-row starts a new line there.
+ * wrapped rows are joined, and an accepted mark that falls mid-row starts a new line there. A logical
+ * line longer than MAX_LINE is numbered as its pieces, live and frozen alike, so freezing never
+ * renumbers a line.
  */
 export class Transcript {
   private readonly term: TerminalType;
@@ -63,6 +65,8 @@ export class Transcript {
       reply: (data: string) => void;
       pressure: (paused: boolean) => void;
       redact: (text: string) => string;
+      /** The longest text `redact` replaces. It replaces only whole texts, so a freeze keeps a partial line's last redactSpan - 1 characters unfrozen. */
+      redactSpan: number;
       /** A mark's payload, as the parser meets it. Return true to start a new line there. */
       mark: (payload: string, at: Pos) => boolean;
     },
@@ -159,19 +163,28 @@ export class Transcript {
     if (!this.normal) return { line: this.end(), col: 0 };
     const b = this.term.buffer.normal;
     const from = this.firstLine();
-    const w = this.walk(from, b.baseY + b.cursorY, { row: b.baseY + b.cursorY, x: b.cursorX });
+    const row = b.baseY + b.cursorY;
+    const w = this.walk(from, b.baseY + Math.max(this.lastRow(), b.cursorY), { row, x: b.cursorX });
     let index = w.cursor?.index ?? 0;
     let col = w.cursor?.col ?? 0;
     const head = this.head(from);
     if (head === 'joins' && index === 0) col += this.partial.length;
     else if (head === 'apart') index++;
-    return { line: this.dropped + this.frozen.length + index, col };
+    const lines = this.withPartial(from, w.lines);
+    let line = this.dropped + this.frozen.length;
+    for (let i = 0; i < index && i < lines.length; i++) line += pieceCount(lines[i]!);
+    const ps = index < lines.length ? pieces(lines[index]!) : [''];
+    for (let k = 0; k < ps.length - 1 && col >= ps[k]!.length; k++) {
+      col -= ps[k]!.length;
+      line++;
+    }
+    return { line, col };
   }
 
   /** How the partial line meets the first unfrozen row: it continues there, or it ended and stands apart. */
   private head(from: number): 'joins' | 'apart' | undefined {
     if (!this.partial) return undefined;
-    return this.term.buffer.normal.getLine(from)?.isWrapped ? 'joins' : 'apart';
+    return this.wraps(from) ? 'joins' : 'apart';
   }
 
   private withPartial(from: number, lines: string[]): string[] {
@@ -199,7 +212,24 @@ export class Transcript {
   screen(): Screen {
     const b = this.term.buffer.active;
     const rows: string[] = [];
-    for (let y = 0; y < this.term.rows; y++) rows.push(this.io.redact(b.getLine(b.baseY + y)?.translateToString(true) ?? ''));
+    for (let y = 0; y < this.term.rows; ) {
+      let end = y + 1;
+      while (end < this.term.rows && b.getLine(b.baseY + end)?.isWrapped) end++;
+      const whole: string[] = [];
+      const shown: number[] = [];
+      for (let k = y; k < end; k++) {
+        const line = b.getLine(b.baseY + k);
+        whole.push(line?.translateToString(false) ?? '');
+        shown.push(line?.translateToString(true).length ?? 0);
+      }
+      const text = this.io.redact(whole.join(''));
+      let at = 0;
+      whole.forEach((w, k) => {
+        rows.push(text.slice(at, at + shown[k]!));
+        at += w.length;
+      });
+      y = end;
+    }
     return { rows, cursor: { row: b.cursorY, col: b.cursorX }, alt: b.type === 'alternate', title: this.io.redact(this.titleText) };
   }
 
@@ -229,12 +259,12 @@ export class Transcript {
     return this.anchored ? this.term.buffer.normal.baseY : 0;
   }
 
-  private splitsAt(line: number): Split[] {
-    return this.splits.filter((s) => !s.marker.isDisposed && s.marker.line === line).sort((a, b) => a.col - b.col);
-  }
-
+  /** A mark at a position that already starts a line adds nothing, so splits are bounded by the live screen's positions. */
   private split(): void {
     const b = this.term.buffer.normal;
+    const line = b.baseY + b.cursorY;
+    this.splits = this.splits.filter((s) => !s.marker.isDisposed);
+    if (this.splits.some((s) => s.marker.line === line && s.col === b.cursorX)) return;
     const marker = this.term.registerMarker(0);
     if (marker) this.splits.push({ marker, col: b.cursorX });
   }
@@ -243,18 +273,23 @@ export class Transcript {
     if (!this.normal) return [];
     const b = this.term.buffer.normal;
     const from = this.firstLine();
-    return this.withPartial(from, this.walk(from, b.baseY + Math.max(this.lastRow(), b.cursorY)).lines);
+    return this.withPartial(from, this.walk(from, b.baseY + Math.max(this.lastRow(), b.cursorY)).lines).flatMap((l) => (l.length > MAX_LINE ? pieces(this.io.redact(l)) : [l]));
   }
 
   private walk(from: number, to: number, cursor?: { row: number; x: number }): { lines: string[]; cursor?: { index: number; col: number } } {
     const b = this.term.buffer.normal;
     const lines: string[] = [];
     let at: { index: number; col: number } | undefined;
+    const splitAt = new Map<number, number[]>();
+    for (const s of this.splits) {
+      const l = s.marker.line;
+      if (!s.marker.isDisposed && l >= from && l <= to) (splitAt.get(l) ?? splitAt.set(l, []).get(l)!).push(s.col);
+    }
     for (let i = from; i <= to; i++) {
       const row = b.getLine(i);
       if (!row) continue;
-      const last = !b.getLine(i + 1)?.isWrapped;
-      const starts = [0, ...this.splitsAt(i).map((s) => s.col)];
+      const last = !this.wraps(i + 1);
+      const starts = [0, ...(splitAt.get(i) ?? []).sort((x, y) => x - y)];
       starts.forEach((start, k) => {
         const stop = starts[k + 1];
         const piece = stop === undefined ? row.translateToString(last, start) : row.translateToString(false, start, stop);
@@ -289,16 +324,21 @@ export class Transcript {
   }
 
   private freezeThrough(upto: number): number {
-    const b = this.term.buffer.normal;
     const from = this.firstLine();
     if (upto < from) return from;
     const lines = this.withPartial(from, this.walk(from, upto).lines);
-    this.partial = b.getLine(upto + 1)?.isWrapped ? (lines.pop() ?? '') : '';
+    this.partial = this.wraps(upto + 1) ? (lines.pop() ?? '') : '';
     for (const l of lines) this.push(this.io.redact(l));
     if (this.partial.length > MAX_LINE) {
-      const ps = pieces(this.partial);
-      this.partial = ps.pop()!;
-      for (const piece of ps) this.push(this.io.redact(piece));
+      // A text to redact whose head ends the partial goes on in the next row, so redacting the partial
+      // can't replace it. The partial keeps every piece that holds part of its last redactSpan - 1
+      // characters: a text that reaches a frozen piece then lies wholly in the partial, which was
+      // redacted. The kept text starts at a cut, so the live line is cut where it was.
+      const ps = pieces(this.io.redact(this.partial));
+      let kept = ps.pop()!;
+      while (ps.length && kept.length < this.io.redactSpan - 1) kept = ps.pop()! + kept;
+      this.partial = kept;
+      for (const piece of ps) this.push(piece);
     }
     for (const s of this.splits) if (s.marker.line <= upto) s.marker.dispose();
     this.splits = this.splits.filter((s) => !s.marker.isDisposed);
@@ -327,6 +367,15 @@ export class Transcript {
     this.anchored = true;
   }
 
+  /**
+   * Whether row `i` of the normal buffer goes on from the row above it. A row past the buffer's end
+   * goes on from nothing: once the scrollback is full, `getLine` there returned a wrapped row.
+   */
+  private wraps(i: number): boolean {
+    const b = this.term.buffer.normal;
+    return i < b.length && Boolean(b.getLine(i)?.isWrapped);
+  }
+
   private lastRow(): number {
     const b = this.term.buffer.normal;
     for (let y = this.term.rows - 1; y >= 0; y--) if (b.getLine(b.baseY + y)?.translateToString(true)) return y;
@@ -341,22 +390,20 @@ function trimEnd(rows: string[]): string[] {
 }
 
 /**
- * `text` cut into lines of at most MAX_LINE, never between the two halves of a surrogate pair, and not
- * inside a run of digits shorter than half a line, so a nonce (digits) is redacted whole in its piece.
+ * `text` cut into lines of at most MAX_LINE, never between the two halves of a surrogate pair. A cut
+ * looks only at the character before it, so a line that grows is cut where it was, and redaction,
+ * which keeps length and writes no surrogates, moves no cut.
  */
 function pieces(text: string): string[] {
   if (text.length <= MAX_LINE) return [text];
-  const digit = (c: string | undefined): boolean => c !== undefined && c >= '0' && c <= '9';
   const out: string[] = [];
   for (let i = 0; i < text.length; ) {
     let end = Math.min(text.length, i + MAX_LINE);
-    const inDigits = (at: number): boolean => at < text.length && digit(text[at - 1]) && digit(text[at]);
-    let back = end;
-    while (inDigits(back) && back > i + MAX_LINE / 2) back--;
-    if (!inDigits(back)) end = back;
     if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
     out.push(text.slice(i, end));
     i = end;
   }
   return out;
 }
+
+const pieceCount = (text: string): number => (text.length <= MAX_LINE ? 1 : pieces(text).length);

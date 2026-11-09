@@ -4,7 +4,8 @@ import * as fs from 'node:fs';
 const LINUX = process.platform === 'linux';
 /**
  * The numbers of read and readv, whose only wait is for their input, and of splice: x86-64's table, and
- * the generic table arm64, riscv64 and loong64 share. On any other architecture no read is seen.
+ * the generic table arm64, riscv64 and loong64 share. On any other architecture no read is seen, nor
+ * is a 32-bit program's, whose calls are numbered from another table.
  */
 const SYSCALLS: Partial<Record<string, { reads: ReadonlySet<number>; splice: number }>> = {
   x64: { reads: new Set([0, 19]), splice: 275 },
@@ -80,8 +81,13 @@ function pgrpOf(pid: number): number | undefined {
 
 type Proc = { pid: number; pgrp: number };
 
-/** Every descendant of `pid` with its group, a descendant that left the terminal (`setsid`) included; undefined when they can't be listed, or, unless `all`, past 1024 of them. */
+/**
+ * Every descendant of `pid` with its group, a descendant that left the terminal (`setsid`) included;
+ * undefined when they can't be listed, or, unless `all`, past 1024 of them. A descendant or thread
+ * gone while they're listed is left out; any other failure to read one leaves the list unknown.
+ */
 export function descendants(pid: number, all = false): Proc[] | undefined {
+  const exited = (e: unknown): boolean => ['ENOENT', 'ESRCH'].includes((e as NodeJS.ErrnoException).code ?? '');
   try {
     if (CHILDREN_FILES) {
       const out: Proc[] = [];
@@ -91,15 +97,17 @@ export function descendants(pid: number, all = false): Proc[] | undefined {
         let tasks: string[];
         try {
           tasks = fs.readdirSync(`/proc/${p}/task`);
-        } catch {
-          continue;
+        } catch (e) {
+          if (p !== pid && exited(e)) continue;
+          return undefined;
         }
         for (const t of tasks) {
           let kids: number[];
           try {
             kids = fs.readFileSync(`/proc/${p}/task/${t}/children`, 'utf8').split(' ').filter((x) => x.trim()).map(Number);
-          } catch {
-            continue;
+          } catch (e) {
+            if ((p !== pid || t !== String(pid)) && exited(e)) continue;
+            return undefined;
           }
           for (const k of kids) {
             const g = pgrpOf(k);
@@ -112,7 +120,9 @@ export function descendants(pid: number, all = false): Proc[] | undefined {
       return out;
     }
     const kids = new Map<number, Proc[]>();
+    let listed = false;
     const add = (p: number, pp: number, g: number): void => {
+      if (p === pid) listed = true;
       if (p > 0 && g > 0) (kids.get(pp) ?? kids.set(pp, []).get(pp)!).push({ pid: p, pgrp: g });
     };
     if (LINUX) {
@@ -125,9 +135,15 @@ export function descendants(pid: number, all = false): Proc[] | undefined {
         } catch {}
       }
     } else for (const [p, pp, g] of execFileSync('ps', ['-A', '-o', 'pid=,ppid=,pgid='], { encoding: 'utf8', timeout: SPAWN_TIMEOUT_MS }).trim().split('\n').map((l) => l.trim().split(/\s+/).map(Number))) add(p!, pp!, g!);
+    if (!listed) return undefined;
     const out: Proc[] = [];
     const todo = [pid];
-    while (todo.length) for (const k of kids.get(todo.pop()!) ?? []) out.push(k), todo.push(k.pid);
+    while (todo.length)
+      for (const k of kids.get(todo.pop()!) ?? []) {
+        out.push(k);
+        todo.push(k.pid);
+        if (!all && out.length > MAX_DESCENDANTS) return undefined;
+      }
     return out;
   } catch {
     return undefined;

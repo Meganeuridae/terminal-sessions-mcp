@@ -49,6 +49,8 @@ export type Closed = Exit & {
   unlisted?: true;
   /** The shell's exit wasn't seen within a grace after its KILL, as for a process in uninterruptible sleep. */
   unconfirmed?: true;
+  /** With `force`: the groups whose KILL wasn't delivered, each with the error's code, such as `EPERM`; their processes may live on. */
+  unkilled?: Array<{ pgid: number; error: string }>;
 };
 
 /** A process group in front of the terminal. */
@@ -149,11 +151,14 @@ export interface Match {
   row?: number;
 }
 
+/** The events a call took, each emitted `taken` because this call was to give it: handed back untaken by a host that doesn't deliver the call's result, so it becomes a report and a wake. */
+export type Took = Array<Extract<SessionEvent, { kind: 'ended' | 'waiting' | 'exited' }>>;
+
 export type RunOutcome =
   /** Not at a prompt, text pending at it, or the shell exited: `front` says which. Nothing was typed. */
-  | { kind: 'refused'; front: Front }
-  | { kind: 'ended'; command: Command; front: Front }
-  | { kind: 'running'; command: Command; front: Front };
+  | { kind: 'refused'; front: Front; took: Took }
+  | { kind: 'ended'; command: Command; front: Front; took: Took }
+  | { kind: 'running'; command: Command; front: Front; took: Took };
 
 export interface SendOutcome {
   /** false when nothing was sent: the shell had exited (`by: 'exited'`), a prompt whose end mark came wasn't drawn within the wait (`by: 'timeout'`), the call's signal aborted it (`by: 'cancelled'`), or `close` began while it waited (`by: 'closed'`). */
@@ -172,13 +177,16 @@ export interface SendOutcome {
   clipped?: number;
   /** With `until` and no match, the lines and alternate-screen rows the search hadn't reached when the call returned. */
   unsearched?: number;
+  /** With `unsearched`, the first line the search hadn't reached; the lines from it on, then any alternate-screen rows, are the ones counted. */
+  unsearchedFrom?: number;
+  took: Took;
 }
 
 export type Until = { kind: 'end' } | { kind: 'input' } | { kind: 'match'; pattern: RegExp };
 
 export interface WaitOutcome {
   /** `end`: the front is at a prompt, at once when it already was; `input`: the front is `waiting`, which ends a wait for `end` too, since a command waiting for input won't end until it's answered. */
-  by: 'end' | 'input' | 'match' | 'exited' | 'timeout' | 'cancelled';
+  by: 'end' | 'input' | 'match' | 'exited' | 'timeout' | 'cancelled' | 'closed';
   front: Front;
   ended: Command[];
   matched?: Match;
@@ -186,6 +194,9 @@ export interface WaitOutcome {
   clipped?: number;
   /** For a match that wasn't found, the lines and alternate-screen rows the search hadn't reached when the call returned. */
   unsearched?: number;
+  /** With `unsearched`, the first line the search hadn't reached; the lines from it on, then any alternate-screen rows, are the ones counted. */
+  unsearchedFrom?: number;
+  took: Took;
 }
 
 export interface StopStep {
@@ -194,6 +205,8 @@ export interface StopStep {
   to?: Process;
   /** The signal wasn't delivered: the error's code, such as `EPERM`. `stop` goes no further. */
   refused?: string;
+  /** The signal wasn't sent: the shell's descendants couldn't be listed, so the job's group couldn't be confirmed as still the shell's. `stop` goes no further. */
+  withheld?: true;
   /** The front once the step settled or its grace ran out. */
   front: Front;
 }
@@ -203,11 +216,14 @@ export interface StopOutcome {
   front: Front;
   /** The shell itself runs what's in front, a program exec'd in the shell's place does, or a job outlived KILL: only `close` ends it. */
   next?: 'close';
+  /** `abort` aborted it: no step after the one under way was taken. */
+  cancelled?: true;
 }
 
 /**
  * Events, each emitted once. `taken` is true when a call's outcome already gave it (`run`, `send` or
- * `wait` on this session, unless the call passed `take: false` or its `signal` aborted it first), so the host can skip the wake.
+ * `wait` on this session, unless the call passed `take: false` or its `signal` aborted it first), so the host can skip the wake;
+ * that call's outcome lists it in `took`.
  * `waiting` fires on each entry into that state, noticed within about a quarter second, and input
  * sent while something is in front starts a new one; a `match`
  * watch fires once and is gone. A shell that exits mid-command emits that command's `ended`, with no
@@ -246,12 +262,12 @@ export interface Session {
   /** `match` looks from line `from` on, so lines already there count. */
   wait(until: Until, opts: { waitMs: number; from: number; take?: boolean; signal?: AbortSignal }): Promise<WaitOutcome>;
   /** Without `signal`, in steps: C-c, typed to the terminal, so it reaches whatever is in front, a shell's own loop included; then TERM, then KILL, each with a grace and each only to the job's group while it is still the shell's. With `signal`, that one step. */
-  stop(signal?: NodeJS.Signals): Promise<StopOutcome>;
+  stop(signal?: NodeJS.Signals, opts?: { abort?: AbortSignal }): Promise<StopOutcome>;
   /** Hangs up the shell, again every 500 ms while it is there, then after a grace KILLs the shell alone, so the kernel hangs up the job in front as a closing terminal does, and a job detached on purpose lives on. With `force`, at once KILLs every process group the shell started, then the shell. Resolves with the exit, at once if it had exited. */
   close(opts?: { force?: boolean }): Promise<Closed>;
 
-  /** A one-shot pattern watch from line `from` on; its id names the `match` event. */
-  watch(pattern: RegExp, from: number): number;
+  /** A one-shot pattern watch from line `from` on; its id names the `match` event. Given `command`, its match in that command's output is emitted before the command's `ended`; other watches search a slice at a time. */
+  watch(pattern: RegExp, from: number, command?: number): number;
   unwatch(id: number): void;
   onEvent(listener: (event: SessionEvent) => void): () => void;
 }

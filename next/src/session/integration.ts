@@ -55,16 +55,19 @@ __tsm_drain() {
   /bin/sh @DRAIN@ @DRAINED@."$__tsm_c" 2>/dev/null
 }
 __tsm_end() {
-  local __tsm_s=$? __tsm_p="$\{PIPESTATUS[*]}" __tsm_f __tsm_n __tsm_cwd __tsm_j=$-
+  local __tsm_s=$? __tsm_p="$\{PIPESTATUS[*]}" __tsm_f __tsm_n __tsm_cwd __tsm_j=$- __tsm_t
   if [ -n "$\{__tsm_ps+x}" ]; then __tsm_p=$__tsm_ps; unset __tsm_ps; fi
   set +m
   __tsm_f=$(__tsm_drain)
+  __tsm_t=$(builtin trap -p INT)
   case $__tsm_j in *m*) set -m ;; esac
   __tsm_esc "$PWD"
   __tsm_cwd=$__tsm_ret
   __tsm_n=$__tsm_c.$__tsm_r
+  builtin trap '' INT
   __tsm_next
   builtin printf '\\033]133;D;%s;%s;%s;%s;%s;%s\\007' "$__tsm_n" "$__tsm_c.$__tsm_r" "$__tsm_s" "$__tsm_p" "$-" "$__tsm_cwd"
+  builtin eval "$\{__tsm_t:-builtin trap - INT}"
   case $- in *e*) return 0 ;; esac
   return "$__tsm_s"
 }
@@ -138,6 +141,8 @@ __tsm_end() {
   __tsm_esc "$PWD"
   __tsm_cwd=$__tsm_ret
   __tsm_n=$__tsm_c.$__tsm_r
+  setopt localoptions localtraps
+  trap '' INT
   __tsm_next
   builtin printf '\\033]133;D;%s;%s;%s;%s;%s;%s\\007' "$__tsm_n" "$__tsm_c.$__tsm_r" "$__tsm_s" "$__tsm_p" "$-" "$__tsm_cwd"
   return $__tsm_s
@@ -182,6 +187,9 @@ function __tsm_esc
     printf '%s' (string replace -r -- 'x$' '' $v | string collect)
 end
 function __tsm_collect
+    if test (string split -f1 . -- $FISH_VERSION) -ge 4
+        builtin history append -- (string collect < $argv[3])
+    end
     string collect < $argv[1]
     return $argv[2]
 end
@@ -198,12 +206,15 @@ end
 function __tsm_d
     begin; __tsm_drain; end | string collect -N >/dev/null
     set -l n $__tsm_c.$__tsm_r
+    function __tsm_noint --on-signal SIGINT
+    end
     __tsm_next
     set -l p $argv
     set -e p[1]
     set -l pj (string join ' ' -- $p)
     set -l cwd (__tsm_esc $PWD)
     printf '\\e]133;D;%s;%s;%s;%s;;%s\\a' $n $__tsm_c.$__tsm_r $argv[1] "$pj" "$cwd"
+    functions -e __tsm_noint
 end
 function __tsm_post --on-event fish_postexec
     set -l x $pipestatus $status
@@ -317,7 +328,8 @@ export const TEXT_FILE = 'tsm-text-';
  * pipeline's, stay its own. In bash the text has a file of its own, so its syntax ends where that file
  * does; a RETURN trap set around it keeps the pipeline's statuses, which zsh and fish reset through
  * every wrapper. In zsh and fish the text stays inline, followed by a blank line, which ends a trailing
- * backslash's continuation.
+ * backslash's continuation. fish 4 adds the text to its history from a copy in a file of its own; fish 3
+ * has no way to add it.
  */
 export function commandFile(kind: ShellKind, dir: string, id: number, text: string): { files: Array<{ path: string; body: string }>; line: string } {
   const file = path.join(dir, `${COMMAND_FILE}${id}`);
@@ -341,8 +353,9 @@ export function commandFile(kind: ShellKind, dir: string, id: number, text: stri
     return { files: [{ path: file, body }], line: ` . ${sq(file)}\r` };
   }
   if (kind === 'fish') {
+    const textFile = path.join(dir, `${TEXT_FILE}${id}`);
     const body = `${text}\n\nset -g __tsm_fps $pipestatus $status; __tsm_setst $__tsm_fps[-1]\n`;
-    return { files: [{ path: file, body }], line: ` eval (__tsm_collect ${fishq(file)} $status)\r` };
+    return { files: [{ path: file, body }, { path: textFile, body: text }], line: ` eval (__tsm_collect ${fishq(file)} $status ${fishq(textFile)})\r` };
   }
   return { files: [], line: `${text}\r` };
 }
