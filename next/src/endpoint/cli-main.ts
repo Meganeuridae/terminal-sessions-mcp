@@ -2,7 +2,8 @@ import { StringDecoder } from 'node:string_decoder';
 import type { Writable } from 'node:stream';
 import { REACH_MS, reach, type Reached } from '../relay.js';
 import { SCOPE_RE, STOP } from './hello.js';
-import { probe, shellQuote } from './socket.js';
+import { shellQuote } from '../core/launch.js';
+import { probe } from './socket.js';
 
 export const USAGE = `usage: tsm [--scope NAME] [--socket PATH] [--json] COMMAND
   open NAME [--cwd DIR] [--cols N] [--rows N]

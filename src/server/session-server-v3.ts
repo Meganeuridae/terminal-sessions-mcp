@@ -408,6 +408,31 @@ const KILL_BUDGET_MS = 10_000;
 const SHELL_WAIT_MS = 3000;
 const SETTLE_MS = 50;
 
+/**
+ * On macOS, node-pty starts every shell through the spawn-helper beside the native module it loaded, which `require`
+ * keeps in its cache. Some of node-pty's releases ship that helper without its execute bit.
+ */
+export function unrunnableHelper(ptyDir?: string, platform: string = process.platform): string | undefined {
+  if (platform !== 'darwin') return undefined;
+  let dir = ptyDir;
+  if (dir === undefined) {
+    try {
+      dir = path.dirname(require.resolve('node-pty/package.json'));
+    } catch {
+      return undefined;
+    }
+  }
+  const addon = Object.keys(require.cache).find((f) => f.startsWith(dir + path.sep) && path.basename(f) === 'pty.node');
+  if (addon === undefined) return undefined;
+  const helper = path.join(path.dirname(addon), 'spawn-helper');
+  try {
+    fs.accessSync(helper, fs.constants.X_OK);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EACCES' && fs.existsSync(helper)) return helper;
+  }
+  return undefined;
+}
+
 function ps(args: string[], until: number): Promise<{ status: number; stdout: string } | undefined> {
   const timeout = Math.floor(until - performance.now());
   if (timeout <= 0) return Promise.resolve(undefined);
@@ -547,13 +572,20 @@ export class PersistentSessionServer extends EventEmitter {
     const shellArgs = shell === 'wsl.exe' ? ['-d', 'Ubuntu', 'bash'] : [];
 
     // Create PTY instance
-    const ptyProcess = pty.spawn(shell, shellArgs, {
-      name: 'xterm-256color',  // Modern terminal with full mouse tracking support
-      cwd,
-      env,
-      cols: 120,
-      rows: 30
-    });
+    let ptyProcess: IPty;
+    try {
+      ptyProcess = pty.spawn(shell, shellArgs, {
+        name: 'xterm-256color',  // Modern terminal with full mouse tracking support
+        cwd,
+        env,
+        cols: 120,
+        rows: 30
+      });
+    } catch (e) {
+      const helper = unrunnableHelper();
+      if (!helper) throw e;
+      throw new Error(`${(e as Error).message} node-pty starts every shell through ${helper}, which isn't executable. Run chmod +x '${helper.replace(/'/g, "'\\''")}', then create the session again.`);
+    }
 
     const sessionInfo: SessionInfo = {
       id,

@@ -2,9 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import { createRequire } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { loginShell } from '../src/core/launch.js';
+import { loginShell, unrunnableHelper } from '../src/core/launch.js';
 
 const LAUNCHER = path.resolve(import.meta.dirname, '../../config/termd-launch.sh');
 
@@ -90,5 +91,63 @@ test("a version manager's directory already on PATH is moved ahead of the system
     assert.equal(r.path.split(':').filter((d) => d === volta).length, 1, 'on PATH once');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// node-pty keeps the native module it loaded in require's cache, from which unrunnableHelper takes it. Each fixture
+// holds a copy of that module, loaded the way node-pty's loader does: the first directory whose require succeeds.
+const req = createRequire(import.meta.url);
+const ptyAddon = (): string => {
+  const ptyDir = path.dirname(req.resolve('node-pty/package.json'));
+  req('node-pty');
+  const loaded = Object.keys(req.cache).find((f) => f.startsWith(ptyDir + path.sep) && path.basename(f) === 'pty.node');
+  assert.ok(loaded, "node-pty's native module is in require's cache once node-pty has loaded");
+  return loaded;
+};
+const ptyFixture = (dirs: Record<string, { addon: string; helper?: number }>): string => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-pty-')));
+  for (const [d, { addon, helper }] of Object.entries(dirs)) {
+    fs.mkdirSync(path.join(dir, d), { recursive: true });
+    if (fs.existsSync(addon)) fs.copyFileSync(addon, path.join(dir, d, 'pty.node'));
+    else fs.writeFileSync(path.join(dir, d, 'pty.node'), addon);
+    if (helper !== undefined) {
+      fs.writeFileSync(path.join(dir, d, 'spawn-helper'), '');
+      fs.chmodSync(path.join(dir, d, 'spawn-helper'), helper);
+    }
+  }
+  for (const d of ['build/Release', 'build/Debug', `prebuilds/darwin-${process.arch}`]) {
+    try {
+      req(path.join(dir, d, 'pty.node'));
+      break;
+    } catch {}
+  }
+  return dir;
+};
+const dropFixture = (dir: string): void => {
+  for (const f of Object.keys(req.cache)) if (f.startsWith(dir + path.sep)) delete req.cache[f];
+  fs.rmSync(dir, { recursive: true, force: true });
+};
+
+test("on macOS, the spawn-helper named is the one beside the native module node-pty loaded, not beside the first one present", () => {
+  const prebuilds = `prebuilds/darwin-${process.arch}`;
+  const dir = ptyFixture({ 'build/Release': { addon: 'not a native module', helper: 0o755 }, [prebuilds]: { addon: ptyAddon(), helper: 0o644 } });
+  try {
+    const helper = path.join(dir, prebuilds, 'spawn-helper');
+    assert.equal(unrunnableHelper(dir, 'darwin'), helper);
+    assert.equal(unrunnableHelper(dir, 'linux'), undefined);
+    fs.chmodSync(helper, 0o755);
+    assert.equal(unrunnableHelper(dir, 'darwin'), undefined);
+  } finally {
+    dropFixture(dir);
+  }
+});
+
+test('on macOS, a spawn-helper that is missing is not named, since chmod cannot fix it', () => {
+  const prebuilds = `prebuilds/darwin-${process.arch}`;
+  const dir = ptyFixture({ [prebuilds]: { addon: ptyAddon() } });
+  try {
+    assert.equal(unrunnableHelper(dir, 'darwin'), undefined);
+  } finally {
+    dropFixture(dir);
   }
 });

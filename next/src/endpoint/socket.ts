@@ -3,6 +3,7 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { shellQuote } from '../core/launch.js';
 
 /** The longest Unix socket path both platforms take: macOS's sun_path holds 104 bytes with its NUL, Linux's 108. */
 const SOCKET_PATH_MAX = 103;
@@ -38,8 +39,6 @@ function linuxRunUser(uid: number): string | undefined {
   }
 }
 
-export const shellQuote = (s: string): string =>
-  /^[A-Za-z0-9_./:,+@%-]+$/.test(s) ? s : s === '' ? "''" : s.split(/(['\\])/).map((p) => (p === "'" || p === '\\' ? `\\${p}` : p ? `'${p}'` : '')).join('');
 
 /** The process's uid, without the passwd lookup os.userInfo() makes, which throws for a uid with no entry. */
 const uidOf = (): number => process.getuid?.() ?? os.userInfo().uid;

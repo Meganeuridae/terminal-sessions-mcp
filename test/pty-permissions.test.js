@@ -55,3 +55,61 @@ test('postinstall warns with a chmod that works as printed when it cannot change
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// node-pty keeps the native module it loaded in require's cache, from which unrunnableHelper takes it. Each fixture
+// holds a copy of that module, loaded the way node-pty's loader does: the first directory whose require succeeds.
+const ptyAddon = () => {
+  require('../dist/src/server/session-server-v3.js');
+  const ptyDir = path.dirname(require.resolve('node-pty/package.json'));
+  const loaded = Object.keys(require.cache).find((f) => f.startsWith(ptyDir + path.sep) && path.basename(f) === 'pty.node');
+  assert.ok(loaded, "node-pty's native module is in require's cache once node-pty has loaded");
+  return loaded;
+};
+const ptyFixture = (dirs) => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-pty-')));
+  for (const [d, { addon, helper }] of Object.entries(dirs)) {
+    fs.mkdirSync(path.join(dir, d), { recursive: true });
+    if (fs.existsSync(addon)) fs.copyFileSync(addon, path.join(dir, d, 'pty.node'));
+    else fs.writeFileSync(path.join(dir, d, 'pty.node'), addon);
+    if (helper !== undefined) {
+      fs.writeFileSync(path.join(dir, d, 'spawn-helper'), '');
+      fs.chmodSync(path.join(dir, d, 'spawn-helper'), helper);
+    }
+  }
+  for (const d of ['build/Release', 'build/Debug', `prebuilds/darwin-${process.arch}`]) {
+    try {
+      require(path.join(dir, d, 'pty.node'));
+      break;
+    } catch {}
+  }
+  return dir;
+};
+const dropFixture = (dir) => {
+  for (const f of Object.keys(require.cache)) if (f.startsWith(dir + path.sep)) delete require.cache[f];
+  fs.rmSync(dir, { recursive: true, force: true });
+};
+
+test("1.x names, on macOS, the spawn-helper beside the native module node-pty loaded, not beside the first one present", () => {
+  const { unrunnableHelper } = require('../dist/src/server/session-server-v3.js');
+  const prebuilds = `prebuilds/darwin-${process.arch}`;
+  const dir = ptyFixture({ 'build/Release': { addon: 'not a native module', helper: 0o755 }, [prebuilds]: { addon: ptyAddon(), helper: 0o644 } });
+  try {
+    const helper = path.join(dir, prebuilds, 'spawn-helper');
+    assert.strictEqual(unrunnableHelper(dir, 'darwin'), helper);
+    assert.strictEqual(unrunnableHelper(dir, 'linux'), undefined);
+    fs.chmodSync(helper, 0o755);
+    assert.strictEqual(unrunnableHelper(dir, 'darwin'), undefined);
+  } finally {
+    dropFixture(dir);
+  }
+});
+
+test('1.x names no spawn-helper that is missing, since chmod cannot fix it', () => {
+  const { unrunnableHelper } = require('../dist/src/server/session-server-v3.js');
+  const dir = ptyFixture({ [`prebuilds/darwin-${process.arch}`]: { addon: ptyAddon() } });
+  try {
+    assert.strictEqual(unrunnableHelper(dir, 'darwin'), undefined);
+  } finally {
+    dropFixture(dir);
+  }
+});

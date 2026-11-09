@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import { createRequire } from 'node:module';
 import * as path from 'node:path';
 
 /**
@@ -59,4 +60,24 @@ function executableFile(p: string): boolean {
 /** The argv that runs `text` under bash with no startup files and in privileged mode, named `name`, with `args` as its positional parameters. */
 export function viaBash(bash: string, text: string, name: string, args: readonly string[]): [string, string[]] {
   return [bash, ['--noprofile', '--norc', '-p', '-c', text, name, ...args]];
+}
+
+export const shellQuote = (s: string): string =>
+  /^[A-Za-z0-9_./:,+@%-]+$/.test(s) ? s : s === '' ? "''" : s.split(/(['\\])/).map((p) => (p === "'" || p === '\\' ? `\\${p}` : p ? `'${p}'` : '')).join('');
+
+/**
+ * On macOS, node-pty starts every shell through the spawn-helper beside the native module it loaded, which `require`
+ * keeps in its cache. Some of node-pty's releases ship that helper without its execute bit.
+ */
+export function unrunnableHelper(ptyDir: string, platform: string = process.platform): string | undefined {
+  if (platform !== 'darwin') return undefined;
+  const addon = Object.keys(createRequire(import.meta.url).cache).find((f) => f.startsWith(ptyDir + path.sep) && path.basename(f) === 'pty.node');
+  if (addon === undefined) return undefined;
+  const helper = path.join(path.dirname(addon), 'spawn-helper');
+  try {
+    fs.accessSync(helper, fs.constants.X_OK);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EACCES' && fs.existsSync(helper)) return helper;
+  }
+  return undefined;
 }
