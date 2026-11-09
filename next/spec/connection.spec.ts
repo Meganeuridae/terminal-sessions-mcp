@@ -343,7 +343,7 @@ test('a cancelled call stops its wait, and is answered to nobody', async () => {
       new Promise((resolve) => {
         opts.signal?.addEventListener('abort', () => {
           aborted = true;
-          resolve({ by: 'cancelled', front: s.frontNow, ended: [] });
+          resolve({ by: 'cancelled', front: s.frontNow, ended: [], took: [] });
         });
       });
     c.send({ jsonrpc: '2.0', id: 'w', method: 'tools/call', params: { name: 'look', arguments: { name: 'main', until: 'end', wait: 30 } } });
@@ -352,6 +352,71 @@ test('a cancelled call stops its wait, and is answered to nobody', async () => {
     assert.deepEqual((await c.request('ping')).result, {});
     assert.equal(aborted, true, 'the session saw the abort');
     assert.equal(c.order.filter((m) => m.id === 'w').length, 0, 'no answer to the cancelled call');
+  } finally {
+    await h.done();
+  }
+});
+
+test('a connection that closes aborts the calls it has in flight', async () => {
+  const h = await harness();
+  try {
+    const c = await h.connect(relayHello('a'));
+    await c.request('initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+    await c.request('tools/call', { name: 'open', arguments: { name: 'main' } });
+    const s = h.sessions.at(-1)!;
+    let aborted = false;
+    let waiting!: () => void;
+    const started = new Promise<void>((r) => (waiting = r));
+    s.wait = (_until, opts) =>
+      new Promise((resolve) => {
+        waiting();
+        opts.signal?.addEventListener('abort', () => {
+          aborted = true;
+          resolve({ by: 'cancelled', front: s.frontNow, ended: [], took: [] });
+        });
+      });
+    c.send({ jsonrpc: '2.0', id: 'w', method: 'tools/call', params: { name: 'look', arguments: { name: 'main', until: 'end', wait: 30 } } });
+    await started;
+    c.close();
+    const deadline = Date.now() + 2000;
+    while (!aborted && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(aborted, true, 'the session saw the abort');
+  } finally {
+    await h.done();
+  }
+});
+
+test('an end a closed connection was waiting for is pushed to another connection of its scope', async () => {
+  const h = await harness();
+  try {
+    const a = await h.connect(relayHello('a'));
+    await a.request('initialize', MCPL_INIT);
+    await a.request('featureSets/update', GRANT);
+    const b = await h.connect(relayHello('a'));
+    await b.request('initialize', MCPL_INIT);
+    await b.request('featureSets/update', GRANT);
+    await a.request('tools/call', { name: 'open', arguments: { name: 'main' } });
+    const s = h.sessions[0]!;
+    s.runMode = 'run';
+    const run = s.run.bind(s);
+    let started!: () => void;
+    const waiting = new Promise<void>((r) => (started = r));
+    let inFlight = false;
+    s.run = async (text, opts) => {
+      const r = await run(text, opts);
+      inFlight = true;
+      started();
+      await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
+      inFlight = false;
+      return r;
+    };
+    a.send({ jsonrpc: '2.0', id: 'r', method: 'tools/call', params: { name: 'run', arguments: { name: 'main', command: 'make', wait: 30 } } });
+    await waiting;
+    a.close();
+    await b.request('ping');
+    s.end(0, inFlight);
+    const push = await b.next((m) => m.method === 'push/event');
+    assert.match((push.params as { payload: { content: Array<{ text: string }> } }).payload.content[0]!.text, /^\[main · command 1 · exit 0 · /);
   } finally {
     await h.done();
   }

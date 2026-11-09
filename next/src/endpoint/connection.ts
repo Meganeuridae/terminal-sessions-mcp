@@ -238,6 +238,7 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
   socket.on('close', () => {
     closed = true;
     unsubscribe?.();
+    for (const ac of calls.values()) ac.abort();
     out.rejectAll('the connection closed');
   });
 }

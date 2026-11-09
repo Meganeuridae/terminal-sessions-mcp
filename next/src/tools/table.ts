@@ -79,7 +79,7 @@ export const TOOLS: readonly ToolDef[] = [
     description:
       'Type into the terminal exactly the given `text`, then the named `keys`; nothing is appended, so a line needs `keys: ["Enter"]`. ' +
       'For answering a program that waits for input, or driving a full-screen one. Returns what changed: the new lines, or the screen of a full-screen program, ' +
-      'once `wait_for` matches or output has been quiet for 300 ms. Keys: Enter, Tab, S-Tab, Esc, Space, Backspace, Delete, Insert, Up, Down, Left, Right, Home, End, ' +
+      'once `wait_for` matches, or, without `wait_for`, once output has been quiet for 300 ms. Keys: Enter, Tab, S-Tab, Esc, Space, Backspace, Delete, Insert, Up, Down, Left, Right, Home, End, ' +
       'PageUp, PageDown, F1 to F12, C-a to C-z and C-\\, C-], C-@, C-^, C-_ (Ctrl), M-<char> (Alt), and C-, M- and S- on the arrows, Home, End, Insert, Delete, PageUp, PageDown and F-keys.',
     inputSchema: {
       type: 'object',

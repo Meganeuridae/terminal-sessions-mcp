@@ -1,15 +1,16 @@
-import { test } from 'node:test';
+import { mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Host, type Caller, type Wake } from '../src/tools/host.js';
 import { cutAt, outputValue, RESULT_MAX_CHARS } from '../src/tools/render.js';
-import type { OpenOptions } from '../src/session/types.js';
+import type { Command, OpenOptions } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
 
 const STARTED = Date.parse('2026-11-08T13:00:00.000Z');
 
-function setup() {
+function setup(now?: () => number) {
   const opened: FakeSession[] = [];
   const host = new Host({
+    ...(now ? { now } : {}),
     openSession: async (o: OpenOptions) => {
       const s = new FakeSession(o.name, o);
       opened.push(s);
@@ -62,7 +63,7 @@ test('H6: a run refused away from the prompt says what is in front and what woul
   assert.match(r.text, /^\[main · waiting for input: python3 -c input\(\), not echoed, as for a password, for [\d.]+ s · \/home\/u\]\nNothing was typed: python3 -c input\(\) is waiting for input\. `send` answers it, `stop` stops it\.$/);
 });
 
-test('H6: every result opens with the status line: a command\'s status, duration, directory and what is in front', async () => {
+test('H6: every result but close\'s opens with the status line: a command\'s status, duration, directory and what is in front', async () => {
   const { host } = setup();
   await host.call(agent(), 'open', { name: 'main', cwd: '/srv/app' });
   const r = await host.call(agent(), 'run', { name: 'main', command: 'make' });
@@ -82,7 +83,7 @@ test('H6: output too long for the host\'s inline cap keeps its start and its end
   assert.ok(r.text.length <= RESULT_MAX_CHARS, `${r.text.length} chars`);
   assert.match(r.text, /line 0 x/);
   assert.match(r.text, /line 4999 x/);
-  assert.match(r.text, /… \d+ lines left out \(`read` with `command: 1` or a range of `lines` gives more of it\)/);
+  assert.match(r.text, /… \d+ lines left out \(`read` with a range of `lines` within \[\d+, \d+\] gives more\)/);
 });
 
 test('H7: waits default to 15 s, reach 55 s, and go no further', async () => {
@@ -157,7 +158,7 @@ test('H8: a shell dying mid-command pushes its death under the command\'s key, s
   assert.deepEqual(unseen, ['[main · the shell exited with status 3]']);
 });
 
-test('H8: notify_on reports its first match once, under its command\'s key', async () => {
+test('H8: notify_on reports its first match once, under its command\'s key with /match', async () => {
   const { host, opened } = setup();
   const wakes: Wake[] = [];
   host.subscribe('a', async (w) => (wakes.push(w), true));
@@ -167,7 +168,7 @@ test('H8: notify_on reports its first match once, under its command\'s key', asy
   await host.call(agent(), 'run', { name: 'main', command: 'serve', wait: 0, notify_on: 'listening on \\d+' });
   s.print('starting', 'listening on 8080', 'listening on 8081');
   await settle();
-  assert.deepEqual(wakes.map((w) => [w.tag, w.key]), [['terminal:match', 'a/main/1']]);
+  assert.deepEqual(wakes.map((w) => [w.tag, w.key]), [['terminal:match', 'a/main/1/match']]);
   assert.match(wakes[0]!.text, /Matched at line \d+: listening on 8080$/);
 });
 
@@ -294,15 +295,16 @@ test('no result passes the cap, even with more endings not yet seen than its sta
 });
 
 test('a send whose wait ends before the prompt is drawn types nothing, and says so and for how long', async () => {
-  const { host, opened } = setup();
+  const now = Date.now();
+  const { host, opened } = setup(() => now);
   await host.call(agent(), 'open', { name: 'main' });
   const s = opened[0]!;
-  s.frontNow = { state: 'running', since: Date.now() - 2_300, process: { pgid: 5, argv: 'bash', shell: true }, waitVisible: true };
+  s.frontNow = { state: 'running', since: now - 2_300, process: { pgid: 5, argv: 'bash', shell: true }, waitVisible: true };
   s.promptUndrawn = true;
   const r = await host.call(agent(), 'send', { name: 'main', keys: ['C-r'], wait: 1 });
   assert.equal(r.isError, true);
   assert.equal(r.structured.error, 'not_at_prompt');
-  assert.match(r.text, /\nNothing was typed: the shell hasn't finished drawing its prompt after 2\.\d s, .* `send` again with a longer `wait`\.$/);
+  assert.match(r.text, /\nNothing was typed: the shell hasn't finished drawing its prompt after 2\.3 s, .* `send` again with a longer `wait`\.$/);
 });
 
 test('a shell still running its startup files says so, in the status line and in a refused run', async () => {
@@ -383,7 +385,8 @@ test('closing a session wakes no one, though its running command ends and its sh
   host.subscribe('a', async (w) => (wakes.push(w), true));
   await host.call(agent(), 'open', { name: 'main' });
   running(opened[0]!);
-  await host.call(agent(), 'run', { name: 'main', command: 'sleep 9', wait: 0 });
+  const r = await host.call(agent(), 'run', { name: 'main', command: 'sleep 9', wait: 0 });
+  assert.equal(r.structured.running, true, 'a command was running when the session closed');
   await host.call(agent(), 'close', { name: 'main' });
   await settle();
   assert.deepEqual(wakes, []);
@@ -438,6 +441,8 @@ test('a timed-out look promises only what will be reported, and its match is key
   const { host, opened } = setup();
   await host.call(agent(), 'open', { name: 'main' });
   const s = opened[0]!;
+  assert.doesNotMatch((await host.call(agent(), 'look', { name: 'main', until: 'end', wait: 0 })).text, /The wait ended first/, 'at the prompt, nothing is waited for');
+  s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 4242, argv: 'bash', shell: true }, waitVisible: true };
   const end = await host.call(agent(), 'look', { name: 'main', until: 'end', wait: 0 });
   assert.match(end.text, /No command is running, so no end will be reported/);
   s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 9, argv: 'cat', shell: false }, waitVisible: false };
@@ -712,7 +717,7 @@ test('a single line too long for a result keeps its start and its end, and says 
   s.out = [`${'a'.repeat(30_000)}${'b'.repeat(30_000)}`];
   const r = await host.call(cli(), 'read', { name: 'main', lines: [0, 1] });
   assert.ok(r.text.length <= RESULT_MAX_CHARS, `${r.text.length}`);
-  assert.match(r.text, /\na+…\n… \d+ characters of this line left out\n…b+$/);
+  assert.match(r.text, /\na+…\n… \d+ characters of this line left out, which no call returns; .*\n…b+$/);
   const [, cut] = /… (\d+) characters of this line left out/.exec(r.text)!;
   const kept = (/\n(a+)…/.exec(r.text)![1]!.length) + (/…(b+)$/.exec(r.text)![1]!.length);
   assert.equal(kept + Number(cut), 60_000);
@@ -732,10 +737,16 @@ test('a read search lets other calls run between the lines it searches', async (
   await host.call(agent(), 'open', { name: 'main' });
   opened[0]!.out = Array.from({ length: 50 }, (_, i) => `line ${i}`);
   let done = false;
-  const reading = host.call(cli(), 'read', { name: 'main', match: 'nowhere' }).then(() => (done = true));
-  await settle();
-  assert.equal(done, false, 'a turn of the event loop came while it searched');
-  await reading;
+  let turns = 0;
+  const tick = (): void => {
+    if (done) return;
+    turns++;
+    setImmediate(tick);
+  };
+  setImmediate(tick);
+  await host.call(cli(), 'read', { name: 'main', match: 'nowhere' });
+  done = true;
+  assert.ok(turns >= 48, `the event loop turned ${turns} times while it searched 50 lines`);
 });
 
 test('a call that waited while its session closed is refused, and sets no watch', async () => {
@@ -811,15 +822,15 @@ test('strings in structured content are cut as the text quotes them', async () =
   assert.ok(text.length < 300, `${text.length}`);
 });
 
-test('a failed open or close says what is unknown and that list shows it; a backend failure says calling again won\'t help', async () => {
+test('a failed open or close says what is unknown and that list shows it; a backend failure says what the session said, next step included', async () => {
   let fail: Error = new Error('EMFILE');
   const host = new Host({ openSession: async () => { throw fail; }, shell: '/bin/bash', env: {}, sessionsDir: '/tmp/sessions', startedAt: STARTED });
   const r = await host.call(agent(), 'open', { name: 'main' });
   assert.match(r.text, /^`open` failed: EMFILE\. Whether the session opened is unknown; `list` shows the sessions open\.$/);
   const { TermError } = await import('../src/core/errors.js');
-  fail = new TermError('backend_failure', 'this host has no bash');
+  fail = new TermError('backend_failure', 'this host has no bash. Sessions open here once bash is installed');
   const b = await host.call(agent(), 'open', { name: 'main' });
-  assert.match(b.text, /^This host has no bash\. Calling again won't help: whoever runs the daemon can fix it\.$/);
+  assert.equal(b.text, 'This host has no bash. Sessions open here once bash is installed.');
 });
 
 test('a send refused at the longest wait advises look, not a longer wait', async () => {
@@ -895,7 +906,7 @@ test("the host says what the session reports of a match on the screen, an undeli
   assert.match(wakes.find((w) => w.tag === 'terminal:match')!.text, /\nMatched on the screen, row 3: ALT-READY$/);
   s.stop = async () => ({ steps: [{ sent: 'SIGTERM', to: { pgid: 9, argv: 'sudo -n sleep 9', shell: false }, refused: 'EPERM', front: s.frontNow }], front: s.frontNow });
   assert.match((await host.call(agent(), 'stop', { name: 'main' })).text, /\nSIGTERM wasn't delivered to sudo -n sleep 9 \(EPERM\), so no further step was taken: now /);
-  s.send = async () => ({ sent: true, lines: s.lines(s.out.length), front: s.frontNow, ended: [], by: 'timeout', clipped: 2 });
+  s.send = async () => ({ sent: true, lines: s.lines(s.out.length), front: s.frontNow, ended: [], by: 'timeout', clipped: 2, took: [] });
   assert.match((await host.call(agent(), 'send', { name: 'main', text: 'x', wait_for: 'never', wait: 1 })).text, /\nThe wait ended before the pattern matched; 2 lines longer than the match window, searched on their head only\./);
   s.frontNow = { state: 'waiting', since: Date.now(), process: { pgid: 9, argv: 'read', shell: false } };
   assert.match((await host.call(agent(), 'list', {})).text, /waiting for input: read, echo unknown, for /);
@@ -911,14 +922,454 @@ test('a search the wait ended before it reached the end says how many lines it n
   const { host, opened } = setup();
   await host.call(agent(), 'open', { name: 'main' });
   const s = opened[0]!;
-  s.send = async () => ({ sent: true, lines: s.lines(s.out.length), front: s.frontNow, ended: [], by: 'timeout', unsearched: 1200, clipped: 3 });
+  s.out = Array.from({ length: 1300 }, (_, i) => `line ${i}`);
+  s.send = async () => ({ sent: true, lines: s.lines(s.out.length), front: s.frontNow, ended: [], by: 'timeout', unsearched: 1202, unsearchedFrom: 100, clipped: 3, took: [] });
   const sent = await host.call(agent(), 'send', { name: 'main', text: 'x', wait_for: 'DONE', wait: 5 });
-  assert.match(sent.text, /\nThe wait ended with 1200 lines not yet searched, and no match in those it searched; 3 lines longer than the match window, searched on their head only\. `look` again with a longer `wait` searches them, or `read` with `match` searches a range of `lines`\./);
-  const longest = await host.call(agent(), 'send', { name: 'main', text: 'x', wait_for: 'DONE', wait: 55 });
-  assert.match(longest.text, /no match in those it searched; 3 lines .* head only\. `read` with `match` searches a range of `lines`\./);
-  s.wait = async () => ({ by: 'timeout', front: s.frontNow, ended: [], unsearched: 1 });
-  assert.match((await host.call(cli(), 'look', { name: 'main', match: 'DONE', wait: 5 })).text, /\nThe wait ended with 1 line not yet searched, and no match in those it searched\. `look` again with a longer `wait` searches them/);
+  assert.match(sent.text, /\nThe wait ended with 1202 lines not yet searched, and no match in those it searched; 3 lines longer than the match window, searched on their head only\. `read` with `match` and `lines: \[100, 1300\]` searches them\. The screen's 2 rows it didn't reach are on the screen now\./);
+  s.wait = async () => ({ by: 'timeout', front: s.frontNow, ended: [], unsearched: 1, unsearchedFrom: 1299, took: [] });
+  assert.match((await host.call(cli(), 'look', { name: 'main', match: 'DONE', wait: 5 })).text, /\nThe wait ended with 1 line not yet searched, and no match in those it searched\. `read` with `match` and `lines: \[1299, 1300\]` searches them\.$/m);
   assert.match((await host.call(agent(), 'look', { name: 'main', match: 'DONE', wait: 5 })).text, /\nThe wait ended with 1 line not yet searched, and no match in those it searched\. The match will be reported to you when it comes\./);
-  s.wait = async () => ({ by: 'timeout', front: s.frontNow, ended: [] });
+  s.wait = async () => ({ by: 'timeout', front: s.frontNow, ended: [], took: [] });
   assert.match((await host.call(agent(), 'look', { name: 'main', match: 'DONE', wait: 5 })).text, /\nThe wait ended first\. The match will be reported to you when it comes\./);
+});
+
+const plain = (scope = 'a'): Caller => ({ scope, takes: true, pushes: false });
+const unseenOf = async (host: Host): Promise<string[]> => (await host.call(cli(), 'list', {})).structured.unseen as string[];
+
+test('a pattern a command asked to be told of stays reported when its command ends before anyone saw the match', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(plain(), 'run', { name: 'main', command: 'make', notify_on: 'needle', wait: 0 });
+  s.print('a needle here');
+  await settle();
+  s.end(0);
+  await settle();
+  const unseen = await unseenOf(host);
+  assert.equal(unseen.length, 2, unseen.join('\n---\n'));
+  assert.match(unseen[0]!, /\nMatched at line \d+: a needle here$/);
+  assert.match(unseen[1]!, /^\[main · command 1 · exit 0 /);
+});
+
+test('a match is pushed under a key of its own, so a host coalescing by key keeps it beside its command\'s end', async () => {
+  const { host, opened } = setup();
+  const keys: string[] = [];
+  host.subscribe('a', async (w) => (keys.push(`${w.tag} ${w.key}`), false));
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(agent(), 'run', { name: 'main', command: 'make', notify_on: 'needle', wait: 0 });
+  s.print('a needle here');
+  await settle();
+  await settle();
+  s.end(0);
+  await settle();
+  await settle();
+  const match = keys.find((k) => k.startsWith('terminal:match'))!.split(' ')[1];
+  const end = keys.find((k) => k.startsWith('terminal:ended'))!.split(' ')[1];
+  assert.notEqual(match, end);
+});
+
+test('a single line longer than a result says its middle is returned by no call, and what can show it', async () => {
+  const { host, opened } = setup();
+  await host.call(cli(), 'open', { name: 'main' });
+  opened[0]!.out = ['x'.repeat(30_000)];
+  const r = await host.call(cli(), 'read', { name: 'main', lines: [0, 1] });
+  assert.match(r.text, /\n… \d+ characters of this line left out, which no call returns; a command that prints the line in pieces, such as `fold -w 10000`, shows them\n/);
+});
+
+test('read takes `command` or `lines`, not both, and a cut command output names the range of lines that gives more', async () => {
+  const { host, opened } = setup();
+  await host.call(cli(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.runOutput = Array.from({ length: 3000 }, (_, i) => `line ${i} ${'y'.repeat(20)}`);
+  const r = await host.call(cli(), 'run', { name: 'main', command: 'make' });
+  const c = r.structured.command as { id: number; from: number; to: number };
+  assert.match(r.text, new RegExp(`\\(\`read\` with a range of \`lines\` within \\[${c.from}, ${c.to}\\] gives more\\)`));
+  const both = await host.call(cli(), 'read', { name: 'main', command: c.id, lines: [c.from + 10, c.from + 20] });
+  assert.equal(both.isError, true);
+  assert.equal(both.structured.error, 'invalid_argument');
+  assert.match(both.text, /^Give `command` or `lines`, not both/);
+});
+
+test('a read search and a notify_on search of an ended command stop at the 55 s a call may hold, and say which lines they left', async () => {
+  const { host, opened } = setup();
+  await host.call(cli(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.out = Array.from({ length: 50 }, (_, i) => `line ${i}`);
+  let t = 0;
+  const clock = mock.method(performance, 'now', () => (t += 5_000));
+  try {
+    const r = await host.call(cli(), 'read', { name: 'main', match: 'nowhere' });
+    assert.match(r.text, /searched lines 0 to \d+ before the 55 s a call may hold ran out; `read` with `match` and `lines: \[\d+, 50\]` searches the rest/);
+    assert.ok((r.structured.unsearched as { from: number }).from < 50);
+    s.runOutput = Array.from({ length: 50 }, (_, i) => `out ${i}`);
+    const run = await host.call(cli(), 'run', { name: 'main', command: 'make', notify_on: 'nowhere' });
+    assert.match(run.text, /`notify_on` searched lines \d+ to \d+ before the 55 s a call may hold ran out; `read` with `match` and `lines: \[\d+, \d+\]` searches the rest/);
+  } finally {
+    clock.mock.restore();
+  }
+});
+
+test('a report keeps its status line whole when a directory holds a line break, and the status line stays one line', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main', cwd: '/tmp' });
+  const s = opened[0]!;
+  s.dir = '/tmp/a\nb';
+  running(s);
+  const r = await host.call(plain(), 'run', { name: 'main', command: 'make', notify_on: 'needle', wait: 0 });
+  assert.match(r.text.split('\n')[0]!, /^\[main · command 1 · still running · .* · \/tmp\/a\\nb\]$/);
+  s.print('a needle here');
+  await settle();
+  const [report] = await unseenOf(host);
+  const lines = report!.split('\n');
+  assert.equal(lines.length, 2, report);
+  assert.match(lines[0]!, /\/tmp\/a\\nb\]$/);
+  assert.match(lines[1]!, /^Matched at line \d+: a needle here$/);
+});
+
+test('a run or send on a session closed while it waited says what it typed and what ended', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.run = async (text) => {
+    const c = { id: 7, text, from: 0, to: 1, startedAt: Date.now(), end: { at: Date.now(), ms: 1200, status: 0, errexit: false, refusedMarks: 0 } };
+    s.commands.set(7, c);
+    await host.call(cli(), 'close', { name: 'main' });
+    return { kind: 'ended', command: c, front: s.frontNow, took: [] };
+  };
+  const r = await host.call(plain(), 'run', { name: 'main', command: 'make' });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /^Session "main" was closed while this call waited\. Command 7 was typed, and ended: exit 0 · 1\.2 s\. /);
+  await host.call(plain(), 'open', { name: 'other' });
+  const o = opened[1]!;
+  o.send = async () => {
+    await host.call(cli(), 'close', { name: 'other' });
+    return { sent: true, lines: o.lines(0), front: o.frontNow, ended: [], by: 'closed', took: [] };
+  };
+  const sent = await host.call(plain(), 'send', { name: 'other', text: 'y\n' });
+  assert.match(sent.text, /^Session "other" was closed while this call waited\. Its input was typed\. /);
+});
+
+test('closing a session returns the reports about it that no one has seen, since nothing can show them after', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(plain(), 'run', { name: 'main', command: 'make', wait: 0 });
+  s.end(2);
+  await settle();
+  const r = await host.call(plain(), 'close', { name: 'main' });
+  assert.match(r.text, /\n\nNot yet seen:\n\[main · command 1 · exit 2 /);
+  assert.equal((r.structured.unseen as string[]).length, 1);
+});
+
+test('look gives the ends its own wait took before the reports not yet seen, so a cut leaves them', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  for (let id = 100; id < 400; id++) {
+    const c = { id, text: 'x', from: 0, to: 0, startedAt: Date.now(), end: { at: Date.now(), ms: 1, status: 0, errexit: false, refusedMarks: 0, cwd: '/home/u' } };
+    s.commands.set(id, c);
+    s.emit({ kind: 'ended', command: c, taken: false });
+  }
+  await settle();
+  const mine = { id: 500, text: 'make', from: 0, to: 0, startedAt: Date.now(), end: { at: Date.now(), ms: 3, status: 1, errexit: false, refusedMarks: 0, cwd: '/home/u' } };
+  s.commands.set(500, mine);
+  s.wait = async () => ({ by: 'end', front: s.frontNow, ended: [mine], took: [] });
+  const r = await host.call(plain(), 'look', { name: 'main', until: 'end' });
+  assert.match(r.text, /^\[main · [^\n]*\]\nCommand 500 ended: exit 1 · /);
+  assert.deepEqual((r.structured.ended as Array<{ id: number }>).map((c) => c.id), [500]);
+});
+
+test('a send that returns a screen leaves the look cursor where it was, since it returned no lines', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.live = 0;
+  s.out = ['before'];
+  await host.call(plain(), 'look', { name: 'main' });
+  s.send = async () => {
+    s.out.push('normal output');
+    return { sent: true, lines: { from: 1, to: 2, lines: ['normal output'], dropped: 0, live: 0 }, screen: { rows: ['vim'], cursor: { row: 0, col: 0 }, alt: true, title: '' }, front: s.frontNow, ended: [], by: 'quiet', took: [] };
+  };
+  const sent = await host.call(plain(), 'send', { name: 'main', text: 'x' });
+  assert.match(sent.text, /full-screen program/);
+  const after = await host.call(plain(), 'look', { name: 'main' });
+  assert.match(after.text, /\nnormal output$/);
+});
+
+test('a read search\'s context costs about the lines it shows, not a hit\'s context times the hits', async () => {
+  const { host, opened } = setup();
+  await host.call(cli(), 'open', { name: 'main' });
+  const cost = async (n: number): Promise<number> => {
+    opened[0]!.out = Array.from({ length: n }, () => 'hit');
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const start = process.cpuUsage();
+      await host.call(cli(), 'read', { name: 'main', match: 'hit', context: n });
+      const { user, system } = process.cpuUsage(start);
+      best = Math.min(best, (user + system) / 1000);
+    }
+    return best;
+  };
+  const small = await cost(1_000);
+  const large = await cost(4_000);
+  assert.ok(large < small * 8 + 20, `4,000 lines: ${large.toFixed(1)} ms; 1,000 lines: ${small.toFixed(1)} ms`);
+});
+
+test('list leaves room for the oldest report not yet seen however many sessions there are, so a taking list clears them', async () => {
+  const { host, opened } = setup();
+  for (let i = 0; i < 150; i++) await host.call(plain(), 'open', { name: `s${i}`, cwd: `/${'d'.repeat(200)}` });
+  const s = opened[0]!;
+  running(s);
+  await host.call(plain(), 'run', { name: 's0', command: 'make', wait: 0 });
+  s.end(0);
+  await settle();
+  const first = await host.call(plain(), 'list', {});
+  assert.equal((first.structured.unseen as string[]).length, 1);
+  assert.match(first.text, /\n… \d+ more sessions, listed in structuredContent\n\nNot yet seen:\n\[s0 · command 1 · exit 0 /);
+  assert.equal((first.structured.sessions as unknown[]).length, 150);
+  assert.equal(((await host.call(plain(), 'list', {})).structured.unseen as string[]).length, 0);
+});
+
+test('stop is an error when the step asked for wasn\'t carried out, and not when its signals were delivered', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const front = { state: 'running' as const, since: Date.now(), process: { pgid: 4242, argv: 'bash', shell: true }, waitVisible: true };
+  s.stop = async () => ({ steps: [], front, next: 'close' as const });
+  const shell = await host.call(plain(), 'stop', { name: 'main', signal: 'TERM' });
+  assert.equal(shell.isError, true);
+  assert.equal(shell.structured.error, 'not_sent');
+  s.stop = async () => ({ steps: [{ sent: 'SIGTERM', to: { pgid: 9, argv: 'make', shell: false }, refused: 'EPERM', front }], front });
+  assert.equal((await host.call(plain(), 'stop', { name: 'main', signal: 'TERM' })).isError, true);
+  s.stop = async () => ({ steps: [{ sent: 'C-c', front }], front });
+  assert.equal((await host.call(plain(), 'stop', { name: 'main' })).isError, undefined);
+});
+
+test('a timed-out look tells a plain host the argument that waits again', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(plain(), 'run', { name: 'main', command: 'make', wait: 0 });
+  assert.match((await host.call(plain(), 'look', { name: 'main', until: 'end', wait: 0 })).text, /`look` with `until: "end"` again waits for it\./);
+  s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 99, argv: 'make', shell: false }, command: 1, waitVisible: true };
+  assert.match((await host.call(plain(), 'look', { name: 'main', until: 'input', wait: 0 })).text, /`look` with `until: "input"` again waits for it\./);
+  assert.match((await host.call(plain(), 'look', { name: 'main', match: 'DONE', wait: 0 })).text, /`look` with the same `match` again waits for it\./);
+});
+
+test('structuredContent keeps a directory whole, since a script passes it back', async () => {
+  const { host, opened } = setup();
+  const long = `/${'d'.repeat(400)}`;
+  await host.call(cli(), 'open', { name: 'main', cwd: long });
+  opened[0]!.dir = long;
+  const listed = await host.call(cli(), 'list', {});
+  assert.equal((listed.structured.sessions as Array<{ cwd: string }>)[0]!.cwd, long);
+  assert.match(listed.text, /d… \(\d+ more characters\)/);
+});
+
+test('an end a cancelled call had taken is reported, and the cursor stays where it was', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.live = 0;
+  s.run = async (text, opts) => {
+    const c = { id: 1, text, from: s.out.length, startedAt: Date.now() } as Command;
+    s.out.push(...Array.from({ length: 50 }, (_, i) => `out ${i}`));
+    c.to = s.out.length;
+    c.end = { at: Date.now(), ms: 1, status: 0, errexit: false, refusedMarks: 0 };
+    s.commands.set(1, c);
+    const ended = { kind: 'ended' as const, command: c, taken: opts.take !== false };
+    s.emit(ended);
+    return { kind: 'ended', command: c, front: s.frontNow, took: [ended] };
+  };
+  const ac = new AbortController();
+  const running = host.call(plain(), 'run', { name: 'main', command: 'make', notify_on: 'nowhere' }, ac.signal);
+  await settle();
+  await settle();
+  ac.abort();
+  const r = await running;
+  assert.equal(r.structured.error, 'cancelled');
+  await settle();
+  const unseen = await unseenOf(host);
+  assert.equal(unseen.length, 1, 'the end the call took is a report again');
+  assert.match(unseen[0]!, /^\[main · command 1 · exit 0 /);
+  const look = await host.call(plain(), 'look', { name: 'main' });
+  assert.match(look.text, /\nout 0\n/, 'the cancelled run moved no cursor');
+  assert.equal(r.text, 'The call was cancelled.');
+});
+
+test('a cancelled send or look hands back what it took: an end, a wait for input and an exit, the exit keyed to the command it ended', async () => {
+  const { host, opened } = setup();
+  const keys: string[] = [];
+  host.subscribe('a', async (w) => (keys.push(`${w.tag} ${w.key}`), false));
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const c = { id: 9, text: 'make', from: 0, to: 0, startedAt: Date.now(), end: { at: Date.now(), ms: 5, errexit: false, refusedMarks: 0 } };
+  s.commands.set(9, c);
+  const exit = { code: 1 };
+  const took = [{ kind: 'ended' as const, command: c, taken: true }, { kind: 'exited' as const, exit, taken: true }];
+  s.wait = async (_u, opts) => {
+    for (const ev of took) s.emit(ev);
+    await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
+    return { by: 'cancelled', front: s.frontNow, ended: [c], took };
+  };
+  const ac = new AbortController();
+  const looking = host.call(agent(), 'look', { name: 'main', until: 'end' }, ac.signal);
+  await settle();
+  ac.abort();
+  assert.equal((await looking).structured.error, 'cancelled');
+  await settle();
+  await settle();
+  assert.ok(keys.includes('terminal:exited a/main/9'), keys.join(', '));
+  const waiting = { kind: 'waiting' as const, front: { state: 'waiting' as const, since: Date.now(), process: { pgid: 7, argv: 'read', shell: false } }, taken: true };
+  s.frontNow = waiting.front;
+  s.send = async (_b, opts) => {
+    s.emit(waiting);
+    await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
+    return { sent: true, lines: s.lines(0), front: s.frontNow, ended: [], by: 'cancelled', took: [waiting] };
+  };
+  const ac2 = new AbortController();
+  const sending = host.call(agent(), 'send', { name: 'main', text: 'x' }, ac2.signal);
+  await settle();
+  ac2.abort();
+  await sending;
+  await settle();
+  await settle();
+  assert.ok(keys.some((k) => k.startsWith('terminal:waiting ')), keys.join(', '));
+});
+
+test('a report handed back after a newer one sits after it, and both are listed', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const old = { id: 3, text: 'a', from: 0, to: 0, startedAt: Date.now(), end: { at: Date.now(), ms: 1, status: 0, errexit: false, refusedMarks: 0 } };
+  const newer = { id: 4, text: 'b', from: 0, to: 0, startedAt: Date.now(), end: { at: Date.now(), ms: 1, status: 5, errexit: false, refusedMarks: 0 } };
+  s.commands.set(3, old);
+  s.commands.set(4, newer);
+  s.wait = async (_u, opts) => {
+    s.emit({ kind: 'ended', command: old, taken: true });
+    s.emit({ kind: 'ended', command: newer, taken: false });
+    await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
+    return { by: 'cancelled', front: s.frontNow, ended: [old], took: [{ kind: 'ended', command: old, taken: true }] };
+  };
+  const ac = new AbortController();
+  const looking = host.call(plain(), 'look', { name: 'main', until: 'end' }, ac.signal);
+  await settle();
+  ac.abort();
+  await looking;
+  const unseen = await unseenOf(host);
+  assert.equal(unseen.length, 2);
+  assert.match(unseen[0]!, /command 4 · exit 5/);
+  assert.match(unseen[1]!, /command 3 · exit 0/);
+});
+
+test('a running command\'s notify_on watch names its command, and a cancelled stop takes no step after it and answers nobody', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(plain(), 'run', { name: 'main', command: 'make', notify_on: 'x', wait: 0 });
+  assert.deepEqual(s.calls.find((c) => c.method === 'watch')!.args.slice(1), [s.commands.get(1)!.from, 1]);
+  let abort: AbortSignal | undefined;
+  s.stop = async (_sig, opts) => {
+    abort = opts?.abort;
+    await new Promise<void>((res) => opts?.abort?.addEventListener('abort', () => res()));
+    return { steps: [], front: s.frontNow, cancelled: true };
+  };
+  const ac = new AbortController();
+  const stopping = host.call(plain(), 'stop', { name: 'main' }, ac.signal);
+  await settle();
+  assert.equal(abort, ac.signal, 'the session got the call\'s signal');
+  ac.abort();
+  assert.equal((await stopping).structured.error, 'cancelled');
+});
+
+test('stop says when it withheld a signal, and close names the groups KILL didn\'t reach', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const front = { state: 'running' as const, since: Date.now(), process: { pgid: 9, argv: 'make', shell: false }, waitVisible: true };
+  s.stop = async () => ({ steps: [{ sent: 'C-c', front }, { sent: 'SIGTERM', to: front.process, withheld: true, front }], front });
+  const stopped = await host.call(plain(), 'stop', { name: 'main' });
+  assert.equal(stopped.isError, true);
+  assert.match(stopped.text, /\nSIGTERM wasn't sent to make: the shell's processes couldn't be listed, so its group couldn't be confirmed as still the shell's, and no further step was taken: now /);
+  s.close = async () => ({ code: null, signal: 'SIGKILL', unkilled: [{ pgid: 77, error: 'EPERM' }] });
+  assert.match((await host.call(plain(), 'close', { name: 'main', force: true })).text, / KILL didn't reach group 77 \(EPERM\), whose processes may live on\.$/);
+});
+
+test('an end handed back from a cancelled call doesn\'t change which command a later exit is keyed to', async () => {
+  const { host, opened } = setup();
+  const keys: string[] = [];
+  host.subscribe('a', async (w) => (keys.push(`${w.tag} ${w.key}`), true));
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const lost = { id: 9, text: 'a', from: 0, to: 0, startedAt: Date.now(), end: { at: Date.now(), ms: 1, errexit: false, refusedMarks: 0 } };
+  const after = { id: 10, text: 'b', from: 0, to: 0, startedAt: Date.now(), end: { at: Date.now(), ms: 1, status: 0, errexit: false, refusedMarks: 0 } };
+  s.commands.set(9, lost);
+  s.commands.set(10, after);
+  s.wait = async (_u, opts) => {
+    s.emit({ kind: 'ended', command: lost, taken: true });
+    s.emit({ kind: 'ended', command: after, taken: false });
+    await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
+    return { by: 'cancelled', front: s.frontNow, ended: [lost], took: [{ kind: 'ended', command: lost, taken: true }] };
+  };
+  const ac = new AbortController();
+  const looking = host.call(agent(), 'look', { name: 'main', until: 'end' }, ac.signal);
+  await settle();
+  ac.abort();
+  await looking;
+  s.emit({ kind: 'exited', exit: { code: 0 }, taken: false });
+  await settle();
+  await settle();
+  assert.ok(keys.includes('terminal:exited a/main/shell'), keys.join(', '));
+});
+
+test('a wait for input a cancelled call took is reported only while the program still waits', async () => {
+  const { host, opened } = setup();
+  const tags: string[] = [];
+  host.subscribe('a', async (w) => (tags.push(w.tag), true));
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const waiting = { kind: 'waiting' as const, front: { state: 'waiting' as const, since: Date.now(), process: { pgid: 7, argv: 'read', shell: false } }, taken: true };
+  s.wait = async (_u, opts) => {
+    s.emit(waiting);
+    s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 7, argv: 'read', shell: false }, waitVisible: true };
+    await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
+    return { by: 'cancelled', front: s.frontNow, ended: [], took: [waiting] };
+  };
+  const ac = new AbortController();
+  const looking = host.call(agent(), 'look', { name: 'main', until: 'input' }, ac.signal);
+  await settle();
+  ac.abort();
+  await looking;
+  await settle();
+  await settle();
+  assert.deepEqual(tags, [], 'the program was answered, so no wake asks for input');
+});
+
+test('a cancelled run keeps its command\'s notify_on watch, so the match is still reported', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  const run = s.run.bind(s);
+  s.run = async (text, opts) => {
+    const r = await run(text, opts);
+    await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
+    return r;
+  };
+  const ac = new AbortController();
+  const running2 = host.call(plain(), 'run', { name: 'main', command: 'make', notify_on: 'needle', wait: 30 }, ac.signal);
+  await settle();
+  ac.abort();
+  assert.equal((await running2).structured.error, 'cancelled');
+  s.print('a needle here');
+  await settle();
+  await settle();
+  const unseen = await unseenOf(host);
+  assert.ok(unseen.some((u) => /\nMatched at line \d+: a needle here$/.test(u)), unseen.join('\n---\n'));
 });

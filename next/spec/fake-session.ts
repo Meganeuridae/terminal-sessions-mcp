@@ -97,7 +97,7 @@ export class FakeSession implements Session {
 
   async run(text: string, opts: { waitMs: number; take?: boolean; signal?: AbortSignal }): Promise<RunOutcome> {
     this.calls.push({ method: 'run', args: [text, opts] });
-    if (this.runMode === 'refuse' || this.frontNow.state !== 'prompt') return { kind: 'refused', front: this.frontNow };
+    if (this.runMode === 'refuse' || this.frontNow.state !== 'prompt') return { kind: 'refused', front: this.frontNow, took: [] };
     const id = this.opts.nextCommandId();
     this.out.push(`$ ${text}`);
     const c: Command = { id, text, from: this.out.length, startedAt: Date.now() };
@@ -106,27 +106,29 @@ export class FakeSession implements Session {
     if (this.runMode === 'end') {
       c.to = this.out.length;
       c.end = { at: Date.now(), ms: Date.now() - c.startedAt, ...(this.runStatus === undefined ? {} : { status: this.runStatus }), errexit: false, refusedMarks: 0, cwd: this.dir };
-      this.emit({ kind: 'ended', command: c, taken: opts.take !== false });
-      return { kind: 'ended', command: c, front: this.frontNow };
+      const ended = { kind: 'ended' as const, command: c, taken: opts.take !== false };
+      this.emit(ended);
+      return { kind: 'ended', command: c, front: this.frontNow, took: ended.taken ? [ended] : [] };
     }
     this.frontNow = { state: 'running', since: Date.now(), process: { pgid: 99, argv: text, shell: false }, command: id, waitVisible: true };
-    return { kind: 'running', command: c, front: this.frontNow };
+    return { kind: 'running', command: c, front: this.frontNow, took: [] };
   }
 
   async send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean; signal?: AbortSignal }): Promise<SendOutcome> {
     this.calls.push({ method: 'send', args: [bytes, opts] });
     const from = this.out.length;
-    if (this.promptUndrawn) return { sent: false, lines: this.lines(from), front: this.frontNow, ended: [], by: 'timeout' };
-    return { sent: this.frontNow.state !== 'exited', lines: this.lines(from), ...(this.screenNow?.alt ? { screen: this.screenNow } : {}), front: this.frontNow, ended: [], by: 'quiet' };
+    if (this.promptUndrawn) return { sent: false, lines: this.lines(from), front: this.frontNow, ended: [], by: 'timeout', took: [] };
+    return { sent: this.frontNow.state !== 'exited', lines: this.lines(from), ...(this.screenNow?.alt ? { screen: this.screenNow } : {}), front: this.frontNow, ended: [], by: 'quiet', took: [] };
   }
 
   async wait(until: Until, opts: { waitMs: number; from: number; take?: boolean; signal?: AbortSignal }): Promise<WaitOutcome> {
     this.calls.push({ method: 'wait', args: [until, opts] });
+    if (until.kind === 'end' && this.frontNow.state === 'prompt' && !this.current()) return { by: 'end', front: this.frontNow, ended: [], took: [] };
     const matched = until.kind === 'match' ? this.firstMatch(until.pattern, opts.from) : undefined;
-    return matched ? { by: 'match', front: this.frontNow, ended: [], matched } : { by: 'timeout', front: this.frontNow, ended: [] };
+    return matched ? { by: 'match', front: this.frontNow, ended: [], matched, took: [] } : { by: 'timeout', front: this.frontNow, ended: [], took: [] };
   }
 
-  async stop(signal?: NodeJS.Signals): Promise<StopOutcome> {
+  async stop(signal?: NodeJS.Signals, _opts?: { abort?: AbortSignal }): Promise<StopOutcome> {
     this.calls.push({ method: 'stop', args: [signal] });
     return { steps: [{ sent: signal ?? 'C-c', front: this.frontNow }], front: this.frontNow };
   }
@@ -145,8 +147,8 @@ export class FakeSession implements Session {
     return this.closedWith;
   }
 
-  watch(pattern: RegExp, from: number): number {
-    this.calls.push({ method: 'watch', args: [pattern, from] });
+  watch(pattern: RegExp, from: number, command?: number): number {
+    this.calls.push({ method: 'watch', args: [pattern, from, command] });
     const id = this.nextWatch++;
     this.watches.set(id, { pattern, from });
     queueMicrotask(() => this.checkWatches());

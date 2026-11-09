@@ -148,7 +148,7 @@ function omitted(left: number, cut: number): string {
 }
 
 function middleCut(line: string, budget: number): string[] {
-  const note = (n: number): string => `… ${n} characters of this line left out`;
+  const note = (n: number): string => `… ${n} characters of this line left out, which no call returns; a command that prints the line in pieces, such as \`fold -w 10000\`, shows them`;
   const room = Math.max(2, budget - note(line.length).length - 2);
   const headRoom = Math.max(1, Math.floor(room / 3));
   const start = cutAt(line, headRoom, false);
@@ -173,21 +173,26 @@ export const SCREEN_ROOM_CHARS = 1_000;
  */
 export const QUOTED_MAX_CHARS = SCREEN_ROOM_CHARS / 4;
 
+const escaped = (s: string): string =>
+  s.replace(/[\x00-\x08\x0a-\x1f\x7f]/g, (c) => (c === '\n' ? '\\n' : c === '\r' ? '\\r' : `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`));
+
 function clip(s: string): { text: string; more: number } {
   if (s.length <= QUOTED_MAX_CHARS) return { text: s, more: 0 };
   const n = isHighSurrogate(s.charCodeAt(QUOTED_MAX_CHARS - 1)) ? QUOTED_MAX_CHARS - 1 : QUOTED_MAX_CHARS;
   return { text: s.slice(0, n), more: s.length - n };
 }
 
-export function quoted(s: string): string {
+function noted(s: string): string {
   const c = clip(s);
   return c.more ? `${c.text}… (${c.more} more characters)` : s;
 }
 
-const OWN_BOUND = new Set(['unseen', 'output']);
+export const quoted = (s: string): string => noted(escaped(s));
+
+const OWN_BOUND = new Set(['unseen', 'output', 'cwd']);
 
 export function boundedStrings<T>(v: T): T {
-  if (typeof v === 'string') return quoted(v) as T;
+  if (typeof v === 'string') return noted(v) as T;
   if (Array.isArray(v)) return v.map(boundedStrings) as T;
   if (v !== null && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, OWN_BOUND.has(k) ? x : boundedStrings(x)])) as T;
   return v;
