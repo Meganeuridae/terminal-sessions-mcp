@@ -633,6 +633,22 @@ for (const sh of shells) {
       assert.match(out(s, c).join('\n'), /got\d+;\d+/);
     });
 
+    test('a directory at the drain file\'s path counts as no drain: the command ends with nothing flushed, and the session goes on', async () => {
+      const s = await open(shell);
+      const gate = newGate();
+      fs.writeFileSync(gate, '');
+      const r = await s.run(holdJob(gate), { waitMs: 200 });
+      assert.equal(r.kind, 'running', JSON.stringify(r));
+      // The end hook drains into the session's directory, to a file named for the nonce counter its end mark closes.
+      const inner = s as unknown as { dir: string; chains: Array<{ expected: { counter: number } }> };
+      fs.mkdirSync(path.join(inner.dir, `drained.${inner.chains[0]!.expected.counter}`));
+      fs.rmSync(gate);
+      await s.wait({ kind: 'end' }, { waitMs: 10_000, from: 0 });
+      const c = s.command(r.kind === 'running' ? r.command.id : -1);
+      assert.deepEqual([c?.end?.status, c?.end?.flushed], [0, undefined], JSON.stringify(c?.end));
+      assert.deepEqual(out(s, await ran(s, 'echo after')), ['after']);
+    });
+
     test('stop with a signal takes that one step', async () => {
       const s = await open(shell);
       await s.run('sleep 30', { waitMs: 200 });
