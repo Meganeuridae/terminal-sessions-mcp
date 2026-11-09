@@ -157,7 +157,7 @@ function hintFor(name: string, prefix: string, base: string): string {
     const m = /^([a-z]+)[-+](.+)$/i.exec(name);
     if (m) {
       const word = m[1]!.toLowerCase();
-      const mod = Object.keys(MODIFIERS).find((w) => w.length > 2 && distance(word, w) <= (w.length > 5 ? 2 : 1));
+      const mod = Object.keys(MODIFIERS).find((w) => w.length > 2 && Math.abs(word.length - w.length) <= 2 && distance(word, w) <= (w.length > 5 ? 2 : 1));
       if (mod !== undefined) return ` Did you mean '${MODIFIERS[mod]!.toUpperCase()}-${m[2]}'?`;
     }
   }
