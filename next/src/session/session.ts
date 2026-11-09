@@ -538,6 +538,9 @@ class LiveSession implements Session {
   front(): Front {
     const exit = this.exitInfo ?? this.ptyExit;
     if (exit) return { state: 'exited', since: this.exitedAt, exit };
+    const shell = proc.info(this.pid);
+    const command = this.top.running?.id ?? this.top.runCommand?.id;
+    const at = <T extends object>(o: T): T => (command !== undefined ? { ...o, command } : o);
     const far = this.top.far;
     if (far) {
       const depth = this.chains.length;
@@ -545,14 +548,18 @@ class LiveSession implements Session {
         const pending = this.pending();
         return { state: 'prompt', since: this.since(`prompt:${depth}`), ...(pending !== undefined && { pending }), within: far.within };
       }
-      const id = this.top.running?.id ?? this.top.runCommand?.id;
-      return { state: 'running', since: this.since(`r:${depth}:${id ?? ''}`), process: far.within, ...(id !== undefined && { command: id }), waitVisible: false, within: far.within };
+      if (!shell) return at({ state: 'unknown', since: this.since(`unknown:${depth}`) });
+      return at({ state: 'running', since: this.since(`r:${depth}:${command ?? ''}`), process: far.within, waitVisible: false, within: far.within });
     }
     this.lastLook = mono();
-    const shell = proc.info(this.pid);
-    const g = shell?.tpgid !== undefined ? { pgrp: shell.pgrp, tpgid: shell.tpgid } : undefined;
-    const command = this.top.running?.id ?? this.top.runCommand?.id;
-    const at = <T extends object>(o: T): T => (command !== undefined ? { ...o, command } : o);
+    if (!shell) {
+      if (this.prompted) {
+        const pending = this.pending();
+        return { state: 'prompt', since: this.since('prompt'), ...(pending !== undefined && { pending }) };
+      }
+      return at({ state: 'unknown', since: this.since('unknown') });
+    }
+    const g = shell.tpgid !== undefined ? { pgrp: shell.pgrp, tpgid: shell.tpgid } : undefined;
     const program = (process: Process, reads: Array<boolean | undefined>): Front => {
       if (reads.includes(true)) {
         const since = this.since(`w:${process.pgid}`);
@@ -566,7 +573,7 @@ class LiveSession implements Session {
         return { state: 'prompt', since: this.since('prompt'), ...(pending !== undefined && { pending }) };
       }
       const pgid = g?.pgrp ?? this.pid;
-      const argv = shell?.argv;
+      const argv = shell.argv;
       if (this.opened && argv !== undefined && argv !== this.argvAtOpen) this.execed = true;
       const reads = proc.readsTerminal(this.pid, this.pts);
       if (this.execed && argv !== undefined && !isShell(argv)) return program({ pgid, argv, shell: false }, [reads]);
@@ -1001,7 +1008,9 @@ class LiveSession implements Session {
     if (this.probe) return { kind: 'refused', integrating: true, front: f };
     if (this.top.atPrompt && !this.plain) return { kind: 'refused', front: f, ...(this.top.submitted && { sent: true as const }) };
     // At its prompt a line editor holds the terminal out of canonical mode; ssh, su and sudo ask for a password or a yes/no in it.
-    if (proc.modes(this.pts)?.canonical === true) return { kind: 'refused', canonical: true, front: f };
+    const canonical = proc.modes(this.pts)?.canonical;
+    if (canonical === undefined) return { kind: 'refused', unread: true, front: f };
+    if (canonical) return { kind: 'refused', canonical: true, front: f };
     const within: Process = f.state === 'prompt' ? { pgid: this.pid, argv: proc.info(this.pid)?.argv ?? this.shellName, shell: true } : f.process;
     const below = this.top;
     const plainBelow = this.plain && within.pgid !== this.pid;

@@ -1858,6 +1858,83 @@ test('integrate names a shell it has no hooks for, and types nothing more', { sk
   assert.equal((await s.run('echo x', { waitMs: 500 })).kind, 'refused');
 });
 
+/** Runs `body` with a `name` first on PATH that fails after `on()` and runs `real` otherwise. */
+async function failing<T>(name: string, real: string, body: (fails: { on: () => void; off: () => void }) => Promise<T>): Promise<T> {
+  const bin = fs.mkdtempSync(path.join(tmp, `${name}-bin-`));
+  const flag = path.join(bin, 'fails');
+  fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n[ -e '${flag}' ] && exit 1\nexec ${real} "$@"\n`, { mode: 0o755 });
+  const PATH = process.env.PATH;
+  process.env.PATH = `${bin}:${PATH ?? '/usr/bin:/bin'}`;
+  try {
+    return await body({ on: () => fs.writeFileSync(flag, ''), off: () => fs.rmSync(flag, { force: true }) });
+  } finally {
+    process.env.PATH = PATH;
+  }
+}
+
+test("integrate types nothing while the terminal's modes can't be read, and reaches the far shell once they can", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open('/bin/sh');
+  await reachFar(s, which('bash')!);
+  await failing('stty', '/bin/stty', async (stty) => {
+    const before = s.lines(0).to;
+    stty.on();
+    const r = await s.integrate({ waitMs: 5000 });
+    assert.deepEqual(r.kind === 'refused' && r.unread, true, JSON.stringify(r));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.deepEqual(s.lines(before).lines.filter((l) => l.trim() && !/^far> ?$/.test(l)), []);
+    stty.off();
+    assert.equal((await s.integrate({ waitMs: 10_000 })).kind, 'integrated');
+  });
+  await s.close({ force: true, deadline: by() });
+});
+
+test("with the terminal's foreground group unread, a program in front of a shell without integration is unknown, not at the prompt, and run types nothing", { skip: process.platform !== 'darwin' ? "here the shell's group is read from /proc, not from ps" : false }, async () => {
+  const s = await open('/bin/sh');
+  const r = await s.run("stty -icanon -echo; cat; stty sane", { waitMs: 300 });
+  assert.equal(r.kind, 'running', JSON.stringify(r));
+  await eventually('cat in front', () => {
+    const now = s.front();
+    return now.state === 'running' && /cat/.test(now.process.argv) && now;
+  });
+  await failing('ps', '/bin/ps', async (ps) => {
+    ps.on();
+    // With the shell taken to be in front, the shell reads as busy until its output has been quiet for a while, then as at its prompt.
+    const f = await eventually('a state other than the shell busy', () => {
+      const now = s.front();
+      return now.state !== 'running' && now;
+    });
+    assert.equal(f.state, 'unknown');
+    assert.equal(f.state === 'unknown' ? f.command : 'x', r.kind === 'running' ? r.command.id : 'y');
+    const typed = await s.run('echo SHOULD_NOT_RUN', { waitMs: 1000 });
+    assert.equal(typed.kind, 'refused');
+    assert.equal(r.kind === 'running' ? r.command.end : 'x', undefined);
+    ps.off();
+  });
+  assert.equal(s.front().state, 'running');
+  await s.stop();
+  assert.ok(!s.lines(0).lines.some((l) => l.includes('SHOULD_NOT_RUN')));
+  await s.close({ force: true, deadline: by() });
+});
+
+test("with the terminal's foreground group unread, a shell with marks running a command is unknown, and one at its prompt is still at it", { skip: process.platform !== 'darwin' ? "here the shell's group is read from /proc, not from ps" : false }, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  await failing('ps', '/bin/ps', async (ps) => {
+    ps.on();
+    assert.equal(s.front().state, 'prompt');
+    ps.off();
+    const r = await s.run('sleep 30', { waitMs: 300 });
+    assert.equal(r.kind, 'running', JSON.stringify(r));
+    ps.on();
+    const f = s.front();
+    assert.equal(f.state, 'unknown');
+    assert.equal(f.state === 'unknown' ? f.command : 'x', r.kind === 'running' ? r.command.id : 'y');
+    ps.off();
+  });
+  assert.equal(s.front().state, 'running');
+  await s.stop();
+  await s.close({ force: true, deadline: by() });
+});
+
 test('the descendants of a pid with no process cannot be listed', () => {
   assert.equal(proc.descendants(2 ** 22 + 12345), undefined);
   assert.ok(Array.isArray(proc.descendants(process.pid)));
@@ -1881,30 +1958,22 @@ test('text sent to a shell without integration at its prompt is pending there, s
 });
 
 test("a shell without integration whose terminal can't be read is in front as unknown, not running, and run types nothing", { skip: process.platform !== 'darwin' ? "here the kernel shows the shell reading its terminal, so the terminal's modes aren't asked" : false }, async () => {
-  const bin = path.join(tmp, 'stty-bin');
-  const fails = path.join(tmp, 'stty-fails');
-  fs.mkdirSync(bin, { recursive: true });
-  fs.writeFileSync(path.join(bin, 'stty'), `#!/bin/sh\n[ -e '${fails}' ] && exit 1\nexec /bin/stty "$@"\n`, { mode: 0o755 });
-  const PATH = process.env.PATH;
-  process.env.PATH = `${bin}:${PATH ?? '/usr/bin:/bin'}`;
-  try {
+  await failing('stty', '/bin/stty', async (stty) => {
     const s = await open('/bin/sh');
     for (let i = 0; i < 100 && s.front().state !== 'prompt'; i++) await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(s.front().state, 'prompt');
-    fs.writeFileSync(fails, '');
+    stty.on();
     assert.equal(s.front().state, 'unknown');
     const r = await s.run('echo SHOULD_NOT_RUN', { waitMs: 1000 });
     assert.equal(r.kind, 'refused');
     assert.equal(r.front.state, 'unknown');
-    fs.rmSync(fails);
+    stty.off();
     assert.equal(s.front().state, 'prompt');
     const after = await s.run('echo plain', { waitMs: 5000 });
     assert.equal(after.kind, 'ended');
     assert.ok(!s.lines(0).lines.some((l) => l.includes('SHOULD_NOT_RUN')));
-  } finally {
-    process.env.PATH = PATH;
-    fs.rmSync(fails, { force: true });
-  }
+    await s.close({ force: true, deadline: by() });
+  });
 });
 
 test('a shell without integration opens and runs, with no status', async () => {

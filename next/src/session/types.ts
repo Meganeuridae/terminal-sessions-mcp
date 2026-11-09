@@ -103,7 +103,7 @@ export type Front =
       starting?: true;
     }
   | {
-      /** A shell without marks whose terminal couldn't be read, so whether it's at its prompt isn't known. */
+      /** The terminal couldn't be read, so whether the shell is at its prompt isn't known. A prompt the marks show stays `prompt`. */
       state: 'unknown';
       since: number;
       command?: number;
@@ -266,9 +266,10 @@ export type IntegrateOutcome =
    * what is in front reads whole lines itself, such as a password or a yes/no question that ssh, su or sudo asks on this machine, or a
    * shell without a line editor. The line editors of bash, zsh and fish hold it out of that mode at their prompts. A program that holds
    * this terminal raw, such as a connected ssh, hides its far side: a question there can't be seen, and the probe line would answer
-   * it. `integrating`: another `integrate` call on this session is still typing.
+   * it. `unread`: this terminal's modes couldn't be read, so whether what is in front reads whole lines itself isn't known.
+   * `integrating`: another `integrate` call on this session is still typing.
    */
-  | { kind: 'refused'; sent?: true; canonical?: true; integrating?: true; front: Front }
+  | { kind: 'refused'; sent?: true; canonical?: true; unread?: true; integrating?: true; front: Front }
   /** A shell answered the probe that has no hooks here (sh, dash, ash, and others). Nothing more was typed. `shell` is its `$0`, when it gave one. */
   | { kind: 'unsupported'; shell?: string; front: Front }
   /**

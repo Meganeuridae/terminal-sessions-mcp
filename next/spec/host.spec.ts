@@ -95,6 +95,18 @@ test('H6: integrate with the terminal unread is refused as unknown, not as integ
   assert.match(integrate.text, /\nNothing was typed: whether the shell is at its prompt couldn't be seen: reading its terminal failed\. `integrate` again, or `look`\.$/);
 });
 
+test("H6: integrate refused because the terminal's modes couldn't be read says so, as front_unknown, not as a whole-line reader", async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main', cwd: '/home/u' });
+  const s = opened[0]!;
+  s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 77, argv: 'ssh box', shell: false }, waitVisible: true };
+  s.integrate = async () => ({ kind: 'refused', unread: true, front: s.frontNow });
+  const r = await host.call(agent(), 'integrate', { name: 'main' });
+  assert.equal(r.structured.error, 'front_unknown');
+  assert.equal(r.structured.unread, true);
+  assert.match(r.text, /\nNothing was typed: this terminal's modes couldn't be read, so whether what's in front reads a whole line itself, such as a password question, couldn't be seen\. `integrate` again, or `look`\.$/);
+});
+
 test('H6: stop with the terminal unread sends nothing and is refused, saying to stop again or look', async () => {
   const { host } = await unreadOpen();
   const stop = await host.call(agent(), 'stop', { name: 'main' });
