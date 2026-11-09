@@ -349,10 +349,10 @@ export interface Session {
   stop(signal?: NodeJS.Signals, opts?: { abort?: AbortSignal }): Promise<StopOutcome>;
   /**
    * Gives the shell now in front the integration, typed, so that `run` types there and its marks give the front, statuses and
-   * the directory until it exits; then the shell it was typed from is in front again. It types a probe line, then that shell's hooks,
-   * into whatever holds the terminal, so it's for a shell at its prompt. Refused at the prompt of a shell with the integration, from
-   * its end mark on, while a line sent there hasn't started, and while the terminal is in canonical mode. If what it types into ends
-   * before the hooks are all typed, it stops.
+   * the directory until it exits, or until the local program it was reached through ends or leaves the terminal; then the shell
+   * it was typed from is in front again. It types a probe line, then that shell's hooks, into whatever holds the terminal, so it's
+   * for a shell at its prompt. Refused at the prompt of a shell with the integration, from its end mark on, while a line sent there
+   * hasn't started, and while the terminal is in canonical mode. If what it types into ends before the hooks are all typed, it stops.
    */
   integrate(opts: { waitMs: number; signal?: AbortSignal }): Promise<IntegrateOutcome>;
   /**
