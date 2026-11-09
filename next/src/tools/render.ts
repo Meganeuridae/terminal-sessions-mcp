@@ -107,7 +107,10 @@ const isLowSurrogate = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
 
 export function linesText(l: Lines, budget: number, readHint: string): string {
   const out: string[] = [];
-  if (l.dropped) out.push(`… ${l.dropped} earlier line${l.dropped === 1 ? '' : 's'} no longer kept`);
+  if (l.dropped) {
+    out.push(`… ${l.dropped} earlier line${l.dropped === 1 ? '' : 's'} no longer kept`);
+    budget = Math.max(0, budget - out[0]!.length - 1);
+  }
   const whole = l.lines.join('\n');
   if (whole.length <= budget) return [...out, whole].join('\n');
   if (l.lines.length === 1) return [...out, ...middleCut(l.lines[0]!, budget)].join('\n');
