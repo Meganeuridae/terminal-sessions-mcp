@@ -116,8 +116,9 @@ export class Host {
   subscribe(scope: string, sink: WakeSink): () => void {
     let set = this.subscribers.get(scope);
     if (!set) this.subscribers.set(scope, (set = new Set()));
-    const sub: Subscriber = { sink, offered: this.wakeSeq, busy: false, gone: false };
+    const sub: Subscriber = { sink, offered: 0, busy: false, gone: false };
     set.add(sub);
+    this.pump(scope);
     return () => {
       sub.gone = true;
       set.delete(sub);

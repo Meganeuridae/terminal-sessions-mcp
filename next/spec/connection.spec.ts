@@ -156,7 +156,7 @@ test('H6: a plain MCP client lists the nine tools and calls them in its scope', 
   }
 });
 
-test('H8: pushes start only once a grant enables terminal.events, after its receipt, with coalesce.key when the host coalesces; accepted, the end is seen', async () => {
+test('H8: pushes start only once a grant enables terminal.events, after its receipt, with coalesce.key when the host coalesces; the end kept from before the grant comes first, and accepted ends are seen', async () => {
   const h = await harness();
   try {
     const c = await h.connect(relayHello('a'));
@@ -171,10 +171,15 @@ test('H8: pushes start only once a grant enables terminal.events, after its rece
 
     const receipt = await c.request('featureSets/update', GRANT);
     assert.equal((receipt.result as { accepted: boolean }).accepted, true);
+    type Push = { featureSet: string; tags: string[]; coalesce: { key: string }; payload: { content: Array<{ text: string }> } };
+    const kept = await c.next((m) => m.method === 'push/event');
+    assert.deepEqual((kept.params as Push).coalesce, { key: 'a/main/1' });
+    assert.match((kept.params as Push).payload.content[0]!.text, /^\[main · command 1 · exit 0 · /);
+    c.send({ jsonrpc: '2.0', id: kept.id, result: { accepted: true } });
     await c.request('tools/call', { name: 'run', arguments: { name: 'main', command: 'sleep 2', wait: 0 } });
     s.end(0);
     const push = await c.next((m) => m.method === 'push/event');
-    const p = push.params as { featureSet: string; tags: string[]; coalesce: { key: string }; payload: { content: Array<{ text: string }> } };
+    const p = push.params as Push;
     assert.equal(p.featureSet, 'terminal.events');
     assert.deepEqual(p.tags, ['terminal:ended']);
     assert.deepEqual(p.coalesce, { key: 'a/main/2' });
@@ -182,8 +187,7 @@ test('H8: pushes start only once a grant enables terminal.events, after its rece
     c.send({ jsonrpc: '2.0', id: push.id, result: { accepted: true } });
     await c.request('ping');
     const unseen = (await h.host.call({ scope: 'a', takes: false, pushes: false }, 'list', {})).structured.unseen as string[];
-    assert.equal(unseen.length, 1, 'only the end before the grant is still unseen');
-    assert.match(unseen[0]!, /^\[main · command 1 · exit 0 · /);
+    assert.deepEqual(unseen, [], 'each end was accepted');
   } finally {
     await h.done();
   }

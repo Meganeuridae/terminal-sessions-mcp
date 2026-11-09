@@ -1303,6 +1303,26 @@ test('a session that a caller taking no reports closes, after one taking them us
   assert.equal(((await host.call(plain(), 'list', {})).structured.unseen as string[]).length, 0, 'a taking list forgets them');
 });
 
+test('a host whose wakes start after reports were kept is offered each one still unseen in its scope, oldest first', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  await host.call(plain(), 'open', { name: 'other' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(plain(), 'run', { name: 'main', command: 'make', wait: 0 });
+  s.end(2);
+  await settle();
+  await host.call(cli(), 'close', { name: 'other' });
+  const offered: Wake[] = [];
+  host.subscribe('a', async (w) => (offered.push(w), true));
+  await settle();
+  await settle();
+  assert.equal(offered.length, 2, offered.map((w) => w.text).join('\n'));
+  assert.match(offered[0]!.text, /^\[main · command 1 · exit 2 /);
+  assert.match(offered[1]!.text, /^\[other · closed by a caller that takes no reports; the shell /);
+  assert.deepEqual((await host.call(cli(), 'list', {})).structured.unseen, [], 'each was taken');
+});
+
 test('a host that takes reports is woken when a caller taking none closes a session it used', async () => {
   const { host, opened } = setup();
   const wakes: Wake[] = [];
