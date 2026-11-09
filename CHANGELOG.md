@@ -4,10 +4,10 @@
 
 A new implementation ships beside the 1.x session server, MCP bridge and CLI. It lives in `next/`
 (`next/README.md`); its binaries are `termd`, `tsm` and `tsm-relay`. 2.0 removes or renames nothing
-of 1.x: `terminal-sessions-mcp`, `session-server` and `session-cli` run 1.x, and 2.0 changes none of
-their code. What reaches them is the package they share with 2.0: a narrower Node range
-(`engines`), `npm run build` and `npm test` building 2.0 too, and 2.0's dependencies installing
-with it. The lockfile also moves `@types/node` from 20 to 22, and `express-rate-limit`, `hono` and `ip-address` up a patch release each.
+of 1.x: `terminal-sessions-mcp`, `session-server` and `session-cli` run 1.x, and 2.0 changes one
+thing they do, their graceful kill (below). Otherwise, what reaches them is the package they share
+with 2.0: a narrower Node range (`engines`), `npm run build` and `npm test` building 2.0 too, and
+2.0's dependencies installing with it. The lockfile also moves `@types/node` from 20 to 22, and `express-rate-limit`, `hono` and `ip-address` up a patch release each.
 
 ### Added
 
@@ -37,6 +37,10 @@ with it. The lockfile also moves `@types/node` from 20 to 22, and `express-rate-
 - Node 22.12 or later, below 25 (`engines`: `>=22.12.0 <25.0.0`): Node 20 reached its end of life on 2026-04-30; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
 - `npm run build` compiles both trees; `npm test` runs 1.x's suite and `npm run test:next` 2.0's.
 - New dependencies: `@animalabs/mcpl-core` and `@xterm/headless` 6.0.0.
+- **1.x's graceful `killSession` and `killAll` hang up every process on the session's terminal**
+  once the shell is gone, as 2.0's `close` does. A disowned job, or one started from a subshell, no
+  longer outlives a graceful kill. A process started with `setsid` or `nohup` still does. A forced
+  kill still KILLs the shell alone, and on Windows the kill is as before.
 
 ### Removed from 1.x
 

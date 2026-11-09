@@ -4,7 +4,7 @@
 
 ## Terminal sessions 2.0, beside 1.x
 
-This package also ships **2.0**, persistent shells for agents: one daemon (`termd`) per user keeps each session's login shell alive between calls and connections, an agent types into it only through explicit calls and gets the exit status, duration and directory of each command `run` types in an integrated shell (or the shell's exit, for a command that ends the shell), with its output, and an MCPL host is woken only when a command ends, a program waits for input, a shell dies or a pattern it asked for appears. It is in [`next/`](next/README.md). Its binaries are `termd`, `tsm` and `tsm-relay`. Everything below is about the 1.x binaries (`terminal-sessions-mcp`, `session-server`, `session-cli`), which run 1.x. 2.0 changes none of their code; what reaches them is the package they share with 2.0: a narrower Node range (`engines`), `npm run build` and `npm test` building 2.0 too, and 2.0's dependencies installing with it.
+This package also ships **2.0**, persistent shells for agents: one daemon (`termd`) per user keeps each session's login shell alive between calls and connections, an agent types into it only through explicit calls and gets the exit status, duration and directory of each command `run` types in an integrated shell (or the shell's exit, for a command that ends the shell), with its output, and an MCPL host is woken only when a command ends, a program waits for input, a shell dies or a pattern it asked for appears. It is in [`next/`](next/README.md). Its binaries are `termd`, `tsm` and `tsm-relay`. Everything below is about the 1.x binaries (`terminal-sessions-mcp`, `session-server`, `session-cli`), which run 1.x. 2.0 changes one thing they do: a graceful kill hangs up every process on the session's terminal once the shell is gone, as 2.0's `close` does, so a disowned job no longer outlives it. Otherwise, what reaches them is the package they share with 2.0: a narrower Node range (`engines`), `npm run build` and `npm test` building 2.0 too, and 2.0's dependencies installing with it.
 
 ## Why This Matters
 
@@ -209,7 +209,7 @@ Once configured, your AI assistant will have access to these tools:
 - **startService** - Start a long-running service with startup detection
 - **runCommand** - Execute a command and wait for completion
 - **listSessions** - Get all active sessions
-- **killSession** - Terminate a specific session (graceful by default)
+- **killSession** - Terminate a specific session (graceful by default). A graceful kill hangs up the shell and every process on its terminal. A process started with `setsid` or `nohup` outlives it.
 - **killAll** - Terminate all active sessions
 
 ### Interactive Operations

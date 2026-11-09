@@ -57,7 +57,7 @@ The session server must be running for the MCP server to work properly.
 ### Session Management
 
 **Note on Graceful Shutdown**: When terminating sessions, you can choose between:
-- **Graceful shutdown** (default): Sends SIGINT to allow processes to clean up resources, save state, and exit cleanly. Waits up to 3 seconds before force killing.
+- **Graceful shutdown** (default): Hangs up the shell (SIGHUP), and once it's gone, every process on its terminal, so they can clean up and exit. A process started with `setsid` or `nohup` outlives it. The shell is killed if it's still there after 3 seconds.
 - **Force kill** (`graceful: false`): Immediately terminates the process without cleanup. Use only when graceful shutdown fails or for unresponsive processes.
 
 - **`startService`**: Start a long-running service with startup detection

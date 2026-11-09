@@ -16,6 +16,7 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { execFile } from 'child_process';
 import { buildInputData } from './keys';
 
 interface SessionInfo {
@@ -395,6 +396,92 @@ const HELD_PROBE_MAX_MS = 2000;
  * (see interruptTyping).
  */
 const INTERRUPTED_BODY = '[command not run: interrupted before its body was all typed in]';
+
+interface Listed {
+  pid: number;
+  pgid: number;
+}
+
+const LINUX = process.platform === 'linux';
+const PS_TIMEOUT_MS = 3000;
+
+function ps(args: string[]): Promise<{ status: number; stdout: string } | undefined> {
+  return new Promise((resolve) => {
+    execFile('ps', args, { encoding: 'utf8', timeout: PS_TIMEOUT_MS, killSignal: 'SIGKILL' }, (error, stdout) => {
+      if (!error) resolve({ status: 0, stdout });
+      else resolve(typeof error.code === 'number' && !error.killed ? { status: error.code, stdout } : undefined);
+    });
+  });
+}
+
+function linuxStat(pid: number): { pgid: number; tty: number } | undefined {
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const f = s.slice(s.lastIndexOf(')') + 2).split(' ');
+    return { pgid: Number(f[2]), tty: Number(f[4]) };
+  } catch {
+    return undefined;
+  }
+}
+
+async function onTerminal(shellPid: number): Promise<Listed[] | undefined> {
+  if (LINUX) {
+    const tty = linuxStat(shellPid)?.tty;
+    if (!(tty !== undefined && tty > 0)) return undefined;
+    let names: string[];
+    try {
+      names = fs.readdirSync('/proc');
+    } catch {
+      return undefined;
+    }
+    const listed: Listed[] = [];
+    for (const name of names) {
+      if (!/^\d+$/.test(name)) continue;
+      const s = linuxStat(Number(name));
+      if (s?.tty === tty) listed.push({ pid: Number(name), pgid: s.pgid });
+    }
+    return listed;
+  }
+  const all = await ps(['-A', '-o', 'pid=,pgid=,tty=']);
+  if (all?.status !== 0) return undefined;
+  const rows = all.stdout.trim().split('\n').map((line) => line.trim().split(/\s+/));
+  const tty = rows.find((r) => Number(r[0]) === shellPid)?.[2];
+  if (tty === undefined || tty.startsWith('?')) return undefined;
+  return rows.filter((r) => r[2] === tty).map((r) => ({ pid: Number(r[0]), pgid: Number(r[1]) }));
+}
+
+// On Linux, a stopped process holds a SIGHUP until it's continued, so a group
+// gets SIGCONT once its SIGHUP is delivered. Any process in the session may
+// continue a process, whoever owns it. kill(-0) would signal our own group,
+// and kill(-1) every process we may signal.
+async function hangUp(listed: Listed[], shellPid: number): Promise<void> {
+  const members = listed.filter((p) => p.pid !== shellPid && p.pgid > 1);
+  if (!members.length) return;
+  const now = new Map<number, number>();
+  if (LINUX) {
+    for (const p of members) {
+      const s = linuxStat(p.pid);
+      if (s) now.set(p.pid, s.pgid);
+    }
+  } else {
+    const still = await ps(['-o', 'pid=,pgid=', '-p', members.map((p) => p.pid).join(',')]);
+    for (const line of (still?.stdout ?? '').trim().split('\n')) {
+      const [pid, pgid] = line.trim().split(/\s+/).map(Number);
+      if (pid! > 0) now.set(pid!, pgid!);
+    }
+  }
+  const groups = new Set(members.filter((p) => now.get(p.pid) === p.pgid).map((p) => p.pgid));
+  for (const pgid of groups) {
+    try {
+      process.kill(-pgid, 'SIGHUP');
+    } catch {
+      continue;
+    }
+    try {
+      process.kill(-pgid, 'SIGCONT');
+    } catch {}
+  }
+}
 
 export class PersistentSessionServer extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
@@ -1992,8 +2079,16 @@ export class PersistentSessionServer extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
+    let listed: Listed[] | undefined;
     if (session.isAlive) {
       if (graceful) {
+        // A shell passes a hangup on only to the jobs in its job table, so
+        // never to a disowned job or one started from a subshell. So once the
+        // shell is gone or KILLed, the processes that were on its terminal are
+        // hung up here. The kernel clears their controlling terminal when the
+        // shell exits, so they're listed before the first SIGHUP.
+        if (process.platform !== 'win32') listed = await onTerminal(session.shell.pid);
+
         // SIGHUP is the "terminal went away" signal: an interactive shell
         // exits on it and resends it to its jobs. (SIGINT, used previously, is
         // IGNORED by an interactive bash — every graceful kill burned the full
@@ -2003,7 +2098,7 @@ export class PersistentSessionServer extends EventEmitter {
         // Linux (bash 5.2), a SIGHUP sent right after a command left the shell
         // running 1.5 s later in 39 of 120 trials, and a second SIGHUP, or an
         // Enter, ended it within about 30 ms each time.
-        session.shell.kill('SIGHUP');
+        if (session.isAlive) session.shell.kill('SIGHUP');
 
         // Wait up to 3 seconds for the process to exit gracefully
         const timeout = 3000;
@@ -2031,6 +2126,7 @@ export class PersistentSessionServer extends EventEmitter {
 
     // Brief settle so the exit handler (log flush, event) runs before removal
     await this.sleep(50);
+    if (listed) await hangUp(listed, session.shell.pid);
     this.cleanupTempFiles(session);
     this.sessions.delete(sessionId);
   }
