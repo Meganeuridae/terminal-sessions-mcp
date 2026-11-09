@@ -106,6 +106,43 @@ test('a session opened while killAll waits on a kill is still listed, and alive,
   }
 });
 
+test('a graceful kill that ends after a force kill of its session leaves a session opened since under that id listed', async () => {
+  await server.createSession('t-kill-reused', { shell: '/bin/bash' });
+  const sleep = server.sleep;
+  let release;
+  const held = new Promise((r) => (release = r));
+  let reached;
+  const atGate = new Promise((r) => (reached = r));
+  let first = true;
+  server.sleep = async function (ms) {
+    if (first) {
+      first = false;
+      reached();
+      await held;
+    }
+    return sleep.call(this, ms);
+  };
+  let pid = 0;
+  try {
+    const graceful = server.killSession('t-kill-reused', true);
+    await atGate;
+    await server.killSession('t-kill-reused', false);
+    await server.createSession('t-kill-reused', { shell: '/bin/bash' });
+    const r = await server.execCommand('t-kill-reused', 'echo SHELLPID=$$', 5000);
+    pid = Number((String(r.output).match(/SHELLPID=(\d+)/) || [])[1]);
+    assert.ok(pid > 0, `the new shell's pid: ${JSON.stringify(r.output)}`);
+    release();
+    await graceful;
+    assert.ok(server.listSessions().some((s) => s.id === 't-kill-reused'), 'the session opened since is listed');
+    assert.strictEqual(exists(pid), true, `the new shell (pid ${pid}) is alive`);
+  } finally {
+    release();
+    server.sleep = sleep;
+    await server.killSession('t-kill-reused', false);
+    if (pid) try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
+});
+
 test('a graceful kill ends the jobs the session started in the background', async () => {
   const { pid, gone } = await goneAfterGracefulKill('t-kill-job', 'sleep 60 & echo BGPID=$!');
   assert.strictEqual(gone, true, `the background job (pid ${pid}) outlived the graceful kill`);

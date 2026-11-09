@@ -2167,7 +2167,7 @@ export class PersistentSessionServer extends EventEmitter {
     await this.sleep(SETTLE_MS);
     if (listed) await hangUp(listed, session.shell.pid, deadline);
     this.cleanupTempFiles(session);
-    this.sessions.delete(sessionId);
+    if (this.sessions.get(sessionId) === session) this.sessions.delete(sessionId);
   }
 
   /**
