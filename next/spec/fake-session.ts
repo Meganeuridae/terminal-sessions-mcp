@@ -138,7 +138,7 @@ export class FakeSession implements Session {
     return { kind: 'refused', front: this.frontNow };
   }
 
-  async close(opts?: { force?: boolean }): Promise<Exit> {
+  async close(opts: { force?: boolean; deadline: number }): Promise<Exit> {
     this.calls.push({ method: 'close', args: [opts] });
     this.closedWith = { code: 0 };
     const c = this.current();

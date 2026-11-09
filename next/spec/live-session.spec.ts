@@ -23,8 +23,10 @@ const shells = wanted.map((name) => ({ name, path: which(name) }));
 let ids = 0;
 let homes = 0;
 const sessions: Session[] = [];
+/** A deadline for `close`, on `performance.now()`'s clock. */
+const by = (ms = 30_000): number => performance.now() + ms;
 after(async () => {
-  for (const s of sessions) await s.close({ force: true });
+  for (const s of sessions) await s.close({ force: true, deadline: by() });
   fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -114,6 +116,13 @@ async function eventually<T>(what: string, get: () => T | undefined | false, ms 
 }
 
 let gates = 0;
+/** A directory holding a `ps` that runs `cases`, a `case "$*"` body, before it runs the real one: put it first on PATH. */
+const fakePs = (cases: string): string => {
+  const dir = path.join(tmp, `ps-${++gates}`);
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'ps'), `#!/bin/sh\ncase "$*" in\n${cases}\nesac\nexec /bin/ps "$@"\n`, { mode: 0o755 });
+  return dir;
+};
 /** A file whose presence holds whatever waits on it; the test removes it to release. */
 const newGate = (): string => path.join(tmp, `gate-${++gates}`);
 /** A job of one process group that runs until `gate` is removed. */
@@ -824,7 +833,7 @@ for (const sh of shells) {
     test('close hangs up the shell and removes its directory', async () => {
       const s = await open(shell);
       const before = fs.readdirSync(tmp).filter((d) => d.startsWith('s-')).length;
-      const exit = await s.close();
+      const exit = await s.close({ deadline: by() });
       assert.deepEqual(exit, exitSeen(s));
       assert.notEqual(exit.signal, 'SIGKILL', 'the shell ended on the hangup, not on the KILL that follows a grace');
       assert.equal(fs.readdirSync(tmp).filter((d) => d.startsWith('s-')).length, before - 1);
@@ -988,7 +997,7 @@ for (const sh of shells) {
       await heldAfter(s, gate, 'true', 'run');
       const typed = path.join(tmp, `typed-${gates}`);
       const r = s.run(`touch '${typed}'`, { waitMs: 10_000 });
-      const closing = s.close();
+      const closing = s.close({ deadline: by() });
       fs.rmSync(gate);
       assert.equal((await r).kind, 'refused');
       await closing;
@@ -1003,7 +1012,7 @@ for (const sh of shells) {
       const pid = Number(fs.readFileSync(file, 'utf8'));
       assert.ok(pid > 0);
       try {
-        const exit = await s.close({ force: true });
+        const exit = await s.close({ force: true, deadline: by() });
         assert.equal(exit.unlisted, undefined, logs.join('\n'));
         await eventually('the setsid descendant is gone', () => gone(pid));
       } finally {
@@ -1019,7 +1028,7 @@ for (const sh of shells) {
       const c = await ran(s, sh.name === 'fish' ? 'sleep 300 & echo "JOB:$last_pid"; disown' : 'sleep 300 & echo "JOB:$!"; disown');
       const job = pidOf(s, c, 'JOB');
       try {
-        const exit = await s.close();
+        const exit = await s.close({ deadline: by() });
         assert.equal(exit.unlisted, undefined, logs.join('\n'));
         await eventually('the disowned job is gone', () => gone(job));
       } finally {
@@ -1032,15 +1041,14 @@ for (const sh of shells) {
       const s = await open(shell, { log: (l) => logs.push(l) });
       const c = await ran(s, sh.name === 'fish' ? 'sleep 300 & echo "JOB:$last_pid"; disown' : 'sleep 300 & echo "JOB:$!"; disown');
       const job = pidOf(s, c, 'JOB');
+      const fake = fakePs('*stat=*) exit 2;;');
       const keep = process.env.PATH;
       try {
-        // close lists the terminal's processes before its first wait. With no ps to find after that, only its later check fails.
-        const closing = s.close();
-        process.env.PATH = '';
-        const exit = await closing;
+        process.env.PATH = `${fake}:${keep}`;
+        const exit = await s.close({ deadline: by() });
         process.env.PATH = keep;
         assert.equal(exit.unlisted, true, JSON.stringify(exit));
-        assert.match(logs.join('\n'), /close couldn't list which listed groups still hold a process: /);
+        assert.match(logs.join('\n'), /close couldn't list which listed groups still hold a process: ps exited with status 2/);
         assert.equal(gone(job), false, 'the disowned job was left alone');
       } finally {
         process.env.PATH = keep;
@@ -1052,7 +1060,7 @@ for (const sh of shells) {
       const s = await open(shell);
       const job = pidOf(s, await ran(s, `sh -c 'sleep 300 & echo "JOB:$!"'`), 'JOB');
       try {
-        await s.close();
+        await s.close({ deadline: by() });
         await eventually('the job whose parent exited is gone', () => gone(job));
       } finally {
         killPid(job);
@@ -1063,7 +1071,7 @@ for (const sh of shells) {
       const s = await open(shell);
       const job = pidOf(s, await ran(s, `sh -c 'sleep 300 & echo "JOB:$!"'`), 'JOB');
       try {
-        await s.close({ force: true });
+        await s.close({ force: true, deadline: by() });
         await eventually('the job whose parent exited is gone', () => gone(job));
       } finally {
         killPid(job);
@@ -1079,7 +1087,7 @@ for (const sh of shells) {
       const stopped = pidOf(s, await ran(s, 'sleep 300 & p=$!; kill -STOP $p; echo "JOB:$p"; disown'), 'JOB');
       const disowned = pidOf(s, await ran(s, 'sleep 300 & echo "JOB:$!"; disown'), 'JOB');
       try {
-        const exit = await s.close();
+        const exit = await s.close({ deadline: by() });
         assert.equal(exit.unreached, undefined);
         // The disowned jobs were hung up in the step that hangs up the nohup job, so once they're gone it has had its hangup.
         await eventually('the disowned job is gone', () => gone(disowned));
@@ -1101,7 +1109,7 @@ for (const sh of shells) {
       const child = await eventually('the child wrote its pid', () => (fs.existsSync(file) && Number(fs.readFileSync(file, 'utf8'))) || undefined);
       try {
         await eventually('the child is stopped', () => isStopped(child));
-        await s.close();
+        await s.close({ deadline: by() });
         await eventually('the stopped child is gone', () => gone(child));
       } finally {
         for (const pid of [child, parent]) killPid(pid);
@@ -1114,7 +1122,7 @@ for (const sh of shells) {
       const dir = out(s, await ran(s, 'd=$(dirname "$HISTFILE"); mkdir "$d/ro" && : > "$d/ro/f" && chmod 555 "$d/ro" && echo "DIR:$d"')).find((l) => l.startsWith('DIR:'))!.slice(4);
       assert.ok(fs.existsSync(path.join(dir, 'ro', 'f')));
       try {
-        const exit = await s.close();
+        const exit = await s.close({ deadline: by() });
         assert.deepEqual(exit, exitSeen(s));
         assert.equal(logged.length, 1, JSON.stringify(logged));
         assert.match(logged[0]!, /closed, but its directory .* wasn't removed: /);
@@ -1128,7 +1136,7 @@ for (const sh of shells) {
       // The trap takes the first hangup, leaves a file to say so, and restores the default. Without ignoreeof, bash at its prompt exits on the trapped hangup with status 0, as at end of file.
       const s = await open(shell, { rc: "set -o ignoreeof\ntrap ': > \"$HOME/first-hangup\"; trap - HUP' HUP\n" });
       const home = lastHome();
-      const exit = await s.close();
+      const exit = await s.close({ deadline: by() });
       assert.deepEqual(exit, exitSeen(s));
       assert.ok(fs.existsSync(path.join(home, 'first-hangup')), 'the shell took the first hangup and went on');
       assert.notEqual(exit.signal, 'SIGKILL', 'the shell ended on a later hangup, not on the KILL that follows a grace');
@@ -1143,7 +1151,7 @@ for (const sh of shells) {
       assert.ok(job > 0);
       try {
         await eventually('the job ticks', () => fs.existsSync(ticks));
-        const exit = await s.close();
+        const exit = await s.close({ deadline: by() });
         assert.deepEqual(exit, exitSeen(s));
         assert.equal(exit.signal, 'SIGKILL');
         const at = fs.statSync(ticks).size;
@@ -1161,7 +1169,7 @@ for (const sh of shells) {
       await s.run(`bash -c 'trap "" HUP INT TERM; echo "TRAPS_SET:$$"; sleep 30'`, { waitMs: 200 });
       assert.equal((await s.wait({ kind: 'match', pattern: /^TRAPS_SET:\d+$/ }, { waitMs: 10_000, from })).by, 'match');
       const job = Number(s.lines(from).lines.find((l) => /^TRAPS_SET:\d+$/.test(l))!.slice('TRAPS_SET:'.length));
-      const exit = await s.close({ force: true });
+      const exit = await s.close({ force: true, deadline: by() });
       assert.deepEqual(exit, exitSeen(s));
       assert.equal(exit.signal, 'SIGKILL');
       await eventually('the job is gone', () => gone(job));
@@ -1286,7 +1294,7 @@ for (const sh of shells) {
     test('a pattern wait when close begins returns that the session closed', async () => {
       const s = await open(shell);
       const w = s.wait({ kind: 'match', pattern: /^NEVER-MATCHED$/ }, { waitMs: 30_000, from: 0 });
-      await s.close();
+      await s.close({ deadline: by() });
       assert.equal((await w).by, 'closed');
     });
 
@@ -1337,7 +1345,7 @@ for (const sh of shells) {
       try {
         const pgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim());
         if (pgid !== pid) return t.skip('this sudo runs its command in its own group');
-        const exit = await s.close({ force: true });
+        const exit = await s.close({ force: true, deadline: by() });
         assert.ok(exit.unreached?.some((u) => u.pgid === pgid && u.signal === 'SIGKILL' && u.error === 'EPERM'), JSON.stringify(exit));
       } finally {
         try {
@@ -1690,24 +1698,101 @@ test('a probe line typed into a program a shell without integration started, whi
   assert.deepEqual(r.kind === 'incomplete' && [r.step, r.by], ['probe', 'exited'], JSON.stringify(r));
 });
 
-test('close with force waits out a slow ps while it lists, within its own bound', { skip: process.platform !== 'darwin' ? 'only macOS spawns ps to list' : false }, async () => {
+const darwinOnly = { skip: process.platform !== 'darwin' ? 'only macOS spawns ps to list' : false };
+
+test('while close waits on a listing, another session runs', darwinOnly, async () => {
   const logs: string[] = [];
-  const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
+  const bash = which('bash') ?? '/bin/bash';
+  const s = await open(bash, { log: (l) => logs.push(l) });
+  const other = await open(bash);
   const job = pidOf(s, await ran(s, 'sleep 300 & echo "JOB:$!"'), 'JOB');
-  const slow = path.join(tmp, `slow-ps-${++gates}`);
-  fs.mkdirSync(slow);
-  fs.writeFileSync(path.join(slow, 'ps'), '#!/bin/sh\nsleep 1\nexec /bin/ps "$@"\n', { mode: 0o755 });
+  const gate = path.join(tmp, `gate-${++gates}`);
+  const fake = fakePs(`*"-t "*) while [ ! -e '${gate}' ]; do sleep 0.05; done;;`);
   const keep = process.env.PATH;
   try {
-    // Each listing's ps now takes a second: longer than the bound for other spawns, within close's own.
-    process.env.PATH = `${slow}:${keep}`;
-    const exit = await s.close({ force: true });
+    process.env.PATH = `${fake}:${keep}`;
+    let settled = false;
+    const closing = s.close({ force: true, deadline: by() }).finally(() => (settled = true));
+    assert.deepEqual(out(other, await ran(other, 'echo other-ran')), ['other-ran']);
+    assert.equal(settled, false, 'close was still waiting on its listing');
+    fs.writeFileSync(gate, '');
+    const exit = await closing;
     process.env.PATH = keep;
     assert.equal(exit.unlisted, undefined, logs.join('\n'));
     await eventually('the job is gone', () => gone(job));
   } finally {
     process.env.PATH = keep;
+    fs.writeFileSync(gate, '');
     killPid(job);
+  }
+});
+
+test('close with a deadline already past runs no listing, says what it started may live on, and still ends the shell', darwinOnly, async () => {
+  const logs: string[] = [];
+  const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
+  const job = pidOf(s, await ran(s, 'sleep 300 & echo "JOB:$!"; disown'), 'JOB');
+  const record = path.join(tmp, `ps-calls-${++gates}`);
+  const fake = fakePs(`*) echo "$*" >> '${record}';;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const exit = await s.close({ deadline: performance.now() - 1 });
+    process.env.PATH = keep;
+    const calls = fs.existsSync(record) ? fs.readFileSync(record, 'utf8') : '';
+    assert.doesNotMatch(calls, /-t |stat=/, calls);
+    assert.equal(exit.unlisted, true, JSON.stringify(exit));
+    assert.match(logs.join('\n'), /close couldn't list the processes on the terminal: no time was left before the deadline/);
+    await eventually('the shell is gone', () => gone(s.pid));
+  } finally {
+    process.env.PATH = keep;
+    killPid(job);
+  }
+});
+
+test('close that runs out of time while ps lists logs how long ps had', darwinOnly, async () => {
+  const logs: string[] = [];
+  const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
+  const job = pidOf(s, await ran(s, 'sleep 300 & echo "JOB:$!"'), 'JOB');
+  const fake = fakePs('*"-t "*) exec sleep 300;;');
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const exit = await s.close({ force: true, deadline: by(3000) });
+    process.env.PATH = keep;
+    assert.equal(exit.unlisted, true, JSON.stringify(exit));
+    assert.match(logs.join('\n'), /close couldn't list the processes on the terminal: ps took longer than \d+ ms/);
+  } finally {
+    process.env.PATH = keep;
+    killPid(job);
+  }
+});
+
+test('close reads a ps that exits 1 because every listed process is gone as nothing left to hang up', darwinOnly, async () => {
+  const logs: string[] = [];
+  const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
+  const hung = pidOf(s, await ran(s, 'sleep 300 & echo "HUNG:$!"'), 'HUNG');
+  const gate = path.join(tmp, `gate-${++gates}`);
+  const fake = fakePs(`*stat=*) while [ ! -e '${gate}' ]; do sleep 0.05; done;;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const closing = s.close({ deadline: by() });
+    await eventually('the job the shell hung up is gone', () => {
+      try {
+        process.kill(hung, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    fs.writeFileSync(gate, '');
+    const exit = await closing;
+    process.env.PATH = keep;
+    assert.equal(exit.unlisted, undefined, logs.join('\n'));
+  } finally {
+    process.env.PATH = keep;
+    fs.writeFileSync(gate, '');
+    killPid(hung);
   }
 });
 

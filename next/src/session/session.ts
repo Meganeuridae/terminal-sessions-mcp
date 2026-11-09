@@ -1056,10 +1056,11 @@ class LiveSession implements Session {
     return ls;
   }
 
-  async close(opts: { force?: boolean } = {}): Promise<Closed> {
+  async close(opts: { force?: boolean; deadline: number }): Promise<Closed> {
     this.closed = true;
     this.wake();
     if (this.poll) clearTimeout(this.poll);
+    const { deadline } = opts;
     let unlisted = false;
     const unreached: NonNullable<Closed['unreached']> = [];
     if (!this.exitInfo) {
@@ -1068,10 +1069,12 @@ class LiveSession implements Session {
           this.p.kill('SIGKILL');
         } catch {}
       };
+      const failed = (why: string): void => this.log?.(`session ${JSON.stringify(this.name)}: close couldn't list ${why}`);
+      const before = (graces: number): proc.Listing => ({ deadline: deadline - graces * CLOSE_GRACE_MS, failed });
       // Listed before the first signal: once the shell exits, nothing in its session has a terminal.
-      const listing: proc.Listing = { timeoutMs: proc.CLOSE_SPAWN_TIMEOUT_MS, failed: (why) => this.log?.(`session ${JSON.stringify(this.name)}: close couldn't list ${why}`) };
-      const onTerminal = proc.onTerminal(this.pid, this.pts, listing)?.filter((d) => d.pid !== this.pid);
-      const ds = opts.force ? proc.descendants(this.pid, true, listing) : [];
+      const first = before(opts.force ? 1 : 2);
+      const onTerminal = (await proc.onTerminal(this.pid, this.pts, first))?.filter((d) => d.pid !== this.pid);
+      const ds = opts.force ? await proc.allDescendants(this.pid, first) : [];
       unlisted = onTerminal === undefined || ds === undefined;
       const listed = [...(onTerminal ?? []), ...(ds ?? [])];
       /**
@@ -1079,27 +1082,31 @@ class LiveSession implements Session {
        * checked, it sends nothing and records the listing as incomplete: a group whose id was taken again isn't signalled, and the
        * result says what was started may live on.
        */
-      const reach = (signal: 'SIGHUP' | 'SIGKILL'): void => {
-        const held = proc.held(listed, listing);
+      const reach = async (signal: 'SIGHUP' | 'SIGKILL', l: proc.Listing): Promise<void> => {
+        const held = await proc.held(listed, l);
         if (!held) {
           if (listed.length) unlisted = true;
           return;
         }
+        const refused: Array<{ pgid: number; error: string }> = [];
         for (const pgid of held) {
           const error = proc.signalGroup(pgid, signal);
           // On Linux, a stopped process holds the hangup until it's continued. So CONT follows a hangup that was delivered, as bash
           // sends it.
           if (signal === 'SIGHUP' && !error) proc.signalGroup(pgid, 'SIGCONT');
-          if (error && error !== 'ESRCH' && proc.held(listed.filter((d) => d.pgrp === pgid), listing)?.has(pgid) !== false) unreached.push({ pgid, signal, error });
+          if (error && error !== 'ESRCH') refused.push({ pgid, error });
         }
+        if (!refused.length) return;
+        const still = await proc.held(listed.filter((d) => refused.some((r) => r.pgid === d.pgrp)), l);
+        for (const { pgid, error } of refused) if (still?.has(pgid) !== false) unreached.push({ pgid, signal, error });
       };
+      const gone = (): Exit | undefined => this.exitInfo ?? this.ptyExit;
       if (opts.force) {
-        reach('SIGKILL');
+        await reach('SIGKILL', first);
         killShell();
       } else {
         // bash can miss a SIGHUP that lands just before its line editor waits for input, and go on waiting.
-        const gone = (): Exit | undefined => this.exitInfo ?? this.ptyExit;
-        const grace = mono() + CLOSE_GRACE_MS;
+        const grace = Math.min(mono() + CLOSE_GRACE_MS, deadline - CLOSE_GRACE_MS);
         for (let at = mono(); !gone() && at < grace; at += HANGUP_EVERY_MS) {
           try {
             this.p.kill('SIGHUP');
@@ -1108,16 +1115,19 @@ class LiveSession implements Session {
         }
         if (!gone()) killShell();
       }
-      await this.until(mono() + CLOSE_GRACE_MS, () => this.exitInfo ?? this.ptyExit);
+      await this.until(Math.min(mono() + CLOSE_GRACE_MS, deadline), gone);
       // A shell hangs up only the jobs it still counts as its own, and a KILLed one none.
-      if (!opts.force) reach('SIGHUP');
+      if (!opts.force) await reach('SIGHUP', before(0));
     }
     const exit = this.exitInfo ?? this.ptyExit;
     this.t.dispose();
     // A process just hung up can still be writing here as it exits, so a removal that meets a file written meanwhile tries again.
-    await fs.promises
+    const removal = fs.promises
       .rm(this.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
       .catch((e: Error) => this.log?.(`session ${JSON.stringify(this.name)} closed, but its directory ${this.dir} wasn't removed: ${e.message}`));
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([removal, new Promise<void>((resolve) => (timer = setTimeout(resolve, Math.max(0, deadline - mono()))))]);
+    clearTimeout(timer);
     const closed: Closed = exit ? { ...exit } : { code: null, signal: 'SIGKILL', unconfirmed: true };
     if (unlisted) closed.unlisted = true;
     if (unreached.length) closed.unreached = unreached;
@@ -1169,6 +1179,7 @@ export const openSession: OpenSession = async (o) => {
   }
   const bash = findBash();
   if (!bash) throw err('backend_failure', 'this host has no bash, which closes the descriptors a shell would otherwise inherit from the daemon. Sessions open here once bash is installed');
+  const deadline = mono() + o.waitMs;
   const dir = fs.mkdtempSync(path.join(o.parent, 's-'));
   const nonce: Nonce = { counter: 1, random: randomDigits() };
   const launch = integration.prepare(o.shell, dir, nonce, o.env);
@@ -1185,7 +1196,7 @@ export const openSession: OpenSession = async (o) => {
   await s.ready(o.waitMs);
   if (s.exit) {
     const said = s.startupText();
-    await s.close();
+    await s.close({ deadline });
     throw err('backend_failure', `the shell exited as it started (${s.exit.signal ?? `status ${s.exit.code}`}). Its startup files or the directory are the likely cause, and opening again runs them again${said ? `. It printed: ${said.slice(-500)}` : ''}`);
   }
   return s;

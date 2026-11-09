@@ -47,9 +47,9 @@ export interface Exit {
 
 /** What `close` resolves with: the shell's exit, as the session saw it. */
 export type Closed = Exit & {
-  /** The processes on the session's terminal, or with `force` the shell's descendants, couldn't be listed, or close couldn't check which listed groups still held them, in which case it signalled none. Either way, what it started may live on. */
+  /** The processes on the session's terminal, or with `force` the shell's descendants, couldn't be listed, or close couldn't check which listed groups still held them, in which case it signalled none: a listing failed, or the deadline left it no time. Either way, what it started may live on. */
   unlisted?: true;
-  /** The shell's exit wasn't seen within a grace after its KILL, as for a process in uninterruptible sleep. */
+  /** The shell's exit wasn't seen within a grace after its KILL, or by the deadline, as for a process in uninterruptible sleep. */
   unconfirmed?: true;
   /** The groups whose hangup, or KILL with `force`, wasn't delivered, each with the error's code, such as `EPERM`; their processes may live on. */
   unreached?: Array<{ pgid: number; signal: 'SIGHUP' | 'SIGKILL'; error: string }>;
@@ -329,8 +329,16 @@ export interface Session {
    * before the hooks are all typed, it stops.
    */
   integrate(opts: { waitMs: number; signal?: AbortSignal }): Promise<IntegrateOutcome>;
-  /** Lists the processes on the session's terminal first. Then it hangs up the shell, again every 500 ms while it is there, and KILLs it if it is still there after a grace. Once the shell is gone, it hangs up each listed group, and continues each group the hangup reached. A process that left the terminal with setsid isn't listed, so it lives on. With `force`, at once KILLs every listed group and every group the shell started, then the shell. Resolves with the exit, at once if it had exited. */
-  close(opts?: { force?: boolean }): Promise<Closed>;
+  /**
+   * Lists the processes on the session's terminal first. Then it hangs up the shell, again every 500 ms while it is there, and KILLs
+   * it if it is still there after a grace. Once the shell is gone, it hangs up each listed group, and continues each group the hangup
+   * reached. A process that left the terminal with setsid isn't listed, so it lives on. With `force`, at once KILLs every listed group
+   * and every group the shell started, then the shell. Resolves with the exit, at once if it had exited.
+   * Every step spends from `deadline`, an absolute time on `performance.now()`'s clock: a listing gets what's left less the graces
+   * still ahead of it, the graces end at it, and the last check gets what's left. The session's directory is removed by then if it
+   * can be; otherwise `close` resolves at the deadline and the removal finishes after it, logged if it fails.
+   */
+  close(opts: { force?: boolean; deadline: number }): Promise<Closed>;
 
   /** A one-shot pattern watch from line `from` on; its id names the `match` event. Given `command`, its match in that command's output is emitted before the command's `ended`; other watches search a slice at a time. */
   watch(pattern: RegExp, from: number, command?: number): number;

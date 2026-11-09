@@ -595,8 +595,8 @@ test('a close that finishes after the name was closed and opened again leaves th
   const s = opened[0]!;
   let release!: () => void;
   const realClose = s.close.bind(s);
-  s.close = async (o?: { force?: boolean }) => {
-    if (!o?.force) await new Promise<void>((r) => (release = r));
+  s.close = async (o: { force?: boolean; deadline: number }) => {
+    if (!o.force) await new Promise<void>((r) => (release = r));
     return realClose(o);
   };
   const graceful = host.call(agent(), 'close', { name: 'main' });
@@ -626,8 +626,8 @@ test('a session that is closing refuses run, send, stop and integrate, and a for
   const s = opened[0]!;
   let release!: () => void;
   const realClose = s.close.bind(s);
-  s.close = async (o?: { force?: boolean }) => {
-    if (!o?.force) await new Promise<void>((r) => (release = r));
+  s.close = async (o: { force?: boolean; deadline: number }) => {
+    if (!o.force) await new Promise<void>((r) => (release = r));
     return realClose(o);
   };
   const graceful = host.call(agent(), 'close', { name: 'main' });
@@ -1598,7 +1598,7 @@ test('a wait for input a call cancelled during a close had taken is not in the c
   await settle();
   const realClose = s.close.bind(s);
   let release!: () => void;
-  s.close = async (o?: { force?: boolean }) => {
+  s.close = async (o: { force?: boolean; deadline: number }) => {
     await new Promise<void>((r) => (release = r));
     return realClose(o);
   };
@@ -1851,4 +1851,52 @@ test('integrated shows the lines not yet shown before the call, frozen or live, 
   s.out[s.out.length - 1] = '$ ssh box2 Last login: today, with no newline before box2$ ';
   const live = await host.call(agent(), 'integrate', { name: 'main' });
   assert.match(live.text, /\n\$ ssh box2 Last login: today, with no newline before box2\$ \nThe shell in front/, live.text);
+});
+
+test('close gives the session until 55 s after the call began, the most any call may hold', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const clock = mock.method(performance, 'now', () => 1_000_000);
+  try {
+    await host.call(agent(), 'close', { name: 'main', force: true });
+  } finally {
+    clock.mock.restore();
+  }
+  assert.deepEqual(opened[0]!.calls.find((c) => c.method === 'close')?.args, [{ force: true, deadline: 1_055_000 }]);
+});
+
+test('a stop gives every session, and one that finishes opening during it, until 20 s after the stop began', async () => {
+  let release!: () => void;
+  let hold = false;
+  const opened: FakeSession[] = [];
+  const host = new Host({
+    openSession: async (o: OpenOptions) => {
+      if (hold) await new Promise<void>((r) => (release = r));
+      const s = new FakeSession(o.name, o);
+      opened.push(s);
+      return s;
+    },
+    shell: '/bin/bash', env: {}, sessionsDir: '/tmp/sessions', startedAt: STARTED,
+  });
+  await host.call(agent(), 'open', { name: 'one' });
+  await host.call(agent(), 'open', { name: 'two' });
+  hold = true;
+  const pending = host.call(agent(), 'open', { name: 'late' });
+  await settle();
+  let t = 2_000_000;
+  const clock = mock.method(performance, 'now', () => t);
+  try {
+    const stopping = host.closeAll();
+    t += 3_000;
+    release();
+    await stopping;
+    await pending;
+  } finally {
+    clock.mock.restore();
+  }
+  assert.deepEqual(opened.map((s) => [s.name, s.calls.find((c) => c.method === 'close')?.args]), [
+    ['one', [{ deadline: 2_020_000 }]],
+    ['two', [{ deadline: 2_020_000 }]],
+    ['late', [{ force: true, deadline: 2_020_000 }]],
+  ]);
 });

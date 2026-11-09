@@ -9,6 +9,13 @@ import { boundedStrings, dirText, duration, endingText, exitText, fitted, fitted
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, WAIT_MAX_S, type ToolDef } from './table.js';
 
 const mono = (): number => performance.now();
+/**
+ * How long a daemon's stop may take to close every session: the shortest stop timeout of what stops it. The shipped
+ * termd.service and com.animalabs.termd.plist each give 20 s before SIGKILL; `tsm daemon stop` waits 25 s, and the
+ * transient unit the relay starts gets systemd's default, 90 s on Ubuntu 26.04. A KILL after this, while the socket
+ * closes, leaves only a socket file the next daemon replaces.
+ */
+const STOP_BUDGET_MS = 20_000;
 
 export interface Caller {
   scope: string;
@@ -86,7 +93,7 @@ export class Host {
   private readonly subscribers = new Map<string, Set<Subscriber>>();
   private readonly opening = new Set<string>();
   private readonly starting = new Set<Promise<void>>();
-  private stopping = false;
+  private stopping: number | undefined;
   private wakeSeq = 0;
   private readonly happened = new WeakMap<object, number>();
   private readonly settled = new WeakMap<Took[number], { count: number; shown: boolean }>();
@@ -163,13 +170,13 @@ export class Host {
   }
 
   async closeAll(): Promise<void> {
-    this.stopping = true;
+    const deadline = (this.stopping = mono() + STOP_BUDGET_MS);
     await Promise.all(this.starting);
     await Promise.all(
       [...this.entries.values()].map(async (e) => {
         e.closing = true;
         try {
-          await e.session.close();
+          await e.session.close({ deadline });
         } catch (err) {
           this.o.log?.(`closing session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)} failed: ${(err as Error)?.message ?? String(err)}`);
         }
@@ -205,7 +212,7 @@ export class Host {
     if (!SESSION_NAME_RE.test(name)) return refused(`${JSON.stringify(name)} isn't a session name: 1 to 64 letters, digits, ".", "_" or "-".`, { error: 'invalid_argument' });
     const k = keyOf(caller.scope, name);
     if (this.entries.has(k) || this.opening.has(k)) return refused(`A session named ${JSON.stringify(name)} is already open in this scope, or opening. Use it, or \`close\` it first.`, { error: 'session_exists', session: name });
-    if (this.stopping) return refused('The daemon is stopping, so no session opens.', { error: 'backend_failure' });
+    if (this.stopping !== undefined) return refused('The daemon is stopping, so no session opens.', { error: 'backend_failure' });
     const cols = (a.cols as number | undefined) ?? 120;
     const rows = (a.rows as number | undefined) ?? 40;
     const fits = RESULT_MAX_CHARS - SCREEN_ROOM_CHARS;
@@ -249,8 +256,8 @@ export class Host {
       ...(this.o.oomScoreAdj ? { oomScoreAdj: this.o.oomScoreAdj } : {}),
       ...(this.o.log ? { log: this.o.log } : {}),
     });
-    if (this.stopping) {
-      await session.close({ force: true });
+    if (this.stopping !== undefined) {
+      await session.close({ force: true, deadline: this.stopping });
       return refused('The daemon stopped while this session started, so its shell is closed.', { error: 'backend_failure' });
     }
     const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {} };
@@ -533,7 +540,7 @@ export class Host {
 
   private async close(caller: Caller, e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
     e.closing = true;
-    const [exit] = await Promise.all([e.session.close({ force: a.force === true }), Promise.all(e.settling)]);
+    const [exit] = await Promise.all([e.session.close({ force: a.force === true, deadline: mono() + WAIT_MAX_S * 1000 }), Promise.all(e.settling)]);
     e.off();
     const unseen = [...e.unseen.values()].sort((x, y) => x.at - y.at).map((u) => u.lines.join('\n'));
     if (caller.takes) e.unseen.clear();
