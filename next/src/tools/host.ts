@@ -409,15 +409,17 @@ export class Host {
       }
     }
     const lines = e.session.lines(e.cursor);
+    const screen = e.session.screen();
     const pending = [...e.unseen.values()].sort((x, y) => x.at - y.at);
     let before = [this.status(e, front), ...parts].join('\n');
     const ends = pending.map((u) => (before += `\n${u.lines.join('\n')}`).length);
-    const full = `${before}\n${lines.lines.length ? this.output(lines, RESULT_MAX_CHARS - before.length - 1) : '(no new output)'}`;
+    const room = RESULT_MAX_CHARS - before.length - 1;
+    const full = `${before}\n${screen.alt ? screenText(screen, room) : lines.lines.length ? this.output(lines, room) : '(no new output)'}`;
     const text = fitted(full);
     const kept = fittedLength(full);
     const shown = pending.filter((_, i) => ends[i]! <= kept);
     if (caller.takes) {
-      e.cursor = Math.max(e.cursor, lines.to - lines.live);
+      if (!screen.alt) e.cursor = Math.max(e.cursor, lines.to - lines.live);
       for (const u of shown) this.forget(e, u);
     }
     return ok(text, { front, ...(ended.length ? { ended } : {}), unseen: shown.map((u) => u.lines.join('\n')), lines: { from: lines.from, to: lines.to } });

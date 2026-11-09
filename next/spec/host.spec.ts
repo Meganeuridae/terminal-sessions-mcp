@@ -1110,6 +1110,22 @@ test('a send that returns a screen leaves the look cursor where it was, since it
   assert.match(after.text, /\nnormal output$/);
 });
 
+test('look shows a full-screen program\'s screen while it is up, and leaves its cursor where it was, since it returned no lines', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.live = 0;
+  s.out = ['before'];
+  await host.call(plain(), 'look', { name: 'main' });
+  s.out.push('printed before the program took the screen');
+  s.screenNow = { rows: ['VIM ROW', ''], cursor: { row: 0, col: 3 }, alt: true, title: '' };
+  const r = await host.call(plain(), 'look', { name: 'main' });
+  assert.match(r.text, /^\[main · [^\n]*\]\n\(screen, full-screen program; cursor at row 1, column 4\)\nVIM ROW$/);
+  s.screenNow = undefined;
+  const after = await host.call(plain(), 'look', { name: 'main' });
+  assert.match(after.text, /\nprinted before the program took the screen$/);
+});
+
 test('a read search\'s context costs about the lines it shows, not a hit\'s context times the hits', async () => {
   const { host, opened } = setup();
   await host.call(cli(), 'open', { name: 'main' });

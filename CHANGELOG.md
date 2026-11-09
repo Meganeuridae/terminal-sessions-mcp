@@ -28,7 +28,7 @@ with 2.0: a narrower Node range (`engines`), `npm run build` and `npm test` buil
   `structuredContent` gives the command's `exitCode` and its own `output` as values. `run` types only at the prompt; `send` types
   exactly what it is given and returns its effect; with `paste: true` it sends the text as a
   bracketed paste and the keys after it, for a program such as Claude Code that takes long typed
-  text as a paste. `integrate` gives a shell reached through a typed
+  text as a paste. `look` gives a full-screen program's screen while it is up. `integrate` gives a shell reached through a typed
   `ssh`, `su` or `docker exec` the session's integration, so `run` works there with statuses.
 - **Wakes over MCPL** (feature set `terminal.events`): a command ended that no call was waiting on,
   a program waiting for input (on the kernel's evidence, on Linux), a shell exited, a pattern asked
