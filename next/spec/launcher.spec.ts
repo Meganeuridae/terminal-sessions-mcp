@@ -75,3 +75,20 @@ test('the daemon takes the first shell that can run: the passwd entry\'s, then $
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a version manager's directory already on PATH is moved ahead of the system's, so its node is the one found", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-launch-'));
+  try {
+    const sys = path.join(home, 'sys/bin');
+    fakeNode(path.join(sys, 'node'));
+    const volta = path.join(home, '.volta/bin');
+    fakeNode(path.join(volta, 'node'));
+    const daemon = path.join(home, 'daemon.js');
+    fs.writeFileSync(daemon, '');
+    const r = launch({ HOME: home, TSM_DAEMON: daemon, PATH: `${sys}:/usr/bin:/bin:${volta}` });
+    assert.equal(r.node, path.join(volta, 'node'));
+    assert.equal(r.path.split(':').filter((d) => d === volta).length, 1, 'on PATH once');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

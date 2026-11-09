@@ -200,7 +200,15 @@ export async function runCli(o: CliOptions & { socket: string; version: string; 
         return 1;
       }
       r.socket.destroy();
-      while ((await probe(o.socket).catch(() => 'missing')) === 'answers') {
+      for (;;) {
+        let seen: string;
+        try {
+          seen = await probe(o.socket);
+        } catch (e) {
+          o.stderr.write(`tsm: the daemon (pid ${pid}) was asked to stop, but whether it did can't be seen: ${(e as Error).message}\n`);
+          return 1;
+        }
+        if (seen !== 'answers') break;
         if (performance.now() >= end) {
           o.stderr.write(`tsm: ${wedged}\n`);
           return 1;

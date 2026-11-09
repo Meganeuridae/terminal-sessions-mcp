@@ -38,7 +38,8 @@ function linuxRunUser(uid: number): string | undefined {
   }
 }
 
-export const shellQuote = (s: string): string => (/^[A-Za-z0-9_./:,+@%-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+export const shellQuote = (s: string): string =>
+  /^[A-Za-z0-9_./:,+@%-]+$/.test(s) ? s : s === '' ? "''" : s.split(/(['\\])/).map((p) => (p === "'" || p === '\\' ? `\\${p}` : p ? `'${p}'` : '')).join('');
 
 /** The process's uid, without the passwd lookup os.userInfo() makes, which throws for a uid with no entry. */
 const uidOf = (): number => process.getuid?.() ?? os.userInfo().uid;

@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as net from 'node:net';
 import { PassThrough } from 'node:stream';
+import { spawnSync } from 'node:child_process';
 import { parseCli, runCli, type CliOptions } from '../src/endpoint/cli-main.js';
 import { runDaemon, type RunningDaemon } from '../src/endpoint/daemon-main.js';
 import { helloLine } from '../src/endpoint/hello.js';
@@ -67,7 +68,7 @@ test('H9: the CLI calls the daemon in its scope, prints the text, and takes noth
 });
 
 test('several words after the name are each quoted for the shell, one stays a command line, and an empty number is refused', () => {
-  assert.deepEqual(parseCli(['run', 'demo', '--', 'printf', '%s\\n', 'hello world']), { scope: 'default', call: { tool: 'run', args: { name: 'demo', command: "printf '%s\\n' 'hello world'" } } });
+  assert.deepEqual(parseCli(['run', 'demo', '--', 'printf', '%s\\n', 'hello world']), { scope: 'default', call: { tool: 'run', args: { name: 'demo', command: "printf '%s'\\\\'n' 'hello world'" } } });
   assert.deepEqual(parseCli(['run', 'demo', 'echo', '; rm -rf target']), { scope: 'default', call: { tool: 'run', args: { name: 'demo', command: "echo '; rm -rf target'" } } });
   assert.deepEqual(parseCli(['run', 'demo', "it's"]), { scope: 'default', call: { tool: 'run', args: { name: 'demo', command: "it's" } } });
   assert.deepEqual(parseCli(['run', 'demo', 'make test | tee log']), { scope: 'default', call: { tool: 'run', args: { name: 'demo', command: 'make test | tee log' } } });
@@ -166,6 +167,77 @@ test('tsm daemon stop asks the daemon over its connection, and it stops and hang
     assert.ok(sessions[0]!.closedWith, 'its shell was hung up');
   } finally {
     await d.stop('test');
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a word given as several is quoted so that bash, zsh, fish and sh each read it back as given', () => {
+  const words = ['abc\\', 'a\\\\b', "it's", 'a b', '$HOME', '*', '\\n', "'\\'", ''];
+  const quoted = (w: string): string => (parseCli(['run', 'demo', 'printf', w]) as unknown as { call: { args: { command: string } } }).call.args.command.slice('printf '.length);
+  const shells = ['bash', 'zsh', 'fish', 'sh', 'dash'].filter((sh) => spawnSync(sh, ['-c', 'true']).status === 0);
+  assert.ok(shells.length >= 2, `shells found: ${shells.join(', ')}`);
+  for (const sh of shells) for (const w of words) {
+    const r = spawnSync(sh, ['-c', `printf '%s' ${quoted(w)}`], { encoding: 'utf8' });
+    assert.equal(r.stdout, w, `${sh} read ${quoted(w)} as ${JSON.stringify(r.stdout)}: ${r.stderr}`);
+  }
+});
+
+test('tsm daemon stop returns once the daemon has hung up its shells, not once its socket is gone', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
+  const socket = path.join(dir, 'daemon.sock');
+  let closed = false;
+  const d = (await runDaemon({
+    socket,
+    openSession: async (o: OpenOptions) => {
+      const s = new FakeSession(o.name, o);
+      const close = s.close.bind(s);
+      s.close = async (opts) => {
+        await new Promise((r) => setTimeout(r, 400));
+        closed = true;
+        return close(opts);
+      };
+      return s;
+    },
+    shell: '/bin/bash', env: {}, version: '2.0.0', log: () => {}, confirmMs: 50,
+  })) as RunningDaemon;
+  const call = (...argv: string[]) => runCli({ ...(parseCli(argv) as CliOptions), socket, version: '2.0.0', startDaemon: () => assert.fail('a daemon answers'), stdout: new PassThrough(), stderr: new PassThrough() });
+  try {
+    await call('open', 'main');
+    assert.equal(await call('daemon', 'stop'), 0);
+    assert.equal(closed, true, 'its shell was hung up before tsm returned');
+  } finally {
+    await d.stop('test');
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tsm daemon stop says it can't tell when the socket can't be probed after the stop was answered", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
+  const socket = path.join(dir, 'daemon.sock');
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    c.write(helloLine({ version: '2.0.0', pid: 4242, startedAt: '2026-11-08T19:00:00.000Z' } as never));
+    c.on('data', (b) => {
+      const m = JSON.parse(String(b).split('\n')[0]!) as { id: unknown };
+      fs.chmodSync(socket, 0);
+      c.end(`${JSON.stringify({ jsonrpc: '2.0', id: m.id, result: {} })}\n`);
+    });
+  });
+  await new Promise<void>((r) => server.listen(socket, r));
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  let out = '';
+  let err = '';
+  stdout.on('data', (b) => (out += b));
+  stderr.on('data', (b) => (err += b));
+  try {
+    const code = await runCli({ ...(parseCli(['daemon', 'stop']) as CliOptions), socket, version: '2.0.0', startDaemon: () => assert.fail('a daemon answers'), stdout, stderr, reachMs: 1000 });
+    assert.equal(code, 1);
+    assert.equal(out, '');
+    assert.match(err, /^tsm: the daemon \(pid 4242\) was asked to stop, but whether it did can't be seen: /);
+  } finally {
+    fs.chmodSync(socket, 0o600);
+    await new Promise<void>((r) => server.close(() => r()));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

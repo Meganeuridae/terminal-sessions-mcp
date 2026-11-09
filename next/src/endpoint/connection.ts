@@ -8,6 +8,7 @@ export interface DaemonInfo {
   version: string;
   pid: number;
   startedAt: number;
+  socket: string;
 }
 
 const TAG_ONTOLOGY = {
@@ -125,7 +126,7 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
         mcpl = exp.mcpl !== undefined;
         const ec = isObj(exp.mcpl) ? exp.mcpl.eventCoalescing : undefined;
         coalescing = ec === true || (isObj(ec) && ec.pushEvents === true);
-        const note = versionNote(hello!.version, { version: daemon.version, pid: daemon.pid, startedAt: new Date(daemon.startedAt).toISOString() });
+        const note = versionNote(hello!.version, { version: daemon.version, pid: daemon.pid, startedAt: new Date(daemon.startedAt).toISOString() }, daemon.socket);
         return {
           protocolVersion: typeof p.protocolVersion === 'string' && PROTOCOL_VERSIONS.includes(p.protocolVersion) ? p.protocolVersion : PROTOCOL_VERSIONS[0],
           capabilities: { tools: { listChanged: true }, ...(mcpl ? { experimental: { mcpl: manifest() } } : {}) },

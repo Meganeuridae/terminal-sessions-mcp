@@ -94,7 +94,7 @@ export async function relay(o: RelayOptions): Promise<number> {
     return 1;
   }
   const { socket, daemon, rest } = reached;
-  const note = versionNote(o.hello.version, daemon);
+  const note = versionNote(o.hello.version, daemon, o.socket);
   if (note) o.stderr.write(`tsm-relay: ${note}\n`);
   if (rest.length) o.stdout.write(rest);
 
@@ -124,16 +124,19 @@ export async function relay(o: RelayOptions): Promise<number> {
  * would end with the resident. A transient user unit of its own escapes that; it takes the
  * settings next/config/termd.service gives the daemon, for the reasons given there.
  */
-export function startDaemon(daemonScript: string, socket: string, log: string, budgetMs: number): string {
+export function startDaemon(daemonScript: string, socket: string, log: string, budgetMs: number, note: (line: string) => void): string {
   const args = [daemonScript, '--socket', socket];
   if (process.platform === 'linux') {
     const unit = `terminal-sessions-${process.pid}-${Date.now()}`;
     const props = ['KillMode=process', 'OOMPolicy=continue'].flatMap((p) => ['-p', p]);
-    const r = spawnSync('systemd-run', ['--user', '--collect', '--quiet', '--unit', unit, ...props, '--', process.execPath, ...args], { stdio: 'ignore', timeout: budgetMs, killSignal: 'SIGKILL' });
+    const r = spawnSync('systemd-run', ['--user', '--collect', '--quiet', '--unit', unit, ...props, '--', process.execPath, ...args], { stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: budgetMs, killSignal: 'SIGKILL' });
     if (r.status === 0) return `the user journal (journalctl --user -u ${unit})`;
-    if ((r.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT') {
+    const code = (r.error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ETIMEDOUT') {
       throw new Error(`systemd-run --user didn't finish within the ${budgetMs} ms left to reach a daemon, so whether it started one is unknown, and no other was started`);
     }
+    const why = code ?? `status ${r.status}${r.stderr?.trim() ? `: ${r.stderr.trim().split('\n')[0]!.slice(0, 200)}` : ''}`;
+    note(`systemd-run --user failed (${why}), so the daemon starts detached in this relay's control group, and ends when the host's service stops`);
   }
   const { O_WRONLY, O_CREAT, O_TRUNC, O_APPEND } = fs.constants;
   const fd = fs.openSync(log, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0o600);
@@ -153,21 +156,25 @@ function answerFirstRequest(stdin: Readable, stdout: Writable, reason: string): 
       stdin.off('end', done);
       resolve();
     };
-    const onData = (b: Buffer | string): void => {
-      buf += b.toString();
-      const nl = buf.indexOf('\n');
-      if (nl < 0) return;
-      let m: { id?: unknown; method?: unknown } | undefined;
-      try {
-        m = JSON.parse(buf.slice(0, nl)) as { id?: unknown; method?: unknown };
-      } catch {
-        m = undefined;
+    const onData = (b: string): void => {
+      buf += b;
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        let m: { id?: unknown; method?: unknown } | undefined;
+        try {
+          m = JSON.parse(line) as { id?: unknown; method?: unknown };
+        } catch {
+          m = undefined;
+        }
+        if (m && (typeof m.id === 'number' || typeof m.id === 'string') && typeof m.method === 'string') {
+          stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: reason } })}\n`);
+          return done();
+        }
       }
-      if (m && (typeof m.id === 'number' || typeof m.id === 'string') && typeof m.method === 'string') {
-        stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: reason } })}\n`);
-      }
-      done();
     };
+    stdin.setEncoding('utf8');
     stdin.on('data', onData);
     stdin.once('end', done);
     stdin.resume();
@@ -205,7 +212,7 @@ async function main(argv: string[]): Promise<number> {
   return relay({
     socket: paths.socket,
     hello: { version: packageVersion(), scope, client: 'relay' },
-    startDaemon: (budgetMs) => startDaemon(daemonScript, paths.socket, path.join(paths.dir, 'daemon.log'), budgetMs),
+    startDaemon: (budgetMs) => startDaemon(daemonScript, paths.socket, path.join(paths.dir, 'daemon.log'), budgetMs, (line) => process.stderr.write(`tsm-relay: ${line}\n`)),
     stdin: process.stdin,
     stdout: process.stdout,
     stderr: process.stderr,

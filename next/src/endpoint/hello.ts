@@ -44,10 +44,10 @@ export function parseDaemonHello(line: string): DaemonHello | undefined {
   return { version: p.version, pid: p.pid, startedAt: p.startedAt };
 }
 
-export function versionNote(relay: string, daemon: DaemonHello): string | undefined {
+export function versionNote(relay: string, daemon: DaemonHello, socket: string): string | undefined {
   if (relay === daemon.version) return undefined;
   return (
     `The terminal-sessions daemon is version ${daemon.version}, running since ${daemon.startedAt}, and the relay that reached it is ${relay}. ` +
-    `The daemon keeps its version until it restarts, which ends every shell it holds, so restarting it is for whoever runs it to choose: \`tsm daemon stop\`, then any call.`
+    `The daemon keeps its version until it restarts, which ends every shell it holds, so restarting it is for whoever runs it to choose: \`tsm --socket ${socket} daemon stop\`, then any call.`
   );
 }

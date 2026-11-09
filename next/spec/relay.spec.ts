@@ -7,7 +7,7 @@ import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { helloLine, parseClientHello, type ClientHello } from '../src/endpoint/hello.js';
-import { relay } from '../src/relay.js';
+import { relay, startDaemon } from '../src/relay.js';
 
 const HELLO: ClientHello = { version: '2.0.0', scope: 'agent-a', client: 'relay' };
 
@@ -184,16 +184,19 @@ test('H3: something at the socket that isn\'t a daemon is said to be so', { time
 test('H4: a daemon of another version is named on stderr; one of the same version says nothing', { timeout: 10_000 }, async () => {
   const dir = tmp();
   try {
-    for (const [version, expect] of [['1.9.0', /daemon is version 1\.9\.0, running since 2026-11-08T12:00:00\.000Z, and the relay that reached it is 2\.0\.0/], ['2.0.0', /^$/]] as const) {
+    for (const [version, expect] of [['1.9.0', /daemon is version 1\.9\.0, running since 2026-11-08T12:00:00\.000Z, and the relay that reached it is 2\.0\.0.*`tsm --socket \S*d-1\.9\.0\.sock daemon stop`/], ['2.0.0', /^$/]] as const) {
       const socket = path.join(dir, `d-${version}.sock`);
       const fake = await fakeDaemon(socket, version);
-      const s = io();
-      const done = relay({ socket, hello: HELLO, stdin: s.stdin, stdout: s.stdout, stderr: s.stderr, startDaemon: () => 'x' });
-      await until(() => fake.conns.length === 1);
-      s.stdin.end();
-      await done;
-      assert.match(s.err(), expect);
-      await fake.close();
+      try {
+        const s = io();
+        const done = relay({ socket, hello: HELLO, stdin: s.stdin, stdout: s.stdout, stderr: s.stderr, startDaemon: () => 'x' });
+        await until(() => fake.conns.length === 1);
+        s.stdin.end();
+        await done;
+        assert.match(s.err(), expect);
+      } finally {
+        await fake.close();
+      }
     }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -281,6 +284,56 @@ test("a directory others can enter is refused, and the host's first request is a
     assert.equal(answer.id, 1);
     assert.match(answer.error.message, /^tsm-relay: .* can be entered by others \(mode 755\)/);
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a relay that can't reach a daemon answers the host's first request though a notification came first, with an id split across reads", { timeout: 10_000 }, async () => {
+  const dir = tmp();
+  fs.chmodSync(dir, 0o755);
+  try {
+    const child = spawn(process.execPath, [path.resolve(import.meta.dirname, '../src/relay.js'), '--socket', path.join(dir, 'daemon.sock')], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const exited = new Promise<number | null>((r) => child.once('exit', r));
+    child.stdin.on('error', () => {});
+    let out = '';
+    child.stdout.on('data', (b) => (out += b));
+    child.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
+    const request = Buffer.from('{"jsonrpc":"2.0","id":"café","method":"initialize","params":{}}\n', 'utf8');
+    const at = request.indexOf(Buffer.from('é', 'utf8')) + 1;
+    child.stdin.write(request.subarray(0, at));
+    await new Promise((r) => setTimeout(r, 100));
+    child.stdin.write(request.subarray(at));
+    try {
+      assert.equal(await exited, 1);
+      assert.ok(out.trim(), 'the relay answered');
+      const answer = JSON.parse(out.trim()) as { id: string; error: { message: string } };
+      assert.equal(answer.id, 'café');
+      assert.match(answer.error.message, /can be entered by others/);
+    } finally {
+      child.kill();
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a relay whose systemd-run fails says so, and that the daemon it starts instead ends with its host', { skip: process.platform !== 'linux', timeout: 10_000 }, async () => {
+  const dir = tmp();
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'systemd-run'), '#!/bin/sh\necho "Failed to start transient service unit: Unit already exists." >&2\nexit 1\n', { mode: 0o755 });
+  const script = path.join(dir, 'daemon.js');
+  fs.writeFileSync(script, '');
+  const was = process.env.PATH;
+  process.env.PATH = `${bin}:${was ?? ''}`;
+  try {
+    const notes: string[] = [];
+    const log = startDaemon(script, path.join(dir, 'daemon.sock'), path.join(dir, 'daemon.log'), 5_000, (n) => notes.push(n));
+    assert.equal(log, path.join(dir, 'daemon.log'));
+    assert.equal(notes.length, 1);
+    assert.match(notes[0]!, /^systemd-run --user failed \(status 1: Failed to start transient service unit: Unit already exists\.\), so the daemon starts detached in this relay's control group, and ends when the host's service stops$/);
+  } finally {
+    process.env.PATH = was;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

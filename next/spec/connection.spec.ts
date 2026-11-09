@@ -10,7 +10,7 @@ import { Host } from '../src/tools/host.js';
 import type { OpenOptions } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
 
-const DAEMON = { version: '2.0.0', pid: 777, startedAt: Date.parse('2026-11-08T13:00:00.000Z') };
+const DAEMON = { version: '2.0.0', pid: 777, startedAt: Date.parse('2026-11-08T13:00:00.000Z'), socket: '/run/user/1000/terminal-sessions/other.sock' };
 
 interface Client {
   send(m: unknown): void;
@@ -131,7 +131,7 @@ test('H4: a client of another version is told so in initialize\'s instructions',
     const old = await h.connect(relayHello('a', '1.9.0'));
     const r = await old.request('initialize', MCPL_INIT);
     assert.match(String((r.result as { instructions: string }).instructions), /daemon is version 2\.0\.0, running since 2026-11-08T13:00:00\.000Z, and the relay that reached it is 1\.9\.0/);
-    assert.match(String((r.result as { instructions: string }).instructions), /restarting it is for whoever runs it to choose/);
+    assert.match(String((r.result as { instructions: string }).instructions), /restarting it is for whoever runs it to choose: `tsm --socket \/run\/user\/1000\/terminal-sessions\/other\.sock daemon stop`, then any call/);
     const same = await h.connect(relayHello('a', '2.0.0'));
     const r2 = await same.request('initialize', MCPL_INIT);
     assert.doesNotMatch(String((r2.result as { instructions: string }).instructions), /relay that reached it/);

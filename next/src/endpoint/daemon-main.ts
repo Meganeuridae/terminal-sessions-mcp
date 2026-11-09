@@ -38,7 +38,7 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
   const sessionsDir = path.join(sessionsRoot, ownName);
   fs.mkdirSync(sessionsDir, { mode: 0o700 });
   const host = new Host({ openSession: o.openSession, shell: o.shell, env: o.env, sessionsDir, startedAt, log: o.log, ...(o.oomScoreAdj ? { oomScoreAdj: o.oomScoreAdj } : {}) });
-  const info = { version: o.version, pid: process.pid, startedAt };
+  const info = { version: o.version, pid: process.pid, startedAt, socket: o.socket };
   const conns = new Set<net.Socket>();
   let listening: Listening | undefined;
   let stopping: Promise<void> | undefined;
@@ -51,8 +51,8 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
       o.log(`stopping: ${why}`);
       clearInterval(checking);
       for (const c of conns) c.destroy();
-      await listening?.close().catch((e: Error) => o.log(`closing the socket failed: ${e.message}`));
       await host.closeAll().catch((e: Error) => o.log(`closing the sessions failed: ${e.message}`));
+      await listening?.close().catch((e: Error) => o.log(`closing the socket failed: ${e.message}`));
       resolveStopped();
     })();
     return stopping;

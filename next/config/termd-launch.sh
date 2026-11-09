@@ -67,19 +67,6 @@ nvm_bin() {
   nvm_newest ''
 }
 
-# Prepended in reverse, so a version manager the user chose wins, then Homebrew, then /usr/local.
-prepend() {
-  case ":$PATH:" in
-    *":$1:"*) ;;
-    *) if [ -d "$1" ]; then PATH="$1:$PATH"; fi ;;
-  esac
-}
-prepend /usr/local/bin
-prepend /opt/homebrew/sbin
-prepend /opt/homebrew/bin
-prepend "$HOME/.local/bin"
-if nvm=$(nvm_bin); then prepend "$nvm"; fi
-prepend "$HOME/.volta/bin"
 first() {
   rest=":$PATH:"
   while :; do
@@ -92,6 +79,16 @@ first() {
   rest=${rest%:}
   PATH=$1${rest:+:$rest}
 }
+prepend() {
+  if [ -d "$1" ]; then first "$1"; fi
+}
+# Prepended in reverse, so a version manager the user chose wins, then Homebrew, then /usr/local.
+prepend /usr/local/bin
+prepend /opt/homebrew/sbin
+prepend /opt/homebrew/bin
+prepend "$HOME/.local/bin"
+if nvm=$(nvm_bin); then prepend "$nvm"; fi
+prepend "$HOME/.volta/bin"
 if [ -n "${TSM_NODE_BIN:-}" ]; then first "$(dirname "$TSM_NODE_BIN")"; fi
 export PATH
 
