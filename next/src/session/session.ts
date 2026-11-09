@@ -1036,7 +1036,8 @@ class LiveSession implements Session {
         const now = this.front();
         return settled(now) ? now : undefined;
       }, opts.abort)) ?? this.front();
-    const step = async (sent: StopStep['sent']): Promise<boolean> => {
+    /** Takes one step. `sig`, for a signal `stop` was asked for, is recorded as the command's only once the signal is sent. */
+    const step = async (sent: StopStep['sent'], sig?: Signalled): Promise<boolean> => {
       // Once a close has begun, it ends what runs, and stop sends nothing more.
       if (this.closed) return true;
       const mine = sent === 'C-c' ? true : this.ours(target.pgid);
@@ -1044,8 +1045,10 @@ class LiveSession implements Session {
         this.lastWrite = mono();
         this.p.write('\x03');
       } else if (mine) {
+        if (sig) this.signalled = sig;
         const refused = proc.signalGroup(target.pgid, sent);
         if (refused) {
+          if (sig && this.signalled === sig) this.signalled = undefined;
           f = this.front();
           steps.push({ sent, to: target, refused, front: f });
           return true;
@@ -1066,8 +1069,7 @@ class LiveSession implements Session {
     if (signal) {
       if (own) return { steps, front: f, next: 'close' };
       const sig: Signalled = { pgid: target.pgid, command: f.command };
-      this.signalled = sig;
-      await step(signal);
+      await step(signal, sig);
       const last = steps.at(-1);
       if (last && !last.refused && !last.withheld && last.front.state === 'prompt' && (sig.checked ? sig.stopped : this.groupStopped(target.pgid))) last.stopped = true;
       return { steps, front: f };

@@ -2015,6 +2015,35 @@ test('a second close waits for the first, which hangs up what it listed once the
   }
 });
 
+test("a stop whose signal was withheld doesn't mark the job stopped when something else stops it later", darwinOnly, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const flag = path.join(tmp, `fails-${++gates}`);
+  // Only the whole-table listing fails, so the job's group can't be confirmed as the shell's, and the signal is withheld.
+  const fake = fakePs(`*"-A "*) [ -e '${flag}' ] && { echo 'ps: listing failed' >&2; exit 1; };;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const r = await s.run('sleep 30', { waitMs: 200 });
+    assert.equal(r.kind, 'running', JSON.stringify(r));
+    await inFront(s, /sleep 30/);
+    const f = s.front();
+    const pgid = f.state === 'running' ? f.process.pgid : 0;
+    fs.writeFileSync(flag, '');
+    const o = await s.stop('SIGTSTP');
+    assert.deepEqual(o.steps.map((x) => [x.sent, x.withheld]), [['SIGTSTP', true]], JSON.stringify(o));
+    fs.rmSync(flag, { force: true });
+    // Something other than stop suspends the job, and the shell reports it.
+    process.kill(-pgid, 'SIGTSTP');
+    const c = s.command(r.kind === 'running' ? r.command.id : -1);
+    await eventually('the command ended', () => c?.end);
+    assert.deepEqual([c?.end?.stopped, c?.end?.stoppedUnknown], [undefined, undefined], JSON.stringify(c?.end));
+  } finally {
+    process.env.PATH = keep;
+    fs.rmSync(flag, { force: true });
+    await s.close({ force: true, deadline: by() });
+  }
+});
+
 test("a suspend signal whose stopped check can't be read leaves whether the job stopped unknown, not an exit status", darwinOnly, async () => {
   const s = await open(which('bash') ?? '/bin/bash');
   const flag = path.join(tmp, `fails-${++gates}`);
