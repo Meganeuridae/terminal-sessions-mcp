@@ -106,13 +106,15 @@ test('ux-22: an unknown key is invalid_argument (never internal), naming close m
 
 test('a key name far longer than any key costs no more than reading it a few times, not a comparison with each key', () => {
   const ms = (f: () => void): number => {
-    const t0 = performance.now();
+    const start = process.cpuUsage();
     f();
-    return performance.now() - t0;
+    const { user, system } = process.cpuUsage(start);
+    return (user + system) / 1000;
   };
+  const least = (f: () => void): number => Math.min(...[0, 1, 2].map(() => ms(f)));
   for (const name of ['x'.repeat(2_000_000), `${'x'.repeat(2_000_000)}-a`]) {
-    const read = Math.min(ms(() => name.toLowerCase().replace(/[\s_-]/g, '')), ms(() => name.toLowerCase().replace(/[\s_-]/g, '')));
-    const refused = Math.min(...[0, 1].map(() => ms(() => assert.throws(() => inputBytes(undefined, [name], { appCursor: false })))));
+    const read = least(() => name.toLowerCase().replace(/[\s_-]/g, ''));
+    const refused = least(() => assert.throws(() => inputBytes(undefined, [name], { appCursor: false })));
     assert.ok(refused < read * 60 + 5, `${name.length} characters: refused in ${Math.round(refused)} ms, read once in ${Math.round(read)} ms`);
   }
 });
