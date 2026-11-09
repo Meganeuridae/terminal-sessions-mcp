@@ -32,7 +32,7 @@ Eight tools. The results of `open`, `run`, `send`, `look`, `read` and `stop` ope
 | `close(name, force?)` | Hangs up the shell. Returns the session's reports you haven't seen, since nothing shows them after. |
 
 - **Waits** default to 15 s and stop at 55 s, under agent-framework's 60 s deadline for a call. A `read` search, and `run`'s `notify_on` search of output already there, stop at 55 s too, and say which lines they left. No call holds longer.
-- **A cancelled call** answers nobody. What it took is reported as though no call had, except a wait for input that is over. A cancelled `run`'s command keeps running, and its `notify_on` still reports.
+- **A cancelled call** answers nobody. What it took is reported as though no call had, unless another call's result showed it or a later report about its command came. A wait for input that is over isn't reported. A call that fails after taking something reports it the same way. A cancelled `run`'s command keeps running, and its `notify_on` still reports.
 - **Long output** keeps its start and its end within 24,000 characters, agent-framework's inline limit for a tool result, and says how to read more: `read` gives a command's output or a range of lines, cut the same way. A single line longer than that is cut in its middle, and no call returns the middle.
 - **`run`'s `structuredContent`,** for a script, holds `command`, `front` and `running`, and:
   - `exitCode`: the command's status. It is `null` with `running: true` while the command runs, and `null` with `running: false` when no status is known: a shell without the integration, a removed hook, or the shell exiting mid-command. A non-zero status is a result, not `isError`.

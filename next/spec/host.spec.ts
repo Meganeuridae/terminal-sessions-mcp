@@ -761,9 +761,10 @@ test('a call that waited while its session closed is refused, and sets no watch'
   };
   const looking = host.call(agent(), 'look', { name: 'main', match: 'never', wait: 5 });
   await settle();
-  await host.call(agent(), 'close', { name: 'main' });
+  const closing = host.call(agent(), 'close', { name: 'main' });
   release();
   const r = await looking;
+  await closing;
   assert.equal(r.isError, true);
   assert.match(r.text, /^Session "main" was closed while this call waited\. `list` shows the sessions still open\.$/);
   assert.equal(s.calls.filter((c) => c.method === 'watch').length, 0);
@@ -1033,22 +1034,25 @@ test('a run or send on a session closed while it waited says what it typed and w
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });
   const s = opened[0]!;
+  let closing: Promise<unknown> = Promise.resolve();
   s.run = async (text) => {
     const c = { id: 7, text, from: 0, to: 1, startedAt: Date.now(), end: { at: Date.now(), ms: 1200, status: 0, errexit: false, refusedMarks: 0 } };
     s.commands.set(7, c);
-    await host.call(cli(), 'close', { name: 'main' });
+    closing = host.call(cli(), 'close', { name: 'main' });
     return { kind: 'ended', command: c, front: s.frontNow, took: [] };
   };
   const r = await host.call(plain(), 'run', { name: 'main', command: 'make' });
+  await closing;
   assert.equal(r.isError, true);
   assert.match(r.text, /^Session "main" was closed while this call waited\. Command 7 was typed, and ended: exit 0 · 1\.2 s\. /);
   await host.call(plain(), 'open', { name: 'other' });
   const o = opened[1]!;
   o.send = async () => {
-    await host.call(cli(), 'close', { name: 'other' });
+    closing = host.call(cli(), 'close', { name: 'other' });
     return { sent: true, lines: o.lines(0), front: o.frontNow, ended: [], by: 'closed', took: [] };
   };
   const sent = await host.call(plain(), 'send', { name: 'other', text: 'y\n' });
+  await closing;
   assert.match(sent.text, /^Session "other" was closed while this call waited\. Its input was typed\. /);
 });
 
@@ -1182,7 +1186,7 @@ test('an end a cancelled call had taken is reported, and the cursor stays where 
     c.to = s.out.length;
     c.end = { at: Date.now(), ms: 1, status: 0, errexit: false, refusedMarks: 0 };
     s.commands.set(1, c);
-    const ended = { kind: 'ended' as const, command: c, taken: opts.take !== false };
+    const ended = { kind: 'ended' as const, command: c, taken: opts.take !== false, takers: 1 };
     s.emit(ended);
     return { kind: 'ended', command: c, front: s.frontNow, took: [ended] };
   };
@@ -1211,7 +1215,7 @@ test('a cancelled send or look hands back what it took: an end, a wait for input
   const c = { id: 9, text: 'make', from: 0, to: 0, startedAt: Date.now(), end: { at: Date.now(), ms: 5, errexit: false, refusedMarks: 0 } };
   s.commands.set(9, c);
   const exit = { code: 1 };
-  const took = [{ kind: 'ended' as const, command: c, taken: true }, { kind: 'exited' as const, exit, taken: true }];
+  const took = [{ kind: 'ended' as const, command: c, taken: true, takers: 1 }, { kind: 'exited' as const, exit, taken: true, takers: 1 }];
   s.wait = async (_u, opts) => {
     for (const ev of took) s.emit(ev);
     await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
@@ -1225,7 +1229,7 @@ test('a cancelled send or look hands back what it took: an end, a wait for input
   await settle();
   await settle();
   assert.ok(keys.includes('terminal:exited a/main/9'), keys.join(', '));
-  const waiting = { kind: 'waiting' as const, front: { state: 'waiting' as const, since: Date.now(), process: { pgid: 7, argv: 'read', shell: false } }, taken: true };
+  const waiting = { kind: 'waiting' as const, front: { state: 'waiting' as const, since: Date.now(), process: { pgid: 7, argv: 'read', shell: false } }, taken: true, takers: 1 };
   s.frontNow = waiting.front;
   s.send = async (_b, opts) => {
     s.emit(waiting);
@@ -1242,7 +1246,7 @@ test('a cancelled send or look hands back what it took: an end, a wait for input
   assert.ok(keys.some((k) => k.startsWith('terminal:waiting ')), keys.join(', '));
 });
 
-test('a report handed back after a newer one sits after it, and both are listed', async () => {
+test('a report handed back sits where it happened, before a newer one, and both are listed', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });
   const s = opened[0]!;
@@ -1254,7 +1258,7 @@ test('a report handed back after a newer one sits after it, and both are listed'
     s.emit({ kind: 'ended', command: old, taken: true });
     s.emit({ kind: 'ended', command: newer, taken: false });
     await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
-    return { by: 'cancelled', front: s.frontNow, ended: [old], took: [{ kind: 'ended', command: old, taken: true }] };
+    return { by: 'cancelled', front: s.frontNow, ended: [old], took: [{ kind: 'ended', command: old, taken: true, takers: 1 }] };
   };
   const ac = new AbortController();
   const looking = host.call(plain(), 'look', { name: 'main', until: 'end' }, ac.signal);
@@ -1263,8 +1267,8 @@ test('a report handed back after a newer one sits after it, and both are listed'
   await looking;
   const unseen = await unseenOf(host);
   assert.equal(unseen.length, 2);
-  assert.match(unseen[0]!, /command 4 · exit 5/);
-  assert.match(unseen[1]!, /command 3 · exit 0/);
+  assert.match(unseen[0]!, /command 3 · exit 0/);
+  assert.match(unseen[1]!, /command 4 · exit 5/);
 });
 
 test('a running command\'s notify_on watch names its command, and a cancelled stop takes no step after it and answers nobody', async () => {
@@ -1315,7 +1319,7 @@ test('an end handed back from a cancelled call doesn\'t change which command a l
     s.emit({ kind: 'ended', command: lost, taken: true });
     s.emit({ kind: 'ended', command: after, taken: false });
     await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
-    return { by: 'cancelled', front: s.frontNow, ended: [lost], took: [{ kind: 'ended', command: lost, taken: true }] };
+    return { by: 'cancelled', front: s.frontNow, ended: [lost], took: [{ kind: 'ended', command: lost, taken: true, takers: 1 }] };
   };
   const ac = new AbortController();
   const looking = host.call(agent(), 'look', { name: 'main', until: 'end' }, ac.signal);
@@ -1334,7 +1338,7 @@ test('a wait for input a cancelled call took is reported only while the program 
   host.subscribe('a', async (w) => (tags.push(w.tag), true));
   await host.call(agent(), 'open', { name: 'main' });
   const s = opened[0]!;
-  const waiting = { kind: 'waiting' as const, front: { state: 'waiting' as const, since: Date.now(), process: { pgid: 7, argv: 'read', shell: false } }, taken: true };
+  const waiting = { kind: 'waiting' as const, front: { state: 'waiting' as const, since: Date.now(), process: { pgid: 7, argv: 'read', shell: false } }, taken: true, takers: 1 };
   s.wait = async (_u, opts) => {
     s.emit(waiting);
     s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 7, argv: 'read', shell: false }, waitVisible: true };
@@ -1372,4 +1376,233 @@ test('a cancelled run keeps its command\'s notify_on watch, so the match is stil
   await settle();
   const unseen = await unseenOf(host);
   assert.ok(unseen.some((u) => /\nMatched at line \d+: a needle here$/.test(u)), unseen.join('\n---\n'));
+});
+
+const ended = (s: FakeSession, id: number, status?: number): Command => {
+  const c = { id, text: `c${id}`, from: 0, to: 0, startedAt: Date.now(), end: { at: Date.now(), ms: 1, ...(status === undefined ? {} : { status }), errexit: false, refusedMarks: 0 } } as Command;
+  s.commands.set(id, c);
+  return c;
+};
+const untilAborted = (opts: { signal?: AbortSignal }): Promise<void> => new Promise((res) => opts.signal?.addEventListener('abort', () => res()));
+
+/** Two `look`s that both took one end: the first shows it once released, or is cancelled; the second waits for its abort. Wakes are refused, so a report stays for `list`. */
+async function twoTakers() {
+  const { host, opened } = setup();
+  const wakes: string[] = [];
+  host.subscribe('a', async (w) => (wakes.push(`${w.tag} ${w.key}`), false));
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const c = ended(s, 9, 0);
+  const took = { kind: 'ended' as const, command: c, taken: true, takers: 2 };
+  s.emit(took);
+  await settle();
+  let release!: () => void;
+  const first = new Promise<void>((r) => (release = r));
+  let n = 0;
+  s.wait = async (_u, opts) => {
+    if (++n === 1) {
+      await Promise.race([first, untilAborted(opts)]);
+      return opts.signal?.aborted ? { by: 'cancelled', front: s.frontNow, ended: [c], took: [took] } : { by: 'end', front: s.frontNow, ended: [c], took: [took] };
+    }
+    await untilAborted(opts);
+    return { by: 'cancelled', front: s.frontNow, ended: [c], took: [took] };
+  };
+  const a1 = new AbortController();
+  const a2 = new AbortController();
+  const one = host.call(agent(), 'look', { name: 'main', until: 'end' }, a1.signal);
+  const two = host.call(agent(), 'look', { name: 'main', until: 'end' }, a2.signal);
+  await settle();
+  return { host, s, wakes, one, two, a1, a2, release };
+}
+
+test('an end two calls took is reported only if neither showed it: one shows it, then the other is cancelled', async () => {
+  const t = await twoTakers();
+  t.release();
+  assert.match((await t.one).text, /Command 9 ended: exit 0/);
+  t.a2.abort();
+  assert.equal((await t.two).structured.error, 'cancelled');
+  await settle();
+  await settle();
+  assert.deepEqual(t.wakes, [], 'no wake for an end a result showed');
+  assert.deepEqual(await unseenOf(t.host), []);
+});
+
+test('an end two calls took is reported only if neither showed it: one is cancelled, then the other shows it', async () => {
+  const t = await twoTakers();
+  t.a2.abort();
+  assert.equal((await t.two).structured.error, 'cancelled');
+  await settle();
+  await settle();
+  assert.deepEqual(t.wakes, [], 'no wake while another call that took it may still show it');
+  t.release();
+  assert.match((await t.one).text, /Command 9 ended: exit 0/);
+  await settle();
+  await settle();
+  assert.deepEqual(t.wakes, []);
+  assert.deepEqual(await unseenOf(t.host), []);
+});
+
+test('an end two calls took and both cancelled is reported once', async () => {
+  const t = await twoTakers();
+  t.a2.abort();
+  await t.two;
+  t.a1.abort();
+  await t.one;
+  await settle();
+  await settle();
+  assert.deepEqual(t.wakes, ['terminal:ended a/main/9']);
+  assert.equal((await unseenOf(t.host)).length, 1);
+});
+
+test('an end a call took is reported when the host fails after the session returned it', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const c = ended(s, 9, 0);
+  const took = { kind: 'ended' as const, command: c, taken: true, takers: 1 };
+  s.emit(took);
+  await settle();
+  s.wait = async () => ({ by: 'end', front: s.frontNow, ended: [c], took: [took] });
+  const lines = s.lines.bind(s);
+  let fail = true;
+  s.lines = (from, to) => {
+    if (fail) {
+      fail = false;
+      throw new Error('EIO');
+    }
+    return lines(from, to);
+  };
+  const r = await host.call(plain(), 'look', { name: 'main', until: 'end' });
+  assert.equal(r.isError, true);
+  const unseen = await unseenOf(host);
+  assert.equal(unseen.length, 1, 'the end the failed call took is a report');
+  assert.match(unseen[0]!, /command 9 · exit 0/);
+});
+
+test('an end a call cancelled during a close had taken is in the close\'s result', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const c = ended(s, 9, 7);
+  const took = { kind: 'ended' as const, command: c, taken: true, takers: 1 };
+  s.emit(took);
+  await settle();
+  s.wait = async (_u, opts) => {
+    await untilAborted(opts);
+    return { by: 'cancelled', front: s.frontNow, ended: [c], took: [took] };
+  };
+  const ac = new AbortController();
+  const looking = host.call(plain(), 'look', { name: 'main', until: 'input' }, ac.signal);
+  await settle();
+  const closing = host.call(plain(), 'close', { name: 'main' });
+  await settle();
+  await settle();
+  ac.abort();
+  assert.equal((await looking).structured.error, 'cancelled');
+  const closed = await closing;
+  assert.match(closed.text, /\n\nNot yet seen:\n\[main · command 9 · exit 7 /);
+});
+
+test('a run whose session closed after its command ended names the end in its text and its structured content', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const run = s.run.bind(s);
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  s.run = async (text, opts) => {
+    const r = await run(text, opts);
+    await held;
+    return r;
+  };
+  const running = host.call(plain(), 'run', { name: 'main', command: 'make' });
+  await settle();
+  const closing = host.call(plain(), 'close', { name: 'main' });
+  await settle();
+  release();
+  const r = await running;
+  assert.match(r.text, /Command 1 was typed, and ended: exit 0/);
+  assert.deepEqual(((r.structured.ended ?? []) as Command[]).map((x) => x.id), [1]);
+  const closed = await closing;
+  assert.doesNotMatch(closed.text, /Not yet seen/, 'the run showed its end');
+});
+
+test('an end handed back after a later report about its command happened adds nothing, whether that report waits or was read', async () => {
+  for (const readFirst of [false, true]) {
+    const { host, opened } = setup();
+    await host.call(plain(), 'open', { name: 'main' });
+    const s = opened[0]!;
+    const c = ended(s, 9);
+    const took = { kind: 'ended' as const, command: c, taken: true, takers: 1 };
+    s.emit(took);
+    s.emit({ kind: 'exited', exit: { code: 1 }, taken: false });
+    await settle();
+    s.wait = async (_u, opts) => {
+      await untilAborted(opts);
+      return { by: 'cancelled', front: s.frontNow, ended: [c], took: [took] };
+    };
+    if (readFirst) assert.match((await host.call(plain(), 'list', {})).text, /the shell exited/);
+    const ac = new AbortController();
+    const looking = host.call(plain(), 'look', { name: 'main', until: 'end' }, ac.signal);
+    await settle();
+    ac.abort();
+    await looking;
+    const unseen = await unseenOf(host);
+    if (readFirst) assert.deepEqual(unseen, [], 'the exit was read, and the older end adds nothing');
+    else {
+      assert.equal(unseen.length, 1, unseen.join('\n---\n'));
+      assert.match(unseen[0]!, /the shell exited/, 'the exit stands');
+    }
+  }
+});
+
+test('an end handed back after the session dropped its command adds nothing', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const c = ended(s, 9, 0);
+  const took = { kind: 'ended' as const, command: c, taken: true, takers: 1 };
+  s.emit(took);
+  await settle();
+  s.wait = async (_u, opts) => {
+    await untilAborted(opts);
+    return { by: 'cancelled', front: s.frontNow, ended: [c], took: [took] };
+  };
+  const ac = new AbortController();
+  const looking = host.call(plain(), 'look', { name: 'main', until: 'end' }, ac.signal);
+  await settle();
+  s.commands.delete(9);
+  ac.abort();
+  await looking;
+  assert.deepEqual(await unseenOf(host), []);
+});
+
+test('a wait for input a call cancelled during a close had taken is not in the close\'s result, since the close ends it', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const front = { state: 'waiting' as const, since: Date.now(), process: { pgid: 7, argv: 'read', shell: false } };
+  s.frontNow = front;
+  const took = { kind: 'waiting' as const, front, taken: true, takers: 1 };
+  s.emit(took);
+  await settle();
+  s.wait = async (_u, opts) => {
+    await untilAborted(opts);
+    return { by: 'cancelled', front: s.frontNow, ended: [], took: [took] };
+  };
+  const ac = new AbortController();
+  const looking = host.call(plain(), 'look', { name: 'main', until: 'input' }, ac.signal);
+  await settle();
+  const realClose = s.close.bind(s);
+  let release!: () => void;
+  s.close = async (o?: { force?: boolean }) => {
+    await new Promise<void>((r) => (release = r));
+    return realClose(o);
+  };
+  const closing = host.call(plain(), 'close', { name: 'main' });
+  await settle();
+  ac.abort();
+  await looking;
+  release();
+  assert.doesNotMatch((await closing).text, /Not yet seen/);
 });

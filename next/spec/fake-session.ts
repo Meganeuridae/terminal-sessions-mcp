@@ -106,7 +106,7 @@ export class FakeSession implements Session {
     if (this.runMode === 'end') {
       c.to = this.out.length;
       c.end = { at: Date.now(), ms: Date.now() - c.startedAt, ...(this.runStatus === undefined ? {} : { status: this.runStatus }), errexit: false, refusedMarks: 0, cwd: this.dir };
-      const ended = { kind: 'ended' as const, command: c, taken: opts.take !== false };
+      const ended = { kind: 'ended' as const, command: c, taken: opts.take !== false, takers: 1 };
       this.emit(ended);
       return { kind: 'ended', command: c, front: this.frontNow, took: ended.taken ? [ended] : [] };
     }

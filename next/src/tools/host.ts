@@ -45,6 +45,7 @@ export interface HostOptions {
 
 interface Unseen {
   seq: number;
+  at: number;
   wake: Wake;
   lines: string[];
   command: number | undefined;
@@ -66,7 +67,14 @@ interface Entry {
   watches: Map<number, { key: string; command: number | undefined }>;
   dying: number | undefined;
   closing: boolean;
+  settling: Set<Promise<void>>;
+  latest: Map<string, { at: number; command: number | undefined }>;
   off: () => void;
+}
+
+interface Held {
+  took: Took;
+  shows: 'all' | 'none' | readonly Command[];
 }
 
 const PUSH_LINES = 20;
@@ -80,6 +88,8 @@ export class Host {
   private readonly starting = new Set<Promise<void>>();
   private stopping = false;
   private wakeSeq = 0;
+  private readonly happened = new WeakMap<object, number>();
+  private readonly settled = new WeakMap<Took[number], { count: number; shown: boolean }>();
   private nextId = 1;
   private readonly now: () => number;
 
@@ -128,11 +138,11 @@ export class Host {
       }
       switch (tool) {
         case 'run':
-          return await this.run(caller, entry, a, signal);
+          return await this.taking(entry, (held) => this.run(caller, entry, a, signal, held));
         case 'send':
-          return await this.send(caller, entry, a, signal);
+          return await this.taking(entry, (held) => this.send(caller, entry, a, signal, held));
         case 'look':
-          return await this.look(caller, entry, a, signal);
+          return await this.taking(entry, (held) => this.look(caller, entry, a, signal, held));
         case 'read':
           return await this.read(entry, a, signal);
         case 'stop':
@@ -240,7 +250,7 @@ export class Host {
       await session.close({ force: true });
       return refused('The daemon stopped while this session started, so its shell is closed.', { error: 'backend_failure' });
     }
-    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, off: () => {} };
+    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {} };
     entry.off = session.onEvent((ev) => this.onEvent(entry, ev));
     this.entries.set(k, entry);
     const front = session.front();
@@ -257,7 +267,7 @@ export class Host {
       const front = e.session.front();
       return { e, front, line: `${e.name}: ${frontText(front, now)} · ${quoted(e.session.cwd())}${e.unseen.size ? ` · ${reportsText(e.unseen.size)}` : ''}` };
     });
-    const pending = rows.flatMap((r) => [...r.e.unseen.values()].map((u) => ({ e: r.e, u }))).sort((a, b) => a.u.seq - b.u.seq);
+    const pending = rows.flatMap((r) => [...r.e.unseen.values()].map((u) => ({ e: r.e, u }))).sort((a, b) => a.u.at - b.u.at);
     const build = (n: number): { joined: string; ends: number[] } => {
       let joined = rows.slice(0, n).map((r) => r.line).join('\n');
       if (n < rows.length) joined += `\n… ${rows.length - n} more session${rows.length - n === 1 ? '' : 's'}, listed in structuredContent`;
@@ -279,19 +289,20 @@ export class Host {
     });
   }
 
-  private async run(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined): Promise<ToolResult> {
+  private async run(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined, held: Held): Promise<ToolResult> {
     const deadline = mono() + WAIT_MAX_S * 1000;
     const notify = a.notify_on !== undefined ? this.regex(a.notify_on as string, 'notify_on', 'nothing was typed') : undefined;
     const r = await e.session.run(a.command as string, { waitMs: this.waitMs(a), take: caller.takes, ...(signal ? { signal } : {}) });
+    held.took = r.took;
     if (r.kind === 'running' && notify && !e.closing) e.watches.set(e.session.watch(notify, r.command.from, r.command.id), { key: this.pushKey(e, r.command.id, 'match'), command: r.command.id });
-    if (signal?.aborted) return this.cancelled(e, r.took);
-    if (e.closing) return closedMeanwhile(e, r.kind === 'refused' ? 'Nothing was typed.' : typedText(r.command));
+    if (signal?.aborted) return this.cancelled(held);
+    if (e.closing) return this.closed(e, held, r.kind === 'refused' ? 'Nothing was typed.' : typedText(r.command), r.kind === 'refused' ? [] : endOf(r.command));
     if (r.kind === 'refused') return refused(`${this.status(e, r.front)}\nNothing was typed: ${refusalAdvice(r.front)}`, { error: 'not_at_prompt', front: r.front });
     const c = r.command;
     const out = e.session.lines(c.from, c.to);
     const search = r.kind === 'ended' && notify ? await firstMatch(notify, out, deadline, () => signal?.aborted === true || e.closing) : undefined;
-    if (signal?.aborted) return this.cancelled(e, r.took);
-    if (e.closing) return closedMeanwhile(e, typedText(c));
+    if (signal?.aborted) return this.cancelled(held);
+    if (e.closing) return this.closed(e, held, typedText(c), endOf(c));
     if (caller.takes && out.from <= e.cursor) e.cursor = Math.max(e.cursor, out.to - (r.kind === 'ended' ? 0 : out.live));
     const found = search?.match;
     const left = search && !found && search.to < out.to ? [`\`notify_on\` searched lines ${out.from} to ${search.to} ${RAN_OUT}; \`read\` with \`match\` and \`lines: [${search.to}, ${out.to}]\` searches the rest.`] : [];
@@ -310,7 +321,7 @@ export class Host {
     });
   }
 
-  private async send(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined): Promise<ToolResult> {
+  private async send(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined, held: Held): Promise<ToolResult> {
     let bytes: string;
     try {
       bytes = inputBytes(a.text as string | undefined, a.keys as string[] | undefined, e.session.keyOptions());
@@ -321,8 +332,9 @@ export class Host {
     if (bytes === '') return refused('Nothing to send: give `text`, `keys`, or both.', { error: 'invalid_argument' });
     const until = a.wait_for !== undefined ? this.regex(a.wait_for as string, 'wait_for', 'nothing was typed') : undefined;
     const r = await e.session.send(bytes, { waitMs: this.waitMs(a), take: caller.takes, ...(until ? { until } : {}), ...(signal ? { signal } : {}) });
-    if (signal?.aborted) return this.cancelled(e, r.took);
-    if (e.closing || r.by === 'closed') return closedMeanwhile(e, [r.sent ? 'Its input was typed.' : 'Nothing was typed.', ...r.ended.map(endedLine)].join(' '), r.ended);
+    held.took = r.took;
+    if (signal?.aborted) return this.cancelled(held);
+    if (e.closing || r.by === 'closed') return this.closed(e, held, [r.sent ? 'Its input was typed.' : 'Nothing was typed.', ...r.ended.map(endedLine)].join(' '), r.ended);
     if (!r.sent && r.by === 'timeout' && r.front.state !== 'exited') {
       return refused(
         `${this.status(e, r.front)}\nNothing was typed: the shell hasn't finished drawing its prompt after ${duration(this.now() - r.front.since)}, and keys sent before a line editor has the terminal would reach the terminal's own line editing instead. ${this.waitMs(a) >= WAIT_MAX_S * 1000 ? '`look` shows what is in front.' : '`send` again with a longer `wait`.'}`,
@@ -340,7 +352,7 @@ export class Host {
     return ok(parts.join('\n'), { front: r.front, by: r.by, ended: r.ended, ...(r.matched ? { matched: r.matched } : {}), lines: { from: r.lines.from, to: r.lines.to } });
   }
 
-  private async look(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined): Promise<ToolResult> {
+  private async look(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined, held: Held): Promise<ToolResult> {
     if (a.until !== undefined && a.match !== undefined) return refused('Give `until` or `match`, not both.', { error: 'invalid_argument' });
     const parts: string[] = [];
     let ended: Command[] = [];
@@ -350,8 +362,9 @@ export class Host {
       const until = pattern ? { kind: 'match' as const, pattern } : { kind: a.until as 'end' | 'input' };
       const from = e.cursor;
       const w = await e.session.wait(until, { waitMs: this.waitMs(a), from, take: caller.takes, ...(signal ? { signal } : {}) });
-      if (signal?.aborted) return this.cancelled(e, w.took);
-      if (e.closing || w.by === 'closed') return closedMeanwhile(e, w.ended.map(endedLine).join(' '), w.ended);
+      held.took = w.took;
+      if (signal?.aborted) return this.cancelled(held);
+      if (e.closing || w.by === 'closed') return this.closed(e, held, w.ended.map(endedLine).join(' '), w.ended);
       front = w.front;
       ended = w.ended;
       for (const c of w.ended) parts.push(endedLine(c));
@@ -368,7 +381,7 @@ export class Host {
       }
     }
     const lines = e.session.lines(e.cursor);
-    const pending = [...e.unseen.values()].sort((x, y) => x.seq - y.seq);
+    const pending = [...e.unseen.values()].sort((x, y) => x.at - y.at);
     let before = [this.status(e, front), ...parts].join('\n');
     const ends = pending.map((u) => (before += `\n${u.lines.join('\n')}`).length);
     const full = `${before}\n${lines.lines.length ? this.output(lines, RESULT_MAX_CHARS - before.length - 1) : '(no new output)'}`;
@@ -459,9 +472,9 @@ export class Host {
 
   private async close(caller: Caller, e: Entry, a: Record<string, unknown>): Promise<ToolResult> {
     e.closing = true;
-    const exit = await e.session.close({ force: a.force === true });
+    const [exit] = await Promise.all([e.session.close({ force: a.force === true }), Promise.all(e.settling)]);
     e.off();
-    const unseen = [...e.unseen.values()].sort((x, y) => x.seq - y.seq).map((u) => u.lines.join('\n'));
+    const unseen = [...e.unseen.values()].sort((x, y) => x.at - y.at).map((u) => u.lines.join('\n'));
     if (caller.takes) e.unseen.clear();
     const k = keyOf(e.scope, e.name);
     if (this.entries.get(k) === e) this.entries.delete(k);
@@ -471,15 +484,48 @@ export class Host {
     return ok(`[${e.name} · closed]\nThe shell ${how}.${unlisted}${unkilled}${unseen.length ? `\n\nNot yet seen:\n${unseen.join('\n')}` : ''}`, { session: e.name, exit, ...(unseen.length ? { unseen } : {}) });
   }
 
-  private cancelled(e: Entry, took: Took): ToolResult {
+  private async taking(e: Entry, call: (held: Held) => Promise<ToolResult>): Promise<ToolResult> {
+    const held: Held = { took: [], shows: 'all' };
+    let done!: () => void;
+    const settling = new Promise<void>((r) => (done = r));
+    e.settling.add(settling);
+    try {
+      return await call(held);
+    } catch (err) {
+      held.shows = 'none';
+      throw err;
+    } finally {
+      try {
+        this.settle(e, held);
+      } finally {
+        e.settling.delete(settling);
+        done();
+      }
+    }
+  }
+
+  private cancelled(held: Held): ToolResult {
+    held.shows = 'none';
+    return CANCELLED;
+  }
+
+  private closed(e: Entry, held: Held, happened: string, ended: readonly Command[]): ToolResult {
+    held.shows = ended;
+    return closedMeanwhile(e, happened, [...ended]);
+  }
+
+  private settle(e: Entry, held: Held): void {
     let dying: number | undefined;
-    for (const ev of took) {
+    for (const ev of held.took) {
+      const s = this.settled.get(ev) ?? { count: 0, shown: false };
+      this.settled.set(ev, s);
+      s.count++;
+      if (held.shows === 'all' || (held.shows !== 'none' && ev.kind === 'ended' && held.shows.includes(ev.command))) s.shown = true;
       const front = ev.kind === 'waiting' ? e.session.front() : undefined;
-      const over = ev.kind === 'waiting' && (front?.state !== 'waiting' || front.process.pgid !== ev.front.process.pgid || front.since !== ev.front.since);
-      if (!over) this.onEvent(e, { ...ev, taken: false }, { dying });
+      const over = ev.kind === 'waiting' && (e.closing || front?.state !== 'waiting' || front.process.pgid !== ev.front.process.pgid || front.since !== ev.front.since);
+      if (s.count === ev.takers && !s.shown && !over) this.onEvent(e, { ...ev, taken: false }, { dying, at: this.happened.get(occurrenceOf(ev)) ?? ++this.wakeSeq });
       dying = ev.kind === 'ended' && ev.command.end?.status === undefined ? ev.command.id : undefined;
     }
-    return CANCELLED;
   }
 
   private unsearched(e: Entry, r: { unsearched?: number; unsearchedFrom?: number }): { from: number; to: number; rows: number } | undefined {
@@ -500,33 +546,47 @@ export class Host {
     return `${e.scope}/${e.name}/${command ?? 'shell'}${kind ? `/${kind}` : ''}`;
   }
 
-  private onEvent(e: Entry, ev: SessionEvent, restored?: { dying: number | undefined }): void {
-    if (e.closing) return;
+  private onEvent(e: Entry, ev: SessionEvent, restored?: { dying: number | undefined; at: number }): void {
+    if (e.closing && !restored) return;
     const dying = restored ? restored.dying : e.dying;
     if (!restored) e.dying = ev.kind === 'ended' && ev.command.end?.status === undefined ? ev.command.id : undefined;
     if (ev.kind === 'ended') for (const [id, w] of e.watches) if (w.command === ev.command.id) (e.session.unwatch(id), e.watches.delete(id));
+    this.retire(e);
+    let at: number | undefined;
+    if (ev.kind !== 'match') {
+      const about = ev.kind === 'ended' ? ev.command.id : ev.kind === 'waiting' ? ev.front.command : dying;
+      const key = this.pushKey(e, about);
+      if (restored) {
+        if (about !== undefined && !e.session.command(about)) return;
+        if ((e.latest.get(key)?.at ?? 0) > restored.at) return;
+        at = restored.at;
+      } else {
+        at = ++this.wakeSeq;
+        this.happened.set(occurrenceOf(ev), at);
+        e.latest.set(key, { at, command: about });
+        if (ev.taken) return;
+      }
+    }
+    const withTail = (status: string, c?: Command): string => (e.closing ? status : `${status}\n${this.tailText(e, status, c)}`);
     let wake: Wake;
     let command: number | undefined;
     switch (ev.kind) {
       case 'ended': {
-        if (ev.taken) return;
         const status = this.status(e, e.session.front(), ev.command);
         command = ev.command.id;
-        wake = { scope: e.scope, session: e.name, tag: 'terminal:ended', key: this.pushKey(e, ev.command.id), text: `${status}\n${this.tailText(e, status, ev.command)}` };
+        wake = { scope: e.scope, session: e.name, tag: 'terminal:ended', key: this.pushKey(e, ev.command.id), text: withTail(status, ev.command) };
         break;
       }
       case 'waiting': {
-        if (ev.taken) return;
         const status = this.status(e, ev.front);
         command = ev.front.command;
-        wake = { scope: e.scope, session: e.name, tag: 'terminal:waiting', key: this.pushKey(e, ev.front.command), text: `${status}\n${this.tailText(e, status)}` };
+        wake = { scope: e.scope, session: e.name, tag: 'terminal:waiting', key: this.pushKey(e, ev.front.command), text: withTail(status) };
         break;
       }
       case 'exited': {
-        if (ev.taken) return;
         const status = `[${e.name} · the shell ${exitText(ev.exit)}]`;
         command = dying;
-        wake = { scope: e.scope, session: e.name, tag: 'terminal:exited', key: this.pushKey(e, dying), text: `${status}\n${this.tailText(e, status)}` };
+        wake = { scope: e.scope, session: e.name, tag: 'terminal:exited', key: this.pushKey(e, dying), text: withTail(status) };
         break;
       }
       case 'match': {
@@ -540,9 +600,14 @@ export class Host {
     }
     wake.text = fitted(wake.text);
     const lines = wake.text.split('\n');
+    const seq = ++this.wakeSeq;
+    e.unseen.set(wake.key, { seq, at: at ?? seq, wake, lines: wake.tag === 'terminal:match' ? lines.slice(0, 2) : lines.slice(0, 1), command });
+    if (!e.closing) this.pump(e.scope);
+  }
+
+  private retire(e: Entry): void {
     for (const [k, u] of e.unseen) if (u.command !== undefined && !e.session.command(u.command)) e.unseen.delete(k);
-    e.unseen.set(wake.key, { seq: ++this.wakeSeq, wake, lines: wake.tag === 'terminal:match' ? lines.slice(0, 2) : lines.slice(0, 1), command });
-    this.pump(e.scope);
+    for (const [k, l] of e.latest) if (l.command !== undefined && !e.session.command(l.command)) e.latest.delete(k);
   }
 
   private tailText(e: Entry, status: string, c: Command | undefined = e.session.current() ?? e.session.last()): string {
@@ -598,6 +663,10 @@ async function firstMatch(re: RegExp, l: Lines, deadline: number, stopped: () =>
 const RAN_OUT = `before the ${WAIT_MAX_S} s a call may hold ran out`;
 
 const endedLine = (c: Command): string => `Command ${c.id} ended: ${endingText(c).join(' · ')}.`;
+
+const endOf = (c: Command): Command[] => (c.end ? [c] : []);
+
+const occurrenceOf = (ev: Exclude<SessionEvent, { kind: 'match' }>): object => (ev.kind === 'ended' ? ev.command : ev.kind === 'waiting' ? ev.front : ev.exit);
 
 const typedText = (c: Command): string => `Command ${c.id} was typed${c.end ? `, and ended: ${endingText(c).join(' · ')}` : ', and the close ended its shell before it ended'}.`;
 
