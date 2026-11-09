@@ -67,6 +67,10 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
     r = await listenAt(
       o.socket,
       (c) => {
+        if (stopping) {
+          c.destroy();
+          return;
+        }
         conns.add(c);
         c.once('close', () => {
           conns.delete(c);

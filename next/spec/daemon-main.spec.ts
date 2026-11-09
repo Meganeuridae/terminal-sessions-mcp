@@ -84,6 +84,39 @@ test('H10: stopping hangs up every shell and removes the socket', async () => {
   }
 });
 
+test('a connection made while the daemon stops is accepted and closed at once, so the stop still finishes', async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  const sessions: FakeSession[] = [];
+  const d = running(await runDaemon(options(socket, sessions)));
+  let release = (): void => {};
+  let late: net.Socket | undefined;
+  try {
+    const c = await openMain(socket);
+    c.destroy();
+    const gate = new Promise<void>((r) => (release = r));
+    const s = sessions[0]!;
+    const close = s.close.bind(s);
+    s.close = async (o) => {
+      await gate;
+      return close(o);
+    };
+    const stopping = d.stop('test');
+    const conn = net.connect(socket);
+    late = conn;
+    conn.on('error', () => {});
+    await within(new Promise<void>((r) => conn.once('connect', () => r())), 2_000, 'the late connection');
+    await within(new Promise<void>((r) => conn.once('close', () => r())), 2_000, 'the late connection closing');
+    release();
+    await within(stopping, 5_000, 'the stop');
+    assert.equal(fs.existsSync(socket), false);
+  } finally {
+    late?.destroy();
+    release();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('H2: a daemon whose socket another took, with no connection left, ends its shells and stops', async () => {
   const dir = tmp();
   const socket = path.join(dir, 'daemon.sock');
