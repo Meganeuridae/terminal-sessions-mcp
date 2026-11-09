@@ -1831,6 +1831,22 @@ test('close returns at its deadline though the ps it waits on outlives the signa
   }
 });
 
+test('close of a shell that had already exited says what it left running may live on', async () => {
+  const logs: string[] = [];
+  const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
+  const r = await s.run('sleep 300 & echo "JOB:$!"; disown; exit', { waitMs: 10_000 });
+  assert.notEqual(r.kind, 'refused', JSON.stringify(r));
+  await eventually('the shell exited', () => s.front().state === 'exited');
+  const job = Number(/JOB:(\d+)/.exec(s.lines(0).lines.join('\n'))?.[1]);
+  try {
+    const exit = await s.close({ deadline: by() });
+    assert.equal(exit.unlisted, true, JSON.stringify(exit));
+    assert.match(logs.join('\n'), /the shell had already exited/);
+  } finally {
+    if (job > 0) killPid(job);
+  }
+});
+
 test("a /proc read that fails for a reason other than the process being gone fails close's listing, rather than leaving that process out", { skip: process.platform !== 'linux' ? 'only Linux lists from /proc' : false }, async () => {
   const logs: string[] = [];
   const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });

@@ -1263,6 +1263,10 @@ class LiveSession implements Session {
       // A shell hangs up only the jobs it still counts as its own, and a KILLed one none. A close forced once the shell had gone
       // KILLs what it listed.
       if (!killed) await (forced() ? reach('SIGKILL', before(0)) : reach('SIGHUP', before(0)));
+    } else {
+      // Once the shell has exited, nothing has its terminal, so what it left running can't be listed, and may live on.
+      unlisted = true;
+      this.log?.(`session ${JSON.stringify(this.name)}: close couldn't list what the shell left running, since the shell had already exited`);
     }
     const exit = this.exitInfo ?? this.ptyExit;
     this.t.dispose();
