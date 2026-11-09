@@ -1785,6 +1785,29 @@ test('close that runs out of time while ps lists logs how long ps had', darwinOn
   }
 });
 
+test('close returns at its deadline though the ps it waits on outlives the signal that ends its time', darwinOnly, async () => {
+  const logs: string[] = [];
+  const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
+  const job = pidOf(s, await ran(s, 'sleep 300 & echo "JOB:$!"'), 'JOB');
+  const held = path.join(tmp, `held-${++gates}`);
+  const fake = fakePs(`*"-t "*) trap '' TERM; sleep 300 & echo $! > '${held}'; wait;;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const closing = s.close({ force: true, deadline: by(3000) });
+    const ended = await Promise.race([closing.then(() => 'closed'), new Promise<string>((resolve) => setTimeout(() => resolve('still waiting'), 20_000))]);
+    process.env.PATH = keep;
+    assert.equal(ended, 'closed');
+    const exit = await closing;
+    assert.equal(exit.unlisted, true, JSON.stringify(exit));
+    assert.match(logs.join('\n'), /close couldn't list the processes on the terminal: ps took longer than \d+ ms/);
+  } finally {
+    process.env.PATH = keep;
+    if (fs.existsSync(held)) killPid(Number(fs.readFileSync(held, 'utf8')));
+    killPid(job);
+  }
+});
+
 test('close reads a ps that exits 1 because every listed process is gone as nothing left to hang up', darwinOnly, async () => {
   const logs: string[] = [];
   const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
