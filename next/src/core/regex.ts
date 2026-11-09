@@ -25,10 +25,10 @@
  * matched against a 64 KiB line takes seconds. So each compiled pattern gets a
  * match window, `matchWindow(re)`: MAX_MATCH_INPUT characters for an ordinary
  * pattern, fewer for a large one, sized so that one match costs about the same
- * (MATCH_COST units of engine work) whatever the pattern. For `(\w+\s?){1,80}$` that was
- * 26 to 90 ms of CPU on Node 24, and 132 ms to 2 s on Node 22, measured on macos-26-arm64 and
- * ubuntu-26.04 runners: one large pattern's match on one line can hold the daemon, and every
- * session with it, that long. That is one pattern's measurement, not a ceiling.
+ * (MATCH_COST units of engine work) whatever the pattern. For `(\w+\s?){1,80}$` the slowest
+ * match we timed took 90 ms of CPU on Node 24 and about 2 s on Node 22, on a macos-26-arm64
+ * runner: one large pattern's match on one line can hold the daemon, and every session with
+ * it, that long. That is one pattern's measurement, not a ceiling.
  * The window never falls under MIN_WINDOW, so the largest patterns accepted
  * (a size of a few thousand) cost up to a few times MATCH_COST; nothing costs
  * more. `execBounded` and `testBounded` match the head of a line within that
