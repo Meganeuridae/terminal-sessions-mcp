@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as pty from 'node-pty';
 import { historyIsolationEnv } from '../core/env.js';
-import { err } from '../core/errors.js';
+import { clause, err } from '../core/errors.js';
 import { shellLaunch, viaBash } from '../core/launch.js';
 import { testBounded } from '../core/regex.js';
 import * as integration from './integration.js';
@@ -1190,7 +1190,7 @@ export const openSession: OpenSession = async (o) => {
     p = pty.spawn(file, args, { name: env.TERM ?? 'xterm-256color', cwd: o.cwd, env, cols: o.cols, rows: o.rows });
   } catch (e) {
     fs.rmSync(dir, { recursive: true, force: true });
-    throw err('backend_failure', `the shell could not start: ${(e as Error).message}. If that error passes, such as a limit on processes, opening again may work`);
+    throw err('backend_failure', `the shell could not start: ${clause((e as Error).message)}. If that error passes, such as a limit on processes, opening again may work`);
   }
   const s = new LiveSession(o, p, dir, launch.kind, nonce, o.nextCommandId, [o.shell, ...launch.args].join(' '));
   await s.ready(o.waitMs, o.signal);

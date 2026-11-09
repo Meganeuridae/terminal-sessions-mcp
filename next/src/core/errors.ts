@@ -13,3 +13,5 @@ export class TermError extends Error {
 
 export const err = (code: ErrorCode, message: string, data?: Record<string, unknown>): TermError =>
   new TermError(code, message, data);
+
+export const clause = (message: string): string => message.replace(/\.$/, '');

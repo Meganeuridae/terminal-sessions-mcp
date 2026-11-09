@@ -1,7 +1,7 @@
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { validate, ValidationError } from '../api/validate.js';
-import { TermError } from '../core/errors.js';
+import { clause, TermError } from '../core/errors.js';
 import { inputBytes } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, Match, OpenSession, Session, SessionEvent, Took } from '../session/types.js';
@@ -166,7 +166,7 @@ export class Host {
         const text = e.code === 'backend_failure' ? `${capitalized(e.message)}.` : e.message;
         return refused(text, { error: e.code });
       }
-      return refused(`\`${tool}\` failed: ${(e as Error)?.message ?? String(e)}. ${UNKNOWN_AFTER_FAILURE[tool] ?? 'Nothing was typed or sent.'}`, { error: 'backend_failure' });
+      return refused(`\`${tool}\` failed: ${clause((e as Error)?.message ?? String(e))}. ${UNKNOWN_AFTER_FAILURE[tool] ?? 'Nothing was typed or sent.'}`, { error: 'backend_failure' });
     }
   }
 

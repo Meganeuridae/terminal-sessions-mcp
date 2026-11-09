@@ -1692,6 +1692,17 @@ for (const sh of shells) {
   });
 }
 
+test('a shell that node-pty cannot spawn is refused with its reason, one sentence and one period', { skip: process.platform !== 'darwin' ? 'only macOS spawns through posix_spawn, which an environment past ARG_MAX fails' : false }, async () => {
+  const home = path.join(tmp, `home-${++homes}`);
+  fs.mkdirSync(home);
+  const env = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, TERM: 'xterm-256color', LANG: 'C.UTF-8', BIG: 'x'.repeat(2_000_000) };
+  await assert.rejects(openSession({ name: 'unspawnable', shell: which('bash') ?? '/bin/bash', cwd: home, cols: 80, rows: 24, env, parent: tmp, nextCommandId: () => ++ids, waitMs: 10_000 }), (e: Error & { code?: string }) => {
+    assert.equal(e.code, 'backend_failure');
+    assert.match(e.message, /^the shell could not start: posix_spawnp failed\. If that error passes/);
+    return true;
+  });
+});
+
 test('a probe line typed into a program a shell without integration started, which reads it and ends, stops the call by exited', async () => {
   const s = await open('/bin/sh');
   await readingRaw(s);

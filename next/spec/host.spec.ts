@@ -834,6 +834,12 @@ test('a failed open or close says what is unknown and that list shows it; a back
   assert.equal(b.text, 'This host has no bash. Sessions open here once bash is installed.');
 });
 
+test('a failure whose message ends with a period gets no second one', async () => {
+  const host = new Host({ openSession: async () => { throw new Error('posix_spawnp failed.'); }, shell: '/bin/bash', env: {}, sessionsDir: '/tmp/sessions', startedAt: STARTED });
+  const r = await host.call(agent(), 'open', { name: 'main' });
+  assert.equal(r.text, '`open` failed: posix_spawnp failed. Whether the session opened is unknown; `list` shows the sessions open.');
+});
+
 test('a send refused at the longest wait advises look, not a longer wait', async () => {
   const { host, opened } = setup();
   await host.call(agent(), 'open', { name: 'main' });
