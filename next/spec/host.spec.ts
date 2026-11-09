@@ -916,7 +916,7 @@ test("the host says what the session reports of a match on the screen, an undeli
   await settle();
   assert.ok(wakes.some((w) => w.tag === 'terminal:ended' && / · exit 0 · 1\.2 s · /.test(w.text)), "the duration is the ending's own");
   s.close = async () => ({ code: null, signal: 'SIGKILL', unconfirmed: true, unlisted: true });
-  assert.equal((await host.call(agent(), 'close', { name: 'main', force: true })).text, "[main · closed]\nThe shell was sent SIGKILL, and its exit wasn't seen within the grace after it. Its descendants couldn't be listed, so only the shell was killed, and jobs it started may live on.");
+  assert.equal((await host.call(agent(), 'close', { name: 'main', force: true })).text, "[main · closed]\nThe shell was sent SIGKILL, and its exit wasn't seen within the grace after it. The session couldn't list every process it started, so jobs it started may live on.");
 });
 
 test('a search the wait ended before it reached the end says how many lines it never searched, and what searches them', async () => {
@@ -1292,7 +1292,7 @@ test('a running command\'s notify_on watch names its command, and a cancelled st
   assert.equal((await stopping).structured.error, 'cancelled');
 });
 
-test('stop says when it withheld a signal, and close names the groups KILL didn\'t reach', async () => {
+test('stop says when it withheld a signal, and close names the signals that weren\'t delivered', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });
   const s = opened[0]!;
@@ -1301,8 +1301,11 @@ test('stop says when it withheld a signal, and close names the groups KILL didn\
   const stopped = await host.call(plain(), 'stop', { name: 'main' });
   assert.equal(stopped.isError, true);
   assert.match(stopped.text, /\nSIGTERM wasn't sent to make: the shell's processes couldn't be listed, so its group couldn't be confirmed as still the shell's, and no further step was taken: now /);
-  s.close = async () => ({ code: null, signal: 'SIGKILL', unkilled: [{ pgid: 77, error: 'EPERM' }] });
-  assert.match((await host.call(plain(), 'close', { name: 'main', force: true })).text, / KILL didn't reach group 77 \(EPERM\), whose processes may live on\.$/);
+  s.close = async () => ({ code: null, signal: 'SIGKILL', unreached: [{ pgid: 77, signal: 'SIGKILL', error: 'EPERM' }] });
+  assert.match((await host.call(plain(), 'close', { name: 'main', force: true })).text, / These signals weren't delivered: SIGKILL to group 77 \(EPERM\)\. Their processes may live on\.$/);
+  await host.call(plain(), 'open', { name: 'main' });
+  opened[1]!.close = async () => ({ code: 0, unreached: [{ pgid: 78, signal: 'SIGHUP', error: 'EPERM' }] });
+  assert.match((await host.call(plain(), 'close', { name: 'main' })).text, / These signals weren't delivered: SIGHUP to group 78 \(EPERM\)\. Their processes may live on\.$/);
 });
 
 test('an end handed back from a cancelled call doesn\'t change which command a later exit is keyed to', async () => {

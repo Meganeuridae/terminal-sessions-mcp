@@ -29,6 +29,8 @@ export interface OpenOptions {
   waitMs: number;
   /** Linux: the shell's oom_score_adj; 0 leaves it alone. */
   oomScoreAdj?: number;
+  /** Where the session writes what no caller is told, such as a directory `close` couldn't remove. */
+  log?: (line: string) => void;
 }
 
 /**
@@ -45,12 +47,12 @@ export interface Exit {
 
 /** What `close` resolves with: the shell's exit, as the session saw it. */
 export type Closed = Exit & {
-  /** With `force`: the shell's descendants couldn't be listed, so only the shell was KILLed. */
+  /** The processes on the session's terminal, or with `force` the shell's descendants, couldn't be listed, or close couldn't check which listed groups still held them, in which case it signalled none. Either way, what it started may live on. */
   unlisted?: true;
   /** The shell's exit wasn't seen within a grace after its KILL, as for a process in uninterruptible sleep. */
   unconfirmed?: true;
-  /** With `force`: the groups whose KILL wasn't delivered, each with the error's code, such as `EPERM`; their processes may live on. */
-  unkilled?: Array<{ pgid: number; error: string }>;
+  /** The groups whose hangup, or KILL with `force`, wasn't delivered, each with the error's code, such as `EPERM`; their processes may live on. */
+  unreached?: Array<{ pgid: number; signal: 'SIGHUP' | 'SIGKILL'; error: string }>;
 };
 
 /** A process group in front of the terminal. */
@@ -266,7 +268,7 @@ export interface Session {
   wait(until: Until, opts: { waitMs: number; from: number; take?: boolean; signal?: AbortSignal }): Promise<WaitOutcome>;
   /** Without `signal`, in steps: C-c, typed to the terminal, so it reaches whatever is in front, a shell's own loop included; then TERM, then KILL, each with a grace and each only to the job's group while it is still the shell's. With `signal`, that one step. */
   stop(signal?: NodeJS.Signals, opts?: { abort?: AbortSignal }): Promise<StopOutcome>;
-  /** Hangs up the shell, again every 500 ms while it is there, then after a grace KILLs the shell alone, so the kernel hangs up the job in front as a closing terminal does, and a job detached on purpose lives on. With `force`, at once KILLs every process group the shell started, then the shell. Resolves with the exit, at once if it had exited. */
+  /** Lists the processes on the session's terminal first. Then it hangs up the shell, again every 500 ms while it is there, and KILLs it if it is still there after a grace. Once the shell is gone, it hangs up each listed group, and continues each group the hangup reached. A process that left the terminal with setsid isn't listed, so it lives on. With `force`, at once KILLs every listed group and every group the shell started, then the shell. Resolves with the exit, at once if it had exited. */
   close(opts?: { force?: boolean }): Promise<Closed>;
 
   /** A one-shot pattern watch from line `from` on; its id names the `match` event. Given `command`, its match in that command's output is emitted before the command's `ended`; other watches search a slice at a time. */

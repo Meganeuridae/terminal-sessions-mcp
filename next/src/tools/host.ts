@@ -245,6 +245,7 @@ export class Host {
       nextCommandId: () => this.nextId++,
       waitMs: this.waitMs(a),
       ...(this.o.oomScoreAdj ? { oomScoreAdj: this.o.oomScoreAdj } : {}),
+      ...(this.o.log ? { log: this.o.log } : {}),
     });
     if (this.stopping) {
       await session.close({ force: true });
@@ -479,9 +480,9 @@ export class Host {
     const k = keyOf(e.scope, e.name);
     if (this.entries.get(k) === e) this.entries.delete(k);
     const how = exit.unconfirmed ? `was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it` : exitText(exit);
-    const unlisted = exit.unlisted ? " Its descendants couldn't be listed, so only the shell was killed, and jobs it started may live on." : '';
-    const unkilled = exit.unkilled?.length ? ` KILL didn't reach ${exit.unkilled.map((g) => `group ${g.pgid} (${g.error})`).join(', ')}, whose processes may live on.` : '';
-    return ok(`[${e.name} · closed]\nThe shell ${how}.${unlisted}${unkilled}${unseen.length ? `\n\nNot yet seen:\n${unseen.join('\n')}` : ''}`, { session: e.name, exit, ...(unseen.length ? { unseen } : {}) });
+    const unlisted = exit.unlisted ? " The session couldn't list every process it started, so jobs it started may live on." : '';
+    const unreached = exit.unreached?.length ? ` These signals weren't delivered: ${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')}. Their processes may live on.` : '';
+    return ok(`[${e.name} · closed]\nThe shell ${how}.${unlisted}${unreached}${unseen.length ? `\n\nNot yet seen:\n${unseen.join('\n')}` : ''}`, { session: e.name, exit, ...(unseen.length ? { unseen } : {}) });
   }
 
   private async taking(e: Entry, call: (held: Held) => Promise<ToolResult>): Promise<ToolResult> {

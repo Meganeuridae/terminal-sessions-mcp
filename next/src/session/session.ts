@@ -112,6 +112,7 @@ class LiveSession implements Session {
   readonly openedAt = Date.now();
   private readonly t: Transcript;
   private readonly pts: string;
+  private readonly log: ((line: string) => void) | undefined;
   private readonly shellName: string;
   private expected: Nonce;
   private readonly recent: string[] = [];
@@ -168,6 +169,7 @@ class LiveSession implements Session {
     private readonly argvAtOpen: string,
   ) {
     this.name = o.name;
+    this.log = o.log;
     this.pid = p.pid;
     this.cwdNow = o.cwd;
     this.expected = nonce;
@@ -859,20 +861,40 @@ class LiveSession implements Session {
     this.wake();
     if (this.poll) clearTimeout(this.poll);
     let unlisted = false;
-    const unkilled: Array<{ pgid: number; error: string }> = [];
+    const unreached: NonNullable<Closed['unreached']> = [];
     if (!this.exitInfo) {
       const killShell = (): void => {
         try {
           this.p.kill('SIGKILL');
         } catch {}
       };
-      if (opts.force) {
-        const ds = proc.descendants(this.pid, true);
-        unlisted = ds === undefined;
-        for (const pgid of new Set((ds ?? []).map((d) => d.pgrp))) {
-          const error = proc.signalGroup(pgid, 'SIGKILL');
-          if (error && error !== 'ESRCH') unkilled.push({ pgid, error });
+      // Listed before the first signal: once the shell exits, nothing in its session has a terminal.
+      const onTerminal = proc.onTerminal(this.pid, this.pts)?.filter((d) => d.pid !== this.pid);
+      // Force also ends what the shell started that left the terminal with setsid.
+      const ds = opts.force ? proc.descendants(this.pid, true) : [];
+      unlisted = onTerminal === undefined || ds === undefined;
+      const listed = [...(onTerminal ?? []), ...(ds ?? [])];
+      /**
+       * Sends `signal` to each listed group that still holds a listed process, and records each it couldn't reach. When that can't be
+       * checked, it sends nothing and records the listing as incomplete: a group whose id was taken again isn't signalled, and the
+       * result says what was started may live on.
+       */
+      const reach = (signal: 'SIGHUP' | 'SIGKILL'): void => {
+        const held = proc.held(listed);
+        if (!held) {
+          if (listed.length) unlisted = true;
+          return;
         }
+        for (const pgid of held) {
+          const error = proc.signalGroup(pgid, signal);
+          // On Linux, a stopped process holds the hangup until it's continued. So CONT follows a hangup that was delivered, as bash
+          // sends it. One that wasn't leaves the group as it was: a CONT then could only resume what close doesn't end.
+          if (signal === 'SIGHUP' && !error) proc.signalGroup(pgid, 'SIGCONT');
+          if (error && error !== 'ESRCH' && proc.held(listed.filter((d) => d.pgrp === pgid))?.has(pgid) !== false) unreached.push({ pgid, signal, error });
+        }
+      };
+      if (opts.force) {
+        reach('SIGKILL');
         killShell();
       } else {
         // bash can miss a SIGHUP that lands just before its line editor waits for input, and go on waiting.
@@ -887,13 +909,19 @@ class LiveSession implements Session {
         if (!gone()) killShell();
       }
       await this.until(mono() + CLOSE_GRACE_MS, () => this.exitInfo ?? this.ptyExit);
+      // A shell hangs up only the jobs it still counts as its own, and a KILLed one none.
+      if (!opts.force) reach('SIGHUP');
     }
     const exit = this.exitInfo ?? this.ptyExit;
     this.t.dispose();
-    fs.rmSync(this.dir, { recursive: true, force: true });
+    // A process just hung up can still be writing here as it exits, so a removal that meets a file written meanwhile tries again.
+    // The shell is gone by then, and what's left harms nothing in its private parent, so a removal that still fails doesn't fail close.
+    await fs.promises
+      .rm(this.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+      .catch((e: Error) => this.log?.(`session ${JSON.stringify(this.name)} closed, but its directory ${this.dir} wasn't removed: ${e.message}`));
     const closed: Closed = exit ? { ...exit } : { code: null, signal: 'SIGKILL', unconfirmed: true };
     if (unlisted) closed.unlisted = true;
-    if (unkilled.length) closed.unkilled = unkilled;
+    if (unreached.length) closed.unreached = unreached;
     return closed;
   }
 

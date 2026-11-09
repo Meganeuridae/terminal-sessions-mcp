@@ -68,18 +68,90 @@ export function argv(pid: number): string | undefined {
   }
 }
 
-/** Linux: a process's group from its stat, with a terminal or without one. */
-function pgrpOf(pid: number): number | undefined {
+/** Linux: a process's stat fields after its name, from its state on; undefined once it's gone. */
+function statOf(pid: number): string[] | undefined {
   try {
     const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const g = Number(s.slice(s.lastIndexOf(')') + 2).split(' ')[2]);
-    return g > 0 ? g : undefined;
+    return s.slice(s.lastIndexOf(')') + 2).split(' ');
   } catch {
     return undefined;
   }
 }
 
+/** Linux: a process's group from its stat, with a terminal or without one. */
+function pgrpOf(pid: number): number | undefined {
+  const g = Number(statOf(pid)?.[2]);
+  return g > 0 ? g : undefined;
+}
+
 type Proc = { pid: number; pgrp: number };
+
+/**
+ * Every process whose controlling terminal is `pts`, which the session leader `shell` holds, with its group:
+ * the shell, its jobs, disowned ones and those whose parent exited, but not a process that left with
+ * `setsid`. Undefined when they can't be listed. Read it while the shell lives: once a session's leader
+ * exits, the kernel takes the terminal from every process in the session.
+ */
+export function onTerminal(shell: number, pts: string): Proc[] | undefined {
+  try {
+    if (LINUX) {
+      const tty = statOf(shell)?.[4];
+      if (tty === undefined || tty === '0') return undefined;
+      const out: Proc[] = [];
+      for (const d of fs.readdirSync('/proc')) {
+        if (!/^\d+$/.test(d)) continue;
+        const f = statOf(Number(d));
+        if (f?.[4] === tty && Number(f[2]) > 0) out.push({ pid: Number(d), pgrp: Number(f[2]) });
+      }
+      return out;
+    }
+    const text = execFileSync('ps', ['-t', pts.slice(pts.lastIndexOf('/') + 1), '-o', 'pid=,pgid='], { encoding: 'utf8', timeout: SPAWN_TIMEOUT_MS });
+    const out: Proc[] = [];
+    for (const line of text.trim().split('\n')) {
+      const [p, g] = line.trim().split(/\s+/).map(Number);
+      if (p! > 0 && g! > 0) out.push({ pid: p!, pgrp: g! });
+    }
+    return out.some((d) => d.pid === shell) ? out : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The groups among `listed` that still hold one of its processes, alive and in the group it was listed in;
+ * undefined when that can't be read. An exited process its parent hasn't reaped counts as gone: macOS
+ * refuses a signal to a group of only those with EPERM.
+ */
+export function held(listed: Proc[]): Set<number> | undefined {
+  const out = new Set<number>();
+  if (!listed.length) return out;
+  try {
+    if (LINUX) {
+      for (const d of listed) {
+        const f = statOf(d.pid);
+        if (f && f[0] !== 'Z' && Number(f[2]) === d.pgrp) out.add(d.pgrp);
+      }
+      return out;
+    }
+    let text: string;
+    try {
+      text = execFileSync('ps', ['-o', 'pid=,pgid=,stat=', '-p', listed.map((d) => d.pid).join(',')], { encoding: 'utf8', timeout: SPAWN_TIMEOUT_MS });
+    } catch (e) {
+      // ps exits 1 when a pid it was given is gone, and still lists the others.
+      const x = e as { status?: number; stdout?: string };
+      if (x.status !== 1 || typeof x.stdout !== 'string') return undefined;
+      text = x.stdout;
+    }
+    const group = new Map(listed.map((d) => [d.pid, d.pgrp]));
+    for (const line of text.trim().split('\n')) {
+      const [p, g, state] = line.trim().split(/\s+/);
+      if (group.get(Number(p)) === Number(g) && !state?.startsWith('Z')) out.add(Number(g));
+    }
+    return out;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Every descendant of `pid` with its group, a descendant that left the terminal (`setsid`) included;
