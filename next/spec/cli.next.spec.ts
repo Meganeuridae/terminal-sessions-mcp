@@ -8,7 +8,7 @@ import { PassThrough } from 'node:stream';
 import { spawnSync } from 'node:child_process';
 import { parseCli, runCli, type CliOptions } from '../src/endpoint/cli-main.js';
 import { runDaemon, type RunningDaemon } from '../src/endpoint/daemon-main.js';
-import { helloLine } from '../src/endpoint/hello.js';
+import { helloLine, STOP } from '../src/endpoint/hello.js';
 import type { OpenOptions } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
 
@@ -123,13 +123,14 @@ async function standIn(dir: string, hello: object, reply: (id: unknown) => Buffe
 test('the CLI decodes a character split across chunks, reports a line that is not JSON, and names the pid of a daemon that doesn\'t answer a stop', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
   const run = async (socket: string, ...argv: string[]) => {
+    const silentStop = argv[0] === 'daemon';
     const stdout = new PassThrough();
     const stderr = new PassThrough();
     let out = '';
     let err = '';
     stdout.on('data', (b) => (out += b));
     stderr.on('data', (b) => (err += b));
-    const code = await runCli({ ...(parseCli(argv) as CliOptions), socket, version: '2.0.0', startDaemon: () => assert.fail('a daemon answers'), stdout, stderr, reachMs: 300 });
+    const code = await runCli({ ...(parseCli(argv) as CliOptions), socket, version: '2.0.0', startDaemon: () => assert.fail('a daemon answers'), stdout, stderr, ...(silentStop ? { reachMs: 300 } : {}) });
     return { code, out, err };
   };
   const daemon = { version: '2.0.0', pid: 4242, startedAt: '2026-11-08T19:00:00.000Z' };
@@ -196,17 +197,19 @@ test('a word given as several is quoted so that bash, zsh, fish and sh each read
   }
 });
 
-test('tsm daemon stop returns once the daemon has hung up its shells, not once its socket is gone', async () => {
+test("tsm daemon stop doesn't say the daemon stopped while it is still hanging up its shells", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
   const socket = path.join(dir, 'daemon.sock');
   let closed = false;
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
   const d = (await runDaemon({
     socket,
     openSession: async (o: OpenOptions) => {
       const s = new FakeSession(o.name, o);
       const close = s.close.bind(s);
       s.close = async (opts) => {
-        await new Promise((r) => setTimeout(r, 400));
+        await held;
         closed = true;
         return close(opts);
       };
@@ -214,27 +217,44 @@ test('tsm daemon stop returns once the daemon has hung up its shells, not once i
     },
     shell: '/bin/bash', env: {}, version: '2.0.0', log: () => {}, confirmMs: 50,
   })) as RunningDaemon;
-  const call = (...argv: string[]) => runCli({ ...(parseCli(argv) as CliOptions), socket, version: '2.0.0', startDaemon: () => assert.fail('a daemon answers'), stdout: new PassThrough(), stderr: new PassThrough() });
+  let err = '';
+  const stderr = new PassThrough();
+  stderr.on('data', (b) => (err += b));
+  const call = (argv: string[], reachMs?: number) => runCli({ ...(parseCli(argv) as CliOptions), socket, version: '2.0.0', startDaemon: () => assert.fail('a daemon answers'), stdout: new PassThrough(), stderr, ...(reachMs === undefined ? {} : { reachMs }) });
   try {
-    await call('open', 'main');
-    assert.equal(await call('daemon', 'stop'), 0);
-    assert.equal(closed, true, 'its shell was hung up before tsm returned');
+    await call(['open', 'main']);
+    assert.equal(await call(['daemon', 'stop'], 1000), 1);
+    assert.equal(closed, false);
+    assert.match(err, /didn't stop within 1000 ms/);
+    release();
+    await d.stopped;
+    assert.equal(closed, true);
   } finally {
+    release();
     await d.stop('test');
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("tsm daemon stop says it can't tell when the socket can't be probed after the stop was answered", async () => {
+test("tsm daemon stop says it can't tell when the socket can't be probed after the stop was answered", { skip: process.getuid?.() === 0 ? 'root connects through a socket of mode 000' : false }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
   const socket = path.join(dir, 'daemon.sock');
+  let answered = false;
   const server = net.createServer((c) => {
     c.on('error', () => {});
     c.write(helloLine({ version: '2.0.0', pid: 4242, startedAt: '2026-11-08T19:00:00.000Z' } as never));
+    let buf = '';
     c.on('data', (b) => {
-      const m = JSON.parse(String(b).split('\n')[0]!) as { id: unknown };
-      fs.chmodSync(socket, 0);
-      c.end(`${JSON.stringify({ jsonrpc: '2.0', id: m.id, result: {} })}\n`);
+      buf += String(b);
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const m = JSON.parse(buf.slice(0, nl)) as { id?: unknown; method?: unknown };
+        buf = buf.slice(nl + 1);
+        if (m.method !== STOP) continue;
+        answered = true;
+        fs.chmodSync(socket, 0);
+        c.end(`${JSON.stringify({ jsonrpc: '2.0', id: m.id, result: {} })}\n`);
+      }
     });
   });
   await new Promise<void>((r) => server.listen(socket, r));
@@ -246,6 +266,7 @@ test("tsm daemon stop says it can't tell when the socket can't be probed after t
   stderr.on('data', (b) => (err += b));
   try {
     const code = await runCli({ ...(parseCli(['daemon', 'stop']) as CliOptions), socket, version: '2.0.0', startDaemon: () => assert.fail('a daemon answers'), stdout, stderr, reachMs: 1000 });
+    assert.equal(answered, true, 'the stand-in answered the stop');
     assert.equal(code, 1);
     assert.equal(out, '');
     assert.match(err, /^tsm: the daemon \(pid 4242\) was asked to stop, but whether it did can't be seen: /);

@@ -402,18 +402,21 @@ test('an end a closed connection was waiting for is pushed to another connection
     let started!: () => void;
     const waiting = new Promise<void>((r) => (started = r));
     let inFlight = false;
+    let aborted!: () => void;
+    const abort = new Promise<void>((r) => (aborted = r));
     s.run = async (text, opts) => {
       const r = await run(text, opts);
       inFlight = true;
       started();
       await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
       inFlight = false;
+      aborted();
       return r;
     };
     a.send({ jsonrpc: '2.0', id: 'r', method: 'tools/call', params: { name: 'run', arguments: { name: 'main', command: 'make', wait: 30 } } });
     await waiting;
     a.close();
-    await b.request('ping');
+    await abort;
     s.end(0, inFlight);
     const push = await b.next((m) => m.method === 'push/event');
     assert.match((push.params as { payload: { content: Array<{ text: string }> } }).payload.content[0]!.text, /^\[main · command 1 · exit 0 · /);

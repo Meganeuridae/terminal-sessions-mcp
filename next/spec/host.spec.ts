@@ -122,7 +122,7 @@ test('H6: a look for input with the terminal unread says the reading failed and 
   assert.match(input.text, /Reading the terminal failed, so whether a program waits for input couldn't be seen\. `look` with `until: "input"` reads it again\./);
 });
 
-test('H6: every result but close\'s opens with the status line: a command\'s status, duration, directory and what is in front', async () => {
+test('H6: run\'s result opens with the status line: the command\'s status, duration, what is in front and the directory', async () => {
   const { host } = setup();
   await host.call(agent(), 'open', { name: 'main', cwd: '/srv/app' });
   const r = await host.call(agent(), 'run', { name: 'main', command: 'make' });

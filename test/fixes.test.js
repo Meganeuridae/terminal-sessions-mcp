@@ -240,7 +240,11 @@ test('a job started with nohup outlives a graceful kill', { skip: python3 ? fals
 test('a graceful kill ends a stopped process in its own group, whose parent outlives the kill', { skip: python3 ? false : 'needs python3' }, async () => {
   await withPython('t-kill-stopped-child', (script, file) => `nohup python3 '${script}' '${file}' stopped-child >/dev/null 2>&1 &`, async (pid) => {
     const { execFileSync } = require('node:child_process');
-    const state = () => { try { return execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim(); } catch { return ''; } };
+    // ps exits 1 and prints nothing when no process has the pid; any other failure isn't an answer.
+    const state = () => {
+      try { return execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
+      catch (e) { if (e.status === 1 && !String(e.stdout).trim() && !String(e.stderr).trim()) return ''; throw e; }
+    };
     const stopped = Date.now() + 5000;
     while (!state().startsWith('T') && Date.now() < stopped) await pause(50);
     assert.match(state(), /^T/, `the child (pid ${pid}) stopped itself before the kill`);
