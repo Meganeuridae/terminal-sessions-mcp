@@ -5,6 +5,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { compileUserRegex, matchWindow } from '../src/core/regex.js';
+import * as proc from '../src/session/proc.js';
 import { openSession } from '../src/session/session.js';
 import type { Command, Session, SessionEvent } from '../src/session/types.js';
 
@@ -103,6 +104,31 @@ const gateHook = (shell: string, gate: string): string =>
     : shell === 'zsh'
       ? `__gate() { if [[ -e '${gate}' ]]; then echo HELD; while [[ -e '${gate}' ]]; do sleep 0.05; done; fi }\nprecmd_functions+=(__gate)\n`
       : `PROMPT_COMMAND='if [ -e "${gate}" ]; then echo HELD; while [ -e "${gate}" ]; do sleep 0.05; done; fi'\n`;
+/** A prompt hook that, at the prompt after a command creates `arm`, removes it and creates `flag`: once `flag` exists, the command's output and its end mark have been written. */
+const flagHook = (shell: string, arm: string, flag: string): string =>
+  shell === 'fish'
+    ? `function __flag --on-event fish_prompt; if test -e '${arm}'; rm '${arm}'; touch '${flag}'; end; end\n`
+    : shell === 'zsh'
+      ? `__flag() { if [[ -e '${arm}' ]]; then rm '${arm}'; : > '${flag}'; fi }\nprecmd_functions+=(__flag)\n`
+      : `PROMPT_COMMAND='if [ -e "${arm}" ]; then rm "${arm}"; : > "${flag}"; fi'\n`;
+/** Holds the event loop until `file` exists, so whatever was written before it is read in one go. */
+function holdUntil(file: string, ms = 10_000): void {
+  const until = Date.now() + ms;
+  while (!fs.existsSync(file)) if (Date.now() > until) assert.fail(`${file} did not appear within ${ms} ms`);
+}
+/** Each event with the event loop's turn it came in. */
+function eventsByTurn(s: Session): { events: Array<{ e: SessionEvent; turn: number }>; stop: () => void } {
+  const events: Array<{ e: SessionEvent; turn: number }> = [];
+  let turn = 0;
+  let stopped = false;
+  const tick = (): void => {
+    turn++;
+    if (!stopped) setImmediate(tick);
+  };
+  setImmediate(tick);
+  const off = s.onEvent((e) => events.push({ e, turn }));
+  return { events, stop: () => ((stopped = true), off()) };
+}
 /** Starts a command whose prompt hook `gateHook` holds, and returns once the hook holds it, its end mark parsed. */
 async function heldAfter(s: Session, gate: string, text: string, via: 'run' | 'send'): Promise<void> {
   fs.writeFileSync(gate, '');
@@ -276,13 +302,13 @@ for (const sh of shells) {
     test('the live nonce never shows in output', async () => {
       const s = await open(shell);
       const c = await ran(s, 'echo "[$__tsm_r]"');
-      assert.deepEqual(out(s, c), ['[[redacted]]']);
+      assert.deepEqual(out(s, c), ['[[redacted]..........]']);
     });
 
     test('the live nonce never shows in the title', { skip: sh.name === 'fish' ? 'fish sets its own title at each prompt' : false }, async () => {
       const s = await open(shell);
       await ran(s, `printf '\\033]0;%s\\007' "$__tsm_r"`);
-      assert.equal(s.screen().title, '[redacted]');
+      assert.equal(s.screen().title, '[redacted]..........');
     });
 
     test('a line typed ahead of a program that never read it is discarded at the prompt and reported', async () => {
@@ -396,14 +422,23 @@ for (const sh of shells) {
     });
 
     test('keys sent while a prompt hook reads the terminal raw wait for the drawn prompt, so the hook does not get them', { skip: sh.name === 'fish' ? 'the hooks are bash and zsh syntax' : false }, async () => {
-      const hooks = sh.name === 'zsh'
-        ? ['__hk() { echo HOOK_READING; read -rsk1 -t 2 hookkey }\nprecmd_functions+=(__hk)\n', "__cq() { echo HOOK_READING; print -n '\\e[6n'; read -rs -d R pos; sleep 1 }\nprecmd_functions+=(__cq)\n"]
-        : ['PROMPT_COMMAND="echo HOOK_READING; read -rsn1 -t 2 hookkey"\n', "PROMPT_COMMAND='echo HOOK_READING; printf \"\\033[6n\"; IFS= read -rs -d R pos; sleep 1'\n"];
-      for (const rc of hooks) {
+      for (const query of [false, true]) {
+        const gate = newGate();
+        const keys = path.join(tmp, `keys-${gates}`);
+        const loop = sh.name === 'zsh'
+          ? `while :; do if read -rs -k 1 -t 0.05 k; then print -rn -- "$k" >> '${keys}'; elif [[ ! -e '${gate}' ]]; then break; fi; done`
+          : `while :; do if IFS= read -rsn1 -t 1 k; then printf %s "$k" >> '${keys}'; elif [ ! -e '${gate}' ]; then break; fi; done`;
+        const ask = !query ? '' : sh.name === 'zsh' ? "print -n '\\e[6n'; read -rs -d R pos; " : 'printf "\\033[6n"; IFS= read -rs -d R pos; ';
+        const rc = sh.name === 'zsh' ? `__hk() { if [[ -e '${gate}' ]]; then echo HOOK_READING; ${ask}${loop}; fi }\nprecmd_functions+=(__hk)\n` : `__hk() { if [ -e '${gate}' ]; then echo HOOK_READING; ${ask}${loop}; fi; }\nPROMPT_COMMAND=__hk\n`;
         const s = await open(shell, { rc, waitMs: 15_000 });
+        fs.writeFileSync(gate, '');
         assert.equal((await s.send('true\r', { waitMs: 5000, until: /^HOOK_READING$/ })).by, 'match', 'the hook is reading when the keys are sent');
-        assert.equal((await s.send('zq', { waitMs: 6000 })).sent, true);
+        const sent = s.send('zq', { waitMs: 10_000 });
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        fs.rmSync(gate);
+        assert.equal((await sent).sent, true);
         await pendingIs(s, 'zq');
+        assert.equal(fs.existsSync(keys) ? fs.readFileSync(keys, 'utf8') : '', '', 'the hook read none of the keys');
       }
     });
 
@@ -708,10 +743,13 @@ for (const sh of shells) {
 
     test('text typed ahead past what the terminal holds at once is drained whole at the next prompt, and none of it runs', async () => {
       const s = await open(shell);
-      const r = await s.run('sleep 2', { waitMs: 200 });
+      const gate = newGate();
+      fs.writeFileSync(gate, '');
+      const r = await s.run(holdJob(gate), { waitMs: 200 });
       assert.equal(r.kind, 'running');
       const typed = Array.from({ length: 1400 }, (_, i) => `echo LEAKED_${i}\r`).join('');
       await s.send(typed, { waitMs: 300, quietMs: 100 });
+      fs.rmSync(gate);
       assert.equal((await s.wait({ kind: 'end' }, { waitMs: 20_000, from: 0 })).by, 'end');
       assert.ok(r.kind === 'running' && r.command.end?.flushed?.includes('LEAKED_1399'), JSON.stringify(r.kind === 'running' && r.command.end?.flushed?.length));
       assert.deepEqual(out(s, await ran(s, 'echo AFTER')), ['AFTER']);
@@ -723,12 +761,15 @@ for (const sh of shells) {
       const events: SessionEvent[] = [];
       s.onEvent((e) => events.push(e));
       const id = s.watch(/ALT-WATCHED/, s.lines(0).to);
-      const r = await s.run(`printf '\\x1b[?1049h\\x1b[HALT-READY ALT-WATCHED'; sleep 3; printf '\\x1b[?1049l'`, { waitMs: 200 });
+      const gate = newGate();
+      fs.writeFileSync(gate, '');
+      const r = await s.run(`printf '\\x1b[?1049h\\x1b[HALT-READY ALT-WATCHED'; ${holdJob(gate)}; printf '\\x1b[?1049l'`, { waitMs: 200 });
       assert.equal(r.kind, 'running');
       const w = await s.wait({ kind: 'match', pattern: /ALT-READY/ }, { waitMs: 5000, from: s.lines(0).to });
       assert.equal(w.by, 'match');
       assert.equal(w.matched?.row, 0);
       await eventually('the watch', () => events.some((e) => e.kind === 'match' && e.watch === id));
+      fs.rmSync(gate);
     });
 
     test('a match on a line longer than the pattern\'s window is not seen, and the wait says how many lines it searched on their head only', async () => {
@@ -747,25 +788,21 @@ for (const sh of shells) {
     const costly = (): RegExp => compileUserRegex('(\\w+\\s?){1,80}TARGET');
     const same = { skip: sh.name !== 'bash' ? 'a search is the same in every shell' : false };
 
-    test('a pattern search across a long backlog lets the event loop turn while it searches, and a wait finds the first line that matches', same, async () => {
+    /** Starts this turn's search slice and holds the loop past its end, so a search begun later in this turn gets its one line and stops. */
+    const spendSlice = (s: Session): void => {
+      void s.wait({ kind: 'match', pattern: /^NEVER-MATCHED$/ }, { waitMs: 0, from: s.lines(0).to - 1 });
+      const until = performance.now() + 60;
+      while (performance.now() < until);
+    };
+
+    test('a pattern search stops for the turn once the turn\'s slice is spent, and a later wait finds the first line that matches', same, async () => {
       const s = await open(shell, { cols: 200 });
       const from = s.lines(0).to;
       await ran(s, backlog(), 30_000);
-      // Counted with a watch: a wait takes turns of its own after its match.
-      let turns = 0;
-      let done = false;
-      const turn = (): void => {
-        if (done) return;
-        turns++;
-        setImmediate(turn);
-      };
-      setImmediate(turn);
-      const id = s.watch(costly(), from);
-      s.onEvent((e) => {
-        if (e.kind === 'match' && e.watch === id) done = true;
-      });
-      await eventually('the watch', () => done, 300_000);
-      assert.ok(turns >= 3, `the event loop turned ${turns} times while the search ran`);
+      spendSlice(s);
+      const stopped = await s.wait({ kind: 'match', pattern: costly() }, { waitMs: 0, from });
+      assert.equal(stopped.by, 'timeout');
+      assert.equal(stopped.unsearchedFrom, from + 1, 'it searched one line in the spent turn');
       const w = await s.wait({ kind: 'match', pattern: costly() }, { waitMs: 300_000, from });
       assert.equal(w.by, 'match');
       assert.match(w.matched!.text, /^35 /);
@@ -801,28 +838,42 @@ for (const sh of shells) {
       assert.equal((await w).by, 'match');
     });
 
-    test('a pattern wait that ends before its search reaches the end says how many lines it had not searched', same, async () => {
+    test('a pattern wait that ends before its search reaches the end says how many lines it had not searched, and from which', same, async () => {
       const s = await open(shell, { cols: 200 });
       const from = s.lines(0).to;
       await ran(s, backlog(), 30_000);
-      const w = await s.wait({ kind: 'match', pattern: costly() }, { waitMs: 100, from });
+      spendSlice(s);
+      const w = await s.wait({ kind: 'match', pattern: /TARGET/ }, { waitMs: 0, from });
       assert.equal(w.by, 'timeout');
       assert.equal(w.matched, undefined);
-      assert.ok(w.unsearched !== undefined && w.unsearched > 0 && w.unsearched <= s.lines(from).lines.length, String(w.unsearched));
+      assert.equal(w.unsearchedFrom, from + 1);
+      assert.equal(w.unsearched, s.lines(from).lines.length - 1);
     });
 
-    test('a watch that matches a command\'s output is reported before the command\'s end, though both arrive in one read', async () => {
-      const s = await open(shell);
-      const events: SessionEvent[] = [];
-      s.onEvent((e) => events.push(e));
-      const id = s.watch(/^WATCHED-LAST$/, s.lines(0).to);
-      const r = s.run('sleep 0.2; echo WATCHED-LAST', { waitMs: 50 });
-      const held = Date.now() + 1500;
-      while (Date.now() < held);
-      await r;
-      await eventually('both', () => events.some((e) => e.kind === 'match' && e.watch === id) && events.some((e) => e.kind === 'ended'));
-      assert.deepEqual(events.filter((e) => e.kind === 'match' || e.kind === 'ended').map((e) => e.kind), ['match', 'ended']);
-    });
+    for (const own of [true, false]) {
+      const title = own
+        ? 'a watch given its command reports a match in that command\'s output before the command\'s end, though both arrive in one read'
+        : 'a watch given no command reports its match after a command\'s end that arrives in the same read, since only the command\'s own watches search at once';
+      test(title, async (t) => {
+        const gate = newGate();
+        const arm = path.join(tmp, `arm-${gates}`);
+        const flag = path.join(tmp, `flag-${gates}`);
+        const s = await open(shell, { rc: flagHook(sh.name, arm, flag) });
+        fs.writeFileSync(gate, '');
+        const r = await s.run(`${holdJob(gate)}; echo WATCHED-LAST; touch '${arm}'`, { waitMs: 200 });
+        assert.equal(r.kind, 'running');
+        const c = (r as { command: Command }).command;
+        const id = own ? s.watch(/^WATCHED-LAST$/, c.from, c.id) : s.watch(/^WATCHED-LAST$/, c.from);
+        const seen = eventsByTurn(s);
+        fs.rmSync(gate);
+        holdUntil(flag);
+        await eventually('both', () => seen.events.some(({ e }) => e.kind === 'match' && e.watch === id) && seen.events.some(({ e }) => e.kind === 'ended'));
+        seen.stop();
+        const both = seen.events.filter(({ e }) => (e.kind === 'match' && e.watch === id) || e.kind === 'ended');
+        if (both[0]!.turn !== both[1]!.turn) return t.skip('the output and the end mark were parsed in separate reads');
+        assert.deepEqual(both.map(({ e }) => e.kind), own ? ['match', 'ended'] : ['ended', 'match']);
+      });
+    }
 
     test('a program whose other thread reads the terminal shows as waiting', { skip: process.platform !== 'linux' ? 'only Linux shows reads' : false }, async () => {
       const s = await open(shell);
@@ -846,18 +897,21 @@ for (const sh of shells) {
       const gate = newGate();
       const s = await open(shell, { rc: `${gateHook(sh.name, gate)}trap '' HUP\n` });
       await heldAfter(s, gate, 'true', 'run');
-      const r = s.run('echo NOPE', { waitMs: 10_000 });
+      const typed = path.join(tmp, `typed-${gates}`);
+      const r = s.run(`touch '${typed}'`, { waitMs: 10_000 });
       const closing = s.close();
       fs.rmSync(gate);
       assert.equal((await r).kind, 'refused');
       await closing;
+      assert.equal(fs.existsSync(typed), false, 'nothing was typed: the shell, held at its prompt through the hangups, would have run it');
     });
 
     test('close with force ends a descendant that left the terminal with setsid', async () => {
       const s = await open(shell);
-      const c = await ran(s, `sh -c 'python3 -c "import os, sys, time; os.setsid(); sys.stdout.write(str(os.getpid()) + chr(10)); sys.stdout.flush(); time.sleep(300)"; :' & sleep 1`);
-      const pid = Number(out(s, c).find((l) => /^\d+$/.test(l)));
-      assert.ok(pid > 0, out(s, c).join('\n'));
+      const file = path.join(tmp, `pid-${++gates}`);
+      await ran(s, `sh -c 'python3 -c "import os, sys, time; os.setsid(); open(sys.argv[1], \\"w\\").write(str(os.getpid())); time.sleep(300)" "$0"; :' '${file}' & ${holdJob(file).replace('[ -e', '[ ! -s')}`);
+      const pid = Number(fs.readFileSync(file, 'utf8'));
+      assert.ok(pid > 0);
       try {
         const exit = await s.close({ force: true });
         assert.equal(exit.unlisted, undefined);
@@ -910,8 +964,174 @@ for (const sh of shells) {
       assert.equal(exit.signal, 'SIGKILL');
       await eventually('the job is gone', () => gone(job));
     });
+
+    test('a wait and a watch from line 0 find a match in a kept line after the earliest lines were dropped', same, async () => {
+      const s = await open(shell);
+      await ran(s, 'seq 1 11100; echo KEPT-TARGET', 60_000);
+      assert.ok(s.lines(0).dropped > 16, 'the earliest lines were dropped');
+      const w = await s.wait({ kind: 'match', pattern: /^KEPT-TARGET$/ }, { waitMs: 30_000, from: 0 });
+      assert.equal(w.by, 'match');
+      const events: SessionEvent[] = [];
+      s.onEvent((e) => events.push(e));
+      const id = s.watch(/^KEPT-TARGET$/, 0);
+      await eventually('the watch', () => events.some((e) => e.kind === 'match' && e.watch === id), 30_000);
+    });
+
+    test('a line over 64 Ki characters that ends a command keeps its numbers when it freezes, so the command and the next one read their own lines', same, async () => {
+      const s = await open(shell);
+      const c = await ran(s, "head -c 66000 /dev/zero | tr '\\0' 0; echo", 30_000);
+      const next = await ran(s, 'seq 1 200', 30_000);
+      assert.equal(out(s, c).join(''), '0'.repeat(66_000));
+      assert.deepEqual(out(s, next), Array.from({ length: 200 }, (_, i) => String(i + 1)));
+    });
+
+    test('an end mark that lands exactly where a line passes 64 Ki characters ends the command there', same, async () => {
+      const s = await open(shell);
+      const c = await ran(s, "head -c 65536 /dev/zero | tr '\\0' 0", 30_000);
+      assert.equal(out(s, c).join(''), '0'.repeat(65_536));
+      assert.deepEqual(out(s, await ran(s, 'echo after')), ['after']);
+    });
+
+    test('the live nonce wrapped across the screen\'s right edge never shows on the screen', async () => {
+      const s = await open(shell);
+      await ran(s, `printf '%95s%s\\n' '' "$__tsm_r"`);
+      const rows = s.screen().rows;
+      const k = rows.findIndex((r) => r.startsWith(' '.repeat(95)));
+      assert.ok(k >= 0, rows.join('\n'));
+      assert.equal(rows[k]!.slice(95), '[reda');
+      assert.ok(rows[k + 1]!.startsWith('cted]..........'), rows[k + 1]);
+    });
+
+    test('the live nonce across the cut of a long line that freezes as it goes on never shows in the frozen lines', async () => {
+      const s = await open(shell);
+      const c = await ran(s, `head -c 65526 /dev/zero | tr '\\0' 1; printf %s "$__tsm_r"; head -c 70000 /dev/zero | tr '\\0' 1; echo`, 30_000);
+      const text = out(s, c).join('');
+      assert.equal(text.length, 135_546);
+      assert.equal(text.slice(65_526, 65_546), '[redacted]..........');
+    });
+
+    test('the live nonce whose head crosses a 64 Ki cut at the end of a freeze never shows, and no line changes as it freezes', { skip: sh.name !== 'bash' ? 'the transcript is the same in every shell' : false }, async () => {
+      // At 21 columns a row ends at 65,541 = 3,121 × 21 characters: a cut at 65,536, then 5 more. The
+      // nonce starts 8 characters before that row's end, so its head crosses the cut and its tail starts
+      // the next row. Entering the alternate screen freezes through the row above the cursor, which is
+      // that row; the rows above the screen never reach the cut before it.
+      const s = await open(shell, { cols: 21 });
+      const gate = newGate();
+      fs.writeFileSync(gate, '');
+      const r = await s.run(`head -c 65533 /dev/zero | tr '\\0' x; printf '%sxxxx' "$__tsm_r"; ${holdJob(gate)}; printf '\\033[?1049h\\033[?1049l'; echo`, { waitMs: 200 });
+      assert.equal(r.kind, 'running');
+      const c = (r as { command: Command }).command;
+      const before = await eventually(
+        'the line written',
+        () => {
+          const l = s.lines(c.from);
+          return l.lines.join('').length === 65_557 && l;
+        },
+        30_000,
+      );
+      assert.deepEqual(before.lines, [`${'x'.repeat(65_533)}[re`, 'dacted]..........xxxx']);
+      fs.rmSync(gate);
+      await eventually('the end', () => c.end, 30_000);
+      assert.deepEqual(s.lines(before.from, before.to).lines, before.lines);
+      assert.equal(out(s, c).join(''), `${'x'.repeat(65_533)}[redacted]..........xxxx`);
+    });
+
+    test('the line at the cursor is not padded to the screen\'s width once the emulator\'s rows are full', { skip: sh.name !== 'bash' ? 'the transcript is the same in every shell' : false }, async () => {
+      const s = await open(shell);
+      // 20,000 characters fill 200 rows at 100 columns, more than the emulator keeps. So every row it
+      // still keeps, but the prompt's, goes on from the row above.
+      await ran(s, "head -c 20000 /dev/zero | tr '\\0' x; echo", 30_000);
+      const screen = s.screen();
+      const all = s.lines(0).lines;
+      assert.equal(all[all.length - 1], screen.rows[screen.cursor.row]);
+    });
+
+    test('a wait cancelled after a command ended returns that end among what it took', async () => {
+      const s = await open(shell);
+      const gate = newGate();
+      fs.writeFileSync(gate, '');
+      const r = await s.run(holdJob(gate), { waitMs: 200 });
+      assert.equal(r.kind, 'running');
+      const c = (r as { command: Command }).command;
+      const ac = new AbortController();
+      const w = s.wait({ kind: 'match', pattern: /^NEVER-MATCHED$/ }, { waitMs: 30_000, from: s.lines(0).to, signal: ac.signal });
+      fs.rmSync(gate);
+      await eventually('the end', () => c.end);
+      ac.abort();
+      const o = await w;
+      assert.equal(o.by, 'cancelled');
+      assert.deepEqual(o.took.map((e) => (e.kind === 'ended' ? e.command.id : e.kind)), [c.id]);
+    });
+
+    test('a pattern wait when close begins returns that the session closed', async () => {
+      const s = await open(shell);
+      const w = s.wait({ kind: 'match', pattern: /^NEVER-MATCHED$/ }, { waitMs: 30_000, from: 0 });
+      await s.close();
+      assert.equal((await w).by, 'closed');
+    });
+
+    test('a second start mark with the live nonce during a command is counted as refused', async () => {
+      const s = await open(shell);
+      const c = await ran(s, sh.name === 'fish' ? "printf '\\e]133;C;%s.%s;\\a' $__tsm_c $__tsm_r" : `printf '\\033]133;C;%s.%s;\\007' "$__tsm_c" "$__tsm_r"`);
+      assert.equal(c.end?.refusedMarks, 1);
+    });
+
+    test('a command leaves the shell\'s own INT handling as it was', async () => {
+      const rc = sh.name === 'fish' ? '' : "trap 'echo USER_INT' INT\n";
+      const s = await open(shell, { rc });
+      await ran(s, 'true');
+      if (sh.name === 'fish') assert.deepEqual(out(s, await ran(s, 'functions -q __tsm_noint; echo $status')), ['1']);
+      else assert.match(out(s, await ran(s, sh.name === 'zsh' ? 'trap' : 'trap -p INT')).join('\n'), /echo USER_INT/);
+    });
+
+    test('in fish 4, a command given to run is in the shell\'s history', { skip: sh.name !== 'fish' ? 'fish only' : false }, async (t) => {
+      if (Number(execFileSync(shell, ['-c', 'string split -f1 . -- $FISH_VERSION'], { encoding: 'utf8' }).trim()) < 4) return t.skip('fish 3 has no way to add it');
+      const s = await open(shell);
+      await ran(s, 'echo HISTORY-PROBE');
+      assert.deepEqual(out(s, await ran(s, "history search --prefix 'echo HISTORY-PROBE' --max 1 | string collect")), ['echo HISTORY-PROBE']);
+    });
+
+    test('the oldest commands go once the kept commands\' text passes its bound', same, async () => {
+      const s = await open(shell);
+      const ids: number[] = [];
+      for (let i = 0; i < 4; i++) ids.push((await ran(s, `: '${'x'.repeat(2 * 1024 * 1024)}'`, 60_000)).id);
+      assert.equal(s.command(ids[0]!), undefined);
+      assert.ok(s.command(ids[3]!));
+    });
+
+    test('close with force reports a group its KILL did not reach', { skip: sh.name !== 'bash' || process.platform !== 'linux' ? 'bash on Linux, with a sudo that runs its command in a group of its own' : false }, async (t) => {
+      try {
+        execFileSync('sudo', ['-n', 'true'], { stdio: 'ignore' });
+      } catch {
+        return t.skip('sudo asks for a password here');
+      }
+      const s = await open(shell);
+      await ran(s, 'sudo -n sleep 301 & echo started');
+      const pid = await eventually('the root sleep', () => {
+        try {
+          return Number(execFileSync('pgrep', ['-u', '0', '-f', '^sleep 301$'], { encoding: 'utf8' }).trim().split('\n')[0]) || undefined;
+        } catch {
+          return undefined;
+        }
+      });
+      try {
+        const pgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim());
+        if (pgid !== pid) return t.skip('this sudo runs its command in its own group');
+        const exit = await s.close({ force: true });
+        assert.ok(exit.unkilled?.some((u) => u.pgid === pgid && u.error === 'EPERM'), JSON.stringify(exit));
+      } finally {
+        try {
+          execFileSync('sudo', ['-n', 'kill', '-9', String(pid)], { stdio: 'ignore' });
+        } catch {}
+      }
+    });
   });
 }
+
+test('the descendants of a pid with no process cannot be listed', () => {
+  assert.equal(proc.descendants(2 ** 22 + 12345), undefined);
+  assert.ok(Array.isArray(proc.descendants(process.pid)));
+});
 
 test('a cwd that is not a directory is refused as invalid_argument', async () => {
   await assert.rejects(open(which('bash') ?? '/bin/sh', { cwd: path.join(tmp, 'missing') }), { code: 'invalid_argument' });
