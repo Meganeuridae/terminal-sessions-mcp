@@ -11,6 +11,7 @@ function ptyDir() {
 }
 
 const quoted = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
+process.stderr.on('error', () => {});
 
 const dir = process.argv[2] ?? ptyDir();
 if (dir) {

@@ -113,3 +113,18 @@ test('1.x names no spawn-helper that is missing, since chmod cannot fix it', () 
     dropFixture(dir);
   }
 });
+
+test('postinstall ends well when writing its warning fails, so the install goes on', { skip: process.getuid?.() === 0 ? 'root reads a directory whatever its mode' : false }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-pty-'));
+  const failing = path.join(dir, 'failing-stderr.js');
+  fs.writeFileSync(failing, "process.stderr.write = function () { const e = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }); process.nextTick(() => this.emit('error', e)); return false; };\n");
+  try {
+    fs.mkdirSync(path.join(dir, 'prebuilds', 'darwin-arm64'), { recursive: true });
+    fs.chmodSync(path.join(dir, 'prebuilds'), 0o000);
+    const r = spawnSync(process.execPath, ['-r', failing, path.join(__dirname, '..', 'scripts', 'pty-permissions.js'), dir], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, r.stderr);
+  } finally {
+    fs.chmodSync(path.join(dir, 'prebuilds'), 0o755);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
