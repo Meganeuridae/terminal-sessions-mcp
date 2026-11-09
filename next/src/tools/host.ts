@@ -4,7 +4,7 @@ import { validate, ValidationError } from '../api/validate.js';
 import { clause, TermError } from '../core/errors.js';
 import { inputBytes, PASTE_END } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
-import type { Command, Front, Lines, Match, OpenSession, Session, SessionEvent, Took } from '../session/types.js';
+import type { Closed, Command, Front, Lines, Match, OpenSession, Session, SessionEvent, Took } from '../session/types.js';
 import { boundedStrings, dirText, duration, endingText, exitText, fitted, fittedLength, frontText, linesText, outputValue, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
 import { SESSION_NAME_RE, TOOLS, WAIT_DEFAULT_S, WAIT_MAX_S, type ToolDef } from './table.js';
 
@@ -183,6 +183,10 @@ export class Host {
         const exitedBefore = e.exited;
         try {
           const exit = await e.session.close({ deadline });
+          if (exit.underway) {
+            this.o.log?.(`session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)}: the shell ${underwayText(exit, "the stop's wait")}, so processes it started may live on`);
+            return;
+          }
           const left = [exit.unconfirmed && 'its exit wasn\'t seen', exit.unlisted && (exitedBefore ? 'the shell had already exited, so what it left running couldn\'t be listed' : 'not every process it started could be listed'), exit.unreached?.length && `${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')} weren't delivered`].filter(Boolean);
           if (left.length) this.o.log?.(`session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)} closed, but ${left.join('; ')}: processes it started may live on`);
         } catch (err) {
@@ -571,7 +575,7 @@ export class Host {
     e.off();
     const k = keyOf(e.scope, e.name);
     if (this.entries.get(k) === e) this.entries.delete(k);
-    const how = exit.unconfirmed ? `was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it` : exitText(exit);
+    const how = exit.underway ? underwayText(exit, "this call's wait") : exit.unconfirmed ? `was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it` : exitText(exit);
     const unlisted = exit.unlisted ? " The session couldn't list every process it started, so jobs it started may live on." : '';
     const unreached = exit.unreached?.length ? ` These signals weren't delivered: ${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')}. Their processes may live on.` : '';
     const pending = [...e.unseen.values()].sort((x, y) => x.at - y.at);
@@ -785,6 +789,10 @@ async function firstMatch(re: RegExp, l: Lines, deadline: number, stopped: () =>
 }
 
 const RAN_OUT = `before the ${WAIT_MAX_S} s a call may hold ran out`;
+
+/** A close that joined one under way and whose own wait ended first: what that close had sent the shell by then. */
+const underwayText = (exit: Closed, wait: string): string =>
+  `was still being closed by a close begun earlier when ${wait} ended, ${exit.signal ? `and had been sent ${exit.signal}` : 'and nothing had been sent to it yet'}`;
 
 const endedLine = (c: Command): string => `Command ${c.id}${c.end?.unfollowed ? '' : ' ended'}: ${endingText(c).join(' · ')}.`;
 

@@ -1231,6 +1231,33 @@ test("close returns the reports that fit its result, and keeps the rest for list
   assert.match(listed.text, new RegExp(`\\n\\nNot yet seen:\\n\\[main · command ${shown + 1} · exit 1 `));
 });
 
+test("a close whose wait ends while an earlier close is still under way says so, and names only a signal that close had sent", async () => {
+  const lines: string[] = [];
+  const opened: FakeSession[] = [];
+  const host = new Host({
+    openSession: async (o: OpenOptions) => {
+      const s = new FakeSession(o.name, o);
+      opened.push(s);
+      return s;
+    },
+    shell: '/bin/bash',
+    env: { HOME: '/home/u' },
+    sessionsDir: '/tmp/sessions',
+    startedAt: STARTED,
+    log: (line) => lines.push(line),
+  });
+  await host.call(plain(), 'open', { name: 'main' });
+  await host.call(plain(), 'open', { name: 'other' });
+  opened[0]!.close = async () => ({ code: null, underway: true });
+  assert.equal(
+    (await host.call(plain(), 'close', { name: 'main' })).text,
+    '[main · closed]\nThe shell was still being closed by a close begun earlier when this call\'s wait ended, and nothing had been sent to it yet.',
+  );
+  opened[1]!.close = async () => ({ code: null, signal: 'SIGHUP', underway: true });
+  await host.closeAll();
+  assert.deepEqual(lines, ['session "other" of scope "a": the shell was still being closed by a close begun earlier when the stop\'s wait ended, and had been sent SIGHUP, so processes it started may live on']);
+});
+
 test('stopping the daemon logs each session whose close may have left processes behind', async () => {
   const lines: string[] = [];
   const opened: FakeSession[] = [];
