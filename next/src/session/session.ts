@@ -106,6 +106,38 @@ const MAC_LOOK_EVERY_MS = 250;
 /** How long the shell's own read must have been seen before it counts as a builtin read: a bound on the kernel's delivery of output the shell wrote before it began reading, not a proof. */
 const SHELL_READ_FLOOR_MS = 50;
 
+/** Where one shell's chain of marks stands: what it has drawn, what was typed or sent at its prompt, and the command it runs. */
+interface Chain {
+  expected: Nonce;
+  atPrompt: boolean;
+  inCommand: boolean;
+  submitted: boolean;
+  sentPending: string | undefined;
+  sentOutputs: number;
+  promptAt: Pos | undefined;
+  /** At a shell without integration: `lastWrite` when `promptAt` was taken, so a prompt drawn later with nothing typed since moves it. */
+  promptAtWrite: number;
+  running: Command | undefined;
+  runCommand: Command | undefined;
+  refused: number;
+  cwd: string;
+}
+
+const newChain = (expected: Nonce, cwd: string): Chain => ({
+  expected,
+  atPrompt: false,
+  inCommand: false,
+  submitted: false,
+  sentPending: undefined,
+  sentOutputs: -1,
+  promptAt: undefined,
+  promptAtWrite: -1,
+  running: undefined,
+  runCommand: undefined,
+  refused: 0,
+  cwd,
+});
+
 class LiveSession implements Session {
   readonly name: string;
   readonly pid: number;
@@ -114,23 +146,11 @@ class LiveSession implements Session {
   private readonly pts: string;
   private readonly log: ((line: string) => void) | undefined;
   private readonly shellName: string;
-  private expected: Nonce;
+  private readonly chains: Chain[];
   private readonly recent: string[] = [];
-  private atPrompt = false;
-  private inCommand = false;
-  private submitted = false;
-  private sentPending: string | undefined;
-  private sentOutputs = -1;
-  private promptAt: Pos | undefined;
-  /** At a shell without integration: `lastWrite` when `promptAt` was taken, so a prompt drawn later with nothing typed since moves it. */
-  private promptAtWrite = -1;
   private readonly commands = new Map<number, Command>();
   private commandChars = 0;
-  private running: Command | undefined;
   private lastEnded: Command | undefined;
-  private runCommand: Command | undefined;
-  private refused = 0;
-  private cwdNow: string;
   private exitInfo: Exit | undefined;
   private ptyExit: Exit | undefined;
   private exitDone: Promise<void> | undefined;
@@ -171,8 +191,7 @@ class LiveSession implements Session {
     this.name = o.name;
     this.log = o.log;
     this.pid = p.pid;
-    this.cwdNow = o.cwd;
-    this.expected = nonce;
+    this.chains = [newChain(nonce, o.cwd)];
     this.remember(nonce);
     this.shellName = path.basename(o.shell);
     this.pts = (p as unknown as { ptsName?: string; _pty?: string }).ptsName ?? (p as unknown as { _pty?: string })._pty ?? '';
@@ -216,6 +235,11 @@ class LiveSession implements Session {
     return this.t.lines(0).lines.join('\n').trim();
   }
 
+  /** The chain of the shell `run` types into. */
+  private get top(): Chain {
+    return this.chains[this.chains.length - 1]!;
+  }
+
   private remember(n: Nonce): void {
     this.recent.push(n.random);
     if (this.recent.length > RECENT_NONCES) this.recent.shift();
@@ -229,34 +253,34 @@ class LiveSession implements Session {
 
   private mark(payload: string, at: Pos): boolean {
     const [kind, nonce, ...rest] = payload.split(';');
-    const expected = integration.nonceText(this.expected);
-    if (kind === 'C' && nonce === expected && this.inCommand) return this.refused++, false;
+    const expected = integration.nonceText(this.top.expected);
+    if (kind === 'C' && nonce === expected && this.top.inCommand) return this.top.refused++, false;
     const ok = nonce === expected && !this.exitInfo;
     if (kind === 'C' && ok) return this.started(at, rest[0] ? unescape(rest[0]) : undefined), true;
     if (kind === 'D' && ok) {
       const [next, status, pipe, flags, cwd] = rest;
       const m = /^(\d+)\.(\w+)$/.exec(next ?? '');
-      if (m && Number(m[1]) === this.expected.counter + 1) {
-        this.ended(at, { status: Number(status), pipe: (pipe ?? '').split(' ').filter(Boolean).map(Number), flags: flags ?? '', cwd: unescape(cwd ?? ''), flushed: this.drained(this.expected.counter) });
-        this.expected = { counter: Number(m[1]), random: m[2]! };
-        this.remember(this.expected);
+      if (m && Number(m[1]) === this.top.expected.counter + 1) {
+        this.ended(at, { status: Number(status), pipe: (pipe ?? '').split(' ').filter(Boolean).map(Number), flags: flags ?? '', cwd: unescape(cwd ?? ''), flushed: this.drained(this.top.expected.counter) });
+        this.top.expected = { counter: Number(m[1]), random: m[2]! };
+        this.remember(this.top.expected);
         return true;
       }
     }
     if (kind === 'B' && ok) {
       this.drawnOnce = true;
-      if (this.atPrompt && !this.submitted) this.promptAt = at;
-      else if (this.running) this.drawnWithoutEnd(at);
-      else if (!this.runCommand && (this.promptAt === undefined || at.line > this.promptAt.line)) {
-        this.atPrompt = true;
-        this.submitted = false;
-        this.sentPending = undefined;
-        this.promptAt = at;
+      if (this.top.atPrompt && !this.top.submitted) this.top.promptAt = at;
+      else if (this.top.running) this.drawnWithoutEnd(at);
+      else if (!this.top.runCommand && (this.top.promptAt === undefined || at.line > this.top.promptAt.line)) {
+        this.top.atPrompt = true;
+        this.top.submitted = false;
+        this.top.sentPending = undefined;
+        this.top.promptAt = at;
         this.wake();
       }
       return false;
     }
-    if ((kind === 'C' || kind === 'D' || kind === 'B') && /^\d+\.\d+$/.test(nonce ?? '')) this.refused++;
+    if ((kind === 'C' || kind === 'D' || kind === 'B') && /^\d+\.\d+$/.test(nonce ?? '')) this.top.refused++;
     return false;
   }
 
@@ -276,14 +300,14 @@ class LiveSession implements Session {
   }
 
   private started(at: Pos, text: string | undefined): void {
-    this.inCommand = true;
-    this.atPrompt = false;
-    this.submitted = false;
-    this.sentPending = undefined;
-    this.promptAt = undefined;
+    this.top.inCommand = true;
+    this.top.atPrompt = false;
+    this.top.submitted = false;
+    this.top.sentPending = undefined;
+    this.top.promptAt = undefined;
     const from = at.col > 0 ? at.line + 1 : at.line;
-    let c = this.runCommand;
-    this.runCommand = undefined;
+    let c = this.top.runCommand;
+    this.top.runCommand = undefined;
     if (c) c.from = from;
     else {
       c = { id: this.nextId(), from, startedAt: Date.now() };
@@ -291,45 +315,45 @@ class LiveSession implements Session {
       this.store(c);
       this.startedMono.set(c, mono());
     }
-    this.running = c;
+    this.top.running = c;
     this.wake();
   }
 
   private ended(at: Pos, d: { status: number; pipe: number[]; flags: string; cwd: string; flushed: string }): void {
-    this.inCommand = false;
-    this.atPrompt = true;
-    this.submitted = false;
-    this.sentPending = undefined;
-    this.promptAt = undefined;
-    if (d.cwd) this.cwdNow = d.cwd;
-    const c = this.running ?? this.runCommand;
-    this.running = this.runCommand = undefined;
+    this.top.inCommand = false;
+    this.top.atPrompt = true;
+    this.top.submitted = false;
+    this.top.sentPending = undefined;
+    this.top.promptAt = undefined;
+    if (d.cwd) this.top.cwd = d.cwd;
+    const c = this.top.running ?? this.top.runCommand;
+    this.top.running = this.top.runCommand = undefined;
     if (c) {
-      const end: Omit<Ending, 'ms'> = { at: Date.now(), status: d.status, errexit: d.flags.includes('e'), refusedMarks: this.refused };
+      const end: Omit<Ending, 'ms'> = { at: Date.now(), status: d.status, errexit: d.flags.includes('e'), refusedMarks: this.top.refused };
       if (d.pipe.length > 1) end.pipeline = d.pipe;
       if (d.cwd) end.cwd = d.cwd;
       if (d.flushed) end.flushed = d.flushed;
       this.finish(c, at, end);
     }
-    this.refused = 0;
+    this.top.refused = 0;
     this.wake();
   }
 
   private drawnWithoutEnd(at: Pos): void {
-    const c = this.running;
-    this.running = undefined;
-    this.inCommand = false;
-    this.atPrompt = true;
-    this.submitted = false;
-    this.sentPending = undefined;
-    this.promptAt = at;
-    if (c) this.finish(c, { line: at.line, col: 0 }, { at: Date.now(), errexit: false, refusedMarks: this.refused });
-    this.refused = 0;
+    const c = this.top.running;
+    this.top.running = undefined;
+    this.top.inCommand = false;
+    this.top.atPrompt = true;
+    this.top.submitted = false;
+    this.top.sentPending = undefined;
+    this.top.promptAt = at;
+    if (c) this.finish(c, { line: at.line, col: 0 }, { at: Date.now(), errexit: false, refusedMarks: this.top.refused });
+    this.top.refused = 0;
     this.wake();
   }
 
   private get prompted(): boolean {
-    return this.atPrompt && !this.submitted && this.promptAt !== undefined;
+    return this.top.atPrompt && !this.top.submitted && this.top.promptAt !== undefined;
   }
 
   private finish(c: Command, at: Pos | undefined, end: Omit<Ending, 'ms'>): void {
@@ -374,10 +398,10 @@ class LiveSession implements Session {
     await this.t.settled();
     this.exitInfo = exit;
     if (this.t.disposed) return;
-    const c = this.running ?? this.runCommand;
-    this.running = this.runCommand = undefined;
-    if (c) this.finish(c, undefined, { at: Date.now(), errexit: false, refusedMarks: this.refused });
-    this.atPrompt = false;
+    const c = this.top.running ?? this.top.runCommand;
+    this.top.running = this.top.runCommand = undefined;
+    if (c) this.finish(c, undefined, { at: Date.now(), errexit: false, refusedMarks: this.top.refused });
+    this.top.atPrompt = false;
     if (this.poll) clearTimeout(this.poll);
     const takers = [...this.calls].filter((c) => c.take);
     const took = { kind: 'exited' as const, exit, taken: true, takers: takers.length };
@@ -399,7 +423,7 @@ class LiveSession implements Session {
   private schedulePoll(): void {
     if (!LINUX || this.exitInfo || this.closed) return;
     this.poll = setTimeout(() => {
-      if (!this.atPrompt || this.submitted) this.observe(this.front(), [...this.calls].filter((c) => c.take));
+      if (!this.top.atPrompt || this.top.submitted) this.observe(this.front(), [...this.calls].filter((c) => c.take));
       this.schedulePoll();
     }, POLL_MS);
     this.poll.unref();
@@ -439,7 +463,7 @@ class LiveSession implements Session {
     this.lastLook = mono();
     const shell = proc.info(this.pid);
     const g = shell?.tpgid !== undefined ? { pgrp: shell.pgrp, tpgid: shell.tpgid } : undefined;
-    const command = this.running?.id ?? this.runCommand?.id;
+    const command = this.top.running?.id ?? this.top.runCommand?.id;
     const at = <T extends object>(o: T): T => (command !== undefined ? { ...o, command } : o);
     const program = (process: Process, reads: Array<boolean | undefined>): Front => {
       if (reads.includes(true)) {
@@ -459,24 +483,24 @@ class LiveSession implements Session {
       const reads = proc.readsTerminal(this.pid, this.pts);
       if (this.execed && argv !== undefined && !isShell(argv)) return program({ pgid, argv, shell: false }, [reads]);
       const process: Process = { pgid, argv: argv ?? this.shellName, shell: true };
-      if ((!this.submitted || this.plain) && this.withoutHooks(reads)) {
-        if (this.submitted || !this.promptAt || this.lastWrite === this.promptAtWrite) {
-          this.promptAt = this.t.pos();
-          this.promptAtWrite = this.lastWrite;
+      if ((!this.top.submitted || this.plain) && this.withoutHooks(reads)) {
+        if (this.top.submitted || !this.top.promptAt || this.lastWrite === this.top.promptAtWrite) {
+          this.top.promptAt = this.t.pos();
+          this.top.promptAtWrite = this.lastWrite;
         }
-        this.submitted = false;
-        const open = this.running ?? this.runCommand;
+        this.top.submitted = false;
+        const open = this.top.running ?? this.top.runCommand;
         if (open) {
-          this.running = this.runCommand = undefined;
-          this.inCommand = false;
-          this.finish(open, { line: this.t.pos().line, col: 0 }, { at: Date.now(), errexit: false, refusedMarks: this.refused });
-          this.refused = 0;
+          this.top.running = this.top.runCommand = undefined;
+          this.top.inCommand = false;
+          this.finish(open, { line: this.t.pos().line, col: 0 }, { at: Date.now(), errexit: false, refusedMarks: this.top.refused });
+          this.top.refused = 0;
         }
         const pending = this.pending();
         return { state: 'prompt', since: this.since('prompt'), ...(pending !== undefined && { pending }) };
       }
       const starting = !this.drawnOnce && !this.plain ? { starting: true as const } : {};
-      if (reads && !this.plain && (!this.atPrompt || this.submitted)) {
+      if (reads && !this.plain && (!this.top.atPrompt || this.top.submitted)) {
         const since = this.since(`w:${process.pgid}`);
         if (this.shellReadSettled(process.pgid)) return at({ state: 'waiting', since, process, ...this.echo(`${process.pgid}:${since}`), ...starting });
         return at({ state: 'running', since, process, waitVisible: true, ...starting });
@@ -518,7 +542,7 @@ class LiveSession implements Session {
    * mode, or, with no line editor (dash), reads the terminal itself.
    */
   private withoutHooks(reads: boolean | undefined): boolean {
-    if (this.atPrompt || mono() - Math.max(this.lastOutput, this.lastWrite) < HOOKS_QUIET_MS) return false;
+    if (this.top.atPrompt || mono() - Math.max(this.lastOutput, this.lastWrite) < HOOKS_QUIET_MS) return false;
     if (!this.plain) return false;
     if (reads) return true;
     return proc.modes(this.pts)?.canonical === false;
@@ -535,24 +559,24 @@ class LiveSession implements Session {
 
   /** The prompt's text after its end mark; until output that came after the last `send` here is parsed, what that sent. */
   private pending(): string | undefined {
-    const b = this.promptAt;
-    if (!b) return this.sentPending;
+    const b = this.top.promptAt;
+    if (!b) return this.top.sentPending;
     const cur = this.t.pos();
     if (cur.line > b.line || (cur.line === b.line && cur.col > b.col)) {
       const ls = this.t.lines(b.line, cur.line + 1).lines;
       const text = ls.length === 1 ? ls[0]!.slice(b.col, cur.col) : [ls[0]!.slice(b.col), ...ls.slice(1, -1), ls.at(-1)!.slice(0, cur.col)].join('\n');
       if (text.trim()) return text;
     }
-    const sent = this.sentPending;
-    return sent !== undefined && /[^\x00-\x20\x7f]/.test(sent) && (this.outputs === this.sentOutputs || !this.t.caughtUp) ? sent : undefined;
+    const sent = this.top.sentPending;
+    return sent !== undefined && /[^\x00-\x20\x7f]/.test(sent) && (this.outputs === this.top.sentOutputs || !this.t.caughtUp) ? sent : undefined;
   }
 
   cwd(): string {
-    return this.cwdNow;
+    return this.top.cwd;
   }
 
   current(): Command | undefined {
-    return this.running ?? this.runCommand;
+    return this.top.running ?? this.top.runCommand;
   }
 
   last(): Command | undefined {
@@ -616,7 +640,7 @@ class LiveSession implements Session {
   async run(text: string, opts: { waitMs: number; take?: boolean; signal?: AbortSignal }): Promise<RunOutcome> {
     const deadline = mono() + opts.waitMs;
     const stopped = (): boolean => this.closed || opts.signal?.aborted === true;
-    if (this.atPrompt && !this.submitted && !this.prompted && !stopped()) await this.until(deadline, () => (this.prompted || this.exitInfo || !this.atPrompt || stopped() ? true : undefined), opts.signal);
+    if (this.top.atPrompt && !this.top.submitted && !this.prompted && !stopped()) await this.until(deadline, () => (this.prompted || this.exitInfo || !this.top.atPrompt || stopped() ? true : undefined), opts.signal);
     const f = this.front();
     if (stopped() || f.state !== 'prompt' || f.pending !== undefined) return { kind: 'refused', front: f, took: [] };
     const id = this.nextId();
@@ -626,8 +650,8 @@ class LiveSession implements Session {
     const cf = integration.commandFile(this.plain ? 'none' : this.kind, this.dir, id, text);
     if (cf.files.length) this.files.set(id, cf.files.map((f) => f.path));
     for (const f of cf.files) fs.writeFileSync(f.path, f.body, { mode: 0o600 });
-    this.runCommand = c;
-    this.submitted = true;
+    this.top.runCommand = c;
+    this.top.submitted = true;
     const call = this.enter(opts.take ?? true, opts.signal, id);
     this.lastWrite = mono();
     this.p.write(cf.line);
@@ -655,22 +679,22 @@ class LiveSession implements Session {
     if (stopped()) return unsent(stopped()!);
     const deadline = mono() + opts.waitMs;
     const quiet = opts.quietMs ?? 300;
-    if (this.atPrompt && !this.submitted && !this.prompted) {
-      await this.until(deadline, () => (this.prompted || stopped() || !this.atPrompt ? true : undefined), opts.signal);
-      if (!stopped() && this.atPrompt && !this.prompted) return unsent('timeout');
+    if (this.top.atPrompt && !this.top.submitted && !this.prompted) {
+      await this.until(deadline, () => (this.prompted || stopped() || !this.top.atPrompt ? true : undefined), opts.signal);
+      if (!stopped() && this.top.atPrompt && !this.prompted) return unsent('timeout');
     }
     if (stopped()) return unsent(stopped()!);
     if (!this.prompted) this.frontKey = '';
-    if ((this.atPrompt || this.plain) && !this.submitted) {
+    if ((this.top.atPrompt || this.plain) && !this.top.submitted) {
       if (/[\r\n]/.test(bytes)) {
-        this.submitted = true;
-        this.sentPending = undefined;
-      } else this.sentPending = (this.sentPending ?? '') + bytes;
+        this.top.submitted = true;
+        this.top.sentPending = undefined;
+      } else this.top.sentPending = (this.top.sentPending ?? '') + bytes;
     }
     const call = this.enter(opts.take ?? true, opts.signal);
     const sentAt = (this.lastWrite = mono());
     this.p.write(bytes);
-    this.sentOutputs = this.outputs;
+    this.top.sentOutputs = this.outputs;
     const scan = newScan(from);
     let matched: Match | undefined;
     let by: SendOutcome['by'] = 'timeout';
