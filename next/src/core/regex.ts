@@ -53,10 +53,7 @@ export const MAX_MATCH_INPUT = 64 * 1024;
 /**
  * The smallest match window any accepted pattern gets. A pattern of size
  * MATCH_COST / MIN_WINDOW or more (a thousand literal characters) is matched on
- * exactly this much of a line, at MIN_WINDOW × size units of work: the floor is
- * where the bound on one match gives way to seeing a line's head at all (the
- * house's read of ed4ecac, #22: at 2,048 the thousand-dot pattern cost twice the
- * bound).
+ * exactly this much of a line, at MIN_WINDOW × size units of work.
  */
 export const MIN_WINDOW = 1024;
 
@@ -148,9 +145,7 @@ export function testBounded(re: RegExp, text: string): { matched: boolean; clipp
 /**
  * The one wording of a `clipped` line: longer than the pattern's match window, so only its head was
  * searched. Without `n`, the one line a watch, a service's probe or wait_for matched on its head; with
- * it, the count of such lines a search scanned, matched or not, so they are said to be searched, not
- * matched (the house's read of the 33 commits, #22, comment 6307350650, item 4). Search, wait_for and
- * the watch and service notices said it three ways (a reviewer's read of the fixes for #22).
+ * it, the count of such lines a search scanned, matched or not.
  */
 export function headOnlyText(n?: number): string {
   if (n === undefined) return 'the line is longer than the match window: matched on its head only';

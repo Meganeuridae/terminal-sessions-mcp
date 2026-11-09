@@ -63,7 +63,7 @@ export function classify(v: unknown): Frame {
   const badId = hasId && v.id !== null && !isId(v.id);
   const isResponse = !Object.hasOwn(v, 'method') && (Object.hasOwn(v, 'result') || Object.hasOwn(v, 'error'));
   // A bad id on a request is answered (with id null, as the spec says); on a response it is one more
-  // malformed response, dropped below like the rest (the house's read of 2f357bd, #22).
+  // malformed response, dropped below like the rest.
   if (badId && !isResponse) return { kind: 'invalid', id: null, code: INVALID_REQUEST, message: 'id must be a string or a number' };
   const id = hasId ? (v.id as Id | null) : undefined;
   if (Object.hasOwn(v, 'method')) {

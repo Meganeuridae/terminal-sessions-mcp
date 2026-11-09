@@ -36,10 +36,6 @@ export class ValidationError extends Error {
 const RESERVED_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
 
-/**
- * Why `key` is not a parameter: the declared names within a small edit distance (`wiat` →
- * `wait`), or all of them, the way an unknown key name is answered (the house's read of 1cabc6a, #22).
- */
 function unknownKey(key: string, properties: Record<string, Schema> | undefined): string {
   const names = Object.keys(properties ?? {});
   const k = key.toLowerCase();

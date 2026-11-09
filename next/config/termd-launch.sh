@@ -11,8 +11,8 @@
 # shells inherit it, so files a session creates get the usual permissions.
 set -eu
 : "${HOME:?HOME is not set}"
-# Resolved before leaving the caller's directory, so a relative path to this script works as
-# an absolute one does (the house's read of 59f660b, #22).
+# $0 is relative to the caller's directory when this script is run by a relative path, so it's
+# resolved before the cd.
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$HOME"
 

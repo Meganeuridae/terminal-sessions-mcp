@@ -33,7 +33,7 @@
 
 import { err, type TermError } from './errors.js';
 
-/** A table's own entry for `key`, never one inherited from Object.prototype (`constructor` is no key name; the house's read of ed4ecac, #22). */
+/** A table's own entry for `key`, never one inherited from Object.prototype, such as `constructor`. */
 export const own = <T>(o: Record<string, T> | undefined, key: string): T | undefined => (o !== undefined && Object.hasOwn(o, key) ? o[key] : undefined);
 
 
@@ -182,8 +182,7 @@ function unknown(name: string, prefix = '', base = name): TermError {
  * too: only once the name is known not to be a modifier chord (`C-r` is never `cr`).
  */
 function canonical(name: string, hyphens = false): string | undefined {
-  // Own properties only: `constructor` or `__proto__` is no key, whatever Object.prototype holds
-  // (the house's read of ed4ecac, #22: `constructor` decoded to the text of a function).
+  // Own properties only: `constructor` or `__proto__` is no key, whatever Object.prototype holds.
   const k = name.toLowerCase();
   if (Object.hasOwn(NAMED_KEYS, k)) return k;
   let squeezed = k.replace(/[\s_]/g, '');

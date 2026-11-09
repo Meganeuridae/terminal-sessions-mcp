@@ -1,9 +1,3 @@
-/**
- * The JSON-RPC layer on its own (the house's read of 2f357bd, #22): what each frame shape
- * classifies as — in particular that no response-shaped frame is ever answered, whatever
- * is wrong with it — and that an outbound request settles on its response, its timeout, or
- * the connection's close.
- */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { classify, INTERNAL, INVALID_PARAMS, INVALID_REQUEST, Outbound, RpcError, type Message } from '../src/transport/jsonrpc.js';
