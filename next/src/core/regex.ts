@@ -29,10 +29,11 @@
  * match we timed took 90 ms of CPU on Node 24 and about 2 s on Node 22, on a macos-26-arm64
  * runner: one large pattern's match on one line can hold the daemon, and every session with
  * it, that long. That is one pattern's measurement, not a ceiling.
- * The window never falls under MIN_WINDOW, so the largest patterns accepted
- * (a size of a few thousand) cost up to a few times MATCH_COST; nothing costs
- * more. `execBounded` and `testBounded` match the head of a line within that
- * window and say when they cut (G11: truncation is visible).
+ * The window never falls under MIN_WINDOW, and a pattern whose size passes
+ * MAX_EXPANDED_LENGTH is refused, so a pattern the parser models costs at most
+ * MAX_EXPANDED_LENGTH × MIN_WINDOW units, about twice MATCH_COST. `execBounded`
+ * and `testBounded` match the head of a line within that window and say when
+ * they cut (G11: truncation is visible).
  *
  * Where the engine can't be enabled, caller patterns are refused, saying why: no check of a
  * pattern's shape keeps the backtracking engine bounded. `LINEAR_REGEX` says whether it is on.
@@ -97,7 +98,7 @@ export function compileUserRegex(pattern: string, flags = ''): RegExp {
   } catch (e) {
     throw err('invalid_argument', `invalid pattern: ${(e as Error).message}`);
   }
-  if (!LINEAR_REGEX) throw err('invalid_argument', "patterns can't be used here: this Node's linear-time regex engine can't be enabled, and patterns don't run without it");
+  if (!LINEAR_REGEX) throw err('invalid_argument', "patterns can't be used here: this Node's linear-time regex engine can't be enabled, and patterns don't run without it. Calling again won't help: whoever runs the daemon can run it on a Node that enables the engine. `read` without `match` still gives the lines.");
   const source = base.includes('i') ? foldCase(pattern) : pattern;
   // Syntax the parser does not model is compiled as written, on the smallest window.
   const parsed = parse(source);
@@ -108,12 +109,13 @@ export function compileUserRegex(pattern: string, flags = ''): RegExp {
     final = emit(parsed.node, 1);
     if (final.length > MAX_EXPANDED_LENGTH) throw tooLarge();
     size = parse(final)?.node;
+    if (size !== undefined && sizeOf(size) > MAX_EXPANDED_LENGTH) throw err('invalid_argument', `this pattern's counted repetition makes it too large for one match's budget (a size of ${sizeOf(size)}, past ${MAX_EXPANDED_LENGTH}): use + or * for long runs, or smaller counts`);
   }
   let re: RegExp;
   try {
     re = new RegExp(final, `${base.replace('i', '')}l`);
   } catch {
-    throw err('invalid_argument', 'pattern is not supported by this Node\'s linear-time regex engine');
+    throw err('invalid_argument', 'pattern is not supported by this Node\'s linear-time regex engine; a simpler pattern may be');
   }
   windows.set(re, size === undefined ? MIN_WINDOW : Math.max(MIN_WINDOW, Math.min(MAX_MATCH_INPUT, Math.floor(MATCH_COST / Math.max(1, sizeOf(size))))));
   return re;

@@ -30,6 +30,7 @@ console.log(JSON.stringify({ LINEAR_REGEX, refused }));`;
   assert.equal(out.LINEAR_REGEX, false);
   assert.equal(out.refused?.code, 'invalid_argument');
   assert.match(out.refused?.message ?? '', /linear-time regex engine can't be enabled/);
+  assert.match(out.refused?.message ?? '', /Calling again won't help: whoever runs the daemon can run it on a Node that enables the engine\. `read` without `match` still gives the lines\.$/);
 });
 
 test('regex: catastrophic patterns match in time linear in the input', () => {
@@ -257,4 +258,10 @@ test('nullable optional groups keep JavaScript match priority', () => {
   for (const [pattern, text] of [['a(?:b*?)?', 'ab'], ['e(?:c+?|[W-Zb-eA-z]*?)?', 'eY']]) {
     assert.deepEqual(compileUserRegex(pattern!).exec(text!)?.[0], new RegExp(pattern!).exec(text!)?.[0]);
   }
+});
+
+test('a pattern whose kept repetition multiplies its size past the cap is refused, so no accepted match costs more than a few times the budget', () => {
+  const big = `(${'a'.repeat(900)}){16}`;
+  assert.throws(() => compileUserRegex(big), (e: Error & { code?: string }) => e.code === 'invalid_argument' && /too large for one match's budget/.test(e.message));
+  for (const p of ['.'.repeat(1000), 'a'.repeat(1000), '(\\w+\\s?){1,80}$', '(?:(?:(?:(?:a+)+)+)+)']) assert.doesNotThrow(() => compileUserRegex(p), p);
 });
