@@ -118,6 +118,11 @@ export interface Ending {
   flushed?: string;
   /** How many marks shaped like the session's own, nonce and all, its output carried and were refused. Other programs' OSC 133 marks, such as fish 4's own, aren't counted. */
   refusedMarks: number;
+  /**
+   * A signal `stop` sent stopped the job rather than ending it: the shell took the terminal back and reported `status` as for
+   * an end (128 and the signal's number in bash and zsh, 0 in fish). `jobs` lists it, and `run fg` or `run bg` continues it.
+   */
+  stopped?: true;
 }
 
 export interface Command {
@@ -225,6 +230,8 @@ export interface StopStep {
   withheld?: true;
   /** The front once the step settled or its grace ran out. */
   front: Front;
+  /** The prompt came back with the job stopped, not ended: its group holds a stopped process. `jobs` lists it, and `run fg` or `run bg` continues it. */
+  stopped?: true;
 }
 
 export interface StopOutcome {
@@ -305,7 +312,13 @@ export interface Session {
   send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean; signal?: AbortSignal }): Promise<SendOutcome>;
   /** `match` looks from line `from` on, so lines already there count. */
   wait(until: Until, opts: { waitMs: number; from: number; take?: boolean; signal?: AbortSignal }): Promise<WaitOutcome>;
-  /** Without `signal`, in steps: C-c, typed to the terminal, so it reaches whatever is in front, a shell's own loop included; then TERM, then KILL, each with a grace and each only to the job's group while it is still the shell's. With `signal`, that one step. */
+  /**
+   * Without `signal`, in steps: C-c, typed to the terminal, so it reaches whatever is in front, a shell's own loop included; then TERM,
+   * then KILL, each with a grace and each only to the job's group while it is still the shell's. With `signal`, any the platform has,
+   * that one step. A suspend signal (TSTP, STOP, TTIN, TTOU) stops the job: the prompt comes back, and the step and the command's
+   * ending say `stopped`. A signal the job ignores or handles leaves it running, and the step's front says so once its grace runs
+   * out. At a prompt nothing is in front, so CONT reaches no stopped job: `run fg` or `run bg` continues one.
+   */
   stop(signal?: NodeJS.Signals, opts?: { abort?: AbortSignal }): Promise<StopOutcome>;
   /**
    * Gives the shell now in front the integration, typed, so that `run` types there and its marks give the front, statuses and

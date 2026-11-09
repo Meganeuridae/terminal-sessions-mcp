@@ -125,6 +125,14 @@ interface Chain {
   far?: { kind: integration.FarKind; within: Process; drained: string[] };
 }
 
+/** The job a `stop` with a signal sent it to, and the command running then; once that command ends, whether its group holds a stopped process. */
+interface Signalled {
+  pgid: number;
+  command: number | undefined;
+  checked?: true;
+  stopped?: boolean | undefined;
+}
+
 /** What a shell answered `integrate`'s probe line with: each one's version, empty but for the shell that ran it; `$0` from a shell that named none. */
 interface ProbeAnswer {
   fish: string;
@@ -168,6 +176,8 @@ class LiveSession implements Session {
    * While `integrate` runs: its probe line's answer; the index of the last typed line that acknowledged it ran, and where;
    * once its chain is pushed, that chain, and where its first end mark came.
    */
+  /** The last `stop` with a signal, until the command running then ends. */
+  private signalled: Signalled | undefined;
   private probe: { call: string; answer?: ProbeAnswer; acked?: number; ackedAt?: Pos; chain?: Chain; endAt?: Pos } | undefined;
   private readonly recent: string[] = [];
   private readonly commands = new Map<number, Command>();
@@ -416,6 +426,14 @@ class LiveSession implements Session {
     const to = at ? (at.col > 0 ? at.line + 1 : at.line) : this.t.end();
     c.to = Math.max(to, c.from);
     c.end = { ...end, ms: Math.max(0, Math.round(mono() - (this.startedMono.get(c) ?? mono()))) };
+    const sig = this.signalled;
+    if (sig && sig.command === c.id) {
+      // A suspend signal gives the shell its terminal back with the job stopped, and it reports the command ended.
+      this.signalled = undefined;
+      sig.checked = true;
+      sig.stopped = this.groupStopped(sig.pgid);
+      if (sig.stopped) c.end.stopped = true;
+    }
     this.lastEnded = c;
     if (c.end.flushed && this.commands.get(c.id) === c) {
       this.commandChars += c.end.flushed.length;
@@ -900,6 +918,12 @@ class LiveSession implements Session {
     return proc.descendants(this.pid, true)?.some((d) => d.pgrp === pgid);
   }
 
+  /** Whether group `pgid`, among the shell's descendants, holds a stopped process. */
+  private groupStopped(pgid: number): boolean | undefined {
+    const members = proc.descendants(this.pid, true)?.filter((d) => d.pgrp === pgid);
+    return members && (members.length ? proc.stopped(members) : false);
+  }
+
   async stop(signal?: NodeJS.Signals, opts: { abort?: AbortSignal } = {}): Promise<StopOutcome> {
     const steps: StopStep[] = [];
     let f = this.front();
@@ -942,7 +966,11 @@ class LiveSession implements Session {
     }
     if (signal) {
       if (own) return { steps, front: f, next: 'close' };
+      const sig: Signalled = { pgid: target.pgid, command: f.command };
+      this.signalled = sig;
       await step(signal);
+      const last = steps.at(-1);
+      if (last && !last.refused && !last.withheld && last.front.state === 'prompt' && (sig.checked ? sig.stopped : this.groupStopped(target.pgid))) last.stopped = true;
       return { steps, front: f };
     }
     if (await step('C-c')) return { steps, front: f };

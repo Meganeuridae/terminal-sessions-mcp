@@ -117,19 +117,15 @@ export function onTerminal(shell: number, pts: string): Proc[] | undefined {
   }
 }
 
-/**
- * The groups among `listed` that still hold one of its processes, alive and in the group it was listed in;
- * undefined when that can't be read. An exited process its parent hasn't reaped counts as gone: macOS
- * refuses a signal to a group of only those with EPERM.
- */
-export function held(listed: Proc[]): Set<number> | undefined {
-  const out = new Set<number>();
+/** Each of `listed` still in the group it was listed in, with its state; undefined when that can't be read. */
+function states(listed: Proc[]): Array<{ pgrp: number; state: string }> | undefined {
+  const out: Array<{ pgrp: number; state: string }> = [];
   if (!listed.length) return out;
   try {
     if (LINUX) {
       for (const d of listed) {
         const f = statOf(d.pid);
-        if (f && f[0] !== 'Z' && Number(f[2]) === d.pgrp) out.add(d.pgrp);
+        if (f?.[0] && Number(f[2]) === d.pgrp) out.push({ pgrp: d.pgrp, state: f[0] });
       }
       return out;
     }
@@ -145,12 +141,27 @@ export function held(listed: Proc[]): Set<number> | undefined {
     const group = new Map(listed.map((d) => [d.pid, d.pgrp]));
     for (const line of text.trim().split('\n')) {
       const [p, g, state] = line.trim().split(/\s+/);
-      if (group.get(Number(p)) === Number(g) && !state?.startsWith('Z')) out.add(Number(g));
+      if (state && group.get(Number(p)) === Number(g)) out.push({ pgrp: Number(g), state });
     }
     return out;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The groups among `listed` that still hold one of its processes, alive and in the group it was listed in;
+ * undefined when that can't be read. An exited process its parent hasn't reaped counts as gone: macOS
+ * refuses a signal to a group of only those with EPERM.
+ */
+export function held(listed: Proc[]): Set<number> | undefined {
+  const s = states(listed);
+  return s && new Set(s.filter((x) => !x.state.startsWith('Z')).map((x) => x.pgrp));
+}
+
+/** Whether one of `listed` is stopped, as a suspend signal leaves a job; undefined when that can't be read. */
+export function stopped(listed: Proc[]): boolean | undefined {
+  return states(listed)?.some((x) => /^[Tt]/.test(x.state));
 }
 
 /**

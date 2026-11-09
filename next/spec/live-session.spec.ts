@@ -643,6 +643,47 @@ for (const sh of shells) {
       assert.equal(r.front.state, 'prompt');
     });
 
+    test('a suspend signal stops the job: the prompt comes back, the step and the command say stopped, and run fg brings it back', async () => {
+      const s = await open(shell);
+      // As each ended event is emitted, whether its command says stopped then: a wake is written from it at once.
+      const atEmit = new Map<number, boolean>();
+      s.onEvent((e) => e.kind === 'ended' && atEmit.set(e.command.id, e.command.end?.stopped === true));
+      for (const sig of ['SIGTSTP', 'SIGSTOP', 'SIGTTIN', 'SIGTTOU'] as const) {
+        const r = await s.run('sleep 30', { waitMs: 200 });
+        assert.equal(r.kind, 'running', JSON.stringify(r));
+        await inFront(s, /sleep 30/);
+        const o = await s.stop(sig);
+        assert.deepEqual(o.steps.map((x) => [x.sent, x.front.state, x.stopped]), [[sig, 'prompt', true]], JSON.stringify(o));
+        const c = s.command(r.kind === 'running' ? r.command.id : -1);
+        assert.equal(c?.end?.stopped, true, JSON.stringify(c?.end));
+        assert.equal(atEmit.get(c!.id), true, 'the ended event said stopped as it was emitted');
+        // bash and zsh report 128 and the signal's number, as for a job a signal ended; fish reports 0.
+        assert.equal(c?.end?.status, sh.name === 'fish' ? 0 : 128 + os.constants.signals[sig]);
+        if (sig === 'SIGTSTP') {
+          const cont = await s.stop('SIGCONT');
+          assert.deepEqual([cont.steps.length, cont.front.state], [0, 'prompt'], 'at a prompt nothing is in front');
+        }
+        const fg = await s.run('fg', { waitMs: 500 });
+        assert.equal(fg.kind, 'running', JSON.stringify(fg));
+        await inFront(s, /sleep 30/);
+        const k = await s.stop();
+        assert.deepEqual([k.front.state, k.steps.some((x) => x.stopped)], ['prompt', false], JSON.stringify(k));
+      }
+    });
+
+    test('a signal the job ignores leaves it in front, running, once the grace runs out, and an unknown name is refused', async () => {
+      const s = await open(shell);
+      const from = s.lines(0).to - 1;
+      const r = await s.run(`sh -c 'trap "" USR1; echo USR1_IGNORED; sleep 30'`, { waitMs: 300 });
+      assert.equal((await s.wait({ kind: 'match', pattern: /^USR1_IGNORED$/ }, { waitMs: 10_000, from })).by, 'match');
+      const o = await s.stop('SIGUSR1');
+      assert.deepEqual(o.steps.map((x) => [x.sent, x.front.state, x.stopped]), [['SIGUSR1', 'running', undefined]], JSON.stringify(o));
+      assert.equal(s.command(r.kind === 'running' ? r.command.id : -1)?.end, undefined);
+      const bogus = await s.stop('SIGBOGUS' as NodeJS.Signals);
+      assert.deepEqual(bogus.steps.map((x) => [x.sent, x.refused]), [['SIGBOGUS', 'ERR_UNKNOWN_SIGNAL']]);
+      await s.stop();
+    });
+
     test('stop takes steps, each reported, and never signals the shell', async () => {
       const s = await open(shell);
       await s.run('sleep 30', { waitMs: 200 });
