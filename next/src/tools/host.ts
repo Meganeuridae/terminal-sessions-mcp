@@ -318,7 +318,7 @@ export class Host {
     if (caller.takes && r.lines.from <= e.cursor) e.cursor = Math.max(e.cursor, r.lines.to - r.lines.live);
     const parts = [this.status(e, r.front)];
     for (const c of r.ended) parts.push(`Command ${c.id} ended: ${endingText(c).join(' · ')}.`);
-    if (r.by === 'timeout') parts.push(until ? `The wait ended before the pattern matched${r.clipped ? `; ${headOnlyText(r.clipped)}` : ''}.` : 'Output was still changing when the wait ended.');
+    if (r.by === 'timeout') parts.push(until ? searchEndedText('send', r, false, this.waitMs(a) >= WAIT_MAX_S * 1000) : 'Output was still changing when the wait ended.');
     if (r.matched) parts.push(matchedText(r.matched));
     const used = parts.join('\n').length + 1;
     parts.push(r.screen ? screenText(r.screen, RESULT_MAX_CHARS - used) : this.output(r.lines, undefined, RESULT_MAX_CHARS - used));
@@ -346,7 +346,7 @@ export class Host {
             for (const [id, watch] of e.watches) if (watch.key === key) (e.session.unwatch(id), e.watches.delete(id));
             e.watches.set(e.session.watch(pattern, from), { key, command: undefined });
           }
-          parts.push(`The wait ended first${w.clipped ? `; ${headOnlyText(w.clipped)}` : ''}.${caller.pushes ? ' The match will be reported to you when it comes.' : ' `look` again waits for it.'}`);
+          parts.push(searchEndedText('look', w, caller.pushes, this.waitMs(a) >= WAIT_MAX_S * 1000));
         } else parts.push(`The wait ended first. ${laterText(a.until as 'end' | 'input', caller.pushes, e.session.current() !== undefined, front)}`);
       }
     }
@@ -560,6 +560,21 @@ const UNKNOWN_AFTER_FAILURE: Record<string, string> = {
 };
 
 const capitalized = (s: string): string => `${s[0]?.toUpperCase() ?? ''}${s.slice(1)}`;
+
+function searchEndedText(call: 'send' | 'look', r: { unsearched?: number; clipped?: number }, pushes: boolean, atLongest: boolean): string {
+  const clipped = r.clipped ? `; ${headOnlyText(r.clipped)}` : '';
+  if (!r.unsearched) {
+    if (call === 'send') return `The wait ended before the pattern matched${clipped}.`;
+    return `The wait ended first${clipped}.${pushes ? ' The match will be reported to you when it comes.' : ' `look` again waits for it.'}`;
+  }
+  const n = `${r.unsearched} line${r.unsearched === 1 ? '' : 's'}`;
+  const next = pushes
+    ? ' The match will be reported to you when it comes.'
+    : atLongest
+      ? ' `read` with `match` searches a range of `lines`.'
+      : ' `look` again with a longer `wait` searches them, or `read` with `match` searches a range of `lines`.';
+  return `The wait ended with ${n} not yet searched, and no match in those it searched${clipped}.${next}`;
+}
 
 const reportsText = (n: number): string => `${n} report${n === 1 ? '' : 's'} not yet seen`;
 

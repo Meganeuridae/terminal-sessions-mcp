@@ -906,3 +906,19 @@ test("the host says what the session reports of a match on the screen, an undeli
   s.close = async () => ({ code: null, signal: 'SIGKILL', unconfirmed: true, unlisted: true });
   assert.equal((await host.call(agent(), 'close', { name: 'main', force: true })).text, "[main · closed]\nThe shell was sent SIGKILL, and its exit wasn't seen within the grace after it. Its descendants couldn't be listed, so only the shell was killed, and jobs it started may live on.");
 });
+
+test('a search the wait ended before it reached the end says how many lines it never searched, and what searches them', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.send = async () => ({ sent: true, lines: s.lines(s.out.length), front: s.frontNow, ended: [], by: 'timeout', unsearched: 1200, clipped: 3 });
+  const sent = await host.call(agent(), 'send', { name: 'main', text: 'x', wait_for: 'DONE', wait: 5 });
+  assert.match(sent.text, /\nThe wait ended with 1200 lines not yet searched, and no match in those it searched; 3 lines longer than the match window, searched on their head only\. `look` again with a longer `wait` searches them, or `read` with `match` searches a range of `lines`\./);
+  const longest = await host.call(agent(), 'send', { name: 'main', text: 'x', wait_for: 'DONE', wait: 55 });
+  assert.match(longest.text, /no match in those it searched; 3 lines .* head only\. `read` with `match` searches a range of `lines`\./);
+  s.wait = async () => ({ by: 'timeout', front: s.frontNow, ended: [], unsearched: 1 });
+  assert.match((await host.call(cli(), 'look', { name: 'main', match: 'DONE', wait: 5 })).text, /\nThe wait ended with 1 line not yet searched, and no match in those it searched\. `look` again with a longer `wait` searches them/);
+  assert.match((await host.call(agent(), 'look', { name: 'main', match: 'DONE', wait: 5 })).text, /\nThe wait ended with 1 line not yet searched, and no match in those it searched\. The match will be reported to you when it comes\./);
+  s.wait = async () => ({ by: 'timeout', front: s.frontNow, ended: [] });
+  assert.match((await host.call(agent(), 'look', { name: 'main', match: 'DONE', wait: 5 })).text, /\nThe wait ended first\. The match will be reported to you when it comes\./);
+});
