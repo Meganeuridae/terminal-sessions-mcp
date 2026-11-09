@@ -63,7 +63,7 @@ One daemon per user holds every shell, on a Unix socket in a directory only you 
 
 ## CLI
 
-`tsm [--scope NAME] COMMAND` calls the same eight tools: `tsm run main make test --wait 30`, `tsm look main --until end`, `tsm list`. `run`'s command is one argument as typed (`tsm run main 'make test | tee log'`), or several words, each quoted for the shell; put `--` before words that start with `--`. Use the agent's scope to see its sessions. Nothing `tsm` is shown counts as seen, so the agent is still told of it. `tsm --help` lists the rest.
+`tsm [--scope NAME] COMMAND` calls the same eight tools: `tsm run main make test --wait 30`, `tsm look main --until end`, `tsm list`. `run`'s command is one argument as typed (`tsm run main 'make test | tee log'`), or several words, each quoted for the shell; put `--` before words that start with `--`. Use the agent's scope to see its sessions. Nothing `tsm` is shown counts as seen, so the agent is still told of it. `tsm --json` prints the result's `structuredContent` as one line of JSON instead of its text, for a script. A refusal's JSON names its `error`, and its words go to stderr. `tsm --help` lists the rest.
 
 ## Development
 

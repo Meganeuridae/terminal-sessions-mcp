@@ -22,6 +22,8 @@ test('H9: the CLI maps its words to the eight tools\' arguments', () => {
   assert.deepEqual(parseCli(['run', 'main', '--wait', '5', '--', 'grep', '--color', 'x']), { scope: 'default', call: { tool: 'run', args: { name: 'main', wait: 5, command: 'grep --color x' } } });
   assert.deepEqual(parseCli(['run', 'main']), { error: 'run needs a command' });
   assert.deepEqual(parseCli(['look', 'main', '--bogus', 'x']), { error: 'look takes no --bogus' });
+  assert.deepEqual(parseCli(['--json', '--scope', 'a', 'list']), { scope: 'a', json: true, call: { tool: 'list', args: {} } });
+  assert.deepEqual(parseCli(['--json', 'daemon', 'stop']), { error: "--json prints a tool's result, and `tsm daemon stop` calls no tool" });
 });
 
 test('H9: the CLI calls the daemon in its scope, prints the text, and takes nothing an agent hasn\'t seen', async () => {
@@ -61,6 +63,15 @@ test('H9: the CLI calls the daemon in its scope, prints the text, and takes noth
     const missing = await cli('--scope', 'b', 'look', 'main');
     assert.equal(missing.code, 1);
     assert.match(missing.err, /No session named "main" is open in scope "b"/);
+    const listed = await cli('--json', '--scope', 'a', 'list');
+    assert.equal(listed.code, 0);
+    assert.equal(listed.err, '');
+    assert.match(listed.out, /^[^\n]+\n$/, 'one line of JSON');
+    assert.deepEqual((JSON.parse(listed.out) as { sessions: Array<{ name: string }> }).sessions.map((x) => x.name), ['main']);
+    const refusedJson = await cli('--json', '--scope', 'b', 'look', 'main');
+    assert.equal(refusedJson.code, 1);
+    assert.equal((JSON.parse(refusedJson.out) as { error: string }).error, 'session_not_found');
+    assert.match(refusedJson.err, /^No session named "main" is open in scope "b"/);
   } finally {
     await d.stop('test');
     fs.rmSync(dir, { recursive: true, force: true });

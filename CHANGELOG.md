@@ -28,7 +28,8 @@ with 2.0: a narrower Node range (`engines`), `npm run build` and `npm test` buil
 - **Wakes over MCPL** (feature set `terminal.events`): a command ended that no call was waiting on,
   a program waiting for input (on the kernel's evidence, on Linux), a shell exited, a pattern asked
   for appeared. Nothing else wakes.
-- **The CLI, `tsm`,** calls the same tools; nothing it is shown counts as seen.
+- **The CLI, `tsm`,** calls the same tools; nothing it is shown counts as seen. `tsm --json` prints
+  each result's `structuredContent` as one line of JSON.
 - Shipped host and supervisor configurations in `next/config/`. In the repository, not the package:
   checks against agent-framework's and mcpl-cc-bridge's real host code, in `next/acceptance/`.
 

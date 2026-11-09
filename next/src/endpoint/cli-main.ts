@@ -4,7 +4,7 @@ import { REACH_MS, reach, type Reached } from '../relay.js';
 import { SCOPE_RE, STOP } from './hello.js';
 import { probe, shellQuote } from './socket.js';
 
-export const USAGE = `usage: tsm [--scope NAME] [--socket PATH] COMMAND
+export const USAGE = `usage: tsm [--scope NAME] [--socket PATH] [--json] COMMAND
   open NAME [--cwd DIR] [--cols N] [--rows N]
   run NAME [--wait S] [--notify-on REGEX] [--] COMMAND...
       one argument is a command line as typed ('make test | tee log'); several are its words,
@@ -17,13 +17,15 @@ export const USAGE = `usage: tsm [--scope NAME] [--socket PATH] COMMAND
   close NAME [--force]
   daemon stop        stops the daemon, which ends every shell it holds
 The scope is the one an agent's relay names with --scope ("default" when it names none). What tsm
-is shown is never counted as seen: the agent is still told of it.`;
+is shown is never counted as seen: the agent is still told of it. --json prints the result's
+structuredContent as one line of JSON instead of its text. A refusal's text then goes to stderr.`;
 
 export type CliCall = { tool: string; args: Record<string, unknown> } | { daemonStop: true };
 
 export interface CliOptions {
   scope: string;
   socket?: string;
+  json?: true;
   call: CliCall;
 }
 
@@ -56,17 +58,28 @@ const FLAGS: Record<string, Record<string, (v: string) => [string, unknown]>> = 
 export function parseCli(argv: readonly string[]): CliOptions | { error: string } {
   let scope = 'default';
   let socket: string | undefined;
+  let json = false;
   let i = 0;
-  for (; i < argv.length && argv[i]!.startsWith('--'); i += 2) {
+  while (i < argv.length && argv[i]!.startsWith('--')) {
+    if (argv[i] === '--json') {
+      json = true;
+      i += 1;
+      continue;
+    }
     if (argv[i + 1] === undefined) return { error: `${argv[i]} needs a value` };
     if (argv[i] === '--scope') scope = argv[i + 1]!;
     else if (argv[i] === '--socket') socket = argv[i + 1]!;
     else return { error: `unknown option ${argv[i]}` };
+    i += 2;
   }
   if (!SCOPE_RE.test(scope)) return { error: `--scope ${JSON.stringify(scope)} isn't a scope: 1 to 64 letters, digits, '.', '_' or '-'` };
   const tool = argv[i++];
   if (tool === undefined) return { error: 'no command given' };
-  if (tool === 'daemon') return argv[i] === 'stop' && argv.length === i + 1 ? { scope, ...(socket ? { socket } : {}), call: { daemonStop: true } } : { error: 'the daemon command is `tsm daemon stop`' };
+  if (tool === 'daemon') {
+    if (argv[i] !== 'stop' || argv.length !== i + 1) return { error: 'the daemon command is `tsm daemon stop`' };
+    if (json) return { error: '--json prints a tool\'s result, and `tsm daemon stop` calls no tool' };
+    return { scope, ...(socket ? { socket } : {}), call: { daemonStop: true } };
+  }
   const flags = FLAGS[tool];
   if (!flags) return { error: `unknown command ${tool}` };
   const args: Record<string, unknown> = {};
@@ -100,7 +113,7 @@ export function parseCli(argv: readonly string[]): CliOptions | { error: string 
     if (!words.length) return { error: 'run needs a command' };
     args.command = words.length === 1 ? words[0] : words.map(shellQuote).join(' ');
   } else if (words.length) return { error: `${tool} takes no ${JSON.stringify(words[0])}` };
-  return { scope, ...(socket ? { socket } : {}), call: { tool, args } };
+  return { scope, ...(socket ? { socket } : {}), ...(json ? { json: true as const } : {}), call: { tool, args } };
 }
 
 class ConnectionClosed extends Error {
@@ -224,8 +237,12 @@ export async function runCli(o: CliOptions & { socket: string; version: string; 
       o.stderr.write(`tsm: ${(m.error as { message: string }).message}\n`);
       return 1;
     }
-    const result = m.result as { content: Array<{ text: string }>; isError?: boolean };
-    (result.isError ? o.stderr : o.stdout).write(`${result.content.map((c) => c.text).join('\n')}\n`);
+    const result = m.result as { content: Array<{ text: string }>; structuredContent?: unknown; isError?: boolean };
+    const text = `${result.content.map((c) => c.text).join('\n')}\n`;
+    if (o.json) {
+      o.stdout.write(`${JSON.stringify(result.structuredContent ?? null)}\n`);
+      if (result.isError) o.stderr.write(text);
+    } else (result.isError ? o.stderr : o.stdout).write(text);
     return result.isError ? 1 : 0;
   } catch (e) {
     o.stderr.write(`tsm: ${(e as Error).message}\n`);
