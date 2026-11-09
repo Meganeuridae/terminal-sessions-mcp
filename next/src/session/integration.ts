@@ -25,14 +25,16 @@ const fishq = (s: string): string => `'${s.replaceAll('\\', '\\\\').replaceAll("
 
 export const COMMAND_FILE = 'tsm-cmd-';
 
-const BASH_RC = `if [ -r /etc/profile ]; then . /etc/profile; fi
+const BASH_STARTUP = `if [ -r /etc/profile ]; then . /etc/profile; fi
 if [ -r "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile"
 elif [ -r "$HOME/.bash_login" ]; then . "$HOME/.bash_login"
 elif [ -r "$HOME/.profile" ]; then . "$HOME/.profile"
 fi
 HISTFILE=@HISTFILE@
 HISTIGNORE="$\{HISTIGNORE:+$HISTIGNORE:} . '*/${COMMAND_FILE}*'"
-__tsm_c=@COUNTER@
+`;
+
+const BASH_HOOKS = `__tsm_c=@COUNTER@
 __tsm_r=@RANDOM@
 __tsm_next() {
   __tsm_c=$((__tsm_c + 1))
@@ -52,7 +54,7 @@ __tsm_esc() {
   __tsm_ret=$\{__tsm_ret//$'\\033'/\\\\x1b}
 }
 __tsm_drain() {
-  /bin/sh @DRAIN@ @DRAINED@."$__tsm_c" 2>/dev/null
+  @DRAIN_CALL@
 }
 __tsm_end() {
   local __tsm_s=$? __tsm_p="$\{PIPESTATUS[*]}" __tsm_f __tsm_n __tsm_cwd __tsm_j=$- __tsm_t
@@ -113,10 +115,12 @@ if (( $\{+TSM_USER_ZDOTDIR} )); then __tsm_uzd=$TSM_USER_ZDOTDIR; fi
 unset TSM_USER_ZDOTDIR
 ${ZSH_FORWARD('.zshenv', false)}`;
 
-const ZSH_HOOKS = `if (( $\{+__tsm_uzd} )); then ZDOTDIR=$__tsm_uzd; else unset ZDOTDIR; fi
+const ZSH_STARTUP = `if (( $\{+__tsm_uzd} )); then ZDOTDIR=$__tsm_uzd; else unset ZDOTDIR; fi
 unset __tsm_uzd
 HISTFILE=@HISTFILE@
-unsetopt PROMPT_SP PROMPT_CR
+`;
+
+const ZSH_HOOKS = `unsetopt PROMPT_SP PROMPT_CR
 typeset -g __tsm_c=@COUNTER@ __tsm_r=@RANDOM@ __tsm_ret __tsm_bs=
 __tsm_next() {
   __tsm_c=$((__tsm_c + 1))
@@ -132,7 +136,7 @@ __tsm_esc() {
   __tsm_ret=$\{__tsm_ret//$'\\e'/\\\\x1b}
 }
 __tsm_drain() {
-  /bin/sh @DRAIN@ @DRAINED@."$__tsm_c" 2>/dev/null
+  @DRAIN_CALL@
 }
 __tsm_end() {
   local __tsm_s=$? __tsm_p="$\{(j: :)pipestatus}" __tsm_f __tsm_n __tsm_cwd
@@ -165,10 +169,9 @@ __tsm_hook() {
 }
 __tsm_hook
 zshaddhistory_functions=($\{zshaddhistory_functions:#__tsm_nohist} __tsm_nohist)
-unset __tsm_shim
 `;
 
-const FISH_INIT = `set -g fish_history ''
+const FISH_HOOKS = `set -g fish_history ''
 set -g __tsm_c @COUNTER@
 set -g __tsm_r @RANDOM@
 function __tsm_next
@@ -201,7 +204,7 @@ function __tsm_start --on-event fish_preexec
     printf '\\e]133;C;%s.%s;%s\\a' $__tsm_c $__tsm_r "$t"
 end
 function __tsm_drain
-    /bin/sh @DRAIN@ @DRAINED@.$__tsm_c 2>/dev/null
+    @DRAIN_CALL@
 end
 function __tsm_d
     begin; __tsm_drain; end | string collect -N >/dev/null
@@ -253,6 +256,7 @@ __tsm_wrap
 
 const fill = (text: string, o: { nonce: Nonce; dir: string }, quote: (s: string) => string): string =>
   text
+    .replaceAll('@DRAIN_CALL@', `/bin/sh @DRAIN@ @DRAINED@.${quote === fishq ? '$__tsm_c' : '"$__tsm_c"'} 2>/dev/null`)
     .replaceAll('@COUNTER@', String(o.nonce.counter))
     .replaceAll('@RANDOM@', o.nonce.random)
     .replaceAll('@HISTFILE@', quote(path.join(o.dir, 'history')))
@@ -298,7 +302,7 @@ export function prepare(shell: string, dir: string, nonce: Nonce, env: Record<st
   if (kind !== 'none') fs.writeFileSync(path.join(dir, 'drain.sh'), DRAIN, { mode: 0o600 });
   if (kind === 'bash') {
     const rc = path.join(dir, 'rc.bash');
-    fs.writeFileSync(rc, fill(BASH_RC, o, sq), { mode: 0o600 });
+    fs.writeFileSync(rc, fill(BASH_STARTUP + BASH_HOOKS, o, sq), { mode: 0o600 });
     return { kind, args: ['--rcfile', rc, '-i'], env: {} };
   }
   if (kind === 'zsh') {
@@ -308,14 +312,14 @@ export function prepare(shell: string, dir: string, nonce: Nonce, env: Record<st
     fs.writeFileSync(path.join(shim, '.zprofile'), ZSH_FORWARD('.zprofile', false), { mode: 0o600 });
     fs.writeFileSync(path.join(shim, '.zshrc'), ZSH_FORWARD('.zshrc', false), { mode: 0o600 });
     fs.writeFileSync(path.join(shim, '.zlogin'), ZSH_FORWARD('.zlogin', true), { mode: 0o600 });
-    fs.writeFileSync(path.join(shim, 'tsm.zsh'), fill(ZSH_HOOKS, o, sq), { mode: 0o600 });
+    fs.writeFileSync(path.join(shim, 'tsm.zsh'), fill(`${ZSH_STARTUP}${ZSH_HOOKS}unset __tsm_shim\n`, o, sq), { mode: 0o600 });
     const add: Record<string, string> = { ZDOTDIR: shim };
     if (env.ZDOTDIR !== undefined) add.TSM_USER_ZDOTDIR = env.ZDOTDIR;
     return { kind, args: ['-l', '-i'], env: add };
   }
   if (kind === 'fish') {
     const init = path.join(dir, 'init.fish');
-    fs.writeFileSync(init, fill(FISH_INIT, o, fishq), { mode: 0o600 });
+    fs.writeFileSync(init, fill(FISH_HOOKS, o, fishq), { mode: 0o600 });
     return { kind, args: ['-l', '-i', '-C', `source ${fishq(init)}`], env: {} };
   }
   return { kind, args: [], env: {} };
@@ -358,4 +362,137 @@ export function commandFile(kind: ShellKind, dir: string, id: number, text: stri
     return { files: [{ path: file, body }, { path: textFile, body: text }], line: ` eval (__tsm_collect ${fishq(file)} $status ${fishq(textFile)})\r` };
   }
   return { files: [], line: `${text}\r` };
+}
+
+/**
+ * A shell given the integration by typing, as through `ssh`: it shares no files with the session, so
+ * everything reaches it on typed lines, and its drain sends what it read back on the terminal.
+ */
+export type FarKind = Exclude<ShellKind, 'none'>;
+
+/** The probe line: valid in bash, zsh and fish, it prints a K mark with each one's version, empty but for the shell that runs it. */
+export const PROBE_LINE = ` printf '\\033]133;K;;%s;%s;%s\\007' "$FISH_VERSION" "$ZSH_VERSION" "$BASH_VERSION"\r`;
+/** Typed only when the probe named none of the three, so a POSIX shell runs it: a K mark with `$0`. */
+export const PROBE_ZERO_LINE = ` printf '\\033]133;K;;;;;%s\\007' "$0"\r`;
+
+/**
+ * The drain for a shell given the integration by typing, run as `sh -c` with the nonce its end mark
+ * closes. It reads as the local drain does, and sends each piece it read as an F mark, in hex, to the
+ * terminal, before the hook prints its end mark. It turns echo off while it reads: text still arriving
+ * would otherwise be echoed into the middle of a mark.
+ */
+const DRAIN_FAR = `trap '' INT
+PATH=/usr/bin:/bin:$PATH
+m=$(stty -g 2>/dev/null) || exit 0
+stty -icanon -echo min 0 time 0 2>/dev/null || { stty "$m" 2>/dev/null; exit 0; }
+n=0
+while [ $n -lt 1048576 ]; do
+  c=$(dd bs=65536 count=1 2>/dev/null | od -A n -v -t x1 | tr -d ' \\n')
+  [ -n "$c" ] || break
+  printf '\\033]133;F;%s;%s\\007' "$1" "$c"
+  n=$((n + \${#c} / 2))
+  stty min 0 time 1 2>/dev/null
+done
+stty "$m" 2>/dev/null
+`;
+
+/**
+ * Bytes a typed line carries as they are, inside single quotes: printable ASCII but for the quote, the backslash and `!`, which no
+ * line editor acts on there. Every other byte goes as a `\0ooo` escape, which `printf '%b'` decodes.
+ */
+const SAFE = new Set(Array.from({ length: 0x7f - 0x20 }, (_, i) => i + 0x20).filter((b) => b !== 0x27 && b !== 0x5c && b !== 0x21));
+const escaped = (text: string): string => {
+  let out = '';
+  for (const b of Buffer.from(text, 'utf8')) out += SAFE.has(b) ? String.fromCharCode(b) : `\\0${b.toString(8).padStart(3, '0')}`;
+  return out;
+};
+
+/**
+ * The longest piece of the hooks on one typed line. Until its line editor starts, a shell reads the terminal in canonical mode,
+ * where macOS holds at most 1024 bytes (`getconf MAX_CANON` and `MAX_INPUT`), so the hooks go in pieces that each fit. Typed all at once,
+ * pieces arrived cut there, so each is typed only once the line before it has run and printed its P mark.
+ */
+const PIECE = 768;
+
+/** The P mark a typed line prints as its last act, so the next is typed only once the shell has run it: `call` names the call, and `i` the line. */
+const ack = (kind: FarKind, call: string, i: number): string => (kind === 'fish' ? `; printf '\\e]133;P;${call}.${i}\\a'` : `; builtin printf '\\033]133;P;${call}.${i}\\007'`);
+
+/** After the hooks, so these replace what the hooks define: the drain's script, a filter that keeps typed lines out of history, and a way for an eval to end with a status. */
+const FAR_POST: Record<FarKind, string> = {
+  bash: `__tsm_setst() { return "$1"; }
+__tsm_pre() {
+  case $\{PS0-} in *'133;C;'*) ;; *) builtin printf '\\033]133;C;%s.%s;\\007' "$__tsm_c" "$__tsm_r" ;; esac
+  builtin history -s -- "$__tsm_t"
+}
+HISTIGNORE="$\{HISTIGNORE:+$HISTIGNORE:}"' __tsm_*'
+__tsm_dr=@DR@
+`,
+  zsh: `__tsm_setst() { return $1 }
+__tsm_pre() { builtin print -s -- "$__tsm_t" }
+__tsm_nohist() { [[ $1 != ' __tsm_'* ]] }
+__tsm_dr=@DR@
+`,
+  fish: `function __tsm_pre
+    if test (string split -f1 . -- $FISH_VERSION) -ge 4
+        builtin history append -- $__tsm_t
+    end
+end
+set -g __tsm_dr @DR@
+`,
+};
+
+const FAR_DRAIN_CALL: Record<FarKind, string> = {
+  bash: '/bin/sh -c "$__tsm_dr" sh "$__tsm_c.$__tsm_r" 2>/dev/null >/dev/tty',
+  zsh: '/bin/sh -c "$__tsm_dr" sh "$__tsm_c.$__tsm_r" 2>/dev/null >/dev/tty',
+  fish: '/bin/sh -c "$__tsm_dr" sh $__tsm_c.$__tsm_r 2>/dev/null >/dev/tty',
+};
+
+/**
+ * The lines that give a shell of `kind` the hooks, its chain starting at `nonce`, each to be typed once the one before has printed
+ * its P mark, which carries `call` and the line's index. The first turns saving history to a file off: zsh and fish can save a line as it's entered,
+ * and bash a line it ran before a later one runs, so it carries no nonce. The pieces of the escaped program go into a variable,
+ * and the last line prints its P mark, then decodes and evals it; the prompt that follows is its acknowledgement. What the shell
+ * prints between that mark and its first end mark came from taking the hooks.
+ */
+export function farHooks(kind: FarKind, nonce: Nonce, call: string): string[] {
+  const quote = kind === 'fish' ? fishq : sq;
+  const hooks = kind === 'bash' ? BASH_HOOKS : kind === 'zsh' ? ZSH_HOOKS : FISH_HOOKS;
+  const program = (hooks + FAR_POST[kind])
+    .replaceAll('@DRAIN_CALL@', FAR_DRAIN_CALL[kind])
+    .replaceAll('@DR@', quote(DRAIN_FAR))
+    .replaceAll('@COUNTER@', String(nonce.counter))
+    .replaceAll('@RANDOM@', nonce.random);
+  const e = escaped(program);
+  const pieces: string[] = [];
+  for (let i = 0; i < e.length; ) {
+    let j = Math.min(i + PIECE, e.length);
+    // An escape is five characters, so a piece never ends inside one.
+    const k = e.lastIndexOf('\\', j - 1);
+    if (j < e.length && k > j - 5) j = k;
+    pieces.push(e.slice(i, j));
+    i = j;
+  }
+  const last = pieces.length + 1;
+  if (kind === 'fish')
+    return [` set -g fish_history ''${ack(kind, call, 0)}\r`, ...pieces.map((p, i) => ` set ${i ? '' : '-g '}__tsm_h ${i ? '"$__tsm_h"' : ''}'${p}'${ack(kind, call, i + 1)}\r`), ` true${ack(kind, call, last)}; eval (printf '%b' "$__tsm_h" | string collect); set -e __tsm_h\r`];
+  return [` unset HISTFILE${ack(kind, call, 0)}\r`, ...pieces.map((p, i) => ` __tsm_h=${i ? '$__tsm_h' : ''}'${p}'${ack(kind, call, i + 1)}\r`), ` true${ack(kind, call, last)}; eval "$(printf '%b' "$__tsm_h")"; unset __tsm_h\r`];
+}
+
+/**
+ * The longest line `run` types into a shell given the integration by typing. zsh's and bash 3's line editors take time that grows
+ * with its square: on GitHub's macOS runners, in one run each, an 8 KiB line took them 0.8 to 1.5 s, and 16 KiB 2.5 to 4.8 s.
+ */
+export const FAR_MAX_TYPED = 8192;
+
+/**
+ * The line `run` types into a shell given the integration by typing, at its prompt. The text goes once, escaped, into a variable;
+ * `__tsm_pre` adds it to the shell's history (and in bash 3, with no PS0, prints the start mark), and an eval runs it followed by a
+ * blank line, which ends a trailing backslash's continuation, and the line that keeps its statuses, so its pipeline's are its own.
+ */
+export function farCommand(kind: FarKind, text: string): string {
+  const e = escaped(text);
+  if (kind === 'fish')
+    return ` set -g __tsm_t (printf '%b' '${e}' | string collect -N); __tsm_pre; eval (printf '%s\\n\\nset -g __tsm_fps $pipestatus $status' "$__tsm_t" | string collect); __tsm_setst $__tsm_fps[-1]\r`;
+  const ps = kind === 'zsh' ? '$\{(j: :)pipestatus}' : '$\{PIPESTATUS[*]}';
+  return ` __tsm_t=$(printf '%b' '${e}'); __tsm_pre; builtin eval "$__tsm_t"$'\\n\\n''__tsm_st=$? __tsm_ps="${ps}"'; __tsm_hook 2>/dev/null; __tsm_setst "$__tsm_st"\r`;
 }

@@ -64,26 +64,33 @@ export interface Process {
   shell: boolean;
 }
 
+/**
+ * In `prompt` and `running`: the state is a shell's given the integration with `integrate`, read from its marks alone, and this is
+ * the local program it runs under, which holds the terminal (such as `ssh host`). Absent for the session's own shell.
+ */
+export type Within = { within?: Process };
+
 export type Front =
-  | {
+  | ({
       state: 'prompt';
       since: number;
       /** Text sent at this prompt and not yet submitted, as far as the session knows: `run` refuses while it's there. */
       pending?: string;
-    }
-  | {
+    } & Within)
+  | ({
       state: 'running';
       since: number;
+      /** With `within`, that program: the kernel sees nothing past it. */
       process: Process;
       /** The command that put it there, when a start mark named one. */
       command?: number;
-      /** false when the kernel won't show whether it reads the terminal (no ptrace access, or not Linux), so `waiting` can't be seen. */
+      /** false when the kernel won't show whether it reads the terminal (no ptrace access, or not Linux), so `waiting` can't be seen; always false with `within`. */
       waitVisible: boolean;
       /** The shell hasn't drawn its first prompt yet: it is still running its startup files. */
       starting?: true;
-    }
+    } & Within)
   | {
-      /** Blocked reading this terminal, on the kernel's evidence. Programs that wait in poll (a REPL, ssh) show as `running`. */
+      /** Blocked reading this terminal, on the kernel's evidence. Programs that wait in poll (a REPL, ssh) show as `running`, and so does everything past a `within`. */
       state: 'waiting';
       since: number;
       process: Process;
@@ -160,8 +167,12 @@ export interface Match {
 export type Took = Array<Extract<SessionEvent, { kind: 'ended' | 'waiting' | 'exited' }> & { takers: number }>;
 
 export type RunOutcome =
-  /** Not at a prompt, text pending at it, or the shell exited: `front` says which. Nothing was typed. */
-  | { kind: 'refused'; front: Front; took: Took }
+  /**
+   * Not at a prompt, text pending at it, or the shell exited: `front` says which. Nothing was typed.
+   * `tooLong`: a shell given the integration with `integrate` gets the text on one typed line, and this one, `typed` characters,
+   * is longer than `max`. Printable ASCII types as itself, but for `'`, `\` and `!`; every other byte types as a five-character escape.
+   */
+  | { kind: 'refused'; front: Front; took: Took; tooLong?: { typed: number; max: number } }
   | { kind: 'ended'; command: Command; front: Front; took: Took }
   | { kind: 'running'; command: Command; front: Front; took: Took };
 
@@ -223,7 +234,35 @@ export interface StopOutcome {
   next?: 'close';
   /** `abort` aborted it: no step after the one under way was taken. */
   cancelled?: true;
+  /** A shell given the integration is in front (`front.within`): C-c is the only step, and a `signal` isn't sent, since it would reach that local program, not the far job. */
+  within?: true;
 }
+
+export type IntegrateOutcome =
+  /**
+   * The shell in front answered the probe and drew a prompt with the hooks: `front` is that prompt, with `within`. `printed` is what
+   * the shell printed while it took them, a line each, from the last typed line's run to its first end mark; with nothing printed, it's absent.
+   */
+  | { kind: 'integrated'; shell: 'bash' | 'zsh' | 'fish'; version: string; printed?: string[]; front: Front }
+  /**
+   * Nothing was typed: a shell with the integration is at its prompt, drawn or not (the session's own, or one given it before), the
+   * shell exited, or the call was cancelled first. `sent`: a line was sent at that prompt and hasn't started yet, so what is in front
+   * may be a question, such as a password, that anything typed would answer. `canonical`: the terminal is in canonical mode, so what
+   * is in front reads whole lines itself, such as a password or a yes/no question, or a shell without a line editor. The line editors
+   * of bash, zsh and fish hold it out of that mode at their prompts. Through a relay that already holds it raw, such as an ssh
+   * given the integration, a question further on can't be seen.
+   */
+  | { kind: 'refused'; sent?: true; canonical?: true; front: Front }
+  /** A shell answered the probe that has no hooks here (sh, dash, ash, and others). Nothing more was typed. `shell` is its `$0`, when it gave one. */
+  | { kind: 'unsupported'; shell?: string; front: Front }
+  /**
+   * The call stopped before the step it names was complete, and nothing more is typed. `probe`: the probe line was typed and no
+   * shell answered. `hooks`: the hooks go in pieces, each typed once the one before has run, and they weren't all typed, or the
+   * last was and no prompt with them was drawn yet. Only the last puts them to use: if it was typed and a prompt is drawn later,
+   * the shell has the integration from then on. `exited`: the session's shell exited, or what the probe or the hooks were typed into
+   * ended, and a shell below it came back to its prompt.
+   */
+  | { kind: 'incomplete'; step: 'probe' | 'hooks'; by: 'timeout' | 'cancelled' | 'exited' | 'closed'; front: Front };
 
 /**
  * Events, each emitted once. `taken` is true when a call's outcome already gave it (`run`, `send` or
@@ -248,7 +287,7 @@ export interface Session {
 
   /** What is in front now, read from the kernel at the call. */
   front(): Front;
-  /** The directory as of the last accepted end mark, else the one it opened in. */
+  /** The directory as of the last accepted end mark, else the one it opened in: a shell's given the integration while it's in front. */
   cwd(): string;
   /** The command running now, and the last that ended. */
   current(): Command | undefined;
@@ -268,6 +307,14 @@ export interface Session {
   wait(until: Until, opts: { waitMs: number; from: number; take?: boolean; signal?: AbortSignal }): Promise<WaitOutcome>;
   /** Without `signal`, in steps: C-c, typed to the terminal, so it reaches whatever is in front, a shell's own loop included; then TERM, then KILL, each with a grace and each only to the job's group while it is still the shell's. With `signal`, that one step. */
   stop(signal?: NodeJS.Signals, opts?: { abort?: AbortSignal }): Promise<StopOutcome>;
+  /**
+   * Gives the shell now in front the integration, typed, so that `run` types there and its marks give the front, statuses and
+   * the directory until it exits; then the shell it was typed from is in front again. It types a probe line, then that shell's hooks,
+   * into whatever holds the terminal, so it's for a shell at its prompt. Refused at the prompt of a shell with the integration, from
+   * its end mark on, while a line sent there hasn't started, and while the terminal is in canonical mode. If what it types into ends
+   * before the hooks are all typed, it stops.
+   */
+  integrate(opts: { waitMs: number; signal?: AbortSignal }): Promise<IntegrateOutcome>;
   /** Lists the processes on the session's terminal first. Then it hangs up the shell, again every 500 ms while it is there, and KILLs it if it is still there after a grace. Once the shell is gone, it hangs up each listed group, and continues each group the hangup reached. A process that left the terminal with setsid isn't listed, so it lives on. With `force`, at once KILLs every listed group and every group the shell started, then the shell. Resolves with the exit, at once if it had exited. */
   close(opts?: { force?: boolean }): Promise<Closed>;
 
