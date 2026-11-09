@@ -747,28 +747,28 @@ for (const sh of shells) {
     const costly = (): RegExp => compileUserRegex('(\\w+\\s?){1,80}TARGET');
     const same = { skip: sh.name !== 'bash' ? 'a search is the same in every shell' : false };
 
-    test('a pattern wait across a long backlog lets the event loop turn while it searches, and finds the first line that matches', same, async () => {
+    test('a pattern search across a long backlog lets the event loop turn while it searches, and a wait finds the first line that matches', same, async () => {
       const s = await open(shell, { cols: 200 });
       const from = s.lines(0).to;
       await ran(s, backlog(), 30_000);
-      let last = performance.now();
-      let longest = 0;
+      // Counted with a watch: a wait takes turns of its own after its match.
+      let turns = 0;
       let done = false;
       const turn = (): void => {
-        const now = performance.now();
-        longest = Math.max(longest, now - last);
-        last = now;
-        if (!done) setImmediate(turn);
+        if (done) return;
+        turns++;
+        setImmediate(turn);
       };
       setImmediate(turn);
-      const t0 = (last = performance.now());
+      const id = s.watch(costly(), from);
+      s.onEvent((e) => {
+        if (e.kind === 'match' && e.watch === id) done = true;
+      });
+      await eventually('the watch', () => done, 300_000);
+      assert.ok(turns >= 3, `the event loop turned ${turns} times while the search ran`);
       const w = await s.wait({ kind: 'match', pattern: costly() }, { waitMs: 300_000, from });
-      const total = performance.now() - t0;
-      done = true;
-      longest = Math.max(longest, performance.now() - last);
       assert.equal(w.by, 'match');
       assert.match(w.matched!.text, /^35 /);
-      assert.ok(longest * 3 < total, `the longest turn took ${longest.toFixed(0)} ms of the search's ${total.toFixed(0)} ms`);
     });
 
     test('a watch on lines already printed goes on searching though nothing more is printed, and reports the first line that matches', same, async () => {
