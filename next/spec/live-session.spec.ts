@@ -476,10 +476,18 @@ for (const sh of shells) {
       assert.equal(r.kind, 'running');
       const read = process.arch === 'x64' ? '0' : '63';
       const terminal = fs.readlinkSync(`/proc/${s.pid}/fd/0`);
+      /** What descriptor `fd` names, or undefined when the shell closed it after the read was seen. */
+      const named = (fd: number): string | undefined => {
+        try {
+          return fs.readlinkSync(`/proc/${s.pid}/fd/${fd}`);
+        } catch {
+          return undefined;
+        }
+      };
       const until = Date.now() + 15_000;
       for (;;) {
         const sc = fs.readFileSync(`/proc/${s.pid}/syscall`, 'utf8').split(' ');
-        if (sc[0] === read && fs.readlinkSync(`/proc/${s.pid}/fd/${Number.parseInt(sc[1] ?? '', 16)}`) === terminal) break;
+        if (sc[0] === read && named(Number.parseInt(sc[1] ?? '', 16)) === terminal) break;
         if (Date.now() > until) assert.fail(`the shell never read the terminal: ${sc.join(' ')}`);
       }
       assert.notEqual(s.front().state, 'waiting');
