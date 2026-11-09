@@ -1222,6 +1222,21 @@ test('stop is an error when the step asked for wasn\'t carried out, and not when
   assert.equal((await host.call(plain(), 'stop', { name: 'main' })).isError, undefined);
 });
 
+test('a signal asked for at the prompt or after the shell exited is not sent, and stop says so as an error', async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  for (const front of [{ state: 'prompt' as const, since: Date.now() }, { state: 'exited' as const, since: Date.now(), exit: { code: 0 } }]) {
+    s.stop = async () => ({ steps: [], front });
+    const term = await host.call(plain(), 'stop', { name: 'main', signal: 'TERM' });
+    assert.equal(term.isError, true, front.state);
+    assert.equal(term.structured.error, 'not_sent', front.state);
+    assert.match(term.text, /\nNothing was sent: /, front.state);
+  }
+  s.stop = async () => ({ steps: [], front: { state: 'prompt' as const, since: Date.now() } });
+  assert.equal((await host.call(plain(), 'stop', { name: 'main' })).isError, undefined);
+});
+
 test('a timed-out look tells a plain host the argument that waits again', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });

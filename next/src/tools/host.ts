@@ -501,7 +501,7 @@ export class Host {
     } else if (!r.steps.length) steps.push(`Nothing was sent: ${r.front.state === 'unknown' ? refusalAdvice(r.front, 'stop') : `${frontText(r.front, now)}.`}`);
     if (r.next === 'close') steps.push('What runs is the shell itself, or a job that outlived KILL: only `close` ends it.');
     const structured = { steps: r.steps, front: r.front, ...(r.next ? { next: r.next } : {}), ...(r.within ? { within: true } : {}) };
-    const notSent = farSignal || r.steps.some((s) => s.refused || s.withheld) || (a.signal !== undefined && r.next === 'close' && r.steps.length === 0) || (r.front.state === 'unknown' && r.steps.length === 0);
+    const notSent = farSignal || r.steps.some((s) => s.refused || s.withheld) || (r.steps.length === 0 && (a.signal !== undefined || r.front.state === 'unknown'));
     const text = [this.status(e, r.front), ...steps].join('\n');
     return notSent ? refused(text, { error: 'not_sent', ...structured }) : ok(text, structured);
   }
