@@ -75,6 +75,7 @@ Nine tools. The results of `open`, `run`, `send`, `look`, `read`, `stop` and `in
 | `killAll` | Not carried. `list`, then `close` each. One call ending every session in a scope could end another agent's sessions where two share a scope. |
 | `raw: true` | Not carried. `look` gives a full-screen program's screen, and the escape codes would be noise. |
 | The WebSocket API and `SessionClient` | Not carried. A script uses `tsm --json` or the MCP tools. |
+| Resizing a session, through the WebSocket API's `session.resize` | Not carried. `open` a session with the `cols` and `rows` it needs. A resize reflows the lines the session keeps, so line numbers and positions already returned would point at other text. |
 | Windows, where 1.x's sessions ran `wsl.exe` | The relay and daemon run inside a WSL2 distro, as in "Windows, through WSL2" below. |
 | The network server and its `--token` | Not carried: 2.0 opens no port. For another machine, the host starts the relay there over ssh, as in "Another machine, over ssh" below. |
 
