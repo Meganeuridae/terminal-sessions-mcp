@@ -1273,6 +1273,30 @@ test("a taking caller refused because the session is still opening counts as sho
   assert.match(r.text, /\n\nNot yet seen:\n\[main · closed by a caller that takes no reports; the shell /);
 });
 
+test('a report a host accepts after a caller taking none closed its session, moving it, is forgotten', async () => {
+  const { host, opened } = setup();
+  const wakes: Wake[] = [];
+  let accept!: (v: boolean) => void;
+  host.subscribe('a', (w) => {
+    wakes.push(w);
+    return wakes.length === 1 ? new Promise<boolean>((r) => (accept = r)) : Promise.resolve(true);
+  });
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(cli(), 'run', { name: 'main', command: 'make', wait: 0 });
+  s.end(2);
+  await settle();
+  assert.equal(wakes.length, 1);
+  await host.call(cli(), 'close', { name: 'main' });
+  accept(true);
+  await settle();
+  await settle();
+  assert.equal(wakes.length, 2, wakes.map((w) => w.text).join('\n'));
+  const r = await host.call(plain(), 'list', {});
+  assert.match(r.text, /^No session is open in scope "a"\.$/);
+});
+
 test('a session a caller taking none opened counts as shown once a wake about it is offered, before the host answers', async () => {
   const { host, opened } = setup();
   const wakes: Wake[] = [];

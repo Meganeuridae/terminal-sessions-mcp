@@ -774,11 +774,13 @@ export class Host {
   }
 
   private forget(e: Entry | undefined, u: Unseen): void {
-    if (e) {
-      if (e.unseen.get(u.wake.key) === u) e.unseen.delete(u.wake.key);
+    if (e && e.unseen.get(u.wake.key) === u) {
+      e.unseen.delete(u.wake.key);
       return;
     }
-    const rest = (this.left.get(u.wake.scope) ?? []).filter((x) => x !== u);
+    const left = this.left.get(u.wake.scope);
+    if (!left?.includes(u)) return;
+    const rest = left.filter((x) => x !== u);
     if (rest.length) this.left.set(u.wake.scope, rest);
     else this.left.delete(u.wake.scope);
   }
