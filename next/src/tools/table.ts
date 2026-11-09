@@ -80,6 +80,7 @@ export const TOOLS: readonly ToolDef[] = [
     name: 'send',
     description:
       'Type into the terminal exactly the given `text`, then the named `keys`; nothing is appended, so a line needs `keys: ["Enter"]`. ' +
+      'A program such as Claude Code takes long typed text as a paste, and an Enter with it; give `paste: true`, and the keys go after the paste. ' +
       'For answering a program that waits for input, or driving a full-screen one. Returns what changed: the new lines, or the screen of a full-screen program, ' +
       'once `wait_for` matches, or, without `wait_for`, once output has been quiet for 300 ms. Keys: Enter, Tab, S-Tab, Esc, Space, Backspace, Delete, Insert, Up, Down, Left, Right, Home, End, ' +
       'PageUp, PageDown, F1 to F12, C-a to C-z and C-\\, C-], C-@, C-^, C-_ (Ctrl), M-<char> (Alt), and C-, M- and S- on the arrows, Home, End, Insert, Delete, PageUp, PageDown and F-keys.',
@@ -89,6 +90,7 @@ export const TOOLS: readonly ToolDef[] = [
         name,
         text: { type: 'string', description: 'Text to type, exactly as given.' },
         keys: { type: 'array', items: { type: 'string' }, description: 'Named keys to press after the text, in order.' },
+        paste: { type: 'boolean', description: 'Send `text` as a paste: inside the bracketed-paste frame, with `keys` after it. Only while the program in front has turned bracketed paste on.' },
         wait_for: { type: 'string', description: 'A regular expression: return once it matches from the line the cursor was on.' },
         wait,
       },

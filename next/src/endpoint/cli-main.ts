@@ -10,7 +10,7 @@ export const USAGE = `usage: tsm [--scope NAME] [--socket PATH] [--json] COMMAND
   run NAME [--wait S] [--notify-on REGEX] [--] COMMAND...
       one argument is a command line as typed ('make test | tee log'); several are its words,
       each quoted for the shell; put -- before a command whose words start with --
-  send NAME [--text TEXT] [--keys KEY,KEY...] [--wait-for REGEX] [--wait S]
+  send NAME [--text TEXT] [--keys KEY,KEY...] [--paste] [--wait-for REGEX] [--wait S]
   look NAME [--until end|input] [--match REGEX] [--wait S]
   read NAME [--command N] [--lines FROM:TO] [--match REGEX] [--context N]
   stop NAME [--signal NAME]
@@ -94,6 +94,7 @@ export function parseCli(argv: readonly string[]): CliOptions | { error: string 
       break;
     }
     if (a === '--force' && tool === 'close') args.force = true;
+    else if (a === '--paste' && tool === 'send') args.paste = true;
     else if (a.startsWith('--')) {
       const f = flags[a];
       if (!f) return { error: `${tool} takes no ${a}` };

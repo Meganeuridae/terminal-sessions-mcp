@@ -269,10 +269,13 @@ export function decodeKey(name: string, opts: KeyOptions = {}): string {
   throw bad();
 }
 
+export const PASTE_START = '\x1b[200~';
+export const PASTE_END = '\x1b[201~';
+
 /**
  * Exactly `text` followed by exactly `keys`; nothing is appended (DESIGN §11.1).
  * Pass the emulator's cursor-key mode as `opts.appCursor` (Screen.applicationCursorKeys).
  */
-export function inputBytes(text: string | undefined, keys: string[] | undefined, opts: KeyOptions = {}): string {
+export function inputBytes(text: string | undefined, keys: readonly string[] | undefined, opts: KeyOptions = {}): string {
   return (text ?? '') + (keys ?? []).map((k) => decodeKey(k, opts)).join('');
 }

@@ -194,8 +194,8 @@ export interface SendOutcome {
   /** Commands that ended during the call. */
   ended: Command[];
   matched?: Match;
-  /** Why it returned: `until` matched, output went quiet, the shell exited, the wait ran out, or the call's signal aborted it. */
-  by: 'match' | 'quiet' | 'exited' | 'timeout' | 'cancelled' | 'closed';
+  /** Why it returned: `until` matched, output went quiet, the shell exited, the wait ran out, or the call's signal aborted it; or, with nothing sent, `paste` was asked while the program in front had bracketed paste off. */
+  by: 'match' | 'quiet' | 'exited' | 'timeout' | 'cancelled' | 'closed' | 'paste_off';
   /** With `until`, lines longer than the pattern's match window that were searched on their head only. */
   clipped?: number;
   /** With `until` and no match, the lines and alternate-screen rows the search hadn't reached when the call returned. */
@@ -306,13 +306,11 @@ export interface Session {
   /** Lines `from` up to `to`, or through the cursor's line when `to` is absent. The live nonce never shows in them. */
   lines(from: number, to?: number): Lines;
   screen(): Screen;
-  /** For keys' `inputBytes`: arrows follow the cursor-key mode the program set. */
-  keyOptions(): { appCursor: boolean };
 
   /** Only at a prompt with nothing pending; otherwise refused with nothing typed. At a prompt whose end mark came but which isn't drawn yet, it first waits, within `waitMs`, for the mark at the prompt's end, as `send` does. In `run`, `send` and `wait`, an aborted `signal` ends the call's wait at once: `run` is refused if nothing was typed yet, and `send` and `wait` return `by: 'cancelled'`. */
   run(text: string, opts: { waitMs: number; take?: boolean; signal?: AbortSignal }): Promise<RunOutcome>;
-  /** Exactly these bytes, nothing appended. At a prompt whose end mark came but which isn't drawn yet, it first waits, within `waitMs`, for the mark at the prompt's end, so the line editor gets the bytes rather than the terminal or a prompt hook, and sends nothing if the wait runs out. Returns when `until` matches from the cursor's line on, or (without `until`) when output is quiet for `quietMs`, default 300. */
-  send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean; signal?: AbortSignal }): Promise<SendOutcome>;
+  /** Exactly `text`, then the named `keys`, nothing appended, in one write. At a prompt whose end mark came but which isn't drawn yet, it first waits, within `waitMs`, for the mark at the prompt's end, so the line editor gets the bytes rather than the terminal or a prompt hook, and sends nothing if the wait runs out. Then, from all output parsed so far, it encodes the keys by the cursor-key mode the program set, and with `paste` frames `text` as a bracketed paste, or sends nothing if the program has that mode off. Returns when `until` matches from the cursor's line on, or (without `until`) when output is quiet for `quietMs`, default 300. */
+  send(text: string, opts: { waitMs: number; keys?: readonly string[]; paste?: boolean; until?: RegExp; quietMs?: number; take?: boolean; signal?: AbortSignal }): Promise<SendOutcome>;
   /** `match` looks from line `from` on, so lines already there count. */
   wait(until: Until, opts: { waitMs: number; from: number; take?: boolean; signal?: AbortSignal }): Promise<WaitOutcome>;
   /**

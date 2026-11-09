@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import * as pty from 'node-pty';
 import { historyIsolationEnv } from '../core/env.js';
 import { clause, err } from '../core/errors.js';
+import { inputBytes, PASTE_END, PASTE_START } from '../core/keys.js';
 import { shellLaunch, shellQuote, unrunnableHelper, viaBash } from '../core/launch.js';
 import { testBounded } from '../core/regex.js';
 import * as integration from './integration.js';
@@ -683,10 +684,6 @@ class LiveSession implements Session {
     return this.t.screen();
   }
 
-  keyOptions(): { appCursor: boolean } {
-    return { appCursor: this.t.appCursor };
-  }
-
   /** Resolves with `done()`'s first value, or undefined at the deadline. It looks again on each wake and tick, and when `signal` aborts. */
   private until<T>(deadline: number, done: () => T | undefined, signal?: AbortSignal): Promise<T | undefined> {
     return new Promise((resolve) => {
@@ -762,7 +759,7 @@ class LiveSession implements Session {
     return c.end ? { kind: 'ended', command: c, front, took: call.took } : { kind: 'running', command: c, front, took: call.took };
   }
 
-  async send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean; signal?: AbortSignal }): Promise<SendOutcome> {
+  async send(text: string, opts: { waitMs: number; keys?: readonly string[]; paste?: boolean; until?: RegExp; quietMs?: number; take?: boolean; signal?: AbortSignal }): Promise<SendOutcome> {
     const from = this.t.pos().line;
     const gone = (): Exit | undefined => this.exitInfo ?? this.ptyExit;
     const unsent = (by: SendOutcome['by']): SendOutcome => ({ sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by, took: [] });
@@ -770,11 +767,17 @@ class LiveSession implements Session {
     if (stopped()) return unsent(stopped()!);
     const deadline = mono() + opts.waitMs;
     const quiet = opts.quietMs ?? 300;
+    await this.t.settled();
+    if (stopped()) return unsent(stopped()!);
     if (this.top.atPrompt && !this.top.submitted && !this.prompted) {
       await this.until(deadline, () => (this.prompted || stopped() || !this.top.atPrompt ? true : undefined), opts.signal);
       if (!stopped() && this.top.atPrompt && !this.prompted) return unsent('timeout');
+      await this.t.settled();
     }
     if (stopped()) return unsent(stopped()!);
+    if (opts.paste && !this.t.bracketedPaste) return unsent('paste_off');
+    const keys = opts.keys?.length ? inputBytes(undefined, opts.keys, { appCursor: this.t.appCursor }) : '';
+    const bytes = opts.paste ? `${PASTE_START}${text}${PASTE_END}${keys}` : text + keys;
     if (!this.prompted) this.frontKey = '';
     if ((this.top.atPrompt || this.plain) && !this.top.submitted) {
       if (/[\r\n]/.test(bytes)) {

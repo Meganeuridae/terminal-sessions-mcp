@@ -126,6 +126,10 @@ export class Transcript {
     return this.term.modes.applicationCursorKeysMode;
   }
 
+  get bracketedPaste(): boolean {
+    return this.term.modes.bracketedPasteMode;
+  }
+
   /** Feeds output; `parsed` runs once the emulator has parsed it. Ignored once disposed. */
   write(data: string, parsed: () => void): void {
     if (this.isDisposed) return;

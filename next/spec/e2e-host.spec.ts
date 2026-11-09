@@ -114,6 +114,131 @@ test('through the relay to a real bash: a command\'s status and output, an end n
   }
 });
 
+const reads = (text: string): string[] => [...text.matchAll(/READ:("(?:[^"\\]|\\.)*")/g)].map((m) => JSON.parse(m[1]!) as string);
+
+const READER = "process.stdin.setRawMode(true); if (process.argv[2] === 'on') process.stdout.write('\\x1b[?2004h'); console.log('ready'); process.stdin.on('data', (d) => { const s = d.toString(); console.log('READ:' + JSON.stringify(s)); if (s.endsWith('\\r')) { console.log('DONE'); process.exit(0); } });\n";
+
+test('send: with paste, the text goes inside the bracketed-paste frame and the keys after it', { timeout: 60_000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-paste-'));
+  const reader = path.join(dir, 'reads.cjs');
+  fs.writeFileSync(reader, READER);
+  const h = new Host({ openSession, shell: '/bin/bash', env: configuredEnv(process.env, {}), sessionsDir: dir, startedAt: Date.now() });
+  const caller = { scope: 'p', takes: true, pushes: false };
+  try {
+    assert.equal((await h.call(caller, 'open', { name: 'p', cwd: dir })).isError, undefined);
+    const ran = await h.call(caller, 'run', { name: 'p', command: `'${process.execPath}' '${reader}' on`, wait: 0 });
+    assert.equal(ran.isError, undefined, ran.text);
+    assert.match((await h.call(caller, 'look', { name: 'p', match: '^ready$', wait: 20 })).text, /ready/);
+    const text = 'x'.repeat(40);
+    const sent = await h.call(caller, 'send', { name: 'p', text, keys: ['Enter'], paste: true, wait_for: '^DONE$', wait: 20 });
+    assert.equal(sent.isError, undefined, sent.text);
+    assert.equal(reads(sent.text).join(''), `\x1b[200~${text}\x1b[201~\r`, sent.text);
+  } finally {
+    await h.closeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("send: paste is refused, with nothing typed, while the program hasn't turned bracketed paste on, or when the text holds the frame's end", { timeout: 60_000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-paste-'));
+  const reader = path.join(dir, 'reads.cjs');
+  fs.writeFileSync(reader, READER);
+  const h = new Host({ openSession, shell: '/bin/bash', env: configuredEnv(process.env, {}), sessionsDir: dir, startedAt: Date.now() });
+  const caller = { scope: 'q', takes: true, pushes: false };
+  try {
+    assert.equal((await h.call(caller, 'open', { name: 'q', cwd: dir })).isError, undefined);
+    const ran = await h.call(caller, 'run', { name: 'q', command: `'${process.execPath}' '${reader}' off`, wait: 0 });
+    assert.equal(ran.isError, undefined, ran.text);
+    assert.match((await h.call(caller, 'look', { name: 'q', match: '^ready$', wait: 20 })).text, /ready/);
+    const off = await h.call(caller, 'send', { name: 'q', text: 'abc', keys: ['Enter'], paste: true, wait: 2 });
+    assert.equal(off.isError, true, off.text);
+    assert.match(off.text, /Nothing was typed: the program in front hasn't turned bracketed paste on\. `send` without `paste` types the text\./);
+    const marker = await h.call(caller, 'send', { name: 'q', text: 'a\x1b[201~b', paste: true, wait: 2 });
+    assert.equal(marker.isError, true, marker.text);
+    assert.match(marker.text, /Nothing was typed: `text` holds the bracketed-paste end marker/);
+    const keysOnly = await h.call(caller, 'send', { name: 'q', keys: ['Enter'], paste: true, wait: 2 });
+    assert.equal(keysOnly.isError, true, keysOnly.text);
+    assert.match(keysOnly.text, /Nothing was typed: `paste` sends `text` as a paste, so it needs `text`\./);
+    const typed = await h.call(caller, 'send', { name: 'q', text: 'z', keys: ['Enter'], wait_for: '^DONE$', wait: 20 });
+    assert.deepEqual(reads(typed.text), ['z\r'], typed.text);
+    const all = await h.call(caller, 'read', { name: 'q', match: 'READ:' });
+    assert.deepEqual(reads(all.text), ['z\r'], all.text);
+  } finally {
+    await h.closeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function gatedBash(rc: { extra: string; before: string; after: string }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-gated-'));
+  const home = path.join(dir, 'home');
+  const gate = path.join(dir, 'gate');
+  fs.mkdirSync(home);
+  const q = (s: string): string => `'${s.replaceAll("'", "'\\''")}'`;
+  fs.writeFileSync(
+    path.join(home, '.bash_profile'),
+    `${rc.extra}__hk() { if [ -e ${q(gate)} ]; then printf '${rc.before}\\nHOOK_WAIT\\n'; while [ -e ${q(gate)} ]; do sleep 0.01; done; printf '${rc.after}'; fi; }\nPROMPT_COMMAND=__hk\n`,
+  );
+  let armed = false;
+  const h = new Host({
+    openSession: async (o) => {
+      const s = await openSession(o);
+      const send = s.send.bind(s);
+      s.send = (text, opts) => {
+        if (armed) fs.rmSync(gate, { force: true });
+        return send(text, opts);
+      };
+      return s;
+    },
+    shell: '/bin/bash',
+    env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, TERM: 'xterm-256color', LANG: 'C.UTF-8' },
+    sessionsDir: dir,
+    startedAt: Date.now(),
+  });
+  const caller = { scope: 'g', takes: true, pushes: false };
+  return {
+    call: (tool: string, args: Record<string, unknown>) => h.call(caller, tool, { name: 'g', ...args }),
+    hold: async () => {
+      assert.equal((await h.call(caller, 'open', { name: 'g', cwd: home })).isError, undefined);
+      fs.writeFileSync(gate, '');
+      const held = await h.call(caller, 'send', { name: 'g', text: 'true\r', wait_for: '^HOOK_WAIT$', wait: 20 });
+      assert.match(held.text, /HOOK_WAIT/, held.text);
+      armed = true;
+    },
+    done: async () => {
+      fs.rmSync(gate, { force: true });
+      await h.closeAll();
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+test('send: paste reads the mode when it writes, after its wait for a prompt, and a mode turned off during that wait refuses it', { timeout: 60_000 }, async () => {
+  const g = gatedBash({ extra: "bind 'set enable-bracketed-paste off'\n", before: '\\033[?2004h', after: '\\033[?2004l' });
+  try {
+    await g.hold();
+    const sent = await g.call('send', { text: 'echo PASTE_PROBE', keys: ['Enter'], paste: true, wait: 20 });
+    assert.equal(sent.isError, true, sent.text);
+    assert.match(sent.text, /Nothing was typed: the program in front hasn't turned bracketed paste on\./);
+    const after = await g.call('run', { command: 'echo next', wait: 20 });
+    assert.match(after.text, /^next$/m, after.text);
+    assert.doesNotMatch(after.text, /PASTE_PROBE/, after.text);
+  } finally {
+    await g.done();
+  }
+});
+
+test('send: keys are encoded by the cursor-key mode as it stands at the write, after the wait for a prompt', { timeout: 60_000 }, async () => {
+  const g = gatedBash({ extra: `bind '"\\eOA": "echo APP_UP\\n"'\nbind '"\\e[A": "echo NORMAL_UP\\n"'\n`, before: '', after: '\\033[?1h' });
+  try {
+    await g.hold();
+    const sent = await g.call('send', { keys: ['Up'], wait_for: '^(APP|NORMAL)_UP$', wait: 20 });
+    assert.match(sent.text, /^APP_UP$/m, sent.text);
+  } finally {
+    await g.done();
+  }
+});
+
 test('send: an arrow key follows the cursor-key mode the program set', { timeout: 60_000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-keys-'));
   const h = new Host({ openSession, shell: '/bin/bash', env: configuredEnv(process.env, {}), sessionsDir: dir, startedAt: Date.now() });

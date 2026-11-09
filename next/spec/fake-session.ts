@@ -47,9 +47,6 @@ export class FakeSession implements Session {
   screen(): Screen {
     return this.screenNow ?? { rows: this.out.slice(-5), cursor: { row: 0, col: 0 }, alt: false, title: '' };
   }
-  keyOptions(): { appCursor: boolean } {
-    return { appCursor: false };
-  }
 
   print(...lines: string[]): void {
     this.out.push(...lines);
@@ -114,8 +111,8 @@ export class FakeSession implements Session {
     return { kind: 'running', command: c, front: this.frontNow, took: [] };
   }
 
-  async send(bytes: string, opts: { waitMs: number; until?: RegExp; quietMs?: number; take?: boolean; signal?: AbortSignal }): Promise<SendOutcome> {
-    this.calls.push({ method: 'send', args: [bytes, opts] });
+  async send(text: string, opts: { waitMs: number; keys?: readonly string[]; paste?: boolean; until?: RegExp; quietMs?: number; take?: boolean; signal?: AbortSignal }): Promise<SendOutcome> {
+    this.calls.push({ method: 'send', args: [text, opts] });
     const from = this.out.length;
     if (this.promptUndrawn) return { sent: false, lines: this.lines(from), front: this.frontNow, ended: [], by: 'timeout', took: [] };
     return { sent: this.frontNow.state !== 'exited', lines: this.lines(from), ...(this.screenNow?.alt ? { screen: this.screenNow } : {}), front: this.frontNow, ended: [], by: 'quiet', took: [] };

@@ -2,7 +2,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { validate, ValidationError } from '../api/validate.js';
 import { clause, TermError } from '../core/errors.js';
-import { inputBytes } from '../core/keys.js';
+import { inputBytes, PASTE_END } from '../core/keys.js';
 import { compileUserRegex, headOnlyText, testBounded } from '../core/regex.js';
 import type { Command, Front, Lines, Match, OpenSession, Session, SessionEvent, Took } from '../session/types.js';
 import { boundedStrings, dirText, duration, endingText, exitText, fitted, fittedLength, frontText, linesText, outputValue, quoted, quotedString, RESULT_MAX_CHARS, SCREEN_ROOM_CHARS, screenChars, screenText, statusLine } from './render.js';
@@ -343,19 +343,26 @@ export class Host {
   }
 
   private async send(caller: Caller, e: Entry, a: Record<string, unknown>, signal: AbortSignal | undefined, held: Held): Promise<ToolResult> {
-    let bytes: string;
+    const text = (a.text as string | undefined) ?? '';
+    const keys = (a.keys as string[] | undefined) ?? [];
+    const paste = a.paste === true;
     try {
-      bytes = inputBytes(a.text as string | undefined, a.keys as string[] | undefined, e.session.keyOptions());
+      inputBytes(undefined, keys);
     } catch (err) {
       if (err instanceof TermError) return refused(`\`keys\`: ${err.message}. Nothing was typed.`, { error: err.code });
       throw err;
     }
-    if (bytes === '') return refused('Nothing to send: give `text`, `keys`, or both.', { error: 'invalid_argument' });
+    if (text === '' && keys.length === 0) return refused('Nothing to send: give `text`, `keys`, or both.', { error: 'invalid_argument' });
+    if (paste && text === '') return refused('Nothing was typed: `paste` sends `text` as a paste, so it needs `text`.', { error: 'invalid_argument' });
+    if (paste && text.includes(PASTE_END)) return refused('Nothing was typed: `text` holds the bracketed-paste end marker, ESC [ 2 0 1 ~, which would end the paste early.', { error: 'invalid_argument' });
     const until = a.wait_for !== undefined ? this.regex(a.wait_for as string, 'wait_for', 'nothing was typed') : undefined;
-    const r = await e.session.send(bytes, { waitMs: this.waitMs(a), take: caller.takes, ...(until ? { until } : {}), ...(signal ? { signal } : {}) });
+    const r = await e.session.send(text, { waitMs: this.waitMs(a), keys, ...(paste ? { paste } : {}), take: caller.takes, ...(until ? { until } : {}), ...(signal ? { signal } : {}) });
     held.took = r.took;
     if (signal?.aborted) return this.cancelled(held);
     if (e.closing || r.by === 'closed') return this.closed(e, held, [r.sent ? 'Its input was typed.' : 'Nothing was typed.', ...r.ended.map(endedLine)].join(' '), r.ended);
+    if (!r.sent && r.by === 'paste_off') {
+      return refused(`${this.status(e, r.front)}\nNothing was typed: the program in front hasn't turned bracketed paste on. \`send\` without \`paste\` types the text.`, { error: 'invalid_argument', front: r.front });
+    }
     if (!r.sent && r.by === 'timeout' && r.front.state !== 'exited') {
       return refused(
         `${this.status(e, r.front)}\nNothing was typed: the shell hasn't finished drawing its prompt after ${duration(this.now() - r.front.since)}, and keys sent before a line editor has the terminal would reach the terminal's own line editing instead. ${this.waitMs(a) >= WAIT_MAX_S * 1000 ? '`look` shows what is in front.' : '`send` again with a longer `wait`.'}`,
