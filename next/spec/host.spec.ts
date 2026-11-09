@@ -438,6 +438,89 @@ test('a late acceptance of an older wake under a key leaves the newer wake under
   assert.match(left[0]!, /command 1 · exit 1/, 'the end, which replaced the waiting wake under its key, is still unseen');
 });
 
+test("a report a call takes removes the older one not yet seen under its key: a command's end, taken, leaves no wait behind", async () => {
+  const { host, opened } = setup();
+  host.subscribe('a', async () => false);
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  await host.call(agent(), 'run', { name: 'main', command: 'read x', wait: 0 });
+  s.emit({ kind: 'waiting', front: { state: 'waiting', since: Date.now(), process: { pgid: 9, argv: 'read', shell: false }, command: 1, echo: true }, taken: false });
+  await settle();
+  assert.equal(((await host.call(cli(), 'list', {})).structured.unseen as string[]).length, 1, 'the wait is kept, since no wake was accepted');
+  s.end(0, true);
+  await settle();
+  assert.deepEqual((await host.call(cli(), 'list', {})).structured.unseen, []);
+});
+
+async function waitingCommand(host: Host, s: FakeSession): Promise<Command> {
+  running(s);
+  await host.call(cli(), 'run', { name: 'main', command: 'cat', wait: 0 });
+  const c = s.current()!;
+  const waiting: Front = { state: 'waiting', since: Date.now(), process: { pgid: 99, argv: 'cat', shell: false }, command: c.id, echo: true };
+  s.frontNow = waiting;
+  s.emit({ kind: 'waiting', front: waiting, taken: false });
+  await settle();
+  return c;
+}
+
+function heldClose(s: FakeSession): { started: Promise<void>; release: () => void } {
+  let begun!: () => void;
+  const started = new Promise<void>((r) => (begun = r));
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const close = s.close.bind(s);
+  s.close = async (o) => (begun(), await gate, close(o));
+  return { started, release };
+}
+
+test("a command's end a look shows during a close removes the older wait under its key, so the close doesn't report the wait", async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  const c = await waitingCommand(host, s);
+  let waitBegun!: () => void;
+  const waitStarted = new Promise<void>((r) => (waitBegun = r));
+  let endNow!: () => void;
+  const ending = new Promise<void>((r) => (endNow = r));
+  s.wait = async () => {
+    waitBegun();
+    await ending;
+    c.to = s.out.length;
+    c.end = { at: Date.now(), ms: 1, status: 0, errexit: false, refusedMarks: 0, cwd: '/w' };
+    s.frontNow = { state: 'prompt', since: Date.now() };
+    const ev = { kind: 'ended' as const, command: c, taken: true, takers: 1 };
+    s.emit(ev);
+    await settle();
+    return { by: 'closed', front: s.front(), ended: [c], took: [ev] };
+  };
+  const held = heldClose(s);
+  const looked = host.call(plain(), 'look', { name: 'main', until: 'end', wait: 1 });
+  await waitStarted;
+  const closed = host.call(plain(), 'close', { name: 'main' });
+  await held.started;
+  endNow();
+  assert.match((await looked).text, /command 1 · exit 0|Command 1 ended/);
+  held.release();
+  const r = await closed;
+  assert.deepEqual(r.structured.unseen ?? [], [], r.text);
+});
+
+test("a command's end that no call takes, during a close, removes the older wait under its key, though the end itself isn't kept", async () => {
+  const { host, opened } = setup();
+  await host.call(plain(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  await waitingCommand(host, s);
+  const held = heldClose(s);
+  const closed = host.call(plain(), 'close', { name: 'main' });
+  await held.started;
+  s.end(0);
+  await settle();
+  held.release();
+  const r = await closed;
+  assert.deepEqual(r.structured.unseen ?? [], [], r.text);
+});
+
 test('closing a session wakes no one, though its running command ends and its shell exits', async () => {
   const { host, opened } = setup();
   const wakes: Wake[] = [];

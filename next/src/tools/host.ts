@@ -668,6 +668,7 @@ export class Host {
 
   private onEvent(e: Entry, ev: SessionEvent, restored?: { dying: number | undefined; at: number }): void {
     if (ev.kind === 'exited') e.exited = true;
+    if (!restored && ev.kind !== 'match' && (ev.taken || ev.kind === 'ended')) e.unseen.delete(this.pushKey(e, ev.kind === 'ended' ? ev.command.id : ev.kind === 'waiting' ? ev.front.command : e.dying));
     if (e.closing && !restored) return;
     const dying = restored ? restored.dying : e.dying;
     if (!restored) e.dying = ev.kind === 'ended' && ev.command.end?.status === undefined && !ev.command.end?.unfollowed ? ev.command.id : undefined;
