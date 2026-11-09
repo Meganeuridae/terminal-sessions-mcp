@@ -78,6 +78,7 @@ interface Entry {
   latest: Map<string, { at: number; command: number | undefined }>;
   off: () => void;
   takerUsed: boolean;
+  exited: boolean;
 }
 
 interface Held {
@@ -179,9 +180,10 @@ export class Host {
     await Promise.all([
       ...[...this.entries.values()].map(async (e) => {
         e.closing = true;
+        const exitedBefore = e.exited;
         try {
           const exit = await e.session.close({ deadline });
-          const left = [exit.unconfirmed && 'its exit wasn\'t seen', exit.unlisted && 'not every process it started could be listed', exit.unreached?.length && `${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')} weren't delivered`].filter(Boolean);
+          const left = [exit.unconfirmed && 'its exit wasn\'t seen', exit.unlisted && (exitedBefore ? 'the shell had already exited, so what it left running couldn\'t be listed' : 'not every process it started could be listed'), exit.unreached?.length && `${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')} weren't delivered`].filter(Boolean);
           if (left.length) this.o.log?.(`session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)} closed, but ${left.join('; ')}: processes it started may live on`);
         } catch (err) {
           this.o.log?.(`closing session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)} failed: ${(err as Error)?.message ?? String(err)}`);
@@ -268,7 +270,7 @@ export class Host {
       await session.close({ force: true, deadline: this.stopping });
       return refused('The daemon stopped while this session started, so its shell is closed.', { error: 'backend_failure' });
     }
-    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes };
+    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes, exited: false };
     entry.off = session.onEvent((ev) => this.onEvent(entry, ev));
     this.entries.set(k, entry);
     const front = session.front();
@@ -647,6 +649,7 @@ export class Host {
   }
 
   private onEvent(e: Entry, ev: SessionEvent, restored?: { dying: number | undefined; at: number }): void {
+    if (ev.kind === 'exited') e.exited = true;
     if (e.closing && !restored) return;
     const dying = restored ? restored.dying : e.dying;
     if (!restored) e.dying = ev.kind === 'ended' && ev.command.end?.status === undefined && !ev.command.end?.unfollowed ? ev.command.id : undefined;

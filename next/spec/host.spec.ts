@@ -1248,10 +1248,20 @@ test('stopping the daemon logs each session whose close may have left processes 
   });
   await host.call(plain(), 'open', { name: 'main' });
   await host.call(plain(), 'open', { name: 'clean' });
-  opened[0]!.close = async () => ({ code: null, signal: 'SIGHUP', unlisted: true, unreached: [{ pgid: 77, signal: 'SIGHUP', error: 'EPERM' }] });
+  await host.call(plain(), 'open', { name: 'done' });
+  opened[0]!.close = async () => {
+    opened[0]!.exit({ code: null, signal: 'SIGHUP' });
+    await settle();
+    return { code: null, signal: 'SIGHUP', unlisted: true, unreached: [{ pgid: 77, signal: 'SIGHUP', error: 'EPERM' }] };
+  };
+  opened[2]!.exit({ code: 0 });
+  await settle();
+  opened[2]!.close = async () => ({ code: 0, unlisted: true });
   await host.closeAll();
-  assert.equal(lines.length, 1, lines.join('\n'));
-  assert.match(lines[0]!, /^session "main" of scope "a" closed, but not every process it started could be listed; SIGHUP to group 77 \(EPERM\) weren't delivered: processes it started may live on$/);
+  assert.equal(lines.length, 2, lines.join('\n'));
+  const line = (n: string): string => lines.find((l) => l.startsWith(`session "${n}" `)) ?? '';
+  assert.match(line('main'), /^session "main" of scope "a" closed, but not every process it started could be listed; SIGHUP to group 77 \(EPERM\) weren't delivered: processes it started may live on$/);
+  assert.match(line('done'), /^session "done" of scope "a" closed, but the shell had already exited, so what it left running couldn't be listed: processes it started may live on$/);
 });
 
 test('a paste refuses text holding Ctrl-C, Ctrl-Z or Ctrl-\\, and types nothing', async () => {
