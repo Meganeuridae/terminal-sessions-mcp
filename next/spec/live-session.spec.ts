@@ -1561,6 +1561,29 @@ for (const sh of shells) {
       assert.deepEqual(out(s, await ran(s, 'echo home')), ['home']);
     });
 
+    test('a second integrate while one is typing is refused, saying so, and the first still integrates', async () => {
+      const s = await open(shell);
+      await reachFar(s, shell);
+      const first = s.integrate({ waitMs: 10_000 });
+      const second = await s.integrate({ waitMs: 2000 });
+      assert.deepEqual([second.kind, second.kind === 'refused' && second.integrating], ['refused', true], JSON.stringify(second));
+      const r = await first;
+      assert.equal(r.kind, 'integrated', JSON.stringify(r));
+      assert.equal(r.kind === 'integrated' && r.printed, undefined);
+      assert.deepEqual(out(s, await ran(s, 'echo far')), ['far']);
+    });
+
+    test('an end mark with the lower chain\'s nonce and a wrong next counter is refused, and the far chain stays in front', async () => {
+      const s = await open(shell);
+      await far(s, shell);
+      const lower = (s as unknown as { chains: Array<{ expected: { counter: number; random: string } }> }).chains[0]!.expected;
+      const c = await ran(s, `printf '\\033]133;D;%s;%s;0;;;\\007' '${lower.counter}.${lower.random}' '${lower.counter + 5}.1'`);
+      assert.equal(c.end?.refusedMarks, 1, JSON.stringify(c.end));
+      const f = s.front();
+      assert.ok(f.state === 'prompt' && f.within !== undefined, JSON.stringify(f));
+      assert.deepEqual(out(s, await ran(s, 'echo still-far')), ['still-far']);
+    });
+
     test('a run whose typed line would be longer than a far shell takes is refused, naming the limit', async () => {
       const s = await open(shell);
       await far(s, shell);

@@ -257,9 +257,10 @@ export type IntegrateOutcome =
    * may be a question, such as a password, that anything typed would answer. `canonical`: the terminal is in canonical mode, so what
    * is in front reads whole lines itself, such as a password or a yes/no question, or a shell without a line editor. The line editors
    * of bash, zsh and fish hold it out of that mode at their prompts. Through a relay that already holds it raw, such as an ssh
-   * given the integration, a question further on can't be seen.
+   * given the integration, a question further on can't be seen. `integrating`: another `integrate` call on this session is still
+   * typing.
    */
-  | { kind: 'refused'; sent?: true; canonical?: true; front: Front }
+  | { kind: 'refused'; sent?: true; canonical?: true; integrating?: true; front: Front }
   /** A shell answered the probe that has no hooks here (sh, dash, ash, and others). Nothing more was typed. `shell` is its `$0`, when it gave one. */
   | { kind: 'unsupported'; shell?: string; front: Front }
   /**

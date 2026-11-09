@@ -303,7 +303,9 @@ class LiveSession implements Session {
       return false;
     }
     if (kind === 'D' && !this.exitInfo) {
-      const below = this.chains.findIndex((c, i) => i < this.chains.length - 1 && integration.nonceText(c.expected) === nonce);
+      // A lower chain's end mark, accepted as the top chain's would be, means the shells above it have exited.
+      const next = /^(\d+)\.\w+$/.exec(rest[0] ?? '');
+      const below = this.chains.findIndex((c, i) => i < this.chains.length - 1 && integration.nonceText(c.expected) === nonce && Number(next?.[1]) === c.expected.counter + 1);
       if (below >= 0) this.drop(below);
     }
     const expected = integration.nonceText(this.top.expected);
@@ -988,6 +990,8 @@ class LiveSession implements Session {
     const by = (): 'exited' | 'closed' | 'cancelled' | undefined => (this.exitInfo || this.ptyExit ? 'exited' : this.closed ? 'closed' : opts.signal?.aborted ? 'cancelled' : undefined);
     const f = this.front();
     if (f.state === 'exited' || this.prompted || by()) return { kind: 'refused', front: f };
+    // One handshake at a time: two typing into one terminal can't both succeed.
+    if (this.probe) return { kind: 'refused', integrating: true, front: f };
     // A shell with marks is at its prompt from its end mark on, drawn or not; a line sent there that hasn't started may reach a question.
     if (this.top.atPrompt && !this.plain) return { kind: 'refused', front: f, ...(this.top.submitted && { sent: true as const }) };
     // At its prompt a line editor holds the terminal out of canonical mode; ssh, su and sudo ask for a password or a yes/no in it.
@@ -1002,10 +1006,11 @@ class LiveSession implements Session {
     const stop = (): typeof stopped => (stopped ??= by() ?? (ended() ? 'exited' : undefined));
     const call = String(randomInt(100000, 1000000));
     const answered = async (): Promise<ProbeAnswer | undefined> => {
-      this.probe = { call };
+      delete this.probe!.answer;
       return (await this.until(deadline, () => (stop() ? null : this.probe?.answer), opts.signal)) ?? undefined;
     };
     try {
+      this.probe = { call };
       this.lastWrite = mono();
       this.p.write(integration.PROBE_LINE);
       const answer = await answered();
