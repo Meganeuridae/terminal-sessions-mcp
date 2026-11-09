@@ -254,11 +254,11 @@ export type IntegrateOutcome =
   /**
    * Nothing was typed: a shell with the integration is at its prompt, drawn or not (the session's own, or one given it before), the
    * shell exited, or the call was cancelled first. `sent`: a line was sent at that prompt and hasn't started yet, so what is in front
-   * may be a question, such as a password, that anything typed would answer. `canonical`: the terminal is in canonical mode, so what
-   * is in front reads whole lines itself, such as a password or a yes/no question, or a shell without a line editor. The line editors
-   * of bash, zsh and fish hold it out of that mode at their prompts. Through a relay that already holds it raw, such as an ssh
-   * given the integration, a question further on can't be seen. `integrating`: another `integrate` call on this session is still
-   * typing.
+   * may be a question, such as a password, that anything typed would answer. `canonical`: this terminal is in canonical mode, so
+   * what is in front reads whole lines itself, such as a password or a yes/no question that ssh, su or sudo asks on this machine, or a
+   * shell without a line editor. The line editors of bash, zsh and fish hold it out of that mode at their prompts. A program that holds
+   * this terminal raw, such as a connected ssh, hides its far side: a question there can't be seen, and the probe line would answer
+   * it. `integrating`: another `integrate` call on this session is still typing.
    */
   | { kind: 'refused'; sent?: true; canonical?: true; integrating?: true; front: Front }
   /** A shell answered the probe that has no hooks here (sh, dash, ash, and others). Nothing more was typed. `shell` is its `$0`, when it gave one. */
