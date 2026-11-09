@@ -23,8 +23,8 @@ what reaches them is the package they share with 2.0: a narrower Node range (`en
   what is in front of the shell now and its directory, and, in `run`'s and a report's, the command's
   exit status (or "status unknown", or the shell's exit for a command that ends the shell) and duration. `list` gives a line
   for each session, `close` says how the shell ended, and a refused call says why. `close` hangs up
-  the shell and every process on its terminal; a process started with `setsid` or `nohup` outlives
-  it, and `force` KILLs at once. `run`'s
+  the shell and every process it lists on its terminal; a process started with `setsid` or `nohup`
+  outlives it, and `force` KILLs at once. `run`'s
   `structuredContent` gives the command's `exitCode` and its own `output` as values. `run` types only at the prompt; `send` types
   exactly what it is given and returns its effect; with `paste: true` it sends the text as a
   bracketed paste and the keys after it, for a program such as Claude Code that takes long typed
@@ -43,7 +43,7 @@ what reaches them is the package they share with 2.0: a narrower Node range (`en
 - Node 22.12 or later, below 25 (`engines`: `>=22.12.0 <25.0.0`): Node 20 reached its end of life on 2026-04-30; the 1.x `session-cli` `require`s `strip-ansi` 7, which ships only as an ES module, and `require` loads one from 22.12 on Node 22, so Node 21 and 22.0 to 22.11 are out. CI runs Node 22 and 24.
 - `npm run build` compiles both trees; `npm test` runs 1.x's suite and `npm run test:next` 2.0's.
 - New dependencies: `@animalabs/mcpl-core` and `@xterm/headless` 6.0.0.
-- **1.x's graceful `killSession` and `killAll` hang up every process on the session's terminal**
+- **1.x's graceful `killSession` and `killAll` hang up every process they list on the session's terminal**
   once the shell is gone, as 2.0's `close` does. A disowned job, or one started from a subshell, no
   longer outlives a graceful kill. A process started with `setsid` or `nohup` still does. A forced
   kill still KILLs the shell alone, and on Windows the kill is as before. Listing the terminal's

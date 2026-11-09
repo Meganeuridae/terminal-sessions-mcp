@@ -72,7 +72,7 @@ Nine tools. The results of `open`, `run`, `send`, `look`, `read`, `stop` and `in
 | `searchLogs` | `read` with `match` and `context`. |
 | `sendInput` | `send`, with `text` and `keys`. |
 | `sendSignal` | `stop`. Its TERM and KILL go to the job in front, never to the shell. Its Ctrl-C reaches whatever reads the terminal, a loop in the shell included. 1.x sent every signal but SIGINT to the shell itself. |
-| `killSession` | `close`. A graceful close ends the same processes as 1.x's graceful kill. With `force`, 2.0 also KILLs every process on the terminal and the shell's descendants. 1.x's forced kill KILLs the shell alone. |
+| `killSession` | `close`. A graceful close ends the same processes as 1.x's graceful kill. With `force`, 2.0 also KILLs every process it lists on the terminal or among the shell's descendants. 1.x's forced kill KILLs the shell alone. |
 | `killAll` | Not carried. `list`, then `close` each. One call ending every session in a scope could end another agent's sessions where two share a scope. |
 | `raw: true` | Not carried. `look` gives a full-screen program's screen, and the escape codes would be noise. |
 | The WebSocket API and `SessionClient` | Not carried. A script uses the MCP tools, or `tsm --json`, which prints a result's `structuredContent` alone. Some results carry their content only in their text: `read`'s lines, the new lines `look`, `send` and `integrate` return, and a full-screen program's screen. For those, a script reads the text, which `tsm` prints without `--json`. |
