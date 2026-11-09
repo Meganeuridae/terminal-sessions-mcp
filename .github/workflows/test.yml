@@ -48,7 +48,6 @@ jobs:
         if: runner.os == 'macOS'
         run: brew list fish >/dev/null 2>&1 || brew install fish
       - run: npm ci
-      # 1.x's suite (src/, cli/, test/) and 2.0's (next/): both ship in this package.
       - run: npm test
       - run: npm run test:next
 

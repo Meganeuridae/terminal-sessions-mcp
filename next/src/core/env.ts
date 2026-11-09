@@ -61,9 +61,10 @@ export function scrubDaemonEnv(daemonEnv: NodeJS.ProcessEnv): Record<string, str
 }
 
 /**
- * A session's history is its own, never the user's, for history tools the user's rc
- * loads as well as for HISTFILE, though a prompt hook of the user's own that writes a named
- * file (`history -a ~/.bash_history`) still writes there. atuin keeps one global database and records every line
+ * In bash, zsh and fish, a session's history is its own, never the user's, for history tools the
+ * user's rc loads as well as for HISTFILE. A prompt hook of the user's own that writes a named
+ * file (`history -a ~/.bash_history`) still writes there, and a shell without the integration
+ * keeps the HISTFILE it is given. atuin keeps one global database and records every line
  * typed at a prompt into it; these point its database, record store, key and sync
  * session at the session's own directory and turn its daemon and sync off (environment
  * settings override atuin's config file).

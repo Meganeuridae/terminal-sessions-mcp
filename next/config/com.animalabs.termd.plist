@@ -4,7 +4,7 @@
      and < as &lt;):
        PACKAGE  the installed package: "$(npm root -g)/term-sessions-mcp", or with Volta
                 ~/.volta/tools/image/packages/term-sessions-mcp/lib/node_modules/term-sessions-mcp
-       YOU      your home directory's name (launchd does not expand ~ or $HOME)
+       /Users/YOU  your home directory (launchd does not expand ~ or $HOME)
      and start it:  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.animalabs.termd.plist
      termd-launch.sh finds node (Volta, Homebrew, /usr/local, nvm's default version; or
      TSM_NODE_BIN=/path/to/node in EnvironmentVariables), puts those directories on PATH and

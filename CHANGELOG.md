@@ -7,7 +7,7 @@ A new implementation ships beside the 1.x session server, MCP bridge and CLI. It
 of 1.x: `terminal-sessions-mcp`, `session-server` and `session-cli` run 1.x, and 2.0 changes none of
 their code. What reaches them is the package they share with 2.0: a narrower Node range
 (`engines`), `npm run build` and `npm test` building 2.0 too, and 2.0's dependencies installing
-with it.
+with it. The lockfile also moves `@types/node` from 20 to 22, and `express-rate-limit`, `hono` and `ip-address` up a patch release each.
 
 ### Added
 
@@ -16,7 +16,8 @@ with it.
   starts one. `--scope` on the relay keeps two hosts' sessions apart.
 - **Sessions are your own login shell,** persisting across calls, connections and host restarts.
   bash, zsh and fish start with your startup files and get the session's integration; any other
-  shell starts with no arguments and runs without it. A daemon restart ends them, and says so.
+  shell starts with no arguments and runs without it. A daemon restart ends them. A call naming one
+  is then refused, and says why.
 - **Eight tools:** `open`, `run`, `send`, `look`, `read`, `stop`, `list` and `close`. The results of
   `open`, `run`, `send`, `look`, `read` and `stop` open with the session's status line: the
   command's exit status (or "status unknown", or the shell's exit for a command that ends the
@@ -28,8 +29,8 @@ with it.
   a program waiting for input (on the kernel's evidence, on Linux), a shell exited, a pattern asked
   for appeared. Nothing else wakes.
 - **The CLI, `tsm`,** calls the same tools; nothing it is shown counts as seen.
-- Shipped host and supervisor configurations in `next/config/`, and checks against
-  agent-framework's and mcpl-cc-bridge's real host code in `next/acceptance/`.
+- Shipped host and supervisor configurations in `next/config/`. In the repository, not the package:
+  checks against agent-framework's and mcpl-cc-bridge's real host code, in `next/acceptance/`.
 
 ### Changed
 
