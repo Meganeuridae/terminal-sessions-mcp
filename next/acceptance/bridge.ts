@@ -91,7 +91,7 @@ try {
   await check('a command that outlives its call is delivered once, and the wake gate wakes on it', async () => {
     const opened = await call('open', { name: 'main', cwd: tmp })
     if (opened.isError) fail(opened.text)
-    const r = await call('run', { name: 'main', command: `until [ -e ${released} ]; do sleep 0.1; done; echo acceptance-out""put`, wait: 0 })
+    const r = await call('run', { name: 'main', command: `until [ -e '${released.replace(/'/g, "'\\''")}' ]; do sleep 0.1; done; echo acceptance-out""put`, wait: 0 })
     if (!/still running/.test(r.text)) fail(r.text)
     fs.writeFileSync(released, '')
     const mine = () => deliveries.filter((d) => /acceptance-output/.test(d.text))

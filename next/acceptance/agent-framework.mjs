@@ -109,7 +109,7 @@ try {
   await check(wakes ? 'a command that outlives its call wakes the agent once, with its output, and no inference loop' : 'under a gate that defers what no rule names, the end enters the context and wakes no one', async () => {
     const opened = await call('open', { name: 'main', cwd: tmp });
     assert.equal(opened.isError, false, opened.text);
-    const r = await call('run', { name: 'main', command: `until [ -e ${released} ]; do sleep 0.1; done; echo acceptance-out""put`, wait: 0 });
+    const r = await call('run', { name: 'main', command: `until [ -e '${released.replace(/'/g, "'\\''")}' ]; do sleep 0.1; done; echo acceptance-out""put`, wait: 0 });
     assert.match(r.text, /still running/, r.text);
     fs.writeFileSync(released, '');
     const woke = () => messages().filter((m) => text(m).includes('acceptance-output'));
