@@ -881,7 +881,7 @@ function integrateHint(argv: string): string {
 function refusalAdvice(front: Front, tool: 'run' | 'integrate' | 'stop'): string {
   switch (front.state) {
     case 'prompt':
-      return `${quotedString(front.pending ?? '')} is typed at the prompt and not run. With a line editor's default keys, \`send\` with \`keys: ["C-e", "C-u"]\` clears the line, or \`keys: ["Enter"]\` runs it.`;
+      return `${quotedString(front.pending ?? '')} is on the prompt's line and not run. With a line editor's default keys, \`send\` with \`keys: ["C-e", "C-u"]\` clears the line, or \`keys: ["Enter"]\` runs it. If the prompt or a job drew it, \`keys: ["C-c"]\` draws a fresh prompt.`;
     case 'running':
       if (front.within) return `the shell within ${quoted(front.within.argv)} is running a command. \`look\` with \`until: "end"\` waits for it, \`send\` types into it, \`stop\` types Ctrl-C to it.`;
       if (front.starting) return `the shell is still running its startup files${front.process.shell ? '' : `, now ${quoted(front.process.argv)}`}, and \`run\` works once it has drawn its first prompt. \`look\` shows what it prints, \`send\` types into it.`;

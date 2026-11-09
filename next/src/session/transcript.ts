@@ -122,6 +122,11 @@ export class Transcript {
     return this.term.buffer.active.type === 'normal';
   }
 
+  /** The screen's height in rows. */
+  get rows(): number {
+    return this.term.rows;
+  }
+
   get appCursor(): boolean {
     return this.term.modes.applicationCursorKeysMode;
   }

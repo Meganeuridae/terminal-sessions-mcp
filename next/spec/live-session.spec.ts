@@ -2562,6 +2562,75 @@ test('a cwd that is not a directory is refused as invalid_argument', async () =>
   await assert.rejects(open(which('bash') ?? '/bin/sh', { cwd: path.join(tmp, 'missing') }), { code: 'invalid_argument' });
 });
 
+test("a no-break space typed at the prompt is pending, so run refuses, while ordinary spaces are not", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open(which('bash')!);
+  await s.send('\u00a0', { waitMs: 2000, quietMs: 200 });
+  await pendingIs(s, '\u00a0');
+  assert.equal((await s.run('echo x', { waitMs: 2000 })).kind, 'refused');
+  await s.send('', { waitMs: 2000, keys: ['C-e', 'C-u'], quietMs: 200 });
+  await s.send('  ', { waitMs: 2000, quietMs: 200 });
+  assert.deepEqual(out(s, await ran(s, 'echo spaced')), ['spaced']);
+  await s.close({ force: true, deadline: by() });
+});
+
+test('text on the prompt\'s line past the cursor is pending too, so run refuses until the line is cleared', { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open(which('bash')!);
+  await s.send('echo UNWANTED', { waitMs: 2000, quietMs: 100 });
+  await pendingIs(s, 'echo UNWANTED');
+  // Ctrl-A moves readline's cursor to the start of the line, so nothing is left of it before the cursor.
+  await s.send('', { waitMs: 2000, keys: ['C-a'], quietMs: 200 });
+  await pendingIs(s, 'echo UNWANTED');
+  assert.equal((await s.run('echo x', { waitMs: 2000 })).kind, 'refused');
+  await s.send('', { waitMs: 2000, keys: ['C-e', 'C-u'], quietMs: 200 });
+  await eventually('nothing pending', () => {
+    const f = s.front();
+    return f.state === 'prompt' && f.pending === undefined;
+  });
+  assert.deepEqual(out(s, await ran(s, 'echo cleared')), ['cleared']);
+  await s.close({ force: true, deadline: by() });
+});
+
+for (const [name, rc] of [
+  ['zsh', "RPROMPT='RIGHT-SIDE'\n"],
+  ['fish', 'function fish_right_prompt; echo RIGHT-SIDE; end\n'],
+] as const) {
+  test(`a right prompt ${name} draws on the prompt's line isn't taken for typed text`, { skip: which(name) ? false : `${name} is needed` }, async () => {
+    const s = await open(which(name)!, { rc });
+    await eventually('the right prompt is drawn', () => s.lines(0).lines.some((l) => l.includes('RIGHT-SIDE')));
+    const f = s.front();
+    assert.ok(f.state === 'prompt' && f.pending === undefined, JSON.stringify(f));
+    assert.deepEqual(out(s, await ran(s, 'echo ran')), ['ran']);
+    await s.send('echo half', { waitMs: 2000, quietMs: 200 });
+    assert.equal((await s.run('echo x', { waitMs: 2000 })).kind, 'refused');
+    await s.close({ force: true, deadline: by() });
+  });
+}
+
+test("text a line editor draws on the prompt's line with the cursor after it isn't taken for the prompt's own, even once the cursor moves to the end mark", { skip: which('zsh') ? false : 'zsh is needed' }, async () => {
+  const s = await open(which('zsh')!);
+  // print -z puts the text in the line editor at the next prompt, with the cursor after it, before anything is sent there.
+  await ran(s, "print -z 'echo PUSHED'");
+  await pendingIs(s, 'echo PUSHED');
+  await s.send('', { waitMs: 2000, keys: ['C-a'], quietMs: 200 });
+  await pendingIs(s, 'echo PUSHED');
+  assert.equal((await s.run('echo x', { waitMs: 2000 })).kind, 'refused');
+  await s.close({ force: true, deadline: by() });
+});
+
+test("output a job prints onto the prompt's line, with the cursor after it, isn't taken for the prompt's own, so run refuses", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open(which('bash')!);
+  const gate = path.join(tmp, `gate-${++gates}`);
+  fs.writeFileSync(gate, '');
+  await ran(s, `(while [ -e '${gate}' ]; do sleep 0.05; done; printf BGOUT) &`);
+  // The prompt is drawn with the cursor at its end mark; then the job prints there.
+  await eventually('the prompt is in front', () => s.front().state === 'prompt');
+  fs.rmSync(gate);
+  await eventually('the job printed on the prompt line', () => s.lines(0).lines.some((l) => l.includes('BGOUT')));
+  await pendingIs(s, 'BGOUT');
+  assert.equal((await s.run('echo x', { waitMs: 2000 })).kind, 'refused');
+  await s.close({ force: true, deadline: by() });
+});
+
 test('text sent to a shell without integration at its prompt is pending there, so run refuses until it is cleared', async () => {
   const s = await open('/bin/sh');
   await s.send('echo par', { waitMs: 2000, quietMs: 100 });

@@ -105,6 +105,12 @@ interface Scan {
 const newScan = (from: number): Scan => ({ from, parses: -1, next: undefined, row: 0, turn: -1, clipped: 0, clippedLive: 0, live: 0 });
 /** On macOS a look at the kernel spawns `ps`, so a call's loop looks at most this often. */
 const MAC_LOOK_EVERY_MS = 250;
+
+/**
+ * Whether text read from the prompt's line shows nothing typed: the screen leaves an empty cell as U+0020, its one blank. Every
+ * other space, such as a no-break space, is input a line editor hands the shell. A line break here only joins the line's rows.
+ */
+const emptyText = (text: string): boolean => /^[ \n]*$/.test(text);
 /** How long the shell's own read must have been seen before it counts as a builtin read: a bound on the kernel's delivery of output the shell wrote before it began reading, not a proof. */
 const SHELL_READ_FLOOR_MS = 50;
 
@@ -131,6 +137,10 @@ interface Chain {
   cwd: string;
   /** A shell given the integration with `integrate`: its kind, the local program it runs under, and what its drain sent since the last end mark, as hex. */
   far?: { kind: integration.FarKind; within: Process; drained: string[]; leaves: Leaf[] };
+  /** The prompt at which `send` last wrote: something was sent since `promptAt` when this is it. */
+  sentAt?: Pos;
+  /** The prompt's line as drawn at rest, with nothing sent and the cursor at its end mark, such as a right prompt: text that isn't typed. */
+  rest?: { at: Pos; text: string };
 }
 
 /** The job a `stop` with a signal sent it to, and the command running then; once that command ends, whether its group holds a stopped process. */
@@ -750,18 +760,42 @@ class LiveSession implements Session {
     return !this.top.far && (proc.READS_VISIBLE || this.plain);
   }
 
-  /** The prompt's text after its end mark; until output that came after the last `send` here is parsed, what that sent. */
+  /**
+   * What's on the prompt's line that the prompt didn't draw. That's the text between the end mark and the cursor, when it isn't
+   * blank. Otherwise it's the whole line from the end mark, past the cursor too, unless that's the line as drawn at rest. Text past
+   * the cursor counts only then, since a line editor can draw its own there, as fish draws its suggestion. The rest is taken while
+   * nothing has been sent at this prompt and the cursor sits at the end mark, so text a line editor draws there with the cursor
+   * after it isn't taken in. With no rest taken, any text counts. Until output that came after the last `send` here is parsed,
+   * what that sent.
+   */
   private pending(): string | undefined {
     const b = this.top.promptAt;
     if (!b) return this.top.sentPending;
     const cur = this.t.pos();
     if (cur.line > b.line || (cur.line === b.line && cur.col > b.col)) {
       const ls = this.t.lines(b.line, cur.line + 1).lines;
-      const text = ls.length === 1 ? ls[0]!.slice(b.col, cur.col) : [ls[0]!.slice(b.col), ...ls.slice(1, -1), ls.at(-1)!.slice(0, cur.col)].join('\n');
-      if (text.trim()) return text;
+      const before = ls.length === 1 ? ls[0]!.slice(b.col, cur.col) : [ls[0]!.slice(b.col), ...ls.slice(1, -1), ls.at(-1)!.slice(0, cur.col)].join('\n');
+      if (!emptyText(before)) return before;
     }
+    const text = this.promptLine(b);
+    // Reached only with nothing but blanks before the cursor, so the order nearly implies the cursor's place here. It still matters
+    // when only blanks or line breaks sit before a cursor past the mark, with text after it; no test pins that case. Typed text that
+    // draws exactly the line at rest, where the rest draws it, reads as empty: the screen can't tell input from the prompt's drawing.
+    if (this.top.sentAt !== b && cur.line === b.line && cur.col === b.col) this.top.rest = { at: b, text };
+    if (!emptyText(text) && !(this.top.rest?.at === b && this.top.rest.text === text)) return text.replace(/^[ \n]+|[ \n]+$/g, '');
     const sent = this.top.sentPending;
     return sent !== undefined && /[^\x00-\x20\x7f]/.test(sent) && (this.outputs === this.top.sentOutputs || !this.t.caughtUp) ? sent : undefined;
+  }
+
+  /**
+   * The prompt's line from its end mark to the last line, each line's trailing blanks left out. A line editor draws its line within
+   * the screen, so it's read through as many lines as the screen has rows, and anything further down marks it as more.
+   */
+  private promptLine(b: Pos): string {
+    const last = b.line + this.t.rows;
+    const ls = this.t.lines(b.line, last).lines;
+    const text = [ls[0]?.slice(b.col) ?? '', ...ls.slice(1)].map((l) => l.replace(/ +$/, '')).join('\n').replace(/\n+$/, '');
+    return this.t.end() > last ? `${text}\n…` : text;
   }
 
   cwd(): string {
@@ -879,6 +913,12 @@ class LiveSession implements Session {
       if (!stopped() && this.top.atPrompt && !this.prompted) return unsent('timeout');
       await this.t.settled();
     }
+    // The first `send` at a prompt takes the line's rest first, if no look has, so text it types isn't taken for the prompt's own.
+    const at = this.top.atPrompt && !this.top.submitted ? this.top.promptAt : undefined;
+    if (at && this.top.sentAt !== at && this.top.rest?.at !== at && !stopped()) {
+      await this.t.settled();
+      this.pending();
+    }
     if (stopped()) return unsent(stopped()!);
     if (opts.paste && !this.t.bracketedPaste) return unsent('paste_off');
     const keys = opts.keys?.length ? inputBytes(undefined, opts.keys, { appCursor: this.t.appCursor }) : '';
@@ -897,6 +937,7 @@ class LiveSession implements Session {
     let matched: Match | undefined;
     let by: SendOutcome['by'] = 'timeout';
     try {
+      if (this.top.promptAt) this.top.sentAt = this.top.promptAt;
       this.p.write(bytes);
       this.top.sentOutputs = this.outputs;
       const r = await this.until(deadline, () => {
