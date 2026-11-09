@@ -1267,6 +1267,15 @@ test('a paste refuses text holding Ctrl-C, Ctrl-Z or Ctrl-\\, and types nothing'
   assert.equal(s.calls.filter((c) => c.method === 'send').length, 0);
 });
 
+test("notify_on says when it found no match in lines it searched only at their head", async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  s.runOutput = [`${'x'.repeat(200_000)}READY`];
+  const r = await host.call(agent(), 'run', { name: 'main', command: 'serve', notify_on: 'READY' });
+  assert.match(r.text, /\n`notify_on` found no match: 1 line longer than the match window, searched on its head only\./);
+});
+
 test('look gives the ends its own wait took before the reports not yet seen, so a cut leaves them', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });

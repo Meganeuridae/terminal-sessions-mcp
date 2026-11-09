@@ -333,6 +333,7 @@ export class Host {
     if (caller.takes && out.from <= e.cursor) e.cursor = Math.max(e.cursor, out.to - (r.kind === 'ended' ? 0 : out.live));
     const found = search?.match;
     const left = search && !found && search.to < out.to ? [`\`notify_on\` searched lines ${out.from} to ${search.to} ${RAN_OUT}; \`read\` with \`match\` and \`lines: [${search.to}, ${out.to}]\` searches the rest.`] : [];
+    if (search && !found && search.clipped) left.push(`\`notify_on\` found no match: ${headOnlyText(search.clipped)}.`);
     const head = [this.status(e, r.front, c), ...(found ? [matchedText(found)] : []), ...left].join('\n');
     const tail = r.kind === 'running'
       ? `\nIt keeps running. ${caller.pushes ? 'Its end will be reported to you, or ' : ''}\`look\` with \`until: "end"\` waits for it; \`stop\` stops it.`
@@ -768,14 +769,16 @@ export class Host {
   }
 }
 
-async function firstMatch(re: RegExp, l: Lines, deadline: number, stopped: () => boolean): Promise<{ match?: Match; to: number }> {
+async function firstMatch(re: RegExp, l: Lines, deadline: number, stopped: () => boolean): Promise<{ match?: Match; to: number; clipped: number }> {
+  let clipped = 0;
   for (let i = 0; i < l.lines.length; i++) {
-    if (stopped() || mono() >= deadline) return { to: l.from + i };
+    if (stopped() || mono() >= deadline) return { to: l.from + i, clipped };
     const t = testBounded(re, l.lines[i]!);
-    if (t.matched) return { match: { line: l.from + i, text: l.lines[i]!, ...(t.clipped ? { clipped: true as const } : {}) }, to: l.from + i + 1 };
+    if (t.matched) return { match: { line: l.from + i, text: l.lines[i]!, ...(t.clipped ? { clipped: true as const } : {}) }, to: l.from + i + 1, clipped };
+    if (t.clipped) clipped++;
     await turn();
   }
-  return { to: l.to };
+  return { to: l.to, clipped };
 }
 
 const RAN_OUT = `before the ${WAIT_MAX_S} s a call may hold ran out`;
