@@ -610,7 +610,7 @@ class LiveSession implements Session {
   }
 
   private schedulePoll(): void {
-    if (!LINUX || this.exitInfo || this.closed) return;
+    if (!LINUX || this.exitInfo || this.closing) return;
     this.poll = setTimeout(() => {
       if (!this.top.atPrompt || this.top.submitted) this.observe(this.front(), [...this.calls].filter((c) => c.take));
       this.schedulePoll();
@@ -876,6 +876,13 @@ class LiveSession implements Session {
     return call;
   }
 
+  /** Gives `line` to the log; a log that throws can't stop the step it reports on. */
+  private note(line: string): void {
+    try {
+      this.log?.(line);
+    } catch {}
+  }
+
   /** Types `bytes` and returns when, as the last write; a write that throws leaves the last write as it was. */
   private write(bytes: string): number {
     const was = this.lastWrite;
@@ -1025,7 +1032,7 @@ class LiveSession implements Session {
     let by: WaitOutcome['by'] = 'timeout';
     try {
       const r = await this.until(deadline, () => {
-        if (this.closed) return 'closed' as const;
+        if (this.closing) return 'closed' as const;
         if (this.exitInfo) return 'exited' as const;
         if (opts.signal?.aborted) return 'cancelled' as const;
         if (until.kind === 'match') return (matched = this.scan(until.pattern, scan)) ? ('match' as const) : undefined;
@@ -1307,10 +1314,23 @@ class LiveSession implements Session {
   /**
    * A close while one is under way waits for that one, until its own deadline, so neither returns before the first has hung up what
    * it listed. With `force`, the close under way goes on as forced from its next step. At its own deadline it says the close is
-   * still under way, and names only a signal that close has sent the shell.
+   * still under way, and names only a signal that close has sent the shell. A close that fails leaves none under way, so the next
+   * starts again.
    */
   close(opts: { force?: boolean; deadline: number }): Promise<Closed> {
-    if (!this.closing) return (this.closing = this.shut(opts));
+    if (!this.closing) {
+      const closing = this.shut(opts);
+      this.closing = closing;
+      this.wake();
+      closing.catch(() => {
+        if (this.closing !== closing) return;
+        this.closing = undefined;
+        this.forcedLate = false;
+        this.sentShell = undefined;
+        this.schedulePoll();
+      });
+      return closing;
+    }
     if (opts.force && !this.forcedLate) {
       this.forcedLate = true;
       this.wake();
@@ -1324,7 +1344,6 @@ class LiveSession implements Session {
 
   private async shut(opts: { force?: boolean; deadline: number }): Promise<Closed> {
     this.closed = true;
-    this.wake();
     if (this.poll) clearTimeout(this.poll);
     const { deadline } = opts;
     let unlisted = false;
@@ -1337,7 +1356,7 @@ class LiveSession implements Session {
           this.sentShell = 'SIGKILL';
         } catch {}
       };
-      const failed = (why: string): void => this.log?.(`session ${JSON.stringify(this.name)}: close couldn't list ${why}`);
+      const failed = (why: string): void => this.note(`session ${JSON.stringify(this.name)}: close couldn't list ${why}`);
       const before = (graces: number): proc.Listing => ({ deadline: deadline - graces * CLOSE_GRACE_MS, failed });
       // Listed before the first signal: once the shell exits, nothing in its session has a terminal.
       const first = before(forced() ? 1 : 2);
@@ -1409,14 +1428,14 @@ class LiveSession implements Session {
     } else {
       // Once the shell has exited, nothing has its terminal, so what it left running can't be listed, and may live on.
       unlisted = true;
-      this.log?.(`session ${JSON.stringify(this.name)}: close couldn't list what the shell left running, since the shell had already exited`);
+      this.note(`session ${JSON.stringify(this.name)}: close couldn't list what the shell left running, since the shell had already exited`);
     }
     const exit = this.exitInfo ?? this.ptyExit;
     this.t.dispose();
     // A process just hung up can still be writing here as it exits, so a removal that meets a file written meanwhile tries again.
     const removal = fs.promises
       .rm(this.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
-      .catch((e: Error) => this.log?.(`session ${JSON.stringify(this.name)} closed, but its directory ${this.dir} wasn't removed: ${e.message}`));
+      .catch((e: Error) => this.note(`session ${JSON.stringify(this.name)} closed, but its directory ${this.dir} wasn't removed: ${e.message}`));
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([removal, new Promise<void>((resolve) => (timer = setTimeout(resolve, Math.max(0, deadline - mono()))))]);
     clearTimeout(timer);

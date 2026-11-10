@@ -2265,6 +2265,69 @@ test('a close whose every signal to the shell fails names none as sent', async (
   }
 });
 
+test('a close whose log throws still closes', async () => {
+  const s = await open('/bin/sh', {
+    log: () => {
+      throw new Error('log refused');
+    },
+  });
+  await s.run('exit', { waitMs: 2000 });
+  await eventually('the shell exited', () => s.front().state === 'exited');
+  const c = await s.close({ deadline: by() });
+  assert.equal(c.unlisted, true, JSON.stringify(c));
+});
+
+test('a close that fails leaves none under way, so the next close starts again and finishes', async () => {
+  const s = await open('/bin/sh');
+  const dir = (s as unknown as { dir: string }).dir;
+  const t = (s as unknown as { t: { dispose(): void } }).t;
+  const dispose = t.dispose.bind(t);
+  let disposes = 0;
+  t.dispose = () => {
+    if (++disposes === 1) throw new Error('refused');
+    dispose();
+  };
+  await assert.rejects(s.close({ deadline: by() }), /refused/);
+  const c = await s.close({ deadline: by() });
+  assert.deepEqual([disposes, c.underway, fs.existsSync(dir)], [2, undefined, false], JSON.stringify(c));
+  assert.equal(s.front().state, 'exited');
+});
+
+/** A close whose deadline throws as it's read, so it fails before it signals anything. */
+const failingClose = (): { deadline: number } => ({
+  get deadline(): number {
+    throw new Error('refused');
+  },
+});
+
+test('after a close that fails before it signals, input stays blocked, and a wait for the running command still sees it end', async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const gate = newGate();
+  fs.writeFileSync(gate, '');
+  const from = s.lines(0).to - 1;
+  const r = await s.run(holdJob(gate), { waitMs: 200 });
+  assert.equal(r.kind, 'running', JSON.stringify(r));
+  await assert.rejects(s.close(failingClose()), /refused/);
+  assert.equal((await s.run('echo no', { waitMs: 300 })).kind, 'refused');
+  const ending = s.wait({ kind: 'end' }, { waitMs: 10_000, from });
+  fs.rmSync(gate);
+  const w = await ending;
+  assert.equal(w.by, 'end', JSON.stringify(w));
+});
+
+test('after a close that fails before it signals, the session goes on looking while a command runs, so its wait for input is reported', { skip: !proc.READS_VISIBLE ? 'only Linux on x64, arm64, riscv64 and loong64 shows reads' : false }, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const gate = newGate();
+  fs.writeFileSync(gate, '');
+  const r = await s.run(`${holdJob(gate)}; head -n 1 >/dev/null`, { waitMs: 200 });
+  assert.equal(r.kind, 'running', JSON.stringify(r));
+  await assert.rejects(s.close(failingClose()), /refused/);
+  const events: SessionEvent[] = [];
+  s.onEvent((e) => events.push(e));
+  fs.rmSync(gate);
+  await eventually('a wait for input is reported', () => events.some((e) => e.kind === 'waiting'));
+});
+
 test("a close that joins one under way and whose own deadline comes first says it's under way, and names no signal before one was sent", darwinOnly, async () => {
   const s = await open(which('bash') ?? '/bin/bash');
   const gate = path.join(tmp, `gate-${++gates}`);
