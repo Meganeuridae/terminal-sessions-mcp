@@ -1856,6 +1856,30 @@ test('close of a shell that had already exited says what it left running may liv
   }
 });
 
+test("a scan of the terminal's processes that doesn't find the shell fails close's listing, since a shell that exited mid-scan took the terminal from the rest", { skip: process.platform !== 'linux' ? 'only Linux scans /proc' : false }, async () => {
+  const logs: string[] = [];
+  const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
+  const real = fs.readdirSync;
+  // The scan sees every process but the shell, as when the shell exits once its terminal was read.
+  const patched = ((p: fs.PathLike, ...rest: unknown[]) => {
+    const out = (real as (...a: unknown[]) => unknown)(p, ...rest);
+    return p === '/proc' ? (out as string[]).filter((d) => d !== String(s.pid)) : out;
+  }) as typeof fs.readdirSync;
+  const fsModule = (await import('node:fs')).default;
+  fsModule.readdirSync = patched;
+  syncBuiltinESMExports();
+  try {
+    const exit = await s.close({ deadline: by() });
+    fsModule.readdirSync = real;
+    syncBuiltinESMExports();
+    assert.equal(exit.unlisted, true, JSON.stringify(exit));
+    assert.match(logs.join('\n'), /the processes on the terminal: the shell itself wasn't among them/);
+  } finally {
+    fsModule.readdirSync = real;
+    syncBuiltinESMExports();
+  }
+});
+
 test("a /proc read that fails for a reason other than the process being gone fails close's listing, rather than leaving that process out", { skip: process.platform !== 'linux' ? 'only Linux lists from /proc' : false }, async () => {
   const logs: string[] = [];
   const s = await open(which('bash') ?? '/bin/bash', { log: (l) => logs.push(l) });
