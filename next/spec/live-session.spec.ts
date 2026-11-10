@@ -643,7 +643,18 @@ for (const sh of shells) {
       const c = await ran(s, "head -c 250000 /dev/zero | tr '\\0' x; echo", 30_000);
       assert.deepEqual(out(s, c).map((l) => l.length), [65_536, 65_536, 65_536, 53_392]);
       assert.equal(out(s, c).join(''), 'x'.repeat(250_000));
+      assert.deepEqual(s.lines(c.from, c.to).continues, [c.from + 1, c.from + 2, c.from + 3]);
       assert.deepEqual(out(s, await ran(s, 'echo after')), ['after']);
+    });
+
+    test('of the pieces of a line longer than 64 Ki characters, each after the first is reported as going on the line before, on the screen and once frozen', async () => {
+      const s = await open(shell);
+      const c = await ran(s, "head -c 70000 /dev/zero | tr '\\0' y; echo; echo short", 30_000);
+      assert.deepEqual(out(s, c).map((l) => l.length), [65_536, 4_464, 5]);
+      assert.deepEqual(s.lines(c.from, c.to).continues, [c.from + 1]);
+      await ran(s, 'seq 1 100');
+      assert.deepEqual(s.lines(c.from, c.to).continues, [c.from + 1]);
+      assert.equal(s.lines(c.from, c.to).live, 0, 'frozen');
     });
 
     test('a full-screen program leaves its last frame in the transcript', async () => {

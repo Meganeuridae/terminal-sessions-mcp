@@ -174,6 +174,8 @@ export interface Lines {
   dropped: number;
   /** How many of the last lines are still on the live screen and may yet change. */
   live: number;
+  /** The lines, by number, that go on the line before them: a logical line longer than 65,536 characters is numbered as its pieces. */
+  continues?: number[];
 }
 
 export interface Screen {

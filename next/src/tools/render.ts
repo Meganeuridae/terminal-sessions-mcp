@@ -147,8 +147,9 @@ export function linesText(l: Lines, budget: number, readHint: string): string {
   return [...out, ...head, marker(left, cut), ...tail].join('\n');
 }
 
-export function outputValue(lines: readonly string[], budget: number): { output: string; outputLeftOut?: { at: number; characters: number } } {
-  const whole = lines.join('\n');
+/** `joined` lists the indices of lines that go on the line before them, which take no line break. */
+export function outputValue(lines: readonly string[], budget: number, joined: readonly number[] = []): { output: string; outputLeftOut?: { at: number; characters: number } } {
+  const whole = lines.map((l, i) => (i > 0 && !joined.includes(i) ? `\n${l}` : l)).join('');
   if (whole.length <= budget) return { output: whole };
   let at = Math.floor(Math.max(0, budget) / 3);
   if (at > 0 && isHighSurrogate(whole.charCodeAt(at - 1))) at--;

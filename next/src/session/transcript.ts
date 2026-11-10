@@ -51,6 +51,10 @@ export class Transcript {
   private scrolled = 0;
   /** The head of a logical line that goes on wrapping, taken from the emulator by a freeze before it ended. */
   private partial = '';
+  /** Whether pieces of the partial's logical line were frozen already, so what's left of it continues them. */
+  private partialCut = false;
+  /** Frozen lines, by number, that are a later piece of a logical line longer than MAX_LINE. */
+  private readonly continuing = new Set<number>();
   private reset = false;
   private titleText = '';
   private written = 0;
@@ -214,13 +218,17 @@ export class Transcript {
   }
 
   lines(from: number, to?: number): Lines {
-    const live = this.live();
+    const { lines: live, continuing } = this.liveLines();
     const base = this.dropped + this.frozen.length;
     const last = Math.min(to ?? base + live.length, base + live.length);
     const start = Math.max(from, this.dropped);
     const out: string[] = [];
-    for (let n = start; n < last; n++) out.push(this.io.redact(n < base ? this.frozen[n - this.dropped]! : live[n - base]!));
-    return { from: start, to: Math.max(start, last), lines: out, dropped: Math.max(0, Math.min(this.dropped, last) - from), live: Math.max(0, last - Math.max(start, base)) };
+    const continues: number[] = [];
+    for (let n = start; n < last; n++) {
+      out.push(this.io.redact(n < base ? this.frozen[n - this.dropped]! : live[n - base]!));
+      if (n < base ? this.continuing.has(n) : continuing.has(n - base)) continues.push(n);
+    }
+    return { from: start, to: Math.max(start, last), lines: out, dropped: Math.max(0, Math.min(this.dropped, last) - from), live: Math.max(0, last - Math.max(start, base)), ...(continues.length && { continues }) };
   }
 
   screen(): Screen {
@@ -265,8 +273,9 @@ export class Transcript {
       this.at = this.above = undefined;
       this.splits = [];
       this.anchored = false;
-      if (this.partial) this.push(this.io.redact(this.partial));
+      if (this.partial) this.push(this.io.redact(this.partial), this.partialCut);
       this.partial = '';
+      this.partialCut = false;
     }
     if (this.at && !this.at.isDisposed) return this.at.line;
     if (this.above && !this.above.isDisposed) return this.above.line + 1;
@@ -284,10 +293,24 @@ export class Transcript {
   }
 
   private live(): string[] {
-    if (!this.normal) return [];
+    return this.liveLines().lines;
+  }
+
+  /** The live lines, with the indices among them that are a later piece of a logical line longer than MAX_LINE. */
+  private liveLines(): { lines: string[]; continuing: Set<number> } {
+    const lines: string[] = [];
+    const continuing = new Set<number>();
+    if (!this.normal) return { lines, continuing };
     const b = this.term.buffer.normal;
     const from = this.firstLine();
-    return this.withPartial(from, this.walk(from, b.baseY + Math.max(this.lastRow(), b.cursorY)).lines).flatMap((l) => (l.length > MAX_LINE ? pieces(this.io.redact(l)) : [l]));
+    const cut = this.partial !== '' && this.partialCut;
+    this.withPartial(from, this.walk(from, b.baseY + Math.max(this.lastRow(), b.cursorY)).lines).forEach((l, k) => {
+      (l.length > MAX_LINE ? pieces(this.io.redact(l)) : [l]).forEach((piece, j) => {
+        if (j > 0 || (k === 0 && cut)) continuing.add(lines.length);
+        lines.push(piece);
+      });
+    });
+    return { lines, continuing };
   }
 
   private walk(from: number, to: number, cursor?: { row: number; x: number }): { lines: string[]; cursor?: { index: number; col: number } } {
@@ -317,8 +340,10 @@ export class Transcript {
     return at ? { lines, cursor: at } : { lines };
   }
 
-  private push(text: string): void {
-    for (const piece of pieces(text)) {
+  /** Freezes `text` as its pieces; `continues` when it goes on a logical line whose earlier pieces are frozen. */
+  private push(text: string, continues = false): void {
+    for (const [k, piece] of pieces(text).entries()) {
+      if (k > 0 || continues) this.continuing.add(this.dropped + this.frozen.length);
       // V8 keeps a string built by appending, as the emulator builds a row's text, as a rope of its pieces,
       // about ten times the memory of the flat string. A string decoded from a buffer is flat.
       this.frozen.push(Buffer.from(piece, 'utf16le').toString('utf16le'));
@@ -335,14 +360,18 @@ export class Transcript {
   private drop(n: number): void {
     for (const l of this.frozen.splice(0, n)) this.frozenChars -= l.length;
     this.dropped += n;
+    for (const c of this.continuing) if (c < this.dropped) this.continuing.delete(c);
   }
 
   private freezeThrough(upto: number): number {
     const from = this.firstLine();
     if (upto < from) return from;
+    const cut = this.partial !== '' && this.partialCut;
     const lines = this.withPartial(from, this.walk(from, upto).lines);
     this.partial = this.wraps(upto + 1) ? (lines.pop() ?? '') : '';
-    for (const l of lines) this.push(this.io.redact(l));
+    // The first line goes on the partial's logical line; with none frozen now, the new partial still does.
+    for (const [k, l] of lines.entries()) this.push(this.io.redact(l), k === 0 && cut);
+    this.partialCut = lines.length ? false : cut;
     if (this.partial.length > MAX_LINE) {
       // A text to redact whose head ends the partial goes on in the next row, so redacting the partial
       // can't replace it. The partial keeps every piece that holds part of its last redactSpan - 1
@@ -352,7 +381,10 @@ export class Transcript {
       let kept = ps.pop()!;
       while (ps.length && kept.length < this.io.redactSpan - 1) kept = ps.pop()! + kept;
       this.partial = kept;
-      for (const piece of ps) this.push(piece);
+      for (const piece of ps) {
+        this.push(piece, this.partialCut);
+        this.partialCut = true;
+      }
     }
     for (const s of this.splits) if (s.marker.line <= upto) s.marker.dispose();
     this.splits = this.splits.filter((s) => !s.marker.isDisposed);

@@ -360,7 +360,7 @@ export class Host {
       ...(c.end?.stopped ? { stopped: true } : {}),
       ...(c.end?.stoppedUnknown ? { stoppedUnknown: true } : {}),
       ...(c.end?.unfollowed ? { unfollowed: true } : {}),
-      ...outputValue(out.lines, budget),
+      ...outputValue(out.lines, budget, out.continues?.map((n) => n - out.from)),
       ...(out.dropped ? { outputDropped: out.dropped } : {}),
     });
   }

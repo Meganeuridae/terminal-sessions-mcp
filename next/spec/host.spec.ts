@@ -958,6 +958,12 @@ test("run's output past its budget keeps its start and end, and says where the g
     }
 });
 
+test("output joins the pieces of one long line with no line break, and its left-out count is the command's own characters", () => {
+  assert.equal(outputValue(['ab', 'cd', 'ef'], 100, [1]).output, 'abcd\nef');
+  const v = outputValue(['x'.repeat(60), 'y'.repeat(40)], 30, [1]);
+  assert.equal(v.output.length + v.outputLeftOut!.characters, 100);
+});
+
 test("the host says what the session reports of a match on the screen, an undelivered signal, an unlisted or unseen close, a timed-out search's long lines, unknown echo and a command's duration", async () => {
   const { host, opened } = setup();
   const wakes: Wake[] = [];
