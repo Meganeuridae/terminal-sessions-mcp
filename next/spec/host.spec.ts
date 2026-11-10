@@ -190,6 +190,35 @@ test('H8: an end no call took is pushed under its command\'s key; accepted, it i
   assert.equal(otherScope.length, 0, 'another scope is never woken');
 });
 
+test('a report a cancelled call gives back is offered before a newer one, to a host whose wakes start later', async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'one' });
+  await host.call(agent(), 'open', { name: 'two' });
+  const [one, two] = opened as [FakeSession, FakeSession];
+  two.runMode = 'run';
+  await host.call(agent(), 'run', { name: 'two', command: 'sleep 9', wait: 0 });
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const run = one.run.bind(one);
+  one.run = async (text, opts) => {
+    const r = await run(text, opts);
+    await gate;
+    return r;
+  };
+  const ac = new AbortController();
+  const taking = host.call(agent(), 'run', { name: 'one', command: 'true' }, ac.signal);
+  await settle();
+  two.end(0);
+  await settle();
+  ac.abort();
+  release();
+  assert.equal((await taking).structured.error, 'cancelled', 'the premise: the call that took the older end was cancelled');
+  const wakes: Wake[] = [];
+  host.subscribe('a', async (w) => (wakes.push(w), true));
+  for (let i = 0; i < 3; i++) await settle();
+  assert.deepEqual(wakes.map((w) => w.session), ['one', 'two'], 'the older end first');
+});
+
 test('H8: an end a call already returned wakes no one', async () => {
   const { host } = setup();
   const wakes: Wake[] = [];

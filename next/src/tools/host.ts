@@ -61,7 +61,7 @@ interface Unseen {
 
 interface Subscriber {
   sink: WakeSink;
-  offered: number;
+  offered: WeakSet<Unseen>;
   busy: boolean;
   gone: boolean;
 }
@@ -118,7 +118,7 @@ export class Host {
   subscribe(scope: string, sink: WakeSink): () => void {
     let set = this.subscribers.get(scope);
     if (!set) this.subscribers.set(scope, (set = new Set()));
-    const sub: Subscriber = { sink, offered: 0, busy: false, gone: false };
+    const sub: Subscriber = { sink, offered: new WeakSet(), busy: false, gone: false };
     set.add(sub);
     this.pump(scope);
     return () => {
@@ -779,7 +779,7 @@ export class Host {
       if (sub.busy || sub.gone) continue;
       const next = this.nextUnseen(scope, sub.offered);
       if (!next) continue;
-      sub.offered = next.u.seq;
+      sub.offered.add(next.u);
       sub.busy = true;
       if (next.e) next.e.takerUsed = true;
       void sub
@@ -793,13 +793,14 @@ export class Host {
     }
   }
 
-  private nextUnseen(scope: string, after: number): { e: Entry | undefined; u: Unseen } | undefined {
+  private nextUnseen(scope: string, offered: WeakSet<Unseen>): { e: Entry | undefined; u: Unseen } | undefined {
     let best: { e: Entry | undefined; u: Unseen } | undefined;
+    const older = (u: Unseen): boolean => !best || u.at < best.u.at || (u.at === best.u.at && u.seq < best.u.seq);
     for (const e of this.entries.values()) {
       if (e.scope !== scope) continue;
-      for (const u of e.unseen.values()) if (u.seq > after && (!best || u.seq < best.u.seq)) best = { e, u };
+      for (const u of e.unseen.values()) if (!offered.has(u) && older(u)) best = { e, u };
     }
-    for (const u of this.left.get(scope) ?? []) if (u.seq > after && (!best || u.seq < best.u.seq)) best = { e: undefined, u };
+    for (const u of this.left.get(scope) ?? []) if (!offered.has(u) && older(u)) best = { e: undefined, u };
     return best;
   }
 
