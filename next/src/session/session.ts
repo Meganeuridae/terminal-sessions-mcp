@@ -663,13 +663,7 @@ class LiveSession implements Session {
       return at({ state: 'running', since: this.since(`r:${depth}:${command ?? ''}`), process: far.within, waitVisible: false, within: far.within });
     }
     this.lastLook = mono();
-    if (!shell) {
-      if (this.prompted) {
-        const pending = this.pending();
-        return { state: 'prompt', since: this.since('prompt'), ...(pending !== undefined && { pending }) };
-      }
-      return at({ state: 'unknown', since: this.since('unknown') });
-    }
+    if (!shell) return at({ state: 'unknown', since: this.since('unknown') });
     const g = shell.tpgid !== undefined ? { pgrp: shell.pgrp, tpgid: shell.tpgid } : undefined;
     const program = (process: Process, reads: Array<boolean | undefined>): Front => {
       if (reads.includes(true)) {
@@ -679,10 +673,6 @@ class LiveSession implements Session {
       return at({ state: 'running', since: this.since(`r:${process.pgid}`), process, waitVisible: reads.length > 0 && !reads.includes(undefined) });
     };
     if (!g || g.tpgid === g.pgrp) {
-      if (this.prompted) {
-        const pending = this.pending();
-        return { state: 'prompt', since: this.since('prompt'), ...(pending !== undefined && { pending }) };
-      }
       const pgid = g?.pgrp ?? this.pid;
       const argv = shell.argv;
       if (this.opened && argv !== undefined && argv !== this.argvAtOpen && !this.execed) {
@@ -690,6 +680,11 @@ class LiveSession implements Session {
         // The marks were the replaced shell's. Its last said prompt when the line that ran exec started none, as in bash 3.2,
         // which has no mark for a line it starts; that says nothing of the shell in front now.
         this.top.atPrompt = false;
+      }
+      if (this.prompted) {
+        if (argv === undefined) return at({ state: 'unknown', since: this.since('unknown') });
+        const pending = this.pending();
+        return { state: 'prompt', since: this.since('prompt'), ...(pending !== undefined && { pending }) };
       }
       const reads = proc.readsTerminal(this.pid, this.pts);
       if (this.execed && argv !== undefined && !isShell(argv)) return program({ pgid, argv, shell: false }, [reads]);
