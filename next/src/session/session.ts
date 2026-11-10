@@ -963,7 +963,7 @@ class LiveSession implements Session {
   }
 
   async send(text: string, opts: { waitMs: number; keys?: readonly string[]; paste?: boolean; until?: RegExp; quietMs?: number; take?: boolean; signal?: AbortSignal }): Promise<SendOutcome> {
-    const from = this.t.pos().line;
+    let from = this.t.pos().line;
     const gone = (): Exit | undefined => this.exitInfo ?? this.ptyExit;
     const unsent = (by: SendOutcome['by']): SendOutcome => ({ sent: false, lines: this.t.lines(from), front: this.front(), ended: [], by, took: [] });
     const stopped = (): SendOutcome['by'] | undefined => (gone() ? 'exited' : this.closed ? 'closed' : opts.signal?.aborted ? 'cancelled' : undefined);
@@ -997,6 +997,7 @@ class LiveSession implements Session {
     }
     const call = this.enter(opts.take ?? true, opts.signal);
     let sentAt = 0;
+    from = this.t.pos().line;
     const scan = newScan(from);
     let matched: Match | undefined;
     let by: SendOutcome['by'] = 'timeout';

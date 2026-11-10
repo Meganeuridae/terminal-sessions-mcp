@@ -153,13 +153,13 @@ const fakePs = (cases: string): string => {
 const newGate = (): string => path.join(tmp, `gate-${++gates}`);
 /** A job of one process group that runs until `gate` is removed. */
 const holdJob = (gate: string): string => `sh -c 'while [ -e "$0" ]; do sleep 0.05; done' '${gate}'`;
-/** A prompt hook that, while `gate` exists, prints HELD and holds the prompt; it runs after the end mark. fish draws what its prompt function prints only once it returns, so there HELD goes to the terminal itself. */
-const gateHook = (shell: string, gate: string): string =>
+/** A prompt hook that, while `gate` exists, prints HELD and holds the prompt, then prints `then` if it's given; it runs after the end mark. fish draws what its prompt function prints only once it returns, so there HELD and `then` go to the terminal itself. */
+const gateHook = (shell: string, gate: string, then?: string): string =>
   shell === 'fish'
-    ? `function fish_prompt; if test -e '${gate}'; echo HELD >/dev/tty; while test -e '${gate}'; sleep 0.05; end; end; echo -n "> "; end\n`
+    ? `function fish_prompt; if test -e '${gate}'; echo HELD >/dev/tty; while test -e '${gate}'; sleep 0.05; end;${then ? ` echo ${then} >/dev/tty;` : ''} end; echo -n "> "; end\n`
     : shell === 'zsh'
-      ? `__gate() { if [[ -e '${gate}' ]]; then echo HELD; while [[ -e '${gate}' ]]; do sleep 0.05; done; fi }\nprecmd_functions+=(__gate)\n`
-      : `PROMPT_COMMAND='if [ -e "${gate}" ]; then echo HELD; while [ -e "${gate}" ]; do sleep 0.05; done; fi'\n`;
+      ? `__gate() { if [[ -e '${gate}' ]]; then echo HELD; while [[ -e '${gate}' ]]; do sleep 0.05; done;${then ? ` echo ${then};` : ''} fi }\nprecmd_functions+=(__gate)\n`
+      : `PROMPT_COMMAND='if [ -e "${gate}" ]; then echo HELD; while [ -e "${gate}" ]; do sleep 0.05; done;${then ? ` echo ${then};` : ''} fi'\n`;
 /** A prompt hook that, at the prompt after a command creates `arm`, removes it and creates `flag`: once `flag` exists, the command's output and its end mark have been written. */
 const flagHook = (shell: string, arm: string, flag: string): string =>
   shell === 'fish'
@@ -489,6 +489,16 @@ for (const sh of shells) {
       fs.rmSync(gate);
       assert.equal((await s.send('zq', { waitMs: 10_000 })).sent, true);
       await pendingIs(s, 'zq');
+    });
+
+    test("send's wait_for looks only from where its text went in, though the prompt it waited for printed a match", async () => {
+      const gate = newGate();
+      const s = await open(shell, { rc: gateHook(sh.name, gate, 'RELEASED') });
+      await heldAfter(s, gate, 'true', 'run');
+      const sent = s.send('echo AF""TER\r', { waitMs: 10_000, until: /^(RELEASED|AFTER)$/ });
+      fs.rmSync(gate);
+      const r = await sent;
+      assert.deepEqual([r.by, r.matched?.text], ['match', 'AFTER'], JSON.stringify(r.matched));
     });
 
     test('after a blank line, which ends with no start mark, run waits for the prompt a hook holds, then runs', { skip: sh.name === 'fish' ? 'fish prints no end mark for a blank line' : false }, async () => {
