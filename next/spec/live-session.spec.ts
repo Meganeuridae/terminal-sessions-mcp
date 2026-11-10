@@ -2355,6 +2355,23 @@ test("a command in a far shell reached from another far shell, which ends there,
   await s.close({ force: true, deadline: by() });
 });
 
+test("the session's own shell, given the integration in place, is no longer followed once a command run from its line editor replaces it with another program", { skip: !which('bash') ? 'bash is needed' : bashBelow(which('bash')!, 5, 0) ? 'bind -x is tried only in bash 5 here' : false }, async () => {
+  const s = await open('/bin/sh');
+  const capture = path.join(tmp, `capture-${++gates}`);
+  await s.run(`exec ${which('bash')} --norc --noprofile`, { waitMs: 5000 });
+  await eventually('bash is at its prompt', () => /bash/.test(proc.argv(s.pid) ?? '') && s.front().state === 'prompt');
+  assert.equal((await s.integrate({ waitMs: 10_000 })).kind, 'integrated');
+  // A key bound to a command runs it from the line editor at the prompt, with no mark of a command, as a trap would.
+  await ran(s, `bind -x '"\\C-t": exec cat > "${capture}"'`);
+  await s.send('', { waitMs: 2000, keys: ['C-t'], quietMs: 300 });
+  await eventually('the shell is replaced by cat', () => /^cat\b/.test(proc.argv(s.pid) ?? ''));
+  const f = s.front();
+  assert.notEqual(f.state, 'prompt', JSON.stringify(f));
+  assert.equal((await s.run('echo MUST_NOT_REACH_CAT', { waitMs: 300 })).kind, 'refused');
+  await s.close({ force: true, deadline: by() });
+  assert.doesNotMatch(fs.existsSync(capture) ? fs.readFileSync(capture, 'utf8') : '', /MUST_NOT_REACH_CAT|__tsm/);
+});
+
 test("a run whose command file or terminal write fails leaves no command, file or submitted line behind", { skip: which('bash') ? false : 'bash is needed' }, async () => {
   const s = await open(which('bash')!);
   const dir = (s as unknown as { dir: string }).dir;

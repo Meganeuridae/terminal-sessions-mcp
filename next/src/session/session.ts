@@ -136,7 +136,7 @@ interface Chain {
   refused: number;
   cwd: string;
   /** A shell given the integration with `integrate`: its kind, the local program it runs under, and what its drain sent since the last end mark, as hex. */
-  far?: { kind: integration.FarKind; within: Process; drained: string[]; leaves: Leaf[] };
+  far?: { kind: integration.FarKind; within: Process; drained: string[]; leaves: Leaf[]; self?: string };
   /** The prompt at which `send` last wrote: something was sent since `promptAt` when this is it. */
   sentAt?: Pos;
   /** The prompt's line as drawn at rest, with nothing sent and the cursor at its end mark, such as a right prompt: text that isn't typed. */
@@ -398,7 +398,17 @@ class LiveSession implements Session {
         this.drop(i - 1, { by: left.argv, how: 'ended' });
         return undefined;
       }
-      if (by.pgid === this.pid || by.pgid === w) continue;
+      if (by.pgid === this.pid) {
+        // The session's own shell, given the integration in place, keeps its pid and group when it replaces itself with another
+        // program, as `exec` from a trap does, so its command line is what changes.
+        const now = shell?.argv;
+        if (far.self !== undefined && now !== undefined && now !== far.self) {
+          this.drop(i - 1, { by: by.argv, how: 'ended' });
+          return undefined;
+        }
+        continue;
+      }
+      if (by.pgid === w) continue;
       w = by.pgid;
       const h = this.holds(w, shell, list);
       if (h === undefined) return 'unread';
@@ -1182,7 +1192,12 @@ class LiveSession implements Session {
     if (canonical === undefined) return { kind: 'refused', unread: true, front: f };
     if (canonical) return { kind: 'refused', canonical: true, front: f };
     let within: Process;
-    if (f.state === 'prompt') within = { pgid: this.pid, argv: proc.info(this.pid)?.argv ?? this.shellName, shell: true };
+    let self: string | undefined;
+    if (f.state === 'prompt') {
+      self = proc.info(this.pid)?.argv;
+      if (self === undefined) return { kind: 'refused', unlisted: true, front: f };
+      within = { pgid: this.pid, argv: self, shell: true };
+    }
     else if (this.top.far) {
       // A far chain's front names the program it was reached through. What holds the terminal now may be one that chain's shell
       // started here, as ssh from a local shell, and that is what this shell is reached through.
@@ -1245,7 +1260,7 @@ class LiveSession implements Session {
       }
       if (stop()) return incomplete('hooks', stop()!);
       const chain = newChain(nonce, '');
-      chain.far = { kind, within, drained: [], leaves };
+      chain.far = { kind, within, drained: [], leaves, ...(self !== undefined && { self }) };
       this.chains.push(chain);
       this.probe!.chain = chain;
       this.lastWrite = mono();
