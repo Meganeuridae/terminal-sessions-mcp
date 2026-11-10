@@ -89,7 +89,7 @@ prepend /opt/homebrew/sbin
 prepend /opt/homebrew/bin
 prepend "$HOME/.local/bin"
 if nvm=$(nvm_bin); then prepend "$nvm"; fi
-prepend "$HOME/.volta/bin"
+prepend "${VOLTA_HOME:-$HOME/.volta}/bin"
 if [ -n "${TSM_NODE_BIN:-}" ]; then first "$(dirname "$TSM_NODE_BIN")"; fi
 export PATH
 

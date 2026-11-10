@@ -115,6 +115,20 @@ test("a version manager's directory already on PATH is moved ahead of the system
   }
 });
 
+test("a configured VOLTA_HOME's node is found under a supervisor's minimal PATH", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-launch-'));
+  try {
+    const voltaHome = path.join(home, 'custom-volta');
+    fakeNode(path.join(voltaHome, 'bin', 'node'));
+    const daemon = path.join(home, 'daemon.js');
+    fs.writeFileSync(daemon, '');
+    const r = launch({ HOME: home, VOLTA_HOME: voltaHome, TSM_DAEMON: daemon });
+    assert.equal(r.node, path.join(voltaHome, 'bin', 'node'));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // node-pty keeps the native module it loaded in require's cache, from which unrunnableHelper takes it. Each fixture
 // holds a copy of that module, loaded the way node-pty's loader does: the first directory whose require succeeds.
 const req = createRequire(import.meta.url);
