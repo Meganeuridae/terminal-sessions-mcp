@@ -2111,6 +2111,22 @@ test('a close with force that joins a gentle close after its hangup went out sti
   }
 });
 
+test('a close whose every signal to the shell fails names none as sent', async () => {
+  const s = await open('/bin/sh');
+  const pty = (s as unknown as { p: { kill(signal?: string): void } }).p;
+  const real = pty.kill.bind(pty);
+  pty.kill = () => {
+    throw new Error('refused');
+  };
+  try {
+    const c = await s.close({ deadline: by(6000) });
+    assert.deepEqual([c.unconfirmed, c.signal], [true, undefined], JSON.stringify(c));
+  } finally {
+    pty.kill = real;
+    killPid(s.pid);
+  }
+});
+
 test("a close that joins one under way and whose own deadline comes first says it's under way, and names no signal before one was sent", darwinOnly, async () => {
   const s = await open(which('bash') ?? '/bin/bash');
   const gate = path.join(tmp, `gate-${++gates}`);

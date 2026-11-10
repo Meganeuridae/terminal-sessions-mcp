@@ -984,6 +984,14 @@ test("the host says what the session reports of a match on the screen, an undeli
   assert.equal((await host.call(agent(), 'close', { name: 'main', force: true })).text, "[main · closed]\nThe shell was sent SIGKILL, and its exit wasn't seen within the grace after it. The session couldn't list every process it started, so jobs it started may live on.");
 });
 
+test("a close that couldn't send the shell any signal doesn't say one was sent", async () => {
+  const { host, opened } = setup();
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened.at(-1)!;
+  s.close = async () => ({ code: null, unconfirmed: true });
+  assert.equal((await host.call(agent(), 'close', { name: 'main' })).text, "[main · closed]\nThe shell couldn't be sent a signal, and its exit wasn't seen.");
+});
+
 test('a search the wait ended before it reached the end says how many lines it never searched, and what searches them', async () => {
   const { host, opened } = setup();
   await host.call(agent(), 'open', { name: 'main' });

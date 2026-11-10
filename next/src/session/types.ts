@@ -51,7 +51,10 @@ export interface Exit {
 export type Closed = Exit & {
   /** The processes on the session's terminal, or with `force` the shell's descendants, couldn't be listed, or close couldn't check which listed groups still held them, in which case it signalled none: a listing failed, or the deadline left it no time. Either way, what it started may live on. */
   unlisted?: true;
-  /** The shell's exit wasn't seen within a grace after its KILL, or by the deadline, as for a process in uninterruptible sleep. */
+  /**
+   * The shell's exit wasn't seen within a grace after its KILL, or by the deadline, as for a process in uninterruptible sleep.
+   * `signal` is the strongest signal the shell was sent, and absent when sending each one failed.
+   */
   unconfirmed?: true;
   /**
    * This close joined one already under way, and its own deadline came first. `signal` is the strongest signal that close had sent

@@ -584,7 +584,7 @@ export class Host {
     e.closing = true;
     const [exit] = await Promise.all([e.session.close({ force: a.force === true, deadline: mono() + WAIT_MAX_S * 1000 }), Promise.all(e.settling)]);
     if (exit.underway) return ok(`[${e.name} · still closing]\nThe shell ${underwayText(exit, "this call's wait")}.`, { session: e.name, exit });
-    const how = exit.unconfirmed ? `was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it` : exitText(exit);
+    const how = exit.unconfirmed ? (exit.signal ? `was sent ${exit.signal}, and its exit wasn't seen within the grace after it` : `couldn't be sent a signal, and its exit wasn't seen`) : exitText(exit);
     const unlisted = exit.unlisted ? " The session couldn't list every process it started, so jobs it started may live on." : '';
     const unreached = exit.unreached?.length ? ` These signals weren't delivered: ${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')}. Their processes may live on.` : '';
     let full = `[${e.name} · closed]\nThe shell ${how}.${unlisted}${unreached}`;

@@ -1274,9 +1274,9 @@ class LiveSession implements Session {
     if (!this.exitInfo) {
       const forced = (): boolean => opts.force === true || this.forcedLate;
       const killShell = (): void => {
-        this.sentShell = 'SIGKILL';
         try {
           this.p.kill('SIGKILL');
+          this.sentShell = 'SIGKILL';
         } catch {}
       };
       const failed = (why: string): void => this.log?.(`session ${JSON.stringify(this.name)}: close couldn't list ${why}`);
@@ -1331,9 +1331,9 @@ class LiveSession implements Session {
         // bash can miss a SIGHUP that lands just before its line editor waits for input, and go on waiting.
         const grace = Math.min(mono() + CLOSE_GRACE_MS, deadline - CLOSE_GRACE_MS);
         for (let at = mono(); !gone() && !forced() && at < grace; at += HANGUP_EVERY_MS) {
-          this.sentShell ??= 'SIGHUP';
           try {
             this.p.kill('SIGHUP');
+            this.sentShell ??= 'SIGHUP';
           } catch {}
           await this.until(Math.min(at + HANGUP_EVERY_MS, grace), () => gone() ?? (forced() || undefined));
         }
@@ -1360,7 +1360,7 @@ class LiveSession implements Session {
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([removal, new Promise<void>((resolve) => (timer = setTimeout(resolve, Math.max(0, deadline - mono()))))]);
     clearTimeout(timer);
-    const closed: Closed = exit ? { ...exit } : { code: null, signal: 'SIGKILL', unconfirmed: true };
+    const closed: Closed = exit ? { ...exit } : { code: null, ...(this.sentShell && { signal: this.sentShell }), unconfirmed: true };
     if (unlisted) closed.unlisted = true;
     if (unreached.length) closed.unreached = unreached;
     return closed;
