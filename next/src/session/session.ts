@@ -400,7 +400,8 @@ class LiveSession implements Session {
         // The session's own shell, given the integration in place, keeps its pid and group when it replaces itself with another
         // program, as `exec` from a trap does, so its command line is what changes.
         const now = shell?.argv;
-        if (far.self !== undefined && now !== undefined && now !== far.self) {
+        if (now === undefined) return 'unread';
+        if (far.self !== undefined && now !== far.self) {
           this.drop(i - 1, { by: by.argv, how: 'ended' });
           return undefined;
         }
