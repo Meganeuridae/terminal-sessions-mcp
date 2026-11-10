@@ -62,7 +62,7 @@ test("the launcher refuses a node outside the package's engines range, naming it
     const daemon = path.join(home, 'daemon.js');
     fs.writeFileSync(daemon, '');
     const engines = (JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, '../../../package.json'), 'utf8')) as { engines: { node: string } }).engines.node;
-    for (const [version, runs] of [['v12.22.12', false], ['v22.11.0', false], ['v22.12.0', true], ['v24.22.2', true], ['v25.0.0', false]] as const) {
+    for (const [version, runs] of [['v12.22.12', false], ['v22.11.0', false], ['v22.12.0-rc.1', false], ['v22.12.0', true], ['v24.22.2', true], ['v24.0.0-nightly20250101', false], ['v25.0.0', false]] as const) {
       const node = path.join(home, version, 'bin/node');
       fakeNode(node, version);
       const r = spawnSync('/bin/sh', [LAUNCHER], { env: { PATH: '/usr/bin:/bin', HOME: home, TSM_DAEMON: daemon, TSM_NODE_BIN: node }, encoding: 'utf8' });

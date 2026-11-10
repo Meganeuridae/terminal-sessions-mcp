@@ -104,6 +104,7 @@ v=${version#v} major=${version#v} minor=0
 major=${major%%.*}
 case $v in *.*) minor=${v#*.} minor=${minor%%.*} ;; esac
 case $major$minor in *[!0-9]*|'') major=0 ;; esac
+case $v in *-*) major=0 ;; esac
 if ! { [ "$major" -eq 22 ] && [ "$minor" -ge 12 ]; } && ! { [ "$major" -ge 23 ] && [ "$major" -le 24 ]; }; then
   echo "termd-launch: $node is Node ${version:-of an unknown version}, and termd runs on Node >=22.12.0 <25.0.0; set TSM_NODE_BIN=/path/to/node" >&2
   exit 127
