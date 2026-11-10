@@ -75,6 +75,7 @@ interface Entry {
   watches: Map<number, { key: string; command: number | undefined }>;
   dying: number | undefined;
   closing: boolean;
+  closeFailed: string | undefined;
   settling: Set<Promise<void>>;
   latest: Map<string, { at: number; command: number | undefined }>;
   off: () => void;
@@ -156,6 +157,9 @@ export class Host {
       if (caller.takes) entry.takerUsed = true;
       if (entry.closing && (tool === 'run' || tool === 'send' || tool === 'stop' || tool === 'integrate')) {
         return refused(`Session ${JSON.stringify(name)} is closing, so nothing was ${tool === 'stop' ? 'sent' : 'typed'}. \`close\` with \`force\` makes that close KILL the shell and what it listed, from its next step.`, { error: 'session_exited', session: name });
+      }
+      if (entry.closeFailed !== undefined && (tool === 'run' || tool === 'send' || tool === 'stop' || tool === 'integrate')) {
+        return refused(`Session ${JSON.stringify(name)}'s last close failed partway: ${entry.closeFailed}. Nothing was ${tool === 'stop' ? 'sent' : 'typed'}. \`close\` finishes it, and with \`force\` that close KILLs the shell and what it lists, with no hangup and no grace.`, { error: 'close_failed', session: name });
       }
       switch (tool) {
         case 'run':
@@ -307,7 +311,7 @@ export class Host {
               : ', so its shell is closed';
       return refused(`The daemon stopped while this session started${how}.`, { error: 'backend_failure' });
     }
-    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes || this.opening.get(k) === true, exited: false, finished: false, left: [] };
+    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, closeFailed: undefined, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes || this.opening.get(k) === true, exited: false, finished: false, left: [] };
     entry.off = session.onEvent((ev) => this.onEvent(entry, ev));
     this.entries.set(k, entry);
     const front = session.front();
@@ -609,7 +613,16 @@ export class Host {
 
   private async close(caller: Caller, e: Entry, a: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
     e.closing = true;
-    const [exit] = await Promise.all([e.session.close({ force: a.force === true, deadline: mono() + WAIT_MAX_S * 1000 }), Promise.all(e.settling)]);
+    let exit: Closed;
+    try {
+      [exit] = await Promise.all([e.session.close({ force: a.force === true, deadline: mono() + WAIT_MAX_S * 1000 }), Promise.all(e.settling)]);
+    } catch (err) {
+      if (!e.finished) {
+        e.closing = false;
+        e.closeFailed = clause((err as Error)?.message ?? String(err));
+      }
+      throw err;
+    }
     if (exit.underway) return ok(`[${e.name} · still closing]\nThe shell ${underwayText(exit, "this call's wait")}.`, { session: e.name, exit });
     const how = exit.unconfirmed ? unconfirmedText(exit) : exitText(exit);
     const unlisted = exit.unlisted ? " The session couldn't list every process it started, so jobs it started may live on." : '';

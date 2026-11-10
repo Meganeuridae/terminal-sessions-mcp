@@ -18,6 +18,8 @@ export class FakeSession implements Session {
   runOutput: string[] = [];
   runStatus: number | undefined = 0;
   closedWith: Exit | undefined;
+  closeFails: Error | undefined;
+  closed = false;
   screenNow: Screen | undefined;
   promptUndrawn = false;
 
@@ -94,7 +96,7 @@ export class FakeSession implements Session {
 
   async run(text: string, opts: { waitMs: number; take?: boolean; signal?: AbortSignal }): Promise<RunOutcome> {
     this.calls.push({ method: 'run', args: [text, opts] });
-    if (this.runMode === 'refuse' || this.frontNow.state !== 'prompt') return { kind: 'refused', front: this.frontNow, took: [] };
+    if (this.closed || this.runMode === 'refuse' || this.frontNow.state !== 'prompt') return { kind: 'refused', front: this.frontNow, took: [] };
     const id = this.opts.nextCommandId();
     this.out.push(`$ ${text}`);
     const c: Command = { id, text, from: this.out.length, startedAt: Date.now() };
@@ -115,6 +117,7 @@ export class FakeSession implements Session {
     this.calls.push({ method: 'send', args: [text, opts] });
     const from = this.out.length;
     if (this.promptUndrawn) return { sent: false, lines: this.lines(from), front: this.frontNow, ended: [], by: 'timeout', took: [] };
+    if (this.closed) return { sent: false, lines: this.lines(from), front: this.frontNow, ended: [], by: 'closed', took: [] };
     return { sent: this.frontNow.state !== 'exited', lines: this.lines(from), ...(this.screenNow?.alt ? { screen: this.screenNow } : {}), front: this.frontNow, ended: [], by: 'quiet', took: [] };
   }
 
@@ -127,7 +130,7 @@ export class FakeSession implements Session {
 
   async stop(signal?: NodeJS.Signals, _opts?: { abort?: AbortSignal }): Promise<StopOutcome> {
     this.calls.push({ method: 'stop', args: [signal] });
-    if (this.frontNow.state === 'unknown') return { steps: [], front: this.frontNow };
+    if (this.closed || this.frontNow.state === 'unknown') return { steps: [], front: this.frontNow };
     return { steps: [{ sent: signal ?? 'C-c', front: this.frontNow }], front: this.frontNow };
   }
 
@@ -138,6 +141,12 @@ export class FakeSession implements Session {
 
   async close(opts: { force?: boolean; deadline: number }): Promise<Exit> {
     this.calls.push({ method: 'close', args: [opts] });
+    this.closed = true;
+    if (this.closeFails) {
+      const failure = this.closeFails;
+      this.closeFails = undefined;
+      throw failure;
+    }
     this.closedWith = { code: 0 };
     const c = this.current();
     if (c) {

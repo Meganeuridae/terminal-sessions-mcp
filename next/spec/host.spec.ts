@@ -550,6 +550,42 @@ test("a command's end that no call takes, during a close, removes the older wait
   assert.deepEqual(r.structured.unseen ?? [], [], r.text);
 });
 
+test("a close whose session's close fails keeps its reports and refuses input until a close finishes it", async () => {
+  const { host, opened } = setup();
+  const wakes: Wake[] = [];
+  host.subscribe('a', async (w) => (wakes.push(w), true));
+  await host.call(agent(), 'open', { name: 'main' });
+  const s = opened[0]!;
+  running(s);
+  const r = await host.call(agent(), 'run', { name: 'main', command: 'sleep 9', wait: 0 });
+  assert.equal(r.structured.running, true, `the premise: a command runs: ${r.text}`);
+  s.closeFails = new Error('the listing failed');
+  const failed = await host.call(agent(), 'close', { name: 'main' });
+  assert.equal(failed.structured.error, 'backend_failure', failed.text);
+  s.end(0);
+  await settle();
+  assert.equal(wakes.length, 1, 'the end of the command that ran before the failed close wakes');
+  const before = s.calls.length;
+  for (const [tool, args, nothing] of [
+    ['run', { command: 'echo hi', wait: 0 }, 'Nothing was typed.'],
+    ['send', { text: 'q' }, 'Nothing was typed.'],
+    ['stop', {}, 'Nothing was sent.'],
+    ['integrate', {}, 'Nothing was typed.'],
+  ] as const) {
+    const refused = await host.call(agent(), tool, { name: 'main', ...args });
+    assert.equal(refused.structured.error, 'close_failed', `${tool}: ${refused.text}`);
+    assert.match(refused.text, /last close failed partway: the listing failed\./, tool);
+    assert.ok(refused.text.includes(nothing), `${tool}: ${refused.text}`);
+  }
+  assert.deepEqual(s.calls.slice(before).map((c) => c.method), [], 'no input call reached the session');
+  const look = await host.call(agent(), 'look', { name: 'main' });
+  assert.equal(look.structured.error, undefined, `look goes on: ${look.text}`);
+  const closed = await host.call(agent(), 'close', { name: 'main' });
+  assert.equal(closed.structured.error, undefined, `a second close finishes it: ${closed.text}`);
+  const gone = await host.call(agent(), 'run', { name: 'main', command: 'echo hi', wait: 0 });
+  assert.equal(gone.structured.error, 'session_not_found', gone.text);
+});
+
 test('closing a session wakes no one, though its running command ends and its shell exits', async () => {
   const { host, opened } = setup();
   const wakes: Wake[] = [];
