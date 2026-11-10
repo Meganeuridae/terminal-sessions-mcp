@@ -23,7 +23,7 @@ export interface RelayOptions {
 /**
  * How long the relay keeps trying to reach a daemon, starting one. A host sends `initialize` as
  * soon as it has launched the relay, and agent-framework gives up on that handshake after 30 s
- * (INITIALIZE_TIMEOUT_MS in src/mcpl/server-connection.ts at aa134e75fc) and kills the child, so
+ * (INITIALIZE_TIMEOUT_MS in src/mcpl/server-connection.ts at 36b6dfe9de) and kills the child, so
  * the relay must reach a daemon, or say why it couldn't, within it; 5 s of it are left for the
  * answer, as for a call's wait.
  */

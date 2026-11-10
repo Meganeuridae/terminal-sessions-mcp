@@ -10,7 +10,7 @@ export interface ToolDef {
 
 /**
  * The longest a call may wait. agent-framework gives up on a tools/call after 60 s
- * (DEFAULT_REQUEST_TIMEOUT_MS in src/mcpl/server-connection.ts at aa134e75fc), so a call that
+ * (DEFAULT_REQUEST_TIMEOUT_MS in src/mcpl/server-connection.ts at 36b6dfe9de), so a call that
  * waited the whole 60 s would be answered to nobody; 5 s of it are left for the answer to travel.
  */
 export const WAIT_MAX_S = 55;

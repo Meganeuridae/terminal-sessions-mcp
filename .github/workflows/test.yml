@@ -98,7 +98,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: anima-research/agent-framework
-          ref: aa134e75fc19bc8cb3b73cb1ec53465dd9cf5c91
+          ref: 36b6dfe9de397d865403c0b6b943681444b05db5
           path: .hosts/agent-framework
       - uses: actions/checkout@v4
         with:

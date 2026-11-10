@@ -85,7 +85,7 @@ export function statusLine(f: StatusFacts): string {
 /**
  * The most text a result carries. agent-framework stores a tool result longer than its inline cap
  * cut to its head, with a note (DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS, 24,000 characters, in
- * src/tool-result-history.ts at aa134e75fc), so a longer result would lose its tail, where a
+ * src/tool-result-history.ts at 36b6dfe9de), so a longer result would lose its tail, where a
  * command's outcome and errors usually are. It's the smallest such cap among the hosts we know of.
  */
 export const RESULT_MAX_CHARS = 24_000;
