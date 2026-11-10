@@ -6,7 +6,8 @@ import * as path from 'node:path';
 import * as net from 'node:net';
 import { PassThrough } from 'node:stream';
 import { spawn, spawnSync } from 'node:child_process';
-import { parseCli, runCli, type CliOptions } from '../src/endpoint/cli-main.js';
+import { fileURLToPath } from 'node:url';
+import { parseCli, runCli, USAGE, type CliOptions } from '../src/endpoint/cli-main.js';
 import { runDaemon, type RunningDaemon } from '../src/endpoint/daemon-main.js';
 import { helloLine, STOP } from '../src/endpoint/hello.js';
 import type { OpenOptions } from '../src/session/types.js';
@@ -29,6 +30,15 @@ test('H9: the CLI maps its words to the nine tools\' arguments', () => {
   assert.deepEqual(parseCli(['--json', 'daemon', 'stop']), { error: "--json prints a tool's result, and `tsm daemon stop` calls no tool" });
   assert.deepEqual(parseCli(['--scope', 'work', '--help']), { help: true });
   assert.deepEqual(parseCli(['--json', '--help', 'list']), { help: true });
+});
+
+test('tsm prints its usage and exits 0 for --help among the options before a command', () => {
+  const tsm = fileURLToPath(new URL('../src/cli/tsm.js', import.meta.url));
+  for (const argv of [['--scope', 'work', '--help'], ['--json', '--help', 'list']]) {
+    const r = spawnSync(process.execPath, [tsm, ...argv], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `${argv.join(' ')}: ${r.stderr}`);
+    assert.equal(r.stdout, `${USAGE}\n`, argv.join(' '));
+  }
 });
 
 test('H9: the CLI calls the daemon in its scope, prints the text, and takes nothing an agent hasn\'t seen', async () => {
@@ -203,6 +213,7 @@ test("tsm daemon stop doesn't say the daemon stopped while it is still hanging u
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
   const socket = path.join(dir, 'daemon.sock');
   let closed = false;
+  let entered = false;
   let release!: () => void;
   const held = new Promise<void>((r) => (release = r));
   const d = (await runDaemon({
@@ -211,6 +222,7 @@ test("tsm daemon stop doesn't say the daemon stopped while it is still hanging u
       const s = new FakeSession(o.name, o);
       const close = s.close.bind(s);
       s.close = async (opts) => {
+        entered = true;
         await held;
         closed = true;
         return close(opts);
@@ -226,6 +238,7 @@ test("tsm daemon stop doesn't say the daemon stopped while it is still hanging u
   try {
     await call(['open', 'main']);
     assert.equal(await call(['daemon', 'stop'], 1000), 1);
+    assert.equal(entered, true, 'the premise: the stop reached the session\'s close, which is held');
     assert.equal(closed, false);
     assert.match(err, /didn't stop within 1000 ms/);
     release();

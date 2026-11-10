@@ -224,7 +224,8 @@ test('H8: an end a call already returned wakes no one', async () => {
   const wakes: Wake[] = [];
   host.subscribe('a', async (w) => (wakes.push(w), true));
   await host.call(agent(), 'open', { name: 'main' });
-  await host.call(agent(), 'run', { name: 'main', command: 'true' });
+  const ran = await host.call(agent(), 'run', { name: 'main', command: 'true' });
+  assert.match(ran.text, /^\[main · command 1 · exit 0 · /, 'the premise: the run returned the end');
   await settle();
   assert.equal(wakes.length, 0);
 });
@@ -490,6 +491,8 @@ async function waitingCommand(host: Host, s: FakeSession): Promise<Command> {
   s.frontNow = waiting;
   s.emit({ kind: 'waiting', front: waiting, taken: false });
   await settle();
+  const kept = (await host.call(cli(), 'list', {})).structured.unseen as string[] | undefined;
+  assert.equal(kept?.length, 1, 'the premise: the wait for input is kept as a report');
   return c;
 }
 
@@ -594,8 +597,12 @@ test('closing a session wakes no one, though its running command ends and its sh
   running(opened[0]!);
   const r = await host.call(agent(), 'run', { name: 'main', command: 'sleep 9', wait: 0 });
   assert.equal(r.structured.running, true, 'a command was running when the session closed');
-  await host.call(agent(), 'close', { name: 'main' });
+  const emitted: string[] = [];
+  opened[0]!.onEvent((e) => emitted.push(e.kind));
+  const closed = await host.call(agent(), 'close', { name: 'main' });
   await settle();
+  assert.match(closed.text, /^\[main · closed\]\nThe shell /);
+  assert.deepEqual(emitted, ['ended', 'exited'], 'the premise: the session gave the end and the exit');
   assert.deepEqual(wakes, []);
 });
 
@@ -2014,7 +2021,7 @@ test('a report handed back sits where it happened, before a newer one, and both 
   assert.match(unseen[1]!, /command 4 · exit 5/);
 });
 
-test('a running command\'s notify_on watch names its command, and a cancelled stop takes no step after it and answers nobody', async () => {
+test('a running command\'s notify_on watch names its command, and a cancelled stop hands the session its signal, asks nothing of it after, and answers nobody', async () => {
   const { host, opened } = setup();
   await host.call(plain(), 'open', { name: 'main' });
   const s = opened[0]!;
@@ -2031,8 +2038,11 @@ test('a running command\'s notify_on watch names its command, and a cancelled st
   const stopping = host.call(plain(), 'stop', { name: 'main' }, ac.signal);
   await settle();
   assert.equal(abort, ac.signal, 'the session got the call\'s signal');
+  const before = s.calls.length;
   ac.abort();
   assert.equal((await stopping).structured.error, 'cancelled');
+  await settle();
+  assert.deepEqual(s.calls.slice(before).map((c) => c.method), [], 'nothing is asked of the session after the cancel');
 });
 
 test('stop says when it withheld a signal, and close names the signals that weren\'t delivered', async () => {
@@ -2085,17 +2095,20 @@ test('a wait for input a cancelled call took is reported only while the program 
   await host.call(agent(), 'open', { name: 'main' });
   const s = opened[0]!;
   const waiting = { kind: 'waiting' as const, front: { state: 'waiting' as const, since: Date.now(), process: { pgid: 7, argv: 'read', shell: false } }, taken: true, takers: 1 };
+  let tookWaiting = false;
   s.wait = async (_u, opts) => {
     s.emit(waiting);
     s.frontNow = { state: 'running', since: Date.now(), process: { pgid: 7, argv: 'read', shell: false }, waitVisible: true };
     await new Promise<void>((res) => opts.signal?.addEventListener('abort', () => res()));
+    tookWaiting = true;
     return { by: 'cancelled', front: s.frontNow, ended: [], took: [waiting] };
   };
   const ac = new AbortController();
   const looking = host.call(agent(), 'look', { name: 'main', until: 'input' }, ac.signal);
   await settle();
   ac.abort();
-  await looking;
+  assert.equal((await looking).structured.error, 'cancelled');
+  assert.equal(tookWaiting, true, 'the premise: the wait ran and returned the wait for input as taken');
   await settle();
   await settle();
   assert.deepEqual(tags, [], 'the program was answered, so no wake asks for input');

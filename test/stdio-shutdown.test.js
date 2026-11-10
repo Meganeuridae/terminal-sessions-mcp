@@ -21,15 +21,26 @@ const ANSWER_WITHIN_MS = 10000;
 async function fakeSessionServer({ delayMs = 0 } = {}) {
   const wss = new WebSocket.Server({ host: '127.0.0.1', port: 0 });
   await once(wss, 'listening');
+  const answered = [];
+  let onAnswer = () => {};
   wss.on('connection', (ws) => {
     ws.on('message', (data) => {
       const { id, method } = JSON.parse(data.toString());
       const result = method === 'session.list' ? [] : null;
-      setTimeout(() => ws.send(JSON.stringify({ id, result })), delayMs);
+      setTimeout(() => {
+        ws.send(JSON.stringify({ id, result }));
+        answered.push(method);
+        onAnswer();
+      }, delayMs);
     });
   });
   const url = `ws://127.0.0.1:${wss.address().port}`;
-  return { url, close: () => new Promise((resolve) => wss.close(() => resolve())) };
+  const answer = (method) => new Promise((resolve) => {
+    const check = () => answered.includes(method) && resolve();
+    onAnswer = check;
+    check();
+  });
+  return { url, answer, close: () => new Promise((resolve) => wss.close(() => resolve())) };
 }
 
 // Spawns the stdio server with a JSON-RPC line client over its pipes. Each
@@ -185,9 +196,10 @@ test('a closed stdin ends the server before any tool call', async () => {
 });
 
 // A client may close stdin while answers the server has already written are
-// still on their way to it. Here the client reads nothing for 600 ms. The
-// answers fill the pipe and wait in the server's queue, and a tool call's
-// answer arrives from the session server only after stdin has closed. The
+// still on their way to it. Here the client reads nothing until the session
+// server has answered the tool call. The answers fill the pipe and wait in the
+// server's queue, and a tool call's answer arrives from the session server only
+// after stdin has closed. The
 // server must let out the answers it had written, write no other, and exit
 // once they have left. Writes to a pipe are synchronous on Windows, so no
 // answer waits in the server's queue there, and the case shows nothing.
@@ -201,10 +213,11 @@ test('on a closed stdin the server lets out the answers it has written to a clie
     const call = server.request('tools/call', { name: 'listSessions', arguments: {} });
     const ended = assert.rejects(call, /server ended/);
     server.child.stdin.end();
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await fake.answer('session.list');
     server.child.stdout.resume();
     const all = await Promise.all(answers);
     assert.ok(all.every((msg) => msg.result.tools.length > 0));
+    assert.ok(JSON.stringify(all).length > 65536, 'the premise: the answers were more than a pipe holds, so they waited in the server');
     const exit = await exitWithin(server, EXIT_WITHIN_MS);
     assert.ok(exit, `server still running ${EXIT_WITHIN_MS}ms after its answers were read`);
     assert.equal(exit.code, 0);

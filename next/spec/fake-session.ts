@@ -43,8 +43,10 @@ export class FakeSession implements Session {
     return this.commands.get(id);
   }
   lines(from: number, to?: number): Lines {
-    const end = to ?? this.out.length;
-    return { from, to: end, lines: this.out.slice(from, end), dropped: 0, live: to === undefined ? Math.min(this.live, end - from) : 0 };
+    const base = this.out.length - this.live;
+    const last = Math.min(to ?? this.out.length, this.out.length);
+    const start = Math.max(from, 0);
+    return { from: start, to: Math.max(start, last), lines: this.out.slice(start, last), dropped: 0, live: Math.max(0, last - Math.max(start, base)) };
   }
   screen(): Screen {
     return this.screenNow ?? { rows: this.out.slice(-5), cursor: { row: 0, col: 0 }, alt: false, title: '' };
@@ -117,8 +119,9 @@ export class FakeSession implements Session {
     this.calls.push({ method: 'send', args: [text, opts] });
     const from = this.out.length;
     if (this.promptUndrawn) return { sent: false, lines: this.lines(from), front: this.frontNow, ended: [], by: 'timeout', took: [] };
+    if (this.frontNow.state === 'exited') return { sent: false, lines: this.lines(from), front: this.frontNow, ended: [], by: 'exited', took: [] };
     if (this.closed) return { sent: false, lines: this.lines(from), front: this.frontNow, ended: [], by: 'closed', took: [] };
-    return { sent: this.frontNow.state !== 'exited', lines: this.lines(from), ...(this.screenNow?.alt ? { screen: this.screenNow } : {}), front: this.frontNow, ended: [], by: 'quiet', took: [] };
+    return { sent: true, lines: this.lines(from), ...(this.screenNow?.alt ? { screen: this.screenNow } : {}), front: this.frontNow, ended: [], by: 'quiet', took: [] };
   }
 
   async wait(until: Until, opts: { waitMs: number; from: number; take?: boolean; signal?: AbortSignal }): Promise<WaitOutcome> {
