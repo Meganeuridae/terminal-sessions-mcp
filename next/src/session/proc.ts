@@ -152,8 +152,8 @@ function statOf(pid: number): string[] | undefined {
 const goneError = (e: unknown): boolean => ['ENOENT', 'ESRCH'].includes((e as NodeJS.ErrnoException).code ?? '');
 
 /**
- * Linux: as `statOf`, for a listing. A read that fails for any reason but the process being gone, such as EACCES where /proc
- * hides other users' processes, throws, so the listing fails rather than leaving that process out.
+ * Linux: as `statOf`, for a listing. A read that fails for any reason but the process being gone, such as EPERM where /proc
+ * keeps other users' processes from being read, throws, so the listing fails rather than leaving that process out.
  */
 function statListed(pid: number): string[] | undefined {
   try {
@@ -163,6 +163,14 @@ function statListed(pid: number): string[] | undefined {
     if (goneError(e)) return undefined;
     throw new Error(`/proc/${pid}/stat couldn't be read: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
   }
+}
+
+/**
+ * Linux: throws where /proc hides other users' processes (`hidepid=invisible`), so a listing fails rather than leaving them out.
+ * Every pid namespace has a pid 1, so where it can't be seen, others can't be either.
+ */
+function othersShown(): void {
+  if (!statListed(1)) throw new Error("/proc hides other users' processes");
 }
 
 /** Linux: a process's group from its stat, with a terminal or without one. */
@@ -186,6 +194,7 @@ export async function onTerminal(shell: number, pts: string, l: Listing): Promis
     if (LINUX) {
       const tty = statOf(shell)?.[4];
       if (tty === undefined || tty === '0') return fail("the shell's terminal couldn't be read");
+      othersShown();
       const out: Proc[] = [];
       for (const d of fs.readdirSync('/proc')) {
         if (!/^\d+$/.test(d)) continue;

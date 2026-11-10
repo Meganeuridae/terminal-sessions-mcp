@@ -2370,6 +2370,14 @@ test("a close with force that joins a gentle close while it removes the session'
   }
 });
 
+test("a close where /proc hides other users' processes names its listing as incomplete", { skip: process.platform === 'linux' && !fs.existsSync('/proc/1') ? false : "/proc shows other users' processes here" }, async () => {
+  const logs: string[] = [];
+  const s = await open('/bin/sh', { log: (l) => logs.push(l) });
+  const c = await s.close({ deadline: by() });
+  assert.equal(c.unlisted, true, JSON.stringify(c));
+  assert.match(logs.join('\n'), /hides other users' processes/);
+});
+
 test("a close that joins one under way and whose own deadline comes first says it's under way, and names no signal before one was sent", darwinOnly, async () => {
   const s = await open(which('bash') ?? '/bin/bash');
   const gate = path.join(tmp, `gate-${++gates}`);
