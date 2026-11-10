@@ -1167,7 +1167,6 @@ class LiveSession implements Session {
       }, opts.abort)) ?? this.front();
     /** Takes one step. `sig`, for a signal `stop` was asked for, is recorded as the command's only once the signal is sent. */
     const step = async (sent: StopStep['sent'], sig?: Signalled): Promise<boolean> => {
-      // Once a close has begun, it ends what runs, and stop sends nothing more.
       if (this.closed) return true;
       const mine = sent === 'C-c' ? true : this.ours(target.pgid);
       if (sent === 'C-c') this.write('\x03');
