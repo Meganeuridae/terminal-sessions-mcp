@@ -516,7 +516,8 @@ function fakeConnection() {
     };
   };
   const socket = new FakeSocket();
-  serveConnection(socket as unknown as net.Socket, host, DAEMON, () => {});
+  const logged: string[] = [];
+  (serveConnection as (...args: unknown[]) => void)(socket, host, DAEMON, () => {}, (line: string) => logged.push(line));
   socket.emit('data', helloLine(relayHello('a')));
   let nextId = 1;
   const lines = (): Array<Record<string, unknown>> => socket.written.slice(1).join('').split('\n').filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
@@ -535,7 +536,7 @@ function fakeConnection() {
   };
   const wakes: string[] = [];
   const watch = (): (() => void) => subscribe('a', async (w) => (wakes.push(w.text), true));
-  return { host, sessions, socket, subs, lines, send, answer, wakes, watch, done: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  return { host, sessions, socket, subs, lines, send, answer, wakes, watch, logged, done: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
 const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
@@ -670,6 +671,24 @@ test('a grant in the last chunk before the socket ends subscribes nothing', asyn
     f.socket.emit('end');
     for (let i = 0; i < 5; i++) await tick();
     assert.equal(f.subs.made - f.subs.ended, 0, 'no subscription is left for the ended connection');
+  } finally {
+    f.done();
+  }
+});
+
+test('a grant sent as a notification, which can only disable, is logged with the fields it discarded, and the earlier grant stands', async () => {
+  const f = fakeConnection();
+  try {
+    await f.answer(f.send('initialize', MCPL_INIT));
+    await f.answer(f.send('featureSets/update', GRANT));
+    f.socket.emit('data', `${JSON.stringify({ jsonrpc: '2.0', method: 'featureSets/update', params: { effectiveCapabilities: ['tools'], deniedCapabilities: ['tools'] } })}\n`);
+    f.socket.emit('data', `${JSON.stringify({ jsonrpc: '2.0', method: 'featureSets/update', params: { disabled: ['terminal.events'] } })}\n`);
+    for (let i = 0; i < 5; i++) await tick();
+    assert.deepEqual(f.logged, [
+      'a featureSets/update notification from a relay in scope "a" carried effectiveCapabilities, deniedCapabilities, which only a request can set, so they were discarded, and its effective and denied capabilities overlap (["tools"])',
+    ], 'one line, for the notification that discarded fields alone');
+    const listed = await f.answer(f.send('tools/list'));
+    assert.ok(((listed.result as { tools: unknown[] }).tools).length > 0, 'and the earlier grant stands');
   } finally {
     f.done();
   }

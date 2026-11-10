@@ -76,7 +76,7 @@ export async function runDaemon(o: DaemonOptions): Promise<RunningDaemon | 'runn
           conns.delete(c);
           orphaned();
         });
-        serveConnection(c, host, info, (why) => void stop(why));
+        serveConnection(c, host, info, (why) => void stop(why), o.log);
       },
       o.confirmMs === undefined ? {} : { confirmMs: o.confirmMs },
     );

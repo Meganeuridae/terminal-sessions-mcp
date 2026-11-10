@@ -49,7 +49,7 @@ let eventSeq = 0;
  */
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 
-export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonInfo, stopDaemon: (why: string) => void): void {
+export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonInfo, stopDaemon: (why: string) => void, log: (line: string) => void = () => {}): void {
   let hello: ClientHello | undefined;
   let initialized = false;
   let mcpl = false;
@@ -98,6 +98,10 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
   const updatePolicy = (params: FeatureSetsUpdateParams, form: 'request' | 'notification'): Record<string, unknown> => {
     const r = grantFromUpdate(grant, params, form);
     grant = r.state;
+    if (r.discarded.length) {
+      const overlap = r.conflicts.length ? `, and its effective and denied capabilities overlap (${JSON.stringify(r.conflicts)})` : '';
+      log(`a featureSets/update notification from a ${hello?.client ?? 'client'} in scope ${JSON.stringify(hello?.scope ?? '')} carried ${r.discarded.join(', ')}, which only a request can set, so they were discarded${overlap}`);
+    }
     if (r.malformed) {
       enabled = new Set();
       policyReceived = true;
