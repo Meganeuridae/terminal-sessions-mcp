@@ -540,7 +540,7 @@ for (const sh of shells) {
         fs.writeFileSync(gate, '');
         assert.equal((await s.send('true\r', { waitMs: 5000, until: /^HOOK_READING$/ })).by, 'match', 'the hook is reading when the keys are sent');
         const sent = s.send('zq', { waitMs: 10_000 });
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await eventually('the send waits', () => (s as unknown as { wakers: Set<unknown> }).wakers.size > 0);
         fs.rmSync(gate);
         assert.equal((await sent).sent, true);
         await pendingIs(s, 'zq');
@@ -2200,8 +2200,13 @@ test("a suspend signal whose stopped check can't be read leaves whether the job 
   }
 });
 
-/** A job of its own group that ignores the hangup, as nohup's do, with its pid. */
-const hupProof = async (s: Session): Promise<number> => pidOf(s, await ran(s, `sh -c 'trap "" HUP; while :; do sleep 1; done' & echo "JOB:$!"`), 'JOB');
+/** A job of its own group that ignores the hangup, as nohup's do, with its pid, once it has set that. */
+const hupProof = async (s: Session): Promise<number> => {
+  const trapped = path.join(tmp, `trapped-${++gates}`);
+  const job = pidOf(s, await ran(s, `sh -c 'trap "" HUP; : > "$0"; while :; do sleep 1; done' '${trapped}' & echo "JOB:$!"`), 'JOB');
+  await eventually('the job ignores the hangup', () => fs.existsSync(trapped));
+  return job;
+};
 
 test('a close with force that joins a gentle close held at its listing makes it forced, so a job that ignores the hangup is KILLed', darwinOnly, async () => {
   const s = await open(which('bash') ?? '/bin/bash');
@@ -2630,18 +2635,21 @@ test("a run whose command file or terminal write fails leaves no command, file o
   // A file where the session's directory was makes the command file's write fail.
   fs.renameSync(dir, `${dir}.away`);
   fs.writeFileSync(dir, '');
-  await assert.rejects(s.run('echo two', { waitMs: 2000 }));
+  await assert.rejects(s.run('echo two', { waitMs: 2000 }), { code: 'ENOTDIR' });
   fs.rmSync(dir);
   fs.renameSync(`${dir}.away`, dir);
   assert.equal(s.command(ran1.id + 1), undefined);
   assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(String(ran1.id + 1))), []);
   const pty = (s as unknown as { p: { write(d: string): void } }).p;
   const write = pty.write.bind(pty);
+  let writes = 0;
   pty.write = () => {
+    writes++;
     throw new Error('refused');
   };
-  await assert.rejects(s.run('echo three', { waitMs: 2000 }));
+  await assert.rejects(s.run('echo three', { waitMs: 2000 }), /refused/);
   pty.write = write;
+  assert.equal(writes, 1);
   assert.equal(s.command(ran1.id + 2), undefined);
   assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(String(ran1.id + 2))), []);
   assert.deepEqual(out(s, await ran(s, 'echo four')), ['four']);
@@ -2653,12 +2661,15 @@ test("a send whose terminal write fails leaves the prompt's line as it was", { s
   await ran(s, 'echo one');
   const pty = (s as unknown as { p: { write(d: string): void } }).p;
   const write = pty.write.bind(pty);
+  let writes = 0;
   pty.write = () => {
+    writes++;
     throw new Error('refused');
   };
-  await assert.rejects(s.send('echo two\r', { waitMs: 2000 }));
-  await assert.rejects(s.send('echo three', { waitMs: 2000 }));
+  await assert.rejects(s.send('echo two\r', { waitMs: 2000 }), /refused/);
+  await assert.rejects(s.send('echo three', { waitMs: 2000 }), /refused/);
   pty.write = write;
+  assert.equal(writes, 2);
   const f = s.front();
   assert.ok(f.state === 'prompt' && f.pending === undefined, JSON.stringify(f));
   assert.deepEqual(out(s, await ran(s, 'echo four')), ['four']);
@@ -2716,15 +2727,20 @@ test("an integrate whose last hook write fails leaves no far shell followed, and
   const chains = inner.chains.length;
   const write = inner.p.write.bind(inner.p);
   // The far shell's chain is added just before the last hook is written, so that is the write that fails.
+  let thrown = false;
   inner.p.write = (d: string) => {
-    if (inner.chains.length > chains) throw new Error('refused');
+    if (inner.chains.length > chains) {
+      thrown = true;
+      throw new Error('refused');
+    }
     write(d);
   };
   try {
-    await assert.rejects(s.integrate({ waitMs: 10_000 }));
+    await assert.rejects(s.integrate({ waitMs: 10_000 }), /refused/);
   } finally {
     inner.p.write = write;
   }
+  assert.ok(thrown, 'the last hook write was the one that failed');
   assert.equal(inner.chains.length, chains);
   const f = s.front();
   assert.ok(f.state !== 'prompt' && !('within' in f && f.within), JSON.stringify(f));
@@ -2775,8 +2791,10 @@ test("a far shell's carrier whose own process ends, while its group goes on with
 test("a far command whose carrier is suspended is no longer followed, and its end says the carrier left the terminal, not that it ended", { skip: which('bash') ? false : 'bash is needed' }, async () => {
   const s = await open('/bin/sh');
   const w = await farThen(s, 'true');
-  const r = await s.run('sleep 300', { waitMs: 300 });
+  const from = s.lines(0).to - 1;
+  const r = await s.run('echo STARTED; sleep 300', { waitMs: 300 });
   assert.equal(r.kind, 'running', JSON.stringify(r));
+  assert.equal((await s.wait({ kind: 'match', pattern: /^STARTED$/ }, { waitMs: 10_000, from })).by, 'match', 'the far shell started the command');
   // What Ctrl-Z does to a local ssh: its group stops, and the shell takes the terminal back.
   process.kill(-w, 'SIGSTOP');
   try {
@@ -2799,8 +2817,10 @@ test("at the end mark of a shell with the integration, a far command whose carri
   const f = s.front();
   const w = f.state === 'prompt' && f.within ? f.within.pgid : 0;
   assert.ok(w > 0, JSON.stringify(f));
-  const r = await s.run('sleep 300', { waitMs: 300 });
+  const from = s.lines(0).to - 1;
+  const r = await s.run('echo STARTED; sleep 300', { waitMs: 300 });
   assert.equal(r.kind, 'running', JSON.stringify(r));
+  assert.equal((await s.wait({ kind: 'match', pattern: /^STARTED$/ }, { waitMs: 10_000, from })).by, 'match', 'the far shell started the command');
   try {
     // With ps failing, nothing can read who holds the terminal, so only the session shell's end mark can drop the far chain.
     await failing('ps', '/bin/ps', async (ps) => {
@@ -2821,10 +2841,13 @@ test("a local shell given the integration stays followed while a job it started 
   const s = await open('/bin/sh');
   // A local bash, as su or sudo -i would start: its jobs take the terminal in groups of their own.
   await localFar(s);
-  const job = await s.run('sleep 2', { waitMs: 500 });
+  const gate = newGate();
+  fs.writeFileSync(gate, '');
+  const job = await s.run(holdJob(gate), { waitMs: 500 });
   assert.equal(job.kind, 'running', JSON.stringify(job));
   const f = s.front();
   assert.ok(f.state === 'running' && f.within, JSON.stringify(f));
+  fs.rmSync(gate);
   const ended = await s.wait({ kind: 'end' }, { waitMs: 10_000, from: 0 });
   assert.equal(ended.by, 'end');
   const end = job.kind === 'running' ? job.command.end : undefined;
@@ -2905,8 +2928,9 @@ test('an integrate whose carrier ends while it waits for a hook to run stops as 
   const r = await integrating;
   assert.deepEqual([r.kind, r.kind === 'incomplete' && r.step, r.kind === 'incomplete' && r.by], ['incomplete', 'hooks', 'exited'], JSON.stringify(r));
   assert.match((r.kind === 'incomplete' && r.ended) || '', /^\S*script /, JSON.stringify(r));
+  await inFront(s, /^cat\b/);
   await s.close({ force: true, deadline: by() });
-  assert.equal(fs.existsSync(capture) ? fs.readFileSync(capture, 'utf8') : '', '');
+  assert.equal(fs.readFileSync(capture, 'utf8'), '');
 });
 
 test("an integrate whose second probe line gets no answer within the wait stops at the probe as timed out, rather than naming no shell", async () => {
@@ -3104,8 +3128,10 @@ test('text on the prompt\'s line past the cursor is pending too, so run refuses 
   const s = await open(which('bash')!);
   await s.send('echo UNWANTED', { waitMs: 2000, quietMs: 100 });
   await pendingIs(s, 'echo UNWANTED');
+  const typed = s.screen().cursor;
   // Ctrl-A moves readline's cursor to the start of the line, so nothing is left of it before the cursor.
   await s.send('', { waitMs: 2000, keys: ['C-a'], quietMs: 200 });
+  await eventually('the cursor moved back', () => s.screen().cursor.col < typed.col);
   await pendingIs(s, 'echo UNWANTED');
   assert.equal((await s.run('echo x', { waitMs: 2000 })).kind, 'refused');
   await s.send('', { waitMs: 2000, keys: ['C-e', 'C-u'], quietMs: 200 });
@@ -3128,6 +3154,7 @@ for (const [name, rc] of [
     assert.ok(f.state === 'prompt' && f.pending === undefined, JSON.stringify(f));
     assert.deepEqual(out(s, await ran(s, 'echo ran')), ['ran']);
     await s.send('echo half', { waitMs: 2000, quietMs: 200 });
+    await eventually('the typed text is drawn', () => s.screen().rows.some((l) => l.includes('echo half')));
     assert.equal((await s.run('echo x', { waitMs: 2000 })).kind, 'refused');
     await s.close({ force: true, deadline: by() });
   });
@@ -3138,7 +3165,9 @@ test("text a line editor draws on the prompt's line with the cursor after it isn
   // print -z puts the text in the line editor at the next prompt, with the cursor after it, before anything is sent there.
   await ran(s, "print -z 'echo PUSHED'");
   await pendingIs(s, 'echo PUSHED');
+  const pushed = s.screen().cursor;
   await s.send('', { waitMs: 2000, keys: ['C-a'], quietMs: 200 });
+  await eventually('the cursor moved back', () => s.screen().cursor.col < pushed.col);
   await pendingIs(s, 'echo PUSHED');
   assert.equal((await s.run('echo x', { waitMs: 2000 })).kind, 'refused');
   await s.close({ force: true, deadline: by() });
