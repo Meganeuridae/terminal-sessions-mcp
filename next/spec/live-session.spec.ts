@@ -1721,6 +1721,29 @@ test('a shell that node-pty cannot spawn is refused with its reason, one sentenc
   });
 });
 
+test("an open whose integration files can't be written leaves no directory behind", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const home = path.join(tmp, `home-${++homes}`);
+  const parent = path.join(tmp, `parent-${++homes}`);
+  fs.mkdirSync(home);
+  fs.mkdirSync(parent);
+  const env = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, TERM: 'xterm-256color', LANG: 'C.UTF-8' };
+  const real = fs.writeFileSync;
+  const patched = ((p: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+    if (typeof p === 'string' && p.startsWith(parent)) throw Object.assign(new Error(`ENOSPC: no space left on device, open '${p}'`), { code: 'ENOSPC' });
+    return (real as (...a: unknown[]) => unknown)(p, ...rest);
+  }) as typeof fs.writeFileSync;
+  const fsModule = (await import('node:fs')).default;
+  fsModule.writeFileSync = patched;
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(openSession({ name: 'unwritable', shell: which('bash')!, cwd: home, cols: 80, rows: 24, env, parent, nextCommandId: () => ++ids, waitMs: 10_000 }), /ENOSPC/);
+  } finally {
+    fsModule.writeFileSync = real;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(fs.readdirSync(parent), []);
+});
+
 test('a probe line typed into a program a shell without integration started, which reads it and ends, stops the call by exited', async () => {
   const s = await open('/bin/sh');
   await readingRaw(s);

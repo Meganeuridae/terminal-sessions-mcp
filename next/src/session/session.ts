@@ -1454,7 +1454,13 @@ export const openSession: OpenSession = async (o) => {
   const deadline = mono() + o.waitMs;
   const dir = fs.mkdtempSync(path.join(o.parent, 's-'));
   const nonce: Nonce = { counter: 1, random: randomDigits() };
-  const launch = integration.prepare(o.shell, dir, nonce, o.env);
+  let launch: ReturnType<typeof integration.prepare>;
+  try {
+    launch = integration.prepare(o.shell, dir, nonce, o.env);
+  } catch (e) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw e;
+  }
   const env = { ...o.env, ...historyIsolationEnv(dir), ...launch.env };
   const [file, args] = viaBash(bash, shellLaunch(o.oomScoreAdj ?? 0), 'tsm-shell', [o.shell, ...launch.args]);
   let p: pty.IPty;
