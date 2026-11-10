@@ -1264,7 +1264,13 @@ class LiveSession implements Session {
       this.chains.push(chain);
       this.probe!.chain = chain;
       this.lastWrite = mono();
-      this.p.write(lines.at(-1)!);
+      try {
+        this.p.write(lines.at(-1)!);
+      } catch (e) {
+        // The far shell never got its last hook, so the chain isn't one.
+        if (this.top === chain) this.chains.pop();
+        throw e;
+      }
       // Once the chain is on top, a prompt it draws is what's awaited, so only the call's own stops and the captured processes count.
       const drawn = await this.until(deadline, () => (!this.chains.includes(chain) || by() || leafGone() ? false : this.top === chain && this.prompted ? true : undefined), opts.signal);
       if (!drawn) return incomplete('hooks', by() ?? (leafGone() || !this.chains.includes(chain) ? 'exited' : 'timeout'));

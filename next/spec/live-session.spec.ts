@@ -2414,6 +2414,31 @@ test("a send whose terminal write fails leaves the prompt's line as it was", { s
   await s.close({ force: true, deadline: by() });
 });
 
+test("an integrate whose last hook write fails leaves no far shell followed, and a second integrate gives it the integration", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open(which('bash')!);
+  const from = s.lines(0).to - 1;
+  assert.equal((await s.run(relayed(which('bash')!), { waitMs: 200 })).kind, 'running');
+  assert.equal((await s.wait({ kind: 'match', pattern: /^far> ?$/ }, { waitMs: 10_000, from })).by, 'match');
+  const inner = s as unknown as { p: { write(d: string): void }; chains: unknown[] };
+  const chains = inner.chains.length;
+  const write = inner.p.write.bind(inner.p);
+  // The far shell's chain is added just before the last hook is written, so that is the write that fails.
+  inner.p.write = (d: string) => {
+    if (inner.chains.length > chains) throw new Error('refused');
+    write(d);
+  };
+  try {
+    await assert.rejects(s.integrate({ waitMs: 10_000 }));
+  } finally {
+    inner.p.write = write;
+  }
+  assert.equal(inner.chains.length, chains);
+  const f = s.front();
+  assert.ok(f.state !== 'prompt' && !('within' in f && f.within), JSON.stringify(f));
+  assert.equal((await s.integrate({ waitMs: 10_000 })).kind, 'integrated');
+  await s.close({ force: true, deadline: by() });
+});
+
 test("an integrate that timed out doesn't hand its probe's late answer to the next one", { skip: which('bash') && which('zsh') ? false : 'bash and zsh are needed' }, async () => {
   const s = await open(which('bash')!);
   const gate = newGate();
