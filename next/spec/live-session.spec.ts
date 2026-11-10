@@ -2341,6 +2341,35 @@ test("a command whose command file can't be removed still ends with its status, 
   }
 });
 
+test("a close with force that joins a gentle close while it removes the session's directory still KILLs a job that ignores the hangup", async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const job = await hupProof(s);
+  const gate = newGate();
+  const held = path.join(tmp, `held-${++gates}`);
+  fs.writeFileSync(gate, '');
+  const promises = fs.promises as { rm: typeof fs.promises.rm };
+  const rm = promises.rm;
+  promises.rm = async (...args: Parameters<typeof rm>) => {
+    fs.writeFileSync(held, '');
+    await eventually('the gate goes', () => !fs.existsSync(gate), 30_000);
+    return rm(...args);
+  };
+  try {
+    const first = s.close({ deadline: by() });
+    await eventually('the gentle close removes the directory', () => fs.existsSync(held));
+    assert.equal(gone(job), false);
+    const second = s.close({ force: true, deadline: by() });
+    fs.rmSync(gate);
+    await Promise.all([first, second]);
+    promises.rm = rm;
+    await eventually('the job that ignores the hangup is gone', () => gone(job));
+  } finally {
+    promises.rm = rm;
+    fs.rmSync(gate, { force: true });
+    killPid(job);
+  }
+});
+
 test("a close that joins one under way and whose own deadline comes first says it's under way, and names no signal before one was sent", darwinOnly, async () => {
   const s = await open(which('bash') ?? '/bin/bash');
   const gate = path.join(tmp, `gate-${++gates}`);

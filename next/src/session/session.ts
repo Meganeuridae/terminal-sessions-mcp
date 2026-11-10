@@ -1355,6 +1355,7 @@ class LiveSession implements Session {
     const { deadline } = opts;
     let unlisted = false;
     const unreached: NonNullable<Closed['unreached']> = [];
+    let afterRemoval: (() => Promise<void>) | undefined;
     if (!this.exitInfo) {
       const forced = (): boolean => opts.force === true || this.forcedLate;
       const killShell = (): void => {
@@ -1431,7 +1432,14 @@ class LiveSession implements Session {
       await this.until(Math.min(mono() + CLOSE_GRACE_MS, deadline), gone);
       // A shell hangs up only the jobs it still counts as its own, and a KILLed one none. A close forced once the shell had gone
       // KILLs what it listed.
-      if (!killed) await reach(() => (forced() ? 'SIGKILL' : 'SIGHUP'), before(0));
+      if (!killed) {
+        let hungUp = false;
+        await reach(() => (forced() ? 'SIGKILL' : ((hungUp = true), 'SIGHUP')), before(0));
+        if (hungUp)
+          afterRemoval = async () => {
+            if (forced()) await reach('SIGKILL', before(0));
+          };
+      }
     } else {
       // Once the shell has exited, nothing has its terminal, so what it left running can't be listed, and may live on.
       unlisted = true;
@@ -1446,6 +1454,7 @@ class LiveSession implements Session {
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([removal, new Promise<void>((resolve) => (timer = setTimeout(resolve, Math.max(0, deadline - mono()))))]);
     clearTimeout(timer);
+    await afterRemoval?.();
     const closed: Closed = exit ? { ...exit } : { code: null, ...(this.sentShell && { signal: this.sentShell }), unconfirmed: true };
     if (unlisted) closed.unlisted = true;
     if (unreached.length) closed.unreached = unreached;
