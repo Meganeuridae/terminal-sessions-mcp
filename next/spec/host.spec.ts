@@ -2,7 +2,7 @@ import { mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Host, type Caller, type Wake } from '../src/tools/host.js';
 import { cutAt, linesText, outputValue, RESULT_MAX_CHARS } from '../src/tools/render.js';
-import type { Command, Front, OpenOptions, Process } from '../src/session/types.js';
+import type { Closed, Command, Front, OpenOptions, Process } from '../src/session/types.js';
 import { FakeSession } from './fake-session.js';
 
 const STARTED = Date.parse('2026-11-08T13:00:00.000Z');
@@ -1323,6 +1323,33 @@ test('a close whose call is cancelled before its result is made counts nothing a
   await closing;
   const r = await host.call(plain(), 'list', {});
   assert.match(r.text, /\n\nNot yet seen:\n\[main · command 1 · exit 2 [^\n]*\n\[main · closed by a call that was cancelled or lost its connection; the shell /);
+});
+
+test("a close that joins one begun earlier says when that close left the session's reports in list, and nothing when it showed them", async () => {
+  for (const firstTakes of [false, true]) {
+    const { host, opened } = setup();
+    await host.call(plain(), 'open', { name: 'main' });
+    const s = opened[0]!;
+    running(s);
+    await host.call(plain(), 'run', { name: 'main', command: 'make', wait: 0 });
+    s.end(2);
+    await settle();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const close = s.close.bind(s);
+    let joined: Promise<Closed> | undefined;
+    s.close = (o) => (joined ??= (async () => (await gate, close(o)))());
+    const firstCall = host.call(firstTakes ? plain() : cli(), 'close', { name: 'main' });
+    await settle();
+    const secondCall = host.call(firstTakes ? cli() : plain(), 'close', { name: 'main' });
+    await settle();
+    release();
+    const [first, r] = await Promise.all([firstCall, secondCall]);
+    if (firstTakes) {
+      assert.match(first.text, /\n\nNot yet seen:\n\[main · command 1 · exit 2 /);
+      assert.doesNotMatch(r.text, /in `list`/, r.text);
+    } else assert.match(r.text, /\n2 reports about this session that no call showed are in `list`\.$/, r.text);
+  }
 });
 
 test('a host whose wakes start after reports were kept is offered each one still unseen in its scope, oldest first', async () => {

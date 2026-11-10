@@ -80,6 +80,7 @@ interface Entry {
   takerUsed: boolean;
   exited: boolean;
   finished: boolean;
+  left: Unseen[];
 }
 
 interface Held {
@@ -281,7 +282,7 @@ export class Host {
       await session.close({ force: true, deadline: this.stopping });
       return refused('The daemon stopped while this session started, so its shell is closed.', { error: 'backend_failure' });
     }
-    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes || this.opening.get(k) === true, exited: false, finished: false };
+    const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes || this.opening.get(k) === true, exited: false, finished: false, left: [] };
     entry.off = session.onEvent((ev) => this.onEvent(entry, ev));
     this.entries.set(k, entry);
     const front = session.front();
@@ -589,7 +590,11 @@ export class Host {
     const unlisted = exit.unlisted ? " The session couldn't list every process it started, so jobs it started may live on." : '';
     const unreached = exit.unreached?.length ? ` These signals weren't delivered: ${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')}. Their processes may live on.` : '';
     let full = `[${e.name} · closed]\nThe shell ${how}.${unlisted}${unreached}`;
-    if (e.finished) return ok(fitted(full), { session: e.name, exit });
+    if (e.finished) {
+      const listed = (this.left.get(e.scope) ?? []).filter((u) => e.left.includes(u)).length;
+      if (listed) full += `\n${listed === 1 ? 'A report about this session that no call showed is' : `${listed} reports about this session that no call showed are`} in \`list\`.`;
+      return ok(fitted(full), { session: e.name, exit });
+    }
     e.finished = true;
     e.off();
     const k = keyOf(e.scope, e.name);
@@ -774,13 +779,13 @@ export class Host {
   }
 
   private leave(e: Entry, closed: string | undefined): void {
-    const left = [...(this.left.get(e.scope) ?? []), ...e.unseen.values()];
+    e.left = [...e.unseen.values()];
     if (closed !== undefined) {
       const text = fitted(`[${e.name} · ${closed}]`);
       const seq = ++this.wakeSeq;
-      left.push({ seq, at: seq, wake: { scope: e.scope, session: e.name, tag: 'terminal:exited', key: this.pushKey(e, undefined), text }, lines: [text], command: undefined });
+      e.left.push({ seq, at: seq, wake: { scope: e.scope, session: e.name, tag: 'terminal:exited', key: this.pushKey(e, undefined), text }, lines: [text], command: undefined });
     }
-    this.left.set(e.scope, left);
+    this.left.set(e.scope, [...(this.left.get(e.scope) ?? []), ...e.left]);
     e.unseen.clear();
     this.pump(e.scope);
   }
