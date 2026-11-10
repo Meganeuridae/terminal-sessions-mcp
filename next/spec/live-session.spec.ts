@@ -2739,6 +2739,30 @@ test('an integrate whose carrier ends while it waits for a hook to run stops as 
   assert.equal(fs.existsSync(capture) ? fs.readFileSync(capture, 'utf8') : '', '');
 });
 
+test("an integrate whose second probe line gets no answer within the wait stops at the probe as timed out, rather than naming no shell", async () => {
+  const s = await open('/bin/sh');
+  const gate = newGate();
+  const read = path.join(tmp, `read-${++gates}`);
+  fs.writeFileSync(gate, '');
+  const fake = path.join(tmp, `fake-far-${++gates}`);
+  fs.writeFileSync(
+    fake,
+    `#!/bin/sh\nIFS= read -r line\ncall=$(printf '%s\\n' "$line" | sed -n 's/.*133;K;\\([0-9]*\\);.*/\\1/p')\nprintf '\\033]133;K;%s;;;\\007' "$call"\nIFS= read -r zero\n: > '${read}'\nwhile [ -e '${gate}' ]; do sleep 0.05; done\n`,
+    { mode: 0o755 },
+  );
+  assert.equal((await s.run(process.platform === 'darwin' ? `script -q /dev/null ${fake}` : `script -qfc ${fake} /dev/null`, { waitMs: 200 })).kind, 'running');
+  await inFront(s, /script/);
+  const pts = (s as unknown as { pts: string }).pts;
+  await eventually('script holds the terminal out of canonical mode', () => proc.modes(pts)?.canonical === false);
+  try {
+    const r = await s.integrate({ waitMs: 3000 });
+    assert.ok(fs.existsSync(read), 'the stand-in read the second probe line');
+    assert.deepEqual([r.kind, r.kind === 'incomplete' && r.step, r.kind === 'incomplete' && r.by], ['incomplete', 'probe', 'timeout'], JSON.stringify(r));
+  } finally {
+    fs.rmSync(gate, { force: true });
+  }
+});
+
 /** A local bash given the integration in `s`, at its prompt; returns its group. */
 async function localFar(s: Session): Promise<number> {
   const from = s.lines(0).to - 1;

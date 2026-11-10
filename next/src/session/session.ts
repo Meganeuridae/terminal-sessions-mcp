@@ -1260,8 +1260,8 @@ class LiveSession implements Session {
         if (stop()) return incomplete('probe', stop()!);
         this.write(integration.probeZeroLine(call));
         const zero = await answered();
-        if (!zero && stop()) return incomplete('probe', stop()!);
-        const name = zero?.zero?.replace(/^-/, '');
+        if (!zero) return incomplete('probe', stop() ?? 'timeout');
+        const name = zero.zero?.replace(/^-/, '');
         return { kind: 'unsupported', ...(name && { shell: path.basename(name) }), front: this.front() };
       }
       const nonce = { counter: 1, random: randomDigits() };
