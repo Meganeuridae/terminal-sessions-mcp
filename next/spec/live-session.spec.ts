@@ -1290,8 +1290,10 @@ for (const sh of shells) {
       const s = await open(shell);
       const c = await ran(s, `head -c 65526 /dev/zero | tr '\\0' 1; printf %s "$__tsm_r"; head -c 70000 /dev/zero | tr '\\0' 1; echo`, 30_000);
       const text = out(s, c).join('');
-      assert.equal(text.length, 135_546);
-      assert.equal(text.slice(65_526, 65_546), '[redacted]..........');
+      const around = s.lines(Math.max(0, c.from - 1), (c.to ?? c.from) + 1);
+      const edges = `output: lines ${c.from} up to ${c.to}, ${text.length} characters; each line from ${around.from}, its length, its head and its tail:\n${around.lines.map((l, k) => `${around.from + k}: ${l.length} ${JSON.stringify(l.slice(0, 80))} … ${JSON.stringify(l.slice(-80))}`).join('\n')}`;
+      assert.equal(text.length, 135_546, edges);
+      assert.equal(text.slice(65_526, 65_546), '[redacted]..........', edges);
     });
 
     test('the live nonce whose head crosses a 64 Ki cut at the end of a freeze never shows, and no line changes as it freezes', { skip: sh.name !== 'bash' ? 'the transcript is the same in every shell' : false }, async () => {
