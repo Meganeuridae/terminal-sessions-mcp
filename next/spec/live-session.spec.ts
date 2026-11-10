@@ -2332,6 +2332,31 @@ test("a command in a far shell reached from another far shell, which ends there,
   await s.close({ force: true, deadline: by() });
 });
 
+test("a run whose command file or terminal write fails leaves no command, file or submitted line behind", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open(which('bash')!);
+  const dir = (s as unknown as { dir: string }).dir;
+  const ran1 = await ran(s, 'echo one');
+  // A file where the session's directory was makes the command file's write fail.
+  fs.renameSync(dir, `${dir}.away`);
+  fs.writeFileSync(dir, '');
+  await assert.rejects(s.run('echo two', { waitMs: 2000 }));
+  fs.rmSync(dir);
+  fs.renameSync(`${dir}.away`, dir);
+  assert.equal(s.command(ran1.id + 1), undefined);
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(String(ran1.id + 1))), []);
+  const pty = (s as unknown as { p: { write(d: string): void } }).p;
+  const write = pty.write.bind(pty);
+  pty.write = () => {
+    throw new Error('refused');
+  };
+  await assert.rejects(s.run('echo three', { waitMs: 2000 }));
+  pty.write = write;
+  assert.equal(s.command(ran1.id + 2), undefined);
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(String(ran1.id + 2))), []);
+  assert.deepEqual(out(s, await ran(s, 'echo four')), ['four']);
+  await s.close({ force: true, deadline: by() });
+});
+
 test("an integrate that timed out doesn't hand its probe's late answer to the next one", { skip: which('bash') && which('zsh') ? false : 'bash and zsh are needed' }, async () => {
   const s = await open(which('bash')!);
   const gate = newGate();

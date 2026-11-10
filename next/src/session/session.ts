@@ -871,18 +871,40 @@ class LiveSession implements Session {
     const farLine = far && integration.farCommand(far.kind, text);
     if (farLine && farLine.length > integration.FAR_MAX_TYPED) return { kind: 'refused', front: f, took: [], tooLong: { typed: farLine.length, max: integration.FAR_MAX_TYPED } };
     const id = this.nextId();
+    const cf: { files: Array<{ path: string; body: string }>; line: string } = farLine ? { files: [], line: farLine } : integration.commandFile(this.plain ? 'none' : this.kind, this.dir, id, text);
+    const removeFiles = (): void => {
+      for (const f of cf.files) fs.rmSync(f.path, { force: true });
+    };
+    // The files are written before the command is recorded, and a write that fails takes back what it changed, so nothing is left.
+    try {
+      for (const f of cf.files) fs.writeFileSync(f.path, f.body, { mode: 0o600 });
+    } catch (e) {
+      removeFiles();
+      throw e;
+    }
     const c: Command = { id, text, from: this.t.pos().line + 1, startedAt: Date.now() };
     this.store(c);
     this.startedMono.set(c, mono());
-    const cf: { files: Array<{ path: string; body: string }>; line: string } = farLine ? { files: [], line: farLine } : integration.commandFile(this.plain ? 'none' : this.kind, this.dir, id, text);
     if (cf.files.length) this.files.set(id, cf.files.map((f) => f.path));
-    for (const f of cf.files) fs.writeFileSync(f.path, f.body, { mode: 0o600 });
+    const before = { runCommand: this.top.runCommand, submitted: this.top.submitted };
     this.top.runCommand = c;
     this.top.submitted = true;
     const call = this.enter(opts.take ?? true, opts.signal, id);
     this.lastWrite = mono();
     try {
-      this.p.write(cf.line);
+      try {
+        this.p.write(cf.line);
+      } catch (e) {
+        Object.assign(this.top, before);
+        if (this.commands.get(id) === c) {
+          this.commands.delete(id);
+          this.commandChars -= keptChars(c);
+        }
+        this.startedMono.delete(c);
+        this.files.delete(id);
+        removeFiles();
+        throw e;
+      }
       await this.until(deadline, () => {
         if (this.exitInfo || this.closed || opts.signal?.aborted) return true;
         if (this.top.far && this.lookDue()) this.follow(proc.info(this.pid));
