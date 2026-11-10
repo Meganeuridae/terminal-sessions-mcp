@@ -185,17 +185,27 @@ function within<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
   });
 }
 
-export async function runCli(o: CliOptions & { socket: string; version: string; startDaemon: (budgetMs: number) => string; stdout: Writable; stderr: Writable; reachMs?: number }): Promise<number> {
+export async function runCli(o: CliOptions & { socket: string; version: string; startDaemon: (budgetMs: number, after?: 'closing') => string; stdout: Writable; stderr: Writable; reachMs?: number }): Promise<number> {
   const daemonStop = 'daemonStop' in o.call;
+  const alreadyStopping = new Error(`a daemon at ${o.socket} was already stopping`);
   let r: Reached;
   try {
     r = await reach({
       socket: o.socket,
       hello: { version: o.version, scope: o.scope, client: 'cli' },
-      startDaemon: daemonStop ? () => { throw new Error(`no daemon answers at ${o.socket}, so there is none to stop`); } : o.startDaemon,
+      startDaemon: daemonStop
+        ? (_budget, after) => {
+          if (after === 'closing') throw alreadyStopping;
+          throw new Error(`no daemon answers at ${o.socket}, so there is none to stop`);
+        }
+        : o.startDaemon,
       ...(o.reachMs === undefined ? {} : { reachMs: o.reachMs }),
     });
   } catch (e) {
+    if (e === alreadyStopping) {
+      o.stdout.write(`A daemon at ${o.socket} was already stopping; its socket no longer answers.\n`);
+      return 0;
+    }
     o.stderr.write(`tsm: ${(e as Error).message}\n`);
     return 1;
   }

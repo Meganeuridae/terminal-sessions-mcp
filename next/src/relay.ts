@@ -12,7 +12,8 @@ import { packageVersion } from './endpoint/version.js';
 export interface RelayOptions {
   socket: string;
   hello: ClientHello;
-  startDaemon: (budgetMs: number) => string;
+  /** Starts a daemon and returns its log's path; `after` says one was seen closing its connections before this. */
+  startDaemon: (budgetMs: number, after?: 'closing') => string;
   stdin: Readable;
   stdout: Writable;
   stderr: Writable;
@@ -30,18 +31,19 @@ export const REACH_MS = 25_000;
 
 export type Reached = { socket: net.Socket; daemon: DaemonHello; rest: Buffer };
 
-function reachOnce(socketPath: string, hello: ClientHello, budgetMs: number): Promise<Reached | 'nothing'> {
+function reachOnce(socketPath: string, hello: ClientHello, budgetMs: number): Promise<Reached | 'nothing' | 'closing'> {
   return new Promise((resolve, reject) => {
     const socket = net.connect(socketPath);
     let buf = Buffer.alloc(0);
     let done = false;
+    let connected = false;
     const timer = setTimeout(() => finish(new Error(`something at ${socketPath} accepted the connection but sent no hello within ${budgetMs} ms`)), budgetMs);
-    const finish = (r: Reached | 'nothing' | Error): void => {
+    const finish = (r: Reached | 'nothing' | 'closing' | Error): void => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       socket.off('data', onData);
-      if (r === 'nothing' || r instanceof Error) socket.destroy();
+      if (r === 'nothing' || r === 'closing' || r instanceof Error) socket.destroy();
       if (r instanceof Error) reject(r);
       else resolve(r);
     };
@@ -58,12 +60,15 @@ function reachOnce(socketPath: string, hello: ClientHello, budgetMs: number): Pr
       finish({ socket, daemon, rest: buf.subarray(nl + 1) });
     };
     socket.on('data', onData);
-    socket.once('connect', () => socket.write(helloLine(hello)));
+    socket.once('connect', () => {
+      connected = true;
+      socket.write(helloLine(hello));
+    });
     socket.once('error', (e: NodeJS.ErrnoException) => {
-      if (e.code === 'ENOENT' || e.code === 'ECONNREFUSED' || e.code === 'ECONNRESET' || e.code === 'EPIPE') finish('nothing');
+      if (e.code === 'ENOENT' || e.code === 'ECONNREFUSED' || e.code === 'ECONNRESET' || e.code === 'EPIPE') finish(connected ? 'closing' : 'nothing');
       else finish(new Error(`can't reach the daemon at ${socketPath}: ${e.message}`));
     });
-    socket.once('close', () => finish('nothing'));
+    socket.once('close', () => finish(connected ? 'closing' : 'nothing'));
   });
 }
 
@@ -71,14 +76,22 @@ export async function reach(o: Pick<RelayOptions, 'socket' | 'hello' | 'startDae
   const bound = o.reachMs ?? REACH_MS;
   const end = performance.now() + bound;
   let log: string | undefined;
-  const none = (): Error => new Error(`no terminal-sessions daemon answered at ${o.socket} within ${bound} ms${log ? `, though one was started; its log is ${log}` : ''}`);
+  let closing = false;
+  const none = (): Error =>
+    new Error(closing
+      ? `a terminal-sessions daemon at ${o.socket} still accepted connections and closed them before its hello after ${bound} ms, as one that is stopping does`
+      : `no terminal-sessions daemon answered at ${o.socket} within ${bound} ms${log ? `, though one was started; its log is ${log}` : ''}`);
   for (;;) {
     const left = end - performance.now();
     if (left <= 0) throw none();
     const r = await reachOnce(o.socket, o.hello, Math.ceil(left));
-    if (r !== 'nothing') return r;
+    if (r !== 'nothing' && r !== 'closing') return r;
     if (performance.now() >= end) throw none();
-    log ??= o.startDaemon(Math.ceil(end - performance.now()));
+    if (r === 'closing') closing = true;
+    else {
+      log ??= o.startDaemon(Math.ceil(end - performance.now()), closing ? 'closing' : undefined);
+      closing = false;
+    }
     await new Promise((r) => setTimeout(r, 50));
   }
 }

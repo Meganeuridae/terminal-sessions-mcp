@@ -356,3 +356,48 @@ test("tsm daemon stop that gets no answer fails, saying so, when the daemon's pi
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a second tsm daemon stop, while the first daemon is closing its connections, waits for it to go and says it was already stopping', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
+  const socket = path.join(dir, 'daemon.sock');
+  let accepted = 0;
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    accepted++;
+    c.destroy();
+  });
+  await new Promise<void>((r) => server.listen(socket, r));
+  try {
+    const call = stopCall(socket, 5000);
+    let returned = false;
+    void call.code.then(() => (returned = true));
+    const end = Date.now() + 3000;
+    while (accepted < 3 && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(returned, false, 'it waits while the daemon closes its connections');
+    await new Promise<void>((r) => server.close(() => r()));
+    fs.rmSync(socket, { force: true });
+    assert.equal(await call.code, 0, call.seen.err);
+    assert.equal(call.seen.out, `A daemon at ${socket} was already stopping; its socket no longer answers.\n`);
+  } finally {
+    if (server.listening) await new Promise<void>((r) => server.close(() => r()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a second tsm daemon stop whose daemon still closes its connections at the deadline fails, saying what it saw', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
+  const socket = path.join(dir, 'daemon.sock');
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    c.destroy();
+  });
+  await new Promise<void>((r) => server.listen(socket, r));
+  try {
+    const call = stopCall(socket, 400);
+    assert.equal(await call.code, 1);
+    assert.match(call.seen.err, /still accepted connections and closed them before its hello after 400 ms, as one that is stopping does/);
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

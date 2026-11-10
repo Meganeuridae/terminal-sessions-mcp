@@ -7,7 +7,7 @@ import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { helloLine, parseClientHello, type ClientHello } from '../src/endpoint/hello.js';
-import { relay, startDaemon } from '../src/relay.js';
+import { reach, relay, startDaemon } from '../src/relay.js';
 
 const HELLO: ClientHello = { version: '2.0.0', scope: 'agent-a', client: 'relay' };
 
@@ -334,6 +334,123 @@ test('a relay whose systemd-run fails says so, and that the daemon it starts ins
     assert.match(notes[0]!, /^systemd-run --user failed \(status 1: Failed to start transient service unit: Unit already exists\.\), so the daemon starts detached in this relay's control group, and ends when the host's service stops$/);
   } finally {
     process.env.PATH = was;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A daemon that is stopping, as daemon-main's is: it accepts each connection and destroys it before any hello. It
+ * listens under a name of its own linked to `socket`, as a daemon places its socket, so `leave` can take its
+ * listener away and leave `socket` behind, refusing, as a daemon that dies does.
+ */
+async function closingDaemon(socket: string, serveAfter = Infinity) {
+  const own = `${socket}.old`;
+  let accepted = 0;
+  const served: net.Socket[] = [];
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    if (++accepted <= serveAfter) return void c.destroy();
+    served.push(c);
+    c.write(helloLine({ version: '2.0.0', pid: 4242, startedAt: '2026-11-08T12:00:00.000Z' }));
+  });
+  await new Promise<void>((r) => server.listen(own, r));
+  fs.linkSync(own, socket);
+  return {
+    accepted: () => accepted,
+    listening: () => server.listening,
+    leave: async (socketToo: boolean) => {
+      for (const c of served) c.destroy();
+      await new Promise<void>((r) => server.close(() => r()));
+      fs.rmSync(own, { force: true });
+      if (socketToo) fs.rmSync(socket, { force: true });
+    },
+  };
+}
+
+for (const leaves of ['no socket', 'a socket that refuses'] as const) {
+  test(`a client that meets a daemon closing its connections starts none while it does, and starts one once it's gone, leaving ${leaves}`, { timeout: 10_000 }, async () => {
+    const dir = tmp();
+    const socket = path.join(dir, 'daemon.sock');
+    const old = await closingDaemon(socket);
+    const starts: Array<{ after: string | undefined; oldListening: boolean }> = [];
+    let fresh: Fake | undefined;
+    const reached = reach({
+      socket, hello: HELLO, reachMs: 5000,
+      startDaemon: (_budget: number, after?: string) => {
+        starts.push({ after, oldListening: old.listening() });
+        fs.rmSync(socket, { force: true });
+        void fakeDaemon(socket).then((f) => (fresh = f));
+        return '/somewhere/daemon.log';
+      },
+    });
+    try {
+      await until(() => old.accepted() >= 3 || starts.length > 0);
+      assert.deepEqual(starts, [], 'nothing is started while the old daemon closes its connections');
+      await old.leave(leaves === 'no socket');
+      const r = await reached;
+      assert.equal(r.daemon.pid, 4242);
+      assert.deepEqual(starts, [{ after: 'closing', oldListening: false }], 'one daemon is started, once the old one is gone, told what was seen before');
+    } finally {
+      await reached.then((r) => r.socket.destroy(), () => {});
+      if (old.listening()) await old.leave(false);
+      await fresh?.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('a client that meets a daemon closing its connections, then a daemon that answers, as when one that lost the race for the socket gives up, starts none', { timeout: 10_000 }, async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  const d = await closingDaemon(socket, 2);
+  const reached = reach({ socket, hello: HELLO, reachMs: 5000, startDaemon: () => assert.fail('a daemon was there') });
+  try {
+    const r = await reached;
+    assert.equal(r.daemon.pid, 4242);
+    assert.equal(d.accepted(), 3, `it was reached on its third connection, of ${d.accepted()}`);
+  } finally {
+    await reached.then((r) => r.socket.destroy(), () => {});
+    await d.leave(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a client that meets a daemon still closing its connections at its deadline fails, saying so, and has started none', { timeout: 10_000 }, async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  const d = await closingDaemon(socket);
+  try {
+    await assert.rejects(
+      reach({ socket, hello: HELLO, reachMs: 400, startDaemon: () => assert.fail('a daemon was there') }),
+      /still accepted connections and closed them before its hello after 400 ms, as one that is stopping does/,
+    );
+  } finally {
+    await d.leave(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a client that finds a socket that refuses starts a daemon at once, told nothing was seen closing', { timeout: 10_000 }, async () => {
+  const dir = tmp();
+  const socket = path.join(dir, 'daemon.sock');
+  const d = await closingDaemon(socket);
+  await d.leave(false);
+  let fresh: Fake | undefined;
+  const after: Array<string | undefined> = [];
+  try {
+    const r = await reach({
+      socket, hello: HELLO, reachMs: 5000,
+      startDaemon: (_budget: number, a?: string) => {
+        after.push(a);
+        fs.rmSync(socket, { force: true });
+        void fakeDaemon(socket).then((f) => (fresh = f));
+        return '/somewhere/daemon.log';
+      },
+    });
+    r.socket.destroy();
+    assert.deepEqual(after, [undefined]);
+  } finally {
+    await fresh?.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
