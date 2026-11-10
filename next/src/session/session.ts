@@ -947,6 +947,7 @@ class LiveSession implements Session {
     const keys = opts.keys?.length ? inputBytes(undefined, opts.keys, { appCursor: this.t.appCursor }) : '';
     const bytes = opts.paste ? `${PASTE_START}${text}${PASTE_END}${keys}` : text + keys;
     if (!this.prompted) this.frontKey = '';
+    const before = { submitted: this.top.submitted, sentPending: this.top.sentPending, sentAt: this.top.sentAt };
     if ((this.top.atPrompt || this.plain) && !this.top.submitted) {
       // A line break inside a paste is held by the line editor for editing; only the keys after it can submit the line.
       if (/[\r\n]/.test(opts.paste ? keys : bytes)) {
@@ -961,7 +962,13 @@ class LiveSession implements Session {
     let by: SendOutcome['by'] = 'timeout';
     try {
       if (this.top.promptAt) this.top.sentAt = this.top.promptAt;
-      this.p.write(bytes);
+      try {
+        this.p.write(bytes);
+      } catch (e) {
+        // Nothing reached the terminal, so the line is as it was.
+        Object.assign(this.top, before);
+        throw e;
+      }
       this.top.sentOutputs = this.outputs;
       const r = await this.until(deadline, () => {
         if (this.closed) return 'closed' as const;

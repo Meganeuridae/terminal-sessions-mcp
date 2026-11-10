@@ -2357,6 +2357,23 @@ test("a run whose command file or terminal write fails leaves no command, file o
   await s.close({ force: true, deadline: by() });
 });
 
+test("a send whose terminal write fails leaves the prompt's line as it was", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open(which('bash')!);
+  await ran(s, 'echo one');
+  const pty = (s as unknown as { p: { write(d: string): void } }).p;
+  const write = pty.write.bind(pty);
+  pty.write = () => {
+    throw new Error('refused');
+  };
+  await assert.rejects(s.send('echo two\r', { waitMs: 2000 }));
+  await assert.rejects(s.send('echo three', { waitMs: 2000 }));
+  pty.write = write;
+  const f = s.front();
+  assert.ok(f.state === 'prompt' && f.pending === undefined, JSON.stringify(f));
+  assert.deepEqual(out(s, await ran(s, 'echo four')), ['four']);
+  await s.close({ force: true, deadline: by() });
+});
+
 test("an integrate that timed out doesn't hand its probe's late answer to the next one", { skip: which('bash') && which('zsh') ? false : 'bash and zsh are needed' }, async () => {
   const s = await open(which('bash')!);
   const gate = newGate();
