@@ -915,7 +915,6 @@ class LiveSession implements Session {
       throw e;
     }
     const c: Command = { id, text, from: this.t.pos().line + 1, startedAt: Date.now() };
-    this.store(c);
     this.startedMono.set(c, mono());
     if (cf.files.length) this.files.set(id, cf.files.map((f) => f.path));
     const before = { runCommand: this.top.runCommand, submitted: this.top.submitted };
@@ -927,15 +926,12 @@ class LiveSession implements Session {
         this.write(cf.line);
       } catch (e) {
         Object.assign(this.top, before);
-        if (this.commands.get(id) === c) {
-          this.commands.delete(id);
-          this.commandChars -= keptChars(c);
-        }
         this.startedMono.delete(c);
         this.files.delete(id);
         removeFiles();
         throw e;
       }
+      this.store(c);
       await this.until(deadline, () => {
         if (this.exitInfo || this.closed || opts.signal?.aborted) return true;
         if (this.top.far && this.lookDue()) this.follow(proc.info(this.pid));

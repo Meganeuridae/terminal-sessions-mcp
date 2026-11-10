@@ -2515,6 +2515,26 @@ test("a send whose terminal write fails leaves the prompt's line as it was", { s
   await s.close({ force: true, deadline: by() });
 });
 
+test('a run whose terminal write fails takes no older command from those kept', { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open(which('bash')!);
+  const first = await ran(s, 'echo one');
+  const inner = s as unknown as { p: { write(d: string): void }; commandChars: number };
+  inner.commandChars = Number.MAX_SAFE_INTEGER / 2;
+  const write = inner.p.write.bind(inner.p);
+  let writes = 0;
+  inner.p.write = () => {
+    writes++;
+    throw new Error('refused');
+  };
+  try {
+    await assert.rejects(s.run('echo two', { waitMs: 2000 }), /refused/);
+  } finally {
+    inner.p.write = write;
+  }
+  assert.equal(writes, 1);
+  assert.equal(s.command(first.id), first);
+});
+
 for (const via of ['run', 'send'] as const) {
   test(`a ${via} whose terminal write fails at a quiet shell without the integration leaves its prompt in front`, async () => {
     const s = await open('/bin/sh');
