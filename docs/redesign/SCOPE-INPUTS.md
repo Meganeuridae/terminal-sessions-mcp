@@ -1,6 +1,6 @@
 # Scope pass inputs (2026-09-24)
 
-> **Working notes for a pass on the design 2.0 was first built to, kept as a record.** Its items waited on decisions about that design; 2.0 has since been rebuilt on a smaller design, nine tools and four wakes with no journal, channels or sharing, so none of them is pending. [`next/README.md`](../../next/README.md) describes what the code does now.
+> **Working notes for a pass on the design 2.0 was first built to, kept as a record.** Its items waited on decisions about that design; 2.0 has since been rebuilt on a smaller design, nine tools and four wakes with no journal or channels, so none of them is pending. [`next/README.md`](../../next/README.md) describes what the code does now.
 
 Working notes for the scope pass: every place the round-2 trim agents found that a real cut
 would change what users or agents can see. Nothing here is done; each item waits for Aster's

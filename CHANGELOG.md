@@ -45,7 +45,8 @@ what reaches them is the package they share with 2.0: a narrower Node range (`en
 - New dependencies: `@animalabs/mcpl-core` and `@xterm/headless` 6.0.0.
 - **1.x's graceful `killSession` and `killAll` hang up every process they list on the session's terminal**
   once the shell is gone, as 2.0's `close` does. A disowned job, or one started from a subshell, no
-  longer outlives a graceful kill. A process started with `setsid` or `nohup` still does. A forced
+  longer outlives a graceful kill, unless it ignores the hangup, or the listing fails or runs out of
+  time. A process started with `setsid` or `nohup` still does. A forced
   kill still KILLs the shell alone, and on Windows the kill is as before. Listing the terminal's
   processes, the 3 s wait for the shell and the hangup share one deadline, 10 s from the kill's
   start: the time `RobustSessionClient` gives a request. A kill that uses all 10 s can still answer

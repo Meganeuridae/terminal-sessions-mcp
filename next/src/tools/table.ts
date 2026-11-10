@@ -61,7 +61,7 @@ export const TOOLS: readonly ToolDef[] = [
       'Run one command line in a session\'s shell, only when it is at its prompt. Otherwise nothing is typed, and the refusal says what is in front. ' +
       'Returns its exit status, duration, directory afterwards and output, or that it is still running when the wait ends: it keeps running, and on a host that takes wakes its end is reported to you when it comes. ' +
       '`notify_on` reports a pattern in its output once: in the result if the command has ended, otherwise as it appears, on a host that takes wakes. ' +
-      'For a script, `structuredContent` has `exitCode` (null with `running` true while it runs, null with `running` false when no status is known, null with `stopped` true when a `stop` signal stopped the job, null with `stoppedUnknown` true when whether it did couldn\'t be read, and null with `unfollowed` true when the session stopped following the shell it ran in) and `output`, the command\'s own lines without the typed command or any note, ' +
+      'For a script, `structuredContent` has `exitCode` (null with `running` true while it runs, null with `running` false when no status is known, null with `stopped` true when a `stop` signal stopped the job, null with `stoppedUnknown` true when whether it did couldn\'t be read, and null with `unfollowed` true when the session stopped following the shell it ran in) and `output`, the command\'s own lines without any note, and without the typed command except a plain shell\'s echo of a multi-line command\'s later lines, ' +
       'cut past the result\'s budget to its start and end, with `outputLeftOut` giving `at` and `characters` in UTF-16 code units. ' +
       `In a shell given the integration with \`integrate\`, the command line goes inside a wrapper of under 200 characters that keeps its statuses, and the whole is typed as one line of at most ${FAR_MAX_TYPED.toLocaleString('en-US')} characters, with each \`'\`, \`\\\`, \`!\`, control or non-ASCII byte of the command counting five; a longer one is refused, and says how long it was.`,
     inputSchema: {
@@ -149,7 +149,7 @@ export const TOOLS: readonly ToolDef[] = [
           minLength: 1,
           description:
             'Send only this signal to the job in front: any this system has, by name, with or without SIG, such as INT, TERM, KILL, HUP, QUIT, USR1 or TSTP. ' +
-            'A suspend signal (TSTP, STOP, TTIN, TTOU) stops the job and brings the prompt back; `run` with `fg` or `bg` continues it. A signal the job ignores or handles leaves it running.',
+            'A suspend signal (TSTP, STOP, TTIN, TTOU) stops the job and brings the prompt back; `run` with `fg` or `bg` continues it. A signal the job ignores leaves it running, and so does one it handles, unless its handler ends it.',
         },
       },
       required: ['name'],

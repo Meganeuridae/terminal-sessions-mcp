@@ -150,7 +150,7 @@ export class Host {
       if (!entry) return this.noSession(caller, name);
       if (caller.takes) entry.takerUsed = true;
       if (entry.closing && (tool === 'run' || tool === 'send' || tool === 'stop' || tool === 'integrate')) {
-        return refused(`Session ${JSON.stringify(name)} is closing, so nothing was ${tool === 'stop' ? 'sent' : 'typed'}. \`close\` with \`force\` ends it at once.`, { error: 'session_exited', session: name });
+        return refused(`Session ${JSON.stringify(name)} is closing, so nothing was ${tool === 'stop' ? 'sent' : 'typed'}. \`close\` with \`force\` makes that close KILL the shell and what it listed, from its next step.`, { error: 'session_exited', session: name });
       }
       switch (tool) {
         case 'run':
@@ -573,7 +573,7 @@ export class Host {
       case 'refused':
         if (r.integrating) return refused(`${head}\nNothing was typed: another \`integrate\` is running in this session. Its result says how it went.`, { error: 'not_sent', integrating: true, front: r.front });
         if (r.sent) return refused(`${head}\nNothing was typed: a line sent at this prompt hasn't started yet, and what is in front may be a question, such as a password, that anything typed would answer. \`look\` until the shell it reaches shows its prompt, then call \`integrate\` again.`, { error: 'not_at_prompt', sent: true, front: r.front });
-        if (r.canonical) return refused(`${head}\nNothing was typed: what's in front reads a whole line itself, such as a password or a yes/no question, or a shell without a line editor. \`look\` until a shell prompt shows, then call \`integrate\` again.`, { error: 'not_at_prompt', canonical: true, front: r.front });
+        if (r.canonical) return refused(`${head}\nNothing was typed: what's in front reads a whole line itself, such as a password or a yes/no question, or a shell without a line editor. At a question, answer it, then \`look\` until a shell prompt shows and call \`integrate\` again. At a shell prompt, that shell has no line editor, and \`integrate\` can't give it the integration.`, { error: 'not_at_prompt', canonical: true, front: r.front });
         if (r.unread) return refused(`${head}\nNothing was typed: this terminal's modes couldn't be read, so whether what's in front reads a whole line itself, such as a password question, couldn't be seen. \`integrate\` again, or \`look\`.`, { error: 'front_unknown', unread: true, front: r.front });
         if (r.unlisted) return refused(`${head}\nNothing was typed: what holds this terminal, or its processes, couldn't be read, so the program a shell there is reached through couldn't be known. \`integrate\` again, or \`look\`.`, { error: 'front_unknown', unlisted: true, front: r.front });
         if (r.front.state === 'exited') return refused(`${head}\nNothing was typed: ${refusalAdvice(r.front, 'integrate')}`, { error: 'session_exited', front: r.front });
@@ -581,7 +581,7 @@ export class Host {
         return refused(`${head}\nNothing was typed: the shell in front has the session's integration already, so \`run\` works there.`, { error: 'already_integrated', front: r.front });
       case 'unsupported':
         return refused(
-          `${head}\nThe shell in front${r.shell ? `, ${r.shell},` : ''} gets no integration: only bash, zsh and fish do. It answered the probe, and nothing more was typed. \`send\` types into it.`,
+          `${head}\nThe shell in front${r.shell ? `, ${r.shell},` : ''} gets no integration: only bash, zsh and fish do. It answered the probe line, and a second line that asks its name. Nothing more was typed. \`send\` types into it.`,
           { error: 'unsupported_shell', ...(r.shell ? { shell: r.shell } : {}), front: r.front },
         );
       case 'incomplete': {

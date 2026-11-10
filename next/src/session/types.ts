@@ -350,8 +350,9 @@ export interface Session {
    * Without `signal`, in steps: C-c, typed to the terminal, so it reaches whatever is in front, a shell's own loop included; then TERM,
    * then KILL, each with a grace and each only to the job's group while it is still the shell's. With `signal`, any the platform has,
    * that one step. A suspend signal (TSTP, STOP, TTIN, TTOU) stops the job: the prompt comes back, and the step and the command's
-   * ending say `stopped`. A signal the job ignores or handles leaves it running, and the step's front says so once its grace runs
-   * out. At a prompt nothing is in front, so CONT reaches no stopped job: `run fg` or `run bg` continues one.
+   * ending say `stopped`. A signal the job ignores leaves it running, and so does one it handles unless its handler ends it; the
+   * step's front says so once its grace runs out. At a prompt nothing is in front, so CONT reaches no stopped job: `run fg` or
+   * `run bg` continues one.
    */
   stop(signal?: NodeJS.Signals, opts?: { abort?: AbortSignal }): Promise<StopOutcome>;
   /**

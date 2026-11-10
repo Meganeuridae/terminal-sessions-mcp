@@ -2330,7 +2330,7 @@ test('integrate is refused at the prompt of a shell that has the integration, an
   s.integrate = async () => ({ kind: 'refused', canonical: true, front: s.frontNow });
   const canonical = await host.call(agent(), 'integrate', { name: 'main' });
   assert.equal(canonical.isError, true);
-  assert.match(canonical.text, /\nNothing was typed: what's in front reads a whole line itself, such as a password or a yes\/no question, or a shell without a line editor\. `look` until a shell prompt shows, then call `integrate` again\.$/);
+  assert.match(canonical.text, /\nNothing was typed: what's in front reads a whole line itself, such as a password or a yes\/no question, or a shell without a line editor\. At a question, answer it, then `look` until a shell prompt shows and call `integrate` again\. At a shell prompt, that shell has no line editor, and `integrate` can't give it the integration\.$/);
   assert.deepEqual([canonical.structured.error, canonical.structured.canonical], ['not_at_prompt', true]);
   s.integrate = async () => ({ kind: 'refused', integrating: true, front: s.frontNow });
   const busy = await host.call(agent(), 'integrate', { name: 'main' });
@@ -2341,7 +2341,7 @@ test('integrate is refused at the prompt of a shell that has the integration, an
   s.integrate = async () => ({ kind: 'unsupported', shell: 'dash', front: s.frontNow });
   const dash = await host.call(agent(), 'integrate', { name: 'main' });
   assert.equal(dash.isError, true);
-  assert.match(dash.text, /\nThe shell in front, dash, gets no integration: only bash, zsh and fish do\. It answered the probe, and nothing more was typed\. `send` types into it\.$/);
+  assert.match(dash.text, /\nThe shell in front, dash, gets no integration: only bash, zsh and fish do\. It answered the probe line, and a second line that asks its name\. Nothing more was typed\. `send` types into it\.$/);
   assert.deepEqual([dash.structured.error, dash.structured.shell], ['unsupported_shell', 'dash']);
 });
 

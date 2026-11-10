@@ -14,7 +14,7 @@ export interface DaemonInfo {
 const TAG_ONTOLOGY = {
   coreTags: [],
   tags: {
-    'terminal:ended': { desc: 'A command ended that no call was waiting on', facet: 'lifecycle' },
+    'terminal:ended': { desc: 'A command ended that no call showed', facet: 'lifecycle' },
     'terminal:waiting': { desc: 'A program in front of the shell is waiting for input, on the kernel\'s evidence', facet: 'lifecycle' },
     'terminal:exited': { desc: "A session's shell exited", facet: 'lifecycle' },
     'terminal:match': { desc: 'A pattern you asked to be told of appeared in the output', facet: 'lifecycle' },
@@ -26,7 +26,7 @@ const TAG_ONTOLOGY = {
 export const FEATURE_SETS: Record<string, FeatureSetDeclaration> = {
   'terminal.tools': { description: 'The nine tools: open, run, send, look, read, stop, integrate, list, close', uses: ['tools'] },
   'terminal.events': {
-    description: 'Wakes for what needs you: a command ended that no call waited on, a program waits for input, a shell exited, a pattern you asked for appeared',
+    description: 'Wakes for what needs you: a command ended that no call showed, a program waits for input, a shell exited, a pattern you asked for appeared',
     uses: ['pushEvents'],
     tagOntology: TAG_ONTOLOGY,
   } as FeatureSetDeclaration,

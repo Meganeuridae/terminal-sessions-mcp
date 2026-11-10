@@ -86,7 +86,7 @@ The session server must be running for the MCP server to work properly.
 
 - **`killSession`**: Terminate a specific session
   ```typescript
-  // Graceful shutdown (default - sends SIGHUP, waits up to 3 seconds)
+  // Graceful shutdown (default): SIGHUP to the shell, up to 3 seconds for it to exit, then a hangup for each process it listed, within 10 seconds in all
   killSession({ session: "session-id" })
   
   // Force kill (immediate termination - use only when necessary)
