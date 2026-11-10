@@ -247,6 +247,14 @@ for (const sh of shells) {
       assert.deepEqual(out(sourced, await ran(sourced, both)), ['profile_ok|rc_ok']);
     });
 
+    test('a login profile that sets nounset leaves the hooks working', { skip: sh.name !== 'bash' ? 'bash only' : false }, async () => {
+      const s = await open(shell, { rc: 'set -u\n' });
+      const ok = await ran(s, 'echo ok');
+      assert.deepEqual([out(s, ok), ok.end?.status], [['ok'], 0]);
+      const failed = await ran(s, 'false');
+      assert.equal(failed.end?.status, 1);
+    });
+
     test('a startup file reading one key holds the session, starting, until it is answered', { skip: sh.name === 'fish' ? 'fish config has no prompt read here' : false }, async () => {
       const read = sh.name === 'zsh' ? 'read -rsk1 startup_answer' : 'read -rsn1 startup_answer';
       const s = await open(shell, { rc: `${read}\necho STARTUP_DONE:$startup_answer\n`, waitMs: 1000 });

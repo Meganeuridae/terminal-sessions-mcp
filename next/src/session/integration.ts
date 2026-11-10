@@ -75,7 +75,8 @@ __tsm_end() {
 }
 __tsm_b='\\[\\033]133;B;$\{__tsm_c}.$\{__tsm_r}\\007\\]'
 __tsm_hook() {
-  local __tsm_pc
+  local __tsm_pc __tsm_u=
+  case $- in *u*) __tsm_u=1; set +u ;; esac
   case $\{PS1-} in *'133;B;'*) ;; *) PS1="$\{PS1-}$__tsm_b" ;; esac
   if [ "$\{#PROMPT_COMMAND[@]}" -gt 1 ]; then
     case $\{PROMPT_COMMAND[0]} in __tsm_end$'\\n'*) ;; *) PROMPT_COMMAND[0]=__tsm_end$'\\n'"$\{PROMPT_COMMAND[0]}" ;; esac
@@ -91,6 +92,7 @@ __tsm_hook() {
         ;;
     esac
   fi
+  if [ -n "$__tsm_u" ]; then set -u; fi
 }
 __tsm_tail() {
   local __tsm_s=$?
