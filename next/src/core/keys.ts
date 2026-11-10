@@ -138,8 +138,9 @@ function closeMatches(prefix: string, base: string): string[] {
   return scored
     .filter((x) => x.d <= limit)
     .sort((x, y) => x.d - y.d)
-    .slice(0, 3)
-    .map((x) => `${prefix}${x.n}`);
+    .map((x) => `${prefix}${x.n}`)
+    .filter(decodes)
+    .slice(0, 3);
 }
 
 /** Why `name` is not a key, and what the caller may have meant. */
@@ -150,7 +151,13 @@ function hintFor(name: string, prefix: string, base: string): string {
       if (prefix.includes('C-') && ctrlChar(base) !== undefined) return ` A terminal sends the same byte with or without Shift: use '${prefix.replace('S-', '')}${base.toLowerCase()}'.`;
       if (prefix.includes('S-') && !prefix.includes('C-')) {
         const rest = prefix.replace('S-', '');
-        return rest ? ` Shift with a character is its shifted form: use '${rest}${base.toUpperCase()}'.` : ` Shift with a character is its shifted form: type '${base.toUpperCase()}' as text.`;
+        const upper = base.toUpperCase();
+        if (upper !== base.toLowerCase() && [...upper].length === 1 && decodes(`${rest}${upper}`)) {
+          return rest ? ` Shift with a character is its shifted form: use '${rest}${upper}'.` : ` Shift with a character is its shifted form: type '${upper}' as text.`;
+        }
+        return rest
+          ? ` Shift with a character is the character the keyboard gives for it: use '${rest}' with that character.`
+          : ` Shift with a character is the character the keyboard gives for it: type that character as text.`;
       }
       return ` A terminal has no control character for '${base}'.`;
     }
@@ -161,7 +168,8 @@ function hintFor(name: string, prefix: string, base: string): string {
     if (m) {
       const word = m[1]!.toLowerCase();
       const mod = Object.keys(MODIFIERS).find((w) => w.length > 2 && Math.abs(word.length - w.length) <= 2 && distance(word, w) <= (w.length > 5 ? 2 : 1));
-      if (mod !== undefined) return ` Did you mean '${MODIFIERS[mod]!.toUpperCase()}-${m[2]}'?`;
+      const meant = mod === undefined ? undefined : `${MODIFIERS[mod]!.toUpperCase()}-${m[2]}`;
+      if (meant !== undefined && decodes(meant)) return ` Did you mean '${meant}'?`;
     }
   }
   const close = closeMatches(prefix, base);
@@ -219,6 +227,18 @@ function ctrlChar(ch: string): string | undefined {
 }
 
 export function decodeKey(name: string, opts: KeyOptions = {}): string {
+  const r = encode(name, opts);
+  if (typeof r === 'string') return r;
+  throw unknown(...r.refused);
+}
+
+/** Whether `name` is a key decodeKey takes. */
+function decodes(name: string): boolean {
+  return typeof encode(name, {}) === 'string';
+}
+
+/** A key's bytes, or what to name in its refusal. */
+function encode(name: string, opts: KeyOptions): string | { refused: [name: string, prefix?: string, base?: string] } {
   const named = canonical(name);
   if (named !== undefined) {
     const bytes = NAMED_KEYS[named]!;
@@ -227,7 +247,7 @@ export function decodeKey(name: string, opts: KeyOptions = {}): string {
   // `^C`: the caret spelling of a control character.
   if (name.length === 2 && name[0] === '^') {
     const c = ctrlChar(name[1]!);
-    if (c === undefined) throw unknown(name);
+    if (c === undefined) return { refused: [name] };
     return c;
   }
   // A single character is sent as itself.
@@ -235,21 +255,21 @@ export function decodeKey(name: string, opts: KeyOptions = {}): string {
   const m = splitModifiers(name);
   if (!m) {
     const spelled = canonical(name, true);
-    if (spelled === undefined) throw unknown(name);
-    return decodeKey(spelled, opts);
+    if (spelled === undefined) return { refused: [name] };
+    return encode(spelled, opts);
   }
   const ctrl = m.prefixes.has('c');
   const meta = m.prefixes.has('m');
   const shift = m.prefixes.has('s');
   const base = m.base;
   const esc = meta ? '\x1b' : '';
-  const bad = () => unknown(name, m.prefix, base);
+  const bad = { refused: [name, m.prefix, base] as [string, string, string] };
   if ([...base].length === 1) {
     // A character: C- makes it a control character, M- prefixes ESC.
-    if (shift) throw bad();
+    if (shift) return bad;
     if (!ctrl) return esc + base;
     const c = ctrlChar(base);
-    if (c === undefined) throw bad();
+    if (c === undefined) return bad;
     return esc + c;
   }
   const b = canonical(base, true) ?? base.toLowerCase();
@@ -258,7 +278,7 @@ export function decodeKey(name: string, opts: KeyOptions = {}): string {
     return esc + ' ';
   }
   if (b === 'tab') {
-    if (ctrl) throw bad();
+    if (ctrl) return bad;
     return esc + (shift ? '\x1b[Z' : '\t');
   }
   const mod = 1 + (shift ? 1 : 0) + (meta ? 2 : 0) + (ctrl ? 4 : 0);
@@ -269,7 +289,7 @@ export function decodeKey(name: string, opts: KeyOptions = {}): string {
   if (code !== undefined) return `\x1b[${code};${mod}~`;
   // Single-byte keys take only M- (ESC prefix); C-/S- on them have no encoding.
   if (bytes.length === 1 && !ctrl && !shift) return esc + bytes;
-  throw bad();
+  return bad;
 }
 
 export const PASTE_START = '\x1b[200~';

@@ -104,16 +104,26 @@ test('ux-22: an unknown key is invalid_argument (never internal), naming close m
   refused('C-S-1', /no control character for '1'/);
   refused('ls -la', /Literal characters go in `text`/);
   refused('Hyper');
-  for (const name of ['Ctrl-Shift-C', 'M-S-x', 'C-S-1', 'C-M-S-2', 'C-S-]']) {
+  refused('S-1', /the character the keyboard gives for it: type that character as text/);
+  refused('M-S-ß', /use 'M-' with that character/);
+  const advice = (name: string): string[] => {
     let message = '';
     try {
       inputBytes('typed', [name]);
     } catch (e) {
       message = (e as Error).message;
     }
-    const advised = /use '([^']+)'/.exec(message)?.[1];
-    if (advised !== undefined) assert.doesNotThrow(() => inputBytes('typed', [advised]), `${name} advises ${advised}`);
+    const hint = message.slice(0, message.indexOf(' Valid: '));
+    const meant = /Did you mean ([^?]+)\?/.exec(hint)?.[1] ?? '';
+    return [...[...meant.matchAll(/'([^']+)'/g)].map((m) => m[1]!), ...[...hint.matchAll(/use '([^']+)'\./g)].map((m) => m[1]!)];
+  };
+  const names = ['Ctrl-Shift-C', 'M-S-x', 'C-S-1', 'C-M-S-2', 'C-S-]', 'Ctlr-Enter', 'C-Ente', 'Ctlr-C', 'Entr', 'M-S-ß', 'S-1'];
+  for (const name of names) {
+    for (const advised of advice(name)) assert.doesNotThrow(() => inputBytes('typed', [advised]), `${name} advises ${advised}`);
   }
+  assert.deepEqual(advice('Ctlr-C'), ['C-C'], 'the advice is read from the message');
+  assert.ok(!advice('Ctlr-Enter').includes('C-Enter'), 'no terminal sends C-Enter, so it is not advised');
+  assert.ok(!advice('C-Ente').includes('C-Enter'), 'nor as a close match');
 });
 
 test('a key name far longer than any key costs no more than reading it a few hundred times, not a comparison with each key', () => {
