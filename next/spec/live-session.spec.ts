@@ -1,6 +1,6 @@
 import { after, afterEach, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -2376,6 +2376,25 @@ test("a close where /proc hides other users' processes names its listing as inco
   const c = await s.close({ deadline: by() });
   assert.equal(c.unlisted, true, JSON.stringify(c));
   assert.match(logs.join('\n'), /hides other users' processes/);
+});
+
+test("a listing's descendants of a process outside it are unknown, and of one inside it, only what that listing held", async () => {
+  const child = spawn('sh', ['-c', 'read x; sleep 30; :'], { stdio: ['pipe', 'ignore', 'ignore'] });
+  try {
+    const pid = child.pid!;
+    const f = await eventually('sh is listed', () => {
+      const now = proc.family(process.pid);
+      return now?.all.some((d) => d.pid === pid) ? now : undefined;
+    });
+    assert.equal(f.from(1), undefined);
+    assert.deepEqual(f.from(pid), []);
+    child.stdin.write('\n');
+    await eventually('sh started sleep', () => (proc.descendants(pid) ?? []).length > 0);
+    assert.deepEqual(f.from(pid), []);
+  } finally {
+    for (const d of proc.descendants(child.pid!) ?? []) killPid(d.pid);
+    child.kill('SIGKILL');
+  }
 });
 
 test("a close that joins one under way and whose own deadline comes first says it's under way, and names no signal before one was sent", darwinOnly, async () => {

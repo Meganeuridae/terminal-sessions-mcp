@@ -368,30 +368,23 @@ export function descendants(pid: number, all = false): Proc[] | undefined {
 
 /**
  * Every descendant of `pid`, each with its group, from one listing, and `from(w)`, every descendant of `w` among them, undefined
- * when `w` isn't. On macOS both come from the same table. Undefined when they can't be listed.
+ * when `w` isn't among them. Undefined when they can't be listed.
  */
 export function family(pid: number): { all: Proc[]; from: (w: number) => Proc[] | undefined } | undefined {
   const fail = (): undefined => undefined;
+  let all: Proc[] | undefined;
   try {
-    if (LINUX) {
-      const all = descendantsHere(pid, true, fail);
-      const from = (w: number): Proc[] | undefined => {
-        try {
-          return descendantsHere(w, true, fail);
-        } catch {
-          return undefined;
-        }
-      };
-      return all && { all, from };
+    if (LINUX) all = descendantsHere(pid, true, fail);
+    else {
+      const s = psSync(DESCENDANTS_ARGS, SPAWN_TIMEOUT_MS);
+      if (s.status === 0) all = descendantsFrom(pid, true, rowsOf(s.stdout), fail);
     }
-    const s = psSync(DESCENDANTS_ARGS, SPAWN_TIMEOUT_MS);
-    if (s.status !== 0) return undefined;
-    const rows = rowsOf(s.stdout);
-    const all = descendantsFrom(pid, true, rows, fail);
-    return all && { all, from: (w) => descendantsFrom(w, true, rows, fail) };
   } catch {
     return undefined;
   }
+  if (!all) return undefined;
+  const rows = all.map((d) => [d.pid, d.ppid!, d.pgrp]);
+  return { all, from: (w) => descendantsFrom(w, true, rows, fail) };
 }
 
 /** Whether process `pid` is there. Only ESRCH says it isn't: EPERM, for another user's process, says it is. */
