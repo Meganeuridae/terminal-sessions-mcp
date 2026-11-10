@@ -101,8 +101,19 @@ test('ux-22: an unknown key is invalid_argument (never internal), naming close m
   refused('Ctrl-Shift-C', /use 'C-c'/);
   refused('S-x', /type 'X' as text/);
   refused('M-S-x', /use 'M-X'/);
+  refused('C-S-1', /no control character for '1'/);
   refused('ls -la', /Literal characters go in `text`/);
   refused('Hyper');
+  for (const name of ['Ctrl-Shift-C', 'M-S-x', 'C-S-1', 'C-M-S-2', 'C-S-]']) {
+    let message = '';
+    try {
+      inputBytes('typed', [name]);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    const advised = /use '([^']+)'/.exec(message)?.[1];
+    if (advised !== undefined) assert.doesNotThrow(() => inputBytes('typed', [advised]), `${name} advises ${advised}`);
+  }
 });
 
 test('a key name far longer than any key costs no more than reading it a few hundred times, not a comparison with each key', () => {

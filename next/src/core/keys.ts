@@ -148,7 +148,7 @@ function hintFor(name: string, prefix: string, base: string): string {
     // A real key under modifiers a terminal cannot encode (C-Enter, S-x, C-1).
     if ([...base].length === 1) {
       if (prefix.includes('C-') && ctrlChar(base) !== undefined) return ` A terminal sends the same byte with or without Shift: use '${prefix.replace('S-', '')}${base.toLowerCase()}'.`;
-      if (prefix.includes('S-')) {
+      if (prefix.includes('S-') && !prefix.includes('C-')) {
         const rest = prefix.replace('S-', '');
         return rest ? ` Shift with a character is its shifted form: use '${rest}${base.toUpperCase()}'.` : ` Shift with a character is its shifted form: type '${base.toUpperCase()}' as text.`;
       }
