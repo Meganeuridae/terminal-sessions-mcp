@@ -120,7 +120,7 @@ export const TOOLS: readonly ToolDef[] = [
     name: 'read',
     description:
       'Read a session\'s earlier output: one command\'s output by its id (each result names its command id), a range of line numbers, or the lines matching a pattern, with context. ' +
-      `Like every result it is cut to ${RESULT_MAX_CHARS} characters, keeping its start and end, so a long output is read in ranges; a single line longer than that is cut in its middle, and output older than the lines a session keeps is gone.`,
+      `Like every result it is cut to ${RESULT_MAX_CHARS} characters, keeping its start and end, so a long output is read in ranges; a single line longer than that is cut in its middle, and output older than the lines a session keeps is gone. A line longer than 65,536 characters is kept, shown and searched as its pieces, a line each.`,
     inputSchema: {
       type: 'object',
       properties: {

@@ -3,9 +3,10 @@
  * terminal of its own, what is in front of it, and its transcript. A Session knows nothing of
  * connections, scopes, rendering or deadlines' defaults; the host keeps those.
  *
- * Times are milliseconds since the epoch. Line numbers count the session's transcript from 0, and a
- * line given never changes, but for one case: the cursor's line and the screen's lines below it when a
- * full-screen program starts stay live while it runs, and move to follow its last frame.
+ * Times are milliseconds since the epoch. Line numbers count the session's transcript from 0. A line
+ * that has scrolled off the screen never changes. The screen's own lines stay live, as `Lines.live`
+ * counts, so a program that moves its cursor back can rewrite them; and the cursor's line and those
+ * below it when a full-screen program starts stay live while it runs, and move to follow its last frame.
  * The bound on what is kept drops the oldest lines, and every read says how many it dropped.
  */
 
@@ -111,7 +112,7 @@ export type Front =
       starting?: true;
     }
   | {
-      /** The terminal couldn't be read, so whether the shell is at its prompt isn't known. A prompt the marks show stays `prompt`. */
+      /** The terminal couldn't be read, so whether the shell is at its prompt isn't known. A prompt the session's own shell marks stays `prompt`; a far shell's marks don't count here. */
       state: 'unknown';
       since: number;
       command?: number;
@@ -306,9 +307,10 @@ export type IntegrateOutcome =
   | { kind: 'incomplete'; step: 'probe' | 'hooks'; by: 'timeout' | 'cancelled' | 'exited' | 'closed'; ended?: string; front: Front };
 
 /**
- * Events, each emitted once. `taken` is true when a call's outcome already gave it (`run`, `send` or
+ * Events, each emitted once. `taken` is true when a call took it, to give in its outcome (`run`, `send` or
  * `wait` on this session, unless the call passed `take: false` or its `signal` aborted it first), so the host can skip the wake;
- * that call's outcome lists it in `took`.
+ * that call's outcome lists it in `took`. It doesn't say the outcome reached anyone: a host whose call's outcome doesn't reach its
+ * caller hands it back as a report.
  * `waiting` fires on each entry into that state, noticed within about a quarter second, and input
  * sent while something is in front starts a new one; a `match`
  * watch fires once and is gone. A shell that exits mid-command emits that command's `ended`, with no
