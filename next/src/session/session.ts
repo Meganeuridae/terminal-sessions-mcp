@@ -1291,14 +1291,16 @@ class LiveSession implements Session {
       /**
        * Sends `signal` to each listed group that still holds a listed process, and records each it couldn't reach. When that can't be
        * checked, it sends nothing and records the listing as incomplete: a group whose id was taken again isn't signalled, and the
-       * result says what was started may live on.
+       * result says what was started may live on. A signal given as a function is chosen once the listing is back, so a force that
+       * joins meanwhile is honoured.
        */
-      const reach = async (signal: 'SIGHUP' | 'SIGKILL', l: proc.Listing): Promise<void> => {
+      const reach = async (which: 'SIGHUP' | 'SIGKILL' | (() => 'SIGHUP' | 'SIGKILL'), l: proc.Listing): Promise<void> => {
         const held = await proc.held(listed, l);
         if (!held) {
           if (listed.length) unlisted = true;
           return;
         }
+        const signal = typeof which === 'function' ? which() : which;
         const refused: Array<{ pgid: number; error: string }> = [];
         for (const pgid of held) {
           const error = proc.signalGroup(pgid, signal);
@@ -1345,7 +1347,7 @@ class LiveSession implements Session {
       await this.until(Math.min(mono() + CLOSE_GRACE_MS, deadline), gone);
       // A shell hangs up only the jobs it still counts as its own, and a KILLed one none. A close forced once the shell had gone
       // KILLs what it listed.
-      if (!killed) await (forced() ? reach('SIGKILL', before(0)) : reach('SIGHUP', before(0)));
+      if (!killed) await reach(() => (forced() ? 'SIGKILL' : 'SIGHUP'), before(0));
     } else {
       // Once the shell has exited, nothing has its terminal, so what it left running can't be listed, and may live on.
       unlisted = true;

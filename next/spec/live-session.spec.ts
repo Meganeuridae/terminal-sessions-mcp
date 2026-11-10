@@ -2111,6 +2111,30 @@ test('a close with force that joins a gentle close after its hangup went out sti
   }
 });
 
+test('a close with force that joins a gentle close held at its last listing makes that last step KILL, so a job that ignores the hangup is gone', darwinOnly, async () => {
+  const s = await open(which('bash') ?? '/bin/bash');
+  const job = await hupProof(s);
+  const gate = path.join(tmp, `gate-${++gates}`);
+  const held = path.join(tmp, `held-${++gates}`);
+  // Only the last step's check of which listed groups still hold a process asks ps for states.
+  const fake = fakePs(`*"stat="*) : > '${held}'; while [ ! -e '${gate}' ]; do sleep 0.05; done;;`);
+  const keep = process.env.PATH;
+  try {
+    process.env.PATH = `${fake}:${keep}`;
+    const first = s.close({ deadline: by() });
+    await eventually('the gentle close is held at its last listing', () => fs.existsSync(held));
+    const second = s.close({ force: true, deadline: by() });
+    fs.writeFileSync(gate, '');
+    await Promise.all([first, second]);
+    process.env.PATH = keep;
+    await eventually('the job that ignores the hangup is gone', () => gone(job));
+  } finally {
+    process.env.PATH = keep;
+    fs.writeFileSync(gate, '');
+    killPid(job);
+  }
+});
+
 test('a close whose every signal to the shell fails names none as sent', async () => {
   const s = await open('/bin/sh');
   const pty = (s as unknown as { p: { kill(signal?: string): void } }).p;
