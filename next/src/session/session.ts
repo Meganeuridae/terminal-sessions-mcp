@@ -876,6 +876,19 @@ class LiveSession implements Session {
     return call;
   }
 
+  /** Types `bytes` and returns when, as the last write; a write that throws leaves the last write as it was. */
+  private write(bytes: string): number {
+    const was = this.lastWrite;
+    this.lastWrite = mono();
+    try {
+      this.p.write(bytes);
+    } catch (e) {
+      this.lastWrite = was;
+      throw e;
+    }
+    return this.lastWrite;
+  }
+
   /** On macOS, where a look at the kernel spawns `ps`, whether a call's loop may look again yet. */
   private lookDue(): boolean {
     return LINUX || mono() - this.lastLook >= MAC_LOOK_EVERY_MS;
@@ -909,10 +922,9 @@ class LiveSession implements Session {
     this.top.runCommand = c;
     this.top.submitted = true;
     const call = this.enter(opts.take ?? true, opts.signal, id);
-    this.lastWrite = mono();
     try {
       try {
-        this.p.write(cf.line);
+        this.write(cf.line);
       } catch (e) {
         Object.assign(this.top, before);
         if (this.commands.get(id) === c) {
@@ -974,7 +986,7 @@ class LiveSession implements Session {
       } else this.top.sentPending = (this.top.sentPending ?? '') + (opts.paste ? text + keys : bytes);
     }
     const call = this.enter(opts.take ?? true, opts.signal);
-    const sentAt = (this.lastWrite = mono());
+    let sentAt = 0;
     const scan = newScan(from);
     let matched: Match | undefined;
     let by: SendOutcome['by'] = 'timeout';
@@ -985,7 +997,7 @@ class LiveSession implements Session {
         this.top.sentView = { at: b, line: this.promptLine(b), cursor: this.t.pos(), changed: false };
       }
       try {
-        this.p.write(bytes);
+        sentAt = this.write(bytes);
       } catch (e) {
         Object.assign(this.top, before);
         throw e;
@@ -1147,10 +1159,8 @@ class LiveSession implements Session {
       // Once a close has begun, it ends what runs, and stop sends nothing more.
       if (this.closed) return true;
       const mine = sent === 'C-c' ? true : this.ours(target.pgid);
-      if (sent === 'C-c') {
-        this.lastWrite = mono();
-        this.p.write('\x03');
-      } else if (mine) {
+      if (sent === 'C-c') this.write('\x03');
+      else if (mine) {
         if (sig) this.signalled = sig;
         const refused = proc.signalGroup(target.pgid, sent);
         if (refused) {
@@ -1242,14 +1252,13 @@ class LiveSession implements Session {
     try {
       this.probe = { call };
       if (stop()) return incomplete('probe', stop()!);
-      this.lastWrite = mono();
-      this.p.write(integration.probeLine(call));
+      this.write(integration.probeLine(call));
       const answer = await answered();
       if (!answer) return incomplete('probe', stop() ?? 'timeout');
       const kind = answer.fish ? 'fish' : answer.zsh ? 'zsh' : answer.bash ? 'bash' : undefined;
       if (!kind) {
         if (stop()) return incomplete('probe', stop()!);
-        this.p.write(integration.probeZeroLine(call));
+        this.write(integration.probeZeroLine(call));
         const zero = await answered();
         if (!zero && stop()) return incomplete('probe', stop()!);
         const name = zero?.zero?.replace(/^-/, '');
@@ -1260,8 +1269,7 @@ class LiveSession implements Session {
       const lines = integration.farHooks(kind, nonce, call);
       for (const [i, line] of lines.slice(0, -1).entries()) {
         if (stop()) return incomplete('hooks', stop()!);
-        this.lastWrite = mono();
-        this.p.write(line);
+        this.write(line);
         if (!(await this.until(deadline, () => (stop() ? false : (this.probe?.acked ?? -1) >= i ? true : undefined), opts.signal))) return incomplete('hooks', stop() ?? 'timeout');
       }
       if (stop()) return incomplete('hooks', stop()!);
@@ -1269,9 +1277,8 @@ class LiveSession implements Session {
       chain.far = { kind, within, drained: [], leaves, ...(self !== undefined && { self }) };
       this.chains.push(chain);
       this.probe!.chain = chain;
-      this.lastWrite = mono();
       try {
-        this.p.write(lines.at(-1)!);
+        this.write(lines.at(-1)!);
       } catch (e) {
         if (this.top === chain) this.chains.pop();
         throw e;

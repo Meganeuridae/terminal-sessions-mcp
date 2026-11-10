@@ -2515,6 +2515,28 @@ test("a send whose terminal write fails leaves the prompt's line as it was", { s
   await s.close({ force: true, deadline: by() });
 });
 
+for (const via of ['run', 'send'] as const) {
+  test(`a ${via} whose terminal write fails at a quiet shell without the integration leaves its prompt in front`, async () => {
+    const s = await open('/bin/sh');
+    await eventually('the prompt is in front', () => s.front().state === 'prompt');
+    const inner = s as unknown as { p: { write(d: string): void } };
+    const write = inner.p.write.bind(inner.p);
+    let writes = 0;
+    inner.p.write = () => {
+      writes++;
+      throw new Error('refused');
+    };
+    try {
+      await assert.rejects(via === 'run' ? s.run('echo two', { waitMs: 2000 }) : s.send('echo two', { waitMs: 2000 }), /refused/);
+    } finally {
+      inner.p.write = write;
+    }
+    assert.equal(writes, 1);
+    const f = s.front();
+    assert.equal(f.state, 'prompt', JSON.stringify(f));
+  });
+}
+
 test("an integrate whose last hook write fails leaves no far shell followed, and a second integrate gives it the integration", { skip: which('bash') ? false : 'bash is needed' }, async () => {
   const s = await open(which('bash')!);
   const from = s.lines(0).to - 1;
