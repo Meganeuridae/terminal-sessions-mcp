@@ -26,3 +26,4 @@ next/spec/
 next/dist/spec/
 next/acceptance/
 next/tsconfig.json
+.hosts/
