@@ -53,7 +53,7 @@ export function endingText(c: Command): string[] {
   else if (end.stoppedUnknown) parts.push(`whether the stop signal stopped it isn't known${end.status === undefined ? '' : ` (the shell reported ${status})`}`);
   else parts.push(status);
   if (end.pipeline && end.pipeline.some((s) => s !== 0)) parts.push(`pipeline ${end.pipeline.join('|')}`);
-  parts.push(duration(end.ms));
+  parts.push(end.unfollowed ? `followed for ${duration(end.ms)}` : duration(end.ms));
   if (end.errexit) parts.push('set -e is on: a failing command now ends the shell');
   if (end.flushed) parts.push(`discarded typed-ahead text ${quotedString(end.flushed)}, which nothing read`);
   if (end.refusedMarks) parts.push(`${end.refusedMarks} lookalike end mark${end.refusedMarks === 1 ? '' : 's'} in its output refused`);

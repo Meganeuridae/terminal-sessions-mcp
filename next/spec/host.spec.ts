@@ -1290,7 +1290,7 @@ test("a run on a session closed while it waited doesn't call a command the sessi
   };
   const r = await host.call(plain(), 'run', { name: 'main', command: 'make' });
   await closing;
-  assert.match(r.text, /^Session "main" was closed while this call waited\. Command 7 was typed: no longer followed: ssh box left the terminal, so whether the command ended isn't known · 1\.2 s\. /);
+  assert.match(r.text, /^Session "main" was closed while this call waited\. Command 7 was typed: no longer followed: ssh box left the terminal, so whether the command ended isn't known · followed for 1\.2 s\. /);
 });
 
 test("a wait's ends don't call a command the session stopped following ended", async () => {
@@ -1300,7 +1300,7 @@ test("a wait's ends don't call a command the session stopped following ended", a
   const c = unfollowedEnd(s, 8, 'make');
   s.wait = async () => ({ by: 'end', front: s.frontNow, ended: [c], took: [] });
   const w = await host.call(plain(), 'look', { name: 'main', until: 'end' });
-  assert.match(w.text, /Command 8: no longer followed: ssh box left the terminal, so whether the command ended isn't known · 1\.2 s\./);
+  assert.match(w.text, /Command 8: no longer followed: ssh box left the terminal, so whether the command ended isn't known · followed for 1\.2 s\./);
   assert.doesNotMatch(w.text, /Command 8 ended/);
 });
 
