@@ -204,9 +204,11 @@ export async function runCli(o: CliOptions & { socket: string; version: string; 
       const end = performance.now() + bound;
       const pid = r.daemon.pid;
       const wedged = `the daemon (pid ${pid}, as it named itself) didn't stop within ${bound} ms; if it is stuck, \`kill -KILL ${pid}\` ends it, and each shell gets the hangup a closing terminal sends: the shell ends, with the jobs it hangs up, and a job it disowned or started with nohup lives on`;
+      let unanswered = false;
       const answer = await within(rpc(r, STOP, {}, 1).catch((e: unknown): Record<string, unknown> => {
-        if (e instanceof ConnectionClosed) return {};
-        throw e;
+        if (!(e instanceof ConnectionClosed)) throw e;
+        unanswered = true;
+        return {};
       }), bound);
       if (answer === undefined) {
         o.stderr.write(`tsm: ${wedged}\n`);
@@ -232,6 +234,17 @@ export async function runCli(o: CliOptions & { socket: string; version: string; 
         }
         await new Promise((res) => setTimeout(res, 50));
       }
+      if (unanswered) {
+        while (alive(pid)) {
+          if (performance.now() >= end) {
+            o.stderr.write(`tsm: the daemon (pid ${pid}) closed its connection without answering the stop, and its socket no longer answers, but it is still running\n`);
+            return 1;
+          }
+          await new Promise((res) => setTimeout(res, 50));
+        }
+        o.stdout.write(`The daemon (pid ${pid}, running since ${r.daemon.startedAt}) closed its connection without answering the stop, and has exited. Its log says whether it closed its sessions first.\n`);
+        return 0;
+      }
       o.stdout.write(`Stopped the daemon (pid ${pid}, running since ${r.daemon.startedAt}). It hung up each shell it held, and its log names any session whose processes may live on.\n`);
       return 0;
     }
@@ -255,3 +268,12 @@ export async function runCli(o: CliOptions & { socket: string; version: string; 
     r.socket.destroy();
   }
 }
+
+const alive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+};

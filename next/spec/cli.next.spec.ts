@@ -5,7 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as net from 'node:net';
 import { PassThrough } from 'node:stream';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { parseCli, runCli, type CliOptions } from '../src/endpoint/cli-main.js';
 import { runDaemon, type RunningDaemon } from '../src/endpoint/daemon-main.js';
 import { helloLine, STOP } from '../src/endpoint/hello.js';
@@ -273,6 +273,84 @@ test("tsm daemon stop says it can't tell when the socket can't be probed after t
   } finally {
     fs.chmodSync(socket, 0o600);
     await new Promise<void>((r) => server.close(() => r()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+async function silentStop(dir: string, daemon: ReturnType<typeof spawn>): Promise<{ socket: string; done: () => Promise<void> }> {
+  const socket = path.join(dir, 'daemon.sock');
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    c.write(helloLine({ version: '2.0.0', pid: daemon.pid!, startedAt: '2026-11-08T19:00:00.000Z' } as never));
+    let buf = '';
+    c.on('data', (b) => {
+      buf += String(b);
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const m = JSON.parse(buf.slice(0, nl)) as { method?: unknown };
+        buf = buf.slice(nl + 1);
+        if (m.method !== STOP) continue;
+        server.close();
+        c.destroy();
+      }
+    });
+  });
+  await new Promise<void>((r) => server.listen(socket, r));
+  return { socket, done: () => new Promise<void>((r) => server.close(() => r())) };
+}
+
+function stopCall(socket: string, reachMs: number) {
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const seen = { out: '', err: '' };
+  stdout.on('data', (b) => (seen.out += b));
+  stderr.on('data', (b) => (seen.err += b));
+  const code = runCli({ ...(parseCli(['daemon', 'stop']) as CliOptions), socket, version: '2.0.0', startDaemon: () => assert.fail('a daemon answers'), stdout, stderr, reachMs });
+  return { code, seen };
+}
+
+test("tsm daemon stop that gets no answer waits for the daemon's pid to be gone before saying it exited", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
+  const daemon = spawn('sleep', ['60'], { stdio: 'ignore' });
+  const exited = new Promise<void>((r) => daemon.once('exit', () => r()));
+  const kill = process.kill;
+  let polled!: () => void;
+  const polling = new Promise<void>((r) => (polled = r));
+  process.kill = ((pid: number, signal?: string | number) => {
+    if (pid === daemon.pid && signal === 0) polled();
+    return kill.call(process, pid, signal);
+  }) as typeof process.kill;
+  const d = await silentStop(dir, daemon);
+  try {
+    let returned = false;
+    const call = stopCall(d.socket, 10_000);
+    void call.code.then(() => (returned = true));
+    await Promise.race([polling, call.code]);
+    assert.equal(returned, false, `it returned while the pid was alive: ${call.seen.out}${call.seen.err}`);
+    daemon.kill('SIGKILL');
+    await exited;
+    assert.equal(await call.code, 0, call.seen.err);
+    assert.equal(call.seen.out, `The daemon (pid ${daemon.pid}, running since 2026-11-08T19:00:00.000Z) closed its connection without answering the stop, and has exited. Its log says whether it closed its sessions first.\n`);
+  } finally {
+    process.kill = kill;
+    daemon.kill('SIGKILL');
+    await d.done().catch(() => {});
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tsm daemon stop that gets no answer fails, saying so, when the daemon's pid outlives its bound", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-cli-'));
+  const daemon = spawn('sleep', ['60'], { stdio: 'ignore' });
+  const d = await silentStop(dir, daemon);
+  try {
+    const call = stopCall(d.socket, 300);
+    assert.equal(await call.code, 1);
+    assert.equal(call.seen.out, '');
+    assert.equal(call.seen.err, `tsm: the daemon (pid ${daemon.pid}) closed its connection without answering the stop, and its socket no longer answers, but it is still running\n`);
+  } finally {
+    daemon.kill('SIGKILL');
+    await d.done().catch(() => {});
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
