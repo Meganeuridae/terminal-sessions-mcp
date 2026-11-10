@@ -10,7 +10,13 @@ const cpuMs = <T>(f: () => T): { value: T; ms: number } => {
   return { value, ms: (user + system) / 1000 };
 };
 
-const leastMs = (f: () => unknown): number => Math.min(cpuMs(f).ms, cpuMs(f).ms);
+const leastPair = (small: () => unknown, large: () => unknown): { small: number; large: number } => {
+  small();
+  large();
+  let least = { small: Infinity, large: Infinity };
+  for (let i = 0; i < 5; i++) least = { small: Math.min(least.small, cpuMs(small).ms), large: Math.min(least.large, cpuMs(large).ms) };
+  return least;
+};
 
 test('regex: the linear-time engine is in force on this Node', () => {
   assert.equal(LINEAR_REGEX, true);
@@ -56,8 +62,7 @@ test('regex: catastrophic patterns match in time linear in the input', () => {
   const cases: Array<[string, string, string]> = [['(a+)+$', '', 'a'], ['(a|a)+$', '', 'a'], ['(\\w+\\s?)+$', '', 'a'], ['(.*a){16}', '', 'a'], ['^(([a-z])+.)+[A-Z]([a-z])+$', '', 'a'], ['(a+)+$', 'i', 'A']];
   for (const [p, flags, ch] of cases) {
     const re = compileUserRegex(p, flags);
-    const one = leastMs(() => re.test(`${ch.repeat(5000)}!`));
-    const ten = leastMs(() => re.test(`${ch.repeat(50_000)}!`));
+    const { small: one, large: ten } = leastPair(() => re.test(`${ch.repeat(5000)}!`), () => re.test(`${ch.repeat(50_000)}!`));
     assert.ok(ten < one * 30 + 5, `${p}/${flags}: ${Math.round(ten)} ms of CPU on ten times the input, ${Math.round(one)} ms on the input`);
   }
   assert.equal(compileUserRegex('(a+)+$', 'i').test(`${'A'.repeat(5000)}!`), false);
@@ -233,8 +238,7 @@ test('er-9 / atc-2: a line costs what its match window costs, however long the l
     for (const unit of ['a', 'hello world ', '1']) {
       const head = unit.repeat(Math.ceil(w / unit.length)).slice(0, w);
       const long = head.repeat(10);
-      const one = leastMs(() => testBounded(re, head));
-      const ten = leastMs(() => testBounded(re, long));
+      const { small: one, large: ten } = leastPair(() => testBounded(re, head), () => testBounded(re, long));
       assert.ok(ten < one * 3 + 5, `${p.slice(0, 40)}: ${Math.round(ten)} ms of CPU on ten windows' length of ${JSON.stringify(unit)}, ${Math.round(one)} ms on one`);
     }
   }
@@ -249,8 +253,7 @@ test('er-9: a large pattern gets a smaller match window, and testBounded says wh
   const huge = compileUserRegex('a'.repeat(1000));
   assert.equal(matchWindow(huge), MIN_WINDOW);
   assert.ok(MIN_WINDOW * 1000 <= 2_000_000, 'the largest common pattern costs at most twice MATCH_COST');
-  const window = leastMs(() => testBounded(huge, 'b'.repeat(MIN_WINDOW)));
-  const line = leastMs(() => testBounded(huge, 'b'.repeat(MAX_MATCH_INPUT)));
+  const { small: window, large: line } = leastPair(() => testBounded(huge, 'b'.repeat(MIN_WINDOW)), () => testBounded(huge, 'b'.repeat(MAX_MATCH_INPUT)));
   assert.ok(line < window * 3 + 5, `the floor case took ${Math.round(line)} ms of CPU on a whole ${MAX_MATCH_INPUT}-character line, ${Math.round(window)} ms on its window`);
   // execBounded gives the match itself, from the same window.
   assert.deepEqual(execBounded(small, `${'x'.repeat(100)}ERROR`).match?.[0], 'ERROR');
