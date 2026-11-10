@@ -199,6 +199,7 @@ test('on a closed stdin the server lets out the answers it has written to a clie
     server.child.stdout.pause();
     const answers = Array.from({ length: 40 }, () => server.request('tools/list'));
     const call = server.request('tools/call', { name: 'listSessions', arguments: {} });
+    const ended = assert.rejects(call, /server ended/);
     server.child.stdin.end();
     await new Promise((resolve) => setTimeout(resolve, 600));
     server.child.stdout.resume();
@@ -207,7 +208,7 @@ test('on a closed stdin the server lets out the answers it has written to a clie
     const exit = await exitWithin(server, EXIT_WITHIN_MS);
     assert.ok(exit, `server still running ${EXIT_WITHIN_MS}ms after its answers were read`);
     assert.equal(exit.code, 0);
-    await assert.rejects(call, /server ended/);
+    await ended;
     assert.equal(server.unfinished(), '', 'no answer was cut off partway');
   } finally {
     server.child.kill('SIGKILL');
