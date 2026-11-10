@@ -2783,6 +2783,21 @@ test("an integrate whose second probe line gets no answer within the wait stops 
   }
 });
 
+test('the nonce a shell below still expects stays redacted however many commands the shell above it runs', { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const s = await open(which('bash')!);
+  const from = s.lines(0).to - 1;
+  const r = await s.run(`env -i HOME='${lastHome()}' PATH='${process.env.PATH ?? '/usr/bin:/bin'}' TERM=xterm-256color PS1='far> ' SAVED="$__tsm_r" '${which('bash')!}' --norc --noprofile -i`, { waitMs: 200 });
+  assert.equal(r.kind, 'running', JSON.stringify(r));
+  assert.equal((await s.wait({ kind: 'match', pattern: /^far> ?$/ }, { waitMs: 10_000, from })).by, 'match');
+  assert.equal((await s.integrate({ waitMs: 10_000 })).kind, 'integrated');
+  const below = (s as unknown as { chains: Array<{ expected: { random: string } }> }).chains[0]!.expected.random;
+  for (let i = 0; i < 70; i++) await ran(s, 'true');
+  const c = await ran(s, 'echo "S:$SAVED"');
+  assert.deepEqual(out(s, c), [`S:${'[redacted]'.padEnd(below.length, '.')}`]);
+  assert.ok(!s.lines(0).lines.some((l) => l.includes(below)));
+  assert.ok(!s.screen().rows.some((l) => l.includes(below)));
+});
+
 /** A local bash given the integration in `s`, at its prompt; returns its group. */
 async function localFar(s: Session): Promise<number> {
   const from = s.lines(0).to - 1;

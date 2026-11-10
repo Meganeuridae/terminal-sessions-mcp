@@ -306,7 +306,7 @@ class LiveSession implements Session {
 
   private redact(s: string): string {
     if (!DIGIT_RUN.test(s)) return s;
-    for (const r of this.recent) if (s.includes(r)) s = s.replaceAll(r, REDACTED.padEnd(r.length, '.'));
+    for (const r of [...this.recent, ...this.chains.map((c) => c.expected.random)]) if (s.includes(r)) s = s.replaceAll(r, REDACTED.padEnd(r.length, '.'));
     return s;
   }
 
