@@ -1,5 +1,5 @@
 import type * as net from 'node:net';
-import { capabilityGranted, deriveFeatureSets, grantFromUpdate, withRevision, type CapabilityGrantState, type FeatureSetDeclaration, type FeatureSetsUpdateParams } from '@animalabs/mcpl-core';
+import { capabilityGranted, deriveFeatureSets, grantFromUpdate, method as mcplMethod, withRevision, type CapabilityGrantState, type FeatureSetDeclaration, type FeatureSetsUpdateParams } from '@animalabs/mcpl-core';
 import { CAPABILITY_DENIED, classify, INTERNAL, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, Outbound, PARSE_ERROR, RpcError, type Id, type Message } from '../transport/jsonrpc.js';
 import type { Caller, Host, Wake } from '../tools/host.js';
 import { helloLine, parseClientHello, STOP, versionNote, type ClientHello } from './hello.js';
@@ -81,7 +81,7 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
       payload: { content: [{ type: 'text', text: w.text }] },
     };
     if (coalescing) params.coalesce = { key: w.key };
-    const r = await out.request<{ accepted?: unknown }>('push/event', params);
+    const r = await out.request<{ accepted?: unknown }>(mcplMethod.PUSH_EVENT, params);
     return r?.accepted === true;
   };
 
@@ -162,7 +162,7 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
           if (id !== undefined) calls.delete(id);
         }
       }
-      case 'featureSets/update': {
+      case mcplMethod.FEATURE_SETS_UPDATE: {
         if (!mcpl) throw new RpcError(METHOD_NOT_FOUND, 'not an MCPL connection');
         const before = toolsAllowed();
         after(() => {
@@ -171,7 +171,7 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
         });
         return updatePolicy(p as unknown as FeatureSetsUpdateParams, isRequest ? 'request' : 'notification');
       }
-      case 'mcpl/manifest':
+      case mcplMethod.MCPL_MANIFEST:
         if (!mcpl) throw new RpcError(METHOD_NOT_FOUND, 'not an MCPL connection');
         return manifest();
       case STOP:

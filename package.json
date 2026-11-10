@@ -45,7 +45,7 @@
     "url": "https://github.com/antra-tess/terminal-sessions-mcp.git"
   },
   "dependencies": {
-    "@animalabs/mcpl-core": "0.3.0",
+    "@animalabs/mcpl-core": "0.4.0",
     "@modelcontextprotocol/sdk": "^1.11.2",
     "@xterm/headless": "6.0.0",
     "node-pty": "^1.0.0",
