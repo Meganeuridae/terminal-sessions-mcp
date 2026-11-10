@@ -33,6 +33,9 @@ OOMPolicy=continue
 # unit has exited.
 KillMode=process
 KillSignal=SIGTERM
+# 20 s is the time termd's stop gives every session's close, counted from when it handles
+# SIGTERM, so a SIGKILL can land as a close's last steps run. Its log names each close as it
+# begins, so one cut short has no line saying how it ended.
 TimeoutStopSec=20
 
 [Install]

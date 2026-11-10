@@ -11,7 +11,8 @@
      starts in $HOME. termd logs to stderr, kept in the file below. No Umask: the sessions'
      shells inherit the mask, so files a session creates keep the usual permissions.
      ExitTimeOut gives the daemon 20 s from SIGTERM to SIGKILL, as termd.service's TimeoutStopSec does: its stop gives
-     every session's close that long. Without it, launchd's default applies, which was 5 s on macOS 15 and 26. -->
+     every session's close that long, counted from when it handles the signal, so a SIGKILL can land as a close's last
+     steps run. Its log names each close as it begins, so one cut short has no line saying how it ended. Without it, launchd's default applies, which was 5 s on macOS 15 and 26. -->
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.animalabs.termd</string>

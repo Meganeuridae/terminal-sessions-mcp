@@ -710,6 +710,61 @@ test('an open that finishes after the daemon began stopping closes its shell', a
   assert.equal(r.isError, true);
 });
 
+test("an open still starting when the daemon stops says what its shell's close did: it says the shell is closed only when the close confirmed it", async () => {
+  const cases: Array<[string, () => Promise<Closed>, RegExp]> = [
+    ['rejected', async () => Promise.reject(new Error('EIO')), /^The daemon stopped while this session started, and closing its shell failed: EIO, so whether it ended isn't known\.$/],
+    ['under way', async () => ({ code: null, underway: true }), /^The daemon stopped while this session started, and its shell was still being closed by a close begun earlier when the stop's wait ended, and nothing had been sent to it yet\.$/],
+    ['unconfirmed', async () => ({ code: null, signal: 'SIGKILL', unconfirmed: true }), /^The daemon stopped while this session started, and its shell was sent SIGKILL, and its exit wasn't seen within the grace after it\.$/],
+    ['closed', async () => ({ code: null, signal: 'SIGKILL' }), /^The daemon stopped while this session started, so its shell is closed\.$/],
+  ];
+  for (const [kind, close, says] of cases) {
+    let release!: () => void;
+    const host = new Host({
+      openSession: async (o: OpenOptions) => {
+        await new Promise<void>((r) => (release = r));
+        const s = new FakeSession(o.name, o);
+        s.close = close;
+        return s;
+      },
+      shell: '/bin/bash', env: {}, sessionsDir: '/tmp/sessions', startedAt: STARTED,
+    });
+    const pending = host.call(agent(), 'open', { name: 'main' });
+    await settle();
+    const stopping = host.closeAll();
+    await settle();
+    release();
+    await stopping;
+    const r = await pending;
+    assert.equal(r.isError, true, kind);
+    assert.match(r.text, says, kind);
+  }
+});
+
+test("an open still starting when the daemon stops logs its shell's close, and what may live on, as the stop's other closes do", async () => {
+  let release!: () => void;
+  const lines: string[] = [];
+  const host = new Host({
+    openSession: async (o: OpenOptions) => {
+      await new Promise<void>((r) => (release = r));
+      const s = new FakeSession(o.name, o);
+      s.close = async () => ({ code: null, signal: 'SIGKILL', unlisted: true });
+      return s;
+    },
+    shell: '/bin/bash', env: {}, sessionsDir: '/tmp/sessions', startedAt: STARTED, log: (l) => lines.push(l),
+  });
+  const pending = host.call(agent(), 'open', { name: 'main' });
+  await settle();
+  const stopping = host.closeAll();
+  await settle();
+  release();
+  await stopping;
+  await pending;
+  assert.deepEqual(lines, [
+    'closing session "main" of scope "a", which was still opening',
+    'session "main" of scope "a" closed, but not every process it started could be listed: processes it started may live on',
+  ]);
+});
+
 test('a session that fails to close is logged by name as the daemon stops', async () => {
   const logs: string[] = [];
   const opened: FakeSession[] = [];
@@ -728,7 +783,7 @@ test('a session that fails to close is logged by name as the daemon stops', asyn
   };
   await host.closeAll();
   assert.ok(opened[1]!.closedWith, 'the other still closed');
-  assert.deepEqual(logs, ['closing session "main" of scope "a" failed: EIO']);
+  assert.deepEqual(logs.sort(), ['closing session "main" of scope "a"', 'closing session "main" of scope "a" failed: EIO', 'closing session "other" of scope "a"', 'session "other" of scope "a" closed']);
 });
 
 test('a close that finishes after the name was closed and opened again leaves the new session alone', async () => {
@@ -1596,12 +1651,14 @@ test("a close whose wait ends while an earlier close is still under way says so,
   opened[1]!.close = async () => ({ code: null, signal: 'SIGHUP', underway: true });
   await host.closeAll();
   assert.deepEqual(lines.sort(), [
+    'closing session "main" of scope "a"',
+    'closing session "other" of scope "a"',
     'session "main" of scope "a": the shell was still being closed by a close begun earlier when the stop\'s wait ended, and nothing had been sent to it yet, so processes it started may live on',
     'session "other" of scope "a": the shell was still being closed by a close begun earlier when the stop\'s wait ended, and had been sent SIGHUP, so processes it started may live on',
   ]);
 });
 
-test('stopping the daemon logs each session whose close may have left processes behind', async () => {
+test('stopping the daemon logs each session as its close begins, then how each close went, naming what may live on', async () => {
   const lines: string[] = [];
   const opened: FakeSession[] = [];
   const host = new Host({
@@ -1628,8 +1685,10 @@ test('stopping the daemon logs each session whose close may have left processes 
   await settle();
   opened[2]!.close = async () => ({ code: 0, unlisted: true });
   await host.closeAll();
-  assert.equal(lines.length, 2, lines.join('\n'));
+  assert.deepEqual(lines.slice(0, 3), ['closing session "main" of scope "a"', 'closing session "clean" of scope "a"', 'closing session "done" of scope "a"'], 'each close is logged as it begins, before any outcome');
+  assert.equal(lines.length, 6, lines.join('\n'));
   const line = (n: string): string => lines.find((l) => l.startsWith(`session "${n}" `)) ?? '';
+  assert.equal(line('clean'), 'session "clean" of scope "a" closed');
   assert.match(line('main'), /^session "main" of scope "a" closed, but not every process it started could be listed; SIGHUP to group 77 \(EPERM\) weren't delivered: processes it started may live on$/);
   assert.match(line('done'), /^session "done" of scope "a" closed, but the shell had already exited, so what it left running couldn't be listed: processes it started may live on$/);
 });

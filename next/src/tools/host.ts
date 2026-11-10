@@ -12,8 +12,9 @@ const mono = (): number => performance.now();
 /**
  * How long a daemon's stop may take to close every session: the shortest stop timeout of what stops it. The shipped
  * termd.service and com.animalabs.termd.plist each give 20 s before SIGKILL; `tsm daemon stop` waits 25 s, and the
- * transient unit the relay starts gets systemd's default, 90 s on Ubuntu 26.04. A KILL after this, while the socket
- * closes, leaves only a socket file the next daemon replaces.
+ * transient unit the relay starts gets systemd's default, 90 s on Ubuntu 26.04. Their timers start when they send the
+ * stop signal, and this budget starts once the daemon handles it, so a KILL can land at its end, before a close's last
+ * steps and its log line.
  */
 const STOP_BUDGET_MS = 20_000;
 
@@ -180,24 +181,34 @@ export class Host {
   async closeAll(): Promise<void> {
     const deadline = (this.stopping = mono() + STOP_BUDGET_MS);
     this.stopper.abort();
+    const closing = [...this.entries.values()];
+    for (const e of closing) this.o.log?.(`closing session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)}`);
     await Promise.all([
-      ...[...this.entries.values()].map(async (e) => {
+      ...closing.map(async (e) => {
         e.closing = true;
         const exitedBefore = e.exited;
-        try {
-          const exit = await e.session.close({ deadline });
-          if (exit.underway) {
-            this.o.log?.(`session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)}: the shell ${underwayText(exit, "the stop's wait")}, so processes it started may live on`);
-            return;
-          }
-          const left = [exit.unconfirmed && 'its exit wasn\'t seen', exit.unlisted && (exitedBefore ? 'the shell had already exited, so what it left running couldn\'t be listed' : 'not every process it started could be listed'), exit.unreached?.length && `${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')} weren't delivered`].filter(Boolean);
-          if (left.length) this.o.log?.(`session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)} closed, but ${left.join('; ')}: processes it started may live on`);
-        } catch (err) {
-          this.o.log?.(`closing session ${JSON.stringify(e.name)} of scope ${JSON.stringify(e.scope)} failed: ${(err as Error)?.message ?? String(err)}`);
-        }
+        await this.stopClose(e.name, e.scope, () => e.session.close({ deadline }), exitedBefore);
       }),
       ...this.starting,
     ]);
+  }
+
+  private async stopClose(name: string, scope: string, close: () => Promise<Closed>, exitedBefore: boolean): Promise<{ exit?: Closed; error?: string }> {
+    const which = `session ${JSON.stringify(name)} of scope ${JSON.stringify(scope)}`;
+    try {
+      const exit = await close();
+      if (exit.underway) {
+        this.o.log?.(`${which}: the shell ${underwayText(exit, "the stop's wait")}, so processes it started may live on`);
+        return { exit };
+      }
+      const left = [exit.unconfirmed && 'its exit wasn\'t seen', exit.unlisted && (exitedBefore ? 'the shell had already exited, so what it left running couldn\'t be listed' : 'not every process it started could be listed'), exit.unreached?.length && `${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')} weren't delivered`].filter(Boolean);
+      this.o.log?.(left.length ? `${which} closed, but ${left.join('; ')}: processes it started may live on` : `${which} closed`);
+      return { exit };
+    } catch (err) {
+      const error = (err as Error)?.message ?? String(err);
+      this.o.log?.(`closing ${which} failed: ${error}`);
+      return { error };
+    }
   }
 
   private noSession(caller: Caller, name: string): ToolResult {
@@ -279,8 +290,17 @@ export class Host {
       ...(this.o.log ? { log: this.o.log } : {}),
     });
     if (this.stopping !== undefined) {
-      await session.close({ force: true, deadline: this.stopping });
-      return refused('The daemon stopped while this session started, so its shell is closed.', { error: 'backend_failure' });
+      this.o.log?.(`closing session ${JSON.stringify(name)} of scope ${JSON.stringify(caller.scope)}, which was still opening`);
+      const { exit, error } = await this.stopClose(name, caller.scope, () => session.close({ force: true, deadline: this.stopping! }), false);
+      const how =
+        error !== undefined
+          ? `, and closing its shell failed: ${clause(error)}, so whether it ended isn't known`
+          : exit?.underway
+            ? `, and its shell ${underwayText(exit, "the stop's wait")}`
+            : exit?.unconfirmed
+              ? `, and its shell was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it`
+              : ', so its shell is closed';
+      return refused(`The daemon stopped while this session started${how}.`, { error: 'backend_failure' });
     }
     const entry: Entry = { scope: caller.scope, name, session, cursor: 0, unseen: new Map(), watches: new Map(), dying: undefined, closing: false, settling: new Set(), latest: new Map(), off: () => {}, takerUsed: caller.takes || this.opening.get(k) === true, exited: false, finished: false, left: [] };
     entry.off = session.onEvent((ev) => this.onEvent(entry, ev));
