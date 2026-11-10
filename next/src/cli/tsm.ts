@@ -13,6 +13,10 @@ async function main(argv: readonly string[]): Promise<number> {
     return argv.length === 0 ? 2 : 0;
   }
   const parsed = parseCli(argv);
+  if ('help' in parsed) {
+    process.stdout.write(`${USAGE}\n`);
+    return 0;
+  }
   if ('error' in parsed) {
     process.stderr.write(`tsm: ${parsed.error}\n${USAGE}\n`);
     return 2;

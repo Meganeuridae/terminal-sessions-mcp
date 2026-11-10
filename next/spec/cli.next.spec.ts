@@ -27,6 +27,8 @@ test('H9: the CLI maps its words to the nine tools\' arguments', () => {
   assert.deepEqual(parseCli(['look', 'main', '--bogus', 'x']), { error: 'look takes no --bogus' });
   assert.deepEqual(parseCli(['--json', '--scope', 'a', 'list']), { scope: 'a', json: true, call: { tool: 'list', args: {} } });
   assert.deepEqual(parseCli(['--json', 'daemon', 'stop']), { error: "--json prints a tool's result, and `tsm daemon stop` calls no tool" });
+  assert.deepEqual(parseCli(['--scope', 'work', '--help']), { help: true });
+  assert.deepEqual(parseCli(['--json', '--help', 'list']), { help: true });
 });
 
 test('H9: the CLI calls the daemon in its scope, prints the text, and takes nothing an agent hasn\'t seen', async () => {

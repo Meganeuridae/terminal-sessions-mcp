@@ -58,12 +58,13 @@ const FLAGS: Record<string, Record<string, (v: string) => [string, unknown]>> = 
   close: {},
 };
 
-export function parseCli(argv: readonly string[]): CliOptions | { error: string } {
+export function parseCli(argv: readonly string[]): CliOptions | { error: string } | { help: true } {
   let scope = 'default';
   let socket: string | undefined;
   let json = false;
   let i = 0;
   while (i < argv.length && argv[i]!.startsWith('--')) {
+    if (argv[i] === '--help') return { help: true };
     if (argv[i] === '--json') {
       json = true;
       i += 1;
