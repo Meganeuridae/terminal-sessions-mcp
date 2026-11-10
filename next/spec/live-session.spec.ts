@@ -2332,6 +2332,24 @@ test("a command in a far shell reached from another far shell, which ends there,
   await s.close({ force: true, deadline: by() });
 });
 
+test("an integrate that timed out doesn't hand its probe's late answer to the next one", { skip: which('bash') && which('zsh') ? false : 'bash and zsh are needed' }, async () => {
+  const s = await open(which('bash')!);
+  const gate = newGate();
+  fs.writeFileSync(gate, '');
+  const from = s.lines(0).to - 1;
+  assert.equal((await s.run(relayed(which('bash')!), { waitMs: 200 })).kind, 'running');
+  assert.equal((await s.wait({ kind: 'match', pattern: /^far> ?$/ }, { waitMs: 10_000, from })).by, 'match');
+  // Until the gate goes, the far bash reads nothing, so the first probe waits. Then zsh runs that probe, and bash the second.
+  await s.send(`while [ -e '${gate}' ]; do sleep 0.05; done; zsh -f -c "$(head -n 1)"\r`, { waitMs: 2000, quietMs: 200 });
+  const first = await s.integrate({ waitMs: 300 });
+  assert.deepEqual([first.kind, first.kind === 'incomplete' && first.step], ['incomplete', 'probe'], JSON.stringify(first));
+  const second = s.integrate({ waitMs: 10_000 });
+  fs.rmSync(gate);
+  const r = await second;
+  assert.deepEqual([r.kind, r.kind === 'integrated' && r.shell], ['integrated', 'bash'], JSON.stringify(r));
+  await s.close({ force: true, deadline: by() });
+});
+
 test("a far shell's carrier whose own process ends, while its group goes on with another program, is no longer followed, and run types nothing into that program", { skip: which('bash') ? false : 'bash is needed' }, async () => {
   const s = await open('/bin/sh');
   const capture = path.join(tmp, `capture-${++gates}`);

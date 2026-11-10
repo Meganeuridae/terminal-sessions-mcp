@@ -370,10 +370,14 @@ export function commandFile(kind: ShellKind, dir: string, id: number, text: stri
  */
 export type FarKind = Exclude<ShellKind, 'none'>;
 
-/** The probe line: valid in bash, zsh and fish, it prints a K mark with each one's version, empty but for the shell that runs it. */
-export const PROBE_LINE = ` printf '\\033]133;K;;%s;%s;%s\\007' "$FISH_VERSION" "$ZSH_VERSION" "$BASH_VERSION"\r`;
-/** Typed only when the probe named none of the three, so a POSIX shell runs it: a K mark with `$0`. */
-export const PROBE_ZERO_LINE = ` printf '\\033]133;K;;;;;%s\\007' "$0"\r`;
+/**
+ * The probe line: valid in bash, zsh and fish, it prints a K mark with the `integrate` call's number and each shell's version,
+ * empty but for the shell that runs it. The number ties the answer to the call, since a call that timed out leaves its line to run
+ * later. It isn't a nonce: the line may reach the far shell's history.
+ */
+export const probeLine = (call: string): string => ` printf '\\033]133;K;${call};%s;%s;%s\\007' "$FISH_VERSION" "$ZSH_VERSION" "$BASH_VERSION"\r`;
+/** Typed only when the probe named none of the three, so a POSIX shell runs it: a K mark with the call's number and `$0`. */
+export const probeZeroLine = (call: string): string => ` printf '\\033]133;K;${call};;;;%s\\007' "$0"\r`;
 
 /**
  * The drain for a shell given the integration by typing, run as `sh -c` with the nonce its end mark

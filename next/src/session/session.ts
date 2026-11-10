@@ -311,7 +311,8 @@ class LiveSession implements Session {
   private mark(payload: string, at: Pos): boolean {
     const [kind, nonce, ...rest] = payload.split(';');
     if (kind === 'K') {
-      if (this.probe && !this.probe.answer) {
+      // A call that timed out leaves its probe line to run later, so only an answer to this call counts.
+      if (this.probe && !this.probe.answer && nonce === this.probe.call) {
         const [fish = '', zsh = '', bash = '', zero] = rest;
         this.probe.answer = { fish, zsh, bash, ...(zero !== undefined && { zero }) };
         this.wake();
@@ -1192,13 +1193,13 @@ class LiveSession implements Session {
       // Each write is checked first: what it would go to may have ended since the last look.
       if (stop()) return incomplete('probe', stop()!);
       this.lastWrite = mono();
-      this.p.write(integration.PROBE_LINE);
+      this.p.write(integration.probeLine(call));
       const answer = await answered();
       if (!answer) return incomplete('probe', stop() ?? 'timeout');
       const kind = answer.fish ? 'fish' : answer.zsh ? 'zsh' : answer.bash ? 'bash' : undefined;
       if (!kind) {
         if (stop()) return incomplete('probe', stop()!);
-        this.p.write(integration.PROBE_ZERO_LINE);
+        this.p.write(integration.probeZeroLine(call));
         const zero = await answered();
         if (!zero && stop()) return incomplete('probe', stop()!);
         const name = zero?.zero?.replace(/^-/, '');
