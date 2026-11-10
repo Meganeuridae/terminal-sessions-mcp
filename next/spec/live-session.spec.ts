@@ -2328,6 +2328,19 @@ test('after a close that fails before it signals, the session goes on looking wh
   await eventually('a wait for input is reported', () => events.some((e) => e.kind === 'waiting'));
 });
 
+test("a command whose command file can't be removed still ends with its status, and the failed removal is logged", { skip: which('bash') ? false : 'bash is needed' }, async () => {
+  const logs: string[] = [];
+  const s = await open(which('bash')!, { log: (l) => logs.push(l) });
+  const dir = (s as unknown as { dir: string }).dir;
+  try {
+    const c = await ran(s, `chmod u-w '${dir}'; echo done`);
+    assert.deepEqual([out(s, c), c.end?.status], [['done'], 0]);
+    assert.match(logs.join('\n'), /couldn't be removed/);
+  } finally {
+    fs.chmodSync(dir, 0o700);
+  }
+});
+
 test("a close that joins one under way and whose own deadline comes first says it's under way, and names no signal before one was sent", darwinOnly, async () => {
   const s = await open(which('bash') ?? '/bin/bash');
   const gate = path.join(tmp, `gate-${++gates}`);
