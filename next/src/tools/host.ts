@@ -128,6 +128,11 @@ export class Host {
     };
   }
 
+  /**
+   * Runs one tool call. A caller that takes reports aborts `signal` once the result won't reach
+   * whoever made the call (its connection ended, failed or closed, or the call was cancelled).
+   * Otherwise the reports the result shows count as shown when the call returns.
+   */
   async call(caller: Caller, tool: string, args: unknown, signal?: AbortSignal): Promise<ToolResult> {
     const def = TOOLS.find((t) => t.name === tool);
     if (!def) return refused(`There is no tool \`${tool}\`. The tools are ${TOOLS.map((t) => t.name).join(', ')}.`, { error: 'unknown_tool' });

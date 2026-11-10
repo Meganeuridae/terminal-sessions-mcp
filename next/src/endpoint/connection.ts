@@ -86,7 +86,7 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
   };
 
   const activate = (): void => {
-    if (pushes() && !unsubscribe && hello) unsubscribe = host.subscribe(hello.scope, sink);
+    if (pushes() && !unsubscribe && hello && !closed) unsubscribe = host.subscribe(hello.scope, sink);
     if (!pushes() && unsubscribe) {
       unsubscribe();
       unsubscribe = undefined;
@@ -235,11 +235,17 @@ export function serveConnection(socket: net.Socket, host: Host, daemon: DaemonIn
       if (line.trim()) handle(line);
     }
   });
-  socket.on('error', () => {});
-  socket.on('close', () => {
+  // With allowHalfOpen false, nothing written after the peer's end arrives, and an error is
+  // followed by close only later.
+  const shut = (): void => {
+    if (closed) return;
     closed = true;
     unsubscribe?.();
+    unsubscribe = undefined;
     for (const ac of calls.values()) ac.abort();
     out.rejectAll('the connection closed');
-  });
+  };
+  socket.on('end', shut);
+  socket.on('error', shut);
+  socket.on('close', shut);
 }

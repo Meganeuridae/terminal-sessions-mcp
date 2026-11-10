@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { serveConnection } from '../src/endpoint/connection.js';
 import { helloLine, parseDaemonHello, type ClientHello } from '../src/endpoint/hello.js';
 import { Host } from '../src/tools/host.js';
@@ -468,5 +469,208 @@ test("a close whose connection is lost before its result is made leaves the sess
     assert.match(listed.content[0]!.text, /\n\nNot yet seen:\n\[main · command 1 · exit 2 [^\n]*\n\[main · closed by a call that was cancelled or lost its connection; the shell /);
   } finally {
     await h.done();
+  }
+});
+
+/** A connection's socket whose events a test emits itself, so `end` and `error` can come without `close`. */
+class FakeSocket extends EventEmitter {
+  written: string[] = [];
+  write(s: string): boolean {
+    this.written.push(s);
+    return true;
+  }
+  setEncoding(): this {
+    return this;
+  }
+  end(): this {
+    return this;
+  }
+  destroy(): this {
+    return this;
+  }
+}
+
+function fakeConnection() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-conn-fake-'));
+  const sessions: FakeSession[] = [];
+  const host = new Host({
+    openSession: async (o: OpenOptions) => {
+      const s = new FakeSession(o.name, o);
+      sessions.push(s);
+      return s;
+    },
+    shell: '/bin/bash', env: {}, sessionsDir: dir, startedAt: DAEMON.startedAt,
+  });
+  const subscribe = host.subscribe.bind(host);
+  const subs = { made: 0, ended: 0, pending: [] as Array<Promise<boolean>> };
+  host.subscribe = (scope, sink) => {
+    subs.made++;
+    const off = subscribe(scope, (w) => {
+      const p = sink(w);
+      subs.pending.push(p);
+      return p;
+    });
+    return () => {
+      subs.ended++;
+      off();
+    };
+  };
+  const socket = new FakeSocket();
+  serveConnection(socket as unknown as net.Socket, host, DAEMON, () => {});
+  socket.emit('data', helloLine(relayHello('a')));
+  let nextId = 1;
+  const lines = (): Array<Record<string, unknown>> => socket.written.slice(1).join('').split('\n').filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+  const send = (method: string, params?: unknown): number => {
+    const id = nextId++;
+    socket.emit('data', `${JSON.stringify({ jsonrpc: '2.0', id, method, ...(params !== undefined ? { params } : {}) })}\n`);
+    return id;
+  };
+  const answer = async (id: number): Promise<Record<string, unknown>> => {
+    for (let i = 0; i < 300; i++) {
+      const m = lines().find((x) => x.id === id && !('method' in x));
+      if (m) return m;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`no answer to ${id} within 3 s`);
+  };
+  const wakes: string[] = [];
+  const watch = (): (() => void) => subscribe('a', async (w) => (wakes.push(w.text), true));
+  return { host, sessions, socket, subs, lines, send, answer, wakes, watch, done: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+for (const event of ['end', 'error'] as const) {
+  test(`a connection whose socket emits ${event} before close aborts the run it has in flight, so the end that run would have shown is offered as a report`, async () => {
+    const f = fakeConnection();
+    try {
+      await f.answer(f.send('initialize', { protocolVersion: '2025-06-18', capabilities: {} }));
+      await f.answer(f.send('tools/call', { name: 'open', arguments: { name: 'main' } }));
+      const s = f.sessions[0]!;
+      s.runMode = 'run';
+      const run = s.run.bind(s);
+      let started!: () => void;
+      const waiting = new Promise<void>((r) => (started = r));
+      let finish!: () => void;
+      let aborted = false;
+      s.run = async (text, opts) => {
+        const r = await run(text, opts);
+        started();
+        const how = await new Promise<'aborted' | 'ended'>((res) => {
+          opts.signal?.addEventListener('abort', () => res('aborted'));
+          finish = () => res('ended');
+        });
+        if (how === 'aborted' || r.kind !== 'running') return (aborted = true, r);
+        const command = s.end(0, true);
+        return { kind: 'ended', command, front: s.frontNow, took: [{ kind: 'ended' as const, command, taken: true, takers: 1 }] };
+      };
+      f.send('tools/call', { name: 'run', arguments: { name: 'main', command: 'make', wait: 30 } });
+      await waiting;
+      if (event === 'error') f.socket.emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+      else f.socket.emit('end');
+      for (let i = 0; i < 5; i++) await tick();
+      if (aborted) s.end(0, false);
+      else finish();
+      for (let i = 0; i < 5; i++) await tick();
+      const off = f.watch();
+      for (let i = 0; i < 5; i++) await tick();
+      off();
+      assert.equal(aborted, true, `the run saw the abort at ${event}`);
+      assert.match(f.wakes.join('\n'), /^\[main · command 1 · exit 0 · /, 'and the end is offered as a report');
+    } finally {
+      f.done();
+    }
+  });
+}
+
+test('a push in flight when the socket ends is settled then, and the connection leaves its scope', async () => {
+  const f = fakeConnection();
+  try {
+    await f.answer(f.send('initialize', MCPL_INIT));
+    await f.answer(f.send('featureSets/update', GRANT));
+    for (let i = 0; i < 5; i++) await tick();
+    assert.equal(f.subs.made, 1, 'the premise: the grant subscribed the connection');
+    await f.answer(f.send('tools/call', { name: 'open', arguments: { name: 'main' } }));
+    const s = f.sessions[0]!;
+    s.runMode = 'run';
+    await f.answer(f.send('tools/call', { name: 'run', arguments: { name: 'main', command: 'make', wait: 1 } }));
+    s.end(0, false);
+    for (let i = 0; i < 5; i++) await tick();
+    assert.equal(f.lines().filter((m) => m.method === 'push/event').length, 1, 'the premise: a push is in flight, unanswered');
+    f.socket.emit('end');
+    const settled = await Promise.race([f.subs.pending[0]!.then(() => true, () => true), new Promise<false>((r) => setTimeout(() => r(false), 1000))]);
+    assert.equal(settled, true, 'the push settles at the end, not at a close that may not come');
+    assert.equal(f.subs.ended, 1, 'and the connection is unsubscribed');
+    const off = f.watch();
+    for (let i = 0; i < 5; i++) await tick();
+    off();
+    assert.match(f.wakes.join('\n'), /^\[main · command 1 · exit 0 · /, 'the report it carried stays to be offered');
+  } finally {
+    f.done();
+  }
+});
+
+test('end, error and close shut a connection once, whichever comes first, as a stop that destroys it does with close alone', async () => {
+  for (const order of [['close'], ['end'], ['error'], ['end', 'error', 'close'], ['error', 'close', 'end']] as const) {
+    const f = fakeConnection();
+    try {
+      await f.answer(f.send('initialize', MCPL_INIT));
+      await f.answer(f.send('featureSets/update', GRANT));
+      for (let i = 0; i < 5; i++) await tick();
+      await f.answer(f.send('tools/call', { name: 'open', arguments: { name: 'main' } }));
+      const s = f.sessions[0]!;
+      let aborts = 0;
+      let waiting!: () => void;
+      const started = new Promise<void>((r) => (waiting = r));
+      s.wait = (_until, opts) =>
+        new Promise((resolve) => {
+          waiting();
+          opts.signal?.addEventListener('abort', () => {
+            aborts++;
+            resolve({ by: 'cancelled', front: s.frontNow, ended: [], took: [] });
+          });
+        });
+      const id = f.send('tools/call', { name: 'look', arguments: { name: 'main', until: 'end', wait: 30 } });
+      await started;
+      for (const event of order) f.socket.emit(event, ...(event === 'error' ? [new Error('EPIPE')] : []));
+      for (let i = 0; i < 5; i++) await tick();
+      assert.equal(aborts, 1, `${order.join(', ')}: the waiting call is aborted once`);
+      assert.equal(f.subs.ended, 1, `${order.join(', ')}: the connection is unsubscribed once`);
+      assert.equal(f.lines().some((m) => m.id === id), false, `${order.join(', ')}: and no answer is written`);
+    } finally {
+      f.done();
+    }
+  }
+});
+
+test('a run in the last chunk before the socket ends is aborted, so the end it took is offered as a report', async () => {
+  const f = fakeConnection();
+  try {
+    await f.answer(f.send('initialize', { protocolVersion: '2025-06-18', capabilities: {} }));
+    await f.answer(f.send('tools/call', { name: 'open', arguments: { name: 'main' } }));
+    const id = f.send('tools/call', { name: 'run', arguments: { name: 'main', command: 'true', wait: 30 } });
+    f.socket.emit('end');
+    for (let i = 0; i < 5; i++) await tick();
+    assert.equal(f.sessions[0]!.calls.filter((c) => c.method === 'run').length, 1, 'the premise: the run reached the session');
+    assert.equal(f.lines().some((m) => m.id === id), false, 'no answer is written after the end');
+    const off = f.watch();
+    for (let i = 0; i < 5; i++) await tick();
+    off();
+    assert.match(f.wakes.join('\n'), /^\[main · command 1 · exit 0 · /);
+  } finally {
+    f.done();
+  }
+});
+
+test('a grant in the last chunk before the socket ends subscribes nothing', async () => {
+  const f = fakeConnection();
+  try {
+    await f.answer(f.send('initialize', MCPL_INIT));
+    f.send('featureSets/update', GRANT);
+    f.socket.emit('end');
+    for (let i = 0; i < 5; i++) await tick();
+    assert.equal(f.subs.made - f.subs.ended, 0, 'no subscription is left for the ended connection');
+  } finally {
+    f.done();
   }
 });
