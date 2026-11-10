@@ -121,7 +121,7 @@ export type Front =
 
 export interface Ending {
   at: number;
-  /** How long it ran, in ms, on the monotonic clock: a wall-clock step doesn't change it. */
+  /** How long it ran, in ms, on the monotonic clock: a wall-clock step doesn't change it. For an end no longer followed (`unfollowed`), how long it was followed. */
   ms: number;
   /** Absent when no accepted end mark closed it: a shell without integration, a removed hook, or the shell exiting. */
   status?: number;

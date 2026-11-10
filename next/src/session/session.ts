@@ -36,7 +36,7 @@ const isShell = (argv: string): boolean => {
   const name = path.basename(cmd).replace(/^-/, '');
   return name === 'busybox' ? ['sh', 'ash', 'hush'].includes(path.basename(applet)) : SHELLS.has(name);
 };
-/** Deadlines, graces and quiet periods; the times a session reports are wall-clock. */
+/** Deadlines, graces, quiet periods and the durations a session reports; the times of day it reports are wall-clock. */
 const mono = (): number => performance.now();
 
 /** Pattern searches in one turn of the event loop, in every session, stop once they've spent this long, each after at least one line or row in that turn, and go on in a later turn. */
