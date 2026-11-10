@@ -687,7 +687,12 @@ class LiveSession implements Session {
       }
       const pgid = g?.pgrp ?? this.pid;
       const argv = shell.argv;
-      if (this.opened && argv !== undefined && argv !== this.argvAtOpen) this.execed = true;
+      if (this.opened && argv !== undefined && argv !== this.argvAtOpen && !this.execed) {
+        this.execed = true;
+        // The marks were the replaced shell's. Its last said prompt when the line that ran exec started none, as in bash 3.2,
+        // which has no mark for a line it starts; that says nothing of the shell in front now.
+        this.top.atPrompt = false;
+      }
       const reads = proc.readsTerminal(this.pid, this.pts);
       if (this.execed && argv !== undefined && !isShell(argv)) return program({ pgid, argv, shell: false }, [reads]);
       const process: Process = { pgid, argv: argv ?? this.shellName, shell: true };
