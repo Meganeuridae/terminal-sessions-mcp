@@ -233,7 +233,7 @@ test('the relay keeps to its bound by the monotonic clock while the wall clock s
   Date.now = () => (t -= 1_000);
   try {
     const ended = relay({ socket, hello: HELLO, stdin: s.stdin, stdout: s.stdout, stderr: s.stderr, startDaemon: () => '/somewhere/daemon.log', reachMs: 300 });
-    const first = await Promise.race([ended, new Promise((r) => setTimeout(() => r('still trying after 3 s'), 3_000))]);
+    const first = await ended;
     Date.now = wall;
     assert.equal(first, 1);
     assert.match(s.err(), /within 300 ms, though one was started/);
@@ -288,7 +288,7 @@ test("a directory others can enter is refused, and the host's first request is a
   }
 });
 
-test("a relay that can't reach a daemon answers the host's first request though a notification came first, with an id split across reads", { timeout: 10_000 }, async () => {
+test("a relay that can't reach a daemon answers the host's first request though a notification came first, with an id written in two pieces", { timeout: 10_000 }, async () => {
   const dir = tmp();
   fs.chmodSync(dir, 0o755);
   try {

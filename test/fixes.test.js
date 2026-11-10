@@ -21,13 +21,16 @@ after(async () => {
   await server.killAll(false);
 });
 
-test('graceful kill of an idle shell is fast (SIGHUP, not a burned 3s timeout)', async () => {
+test('graceful kill of an idle shell ends it with SIGHUP, not by burning its grace and sending SIGKILL', async () => {
   await server.createSession('t-kill');
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  const start = Date.now();
+  await server.execCommand('t-kill', 'true', 5000);
+  const shell = server.sessions.get('t-kill').shell;
+  const sent = [];
+  const kill = shell.kill.bind(shell);
+  shell.kill = (signal) => (sent.push(signal), kill(signal));
   await server.killSession('t-kill', true);
-  const elapsed = Date.now() - start;
-  assert.ok(elapsed < 1500, `graceful kill took ${elapsed}ms; must not burn the full 3s`);
+  assert.ok(sent.includes('SIGHUP'), `signals sent: ${sent.join(', ')}`);
+  assert.ok(!sent.includes('SIGKILL'), `the grace ran out and the shell was KILLed: ${sent.join(', ')}`);
 });
 
 // kill(pid, 0) checks that the process exists, on Linux and macOS alike.
@@ -41,6 +44,7 @@ async function goneAfterGracefulKill(id, command) {
   const r = await server.execCommand(id, command, 5000);
   const pid = Number((String(r.output).match(/BGPID=(\d+)/) || [])[1]);
   assert.ok(pid > 0, `the job's pid: ${JSON.stringify(r.output)}`);
+  assert.ok(exists(pid), `the job (pid ${pid}) is alive before the kill`);
   try {
     await server.killSession(id, true);
     const deadline = Date.now() + 3000;
@@ -58,7 +62,11 @@ test('a graceful kill whose deadline has passed runs no ps, and still ends the s
   const path = require('node:path');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-ps-'));
   const mark = path.join(dir, 'called');
-  fs.writeFileSync(path.join(dir, 'ps'), `#!/bin/sh\necho "$*" >> '${mark}'\nexec /bin/ps "$@"\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(dir, 'ps'), `#!/bin/sh\necho "$*" >> '${mark}'\nexec /bin/ps "$@"\n`);
+  fs.chmodSync(path.join(dir, 'ps'), 0o755);
+  require('node:child_process').execFileSync(path.join(dir, 'ps'), ['-p', String(process.pid)], { stdio: 'ignore' });
+  assert.ok(fs.existsSync(mark), 'the stand-in ps runs');
+  fs.rmSync(mark);
   await server.createSession('t-kill-deadline', { shell: '/bin/bash' });
   const r = await server.execCommand('t-kill-deadline', 'echo SHELLPID=$$', 5000);
   const shellPid = Number((String(r.output).match(/SHELLPID=(\d+)/) || [])[1]);
@@ -83,12 +91,18 @@ test('a session opened while killAll waits on a kill is still listed, and alive,
   const held = new Promise((r) => (release = r));
   const kill = server.killSession;
   let pid = 0;
+  let entered;
+  const holding = new Promise((r) => (entered = r));
   server.killSession = async function (id, ...rest) {
     await kill.call(this, id, ...rest);
-    if (id === 't-killall-held') await held;
+    if (id === 't-killall-held') {
+      entered();
+      await held;
+    }
   };
   try {
     const all = server.killAll(false);
+    await holding;
     await server.createSession('t-killall-new', { shell: '/bin/bash' });
     const r = await server.execCommand('t-killall-new', 'echo SHELLPID=$$', 5000);
     pid = Number((String(r.output).match(/SHELLPID=(\d+)/) || [])[1]);

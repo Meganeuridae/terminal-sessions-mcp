@@ -108,6 +108,7 @@ test('1.x names no spawn-helper that is missing, since chmod cannot fix it', () 
   const { unrunnableHelper } = require('../dist/src/server/session-server-v3.js');
   const dir = ptyFixture({ [`prebuilds/darwin-${process.arch}`]: { addon: ptyAddon() } });
   try {
+    assert.ok(require.cache[path.join(dir, `prebuilds/darwin-${process.arch}`, 'pty.node')], "the fixture's native module loaded, so the helper beside it is what's checked");
     assert.strictEqual(unrunnableHelper(dir, 'darwin'), undefined);
   } finally {
     dropFixture(dir);

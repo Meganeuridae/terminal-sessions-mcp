@@ -24,11 +24,11 @@ test("the launcher takes nvm's default version, not the one `current` was last p
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-launch-'));
   try {
     const nvm = path.join(home, '.nvm');
-    fakeNode(path.join(nvm, 'versions/node/v20.19.0/bin/node'));
-    fakeNode(path.join(nvm, 'versions/node/v24.22.2/bin/node'));
+    fakeNode(path.join(nvm, 'versions/node/v22.12.0/bin/node'), 'v22.12.0');
+    fakeNode(path.join(nvm, 'versions/node/v24.22.2/bin/node'), 'v24.22.2');
     fs.mkdirSync(path.join(nvm, 'alias'));
     fs.writeFileSync(path.join(nvm, 'alias/default'), '24\n');
-    fs.symlinkSync(path.join(nvm, 'versions/node/v20.19.0'), path.join(nvm, 'current'));
+    fs.symlinkSync(path.join(nvm, 'versions/node/v22.12.0'), path.join(nvm, 'current'));
     const daemon = path.join(home, 'daemon.js');
     fs.writeFileSync(daemon, '');
     assert.equal(launch({ HOME: home, TSM_DAEMON: daemon }).node, path.join(nvm, 'versions/node/v24.22.2/bin/node'));
@@ -77,7 +77,7 @@ test("the launcher refuses a node outside the package's engines range, naming it
   }
 });
 
-test('the daemon takes the first shell that can run: the passwd entry\'s, then $SHELL, then /bin/sh', () => {
+test('the daemon takes the first shell that is executable: the passwd entry\'s, then $SHELL, then /bin/sh', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tsm-shell-'));
   try {
     const usable = path.join(dir, 'zsh');
@@ -167,6 +167,7 @@ test('on macOS, a spawn-helper that is missing is not named, since chmod cannot 
   const prebuilds = `prebuilds/darwin-${process.arch}`;
   const dir = ptyFixture({ [prebuilds]: { addon: ptyAddon() } });
   try {
+    assert.ok(req.cache[path.join(dir, prebuilds, 'pty.node')], "the fixture's native module loaded, so the helper beside it is what's checked");
     assert.equal(unrunnableHelper(dir, 'darwin'), undefined);
   } finally {
     dropFixture(dir);
