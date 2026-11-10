@@ -715,6 +715,7 @@ test("an open still starting when the daemon stops says what its shell's close d
     ['rejected', async () => Promise.reject(new Error('EIO')), /^The daemon stopped while this session started, and closing its shell failed: EIO, so whether it ended isn't known\.$/],
     ['under way', async () => ({ code: null, underway: true }), /^The daemon stopped while this session started, and its shell was still being closed by a close begun earlier when the stop's wait ended, and nothing had been sent to it yet\.$/],
     ['unconfirmed', async () => ({ code: null, signal: 'SIGKILL', unconfirmed: true }), /^The daemon stopped while this session started, and its shell was sent SIGKILL, and its exit wasn't seen within the grace after it\.$/],
+    ['sent nothing', async () => ({ code: null, unconfirmed: true }), /^The daemon stopped while this session started, and its shell couldn't be sent a signal, and its exit wasn't seen\.$/],
     ['closed', async () => ({ code: null, signal: 'SIGKILL' }), /^The daemon stopped while this session started, so its shell is closed\.$/],
   ];
   for (const [kind, close, says] of cases) {

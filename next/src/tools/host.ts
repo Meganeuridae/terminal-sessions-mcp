@@ -298,7 +298,7 @@ export class Host {
           : exit?.underway
             ? `, and its shell ${underwayText(exit, "the stop's wait")}`
             : exit?.unconfirmed
-              ? `, and its shell was sent ${exit.signal ?? 'SIGKILL'}, and its exit wasn't seen within the grace after it`
+              ? `, and its shell ${unconfirmedText(exit)}`
               : ', so its shell is closed';
       return refused(`The daemon stopped while this session started${how}.`, { error: 'backend_failure' });
     }
@@ -606,7 +606,7 @@ export class Host {
     e.closing = true;
     const [exit] = await Promise.all([e.session.close({ force: a.force === true, deadline: mono() + WAIT_MAX_S * 1000 }), Promise.all(e.settling)]);
     if (exit.underway) return ok(`[${e.name} · still closing]\nThe shell ${underwayText(exit, "this call's wait")}.`, { session: e.name, exit });
-    const how = exit.unconfirmed ? (exit.signal ? `was sent ${exit.signal}, and its exit wasn't seen within the grace after it` : `couldn't be sent a signal, and its exit wasn't seen`) : exitText(exit);
+    const how = exit.unconfirmed ? unconfirmedText(exit) : exitText(exit);
     const unlisted = exit.unlisted ? " The session couldn't list every process it started, so jobs it started may live on." : '';
     const unreached = exit.unreached?.length ? ` These signals weren't delivered: ${exit.unreached.map((g) => `${g.signal} to group ${g.pgid} (${g.error})`).join(', ')}. Their processes may live on.` : '';
     let full = `[${e.name} · closed]\nThe shell ${how}.${unlisted}${unreached}`;
@@ -840,6 +840,10 @@ const RAN_OUT = `before the ${WAIT_MAX_S} s a call may hold ran out`;
 /** A close that joined one under way and whose own wait ended first: what that close had sent the shell by then. */
 const underwayText = (exit: Closed, wait: string): string =>
   `was still being closed by a close begun earlier when ${wait} ended, ${exit.signal ? `and had been sent ${exit.signal}` : 'and nothing had been sent to it yet'}`;
+
+/** A close whose shell's exit wasn't seen: what it sent the shell. */
+const unconfirmedText = (exit: Closed): string =>
+  exit.signal ? `was sent ${exit.signal}, and its exit wasn't seen within the grace after it` : "couldn't be sent a signal, and its exit wasn't seen";
 
 const endedLine = (c: Command): string => `Command ${c.id}${c.end?.unfollowed ? '' : ' ended'}: ${endingText(c).join(' · ')}.`;
 
