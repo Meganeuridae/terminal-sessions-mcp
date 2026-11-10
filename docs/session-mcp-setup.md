@@ -13,12 +13,10 @@ The Session MCP server provides terminal session management capabilities for AI 
 
 ## Installation
 
-1. Ensure you have the Connectome TypeScript project set up
-2. Install dependencies:
-   ```bash
-   cd /path/to/connectome-ts
-   npm install
-   ```
+Install the package:
+```bash
+npm install -g term-sessions-mcp
+```
 
 ## Configuration
 
@@ -27,28 +25,25 @@ Add the following to your `~/.cursor/mcp.json` file:
 ```json
 {
   "servers": {
-    "connectome-session": {
-      "command": "/Users/user/.nvm/versions/node/v20.10.0/bin/npx",
-      "args": ["ts-node", "/Users/user/connectome-local/connectome-ts/src/testing/mcp-stdio-server.ts"],
-      "cwd": "/Users/user/connectome-local/connectome-ts",
+    "terminal-sessions": {
+      "command": "terminal-sessions-mcp",
       "env": {
-        "SESSION_SERVER_PORT": "3101"
+        "SESSION_SERVER_PORT": "3100"
       }
     }
   }
 }
 ```
 
-**Note**: Replace `/Users/user` with your actual home directory path.
-
 ## Starting the Session Server
 
 Before using the MCP server in Cursor, start the WebSocket session server:
 
 ```bash
-cd /path/to/connectome-ts
-SESSION_SERVER_PORT=3101 npm run session-server
+session-server
 ```
+
+It listens on port 3100, or `SESSION_SERVER_PORT`.
 
 The session server must be running for the MCP server to work properly.
 
@@ -57,12 +52,12 @@ The session server must be running for the MCP server to work properly.
 ### Session Management
 
 **Note on Graceful Shutdown**: When terminating sessions, you can choose between:
-- **Graceful shutdown** (default): Hangs up the shell (SIGHUP), and once it's gone, every process it lists on its terminal, so they can clean up and exit. A process started with `setsid` or `nohup` outlives it. On Windows it lists none, and a listing that fails or runs out of time leaves the rest running. The shell is killed if it's still there after 3 seconds.
+- **Graceful shutdown** (default): Hangs up the shell (SIGHUP), and once it's gone, every process it lists on its terminal, so they can clean up and exit. A process started with `setsid` or `nohup` outlives it, and so does one it may not signal, such as another user's, which it doesn't report. On Windows it lists none, and a listing that fails or runs out of time leaves the rest running. The shell is killed if it's still there after 3 seconds.
 - **Force kill** (`graceful: false`): Immediately terminates the process without cleanup. Use only when graceful shutdown fails or for unresponsive processes.
 
-- **`startService`**: Start a long-running service with startup detection
+- **`launch`**: Start a long-running service with startup detection
   ```typescript
-  startService({
+  launch({
     name: "my-app",
     command: "npm run dev",
     cwd: "/path/to/project",
@@ -86,7 +81,7 @@ The session server must be running for the MCP server to work properly.
 
 - **`killSession`**: Terminate a specific session
   ```typescript
-  // Graceful shutdown (default): SIGHUP to the shell, up to 3 seconds for it to exit, then a hangup for each process it listed, within 10 seconds in all
+  // Graceful shutdown (default): SIGHUP to the shell, up to 3 seconds for it to exit, then a hangup for each process it listed and may signal, within 10 seconds in all
   killSession({ session: "session-id" })
   
   // Force kill (immediate termination - use only when necessary)

@@ -269,7 +269,7 @@ export class Host {
     }
     const raw = (a.cwd as string | undefined) ?? '~';
     const cwd = raw === '~' ? os.homedir() : raw.startsWith('~/') ? path.join(os.homedir(), raw.slice(2)) : raw;
-    if (!path.isAbsolute(cwd)) return refused(`The directory ${JSON.stringify(raw)} must be absolute, or start with "~".`, { error: 'invalid_argument' });
+    if (!path.isAbsolute(cwd)) return refused(`The directory ${JSON.stringify(raw)} must be absolute, "~", or start with "~/".`, { error: 'invalid_argument' });
     this.opening.set(k, false);
     let started!: () => void;
     const start = new Promise<void>((r) => (started = r));

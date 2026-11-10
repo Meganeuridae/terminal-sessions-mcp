@@ -76,7 +76,7 @@ Once configured, your AI assistant will have access to these tools:
 - **startService** - Start a long-running service with startup detection
 - **runCommand** - Execute a command and wait for completion
 - **listSessions** - Get all active sessions
-- **killSession** - Terminate a specific session (graceful by default). A graceful kill hangs up the shell and every process it lists on its terminal. A process started with `setsid` or `nohup` outlives it. On Windows it lists none, and a listing that fails or runs out of time leaves the rest running.
+- **killSession** - Terminate a specific session (graceful by default). A graceful kill hangs up the shell and every process it lists on its terminal. A process started with `setsid` or `nohup` outlives it, and so does one it may not signal, such as another user's, which it doesn't report. On Windows it lists none, and a listing that fails or runs out of time leaves the rest running.
 - **killAll** - Terminate all active sessions
 
 ### Interactive Operations

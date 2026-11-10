@@ -311,7 +311,7 @@ test('the shells start with the daemon\'s oom preference', async () => {
   assert.equal(opened[0]!.oomScoreAdj, 200);
 });
 
-test('open holds a terminal to the size whose whole screen fits in a result, naming the largest that fits, and a send and a wake at that size stay under the cap', async () => {
+test('open holds a terminal to the size whose whole screen of one-unit cells fits in a result, naming the largest that fits, and a send and a wake at that size stay under the cap', async () => {
   const { host, opened } = setup();
   const wakes: Wake[] = [];
   host.subscribe('a', async (w) => (wakes.push(w), false));
@@ -342,7 +342,7 @@ test('open holds a terminal to the size whose whole screen fits in a result, nam
   assert.match(wakes[0]!.text, /\n44x+$/);
 });
 
-test('a command line, a title and a matched line a program sets are quoted up to a quarter of the room, so a screen at the largest size stays whole', async () => {
+test('a command line, a title and a matched line a program sets are quoted up to a quarter of the room, so a screen of one-unit cells at the largest size stays whole', async () => {
   const { host, opened } = setup();
   const wakes: Wake[] = [];
   host.subscribe('a', async (w) => (wakes.push(w), false));
@@ -2614,7 +2614,7 @@ test('integrated shows the lines not yet shown before the call, frozen or live, 
   assert.match(live.text, /\n\$ ssh box2 Last login: today, with no newline before box2\$ \nThe shell in front/, live.text);
 });
 
-test('close gives the session until 55 s after the call began, the most any call may hold', async () => {
+test('close gives the session until 55 s after the call began, the most a call waits on its own', async () => {
   const { host, opened } = setup();
   await host.call(agent(), 'open', { name: 'main' });
   const clock = mock.method(performance, 'now', () => 1_000_000);

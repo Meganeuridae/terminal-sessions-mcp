@@ -156,7 +156,7 @@ const TOOLS = {
       type: 'object',
       properties: {
         session: { type: 'string' },
-        graceful: { type: 'boolean', description: 'If false, force kills immediately. Default true: hangs up the shell and every process it lists on its terminal, and kills the shell if it is still there after 3 s. A process started with setsid or nohup outlives a graceful kill. On Windows it lists none, and a listing that fails or runs out of time leaves the rest running.' }
+        graceful: { type: 'boolean', description: 'If false, force kills immediately. Default true: hangs up the shell and every process it lists on its terminal, and kills the shell if it is still there after 3 s. A process started with setsid or nohup outlives a graceful kill, and so does one it may not signal, such as another user\'s, which it doesn\'t report. On Windows it lists none, and a listing that fails or runs out of time leaves the rest running.' }
       },
       required: ['session']
     }
@@ -166,7 +166,7 @@ const TOOLS = {
     parameters: {
       type: 'object',
       properties: {
-        graceful: { type: 'boolean', description: 'If false, force kills immediately. Default true: hangs up each shell and every process it lists on its terminal, and kills a shell still there after 3 s. A process started with setsid or nohup outlives a graceful kill. On Windows it lists none, and a listing that fails or runs out of time leaves the rest running.' }
+        graceful: { type: 'boolean', description: 'If false, force kills immediately. Default true: hangs up each shell and every process it lists on its terminal, and kills a shell still there after 3 s. A process started with setsid or nohup outlives a graceful kill, and so does one it may not signal, such as another user\'s, which it doesn\'t report. On Windows it lists none, and a listing that fails or runs out of time leaves the rest running.' }
       }
     }
   },

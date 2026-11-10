@@ -47,7 +47,7 @@ export const TOOLS: readonly ToolDef[] = [
       type: 'object',
       properties: {
         name,
-        cwd: { type: 'string', description: 'The directory to start in: absolute, or starting with `~`. Your home directory when left out.' },
+        cwd: { type: 'string', description: 'The directory to start in: absolute, `~`, or starting with `~/`. Your home directory when left out.' },
         cols: { type: 'integer', minimum: 1, maximum: SIZE_MAX, description: `Terminal width in columns; 120 when left out. Columns plus one, times rows, may be at most ${RESULT_MAX_CHARS - SCREEN_ROOM_CHARS}, so a whole screen of plain text fits in one result.` },
         rows: { type: 'integer', minimum: 1, maximum: SIZE_MAX, description: 'Terminal height in rows; 40 when left out.' },
       },
@@ -61,8 +61,7 @@ export const TOOLS: readonly ToolDef[] = [
       'Run one command line in a session\'s shell, only when it is at its prompt. Otherwise nothing is typed, and the refusal says what is in front. ' +
       'Returns its exit status, duration, directory afterwards and output, or that it is still running when the wait ends: it keeps running, and on a host that takes wakes its end is reported to you when it comes. ' +
       '`notify_on` reports a pattern in its output once: in the result if the command has ended, otherwise as it appears, on a host that takes wakes. ' +
-      'For a script, `structuredContent` has `exitCode` (null with `running` true while it runs, null with `running` false when no status is known, null with `stopped` true when a `stop` signal stopped the job, null with `stoppedUnknown` true when whether it did couldn\'t be read, and null with `unfollowed` true when the session stopped following the shell it ran in) and `output`, the command\'s own lines without any note, and without the typed command except a plain shell\'s echo of a multi-line command\'s later lines, ' +
-      'cut past the result\'s budget to its start and end, with `outputLeftOut` giving `at` and `characters` in UTF-16 code units. ' +
+      'For scripts, `structuredContent` carries the status and the output as values, as next/README.md describes. ' +
       `In a shell given the integration with \`integrate\`, the command line goes inside a wrapper of under 200 characters that keeps its statuses, and the whole is typed as one line of at most ${FAR_MAX_TYPED.toLocaleString('en-US')} characters, with each \`'\`, \`\\\`, \`!\`, control or non-ASCII byte of the command counting five; a longer one is refused, and says how long it was.`,
     inputSchema: {
       type: 'object',
@@ -164,7 +163,7 @@ export const TOOLS: readonly ToolDef[] = [
       'Refused while this terminal reads whole lines, as at the password or yes/no questions ssh, su and sudo ask on this machine. A program that holds the terminal raw, such as a connected ssh, hides its far side: a question there can\'t be seen, and the probe line would answer it. Call it once `look` shows the far prompt. ' +
       'bash, zsh and fish only; another shell is refused, and the refusal names it. If the wait runs out, nothing more is typed, and the result names the step it reached; once the hooks are all typed, a prompt drawn later still completes it. ' +
       'The integration lasts until that shell exits, or until the local program it was reached through ends or leaves the terminal, as when ssh exits or is suspended. Then `run` goes back to the shell it was typed from. ' +
-      'In a shell that writes its history as it goes, the probe line reaches its history file, and in zsh so does the line that turns saving off. Nothing typed after them does.',
+      'Its probe line can reach the shell\'s history file.',
     inputSchema: {
       type: 'object',
       properties: { name, wait },
@@ -179,10 +178,10 @@ export const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'close',
-    description: 'End a session. Its shell and every process it lists on its terminal are hung up, and the shell is killed if it hasn\'t ended after a grace. A process started with `setsid` or `nohup` outlives it.',
+    description: 'End a session. Its shell and every process it lists on its terminal are hung up, and the shell is killed if it hasn\'t ended after a grace. A process started with `setsid` or `nohup` outlives it, and so does one the daemon may not signal, such as another user\'s, which the result names.',
     inputSchema: {
       type: 'object',
-      properties: { name, force: { type: 'boolean', description: 'KILL at once the shell, and every process it lists on its terminal or among the shell\'s descendants. A process that left the terminal and is no longer the shell\'s descendant outlives it.' } },
+      properties: { name, force: { type: 'boolean', description: 'KILL the shell, and every process it lists on its terminal or among the shell\'s descendants, with no hangup first and no grace. A process that left the terminal and is no longer the shell\'s descendant outlives it, and so does one the daemon may not signal.' } },
       required: ['name'],
       additionalProperties: false,
     },

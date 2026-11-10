@@ -403,7 +403,7 @@ interface Listed {
 }
 
 const LINUX = process.platform === 'linux';
-/** How long a kill may take: RobustSessionClient's default request timeout, through which every kill reaches killSession. */
+/** How long a kill may take: RobustSessionClient's default request timeout, through which a kill reaches killSession. The WebSocket API's session.kill calls killSession directly, under no such bound. */
 const KILL_BUDGET_MS = 10_000;
 const SHELL_WAIT_MS = 3000;
 const SETTLE_MS = 50;

@@ -24,7 +24,8 @@ what reaches them is the package they share with 2.0: a narrower Node range (`en
   exit status (or "status unknown", or the shell's exit for a command that ends the shell) and duration. `list` gives a line
   for each session, `close` says how the shell ended, and a refused call says why. `close` hangs up
   the shell and every process it lists on its terminal; a process started with `setsid` or `nohup`
-  outlives it, and `force` KILLs at once. `run`'s
+  outlives it, and so does one the daemon may not signal, such as another user's, which the result
+  names; `force` KILLs, with no hangup and no grace. `run`'s
   `structuredContent` gives the command's `exitCode` and its own `output` as values. `run` types only at the prompt; `send` types
   exactly what it is given and returns its effect; with `paste: true` it sends the text as a
   bracketed paste and the keys after it, for a program such as Claude Code that takes long typed
@@ -46,7 +47,8 @@ what reaches them is the package they share with 2.0: a narrower Node range (`en
 - **1.x's graceful `killSession` and `killAll` hang up every process they list on the session's terminal**
   once the shell is gone, as 2.0's `close` does. A disowned job, or one started from a subshell, no
   longer outlives a graceful kill, unless it ignores the hangup, or the listing fails or runs out of
-  time. A process started with `setsid` or `nohup` still does. A forced
+  time. A process started with `setsid` or `nohup` still does, and so does one the kill may not
+  signal, such as another user's, which it doesn't report. A forced
   kill still KILLs the shell alone, and on Windows the kill is as before. Listing the terminal's
   processes, the 3 s wait for the shell and the hangup share one deadline, 10 s from the kill's
   start: the time `RobustSessionClient` gives a request. A kill that uses all 10 s can still answer
