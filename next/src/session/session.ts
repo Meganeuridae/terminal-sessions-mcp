@@ -311,7 +311,6 @@ class LiveSession implements Session {
   private mark(payload: string, at: Pos): boolean {
     const [kind, nonce, ...rest] = payload.split(';');
     if (kind === 'K') {
-      // A call that timed out leaves its probe line to run later, so only an answer to this call counts.
       if (this.probe && !this.probe.answer && nonce === this.probe.call) {
         const [fish = '', zsh = '', bash = '', zero] = rest;
         this.probe.answer = { fish, zsh, bash, ...(zero !== undefined && { zero }) };
@@ -391,8 +390,7 @@ class LiveSession implements Session {
       const far = this.chains[i]!.far;
       const by = far?.within;
       if (!far || !by) continue;
-      // A group can go on with another program, as `sh -c 'ssh h; exec cat'` does, so each chain's own processes are checked, even
-      // where its group is the session shell's or an earlier chain's verdict stands for it.
+      // A group can go on with another program, as `sh -c 'ssh h; exec cat'` does.
       const left = far.leaves.find((l) => !proc.alive(l.pid));
       if (left) {
         this.drop(i - 1, { by: left.argv, how: 'ended' });
@@ -794,9 +792,8 @@ class LiveSession implements Session {
       if (!emptyText(before)) return before;
     }
     const text = this.promptLine(b);
-    // Reached only with nothing but blanks before the cursor, so the order nearly implies the cursor's place here. It still matters
-    // when only blanks or line breaks sit before a cursor past the mark, with text after it; no test pins that case. Typed text that
-    // draws exactly the line at rest, where the rest draws it, reads as empty: the screen can't tell input from the prompt's drawing.
+    // Typed text that draws exactly the line at rest, where the rest draws it, reads as empty: the screen can't tell input from the
+    // prompt's drawing.
     if (this.top.sentAt !== b && cur.line === b.line && cur.col === b.col) this.top.rest = { at: b, text };
     if (!emptyText(text) && !(this.top.rest?.at === b && this.top.rest.text === text)) return text.replace(/^[ \n]+|[ \n]+$/g, '');
     const sent = this.top.sentPending;
@@ -890,7 +887,6 @@ class LiveSession implements Session {
     const removeFiles = (): void => {
       for (const f of cf.files) fs.rmSync(f.path, { force: true });
     };
-    // The files are written before the command is recorded, and a write that fails takes back what it changed, so nothing is left.
     try {
       for (const f of cf.files) fs.writeFileSync(f.path, f.body, { mode: 0o600 });
     } catch (e) {
@@ -951,7 +947,6 @@ class LiveSession implements Session {
       if (!stopped() && this.top.atPrompt && !this.prompted) return unsent('timeout');
       await this.t.settled();
     }
-    // The first `send` at a prompt takes the line's rest first, if no look has, so text it types isn't taken for the prompt's own.
     const at = this.top.atPrompt && !this.top.submitted ? this.top.promptAt : undefined;
     if (at && this.top.sentAt !== at && this.top.rest?.at !== at && !stopped()) {
       await this.t.settled();
@@ -980,7 +975,6 @@ class LiveSession implements Session {
       try {
         this.p.write(bytes);
       } catch (e) {
-        // Nothing reached the terminal, so the line is as it was.
         Object.assign(this.top, before);
         throw e;
       }
@@ -1210,16 +1204,13 @@ class LiveSession implements Session {
       if (g === undefined) return { kind: 'refused', unlisted: true, front: f };
       within = { pgid: g, argv: proc.argv(g) ?? '?', shell: false };
     } else within = f.process;
-    // The carrier is known by its processes too: those of its group with no child in it. Their end ends it, though the group goes on.
-    // At the session shell's own prompt, that's the shell itself.
     const all = proc.family(this.pid)?.all;
     const members = all && [{ pid: this.pid, pgrp: this.pid }, ...all].filter((d) => d.pgrp === within.pgid);
     if (!members?.length) return { kind: 'refused', unlisted: true, front: f };
     const leaves: Leaf[] = members.filter((m) => !members.some((c) => c.ppid === m.pid)).map((m) => ({ pid: m.pid, argv: proc.argv(m.pid) ?? within.argv }));
     const below = this.top;
     const plainBelow = this.plain && within.pgid !== this.pid;
-    // A program the shell is reached through can end while the line that ran it goes on with another in the same group, so its
-    // captured processes guard the handshake too.
+    // A program the shell is reached through can end while the line that ran it goes on with another in the same group.
     let gone: Leaf | undefined;
     const leafGone = (): boolean => (gone ??= leaves.find((l) => !proc.alive(l.pid))) !== undefined;
     const ended = (): boolean => !this.chains.includes(below) || below.atPrompt || (plainBelow && this.lookDue() && this.front().state === 'prompt') || leafGone();
@@ -1239,7 +1230,6 @@ class LiveSession implements Session {
     };
     try {
       this.probe = { call };
-      // Each write is checked first: what it would go to may have ended since the last look.
       if (stop()) return incomplete('probe', stop()!);
       this.lastWrite = mono();
       this.p.write(integration.probeLine(call));
@@ -1272,11 +1262,9 @@ class LiveSession implements Session {
       try {
         this.p.write(lines.at(-1)!);
       } catch (e) {
-        // The far shell never got its last hook, so the chain isn't one.
         if (this.top === chain) this.chains.pop();
         throw e;
       }
-      // Once the chain is on top, a prompt it draws is what's awaited, so only the call's own stops and the captured processes count.
       const drawn = await this.until(deadline, () => (!this.chains.includes(chain) || by() || leafGone() ? false : this.top === chain && this.prompted ? true : undefined), opts.signal);
       if (!drawn) return incomplete('hooks', by() ?? (leafGone() || !this.chains.includes(chain) ? 'exited' : 'timeout'));
       const p = this.probe!;

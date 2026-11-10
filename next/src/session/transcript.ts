@@ -369,7 +369,6 @@ export class Transcript {
     const cut = this.partial !== '' && this.partialCut;
     const lines = this.withPartial(from, this.walk(from, upto).lines);
     this.partial = this.wraps(upto + 1) ? (lines.pop() ?? '') : '';
-    // The first line goes on the partial's logical line; with none frozen now, the new partial still does.
     for (const [k, l] of lines.entries()) this.push(this.io.redact(l), k === 0 && cut);
     this.partialCut = lines.length ? false : cut;
     if (this.partial.length > MAX_LINE) {
